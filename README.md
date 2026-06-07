@@ -18,7 +18,8 @@ bounded to 5 MiB per file, and managed raw-log directories keep at most 20 files
 by default. Prepared raw-log files are created with no-follow exclusive
 semantics. The direct raw-log writer also requires the managed state directories
 to be real directories, not symlinks, and legacy raw-log directories are ignored
-when they are symlinks. Agentin metadata presence checks do not follow symlinks,
+when they are symlinks. Assignment-log reads require regular files, are capped,
+and use generic errors. Agentin metadata presence checks do not follow symlinks,
 metadata reads reject symlinked and oversized files, and metadata read errors
 use generic markers rather than local file paths. Safe-tail log reads ignore
 non-regular raw-log targets. Tmux control errors are redacted and bounded before

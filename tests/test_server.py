@@ -11,6 +11,7 @@ from unittest.mock import patch
 from codex_master.server import (
     AgentError,
     MAX_ASSIGNMENT_LIST_ITEMS,
+    MAX_ASSIGNMENT_LOG_BYTES,
     MAX_CAPABILITY_PLUGINS,
     MAX_ERROR_CHARS,
     MAX_META_BYTES,
@@ -705,6 +706,53 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(target_content, "external\n")
         self.assertTrue(link_is_symlink)
+
+    @patch("codex_master.server.ensure_state")
+    def test_list_assignments_refuses_symlink_log_without_leaking_path(self, _mock_ensure_state) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "external.jsonl"
+            link = Path(tmpdir) / "assignments.jsonl"
+            target.write_text('{"agent":"a","secret":"ASSIGNMENT_SECRET_SHOULD_NOT_LEAK"}\n', encoding="utf-8")
+            link.symlink_to(target)
+
+            with patch("codex_master.server.ASSIGNMENT_LOG", link):
+                response = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 47,
+                        "method": "tools/call",
+                        "params": {"name": "agent_assignments", "arguments": {"agent": "all", "limit": 10}},
+                    }
+                )
+
+        self.assertTrue(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["error"], "could_not_read_assignment_log")
+        payload_text = json.dumps(payload, sort_keys=True)
+        self.assertNotIn("ASSIGNMENT_SECRET_SHOULD_NOT_LEAK", payload_text)
+        self.assertNotIn(str(target), payload_text)
+        self.assertNotIn(str(link), payload_text)
+
+    @patch("codex_master.server.ensure_state")
+    def test_list_assignments_refuses_oversized_log_without_leaking_path(self, _mock_ensure_state) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assignment_log = Path(tmpdir) / "assignments.jsonl"
+            assignment_log.write_text("x" * (MAX_ASSIGNMENT_LOG_BYTES + 1), encoding="utf-8")
+
+            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+                response = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 48,
+                        "method": "tools/call",
+                        "params": {"name": "agent_assignments", "arguments": {"agent": "all", "limit": 10}},
+                    }
+                )
+
+        self.assertTrue(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["error"], "could_not_read_assignment_log")
+        self.assertNotIn(str(assignment_log), json.dumps(payload, sort_keys=True))
 
     def test_agent_home_process_summary_flags_external_codex_home_users(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

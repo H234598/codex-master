@@ -62,6 +62,7 @@ MAX_SKILL_NAMES = 200
 MAX_CAPABILITY_PLUGINS = 20
 MAX_ASSIGNMENT_RECORDS = 100
 MAX_ASSIGNMENT_LOG_RECORDS = 500
+MAX_ASSIGNMENT_LOG_BYTES = 1024 * 1024
 MAX_ASSIGNMENT_TEXT = 12000
 MAX_SEND_TEXT = 12000
 MAX_TASK_TEXT = 4000
@@ -261,6 +262,42 @@ def write_private_text(path: Path, text: str) -> None:
 
 def replace_private_text(path: Path, text: str) -> None:
     replace_private_bytes(path, text.encode("utf-8"))
+
+
+def read_private_regular_text(path: Path, max_bytes: int, error_text: str) -> str:
+    max_bytes = max(1, int(max_bytes))
+    try:
+        current_stat = path.lstat()
+    except OSError as exc:
+        raise AgentError(error_text) from exc
+    if not stat_module.S_ISREG(current_stat.st_mode) or current_stat.st_size > max_bytes:
+        raise AgentError(error_text)
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(path, flags)
+        opened_stat = os.fstat(fd)
+        if not stat_module.S_ISREG(opened_stat.st_mode) or opened_stat.st_size > max_bytes:
+            raise AgentError(error_text)
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            raw = fh.read(max_bytes + 1)
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError(error_text) from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) > max_bytes:
+        raise AgentError(error_text)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise AgentError(error_text) from exc
 
 
 def replace_private_bytes(path: Path, data: bytes) -> None:
@@ -1261,10 +1298,11 @@ def prune_assignment_log(max_records: int | None = None) -> None:
     max_records = max(1, int(max_records if max_records is not None else MAX_ASSIGNMENT_LOG_RECORDS))
     if not ASSIGNMENT_LOG.exists():
         return
-    try:
-        lines = ASSIGNMENT_LOG.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise AgentError(f"could not read assignment log for pruning: {exc}") from exc
+    lines = read_private_regular_text(
+        ASSIGNMENT_LOG,
+        MAX_ASSIGNMENT_LOG_BYTES,
+        "could_not_read_assignment_log",
+    ).splitlines()
 
     valid_records: list[str] = []
     for line in lines:
@@ -1288,18 +1326,17 @@ def list_assignments(agent: str = "all", limit: int = 20) -> dict[str, Any]:
     limit = max(1, min(int(limit), MAX_ASSIGNMENT_RECORDS))
     records: list[dict[str, Any]] = []
     if ASSIGNMENT_LOG.exists():
-        try:
-            for line in ASSIGNMENT_LOG.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if agent == "all" or record.get("agent") == agent:
-                    records.append(record)
-        except OSError as exc:
-            raise AgentError(f"could not read assignment log: {exc}") from exc
+        for line in read_private_regular_text(
+            ASSIGNMENT_LOG, MAX_ASSIGNMENT_LOG_BYTES, "could_not_read_assignment_log"
+        ).splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if agent == "all" or record.get("agent") == agent:
+                records.append(record)
     return {
         "agent": agent,
         "limit": limit,
