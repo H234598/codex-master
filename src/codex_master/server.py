@@ -1673,13 +1673,34 @@ def safe_error_text(value: Any, max_chars: int = MAX_ERROR_CHARS) -> str:
 
 
 def read_log_tail(path: Path, approx_bytes: int) -> str:
-    if not path.exists():
+    approx_bytes = max(1, int(approx_bytes))
+    try:
+        current_stat = path.lstat()
+    except OSError:
         return ""
-    with path.open("rb") as fh:
-        fh.seek(0, os.SEEK_END)
-        size = fh.tell()
-        fh.seek(max(0, size - approx_bytes), os.SEEK_SET)
-        return fh.read().decode("utf-8", errors="replace")
+    if not stat_module.S_ISREG(current_stat.st_mode):
+        return ""
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(path, flags)
+        opened_stat = os.fstat(fd)
+        if not stat_module.S_ISREG(opened_stat.st_mode):
+            return ""
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - approx_bytes), os.SEEK_SET)
+            return fh.read(approx_bytes).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def pane_tail(agent: str, lines: int) -> str:

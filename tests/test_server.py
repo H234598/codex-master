@@ -400,6 +400,33 @@ class ServerHelpersTest(unittest.TestCase):
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertIn("outside managed raw log state", payload["error"])
 
+    @patch("codex_master.server.ensure_state")
+    def test_safe_tail_log_source_ignores_non_regular_log_file(self, _mock_ensure_state) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir)
+            fifo_path = raw_dir / "agent.log"
+            os.mkfifo(fifo_path)
+            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
+                "codex_master.server.read_meta", return_value={"raw_log": str(fifo_path)}
+            ):
+                response = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 46,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "agent_safe_tail",
+                            "arguments": {"agent": "a", "source": "log", "lines": 2, "chars": 4000},
+                        },
+                    }
+                )
+
+        self.assertIsNotNone(response)
+        self.assertFalse(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["source"], "log")
+        self.assertEqual(payload["output"], "")
+
     def test_append_bounded_raw_log_caps_file_size(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             log_path = Path(tmpdir) / "agent.log"

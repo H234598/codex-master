@@ -108,7 +108,8 @@ Data minimization:
   raw-log files are created with no-follow exclusive semantics, and raw-log
   symlinks are not followed. The direct raw-log writer verifies real managed
   state directories before accepting log input, and symlinked legacy raw-log
-  directories are ignored. Failed starts must remove prepared raw-log files.
+  directories are ignored. Safe-tail log reads only regular raw-log files.
+  Failed starts must remove prepared raw-log files.
 - Assignment inputs are bounded before tmux interaction: sends/start prompts
   12,000 chars, tasks 4,000 chars, names 80 chars, skill refs 300 chars,
   path-like fields 1,000 chars, and assignment lists 50 items. MCP boolean and

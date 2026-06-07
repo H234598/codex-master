@@ -19,9 +19,9 @@ by default. Prepared raw-log files are created with no-follow exclusive
 semantics. The direct raw-log writer also requires the managed state directories
 to be real directories, not symlinks, and legacy raw-log directories are ignored
 when they are symlinks. Agentin metadata reads reject symlinked and oversized
-files. MCP tool responses do not return raw output by default. Existing metadata
-under the old `codex-agent-mcp` state directory is still read as a migration
-fallback.
+files. Safe-tail log reads ignore non-regular raw-log targets. MCP tool
+responses do not return raw output by default. Existing metadata under the old
+`codex-agent-mcp` state directory is still read as a migration fallback.
 
 ## Tools
 
@@ -30,7 +30,8 @@ fallback.
 - `agent_send`: send text to one running Agentin
 - `agent_interrupt`: send Ctrl-C to one running Agentin
 - `agent_stop`: stop Agentin `a`, `b`, or `both`
-- `agent_safe_tail`: explicit capped, ANSI-stripped, redacted excerpt
+- `agent_safe_tail`: explicit capped, ANSI-stripped, redacted excerpt; log
+  source reads only regular raw-log files
 - `agent_skills`: data-sparse skill inventory without file contents
 - `agent_skill_match`: check whether one or all Agentinnen have a named skill
 - `agent_capabilities`: summarized model, skill, and policy capabilities with a
