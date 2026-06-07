@@ -55,6 +55,7 @@ SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
 MCP_SERVER_NAME = "codex-master-mcp"
 DEFAULT_INSTALL_PATH = Path("~/.local/bin/codex-master-mcp").expanduser()
 MAX_SKILL_NAMES = 200
+MAX_CAPABILITY_PLUGINS = 20
 MAX_ASSIGNMENT_RECORDS = 100
 MAX_ASSIGNMENT_TEXT = 12000
 DEFAULT_AGENTIN_NAMES = {"a": "Mila", "b": "Nora"}
@@ -491,8 +492,15 @@ def skill_match_agent(agent: str, skill_ref: str, limit: int = 8) -> dict[str, A
     }
 
 
+def capped_mapping(items: dict[str, int], limit: int) -> tuple[dict[str, int], bool]:
+    sorted_items = sorted(items.items())
+    capped = dict(sorted_items[:limit])
+    return capped, len(sorted_items) > limit
+
+
 def capabilities_agent(agent: str) -> dict[str, Any]:
     inventory = skills_agent(agent, include_names=False)
+    plugins, plugins_truncated = capped_mapping(inventory["plugins"], MAX_CAPABILITY_PLUGINS)
     return {
         "agent": agent,
         "label": AGENTS[agent]["label"],
@@ -506,7 +514,10 @@ def capabilities_agent(agent: str) -> dict[str, Any]:
         },
         "skill_count": inventory["total"],
         "system_skills": inventory["system_skills"],
-        "plugins": inventory["plugins"],
+        "plugin_count": len(inventory["plugins"]),
+        "plugins_limit": MAX_CAPABILITY_PLUGINS,
+        "plugins": plugins,
+        "plugins_truncated": plugins_truncated,
         "master_mcp_tools": "not_configured_for_agent",
         "native_subagents": "assignment_gated",
         "write_policy": "explicit_paths_only",

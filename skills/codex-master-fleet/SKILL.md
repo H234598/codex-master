@@ -81,6 +81,8 @@ Data minimization:
 
 - `status`, `start`, `send`, `assign-*`, `doctor`, `skills`, `capabilities`,
   and `plugin-status` do not return Agentin terminal output.
+- `capabilities` returns a capped plugin sample plus counts/truncation flags,
+  not a complete broad plugin inventory.
 - `assignments` and `last-assignment` return only assignment metadata. They
   must not return prompt text or Agentin responses.
 - Use `tail` only for an explicit capped, ANSI-stripped, redacted excerpt.

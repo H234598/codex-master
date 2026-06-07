@@ -282,6 +282,10 @@ class ServerHelpersTest(unittest.TestCase):
             skill = home / ".tmp" / "plugins" / "plugins" / "github" / "skills" / "gh-fix-ci" / "SKILL.md"
             skill.parent.mkdir(parents=True, exist_ok=True)
             skill.write_text("SECRET_SKILL_CONTENT_SHOULD_NOT_LEAK\n", encoding="utf-8")
+            for index in range(25):
+                extra = home / ".tmp" / "plugins" / "plugins" / f"plugin-{index:02d}" / "skills" / "extra" / "SKILL.md"
+                extra.parent.mkdir(parents=True, exist_ok=True)
+                extra.write_text("extra\n", encoding="utf-8")
 
             with patch.dict(
                 "codex_master.server.AGENTS",
@@ -317,6 +321,9 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(capability_payload["models"]["default"], "gpt-5.4-mini")
         self.assertEqual(capability_payload["models"]["write"], "gpt-5.3-codex-spark")
         self.assertEqual(capability_payload["master_mcp_tools"], "not_configured_for_agent")
+        self.assertEqual(capability_payload["plugins_limit"], 20)
+        self.assertTrue(capability_payload["plugins_truncated"])
+        self.assertLessEqual(len(capability_payload["plugins"]), 20)
 
     def test_scope_check_blocks_writes_outside_scope(self) -> None:
         response = handle_rpc(

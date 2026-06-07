@@ -27,7 +27,8 @@ not return raw output by default. Existing metadata under the old
 - `agent_safe_tail`: explicit capped, ANSI-stripped, redacted excerpt
 - `agent_skills`: data-sparse skill inventory without file contents
 - `agent_skill_match`: check whether one or all Agentinnen have a named skill
-- `agent_capabilities`: summarized model, skill, and policy capabilities
+- `agent_capabilities`: summarized model, skill, and policy capabilities with a
+  capped plugin sample
 - `agent_scope_check`: verify write paths stay inside assignment scope
 - `agent_assign`: structured, skill-aware assignment with explicit boundaries
 - `agent_assign_readonly`: shortcut for read-only Exploriererin assignments
@@ -95,6 +96,12 @@ python3 -m codex_master.server stop both
   and `.tmp/plugins/`
 - returns counts, roots, system-skill names, and plugin skill counts
 - returns no skill file contents and no Agentin terminal output
+
+`capabilities`
+- returns the model policy, total skill count, system skill names, and a capped
+  plugin-count sample
+- reports `plugin_count`, `plugins_limit`, and `plugins_truncated` instead of
+  dumping every plugin name when many are installed
 
 ## Steering Skills
 
