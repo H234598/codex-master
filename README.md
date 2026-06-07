@@ -120,6 +120,8 @@ python3 -m codex_master.server stop both
 - creates `~/.local/bin/codex-master-mcp` as symlink to `bin/codex-master-mcp`
 - verifies that the repo wrapper can answer an MCP `initialize` probe before
   registering it with Codex
+- verifies that the installed command path also answers the same probe before
+  registration
 - registers the command via `codex mcp add codex-master-mcp -- <link>`
 - ensures the active Codex MCP config has `startup_timeout_sec = 120`
 - refuses to register the Master MCP from a managed Agentinnen `CODEX_HOME`

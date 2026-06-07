@@ -2530,14 +2530,36 @@ class CliLifecycleTest(unittest.TestCase):
 
         self.assertFalse(link_exists)
 
+    @patch("codex_master.server.check_mcp_registration")
+    @patch("codex_master.server.mcp_command_startup_self_test")
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_self_tests_installed_path_before_registration(
+        self, mock_wrapper_path, mock_self_test, mock_registration
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            mock_wrapper_path.return_value = wrapper
+            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
+            mock_registration.return_value = {"registered": True, "ok": True, "startup_timeout_ok": True}
+
+            install(register=True, install_path=install_link)
+
+        self.assertEqual(mock_self_test.call_args_list[0].args[0], wrapper)
+        self.assertEqual(mock_self_test.call_args_list[1].args[0], install_link)
+
     @patch("codex_master.server.subprocess.run")
     def test_mcp_command_startup_self_test_is_data_sparse(self, mock_run) -> None:
         mock_run.return_value = subprocess.CompletedProcess(
             ["codex-master-mcp"],
             0,
             (
-                'Content-Length: 118\r\n\r\n{"jsonrpc":"2.0","id":1,'
-                '"result":{"serverInfo":{"name":"codex-master-mcp"}}} SECRET'
+                'Content-Length: 181\r\n\r\n{"jsonrpc":"2.0","id":1,'
+                '"result":{"protocolVersion":"2024-11-05","capabilities":{},'
+                '"serverInfo":{"name":"codex-master-mcp"}}} SECRET'
             ),
             "",
         )
@@ -2563,11 +2585,17 @@ class CliLifecycleTest(unittest.TestCase):
     def test_mcp_probe_response_requires_json_rpc_server_info(self) -> None:
         self.assertTrue(
             mcp_probe_response_ok(
-                'Content-Length: 118\r\n\r\n{"jsonrpc":"2.0","id":1,'
-                '"result":{"serverInfo":{"name":"codex-master-mcp"}}}'
+                'Content-Length: 181\r\n\r\n{"jsonrpc":"2.0","id":1,'
+                '"result":{"protocolVersion":"2024-11-05","capabilities":{},'
+                '"serverInfo":{"name":"codex-master-mcp"}}}'
             )
         )
         self.assertFalse(mcp_probe_response_ok('codex-master-mcp finished with "id":1 but no JSON-RPC response'))
+        self.assertFalse(
+            mcp_probe_response_ok(
+                '{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"codex-master-mcp"}}}'
+            )
+        )
 
     @patch("codex_master.server.run_command")
     def test_installed_source_worktree_state_warns_without_paths(self, mock_run) -> None:

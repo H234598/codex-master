@@ -425,8 +425,14 @@ def mcp_probe_response_ok(output: str) -> bool:
             continue
         if not isinstance(payload, dict) or payload.get("id") != 1:
             continue
+        if payload.get("jsonrpc") != "2.0":
+            continue
         result = payload.get("result")
         if not isinstance(result, dict):
+            continue
+        if result.get("protocolVersion") not in SUPPORTED_PROTOCOL_VERSIONS:
+            continue
+        if not isinstance(result.get("capabilities"), dict):
             continue
         server_info = result.get("serverInfo")
         if isinstance(server_info, dict) and server_info.get("name") == MCP_SERVER_NAME:
@@ -2331,8 +2337,8 @@ def install(register: bool = True, force: bool = False, install_path: Path = DEF
         raise AgentError(f"repo wrapper is not executable: {wrapper}")
     startup_self_test: dict[str, Any] = {"requested": register, "status": "skipped", "raw_output": "not_returned"}
     if register:
-        startup_self_test = {"requested": True, **mcp_command_startup_self_test(wrapper)}
-        if not startup_self_test["ok"]:
+        wrapper_self_test = mcp_command_startup_self_test(wrapper)
+        if not wrapper_self_test["ok"]:
             raise AgentError("repo wrapper failed MCP startup self-test")
 
     install_path = normalize_install_path(install_path)
@@ -2353,6 +2359,9 @@ def install(register: bool = True, force: bool = False, install_path: Path = DEF
 
     registration: dict[str, Any] = {"requested": register, "status": "skipped"}
     if register:
+        startup_self_test = {"requested": True, **mcp_command_startup_self_test(install_path)}
+        if not startup_self_test["ok"]:
+            raise AgentError("install path failed MCP startup self-test")
         current = check_mcp_registration(install_path)
         startup_timeout_config = None
         if current.get("ok"):
