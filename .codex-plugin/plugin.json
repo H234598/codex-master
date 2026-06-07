@@ -1,6 +1,6 @@
 {
   "name": "codex-master",
-  "version": "0.1.6+codex.20260607094826",
+  "version": "0.1.7+codex.20260607095223",
   "description": "Local Codex Masterjet plugin for controlling isolated Agentinnen A/B through a data-sparse tmux MCP server.",
   "author": {
     "name": "teladi"

@@ -85,6 +85,8 @@ Data minimization:
   not a complete broad plugin inventory.
 - `assignments` and `last-assignment` return only assignment metadata. They
   must not return prompt text or Agentin responses.
+- Assignment audit retention is bounded to the newest 500 valid metadata
+  records in a local `0600` JSONL file.
 - Use `tail` only for an explicit capped, ANSI-stripped, redacted excerpt.
 - Do not read raw tmux logs directly unless the user explicitly requests it and
   the privacy impact is acceptable.

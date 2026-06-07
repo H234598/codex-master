@@ -57,6 +57,7 @@ DEFAULT_INSTALL_PATH = Path("~/.local/bin/codex-master-mcp").expanduser()
 MAX_SKILL_NAMES = 200
 MAX_CAPABILITY_PLUGINS = 20
 MAX_ASSIGNMENT_RECORDS = 100
+MAX_ASSIGNMENT_LOG_RECORDS = 500
 MAX_ASSIGNMENT_TEXT = 12000
 DEFAULT_AGENTIN_NAMES = {"a": "Mila", "b": "Nora"}
 
@@ -191,6 +192,27 @@ def write_private_text(path: Path, text: str) -> None:
         path.chmod(0o600)
     except PermissionError:
         pass
+
+
+def replace_private_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{now_id()}.tmp")
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        try:
+            tmp_path.chmod(0o600)
+        except PermissionError:
+            pass
+        tmp_path.replace(path)
+        try:
+            path.chmod(0o600)
+        except PermissionError:
+            pass
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def pane_pid(session: str) -> int | None:
@@ -742,6 +764,31 @@ def redact_list(items: list[str], max_items: int = 50) -> list[str]:
 def record_assignment(record: dict[str, Any]) -> None:
     ensure_state()
     write_private_text(ASSIGNMENT_LOG, json.dumps(record, sort_keys=True) + "\n")
+    prune_assignment_log()
+
+
+def prune_assignment_log(max_records: int | None = None) -> None:
+    max_records = max(1, int(max_records if max_records is not None else MAX_ASSIGNMENT_LOG_RECORDS))
+    if not ASSIGNMENT_LOG.exists():
+        return
+    try:
+        lines = ASSIGNMENT_LOG.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise AgentError(f"could not read assignment log for pruning: {exc}") from exc
+
+    valid_records: list[str] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        valid_records.append(json.dumps(parsed, sort_keys=True))
+
+    kept = valid_records[-max_records:]
+    text = "\n".join(kept) + ("\n" if kept else "")
+    replace_private_text(ASSIGNMENT_LOG, text)
 
 
 def list_assignments(agent: str = "all", limit: int = 20) -> dict[str, Any]:
@@ -768,6 +815,9 @@ def list_assignments(agent: str = "all", limit: int = 20) -> dict[str, Any]:
         "limit": limit,
         "records": records[-limit:],
         "record_count": len(records[-limit:]),
+        "retained_count": len(records),
+        "retention_limit": MAX_ASSIGNMENT_LOG_RECORDS,
+        "records_truncated": len(records) > limit,
         "log_path": str(ASSIGNMENT_LOG),
         "prompt_output": "not_returned",
         "response_output": "not_returned",

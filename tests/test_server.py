@@ -429,6 +429,61 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("Skill body must not be returned", ledger_text)
 
     @patch("codex_master.server.send_agent")
+    def test_assignment_log_retention_prunes_metadata_records(self, mock_send_agent) -> None:
+        mock_send_agent.return_value = {"agent": "a", "status": "sent", "response_output": "not_returned"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            assignment_log = home / "assignments.jsonl"
+            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log), patch(
+                "codex_master.server.MAX_ASSIGNMENT_LOG_RECORDS", 3
+            ), patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                for index in range(5):
+                    response = handle_rpc(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 30 + index,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "agent_assign_readonly",
+                                "arguments": {
+                                    "agent": "a",
+                                    "scope": [f"src/{index}"],
+                                    "task": f"Pruefe nur lesend {index}.",
+                                    "enter": False,
+                                },
+                            },
+                        }
+                    )
+                    self.assertFalse(response["result"]["isError"])
+                ledger_response = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 40,
+                        "method": "tools/call",
+                        "params": {"name": "agent_assignments", "arguments": {"agent": "a", "limit": 10}},
+                    }
+                )
+
+            mode = stat.S_IMODE(assignment_log.stat().st_mode)
+            lines = assignment_log.read_text(encoding="utf-8").splitlines()
+
+        self.assertFalse(ledger_response["result"]["isError"])
+        ledger = json.loads(ledger_response["result"]["content"][0]["text"])
+        self.assertEqual(ledger["record_count"], 3)
+        self.assertEqual(ledger["retained_count"], 3)
+        self.assertEqual(ledger["retention_limit"], 3)
+        self.assertFalse(ledger["records_truncated"])
+        self.assertEqual([record["scope"] for record in ledger["records"]], [["src/2"], ["src/3"], ["src/4"]])
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(mode, 0o600)
+        ledger_text = json.dumps(ledger, sort_keys=True)
+        self.assertNotIn("Pruefe nur lesend", ledger_text)
+
+    @patch("codex_master.server.send_agent")
     def test_agent_assign_allows_nested_subagents_only_when_explicit(self, mock_send_agent) -> None:
         mock_send_agent.return_value = {"agent": "b", "status": "sent", "response_output": "not_returned"}
         with tempfile.TemporaryDirectory() as tmpdir:
