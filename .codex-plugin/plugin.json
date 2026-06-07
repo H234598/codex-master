@@ -1,7 +1,7 @@
 {
   "name": "codex-master",
-  "version": "0.6.4+codex.20260607215229",
-  "description": "Local Codex Masterjet plugin for controlling isolated Agentinnen A/B through a data-sparse tmux MCP server.",
+  "version": "0.7.0+codex.20260607204340",
+  "description": "Local Codex Masterjet plugin for controlling a sleeping Agentinnen pool through a data-sparse tmux MCP server.",
   "author": {
     "name": "teladi"
   },
@@ -23,7 +23,7 @@
   "interface": {
     "displayName": "Codex Master",
     "shortDescription": "Control isolated Codex Agentinnen with a local Masterjet MCP.",
-    "longDescription": "Adds the codex-master-mcp local MCP server plus fleet-management skills and an App Bridge manifest for starting, assigning, auditing, and safely inspecting two isolated Codex Agentinnen through tmux. The tool surface is data-sparse by default and keeps prompt text, Agentin responses, raw terminal logs, and raw-log file paths out of normal MCP responses.",
+    "longDescription": "Adds the codex-master-mcp local MCP server plus fleet-management skills and an App Bridge manifest for starting, assigning, auditing, and safely inspecting a scalable sleeping Codex Agentinnen pool through tmux. The tool surface is data-sparse by default and keeps prompt text, Agentin responses, raw terminal logs, and raw-log file paths out of normal MCP responses.",
     "developerName": "teladi",
     "category": "Developer Tools",
     "capabilities": [
@@ -32,7 +32,7 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Use Codex Master to start Agentin A and Agentin B",
+      "Use Codex Master to start Agentin A1 and Agentin B1",
       "Assign a read-only Exploriererin task with codex-master-mcp",
       "Check codex-master App Bridge and MCP status"
     ],

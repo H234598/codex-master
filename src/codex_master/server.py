@@ -1,4 +1,4 @@
-"""MCP server and CLI for controlling two local Codex instances via tmux.
+"""MCP server and CLI for controlling local Codex Agentinnen via tmux.
 
 The public tool surface is intentionally data-sparse. Raw terminal output is
 written to local state files only; tool responses return structured status or
@@ -112,7 +112,43 @@ DEFAULT_TMUX_TIMEOUT_SECONDS = 10
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
 DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS = 10
 RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS = 120
-DEFAULT_AGENTIN_NAMES = {"a": "Mila", "b": "Nora"}
+AGENT_POOL_ROOT = Path(os.environ.get("CODEX_AGENT_POOL_ROOT", "~/.codex-agents")).expanduser()
+AGENT_SERIES = ("a", "b", "c")
+AGENTS_PER_SERIES = 100
+AGENT_IDS = tuple(f"{series}{index}" for series in AGENT_SERIES for index in range(1, AGENTS_PER_SERIES + 1))
+PRIMARY_AGENT_IDS = ("a1", "b1")
+LEGACY_AGENT_ALIASES = {"a": "a1", "b": "b1"}
+SERIES_AGENT_IDS = {
+    f"{series}-series": tuple(f"{series}{index}" for index in range(1, AGENTS_PER_SERIES + 1))
+    for series in AGENT_SERIES
+}
+AGENT_SELECTOR_DESCRIPTION = (
+    "Agentin selector: a1..a100, b1..b100, c1..c100; legacy aliases a/b; "
+    "group selectors both, all, a-series, b-series, c-series."
+)
+DEFAULT_AGENTIN_BASE_NAMES = (
+    "Mila",
+    "Nora",
+    "Lina",
+    "Emma",
+    "Sofia",
+    "Lea",
+    "Amira",
+    "Maya",
+    "Elif",
+    "Leni",
+    "Clara",
+    "Ida",
+    "Ella",
+    "Mira",
+    "Zoe",
+    "Hanna",
+    "Juna",
+    "Lara",
+    "Nia",
+    "Tara",
+)
+DEFAULT_AGENTIN_NAMES = {"a1": "Mila", "b1": "Nora"}
 WATCHDOG_SERVICE_NAME = "codex-master-watchdog.service"
 WATCHDOG_TIMER_NAME = "codex-master-watchdog.timer"
 MAX_SYSTEMD_UNIT_BYTES = 64 * 1024
@@ -145,6 +181,7 @@ WATCHDOG_REQUIRED_EXEC_FLAGS = (
     "--idle-seconds 60",
     "--poll-interval-seconds 15",
     "--report-grace-seconds 15",
+    "--action stop",
     "--manage-unclaimed",
     "--quiet",
 )
@@ -193,20 +230,71 @@ BRACKETED_PASTE_END = "\x1b[201~"
 PATH_NOT_RETURNED = "not_returned"
 
 
-AGENTS = {
-    "a": {
-        "label": "Codex Agentin A",
-        "runner": Path(os.environ.get("CODEX_AGENT_A_RUNNER", "/home/teladi/.codex-agent-a/codex")),
-        "home": Path(os.environ.get("CODEX_AGENT_A_HOME", "/home/teladi/.codex-agent-a")),
-        "session": os.environ.get("CODEX_AGENT_A_SESSION", "codex_agent_a_mcp"),
-    },
-    "b": {
-        "label": "Codex Agentin B",
-        "runner": Path(os.environ.get("CODEX_AGENT_B_RUNNER", "/home/teladi/.codex-agent-b/codex")),
-        "home": Path(os.environ.get("CODEX_AGENT_B_HOME", "/home/teladi/.codex-agent-b")),
-        "session": os.environ.get("CODEX_AGENT_B_SESSION", "codex_agent_b_mcp"),
-    },
-}
+def agent_env_key(agent: str) -> str:
+    return agent.upper().replace("-", "_")
+
+
+def legacy_agent_env_key(agent: str) -> str | None:
+    if agent == "a1":
+        return "A"
+    if agent == "b1":
+        return "B"
+    return None
+
+
+def env_path_value(primary: str, fallback: str | None, default: Path) -> Path:
+    value = os.environ.get(primary)
+    if value is None and fallback:
+        value = os.environ.get(fallback)
+    return Path(value).expanduser() if value else default
+
+
+def env_text_value(primary: str, fallback: str | None, default: str) -> str:
+    value = os.environ.get(primary)
+    if value is None and fallback:
+        value = os.environ.get(fallback)
+    return value if value is not None else default
+
+
+def default_agentin_name(agent: str) -> str:
+    if agent in DEFAULT_AGENTIN_NAMES:
+        return DEFAULT_AGENTIN_NAMES[agent]
+    try:
+        index = int(agent[1:])
+    except (ValueError, IndexError):
+        return "Arbeitsbiene"
+    base = DEFAULT_AGENTIN_BASE_NAMES[(index - 1) % len(DEFAULT_AGENTIN_BASE_NAMES)]
+    return f"{base} {agent.upper()}"
+
+
+def build_agent_config(agent: str) -> dict[str, Any]:
+    key = agent_env_key(agent)
+    legacy_key = legacy_agent_env_key(agent)
+    home_default = AGENT_POOL_ROOT / agent
+    home = env_path_value(
+        f"CODEX_AGENT_{key}_HOME",
+        f"CODEX_AGENT_{legacy_key}_HOME" if legacy_key else None,
+        home_default,
+    )
+    runner = env_path_value(
+        f"CODEX_AGENT_{key}_RUNNER",
+        f"CODEX_AGENT_{legacy_key}_RUNNER" if legacy_key else None,
+        home / "codex",
+    )
+    session = env_text_value(
+        f"CODEX_AGENT_{key}_SESSION",
+        f"CODEX_AGENT_{legacy_key}_SESSION" if legacy_key else None,
+        f"codex_agent_{agent}_mcp",
+    )
+    return {
+        "label": f"Codex Agentin {agent.upper()}",
+        "runner": runner,
+        "home": home,
+        "session": session,
+    }
+
+
+AGENTS = {agent: build_agent_config(agent) for agent in AGENT_IDS}
 
 
 ANSI_RE = re.compile(
@@ -562,12 +650,37 @@ def assert_install_context_allows_master_registration() -> None:
         raise AgentError("refusing to register Master MCP inside a managed Agentin home")
 
 
+def canonical_agent_id(agent: str) -> str:
+    if agent in AGENTS:
+        return agent
+    if agent in LEGACY_AGENT_ALIASES:
+        return LEGACY_AGENT_ALIASES[agent]
+    raise AgentError(
+        f"unknown agent: {agent!r}; expected a concrete id like a1, b1, c1 or a selector like both/all/a-series"
+    )
+
+
+def agent_record_aliases(agent: str) -> set[str]:
+    aliases = {agent}
+    aliases.update(alias for alias, target in LEGACY_AGENT_ALIASES.items() if target == agent)
+    return aliases
+
+
 def agent_ids(agent: str) -> list[str]:
-    if agent in ("all", "both"):
-        return ["a", "b"]
-    if agent not in AGENTS:
-        raise AgentError(f"unknown agent: {agent!r}; expected a, b, both, or all")
-    return [agent]
+    if agent == "all":
+        return list(AGENTS)
+    if agent == "both":
+        return [canonical_agent_id("a"), canonical_agent_id("b")]
+    if agent in SERIES_AGENT_IDS:
+        return [item for item in SERIES_AGENT_IDS[agent] if item in AGENTS]
+    return [canonical_agent_id(agent)]
+
+
+def single_agent_id(agent: str, tool_name: str) -> str:
+    selected = agent_ids(agent)
+    if len(selected) != 1:
+        raise AgentError(f"{tool_name} requires exactly one concrete Agentin")
+    return selected[0]
 
 
 def timeout_output_text(value: Any) -> str:
@@ -928,13 +1041,15 @@ def resolve_path_no_throw(path: Path) -> Path | None:
 
 
 def read_meta(agent: str) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     path = meta_path(agent)
     if not path_present_no_follow(path):
-        legacy_path = LEGACY_META_DIR / f"{agent}.json"
-        if legacy_path != path and path_present_no_follow(legacy_path):
-            data = read_json_file(legacy_path)
-            data.setdefault("meta_source", "legacy")
-            return data
+        for legacy_agent in sorted(agent_record_aliases(agent) - {agent}):
+            for legacy_path in (META_DIR / f"{legacy_agent}.json", LEGACY_META_DIR / f"{legacy_agent}.json"):
+                if legacy_path != path and path_present_no_follow(legacy_path):
+                    data = read_json_file(legacy_path)
+                    data.setdefault("meta_source", "legacy")
+                    return data
         return {}
     return read_json_file(path)
 
@@ -947,6 +1062,7 @@ def public_agent_meta(meta: dict[str, Any]) -> dict[str, Any]:
 
 
 def write_meta(agent: str, data: dict[str, Any]) -> None:
+    agent = canonical_agent_id(agent)
     path = meta_path(agent)
     replace_private_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
@@ -1073,8 +1189,7 @@ def open_private_regular_update(path: Path) -> Any:
 
 @contextlib.contextmanager
 def agent_lifecycle_lock(agent: str) -> Any:
-    if agent not in {"a", "b"}:
-        raise AgentError("agent must be a or b")
+    agent = canonical_agent_id(agent)
     ensure_private_dir(STATE_ROOT)
     ensure_private_dir(LOCK_DIR)
     lock_path = LOCK_DIR / f"agent-{agent}.lock"
@@ -1092,8 +1207,7 @@ def agent_lifecycle_lock(agent: str) -> Any:
 
 
 def agent_lease_path(agent: str) -> Path:
-    if agent not in {"a", "b"}:
-        raise AgentError("agent must be a or b")
+    agent = canonical_agent_id(agent)
     return LEASE_DIR / f"{agent}.json"
 
 
@@ -1201,18 +1315,24 @@ def age_seconds_from_utc(value: Any, *, now: float | None = None) -> int | None:
 
 
 def read_agent_lease_record(agent: str) -> dict[str, Any] | None:
-    path = agent_lease_path(agent)
-    if not path_present_no_follow(path):
-        return None
-    data = read_json_file(path)
-    if data.get("meta_error"):
-        raise AgentError("could_not_read_agent_lease")
-    if data.get("agent") != agent or not isinstance(data.get("owner"), str):
-        raise AgentError("could_not_read_agent_lease")
-    return data
+    agent = canonical_agent_id(agent)
+    candidate_paths = [agent_lease_path(agent)]
+    candidate_paths.extend(LEASE_DIR / f"{legacy_agent}.json" for legacy_agent in sorted(agent_record_aliases(agent) - {agent}))
+    for path in candidate_paths:
+        if not path_present_no_follow(path):
+            continue
+        data = read_json_file(path)
+        if data.get("meta_error"):
+            raise AgentError("could_not_read_agent_lease")
+        if data.get("agent") not in agent_record_aliases(agent) or not isinstance(data.get("owner"), str):
+            raise AgentError("could_not_read_agent_lease")
+        data["agent"] = agent
+        return data
+    return None
 
 
 def public_agent_lease(agent: str, record: dict[str, Any] | None = None) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     now = time.time()
     if not record:
         return {
@@ -1267,6 +1387,7 @@ def stopped_foreign_lease_recovery_status(
     *,
     stopped_grace_seconds: int,
 ) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     status = status_agent(agent)
     raw_idle = status.get("raw_log_idle_seconds")
     home_process_count = status.get("home_process_count")
@@ -1309,6 +1430,7 @@ def stopped_foreign_lease_recovery_status(
 
 
 def agent_lease_status(agent: str) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     ensure_state()
     try:
         return public_agent_lease(agent, read_agent_lease_record(agent))
@@ -1326,6 +1448,7 @@ def agent_lease_status(agent: str) -> dict[str, Any]:
 
 
 def write_agent_lease(agent: str, ttl_seconds: int) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     now = time.time()
     expires_at = now + ttl_seconds
     record = {
@@ -1342,7 +1465,16 @@ def write_agent_lease(agent: str, ttl_seconds: int) -> dict[str, Any]:
 
 
 def remove_agent_lease(agent: str) -> bool:
-    path = agent_lease_path(agent)
+    agent = canonical_agent_id(agent)
+    removed = False
+    paths = [agent_lease_path(agent)]
+    paths.extend(LEASE_DIR / f"{legacy_agent}.json" for legacy_agent in sorted(agent_record_aliases(agent) - {agent}))
+    for path in paths:
+        removed = remove_agent_lease_path(path) or removed
+    return removed
+
+
+def remove_agent_lease_path(path: Path) -> bool:
     try:
         current = path.lstat()
     except FileNotFoundError:
@@ -1365,6 +1497,7 @@ def claim_agent(
     recover_stopped: bool = False,
     stopped_grace_seconds: int = DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
 ) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     ensure_state()
     ttl_seconds = normalize_lease_seconds(ttl_seconds)
     stopped_grace_seconds = normalize_stopped_lease_recovery_grace_seconds(stopped_grace_seconds)
@@ -1404,6 +1537,7 @@ def claim_agent(
 
 
 def release_agent(agent: str, force: bool = False) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     ensure_state()
     current = read_agent_lease_record(agent)
     current_public = public_agent_lease(agent, current)
@@ -1430,11 +1564,13 @@ def release_agent(agent: str, force: bool = False) -> dict[str, Any]:
 
 
 def claim_for_agent_mutation(agent: str) -> tuple[dict[str, Any], bool]:
+    agent = canonical_agent_id(agent)
     claim = claim_agent(agent)
     return claim["lease"], claim["status"] in {"claimed", "claimed_expired"}
 
 
 def ensure_agent_lease_available(agent: str, *, force: bool = False) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     current = read_agent_lease_record(agent)
     current_public = public_agent_lease(agent, current)
     if current_public["state"] == "held" and not current_public["held_by_this_server"] and not force:
@@ -1451,6 +1587,7 @@ def claim_agent_with_wait(
     recover_stopped: bool = True,
     stopped_grace_seconds: int = DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
 ) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     wait_seconds = normalize_claim_wait_seconds(wait_seconds)
     poll_interval_seconds = normalize_poll_interval_seconds(poll_interval_seconds)
     stopped_grace_seconds = normalize_stopped_lease_recovery_grace_seconds(stopped_grace_seconds)
@@ -1751,7 +1888,7 @@ def read_proc_cmdline(pid_dir: Path) -> list[str]:
 def same_path_text(left: str, right: Path) -> bool:
     try:
         return Path(left).expanduser().resolve(strict=False) == right.expanduser().resolve(strict=False)
-    except OSError:
+    except (OSError, RuntimeError):
         return False
 
 
@@ -1770,12 +1907,17 @@ def public_config_path_state(path: Any) -> str:
 
 
 def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[dict[str, Any]]:
+    agent = canonical_agent_id(agent)
     cfg = AGENTS[agent]
     home = cfg["home"]
     processes: list[dict[str, Any]] = []
     if not proc_root.exists():
         return processes
-    for pid_dir in proc_root.iterdir():
+    try:
+        pid_dirs = list(proc_root.iterdir())
+    except OSError:
+        return processes
+    for pid_dir in pid_dirs:
         if not pid_dir.name.isdigit():
             continue
         env = read_proc_environ(pid_dir)
@@ -1785,9 +1927,13 @@ def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[di
         managed = env.get("CODEX_AGENT_MCP") == "1" or env.get("CODEX_MASTER_MCP") == "1"
         ppid_parts = status.get("PPid", "0").split()
         ppid = int(ppid_parts[0]) if ppid_parts and ppid_parts[0].isdigit() else None
+        try:
+            pid = int(pid_dir.name)
+        except ValueError:
+            continue
         processes.append(
             {
-                "pid": int(pid_dir.name),
+                "pid": pid,
                 "ppid": ppid,
                 "name": status.get("Name") or "unknown",
                 "state": status.get("State") or "unknown",
@@ -1799,6 +1945,7 @@ def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[di
 
 
 def agent_home_process_summary(agent: str, proc_root: Path = Path("/proc")) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     processes = agent_home_processes(agent, proc_root)
     external = [item for item in processes if not item["managed_by_masterjet"]]
     return {
@@ -1842,6 +1989,25 @@ def agent_identity_guard(running: bool, process_summary: dict[str, Any]) -> dict
     }
 
 
+def empty_codex_process_summary(home_kind_counts: dict[str, int]) -> dict[str, Any]:
+    return {
+        "codex_client_process_count": 0,
+        "mcp_server_process_count": 0,
+        "home_kind_counts": home_kind_counts,
+        "namespace_visibility": {
+            "main_default_home_clients": 0,
+            "custom_home_clients": 0,
+            "managed_agent_home_clients": 0,
+            "unknown_home_clients": 0,
+            "custom_home_clients_need_own_mcp_config": False,
+            "managed_agent_home_clients_expect_no_master_mcp": False,
+            "unknown_home_clients_need_manual_check": False,
+            "raw_output": "not_returned",
+        },
+        "raw_output": "not_returned",
+    }
+
+
 def codex_related_process_summary(proc_root: Path = Path("/proc")) -> dict[str, Any]:
     home_kind_counts = {
         "main_default_home": 0,
@@ -1852,24 +2018,14 @@ def codex_related_process_summary(proc_root: Path = Path("/proc")) -> dict[str, 
     client_count = 0
     mcp_server_count = 0
     if not proc_root.exists():
-        return {
-            "codex_client_process_count": 0,
-            "mcp_server_process_count": 0,
-            "home_kind_counts": home_kind_counts,
-            "namespace_visibility": {
-                "main_default_home_clients": 0,
-                "custom_home_clients": 0,
-                "managed_agent_home_clients": 0,
-                "unknown_home_clients": 0,
-                "custom_home_clients_need_own_mcp_config": False,
-                "managed_agent_home_clients_expect_no_master_mcp": False,
-                "unknown_home_clients_need_manual_check": False,
-                "raw_output": "not_returned",
-            },
-            "raw_output": "not_returned",
-        }
+        return empty_codex_process_summary(home_kind_counts)
 
-    for pid_dir in proc_root.iterdir():
+    try:
+        pid_dirs = list(proc_root.iterdir())
+    except OSError:
+        return empty_codex_process_summary(home_kind_counts)
+
+    for pid_dir in pid_dirs:
         if not pid_dir.name.isdigit():
             continue
         status = read_proc_status(pid_dir)
@@ -1942,6 +2098,7 @@ def start_agent(
     lease: dict[str, Any] | None = None,
     release_lease_on_failure: bool = False,
 ) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     ensure_state()
     cfg = AGENTS[agent]
     runner = cfg["runner"]
@@ -2047,6 +2204,7 @@ def start_agent(
 
 
 def start_agent_with_lease(agent: str, cwd: Any = None, prompt: Any = None) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     if tmux_alive(AGENTS[agent]["session"]):
         ensure_agent_lease_available(agent)
         return start_agent(agent, cwd, prompt)
@@ -2072,6 +2230,7 @@ def start_agent_with_lease(agent: str, cwd: Any = None, prompt: Any = None) -> d
 
 
 def stop_agent(agent: str, force: bool = False) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     cfg = AGENTS[agent]
     session = cfg["session"]
     was_running = tmux_alive(session)
@@ -2094,11 +2253,13 @@ def stop_agent(agent: str, force: bool = False) -> dict[str, Any]:
 
 
 def require_running_agent(agent: str) -> None:
+    agent = canonical_agent_id(agent)
     if not tmux_alive(AGENTS[agent]["session"]):
         raise AgentError(f"agent {agent} is not running")
 
 
 def run_with_agent_lease(agent: str, fn: Any) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     lease, release_on_failure = claim_for_agent_mutation(agent)
     try:
         return fn(lease)
@@ -2367,8 +2528,7 @@ def wait_terminal_status(status: dict[str, Any], initial: dict[str, Any]) -> str
 
 
 def wait_agent(agent: str, timeout_seconds: int = DEFAULT_WAIT_SECONDS, poll_interval_seconds: int = DEFAULT_WAIT_POLL_SECONDS) -> dict[str, Any]:
-    if agent not in {"a", "b"}:
-        raise AgentError("agent must be a or b")
+    agent = canonical_agent_id(agent)
     timeout_seconds = normalize_int_field(
         timeout_seconds,
         field="timeout_seconds",
@@ -2405,6 +2565,7 @@ def wait_agent(agent: str, timeout_seconds: int = DEFAULT_WAIT_SECONDS, poll_int
 
 
 def status_agent(agent: str) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     ensure_state()
     cfg = AGENTS[agent]
     session = cfg["session"]
@@ -2801,6 +2962,7 @@ def skills_agent(
     plugins_offset: int = 0,
     plugins_limit: int = MAX_CAPABILITY_PLUGINS,
 ) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     cfg = AGENTS[agent]
     home = cfg["home"]
     limit = normalize_int_field(limit, field="limit", minimum=0, maximum=MAX_SKILL_NAMES)
@@ -2937,6 +3099,7 @@ def as_string_list(
 
 
 def skill_matches(agent: str, skill_ref: str, limit: int = 8) -> list[dict[str, str]]:
+    agent = canonical_agent_id(agent)
     cfg = AGENTS[agent]
     home = cfg["home"]
     wanted = skill_ref.strip().lower()
@@ -2970,6 +3133,7 @@ def skill_matches(agent: str, skill_ref: str, limit: int = 8) -> list[dict[str, 
 
 
 def skill_match_agent(agent: str, skill_ref: Any, limit: int = 8) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     skill_ref = bounded_text(skill_ref, field="skill", max_chars=MAX_SKILL_REF, required=True) or ""
     limit = normalize_int_field(limit, field="limit", minimum=1, maximum=MAX_SKILL_NAMES)
     matches = skill_matches(agent, skill_ref, limit)
@@ -2984,7 +3148,9 @@ def skill_match_agent(agent: str, skill_ref: Any, limit: int = 8) -> dict[str, A
         "raw_output": "not_returned",
     }
 
+
 def capabilities_agent(agent: str) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     inventory = skills_agent(agent, include_names=False)
     return {
         "agent": agent,
@@ -3075,7 +3241,7 @@ def assignment_prompt(
     name: str | None,
     allow_subagents: bool,
 ) -> str:
-    display_name = (name or DEFAULT_AGENTIN_NAMES.get(agent) or "Arbeitsbiene").strip()
+    display_name = (name or default_agentin_name(agent)).strip()
     skill_line = skill.strip() if skill else "kein spezieller Skill vorgegeben"
     model = assignment_model(role)
 
@@ -3137,6 +3303,7 @@ def assign_agent(
     allow_subagents: bool = False,
     lease: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     role = role.strip().lower()
     if role not in {"exploriererin", "arbeitsbiene"}:
         raise AgentError("role must be 'exploriererin' or 'arbeitsbiene'")
@@ -3193,7 +3360,7 @@ def assign_agent(
             "created_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "agent": agent,
             "role": role,
-            "name": name or DEFAULT_AGENTIN_NAMES.get(agent),
+            "name": name or default_agentin_name(agent),
             "model": model,
             "skill": {
                 "requested": skill,
@@ -3224,7 +3391,7 @@ def assign_agent(
         "agent": agent,
         "status": "assigned",
         "role": role,
-        "name": name or DEFAULT_AGENTIN_NAMES.get(agent),
+        "name": name or default_agentin_name(agent),
         "model": model,
         "skill": {"requested": skill, "available": bool(matches) if skill else None, "matches": matches[:5]},
         "scope_count": len(scope),
@@ -3303,8 +3470,10 @@ def prune_assignment_log(max_records: int | None = None) -> None:
 
 def list_assignments(agent: str = "all", limit: int = 20) -> dict[str, Any]:
     ensure_state()
-    if agent not in {"a", "b", "all"}:
-        raise AgentError("agent must be a, b, or all")
+    selected = agent_ids(agent)
+    selected_records = set(selected)
+    for selected_agent in selected:
+        selected_records.update(agent_record_aliases(selected_agent))
     limit = normalize_int_field(limit, field="limit", minimum=1, maximum=MAX_ASSIGNMENT_RECORDS)
     records: list[dict[str, Any]] = []
     if ASSIGNMENT_LOG.exists():
@@ -3317,10 +3486,11 @@ def list_assignments(agent: str = "all", limit: int = 20) -> dict[str, Any]:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if agent == "all" or record.get("agent") == agent:
+            if record.get("agent") in selected_records:
                 records.append(sanitize_assignment_record(record))
     return {
         "agent": agent,
+        "selected_count": len(selected),
         "limit": limit,
         "records": records[-limit:],
         "record_count": len(records[-limit:]),
@@ -3403,8 +3573,7 @@ def repo_relative_public_path(path: Path, repo: Path) -> str | None:
 
 
 def worktree_create_for_agent(agent: str, path: Any = None, base_ref: Any = None) -> dict[str, Any]:
-    if agent not in {"a", "b"}:
-        raise AgentError("agent must be a or b")
+    agent = canonical_agent_id(agent)
     path = bounded_text(path, field="path", max_chars=MAX_PATH_TEXT) if path is not None else None
     base_ref = bounded_text(base_ref, field="base_ref", max_chars=MAX_PATH_TEXT) if base_ref is not None else None
     repo = repo_root().resolve(strict=False)
@@ -5118,6 +5287,7 @@ def uninstall(unregister: bool = True, remove_symlink: bool = False, install_pat
 
 
 def send_agent(agent: str, text: str, enter: bool = True) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     text = bounded_text(text, field="text", max_chars=MAX_SEND_TEXT, required=True, strip=False) or ""
     cfg = AGENTS[agent]
     session = cfg["session"]
@@ -5147,6 +5317,7 @@ def send_agent(agent: str, text: str, enter: bool = True) -> dict[str, Any]:
 
 
 def interrupt_agent(agent: str, force: bool = False) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     cfg = AGENTS[agent]
     session = cfg["session"]
     if not tmux_alive(session):
@@ -5242,6 +5413,7 @@ def read_log_tail(path: Path, approx_bytes: int) -> str:
 
 
 def pane_tail(agent: str, lines: int) -> str:
+    agent = canonical_agent_id(agent)
     cfg = AGENTS[agent]
     session = cfg["session"]
     if not tmux_alive(session):
@@ -5253,6 +5425,7 @@ def pane_tail(agent: str, lines: int) -> str:
 
 
 def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pane") -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     ensure_state()
     lines = normalize_int_field(lines, field="lines", minimum=1, maximum=MAX_TAIL_LINES)
     chars = normalize_int_field(chars, field="chars", minimum=1, maximum=MAX_TAIL_CHARS)
@@ -5320,11 +5493,9 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         selected = agent_ids(str(args.get("agent", "all")))
         return multi_agent_result(selected, status_agent)
     if name == "agent_wait":
-        selected = agent_ids(str(args.get("agent", "")))
-        if len(selected) != 1:
-            raise AgentError("agent_wait requires exactly one agent: a or b")
+        selected_agent = single_agent_id(str(args.get("agent", "")), "agent_wait")
         return wait_agent(
-            selected[0],
+            selected_agent,
             int_arg(args, "timeout_seconds", DEFAULT_WAIT_SECONDS),
             int_arg(args, "poll_interval_seconds", DEFAULT_WAIT_POLL_SECONDS),
         )
@@ -5366,13 +5537,11 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             args.get("cwd"),
         )
     if name == "agent_assign":
-        selected = agent_ids(str(args.get("agent", "")))
-        if len(selected) != 1:
-            raise AgentError("agent_assign requires exactly one agent: a or b")
+        selected_agent = single_agent_id(str(args.get("agent", "")), "agent_assign")
         return call_agent_lifecycle(
-            selected[0],
+            selected_agent,
             lambda: assign_agent(
-                selected[0],
+                selected_agent,
                 role=str(args.get("role", "")),
                 task=args.get("task"),
                 scope=args.get("scope"),
@@ -5387,13 +5556,11 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             ),
         )
     if name == "agent_assign_readonly":
-        selected = agent_ids(str(args.get("agent", "")))
-        if len(selected) != 1:
-            raise AgentError("agent_assign_readonly requires exactly one agent: a or b")
+        selected_agent = single_agent_id(str(args.get("agent", "")), "agent_assign_readonly")
         return call_agent_lifecycle(
-            selected[0],
+            selected_agent,
             lambda: assign_agent(
-                selected[0],
+                selected_agent,
                 role="exploriererin",
                 task=args.get("task"),
                 scope=args.get("scope"),
@@ -5407,13 +5574,11 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             ),
         )
     if name == "agent_assign_write":
-        selected = agent_ids(str(args.get("agent", "")))
-        if len(selected) != 1:
-            raise AgentError("agent_assign_write requires exactly one agent: a or b")
+        selected_agent = single_agent_id(str(args.get("agent", "")), "agent_assign_write")
         return call_agent_lifecycle(
-            selected[0],
+            selected_agent,
             lambda: assign_agent(
-                selected[0],
+                selected_agent,
                 role="arbeitsbiene",
                 task=args.get("task"),
                 scope=args.get("scope"),
@@ -5430,20 +5595,16 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "agent_assignments":
         return list_assignments(str(args.get("agent", "all")), int_arg(args, "limit", 20))
     if name == "agent_last_assignment_status":
-        selected = agent_ids(str(args.get("agent", "")))
-        if len(selected) != 1:
-            raise AgentError("agent_last_assignment_status requires exactly one agent: a or b")
-        return last_assignment_status(selected[0])
+        selected_agent = single_agent_id(str(args.get("agent", "")), "agent_last_assignment_status")
+        return last_assignment_status(selected_agent)
     if name == "agent_report_request":
-        selected = agent_ids(str(args.get("agent", "")))
-        if len(selected) != 1:
-            raise AgentError("agent_report_request requires exactly one agent: a or b")
+        selected_agent = single_agent_id(str(args.get("agent", "")), "agent_report_request")
         return call_agent_lifecycle(
-            selected[0],
+            selected_agent,
             lambda: run_with_agent_lease(
-                selected[0],
+                selected_agent,
                 lambda lease: request_agent_report(
-                    selected[0],
+                    selected_agent,
                     args.get("assignment_id"),
                     bool_arg(args, "enter", True),
                     lease=lease,
@@ -5451,11 +5612,9 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             ),
         )
     if name == "worktree_create_for_agent":
-        selected = agent_ids(str(args.get("agent", "")))
-        if len(selected) != 1:
-            raise AgentError("worktree_create_for_agent requires exactly one agent: a or b")
+        selected_agent = single_agent_id(str(args.get("agent", "")), "worktree_create_for_agent")
         return worktree_create_for_agent(
-            selected[0],
+            selected_agent,
             args.get("path"),
             args.get("base_ref"),
         )
@@ -5480,38 +5639,32 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "agent_doctor":
         return doctor()
     if name == "agent_send":
-        selected = agent_ids(str(args.get("agent", "")))
-        if len(selected) != 1:
-            raise AgentError("agent_send requires exactly one agent: a or b")
+        selected_agent = single_agent_id(str(args.get("agent", "")), "agent_send")
         text = args.get("text")
         if not isinstance(text, str) or text == "":
             raise AgentError("agent_send requires non-empty text")
         return call_agent_lifecycle(
-            selected[0],
+            selected_agent,
             lambda: run_with_agent_lease(
-                selected[0],
+                selected_agent,
                 lambda lease: {
-                    **send_agent(selected[0], text, bool_arg(args, "enter", True)),
+                    **send_agent(selected_agent, text, bool_arg(args, "enter", True)),
                     "lease": lease,
                 },
             ),
         )
     if name == "agent_interrupt":
-        selected = agent_ids(str(args.get("agent", "")))
-        if len(selected) != 1:
-            raise AgentError("agent_interrupt requires exactly one agent: a or b")
+        selected_agent = single_agent_id(str(args.get("agent", "")), "agent_interrupt")
         return call_agent_lifecycle(
-            selected[0],
-            lambda: interrupt_agent(selected[0], bool_arg(args, "force", False)),
+            selected_agent,
+            lambda: interrupt_agent(selected_agent, bool_arg(args, "force", False)),
         )
     if name == "agent_claim":
-        selected = agent_ids(str(args.get("agent", "")))
-        if len(selected) != 1:
-            raise AgentError("agent_claim requires exactly one agent: a or b")
+        selected_agent = single_agent_id(str(args.get("agent", "")), "agent_claim")
         wait_forever = bool_arg(args, "wait_forever", "wait_seconds" not in args and DEFAULT_CLAIM_WAIT_FOREVER)
         wait_seconds: int | str | None = None if wait_forever else int_arg(args, "wait_seconds", 0)
         return claim_agent_with_wait(
-            selected[0],
+            selected_agent,
             int_arg(args, "ttl_seconds", DEFAULT_AGENT_LEASE_SECONDS),
             bool_arg(args, "force", False),
             wait_seconds,
@@ -5520,19 +5673,15 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             int_arg(args, "stopped_grace_seconds", DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS),
         )
     if name == "agent_release":
-        selected = agent_ids(str(args.get("agent", "")))
-        if len(selected) != 1:
-            raise AgentError("agent_release requires exactly one agent: a or b")
-        return call_agent_lifecycle(selected[0], lambda: release_agent(selected[0], bool_arg(args, "force", False)))
+        selected_agent = single_agent_id(str(args.get("agent", "")), "agent_release")
+        return call_agent_lifecycle(selected_agent, lambda: release_agent(selected_agent, bool_arg(args, "force", False)))
     if name == "agent_lease_status":
         selected = agent_ids(str(args.get("agent", "all")))
         return multi_agent_result(selected, agent_lease_status)
     if name == "agent_safe_tail":
-        selected = agent_ids(str(args.get("agent", "")))
-        if len(selected) != 1:
-            raise AgentError("agent_safe_tail requires exactly one agent: a or b")
+        selected_agent = single_agent_id(str(args.get("agent", "")), "agent_safe_tail")
         return safe_tail(
-            selected[0],
+            selected_agent,
             int_arg(args, "lines", 40),
             int_arg(args, "chars", 4000),
             str(args.get("source", "pane")),
@@ -5560,6 +5709,18 @@ def text_schema(max_chars: int, **extra: Any) -> dict[str, Any]:
     return schema
 
 
+def agent_selector_schema(*, default: str | None = None, single: bool = False) -> dict[str, Any]:
+    description = (
+        "Concrete Agentin id or legacy alias: a1..a100, b1..b100, c1..c100, a, b."
+        if single
+        else AGENT_SELECTOR_DESCRIPTION
+    )
+    schema = text_schema(32, description=description)
+    if default is not None:
+        schema["default"] = default
+    return schema
+
+
 def text_array_schema(
     *,
     max_items: int = MAX_ASSIGNMENT_LIST_ITEMS,
@@ -5582,11 +5743,11 @@ def text_array_schema(
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "agent_start",
-        "description": "Start Codex Agentin A, B, or both in persistent tmux sessions with gpt-5.4-mini, --yolo -s danger-full-access --search. Does not return raw output.",
+        "description": "Start selected Codex Agentinnen in persistent tmux sessions with gpt-5.4-mini, --yolo -s danger-full-access --search. Does not return raw output.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "agent": {"type": "string", "enum": ["a", "b", "both"], "default": "both"},
+                "agent": agent_selector_schema(default="both"),
                 "cwd": text_schema(MAX_PATH_TEXT, description="Working directory. Defaults to the MCP server cwd."),
                 "prompt": text_schema(MAX_SEND_TEXT, description="Optional initial prompt passed to Codex."),
             },
@@ -5595,10 +5756,10 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "agent_status",
-        "description": "Return structured status for Codex Agentin A, B, or all Agentinnen, including data-sparse response and limit classification. Does not return raw output.",
+        "description": "Return structured status for selected Codex Agentinnen, including data-sparse response and limit classification. Does not return raw output.",
         "inputSchema": {
             "type": "object",
-            "properties": {"agent": {"type": "string", "enum": ["a", "b", "all"], "default": "all"}},
+            "properties": {"agent": agent_selector_schema(default="all")},
             "additionalProperties": False,
         },
     },
@@ -5607,7 +5768,7 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Return data-sparse per-Agentin lease state for multi-client collision avoidance.",
         "inputSchema": {
             "type": "object",
-            "properties": {"agent": {"type": "string", "enum": ["a", "b", "all"], "default": "all"}},
+            "properties": {"agent": agent_selector_schema(default="all")},
             "additionalProperties": False,
         },
     },
@@ -5618,7 +5779,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "required": ["agent"],
             "properties": {
-                "agent": {"type": "string", "enum": ["a", "b"]},
+                "agent": agent_selector_schema(single=True),
                 "ttl_seconds": {
                     "type": "integer",
                     "minimum": 1,
@@ -5661,7 +5822,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "required": ["agent"],
             "properties": {
-                "agent": {"type": "string", "enum": ["a", "b"]},
+                "agent": agent_selector_schema(single=True),
                 "force": {"type": "boolean", "default": False},
             },
             "additionalProperties": False,
@@ -5674,7 +5835,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "required": ["agent"],
             "properties": {
-                "agent": {"type": "string", "enum": ["a", "b"]},
+                "agent": agent_selector_schema(single=True),
                 "timeout_seconds": {
                     "type": "integer",
                     "minimum": 0,
@@ -5697,7 +5858,7 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "agent": {"type": "string", "enum": ["a", "b", "all"], "default": "all"},
+                "agent": agent_selector_schema(default="all"),
                 "idle_seconds": {
                     "type": "integer",
                     "minimum": 1,
@@ -5731,7 +5892,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "required": ["agent", "text"],
             "properties": {
-                "agent": {"type": "string", "enum": ["a", "b"]},
+                "agent": agent_selector_schema(single=True),
                 "text": text_schema(MAX_SEND_TEXT),
                 "enter": {"type": "boolean", "default": True},
             },
@@ -5745,7 +5906,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "required": ["agent"],
             "properties": {
-                "agent": {"type": "string", "enum": ["a", "b"]},
+                "agent": agent_selector_schema(single=True),
                 "force": {"type": "boolean", "default": False},
             },
             "additionalProperties": False,
@@ -5753,11 +5914,11 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "agent_stop",
-        "description": "Stop Codex Agentin A, B, or both by killing the managed tmux session.",
+        "description": "Stop selected Codex Agentinnen by killing managed tmux sessions.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "agent": {"type": "string", "enum": ["a", "b", "both"], "default": "both"},
+                "agent": agent_selector_schema(default="both"),
                 "force": {"type": "boolean", "default": False},
             },
             "additionalProperties": False,
@@ -5770,7 +5931,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "required": ["agent"],
             "properties": {
-                "agent": {"type": "string", "enum": ["a", "b"]},
+                "agent": agent_selector_schema(single=True),
                 "source": {"type": "string", "enum": ["pane", "log"], "default": "pane"},
                 "lines": {"type": "integer", "minimum": 1, "maximum": MAX_TAIL_LINES, "default": 40},
                 "chars": {"type": "integer", "minimum": 1, "maximum": MAX_TAIL_CHARS, "default": 4000},
@@ -5784,7 +5945,7 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "agent": {"type": "string", "enum": ["a", "b", "all"], "default": "all"},
+                "agent": agent_selector_schema(default="all"),
                 "include_names": {"type": "boolean", "default": False},
                 "limit": {"type": "integer", "minimum": 0, "maximum": MAX_SKILL_NAMES, "default": 80},
                 "names_offset": {"type": "integer", "minimum": 0, "default": 0},
@@ -5806,7 +5967,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "required": ["skill"],
             "properties": {
-                "agent": {"type": "string", "enum": ["a", "b", "all"], "default": "all"},
+                "agent": agent_selector_schema(default="all"),
                 "skill": text_schema(MAX_SKILL_REF),
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_SKILL_NAMES, "default": 8},
             },
@@ -5818,7 +5979,7 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Return data-sparse capability summaries for one or all Agentinnen.",
         "inputSchema": {
             "type": "object",
-            "properties": {"agent": {"type": "string", "enum": ["a", "b", "all"], "default": "all"}},
+            "properties": {"agent": agent_selector_schema(default="all")},
             "additionalProperties": False,
         },
     },
@@ -5842,7 +6003,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "required": ["agent", "role", "task"],
             "properties": {
-                "agent": {"type": "string", "enum": ["a", "b"]},
+                "agent": agent_selector_schema(single=True),
                 "role": {"type": "string", "enum": ["exploriererin", "arbeitsbiene"]},
                 "task": text_schema(MAX_TASK_TEXT),
                 "skill": text_schema(MAX_SKILL_REF),
@@ -5865,7 +6026,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "required": ["agent", "task"],
             "properties": {
-                "agent": {"type": "string", "enum": ["a", "b"]},
+                "agent": agent_selector_schema(single=True),
                 "task": text_schema(MAX_TASK_TEXT),
                 "skill": text_schema(MAX_SKILL_REF),
                 "scope": text_array_schema(max_chars=MAX_PATH_TEXT, default=[]),
@@ -5886,7 +6047,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "required": ["agent", "task", "write_paths"],
             "properties": {
-                "agent": {"type": "string", "enum": ["a", "b"]},
+                "agent": agent_selector_schema(single=True),
                 "task": text_schema(MAX_TASK_TEXT),
                 "skill": text_schema(MAX_SKILL_REF),
                 "scope": text_array_schema(max_chars=MAX_PATH_TEXT, default=[]),
@@ -5907,7 +6068,7 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "agent": {"type": "string", "enum": ["a", "b", "all"], "default": "all"},
+                "agent": agent_selector_schema(default="all"),
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_ASSIGNMENT_RECORDS, "default": 20},
             },
             "additionalProperties": False,
@@ -5919,7 +6080,7 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "required": ["agent"],
-            "properties": {"agent": {"type": "string", "enum": ["a", "b"]}},
+            "properties": {"agent": agent_selector_schema(single=True)},
             "additionalProperties": False,
         },
     },
@@ -5930,7 +6091,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "required": ["agent"],
             "properties": {
-                "agent": {"type": "string", "enum": ["a", "b"]},
+                "agent": agent_selector_schema(single=True),
                 "assignment_id": text_schema(MAX_ASSIGNMENT_ID),
                 "enter": {"type": "boolean", "default": True},
             },
@@ -5944,7 +6105,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "required": ["agent"],
             "properties": {
-                "agent": {"type": "string", "enum": ["a", "b"]},
+                "agent": agent_selector_schema(single=True),
                 "path": text_schema(MAX_PATH_TEXT),
                 "base_ref": text_schema(MAX_PATH_TEXT),
             },
@@ -6211,24 +6372,24 @@ def print_json(payload: Any) -> int:
 
 
 def main_cli(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description="Control local Codex Agentin A/B via tmux, or run as MCP stdio server.")
+    parser = argparse.ArgumentParser(description="Control local Codex Agentinnen via tmux, or run as MCP stdio server.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_start = sub.add_parser("start")
-    p_start.add_argument("agent", choices=["a", "b", "both"], nargs="?", default="both")
+    p_start.add_argument("agent", nargs="?", default="both", help=AGENT_SELECTOR_DESCRIPTION)
     p_start.add_argument("--cwd")
     p_start.add_argument("--prompt")
 
     p_status = sub.add_parser("status")
-    p_status.add_argument("agent", choices=["a", "b", "all"], nargs="?", default="all")
+    p_status.add_argument("agent", nargs="?", default="all", help=AGENT_SELECTOR_DESCRIPTION)
 
     p_wait = sub.add_parser("wait")
-    p_wait.add_argument("agent", choices=["a", "b"])
+    p_wait.add_argument("agent", help="Concrete Agentin id or legacy alias: a1..a100, b1..b100, c1..c100, a, b.")
     p_wait.add_argument("--timeout-seconds", type=int, default=DEFAULT_WAIT_SECONDS)
     p_wait.add_argument("--poll-interval-seconds", type=int, default=DEFAULT_WAIT_POLL_SECONDS)
 
     p_watchdog = sub.add_parser("watchdog")
-    p_watchdog.add_argument("agent", choices=["a", "b", "all"], nargs="?", default="all")
+    p_watchdog.add_argument("agent", nargs="?", default="all", help=AGENT_SELECTOR_DESCRIPTION)
     p_watchdog.add_argument("--idle-seconds", type=int, default=DEFAULT_WATCHDOG_IDLE_SECONDS)
     p_watchdog.add_argument("--poll-interval-seconds", type=int, default=DEFAULT_WATCHDOG_POLL_SECONDS)
     p_watchdog.add_argument("--report-grace-seconds", type=int, default=DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS)
@@ -6239,23 +6400,23 @@ def main_cli(argv: list[str]) -> int:
     p_watchdog.add_argument("--quiet", action="store_true")
 
     p_send = sub.add_parser("send")
-    p_send.add_argument("agent", choices=["a", "b"])
+    p_send.add_argument("agent")
     p_send.add_argument("text")
     p_send.add_argument("--no-enter", action="store_true")
 
     p_interrupt = sub.add_parser("interrupt")
-    p_interrupt.add_argument("agent", choices=["a", "b"])
+    p_interrupt.add_argument("agent")
     p_interrupt.add_argument("--force", action="store_true")
 
     p_stop = sub.add_parser("stop")
-    p_stop.add_argument("agent", choices=["a", "b", "both"], nargs="?", default="both")
+    p_stop.add_argument("agent", nargs="?", default="both", help=AGENT_SELECTOR_DESCRIPTION)
     p_stop.add_argument("--force", action="store_true")
 
     p_lease_status = sub.add_parser("lease-status")
-    p_lease_status.add_argument("agent", choices=["a", "b", "all"], nargs="?", default="all")
+    p_lease_status.add_argument("agent", nargs="?", default="all", help=AGENT_SELECTOR_DESCRIPTION)
 
     p_claim = sub.add_parser("claim")
-    p_claim.add_argument("agent", choices=["a", "b"])
+    p_claim.add_argument("agent")
     p_claim.add_argument("--ttl-seconds", type=int, default=DEFAULT_AGENT_LEASE_SECONDS)
     p_claim_wait = p_claim.add_mutually_exclusive_group()
     p_claim_wait.add_argument("--wait-seconds", type=int)
@@ -6269,17 +6430,17 @@ def main_cli(argv: list[str]) -> int:
     p_claim.add_argument("--force", action="store_true")
 
     p_release = sub.add_parser("release")
-    p_release.add_argument("agent", choices=["a", "b"])
+    p_release.add_argument("agent")
     p_release.add_argument("--force", action="store_true")
 
     p_tail = sub.add_parser("tail")
-    p_tail.add_argument("agent", choices=["a", "b"])
+    p_tail.add_argument("agent")
     p_tail.add_argument("--source", choices=["pane", "log"], default="pane")
     p_tail.add_argument("--lines", type=int, default=20)
     p_tail.add_argument("--chars", type=int, default=2000)
 
     p_skills = sub.add_parser("skills")
-    p_skills.add_argument("agent", choices=["a", "b", "all"], nargs="?", default="all")
+    p_skills.add_argument("agent", nargs="?", default="all", help=AGENT_SELECTOR_DESCRIPTION)
     p_skills.add_argument("--include-names", action="store_true")
     p_skills.add_argument("--limit", type=int, default=80)
     p_skills.add_argument("--names-offset", type=int, default=0)
@@ -6287,12 +6448,12 @@ def main_cli(argv: list[str]) -> int:
     p_skills.add_argument("--plugins-limit", type=int, default=MAX_CAPABILITY_PLUGINS)
 
     p_skill_match = sub.add_parser("skill-match")
-    p_skill_match.add_argument("agent", choices=["a", "b", "all"], nargs="?", default="all")
+    p_skill_match.add_argument("agent", nargs="?", default="all", help=AGENT_SELECTOR_DESCRIPTION)
     p_skill_match.add_argument("skill")
     p_skill_match.add_argument("--limit", type=int, default=8)
 
     p_capabilities = sub.add_parser("capabilities")
-    p_capabilities.add_argument("agent", choices=["a", "b", "all"], nargs="?", default="all")
+    p_capabilities.add_argument("agent", nargs="?", default="all", help=AGENT_SELECTOR_DESCRIPTION)
 
     p_scope_check = sub.add_parser("scope-check")
     p_scope_check.add_argument("--scope", action="append", default=[])
@@ -6300,7 +6461,7 @@ def main_cli(argv: list[str]) -> int:
     p_scope_check.add_argument("--cwd")
 
     p_assign = sub.add_parser("assign")
-    p_assign.add_argument("agent", choices=["a", "b"])
+    p_assign.add_argument("agent")
     p_assign.add_argument("--role", choices=["exploriererin", "arbeitsbiene"], required=True)
     p_assign.add_argument("--task", required=True)
     p_assign.add_argument("--skill")
@@ -6314,7 +6475,7 @@ def main_cli(argv: list[str]) -> int:
     p_assign.add_argument("--allow-subagents", action="store_true")
 
     p_assign_readonly = sub.add_parser("assign-readonly")
-    p_assign_readonly.add_argument("agent", choices=["a", "b"])
+    p_assign_readonly.add_argument("agent")
     p_assign_readonly.add_argument("--task", required=True)
     p_assign_readonly.add_argument("--skill")
     p_assign_readonly.add_argument("--scope", action="append", default=[])
@@ -6326,7 +6487,7 @@ def main_cli(argv: list[str]) -> int:
     p_assign_readonly.add_argument("--allow-subagents", action="store_true")
 
     p_assign_write = sub.add_parser("assign-write")
-    p_assign_write.add_argument("agent", choices=["a", "b"])
+    p_assign_write.add_argument("agent")
     p_assign_write.add_argument("--task", required=True)
     p_assign_write.add_argument("--skill")
     p_assign_write.add_argument("--scope", action="append", default=[])
@@ -6339,19 +6500,19 @@ def main_cli(argv: list[str]) -> int:
     p_assign_write.add_argument("--allow-subagents", action="store_true")
 
     p_assignments = sub.add_parser("assignments")
-    p_assignments.add_argument("agent", choices=["a", "b", "all"], nargs="?", default="all")
+    p_assignments.add_argument("agent", nargs="?", default="all", help=AGENT_SELECTOR_DESCRIPTION)
     p_assignments.add_argument("--limit", type=int, default=20)
 
     p_last_assignment = sub.add_parser("last-assignment")
-    p_last_assignment.add_argument("agent", choices=["a", "b"])
+    p_last_assignment.add_argument("agent")
 
     p_report = sub.add_parser("report-request")
-    p_report.add_argument("agent", choices=["a", "b"])
+    p_report.add_argument("agent")
     p_report.add_argument("--assignment-id")
     p_report.add_argument("--no-enter", action="store_true")
 
     p_worktree_create = sub.add_parser("worktree-create")
-    p_worktree_create.add_argument("agent", choices=["a", "b"])
+    p_worktree_create.add_argument("agent")
     p_worktree_create.add_argument("--path")
     p_worktree_create.add_argument("--base-ref")
 

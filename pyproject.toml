@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-master"
-version = "0.6.4"
-description = "Local MCP wrapper for controlling two isolated Codex CLI instances via tmux"
+version = "0.7.0"
+description = "Local MCP wrapper for controlling a sleeping Codex Agentinnen pool via tmux"
 requires-python = ">=3.11"
 dependencies = []
 

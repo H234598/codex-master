@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 import os
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from codex_master.server import (
     AgentError,
@@ -42,6 +42,7 @@ from codex_master.server import (
     DEFAULT_WATCHDOG_POLL_SECONDS,
     DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS,
     DEFAULT_TMUX_TIMEOUT_SECONDS,
+    agent_ids,
     allowed_raw_log_path,
     append_bounded_raw_log,
     agent_lifecycle_lock,
@@ -75,6 +76,7 @@ from codex_master.server import (
     read_message,
     read_meta,
     safe_tail,
+    same_path_text,
     skills_agent,
     record_assignment,
     redact,
@@ -427,10 +429,23 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(assign_write_props["write_paths"]["minItems"], 1)
         self.assertEqual(by_name["agent_send"]["inputSchema"]["properties"]["text"]["maxLength"], MAX_SEND_TEXT)
         self.assertEqual(skill_props["limit"]["maximum"], MAX_SKILL_NAMES)
+        self.assertEqual(by_name["agent_start"]["inputSchema"]["properties"]["agent"]["default"], "both")
+        self.assertEqual(by_name["agent_status"]["inputSchema"]["properties"]["agent"]["default"], "all")
+        self.assertEqual(by_name["agent_start"]["inputSchema"]["properties"]["agent"]["maxLength"], 32)
+        self.assertNotIn("enum", by_name["agent_start"]["inputSchema"]["properties"]["agent"])
         self.assertEqual(skill_props["names_offset"]["minimum"], 0)
         self.assertEqual(skill_props["plugins_offset"]["minimum"], 0)
         self.assertEqual(skill_props["plugins_limit"]["default"], MAX_CAPABILITY_PLUGINS)
         self.assertEqual(skill_props["plugins_limit"]["maximum"], MAX_SKILL_NAMES)
+
+    def test_agent_selectors_scale_to_series_pool_with_legacy_aliases(self) -> None:
+        self.assertEqual(agent_ids("a"), ["a1"])
+        self.assertEqual(agent_ids("b"), ["b1"])
+        self.assertEqual(agent_ids("both"), ["a1", "b1"])
+        self.assertEqual(agent_ids("a-series")[0], "a1")
+        self.assertEqual(agent_ids("a-series")[-1], "a100")
+        self.assertEqual(len(agent_ids("a-series")), 100)
+        self.assertEqual(len(agent_ids("all")), 300)
 
     def test_master_watchdog_status_reports_hardened_systemd_state_without_paths(self) -> None:
         source_root = Path(__file__).resolve().parents[1]
@@ -1194,6 +1209,20 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["namespace_visibility"]["raw_output"], "not_returned")
         self.assertNotIn(str(missing_proc), json.dumps(result, sort_keys=True))
 
+    def test_codex_related_process_summary_handles_unreadable_proc_root(self) -> None:
+        proc_root = Mock(spec=Path)
+        proc_root.exists.return_value = True
+        proc_root.iterdir.side_effect = PermissionError("denied")
+
+        result = codex_related_process_summary(proc_root)
+
+        self.assertEqual(result["codex_client_process_count"], 0)
+        self.assertEqual(result["mcp_server_process_count"], 0)
+        self.assertFalse(result["namespace_visibility"]["custom_home_clients_need_own_mcp_config"])
+        self.assertFalse(result["namespace_visibility"]["managed_agent_home_clients_expect_no_master_mcp"])
+        self.assertFalse(result["namespace_visibility"]["unknown_home_clients_need_manual_check"])
+        self.assertEqual(result["namespace_visibility"]["raw_output"], "not_returned")
+
     @patch("codex_master.server.codex_related_process_summary")
     @patch("codex_master.server.codex_home_context")
     @patch("codex_master.server.master_app_bridge_status")
@@ -1442,7 +1471,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.6.4+codex.test",
+            "version": "0.7.0+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1469,7 +1498,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.6.4")
+        self.assertEqual(result["expected_tag"], "v0.7.0")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -1744,12 +1773,12 @@ class ServerHelpersTest(unittest.TestCase):
                 "params": {"name": "agent_status", "arguments": {"agent": 1}},
             }
         )
-        bad_enum = handle_rpc(
+        overlong_agent = handle_rpc(
             {
                 "jsonrpc": "2.0",
                 "id": 38,
                 "method": "tools/call",
-                "params": {"name": "agent_status", "arguments": {"agent": "both"}},
+                "params": {"name": "agent_status", "arguments": {"agent": "x" * 33}},
             }
         )
         over_limit = handle_rpc(
@@ -1783,9 +1812,9 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(wrong_type["result"]["isError"])
         wrong_type_payload = json.loads(wrong_type["result"]["content"][0]["text"])
         self.assertEqual(wrong_type_payload["error"], "agent must be a string")
-        self.assertTrue(bad_enum["result"]["isError"])
-        bad_enum_payload = json.loads(bad_enum["result"]["content"][0]["text"])
-        self.assertEqual(bad_enum_payload["error"], "agent must be one of: a, b, all")
+        self.assertTrue(overlong_agent["result"]["isError"])
+        overlong_agent_payload = json.loads(overlong_agent["result"]["content"][0]["text"])
+        self.assertEqual(overlong_agent_payload["error"], "agent must not exceed 32 characters")
         self.assertTrue(over_limit["result"]["isError"])
         over_limit_payload = json.loads(over_limit["result"]["content"][0]["text"])
         self.assertEqual(over_limit_payload["error"], f"limit must be <= {MAX_SKILL_NAMES}")
@@ -2393,8 +2422,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(payload["action_taken"], "interrupt")
         self.assertEqual(payload["action_result"]["status"], "interrupt_sent")
         mock_report.assert_not_called()
-        mock_interrupt.assert_called_once_with("a", force=False)
-        mock_write_meta.assert_called_once_with("a", {})
+        mock_interrupt.assert_called_once_with("a1", force=False)
+        mock_write_meta.assert_called_once_with("a1", {})
 
     def test_fleet_watchdog_skips_other_client_lease(self) -> None:
         status = {
@@ -2556,7 +2585,7 @@ class ServerHelpersTest(unittest.TestCase):
             meta_dir.mkdir()
             target = Path(tmpdir) / "target.json"
             target.write_text('{"external": true}\n', encoding="utf-8")
-            link = meta_dir / "a.json"
+            link = meta_dir / "a1.json"
             link.symlink_to(target)
 
             with patch("codex_master.server.META_DIR", meta_dir):
@@ -2837,6 +2866,29 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(summary["external_processes"][0]["raw_output"], "not_returned")
         self.assertNotIn(str(home), json.dumps(summary, sort_keys=True))
 
+    def test_agent_home_process_summary_handles_unreadable_proc_root(self) -> None:
+        proc_root = Mock(spec=Path)
+        proc_root.exists.return_value = True
+        proc_root.iterdir.side_effect = PermissionError("denied")
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            "codex_master.server.AGENTS",
+            {"a": {"label": "A", "runner": Path(tmpdir) / "codex", "home": Path(tmpdir) / "home", "session": "a"}},
+            clear=False,
+        ):
+            summary = agent_home_process_summary("a", proc_root)
+
+        self.assertEqual(summary["process_count"], 0)
+        self.assertEqual(summary["external_process_count"], 0)
+        self.assertEqual(summary["managed_process_count"], 0)
+        self.assertEqual(summary["raw_output"], "not_returned")
+
+    def test_same_path_text_handles_resolution_runtime_error(self) -> None:
+        with patch("pathlib.Path.resolve", side_effect=RuntimeError("loop")):
+            result = same_path_text("/tmp/loop", Path("/tmp/loop"))
+
+        self.assertFalse(result)
+
     def test_agent_identity_guard_blocks_orphaned_managed_home_process(self) -> None:
         summary = {
             "process_count": 1,
@@ -2861,7 +2913,7 @@ class ServerHelpersTest(unittest.TestCase):
             lock_dir.mkdir(parents=True)
             target = tmp_path / "outside.lock"
             target.write_text("outside", encoding="utf-8")
-            lock_path = lock_dir / "agent-a.lock"
+            lock_path = lock_dir / "agent-a1.lock"
             lock_path.symlink_to(target)
 
             with patch("codex_master.server.STATE_ROOT", state_root), patch("codex_master.server.LOCK_DIR", lock_dir):
@@ -3255,8 +3307,8 @@ class ServerHelpersTest(unittest.TestCase):
         result = call_tool("agent_start", {"agent": "a", "cwd": "/tmp/work", "prompt": "hi"})
 
         self.assertEqual(result["results"], [{"agent": "a", "status": "started"}])
-        self.assertEqual(events, [("lock", "a"), ("unlock", "a")])
-        mock_start_agent.assert_called_once_with("a", "/tmp/work", "hi")
+        self.assertEqual(events, [("lock", "a1"), ("unlock", "a1")])
+        mock_start_agent.assert_called_once_with("a1", "/tmp/work", "hi")
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.tmux_alive", return_value=False)
@@ -4525,6 +4577,7 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertIn("SystemCallArchitectures=native", text)
         self.assertIn("UMask=0077", text)
         self.assertIn("--report-grace-seconds 15", text)
+        self.assertIn("--action stop", text)
         self.assertIn("--quiet", text)
 
     @patch("codex_master.server.print_json")

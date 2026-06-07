@@ -1,6 +1,6 @@
 ---
 name: codex-master-fleet
-description: Use when managing the local codex-master-mcp Masterjet, Codex Agentinnen A/B, Bienen, Arbeitsbienen, Exploriererinnen, fleet variables, plugin status, or persistent feminine agent delegation rules.
+description: Use when managing the local codex-master-mcp Masterjet, Codex Agentinnen pool, Bienen, Arbeitsbienen, Exploriererinnen, fleet variables, plugin status, or persistent feminine agent delegation rules.
 metadata:
   short-description: Manage codex-master-mcp and the local Agentinnen fleet
 ---
@@ -8,12 +8,12 @@ metadata:
 # Codex Master Fleet
 
 Use this skill in the Teamleiterin/main Codex instance when the user refers to
-the Masterjet, `codex-master`, `codex-master-mcp`, Agentin A/B, Bienen,
+the Masterjet, `codex-master`, `codex-master-mcp`, the Agentinnen pool, Bienen,
 Arbeitsbienen, Exploriererinnen, fleet rules, plugin status, telint imports, or
 the persisted delegation templates.
 
-This skill is for the controlling instance. Do not install it into Agentin A/B
-unless the intent is to make that instance a Teamleiterin.
+This skill is for the controlling instance. Do not install it into managed
+Agentinnen unless the intent is to make that instance a Teamleiterin.
 
 `codex-master-mcp` Agentinnen are fremde Bienen: they are controlled through an
 MCP/plugin boundary. Eigene Bienen are native Subagentinnen spawned without MCP;
@@ -27,7 +27,7 @@ not show it; test the user's model IDs instead of assuming they are unavailable.
 
 ## Model Policy
 
-- Agentin A and Agentin B run on `gpt-5.4-mini` by default with medium
+- Managed Agentinnen run on `gpt-5.4-mini` by default with medium
   reasoning effort.
 - Exploriererin/read-only assignments keep `gpt-5.4-mini`.
 - Arbeitsbiene write assignments are marked for `gpt-5.3-codex-spark` with low
@@ -55,13 +55,13 @@ not show it; test the user's model IDs instead of assuming they are unavailable.
 - Version all coding steps. Commit after 10 successful fixes, push after 10
   commits, release after 10 pushes. Push/release only with green tests and no
   known critical findings.
-- Agentin A/B may start native Subagentinnen only when the assignment explicitly
+- Managed Agentinnen may start native Subagentinnen only when the assignment explicitly
   allows it. Nested Subagentinnen must stay inside the assigned scope and write
   paths. They must not use `codex-master-mcp` to control the fleet.
 - Use codex-master-mcp for fremde Bienen and native `multi_agent_v1`
   Subagentinnen for eigene Bienen. Keep their ownership, scopes, and reporting
   separate so the Teamleiterin can integrate safely.
-- Do not manually start Agentin A/B with the same `CODEX_HOME` while the
+- Do not manually start a managed Agentin with the same `CODEX_HOME` while the
   Masterjet manages them. Use `doctor` if a terminal looks stuck; `start`
   blocks when an Agentin home is already used externally, including when a
   Masterjet tmux session already exists. Agentin runners must be regular
@@ -71,10 +71,25 @@ not show it; test the user's model IDs instead of assuming they are unavailable.
 
 ## MCP Visibility
 
-In `/mcp`, the main Codex instance should show `codex-master-mcp`. Agentin A and
-Agentin B intentionally should not show the Masterjet MCP tools. If a standard
+In `/mcp`, the main Codex instance should show `codex-master-mcp`. Managed
+Agentinnen intentionally should not show the Masterjet MCP tools. If a standard
 instance says that Master MCP Tools are none, then either that instance is not
 the Teamleiterin, or `codex-master-mcp` is not installed/configured there.
+
+## Agentinnen Pool
+
+- Homes live under `~/.codex-agents/<id>`.
+- Concrete ids are `a1..a100`, `b1..b100`, and `c1..c100`.
+- Legacy aliases `a` and `b` resolve to `a1` and `b1`; `both` resolves to
+  `a1,b1`.
+- Series selectors are `a-series`, `b-series`, `c-series`; `all` covers all
+  300 Agentinnen.
+- `a1` and `b1` preserve the authenticated original homes. Additional homes are
+  sleeping/slim by default and must not receive copied auth material without an
+  explicit user instruction.
+- Prefer symlinks for read-mostly large content such as skills, plugins, and
+  model caches. Keep runtime state, wrappers, config, tmux sessions, leases, and
+  metadata per Agentin.
 
 ## Masterjet Control
 
@@ -85,22 +100,22 @@ cd /home/teladi/codex-master
 ./bin/codex-master-mcp doctor
 ./bin/codex-master-mcp status
 ./bin/codex-master-mcp lease-status all
-./bin/codex-master-mcp claim b --forever --poll-interval-seconds 30
-./bin/codex-master-mcp claim b --no-wait
-./bin/codex-master-mcp claim b --no-recover-stopped
-./bin/codex-master-mcp wait a --timeout-seconds 120 --poll-interval-seconds 30
-./bin/codex-master-mcp watchdog all --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 15 --action interrupt --manage-unclaimed --quiet
+./bin/codex-master-mcp claim b1 --forever --poll-interval-seconds 30
+./bin/codex-master-mcp claim b1 --no-wait
+./bin/codex-master-mcp claim b1 --no-recover-stopped
+./bin/codex-master-mcp wait a1 --timeout-seconds 120 --poll-interval-seconds 30
+./bin/codex-master-mcp watchdog all --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 15 --action stop --manage-unclaimed --quiet
 ./bin/codex-master-mcp start both --cwd /home/teladi/codex-master
 ./bin/codex-master-mcp capabilities all
 ./bin/codex-master-mcp skills all
-./bin/codex-master-mcp skills a --include-names --limit 20 --names-offset 20 --plugins-offset 20 --plugins-limit 20
+./bin/codex-master-mcp skills a1 --include-names --limit 20 --names-offset 20 --plugins-offset 20 --plugins-limit 20
 ./bin/codex-master-mcp skill-match all codex-security:security-scan
 ./bin/codex-master-mcp scope-check --scope src --write-path src/codex_master/server.py
-./bin/codex-master-mcp assign-readonly a --skill codex-security:security-scan --scope src/codex_master/server.py --task "Pruefe nur lesend und berichte knapp."
-./bin/codex-master-mcp assign-write b --skill github:gh-fix-ci --scope .github/workflows --write-path .github/workflows/ci.yml --task "Haerte nur die CI-Datei."
+./bin/codex-master-mcp assign-readonly a1 --skill codex-security:security-scan --scope src/codex_master/server.py --task "Pruefe nur lesend und berichte knapp."
+./bin/codex-master-mcp assign-write b1 --skill github:gh-fix-ci --scope .github/workflows --write-path .github/workflows/ci.yml --task "Haerte nur die CI-Datei."
 ./bin/codex-master-mcp assignments all --limit 20
-./bin/codex-master-mcp last-assignment a
-./bin/codex-master-mcp report-request a
+./bin/codex-master-mcp last-assignment a1
+./bin/codex-master-mcp report-request a1
 ./bin/codex-master-mcp integration-status
 ./bin/codex-master-mcp commit-ready-check
 ./bin/codex-master-mcp app-bridge-status
@@ -109,7 +124,7 @@ cd /home/teladi/codex-master
 ./bin/codex-master-mcp release-status
 ./bin/codex-master-mcp watchdog-status
 ./bin/codex-master-mcp timeout-policy
-./bin/codex-master-mcp release b
+./bin/codex-master-mcp release b1
 ```
 
 Data minimization:
@@ -122,10 +137,12 @@ Data minimization:
   requests a concise report and stores only a metadata marker. It waits the
   report grace period, default 15 seconds, before `interrupt`, `stop`, or
   `release`. The default watchdog idle threshold is 60 seconds; the systemd
-  timer poll interval is 15 seconds. By default it only mutates Agentinnen held
-  by the current server. The systemd supervisor may additionally manage
-  unclaimed or expired leases via `--manage-unclaimed --quiet`; it must still
-  skip active leases held by other clients.
+  timer poll interval is 15 seconds. The installed systemd supervisor uses
+  `--action stop`, so unused Agentinnen are put back to sleep after the report
+  grace period. By default it only mutates Agentinnen held by the current
+  server. The systemd supervisor may additionally manage unclaimed or expired
+  leases via `--manage-unclaimed --quiet`; it must still skip active leases held
+  by other clients.
 - The watchdog user service should keep conservative systemd hardening:
   empty `CapabilityBoundingSet`, private keyring/tmp/devices, kernel and clock
   protections, `ProtectSystem=strict`, `ReadWritePaths` for managed state plus

@@ -1,11 +1,22 @@
 # codex-master
 
-Local MCP wrapper for controlling two existing Codex CLI homes:
+Local MCP wrapper for controlling a sleeping/scalable Codex Agentinnen pool:
 
-- `/home/teladi/.codex-agent-a`
-- `/home/teladi/.codex-agent-b`
+- `/home/teladi/.codex-agents/a1` through `/home/teladi/.codex-agents/a100`
+- `/home/teladi/.codex-agents/b1` through `/home/teladi/.codex-agents/b100`
+- `/home/teladi/.codex-agents/c1` through `/home/teladi/.codex-agents/c100`
 
-The wrapper starts both instances through their existing `codex` launcher files
+Legacy selectors `a` and `b` map to `a1` and `b1`; `both` maps to `a1,b1`.
+Series selectors `a-series`, `b-series`, `c-series`, and `all` are available
+for status, skills, capabilities, lease status, start/stop, and watchdog calls.
+The original authenticated homes are preserved as `a1` and `b1`. Additional
+homes are intentionally slim and sleeping by default; they have their own
+`CODEX_HOME`, wrapper, config, tmux session name, lease, and metadata, while
+large read-mostly skill/plugin/model cache files may be symlinked from a series
+template. C-series homes are intentionally unauthenticated until another
+account is available.
+
+The wrapper starts instances through their per-home `codex` launcher files
 with the default model `gpt-5.4-mini` and:
 
 ```sh
@@ -33,8 +44,8 @@ are timeout-bounded so MCP calls fail closed instead of hanging indefinitely.
 MCP registration checks compare the exact `command:` field from
 `codex mcp get`, not a broad substring in command output.
 Agentin lifecycle operations that mutate or send into tmux sessions are
-serialized per Agentin with private no-follow lock files, so Agentin A and
-Agentin B can still run independently while concurrent starts/stops/sends for
+serialized per Agentin with private no-follow lock files, so different
+Agentinnen can still run independently while concurrent starts/stops/sends for
 the same Agentin cannot interleave. If `tmux new-session` fails before this
 process created a session, cleanup removes only the prepared raw log and does
 not kill an existing session that may belong to another MCP process.
@@ -86,7 +97,8 @@ and is capped at 900 seconds.
 to a 60 second idle threshold and asks the Agentin for a concise report before
 any escalation. The report grace window defaults to 15 seconds, so the next
 systemd timer pass can escalate only after the Agentin had one interval to
-report. By default the watchdog only mutates
+report. The installed systemd supervisor uses `--action stop`, so unused
+Agentinnen are put back to sleep instead of being left active. By default the watchdog only mutates
 Agentinnen leased by the current server; the systemd supervisor uses
 `--manage-unclaimed --quiet` to handle unclaimed or expired leases while still
 skipping active leases held by other clients and avoiding successful JSON noise
@@ -94,10 +106,11 @@ in the user journal.
 
 ## Tools
 
-- `agent_start`: start Agentin `a`, `b`, or `both`
+- `agent_start`: start selected Agentinnen (`a1`, `b1`, `c1`, series selectors,
+  `both`, or `all`)
 - `agent_status`: structured status, response state, and limit classification
   without raw output
-- `agent_lease_status`: data-sparse lease state for Agentin `a`, `b`, or `all`
+- `agent_lease_status`: data-sparse lease state for selected Agentinnen
 - `agent_claim`: claim or renew one Agentin, retrying forever by default when
   she is busy; explicit claims may recover stopped orphan leases after grace
 - `agent_release`: release this MCP client's Agentin claim; force only after
@@ -108,7 +121,7 @@ in the user journal.
   then optionally interrupt, stop, or release without raw output
 - `agent_send`: send text to one running Agentin
 - `agent_interrupt`: send Ctrl-C to one running Agentin
-- `agent_stop`: stop Agentin `a`, `b`, or `both`
+- `agent_stop`: stop selected Agentinnen
 - `agent_safe_tail`: explicit capped, ANSI-stripped, redacted excerpt; log
   source reads only regular raw-log files
 - `agent_skills`: data-sparse skill inventory without file contents
@@ -141,9 +154,9 @@ in the user journal.
 - `agent_doctor`: structured diagnostics without raw output
 
 `/mcp` should show `codex-master-mcp` only in the Teamleiterin/main Codex
-instance. Agentin A and Agentin B intentionally do not receive Masterjet MCP
-tools; they are controlled from outside and may only use native Subagentinnen
-when an assignment explicitly allows it.
+instance. Managed Agentinnen intentionally do not receive Masterjet MCP tools;
+they are controlled from outside and may only use native Subagentinnen when an
+assignment explicitly allows it.
 `tool_search` is not authoritative for the local stdio MCP namespace; use
 `/mcp` in the affected Codex client or `namespace-status` from this repo.
 `plugin-status` and `namespace-status` also report whether the repo plugin
@@ -174,7 +187,7 @@ python3 -m codex_master.server claim b --forever --poll-interval-seconds 30
 python3 -m codex_master.server claim b --no-wait
 python3 -m codex_master.server claim b --no-recover-stopped
 python3 -m codex_master.server wait a --timeout-seconds 120 --poll-interval-seconds 30
-python3 -m codex_master.server watchdog all --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 15 --action interrupt --manage-unclaimed --quiet
+python3 -m codex_master.server watchdog all --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 15 --action stop --manage-unclaimed --quiet
 python3 -m codex_master.server capabilities all
 python3 -m codex_master.server skills all
 python3 -m codex_master.server skills a --include-names --limit 20 --names-offset 20 --plugins-offset 20 --plugins-limit 20
@@ -442,7 +455,7 @@ outside the active raw-log policy before touching state or paths. Use `tail`
 only when an explicit, capped, ANSI-stripped, redacted excerpt is needed. Failed
 starts remove their prepared raw-log file before returning an error.
 
-Model policy: Agentin A and Agentin B run on `gpt-5.4-mini` by default. Read-only
+Model policy: managed Agentinnen run on `gpt-5.4-mini` by default. Read-only
 Exploriererin assignments keep that model. Arbeitsbiene write assignments are
 marked for `gpt-5.3-codex-spark` in the structured assignment and audit metadata.
 
@@ -452,9 +465,9 @@ forbids nested delegation. Even with the flag, nested Agentinnen stay inside the
 assigned scope and write paths; they do not use `codex-master-mcp` and they do
 not commit, push, or release.
 
-Do not start Agentin A or Agentin B manually with the same `CODEX_HOME` while
-the Masterjet is responsible for them. `start` refuses to launch an Agentin when
-its home is already used by an external Codex process, and `doctor` reports such
+Do not start a managed Agentin manually with the same `CODEX_HOME` while the
+Masterjet is responsible for her. `start` refuses to launch an Agentin when her
+home is already used by an external Codex process, and `doctor` reports such
 home conflicts before they become tmux or lock contention. `start` also refuses
 an already-running Masterjet session if a second external process is using the
 same home. `install` refuses to register `codex-master-mcp` from a managed
@@ -489,8 +502,8 @@ This repo is also a local Codex plugin:
   and declares `startup_timeout_sec = 120`
 - `skills/codex-master-fleet/SKILL.md`: Teamleiterin skill for the Masterjet
 
-The plugin is intended for the main/Teamleiterin Codex instance. Agentin A and
-Agentin B should keep their separate worker skill and should not receive
+The plugin is intended for the main/Teamleiterin Codex instance. Managed
+Agentinnen should keep their separate worker skill and should not receive
 Masterjet MCP tools.
 
 A Marketplace entry is optional. The repo contains the plugin artifacts, and the
