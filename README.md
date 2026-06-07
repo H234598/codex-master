@@ -43,8 +43,9 @@ can distinguish likely daily, weekly, token, quota, or rate limits from ordinary
 "no response yet" states. The classification keeps default Agentinnen-model
 limits separate from Spark write-model limits and reports only metadata plus
 `evidence: not_returned`.
-`agent_wait` lets callers wait up to 10 minutes for activity, process exit, or
-a classified limit without automatically receiving Agentin output.
+`agent_wait` lets callers wait for activity, process exit, or a classified
+limit without automatically receiving Agentin output. It defaults to 120 seconds
+and is capped at 10 minutes per call.
 
 ## Tools
 
@@ -52,7 +53,7 @@ a classified limit without automatically receiving Agentin output.
 - `agent_status`: structured status, response state, and limit classification
   without raw output
 - `agent_wait`: wait for activity/stop/limit metadata without raw output,
-  capped at 10 minutes per call
+  defaulting to 120 seconds and capped at 10 minutes per call
 - `agent_send`: send text to one running Agentin
 - `agent_interrupt`: send Ctrl-C to one running Agentin
 - `agent_stop`: stop Agentin `a`, `b`, or `both`
@@ -91,7 +92,7 @@ python3 -m codex_master.server uninstall       # remove mcp registration and loc
 
 python3 -m codex_master.server start both --cwd /home/teladi/codex-master
 python3 -m codex_master.server status
-python3 -m codex_master.server wait a --timeout-seconds 30 --poll-interval-seconds 2
+python3 -m codex_master.server wait a --timeout-seconds 120 --poll-interval-seconds 2
 python3 -m codex_master.server capabilities all
 python3 -m codex_master.server skills all
 python3 -m codex_master.server skills a --include-names --limit 20 --names-offset 20 --plugins-offset 20 --plugins-limit 20

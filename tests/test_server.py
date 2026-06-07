@@ -171,6 +171,7 @@ class ServerHelpersTest(unittest.TestCase):
         skill_props = by_name["agent_skills"]["inputSchema"]["properties"]
         self.assertEqual(assign_props["task"]["maxLength"], MAX_TASK_TEXT)
         self.assertEqual(assign_props["context"]["maxItems"], MAX_ASSIGNMENT_LIST_ITEMS)
+        self.assertEqual(DEFAULT_WAIT_SECONDS, 120)
         self.assertEqual(MAX_WAIT_SECONDS, 600)
         self.assertEqual(wait_props["timeout_seconds"]["default"], DEFAULT_WAIT_SECONDS)
         self.assertEqual(wait_props["timeout_seconds"]["maximum"], MAX_WAIT_SECONDS)
