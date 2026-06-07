@@ -19,7 +19,8 @@ by default. Prepared raw-log files are created with no-follow exclusive
 semantics. The direct raw-log writer also requires the managed state directories
 to be real directories, not symlinks, and legacy raw-log directories are ignored
 when they are symlinks. Agentin metadata reads reject symlinked and oversized
-files. Safe-tail log reads ignore non-regular raw-log targets. MCP tool
+files. Safe-tail log reads ignore non-regular raw-log targets. Tmux control
+errors are redacted and bounded before they are returned or raised. MCP tool
 responses do not return raw output by default. Existing metadata under the old
 `codex-agent-mcp` state directory is still read as a migration fallback.
 

@@ -855,6 +855,43 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(leftover_logs, [])
 
     @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.write_meta")
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("codex_master.server.run_tmux")
+    def test_start_agent_redacts_tmux_start_error(
+        self, mock_run_tmux, _mock_alive, _mock_write_meta, _mock_ensure_state
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = Path(tmpdir) / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            mock_run_tmux.return_value = subprocess.CompletedProcess(
+                ["tmux", "new-session"], 1, "", "OPENAI_API_KEY=sk-testtoken1234567890"
+            )
+
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
+                clear=False,
+            ), patch("codex_master.server.RAW_DIR", Path(tmpdir)), patch("codex_master.server.META_DIR", Path(tmpdir)), patch(
+                "codex_master.server.agent_home_process_summary",
+                return_value={
+                    "process_count": 0,
+                    "external_process_count": 0,
+                    "managed_process_count": 0,
+                    "external_processes": [],
+                    "external_processes_truncated": False,
+                    "raw_output": "not_returned",
+                },
+            ):
+                with self.assertRaises(AgentError) as raised:
+                    start_agent("a", cwd=tmpdir)
+
+        error_text = str(raised.exception)
+        self.assertNotIn("sk-testtoken1234567890", error_text)
+        self.assertIn("OPENAI_API_KEY=<redacted>", error_text)
+
+    @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.tmux_alive", return_value=False)
     @patch("codex_master.server.run_tmux")
     def test_start_agent_refuses_preexisting_raw_log_symlink(

@@ -677,13 +677,13 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
     cp = run_tmux(["new-session", "-d", "-s", session, "-c", str(start_cwd), command], check=False)
     if cp.returncode != 0:
         cleanup_failed_start(session, raw_log)
-        raise AgentError(f"tmux start failed for agent {agent}: {cp.stderr.strip()}")
+        raise AgentError(f"tmux start failed for agent {agent}: {command_error_text(cp.stderr)}")
 
     pipe_command = raw_log_writer_command(raw_log)
     pipe = run_tmux(["pipe-pane", "-o", "-t", session, pipe_command], check=False)
     if pipe.returncode != 0:
         cleanup_failed_start(session, raw_log)
-        raise AgentError(f"tmux pipe-pane failed for agent {agent}: {pipe.stderr.strip()}")
+        raise AgentError(f"tmux pipe-pane failed for agent {agent}: {command_error_text(pipe.stderr)}")
 
     data = {
         "agent": agent,
@@ -725,7 +725,7 @@ def stop_agent(agent: str) -> dict[str, Any]:
     if was_running:
         cp = run_tmux(["kill-session", "-t", session], check=False)
         if cp.returncode != 0:
-            raise AgentError(f"tmux stop failed for agent {agent}: {cp.stderr.strip()}")
+            raise AgentError(f"tmux stop failed for agent {agent}: {command_error_text(cp.stderr)}")
     return {"agent": agent, "status": "stopped" if was_running else "not_running", "session": session}
 
 
@@ -1607,14 +1607,14 @@ def send_agent(agent: str, text: str, enter: bool = True) -> dict[str, Any]:
     buffer_name = f"codex-master-mcp-{agent}-{int(time.time() * 1000)}"
     cp = run_tmux(["load-buffer", "-b", buffer_name, "-"], input_text=text, check=False)
     if cp.returncode != 0:
-        raise AgentError(f"tmux load-buffer failed for agent {agent}: {cp.stderr.strip()}")
+        raise AgentError(f"tmux load-buffer failed for agent {agent}: {command_error_text(cp.stderr)}")
     cp = run_tmux(["paste-buffer", "-d", "-b", buffer_name, "-t", session], check=False)
     if cp.returncode != 0:
-        raise AgentError(f"tmux paste-buffer failed for agent {agent}: {cp.stderr.strip()}")
+        raise AgentError(f"tmux paste-buffer failed for agent {agent}: {command_error_text(cp.stderr)}")
     if enter:
         cp = run_tmux(["send-keys", "-t", session, "Enter"], check=False)
         if cp.returncode != 0:
-            raise AgentError(f"tmux send Enter failed for agent {agent}: {cp.stderr.strip()}")
+            raise AgentError(f"tmux send Enter failed for agent {agent}: {command_error_text(cp.stderr)}")
     return {
         "agent": agent,
         "status": "sent",
@@ -1631,7 +1631,7 @@ def interrupt_agent(agent: str) -> dict[str, Any]:
         raise AgentError(f"agent {agent} is not running")
     cp = run_tmux(["send-keys", "-t", session, "C-c"], check=False)
     if cp.returncode != 0:
-        raise AgentError(f"tmux interrupt failed for agent {agent}: {cp.stderr.strip()}")
+        raise AgentError(f"tmux interrupt failed for agent {agent}: {command_error_text(cp.stderr)}")
     return {"agent": agent, "status": "interrupt_sent", "response_output": "not_returned"}
 
 
@@ -1670,6 +1670,11 @@ def safe_error_text(value: Any, max_chars: int = MAX_ERROR_CHARS) -> str:
     cleaned = strip_ansi(str(value))
     redacted, _changed = redact(cleaned)
     return trim_chars(redacted, max_chars)
+
+
+def command_error_text(value: Any) -> str:
+    text = safe_error_text(value).strip()
+    return text or "no stderr"
 
 
 def read_log_tail(path: Path, approx_bytes: int) -> str:
