@@ -45,6 +45,7 @@ from codex_master.server import (
     trim_lines,
     write_bounded_raw_log,
     write_meta,
+    worktree_create_for_agent,
 )
 
 
@@ -1189,6 +1190,57 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn(str(target), str(raised.exception))
         self.assertEqual(target_content, "external\n")
         self.assertTrue(link_is_symlink)
+
+    @patch("codex_master.server.run_command")
+    def test_worktree_create_refuses_symlink_parent_without_git_call(self, mock_run_command) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            real_parent = tmp_path / "real-parent"
+            link_parent = tmp_path / "linked-parent"
+            real_parent.mkdir()
+            link_parent.symlink_to(real_parent, target_is_directory=True)
+            target = link_parent / "agent-a"
+
+            with self.assertRaisesRegex(AgentError, "parent directories must be real directories") as raised:
+                worktree_create_for_agent("a", path=str(target))
+
+            redirected_target = real_parent / "agent-a"
+
+        mock_run_command.assert_not_called()
+        self.assertNotIn(str(link_parent), str(raised.exception))
+        self.assertNotIn(str(real_parent), str(raised.exception))
+        self.assertFalse(redirected_target.exists())
+
+    @patch("codex_master.server.run_command")
+    def test_worktree_create_refuses_broken_target_symlink_without_git_call(self, mock_run_command) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target = tmp_path / "agent-a"
+            target.symlink_to(tmp_path / "missing-target")
+
+            with self.assertRaisesRegex(AgentError, "worktree path already exists") as raised:
+                worktree_create_for_agent("a", path=str(target))
+            target_is_symlink = target.is_symlink()
+
+        mock_run_command.assert_not_called()
+        self.assertNotIn(str(target), str(raised.exception))
+        self.assertTrue(target_is_symlink)
+
+    @patch("codex_master.server.run_command")
+    def test_worktree_create_relative_path_is_repo_scoped_and_parent_checked(self, mock_run_command) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            relative = ".codex-master-worktrees/agent-a"
+            expected_target = repo / relative
+            mock_run_command.return_value = subprocess.CompletedProcess(["git"], 0, "", "")
+
+            with patch("codex_master.server.repo_root", return_value=repo):
+                result = worktree_create_for_agent("a", path=relative)
+
+        self.assertEqual(result["path"], str(expected_target))
+        self.assertEqual(result["status"], "created")
+        self.assertEqual(mock_run_command.call_args.args[0], ["git", "worktree", "add", str(expected_target)])
+        self.assertEqual(mock_run_command.call_args.kwargs["cwd"], repo)
 
     def test_repo_wrapper_works_via_symlink(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

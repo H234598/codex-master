@@ -127,6 +127,8 @@ Data minimization:
   before they are returned. `tools/call` validates tool names, object-shaped
   params and arguments, unknown argument names, required fields, value types,
   enums, and declared bounds before dispatch.
+- Worktree creation must reject existing targets, including broken symlinks,
+  and require every target parent directory to be a real directory.
 - Use `tail` only for an explicit capped, ANSI-stripped, redacted excerpt.
 - Do not read raw tmux logs directly unless the user explicitly requests it and
   the privacy impact is acceptable.

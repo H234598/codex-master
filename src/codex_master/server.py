@@ -146,6 +146,29 @@ def ensure_private_dir(path: Path) -> None:
         pass
 
 
+def ensure_directory_chain_no_symlink(path: Path, error_text: str) -> None:
+    if not path.is_absolute():
+        raise AgentError(error_text)
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            current_stat = current.lstat()
+        except FileNotFoundError:
+            try:
+                current.mkdir()
+            except FileExistsError:
+                current_stat = current.lstat()
+            except OSError as exc:
+                raise AgentError(error_text) from exc
+            else:
+                current_stat = current.lstat()
+        except OSError as exc:
+            raise AgentError(error_text) from exc
+        if stat_module.S_ISLNK(current_stat.st_mode) or not stat_module.S_ISDIR(current_stat.st_mode):
+            raise AgentError(error_text)
+
+
 def now_id() -> str:
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
@@ -1476,10 +1499,13 @@ def worktree_create_for_agent(agent: str, path: Any = None, base_ref: Any = None
     path = bounded_text(path, field="path", max_chars=MAX_PATH_TEXT) if path is not None else None
     base_ref = bounded_text(base_ref, field="base_ref", max_chars=MAX_PATH_TEXT) if base_ref is not None else None
     target = Path(path).expanduser() if path else repo_root() / ".codex-master-worktrees" / f"agent-{agent}-{now_id()}"
+    if not target.is_absolute():
+        target = repo_root() / target
+    target = target.absolute()
+    if path_present_no_follow(target):
+        raise AgentError("worktree path already exists")
+    ensure_directory_chain_no_symlink(target.parent, "worktree parent directories must be real directories")
     target = target.resolve(strict=False)
-    if target.exists():
-        raise AgentError(f"worktree path already exists: {target}")
-    target.parent.mkdir(parents=True, exist_ok=True)
     args = ["worktree", "add", str(target)]
     if base_ref:
         args.append(base_ref)
