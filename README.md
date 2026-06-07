@@ -151,6 +151,12 @@ in the user journal.
 - `master_timeout_policy`: report effective timeout and polling policy for MCP
   startup, Agentin claim retry, Agentin wait, watchdog supervision, and
   hidden CLI lease identity source
+- `agent_pool_validate`: validate a machine-readable Agentinnen pool spec
+- `agent_pool_install`: install or refresh sleeping Agentinnen homes from a spec
+- `agent_pool_status`: inspect data-sparse pool installation counts
+- `agent_pool_copy_auth`: explicitly copy one source `auth.json` to many
+  installed Agentinnen, dry-run by default
+- `agent_pool_destroy_pool`: guarded removal of installed Agentinnen homes
 - `agent_doctor`: structured diagnostics without raw output
 
 `/mcp` should show `codex-master-mcp` only in the Teamleiterin/main Codex
@@ -205,11 +211,36 @@ python3 -m codex_master.server namespace-status
 python3 -m codex_master.server release-status
 python3 -m codex_master.server watchdog-status
 python3 -m codex_master.server timeout-policy
+python3 -m codex_master.server pool validate --spec codex-agent-pool.json
+python3 -m codex_master.server pool install --spec codex-agent-pool.json --target-dir "$HOME/.codex-agents" --codex-bin /usr/local/bin/codex
+python3 -m codex_master.server pool status --spec codex-agent-pool.json
+python3 -m codex_master.server pool copy_auth --spec codex-agent-pool.json --from-agent a1 --to a-series
+python3 -m codex_master.server pool destroy_pool --spec codex-agent-pool.json --yes
 python3 -m codex_master.server send a "Kurzer Auftrag"
 python3 -m codex_master.server release b
 python3 -m codex_master.server tail a --source pane --lines 20 --chars 2000
 python3 -m codex_master.server stop both
 ```
+
+## Agentinnen Pool Spec
+
+The repo contains a generic, machine-readable `codex-agent-pool.json` plus
+`schemas/codex-agent-pool.schema.json`. The default spec describes the current
+300-Agentinnen pool: `a1..a100`, `b1..b100`, and `c1..c100`, with `a1` and
+`b1` marked as the authenticated source homes and the C series intentionally
+unauthenticated.
+
+Two install paths are supported:
+
+```sh
+./bin/codex-master-mcp pool install --spec codex-agent-pool.json --target-dir "$HOME/.codex-agents"
+./scripts/install-agent-pool --spec codex-agent-pool.json --target-dir "$HOME/.codex-agents"
+```
+
+Use `--codex-bin` when the Codex CLI binary is not `/usr/local/bin/codex`.
+Normal install never copies auth material. For bulk auth propagation, run
+`pool copy_auth` first without `--yes` to inspect counts, then repeat with
+`--yes` when intentional. See `docs/agent-pool.md` for the full command set.
 
 ## Install-Contract (CLI)
 
@@ -222,8 +253,9 @@ python3 -m codex_master.server stop both
 - registers the command via `codex mcp add codex-master-mcp -- <link>`
 - ensures the active Codex MCP config has `startup_timeout_sec = 120`
 - syncs the personal `codex-master` plugin cache from a runtime allowlist
-  (`.codex-plugin`, `.app.json`, `.mcp.json`, `bin`, `skills`, `src`,
-  `systemd`, README, and package metadata) while excluding `.git`, tests,
+  (`.codex-plugin`, `.app.json`, `.mcp.json`, `bin`, `docs`, `examples`,
+  `schemas`, `scripts`, `skills`, `src`, `systemd`, README,
+  `codex-agent-pool.json`, and package metadata) while excluding `.git`, tests,
   bytecode, test caches, hidden files, editor swap files, and backup/patch
   leftovers
 - rejects hardlinked plugin source files and keeps only the current plus the

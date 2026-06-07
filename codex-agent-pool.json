@@ -1,0 +1,51 @@
+{
+  "$schema": "schemas/codex-agent-pool.schema.json",
+  "schema_version": 1,
+  "pool_root": "${HOME}/.codex-agents",
+  "codex_bin": "${CODEX_AGENT_BIN:-/usr/local/bin/codex}",
+  "series": [
+    {
+      "prefix": "a",
+      "count": 100,
+      "template": "a1",
+      "authenticated": [
+        "a1"
+      ]
+    },
+    {
+      "prefix": "b",
+      "count": 100,
+      "template": "b1",
+      "authenticated": [
+        "b1"
+      ]
+    },
+    {
+      "prefix": "c",
+      "count": 100,
+      "template": "c1",
+      "authenticated": []
+    }
+  ],
+  "aliases": {
+    "a": "a1",
+    "b": "b1",
+    "both": [
+      "a1",
+      "b1"
+    ]
+  },
+  "shared_assets": [
+    "skills",
+    "plugins"
+  ],
+  "runtime_dirs": [
+    "sessions",
+    "logs",
+    "tmp"
+  ],
+  "auth": {
+    "policy": "preserve_existing_only",
+    "copy": []
+  }
+}

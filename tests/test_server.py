@@ -671,6 +671,10 @@ class ServerHelpersTest(unittest.TestCase):
             cache = tmp_path / "cache"
             (root / ".codex-plugin").mkdir(parents=True)
             (root / "bin").mkdir()
+            (root / "docs").mkdir()
+            (root / "examples").mkdir()
+            (root / "schemas").mkdir()
+            (root / "scripts").mkdir()
             (root / "skills" / "codex-master-fleet").mkdir(parents=True)
             (root / "systemd" / "user").mkdir(parents=True)
             (root / "src" / "codex_master" / "__pycache__").mkdir(parents=True)
@@ -682,10 +686,15 @@ class ServerHelpersTest(unittest.TestCase):
             (root / ".app.json").write_text("{}", encoding="utf-8")
             (root / ".mcp.json").write_text("{}", encoding="utf-8")
             (root / "README.md").write_text("readme", encoding="utf-8")
+            (root / "codex-agent-pool.json").write_text("{}", encoding="utf-8")
             (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
             bin_wrapper = root / "bin" / "codex-master-mcp"
             bin_wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
             bin_wrapper.chmod(bin_wrapper.stat().st_mode | stat.S_IXUSR)
+            (root / "docs" / "agent-pool.md").write_text("doc", encoding="utf-8")
+            (root / "examples" / "codex-agent-pool.json").write_text("{}", encoding="utf-8")
+            (root / "schemas" / "codex-agent-pool.schema.json").write_text("{}", encoding="utf-8")
+            (root / "scripts" / "install-agent-pool").write_text("#!/bin/sh\n", encoding="utf-8")
             (root / "skills" / "codex-master-fleet" / "SKILL.md").write_text("skill", encoding="utf-8")
             (root / "src" / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
             (root / "src" / "codex_master" / "__pycache__" / "server.pyc").write_bytes(b"cache")
@@ -704,8 +713,13 @@ class ServerHelpersTest(unittest.TestCase):
                 "manifest": (entry / ".codex-plugin" / "plugin.json").exists(),
                 "app": (entry / ".app.json").exists(),
                 "mcp": (entry / ".mcp.json").exists(),
+                "pool_spec": (entry / "codex-agent-pool.json").exists(),
                 "bin": (entry / "bin" / "codex-master-mcp").exists(),
                 "bin_executable": os.access(entry / "bin" / "codex-master-mcp", os.X_OK),
+                "docs": (entry / "docs" / "agent-pool.md").exists(),
+                "examples": (entry / "examples" / "codex-agent-pool.json").exists(),
+                "schemas": (entry / "schemas" / "codex-agent-pool.schema.json").exists(),
+                "scripts": (entry / "scripts" / "install-agent-pool").exists(),
                 "skill": (entry / "skills" / "codex-master-fleet" / "SKILL.md").exists(),
                 "systemd": (entry / "systemd" / "user").exists(),
                 "server": (entry / "src" / "codex_master" / "server.py").exists(),
@@ -724,8 +738,13 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(copied_state["manifest"])
         self.assertTrue(copied_state["app"])
         self.assertTrue(copied_state["mcp"])
+        self.assertTrue(copied_state["pool_spec"])
         self.assertTrue(copied_state["bin"])
         self.assertTrue(copied_state["bin_executable"])
+        self.assertTrue(copied_state["docs"])
+        self.assertTrue(copied_state["examples"])
+        self.assertTrue(copied_state["schemas"])
+        self.assertTrue(copied_state["scripts"])
         self.assertTrue(copied_state["skill"])
         self.assertTrue(copied_state["systemd"])
         self.assertTrue(copied_state["server"])
@@ -1471,7 +1490,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.7.0+codex.test",
+            "version": "0.8.0+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1498,7 +1517,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.7.0")
+        self.assertEqual(result["expected_tag"], "v0.8.0")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -5373,6 +5392,123 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertNotIn("sess-doctor-test", payload_text)
         self.assertNotIn(str(Path(tmp_home) / "a-runner"), payload_text)
         self.assertNotIn(str(Path(tmp_home) / "a"), payload_text)
+
+
+class AgentPoolManagementTest(unittest.TestCase):
+    def _write_spec(self, root: Path, pool: Path) -> Path:
+        spec = {
+            "schema_version": 1,
+            "pool_root": str(pool),
+            "codex_bin": "/opt/codex/bin/codex",
+            "series": [
+                {"prefix": "a", "count": 2, "template": "a1", "authenticated": ["a1"]},
+                {"prefix": "b", "count": 1, "template": "b1", "authenticated": ["b1"]},
+                {"prefix": "c", "count": 1, "template": "c1", "authenticated": []},
+            ],
+            "aliases": {"a": "a1", "b": "b1", "both": ["a1", "b1"]},
+            "shared_assets": ["skills", "plugins"],
+            "runtime_dirs": ["sessions", "logs"],
+            "auth": {"policy": "preserve_existing_only", "copy": []},
+        }
+        spec_path = root / "pool.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+        return spec_path
+
+    def test_agent_pool_install_status_copy_auth_and_destroy_are_data_sparse(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec(tmp, pool)
+            (pool / "a1" / "skills").mkdir(parents=True)
+            (pool / "a1" / "plugins").mkdir()
+
+            validation = server_module.agent_pool_validate(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            self.assertTrue(validation["ok"])
+            self.assertEqual(validation["expected_agent_count"], 4)
+            self.assertEqual(validation["pool_root"], "not_returned")
+
+            install_result = server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            self.assertTrue(install_result["ok"])
+            self.assertEqual(install_result["installed_agent_count"], 4)
+            self.assertTrue((pool / "a1" / "codex").is_file())
+            self.assertTrue(os.access(pool / "a1" / "codex", os.X_OK))
+            self.assertIn('export CODEX_HOME="', (pool / "a1" / "codex").read_text(encoding="utf-8"))
+            self.assertTrue((pool / "a2" / "skills").is_symlink())
+            self.assertFalse((pool / "a2" / "auth.json").exists())
+
+            (pool / "a1" / "auth.json").write_text('{"token":"secret"}\n', encoding="utf-8")
+            dry_run = server_module.agent_pool_copy_auth(
+                str(spec_path),
+                target_dir=str(pool),
+                codex_bin="/bin/codex",
+                from_agent="a1",
+                to="a-series",
+            )
+            self.assertTrue(dry_run["dry_run"])
+            self.assertEqual(dry_run["copyable_count"], 1)
+            self.assertEqual(dry_run["copied_count"], 0)
+            self.assertFalse((pool / "a2" / "auth.json").exists())
+
+            copied = server_module.agent_pool_copy_auth(
+                str(spec_path),
+                target_dir=str(pool),
+                codex_bin="/bin/codex",
+                from_agent="a1",
+                to="a-series",
+                yes=True,
+            )
+            self.assertFalse(copied["dry_run"])
+            self.assertEqual(copied["copied_count"], 1)
+            self.assertEqual((pool / "a2" / "auth.json").read_text(encoding="utf-8"), '{"token":"secret"}\n')
+
+            status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            self.assertTrue(status["ok"])
+            self.assertEqual(status["existing_agent_count"], 4)
+            self.assertEqual(status["auth_count"], 2)
+            status_text = json.dumps(status, sort_keys=True)
+            self.assertNotIn(str(pool), status_text)
+            self.assertIn("not_returned", status_text)
+
+            with self.assertRaises(AgentError):
+                server_module.agent_pool_destroy_pool(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+
+            destroyed = server_module.agent_pool_destroy_pool(
+                str(spec_path),
+                target_dir=str(pool),
+                codex_bin="/bin/codex",
+                yes=True,
+                remove_root=True,
+            )
+            self.assertTrue(destroyed["ok"])
+            self.assertEqual(destroyed["removed_agent_entries"], 4)
+            self.assertFalse(pool.exists())
+
+    def test_agent_pool_tools_are_registered_and_cli_invokes_pool_namespace(self) -> None:
+        from codex_master import server as server_module
+
+        tool_names = {tool["name"] for tool in server_module.TOOLS}
+        self.assertIn("agent_pool_validate", tool_names)
+        self.assertIn("agent_pool_destroy_pool", tool_names)
+
+        captured_payloads = []
+
+        def _capture(payload):
+            captured_payloads.append(payload)
+            return 0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec(tmp, pool)
+            with patch("codex_master.server.print_json", side_effect=_capture):
+                result = server_module.main_cli(["pool", "validate", "--spec", str(spec_path), "--target-dir", str(pool)])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(captured_payloads), 1)
+        self.assertTrue(captured_payloads[0]["ok"])
+        self.assertEqual(captured_payloads[0]["pool_root"], "not_returned")
 
 if __name__ == "__main__":
     unittest.main()

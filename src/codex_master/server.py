@@ -103,8 +103,10 @@ MAX_PLUGIN_MANIFEST_BYTES = 64 * 1024
 MAX_PLUGIN_CACHE_VERSIONS = 20
 MAX_PLUGIN_CACHE_RETAINED_VERSIONS = 5
 MAX_PAGED_OFFSET = 10_000_000
-PLUGIN_CACHE_ALLOWED_FILES = (".app.json", ".mcp.json", "README.md", "pyproject.toml")
-PLUGIN_CACHE_ALLOWED_DIRS = (".codex-plugin", "bin", "skills", "src", "systemd")
+PLUGIN_CACHE_ALLOWED_FILES = (".app.json", ".mcp.json", "README.md", "codex-agent-pool.json", "pyproject.toml")
+PLUGIN_CACHE_ALLOWED_DIRS = (".codex-plugin", "bin", "docs", "examples", "schemas", "scripts", "skills", "src", "systemd")
+PLUGIN_CACHE_OPTIONAL_FILES = ("codex-agent-pool.json",)
+PLUGIN_CACHE_OPTIONAL_DIRS = ("docs", "examples", "schemas", "scripts")
 PLUGIN_CACHE_EXCLUDED_NAMES = (".git", ".pytest_cache", ".mypy_cache", ".ruff_cache", "__pycache__")
 PLUGIN_CACHE_EXCLUDED_SUFFIXES = (".pyc", ".pyo", ".swp", ".swo", ".tmp", ".bak", ".orig", ".rej", "~")
 COMMAND_TIMEOUT_RETURN_CODE = 124
@@ -113,6 +115,17 @@ DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
 DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS = 10
 RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS = 120
 AGENT_POOL_ROOT = Path(os.environ.get("CODEX_AGENT_POOL_ROOT", "~/.codex-agents")).expanduser()
+POOL_SPEC_FILE = "codex-agent-pool.json"
+POOL_MARKER_FILE = ".codex-agent-pool-installed.json"
+POOL_SCHEMA_VERSION = 1
+POOL_DEFAULT_CODEX_BIN = "${CODEX_AGENT_BIN:-/usr/local/bin/codex}"
+POOL_AUTH_POLICIES = ("preserve_existing_only", "copy_explicit_only")
+POOL_PREFIX_RE = re.compile(r"^[a-z][a-z0-9_-]{0,15}$")
+POOL_SAFE_RELATIVE_RE = re.compile(r"^[A-Za-z0-9._-][A-Za-z0-9._/-]{0,199}$")
+MAX_POOL_AGENTS = 1000
+MAX_POOL_SERIES = 26
+MAX_POOL_SHARED_ASSETS = 40
+MAX_POOL_RUNTIME_DIRS = 40
 AGENT_SERIES = ("a", "b", "c")
 AGENTS_PER_SERIES = 100
 AGENT_IDS = tuple(f"{series}{index}" for series in AGENT_SERIES for index in range(1, AGENTS_PER_SERIES + 1))
@@ -4483,6 +4496,8 @@ def sync_plugin_cache_from_repo(
         for name in PLUGIN_CACHE_ALLOWED_FILES:
             src = source_root / name
             if not path_present_no_follow(src):
+                if name in PLUGIN_CACHE_OPTIONAL_FILES:
+                    continue
                 raise AgentError("plugin source is missing a required file")
             counts = copy_plugin_cache_path(src, tmp_entry / name)
             copied_files += counts["files"]
@@ -4490,6 +4505,8 @@ def sync_plugin_cache_from_repo(
         for name in PLUGIN_CACHE_ALLOWED_DIRS:
             src = source_root / name
             if not path_present_no_follow(src):
+                if name in PLUGIN_CACHE_OPTIONAL_DIRS:
+                    continue
                 raise AgentError("plugin source is missing a required directory")
             counts = copy_plugin_cache_path(src, tmp_entry / name)
             copied_files += counts["files"]
@@ -5636,6 +5653,51 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return master_watchdog_status()
     if name == "master_timeout_policy":
         return master_timeout_policy()
+    if name == "agent_pool_validate":
+        return agent_pool_validate(
+            args.get("spec") if isinstance(args.get("spec"), str) else None,
+            args.get("target_dir") if isinstance(args.get("target_dir"), str) else None,
+            args.get("codex_bin") if isinstance(args.get("codex_bin"), str) else None,
+        )
+    if name == "agent_pool_install":
+        return agent_pool_install(
+            args.get("spec") if isinstance(args.get("spec"), str) else None,
+            args.get("target_dir") if isinstance(args.get("target_dir"), str) else None,
+            args.get("codex_bin") if isinstance(args.get("codex_bin"), str) else None,
+            copy_auth_from=args.get("copy_auth_from") if isinstance(args.get("copy_auth_from"), str) else None,
+            copy_auth_to=args.get("copy_auth_to") if isinstance(args.get("copy_auth_to"), str) else None,
+            yes=bool_arg(args, "yes", False),
+            overwrite_auth=bool_arg(args, "overwrite_auth", False),
+        )
+    if name == "agent_pool_status":
+        return agent_pool_status(
+            args.get("spec") if isinstance(args.get("spec"), str) else None,
+            args.get("target_dir") if isinstance(args.get("target_dir"), str) else None,
+            args.get("codex_bin") if isinstance(args.get("codex_bin"), str) else None,
+        )
+    if name == "agent_pool_copy_auth":
+        from_agent = args.get("from_agent")
+        to = args.get("to")
+        if not isinstance(from_agent, str) or not isinstance(to, str):
+            raise AgentError("agent_pool_copy_auth requires from_agent and to")
+        return agent_pool_copy_auth(
+            args.get("spec") if isinstance(args.get("spec"), str) else None,
+            args.get("target_dir") if isinstance(args.get("target_dir"), str) else None,
+            args.get("codex_bin") if isinstance(args.get("codex_bin"), str) else None,
+            from_agent=from_agent,
+            to=to,
+            yes=bool_arg(args, "yes", False),
+            overwrite=bool_arg(args, "overwrite", False),
+        )
+    if name == "agent_pool_destroy_pool":
+        return agent_pool_destroy_pool(
+            args.get("spec") if isinstance(args.get("spec"), str) else None,
+            args.get("target_dir") if isinstance(args.get("target_dir"), str) else None,
+            args.get("codex_bin") if isinstance(args.get("codex_bin"), str) else None,
+            yes=bool_arg(args, "yes", False),
+            force=bool_arg(args, "force", False),
+            remove_root=bool_arg(args, "remove_root", False),
+        )
     if name == "agent_doctor":
         return doctor()
     if name == "agent_send":
@@ -5738,6 +5800,622 @@ def text_array_schema(
     if default is not None:
         schema["default"] = default
     return schema
+
+
+def default_agent_pool_spec() -> dict[str, Any]:
+    return {
+        "schema_version": POOL_SCHEMA_VERSION,
+        "pool_root": "${HOME}/.codex-agents",
+        "codex_bin": POOL_DEFAULT_CODEX_BIN,
+        "series": [
+            {"prefix": "a", "count": 100, "template": "a1", "authenticated": ["a1"]},
+            {"prefix": "b", "count": 100, "template": "b1", "authenticated": ["b1"]},
+            {"prefix": "c", "count": 100, "template": "c1", "authenticated": []},
+        ],
+        "aliases": {"a": "a1", "b": "b1", "both": ["a1", "b1"]},
+        "shared_assets": ["skills", "plugins"],
+        "runtime_dirs": ["sessions", "logs", "tmp"],
+        "auth": {"policy": "preserve_existing_only", "copy": []},
+    }
+
+
+def pool_expand_text(value: str) -> str:
+    def replace_default(match: re.Match[str]) -> str:
+        env_name = match.group(1)
+        default = match.group(2)
+        return os.environ.get(env_name, default)
+
+    text = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*):-([^}]*)\}", replace_default, value)
+    return os.path.expandvars(text)
+
+
+def pool_normalized_path(value: str) -> Path:
+    path = Path(pool_expand_text(value)).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path
+
+
+def pool_public_path_state(path: Path) -> str:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unreadable"
+    if stat_module.S_ISLNK(mode):
+        return "symlink"
+    if stat_module.S_ISDIR(mode):
+        return "directory"
+    if stat_module.S_ISREG(mode):
+        return "file"
+    return "other"
+
+
+def pool_safe_relative_path(value: Any, *, field: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise AgentError(f"{field} must be a non-empty relative path")
+    if len(value) > 200 or not POOL_SAFE_RELATIVE_RE.fullmatch(value):
+        raise AgentError(f"{field} contains unsupported characters")
+    path = Path(value)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise AgentError(f"{field} must stay inside the Agentin home")
+    if path.parts[0] in {"auth.json", "codex", "config.toml"}:
+        raise AgentError(f"{field} must not target protected Agentin files")
+    return path
+
+
+def pool_load_raw_spec(spec_path: str | None = None) -> tuple[dict[str, Any], str]:
+    if spec_path is None:
+        default_path = repo_root() / POOL_SPEC_FILE
+        if not default_path.exists():
+            return default_agent_pool_spec(), "built_in_default"
+        spec_path = str(default_path)
+
+    path = Path(spec_path).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    try:
+        text = path.read_text(encoding="utf-8")
+        payload = json.loads(text)
+    except FileNotFoundError as exc:
+        raise AgentError("pool spec not found") from exc
+    except json.JSONDecodeError as exc:
+        raise AgentError("pool spec is not valid JSON") from exc
+    except OSError as exc:
+        raise AgentError("pool spec is unreadable") from exc
+    if not isinstance(payload, dict):
+        raise AgentError("pool spec must be a JSON object")
+    return payload, "file"
+
+
+def pool_normalize_spec(
+    spec_path: str | None = None,
+    *,
+    target_dir: str | None = None,
+    codex_bin: str | None = None,
+) -> dict[str, Any]:
+    raw, source = pool_load_raw_spec(spec_path)
+    schema_version = raw.get("schema_version", POOL_SCHEMA_VERSION)
+    if schema_version != POOL_SCHEMA_VERSION:
+        raise AgentError(f"unsupported pool schema_version: {schema_version!r}")
+
+    raw_pool_root = target_dir if target_dir is not None else raw.get("pool_root", "${HOME}/.codex-agents")
+    if not isinstance(raw_pool_root, str) or not raw_pool_root:
+        raise AgentError("pool_root must be a non-empty string")
+    pool_root = pool_normalized_path(raw_pool_root)
+
+    raw_codex_bin = codex_bin if codex_bin is not None else raw.get("codex_bin", POOL_DEFAULT_CODEX_BIN)
+    if not isinstance(raw_codex_bin, str) or not raw_codex_bin:
+        raise AgentError("codex_bin must be a non-empty string")
+    codex_bin_value = pool_expand_text(raw_codex_bin)
+
+    raw_series = raw.get("series")
+    if not isinstance(raw_series, list) or not raw_series:
+        raise AgentError("series must be a non-empty array")
+    if len(raw_series) > MAX_POOL_SERIES:
+        raise AgentError(f"series must not contain more than {MAX_POOL_SERIES} entries")
+
+    ids: list[str] = []
+    series_ids: dict[str, list[str]] = {}
+    templates: dict[str, str] = {}
+    authenticated: set[str] = set()
+    prefixes: set[str] = set()
+    for index, item in enumerate(raw_series):
+        if not isinstance(item, dict):
+            raise AgentError(f"series[{index}] must be an object")
+        prefix = item.get("prefix")
+        if not isinstance(prefix, str) or not POOL_PREFIX_RE.fullmatch(prefix):
+            raise AgentError(f"series[{index}].prefix is invalid")
+        if prefix in prefixes:
+            raise AgentError(f"series prefix is duplicated: {prefix}")
+        prefixes.add(prefix)
+        count = normalize_int_field(item.get("count"), field=f"series[{index}].count", minimum=1, maximum=MAX_POOL_AGENTS)
+        current_ids = [f"{prefix}{number}" for number in range(1, count + 1)]
+        template = item.get("template", current_ids[0])
+        if not isinstance(template, str) or template not in current_ids:
+            raise AgentError(f"series[{index}].template must be one of its Agentin ids")
+        auth_items = item.get("authenticated", [])
+        if not isinstance(auth_items, list) or any(not isinstance(agent, str) for agent in auth_items):
+            raise AgentError(f"series[{index}].authenticated must be an array of Agentin ids")
+        unknown_auth = sorted(set(auth_items) - set(current_ids))
+        if unknown_auth:
+            raise AgentError(f"series[{index}].authenticated contains unknown Agentin ids")
+        for agent in current_ids:
+            templates[agent] = template
+        authenticated.update(auth_items)
+        series_ids[f"{prefix}-series"] = current_ids
+        ids.extend(current_ids)
+
+    if len(ids) > MAX_POOL_AGENTS:
+        raise AgentError(f"pool must not contain more than {MAX_POOL_AGENTS} Agentinnen")
+    if len(set(ids)) != len(ids):
+        raise AgentError("pool contains duplicate Agentin ids")
+
+    raw_aliases = raw.get("aliases", {})
+    if not isinstance(raw_aliases, dict):
+        raise AgentError("aliases must be an object")
+    aliases: dict[str, str | list[str]] = {}
+    valid_targets = set(ids) | set(series_ids)
+    for alias, target in raw_aliases.items():
+        if not isinstance(alias, str) or not alias or len(alias) > 64:
+            raise AgentError("alias names must be short strings")
+        if isinstance(target, str):
+            if target not in valid_targets:
+                raise AgentError(f"alias {alias!r} points to an unknown target")
+            aliases[alias] = target
+        elif isinstance(target, list) and target and all(isinstance(agent, str) for agent in target):
+            if any(agent not in valid_targets for agent in target):
+                raise AgentError(f"alias {alias!r} points to an unknown target")
+            aliases[alias] = target[:]
+        else:
+            raise AgentError(f"alias {alias!r} must point to an Agentin id, series selector, or non-empty list")
+
+    shared_assets = raw.get("shared_assets", [])
+    if not isinstance(shared_assets, list) or len(shared_assets) > MAX_POOL_SHARED_ASSETS:
+        raise AgentError(f"shared_assets must be an array with at most {MAX_POOL_SHARED_ASSETS} entries")
+    shared_asset_paths = [pool_safe_relative_path(item, field="shared_assets[]") for item in shared_assets]
+
+    runtime_dirs = raw.get("runtime_dirs", [])
+    if not isinstance(runtime_dirs, list) or len(runtime_dirs) > MAX_POOL_RUNTIME_DIRS:
+        raise AgentError(f"runtime_dirs must be an array with at most {MAX_POOL_RUNTIME_DIRS} entries")
+    runtime_dir_paths = [pool_safe_relative_path(item, field="runtime_dirs[]") for item in runtime_dirs]
+
+    raw_auth = raw.get("auth", {})
+    if not isinstance(raw_auth, dict):
+        raise AgentError("auth must be an object")
+    auth_policy = raw_auth.get("policy", "preserve_existing_only")
+    if auth_policy not in POOL_AUTH_POLICIES:
+        raise AgentError(f"auth.policy must be one of: {', '.join(POOL_AUTH_POLICIES)}")
+
+    return {
+        "raw": raw,
+        "source": source,
+        "schema_version": schema_version,
+        "pool_root": pool_root,
+        "codex_bin": codex_bin_value,
+        "ids": ids,
+        "series_ids": series_ids,
+        "templates": templates,
+        "authenticated": sorted(authenticated),
+        "aliases": aliases,
+        "shared_assets": shared_asset_paths,
+        "runtime_dirs": runtime_dir_paths,
+        "auth_policy": auth_policy,
+    }
+
+
+def pool_selector_ids(normalized: dict[str, Any], selector: str) -> list[str]:
+    if selector == "all":
+        return list(normalized["ids"])
+    series_ids = normalized["series_ids"]
+    if selector in series_ids:
+        return list(series_ids[selector])
+    aliases = normalized["aliases"]
+    if selector in aliases:
+        target = aliases[selector]
+        if isinstance(target, str):
+            return pool_selector_ids(normalized, target)
+        selected: list[str] = []
+        for item in target:
+            selected.extend(pool_selector_ids(normalized, item))
+        return list(dict.fromkeys(selected))
+    if selector in normalized["ids"]:
+        return [selector]
+    raise AgentError("unknown pool selector")
+
+
+def pool_guard_root(pool_root: Path) -> None:
+    resolved = pool_root.resolve(strict=False)
+    forbidden = {Path("/").resolve(), Path.home().resolve(strict=False), repo_root().resolve(strict=False)}
+    if resolved in forbidden or len(resolved.parts) < 3:
+        raise AgentError("refusing unsafe pool root")
+
+
+def pool_shell_double_content(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
+
+
+def pool_wrapper_text(agent: str, home: Path, codex_bin: str) -> str:
+    home_text = pool_shell_double_content(str(home))
+    codex_bin_text = pool_shell_double_content(codex_bin)
+    return "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            "",
+            f'export CODEX_HOME="{home_text}"',
+            f': "${{CODEX_AGENT_BIN:={codex_bin_text}}}"',
+            "unset CODEX_ACCESS_TOKEN OPENAI_API_KEY",
+            'exec "${CODEX_AGENT_BIN}" "$@"',
+            "",
+        ]
+    )
+
+
+def pool_minimal_config(home: Path) -> str:
+    project_key = json.dumps(str(home))
+    return "\n".join(
+        [
+            f'model = "{DEFAULT_AGENT_MODEL}"',
+            f'model_reasoning_effort = "{DEFAULT_AGENT_MODEL_EFFORT}"',
+            'approval_policy = "never"',
+            'sandbox_mode = "danger-full-access"',
+            "",
+            f"[projects.{project_key}]",
+            'trust_level = "trusted"',
+            "",
+        ]
+    )
+
+
+def pool_write_private_file(path: Path, text: str, mode: int) -> None:
+    replace_private_text(path, text)
+    try:
+        path.chmod(mode)
+    except PermissionError:
+        pass
+
+
+def pool_write_private_bytes(path: Path, data: bytes, mode: int) -> None:
+    replace_private_bytes(path, data)
+    try:
+        path.chmod(mode)
+    except PermissionError:
+        pass
+
+
+def pool_read_private_bytes(path: Path, max_bytes: int, error_text: str) -> bytes:
+    try:
+        current = path.lstat()
+    except OSError as exc:
+        raise AgentError(error_text) from exc
+    if stat_module.S_ISLNK(current.st_mode) or not stat_module.S_ISREG(current.st_mode) or current.st_size > max_bytes:
+        raise AgentError(error_text)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(path, flags)
+        opened = os.fstat(fd)
+        if stat_module.S_ISLNK(opened.st_mode) or not stat_module.S_ISREG(opened.st_mode) or opened.st_size > max_bytes:
+            raise AgentError(error_text)
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            data = fh.read(max_bytes + 1)
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError(error_text) from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(data) > max_bytes:
+        raise AgentError(error_text)
+    return data
+
+
+def pool_marker_payload(normalized: dict[str, Any]) -> dict[str, Any]:
+    digest = hashlib.sha256(json.dumps(normalized["raw"], sort_keys=True).encode("utf-8")).hexdigest()
+    return {
+        "schema_version": normalized["schema_version"],
+        "installed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "agent_count": len(normalized["ids"]),
+        "series_count": len(normalized["series_ids"]),
+        "spec_sha256": digest,
+        "codex_bin_state": "configured",
+        "pool_root": PATH_NOT_RETURNED,
+    }
+
+
+def agent_pool_validate(
+    spec: str | None = None,
+    target_dir: str | None = None,
+    codex_bin: str | None = None,
+) -> dict[str, Any]:
+    normalized = pool_normalize_spec(spec, target_dir=target_dir, codex_bin=codex_bin)
+    return {
+        "ok": True,
+        "schema_version": normalized["schema_version"],
+        "spec_source": normalized["source"],
+        "pool_root": PATH_NOT_RETURNED,
+        "pool_root_state": pool_public_path_state(normalized["pool_root"]),
+        "codex_bin_state": "configured",
+        "expected_agent_count": len(normalized["ids"]),
+        "series_count": len(normalized["series_ids"]),
+        "series": {name: len(ids) for name, ids in sorted(normalized["series_ids"].items())},
+        "alias_count": len(normalized["aliases"]),
+        "aliases": sorted(normalized["aliases"]),
+        "authenticated_agent_count": len(normalized["authenticated"]),
+        "authenticated_agents": normalized["authenticated"],
+        "shared_asset_count": len(normalized["shared_assets"]),
+        "runtime_dir_count": len(normalized["runtime_dirs"]),
+        "auth_policy": normalized["auth_policy"],
+        "raw_output": "not_returned",
+    }
+
+
+def agent_pool_status(
+    spec: str | None = None,
+    target_dir: str | None = None,
+    codex_bin: str | None = None,
+) -> dict[str, Any]:
+    normalized = pool_normalize_spec(spec, target_dir=target_dir, codex_bin=codex_bin)
+    root = normalized["pool_root"]
+    ids = normalized["ids"]
+    existing = 0
+    wrappers = 0
+    configs = 0
+    auth = 0
+    shared_symlinks = 0
+    for agent in ids:
+        home = root / agent
+        if is_real_directory_no_symlink(home):
+            existing += 1
+        if is_regular_executable_no_symlink(home / "codex"):
+            wrappers += 1
+        if (home / "config.toml").is_file() and not (home / "config.toml").is_symlink():
+            configs += 1
+        if (home / "auth.json").is_file() and not (home / "auth.json").is_symlink():
+            auth += 1
+        for asset in normalized["shared_assets"]:
+            if (home / asset).is_symlink():
+                shared_symlinks += 1
+
+    missing = len(ids) - existing
+    marker = root / POOL_MARKER_FILE
+    return {
+        "ok": missing == 0 and wrappers == len(ids),
+        "pool_root": PATH_NOT_RETURNED,
+        "pool_root_state": pool_public_path_state(root),
+        "marker_state": pool_public_path_state(marker),
+        "expected_agent_count": len(ids),
+        "existing_agent_count": existing,
+        "missing_agent_count": missing,
+        "wrapper_executable_count": wrappers,
+        "config_count": configs,
+        "auth_count": auth,
+        "shared_asset_symlink_count": shared_symlinks,
+        "series": {name: len(pool_selector_ids(normalized, name)) for name in sorted(normalized["series_ids"])},
+        "raw_output": "not_returned",
+    }
+
+
+def agent_pool_install(
+    spec: str | None = None,
+    target_dir: str | None = None,
+    codex_bin: str | None = None,
+    *,
+    copy_auth_from: str | None = None,
+    copy_auth_to: str | None = None,
+    yes: bool = False,
+    overwrite_auth: bool = False,
+) -> dict[str, Any]:
+    normalized = pool_normalize_spec(spec, target_dir=target_dir, codex_bin=codex_bin)
+    root = normalized["pool_root"]
+    pool_guard_root(root)
+    ensure_private_dir(root)
+
+    created = 0
+    updated_wrappers = 0
+    created_configs = 0
+    created_runtime_dirs = 0
+    linked_assets = 0
+    missing_asset_sources = 0
+    skipped_existing_assets = 0
+
+    for agent in normalized["ids"]:
+        home = root / agent
+        before = home.exists()
+        ensure_private_dir(home)
+        if not before:
+            created += 1
+
+        wrapper = pool_wrapper_text(agent, home, normalized["codex_bin"])
+        wrapper_path = home / "codex"
+        if not wrapper_path.exists() or wrapper_path.read_text(encoding="utf-8", errors="replace") != wrapper:
+            pool_write_private_file(wrapper_path, wrapper, 0o700)
+            updated_wrappers += 1
+
+        config_path = home / "config.toml"
+        if not config_path.exists():
+            pool_write_private_file(config_path, pool_minimal_config(home), 0o600)
+            created_configs += 1
+
+        for runtime_dir in normalized["runtime_dirs"]:
+            runtime_path = home / runtime_dir
+            if not runtime_path.exists():
+                ensure_private_dir(runtime_path)
+                created_runtime_dirs += 1
+
+        template = normalized["templates"][agent]
+        if template == agent:
+            continue
+        template_home = root / template
+        for asset in normalized["shared_assets"]:
+            source = template_home / asset
+            target = home / asset
+            if target.exists() or target.is_symlink():
+                skipped_existing_assets += 1
+                continue
+            if not source.exists():
+                missing_asset_sources += 1
+                continue
+            ensure_private_dir(target.parent)
+            relative_source = os.path.relpath(source, target.parent)
+            target.symlink_to(relative_source)
+            linked_assets += 1
+
+    marker = root / POOL_MARKER_FILE
+    pool_write_private_file(marker, json.dumps(pool_marker_payload(normalized), indent=2, sort_keys=True) + "\n", 0o600)
+
+    auth_result: dict[str, Any] | None = None
+    if copy_auth_from or copy_auth_to:
+        if not copy_auth_from or not copy_auth_to:
+            raise AgentError("copy_auth_from and copy_auth_to must be provided together")
+        auth_result = agent_pool_copy_auth(
+            spec,
+            target_dir,
+            codex_bin,
+            from_agent=copy_auth_from,
+            to=copy_auth_to,
+            yes=yes,
+            overwrite=overwrite_auth,
+        )
+
+    return {
+        "ok": True,
+        "pool_root": PATH_NOT_RETURNED,
+        "installed_agent_count": len(normalized["ids"]),
+        "created_agent_homes": created,
+        "updated_wrappers": updated_wrappers,
+        "created_configs": created_configs,
+        "created_runtime_dirs": created_runtime_dirs,
+        "linked_shared_assets": linked_assets,
+        "skipped_existing_shared_assets": skipped_existing_assets,
+        "missing_shared_asset_sources": missing_asset_sources,
+        "auth": auth_result,
+        "raw_output": "not_returned",
+    }
+
+
+def agent_pool_copy_auth(
+    spec: str | None = None,
+    target_dir: str | None = None,
+    codex_bin: str | None = None,
+    *,
+    from_agent: str,
+    to: str,
+    yes: bool = False,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    normalized = pool_normalize_spec(spec, target_dir=target_dir, codex_bin=codex_bin)
+    root = normalized["pool_root"]
+    pool_guard_root(root)
+    if from_agent not in normalized["ids"]:
+        raise AgentError("from_agent is not part of the pool")
+    target_ids = [agent for agent in pool_selector_ids(normalized, to) if agent != from_agent]
+    if not target_ids:
+        raise AgentError("copy_auth target selector resolves to no target Agentinnen")
+
+    source = root / from_agent / "auth.json"
+    auth_bytes = pool_read_private_bytes(source, MAX_CODEX_CONFIG_BYTES, "source auth is missing or invalid")
+    copyable = 0
+    copied = 0
+    skipped_existing = 0
+    skipped_missing_home = 0
+
+    for agent in target_ids:
+        home = root / agent
+        if not is_real_directory_no_symlink(home):
+            skipped_missing_home += 1
+            continue
+        target = home / "auth.json"
+        if target.exists() and not overwrite:
+            skipped_existing += 1
+            continue
+        copyable += 1
+        if yes:
+            pool_write_private_bytes(target, auth_bytes, 0o600)
+            copied += 1
+
+    return {
+        "ok": True,
+        "dry_run": not yes,
+        "source_agent": from_agent,
+        "target_selector": to,
+        "target_count": len(target_ids),
+        "copyable_count": copyable,
+        "copied_count": copied,
+        "skipped_existing_count": skipped_existing,
+        "skipped_missing_home_count": skipped_missing_home,
+        "overwrite": overwrite,
+        "auth_content": "not_returned",
+        "pool_root": PATH_NOT_RETURNED,
+        "raw_output": "not_returned",
+    }
+
+
+def agent_pool_destroy_pool(
+    spec: str | None = None,
+    target_dir: str | None = None,
+    codex_bin: str | None = None,
+    *,
+    yes: bool = False,
+    force: bool = False,
+    remove_root: bool = False,
+) -> dict[str, Any]:
+    normalized = pool_normalize_spec(spec, target_dir=target_dir, codex_bin=codex_bin)
+    root = normalized["pool_root"]
+    pool_guard_root(root)
+    if not yes:
+        raise AgentError("destroy_pool requires yes=true")
+    marker = root / POOL_MARKER_FILE
+    if not marker.exists() and not force:
+        raise AgentError("destroy_pool requires an installed pool marker or force=true")
+
+    removed = 0
+    missing = 0
+    skipped = 0
+    for agent in normalized["ids"]:
+        target = root / agent
+        try:
+            mode = target.lstat().st_mode
+        except FileNotFoundError:
+            missing += 1
+            continue
+        except OSError:
+            skipped += 1
+            continue
+        if stat_module.S_ISLNK(mode) or stat_module.S_ISREG(mode):
+            target.unlink()
+            removed += 1
+        elif stat_module.S_ISDIR(mode):
+            shutil.rmtree(target)
+            removed += 1
+        else:
+            skipped += 1
+
+    if marker.exists() and not marker.is_symlink():
+        marker.unlink()
+    root_removed = False
+    if remove_root:
+        try:
+            root.rmdir()
+            root_removed = True
+        except OSError:
+            root_removed = False
+
+    return {
+        "ok": skipped == 0,
+        "pool_root": PATH_NOT_RETURNED,
+        "removed_agent_entries": removed,
+        "missing_agent_entries": missing,
+        "skipped_agent_entries": skipped,
+        "root_removed": root_removed,
+        "raw_output": "not_returned",
+    }
 
 
 TOOLS: list[dict[str, Any]] = [
@@ -6166,6 +6844,84 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
+        "name": "agent_pool_validate",
+        "description": "Validate a machine-readable Codex Agentinnen pool spec and return data-sparse counts only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spec": text_schema(MAX_PATH_TEXT, description="Optional pool spec JSON path. Defaults to repo codex-agent-pool.json."),
+                "target_dir": text_schema(MAX_PATH_TEXT, description="Optional target pool root override."),
+                "codex_bin": text_schema(MAX_PATH_TEXT, description="Optional Codex CLI binary override."),
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_pool_install",
+        "description": "Install or refresh sleeping Codex Agentinnen homes from a pool spec. Does not start Agentinnen or return local paths.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spec": text_schema(MAX_PATH_TEXT, description="Optional pool spec JSON path. Defaults to repo codex-agent-pool.json."),
+                "target_dir": text_schema(MAX_PATH_TEXT, description="Optional target pool root override."),
+                "codex_bin": text_schema(MAX_PATH_TEXT, description="Optional Codex CLI binary override."),
+                "copy_auth_from": text_schema(64, description="Optional source Agentin id for mass auth copy."),
+                "copy_auth_to": text_schema(64, description="Optional target selector for mass auth copy."),
+                "yes": {"type": "boolean", "default": False},
+                "overwrite_auth": {"type": "boolean", "default": False},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_pool_status",
+        "description": "Return data-sparse installation status for a Codex Agentinnen pool spec.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "spec": text_schema(MAX_PATH_TEXT, description="Optional pool spec JSON path. Defaults to repo codex-agent-pool.json."),
+                "target_dir": text_schema(MAX_PATH_TEXT, description="Optional target pool root override."),
+                "codex_bin": text_schema(MAX_PATH_TEXT, description="Optional Codex CLI binary override."),
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_pool_copy_auth",
+        "description": "Copy one source Agentin auth.json to many installed Agentinnen. Dry-run unless yes=true; never returns auth content.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["from_agent", "to"],
+            "properties": {
+                "spec": text_schema(MAX_PATH_TEXT, description="Optional pool spec JSON path. Defaults to repo codex-agent-pool.json."),
+                "target_dir": text_schema(MAX_PATH_TEXT, description="Optional target pool root override."),
+                "codex_bin": text_schema(MAX_PATH_TEXT, description="Optional Codex CLI binary override."),
+                "from_agent": text_schema(64),
+                "to": text_schema(64, description="Target selector such as a-series, b-series, all, or one Agentin id."),
+                "yes": {"type": "boolean", "default": False},
+                "overwrite": {"type": "boolean", "default": False},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_pool_destroy_pool",
+        "description": "Remove installed Agentinnen homes defined by a pool spec. Requires yes=true and installed marker unless force=true.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["yes"],
+            "properties": {
+                "spec": text_schema(MAX_PATH_TEXT, description="Optional pool spec JSON path. Defaults to repo codex-agent-pool.json."),
+                "target_dir": text_schema(MAX_PATH_TEXT, description="Optional target pool root override."),
+                "codex_bin": text_schema(MAX_PATH_TEXT, description="Optional Codex CLI binary override."),
+                "yes": {"type": "boolean"},
+                "force": {"type": "boolean", "default": False},
+                "remove_root": {"type": "boolean", "default": False},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "agent_doctor",
         "description": "Return structured diagnostics for installation, MCP registration, runners, and tmux sessions. Does not return raw output.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -6531,6 +7287,40 @@ def main_cli(argv: list[str]) -> int:
     sub.add_parser("watchdog-status")
     sub.add_parser("timeout-policy")
 
+    p_pool = sub.add_parser("pool")
+    pool_sub = p_pool.add_subparsers(dest="pool_command", required=True)
+
+    def add_pool_common(parser_obj: argparse.ArgumentParser) -> None:
+        parser_obj.add_argument("--spec", help="Pool spec JSON path. Defaults to repo codex-agent-pool.json.")
+        parser_obj.add_argument("--target-dir", help="Target directory where the Agentinnen pool is or should be created.")
+        parser_obj.add_argument("--codex-bin", help="Codex CLI binary path or command override.")
+
+    p_pool_validate = pool_sub.add_parser("validate")
+    add_pool_common(p_pool_validate)
+
+    p_pool_install = pool_sub.add_parser("install")
+    add_pool_common(p_pool_install)
+    p_pool_install.add_argument("--copy-auth-from")
+    p_pool_install.add_argument("--copy-auth-to")
+    p_pool_install.add_argument("--yes", action="store_true")
+    p_pool_install.add_argument("--overwrite-auth", action="store_true")
+
+    p_pool_status = pool_sub.add_parser("status")
+    add_pool_common(p_pool_status)
+
+    p_pool_copy_auth = pool_sub.add_parser("copy_auth")
+    add_pool_common(p_pool_copy_auth)
+    p_pool_copy_auth.add_argument("--from-agent", required=True)
+    p_pool_copy_auth.add_argument("--to", required=True)
+    p_pool_copy_auth.add_argument("--yes", action="store_true")
+    p_pool_copy_auth.add_argument("--overwrite", action="store_true")
+
+    p_pool_destroy = pool_sub.add_parser("destroy_pool", aliases=["destroy-pool"])
+    add_pool_common(p_pool_destroy)
+    p_pool_destroy.add_argument("--yes", action="store_true")
+    p_pool_destroy.add_argument("--force", action="store_true")
+    p_pool_destroy.add_argument("--remove-root", action="store_true")
+
     p_install = sub.add_parser("install")
     p_install.add_argument("--no-register", action="store_true")
     p_install.add_argument("--no-plugin-cache", action="store_true")
@@ -6742,6 +7532,50 @@ def main_cli(argv: list[str]) -> int:
             return print_json(call_validated_tool("master_watchdog_status", {}))
         if args.command == "timeout-policy":
             return print_json(call_validated_tool("master_timeout_policy", {}))
+        if args.command == "pool":
+            common = {"spec": args.spec, "target_dir": args.target_dir, "codex_bin": args.codex_bin}
+            if args.pool_command == "validate":
+                return print_json(call_validated_tool("agent_pool_validate", common))
+            if args.pool_command == "install":
+                return print_json(
+                    call_validated_tool(
+                        "agent_pool_install",
+                        {
+                            **common,
+                            "copy_auth_from": args.copy_auth_from,
+                            "copy_auth_to": args.copy_auth_to,
+                            "yes": args.yes,
+                            "overwrite_auth": args.overwrite_auth,
+                        },
+                    )
+                )
+            if args.pool_command == "status":
+                return print_json(call_validated_tool("agent_pool_status", common))
+            if args.pool_command == "copy_auth":
+                return print_json(
+                    call_validated_tool(
+                        "agent_pool_copy_auth",
+                        {
+                            **common,
+                            "from_agent": args.from_agent,
+                            "to": args.to,
+                            "yes": args.yes,
+                            "overwrite": args.overwrite,
+                        },
+                    )
+                )
+            if args.pool_command in {"destroy_pool", "destroy-pool"}:
+                return print_json(
+                    call_validated_tool(
+                        "agent_pool_destroy_pool",
+                        {
+                            **common,
+                            "yes": args.yes,
+                            "force": args.force,
+                            "remove_root": args.remove_root,
+                        },
+                    )
+                )
         if args.command == "install":
             return print_json(
                 install(

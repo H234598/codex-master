@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/H234598/codex-master/schemas/codex-agent-pool.schema.json",
+  "title": "codex-master Agentinnen Pool",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "series"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "pool_root": {
+      "type": "string",
+      "default": "${HOME}/.codex-agents"
+    },
+    "codex_bin": {
+      "type": "string",
+      "default": "${CODEX_AGENT_BIN:-/usr/local/bin/codex}"
+    },
+    "series": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 26,
+      "items": {
+        "type": "object",
+        "required": [
+          "prefix",
+          "count"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "prefix": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_-]{0,15}$"
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000
+          },
+          "template": {
+            "type": "string"
+          },
+          "authenticated": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": []
+          }
+        }
+      }
+    },
+    "aliases": {
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1
+          }
+        ]
+      },
+      "default": {}
+    },
+    "shared_assets": {
+      "type": "array",
+      "maxItems": 40,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9._-][A-Za-z0-9._/-]{0,199}$"
+      },
+      "default": []
+    },
+    "runtime_dirs": {
+      "type": "array",
+      "maxItems": 40,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9._-][A-Za-z0-9._/-]{0,199}$"
+      },
+      "default": []
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "policy": {
+          "type": "string",
+          "enum": [
+            "preserve_existing_only",
+            "copy_explicit_only"
+          ],
+          "default": "preserve_existing_only"
+        },
+        "copy": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "default": []
+        }
+      },
+      "default": {
+        "policy": "preserve_existing_only",
+        "copy": []
+      }
+    }
+  }
+}
