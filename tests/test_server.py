@@ -39,6 +39,7 @@ from codex_master.server import (
     check_mcp_registration,
     call_tool,
     claim_agent,
+    claim_agent_with_wait,
     classify_limit_text,
     classify_tui_context,
     codex_related_process_summary,
@@ -1916,6 +1917,22 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(blocked_payload["error_code"], "agent_lease_held_by_other_client")
         self.assertEqual(forced["status"], "released")
         self.assertEqual(forced["lease"]["state"], "unclaimed")
+
+    def test_agent_claim_wait_rejects_invalid_direct_interval_values(self) -> None:
+        with self.assertRaisesRegex(AgentError, "wait_seconds must be an integer"):
+            claim_agent_with_wait("a", wait_seconds="nope")
+        with self.assertRaisesRegex(AgentError, "poll_interval_seconds must be an integer"):
+            claim_agent_with_wait("a", poll_interval_seconds=True)
+        with self.assertRaisesRegex(AgentError, f"poll_interval_seconds must be <= {MAX_WAIT_POLL_SECONDS}"):
+            claim_agent_with_wait("a", poll_interval_seconds=MAX_WAIT_POLL_SECONDS + 1)
+
+    def test_wait_agent_rejects_invalid_direct_interval_values(self) -> None:
+        with self.assertRaisesRegex(AgentError, "timeout_seconds must be an integer"):
+            wait_agent("a", timeout_seconds=None)
+        with self.assertRaisesRegex(AgentError, "poll_interval_seconds must be an integer"):
+            wait_agent("a", poll_interval_seconds=False)
+        with self.assertRaisesRegex(AgentError, f"poll_interval_seconds must be <= {MAX_WAIT_POLL_SECONDS}"):
+            wait_agent("a", poll_interval_seconds=MAX_WAIT_POLL_SECONDS + 1)
 
     @patch("codex_master.server.start_agent", return_value={"agent": "a", "status": "started"})
     @patch("codex_master.server.tmux_alive", return_value=True)

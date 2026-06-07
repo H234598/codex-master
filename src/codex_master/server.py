@@ -956,18 +956,35 @@ def lease_utc(timestamp: float | int | None) -> str | None:
         return None
 
 
-def normalize_lease_seconds(value: Any) -> int:
+def normalize_int_field(value: Any, *, field: str, minimum: int, maximum: int) -> int:
     if isinstance(value, bool):
-        raise AgentError("ttl_seconds must be an integer")
+        raise AgentError(f"{field} must be an integer")
     try:
-        seconds = int(value)
+        number = int(value)
     except (TypeError, ValueError) as exc:
-        raise AgentError("ttl_seconds must be an integer") from exc
-    if seconds < 1:
-        raise AgentError("ttl_seconds must be >= 1")
-    if seconds > MAX_AGENT_LEASE_SECONDS:
-        raise AgentError(f"ttl_seconds must be <= {MAX_AGENT_LEASE_SECONDS}")
-    return seconds
+        raise AgentError(f"{field} must be an integer") from exc
+    if number < minimum:
+        raise AgentError(f"{field} must be >= {minimum}")
+    if number > maximum:
+        raise AgentError(f"{field} must be <= {maximum}")
+    return number
+
+
+def normalize_lease_seconds(value: Any) -> int:
+    return normalize_int_field(value, field="ttl_seconds", minimum=1, maximum=MAX_AGENT_LEASE_SECONDS)
+
+
+def normalize_wait_seconds(value: Any) -> int:
+    return normalize_int_field(value, field="wait_seconds", minimum=0, maximum=MAX_WAIT_SECONDS)
+
+
+def normalize_poll_interval_seconds(value: Any) -> int:
+    return normalize_int_field(
+        value,
+        field="poll_interval_seconds",
+        minimum=1,
+        maximum=MAX_WAIT_POLL_SECONDS,
+    )
 
 
 def read_agent_lease_record(agent: str) -> dict[str, Any] | None:
@@ -1156,8 +1173,8 @@ def claim_agent_with_wait(
     wait_seconds: int = 0,
     poll_interval_seconds: int = DEFAULT_WAIT_POLL_SECONDS,
 ) -> dict[str, Any]:
-    wait_seconds = max(0, min(int(wait_seconds), MAX_WAIT_SECONDS))
-    poll_interval_seconds = max(1, min(int(poll_interval_seconds), MAX_WAIT_POLL_SECONDS))
+    wait_seconds = normalize_wait_seconds(wait_seconds)
+    poll_interval_seconds = normalize_poll_interval_seconds(poll_interval_seconds)
     started = time.monotonic()
     deadline = started + wait_seconds
     polls = 0
@@ -2010,8 +2027,13 @@ def wait_terminal_status(status: dict[str, Any], initial: dict[str, Any]) -> str
 def wait_agent(agent: str, timeout_seconds: int = DEFAULT_WAIT_SECONDS, poll_interval_seconds: int = DEFAULT_WAIT_POLL_SECONDS) -> dict[str, Any]:
     if agent not in {"a", "b"}:
         raise AgentError("agent must be a or b")
-    timeout_seconds = max(0, min(int(timeout_seconds), MAX_WAIT_SECONDS))
-    poll_interval_seconds = max(1, min(int(poll_interval_seconds), MAX_WAIT_POLL_SECONDS))
+    timeout_seconds = normalize_int_field(
+        timeout_seconds,
+        field="timeout_seconds",
+        minimum=0,
+        maximum=MAX_WAIT_SECONDS,
+    )
+    poll_interval_seconds = normalize_poll_interval_seconds(poll_interval_seconds)
     started = time.monotonic()
     deadline = started + timeout_seconds
     initial = status_agent(agent)
