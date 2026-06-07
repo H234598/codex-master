@@ -70,7 +70,7 @@ MAX_WAIT_POLL_SECONDS = 900
 DEFAULT_WATCHDOG_IDLE_SECONDS = 60
 MAX_WATCHDOG_IDLE_SECONDS = 24 * 60 * 60
 DEFAULT_WATCHDOG_POLL_SECONDS = 15
-DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS = 120
+DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS = 15
 MAX_WATCHDOG_REPORT_GRACE_SECONDS = 10 * 60
 DEFAULT_AGENT_LEASE_SECONDS = 1800
 MAX_AGENT_LEASE_SECONDS = 7200
@@ -5697,6 +5697,7 @@ def main_cli(argv: list[str]) -> int:
     p_watchdog.add_argument("--no-require-lease", action="store_true")
     p_watchdog.add_argument("--manage-unclaimed", action="store_true")
     p_watchdog.add_argument("--dry-run", action="store_true")
+    p_watchdog.add_argument("--quiet", action="store_true")
 
     p_send = sub.add_parser("send")
     p_send.add_argument("agent", choices=["a", "b"])
@@ -5859,21 +5860,22 @@ def main_cli(argv: list[str]) -> int:
                 )
             )
         if args.command == "watchdog":
-            return print_json(
-                call_validated_tool(
-                    "fleet_watchdog",
-                    {
-                        "agent": args.agent,
-                        "idle_seconds": args.idle_seconds,
-                        "poll_interval_seconds": args.poll_interval_seconds,
-                        "report_grace_seconds": args.report_grace_seconds,
-                        "action": args.action,
-                        "require_lease": not args.no_require_lease,
-                        "manage_unclaimed": args.manage_unclaimed,
-                        "dry_run": args.dry_run,
-                    },
-                )
+            payload = call_validated_tool(
+                "fleet_watchdog",
+                {
+                    "agent": args.agent,
+                    "idle_seconds": args.idle_seconds,
+                    "poll_interval_seconds": args.poll_interval_seconds,
+                    "report_grace_seconds": args.report_grace_seconds,
+                    "action": args.action,
+                    "require_lease": not args.no_require_lease,
+                    "manage_unclaimed": args.manage_unclaimed,
+                    "dry_run": args.dry_run,
+                },
             )
+            if args.quiet:
+                return 0
+            return print_json(payload)
         if args.command == "send":
             return print_json(call_validated_tool("agent_send", {"agent": args.agent, "text": args.text, "enter": not args.no_enter}))
         if args.command == "interrupt":

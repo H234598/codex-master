@@ -71,12 +71,13 @@ and is capped at 10 minutes per call. Its poll interval defaults to 30 seconds
 and is capped at 900 seconds.
 `fleet_watchdog` checks idle Agentinnen without reading raw output. It defaults
 to a 60 second idle threshold and asks the Agentin for a concise report before
-any escalation. The report grace window defaults to 120 seconds, so the 15
-second systemd timer gives the Agentin several checks to report before a later
-run can interrupt, stop, or release it. By default the watchdog only mutates
+any escalation. The report grace window defaults to 15 seconds, so the next
+systemd timer pass can escalate only after the Agentin had one interval to
+report. By default the watchdog only mutates
 Agentinnen leased by the current server; the systemd supervisor uses
-`--manage-unclaimed` to handle unclaimed or expired leases while still skipping
-active leases held by other clients.
+`--manage-unclaimed --quiet` to handle unclaimed or expired leases while still
+skipping active leases held by other clients and avoiding successful JSON noise
+in the user journal.
 
 ## Tools
 
@@ -152,7 +153,7 @@ python3 -m codex_master.server status
 python3 -m codex_master.server lease-status all
 python3 -m codex_master.server claim b --wait-seconds 600 --poll-interval-seconds 30
 python3 -m codex_master.server wait a --timeout-seconds 120 --poll-interval-seconds 30
-python3 -m codex_master.server watchdog all --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 120 --action interrupt --manage-unclaimed
+python3 -m codex_master.server watchdog all --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 15 --action interrupt --manage-unclaimed --quiet
 python3 -m codex_master.server capabilities all
 python3 -m codex_master.server skills all
 python3 -m codex_master.server skills a --include-names --limit 20 --names-offset 20 --plugins-offset 20 --plugins-limit 20
@@ -242,7 +243,7 @@ python3 -m codex_master.server stop both
 - classifies idle state from structured `status` metadata and raw-log metadata
   only; it does not call `tail` or return Agentin output
 - defaults to `idle_seconds=60`, `poll_interval_seconds=15`,
-  `report_grace_seconds=120`, and `action=interrupt`
+  `report_grace_seconds=15`, and `action=interrupt`
 - always asks the Agentin for a concise report before `interrupt`, `stop`, or
   `release`
 - stores only a metadata marker with request time, assignment ID, planned
@@ -250,6 +251,8 @@ python3 -m codex_master.server stop both
   stored in the marker
 - skips active leases held by other clients; `--manage-unclaimed` may supervise
   only unclaimed or expired leases in addition to this server's own lease
+- supports `--quiet` for systemd runs; successful watchdog passes produce no
+  JSON output, while failures still use the normal CLI error path
 - is installed as an optional `systemd --user` top layer through
   `systemd/user/codex-master-watchdog.service` and
   `systemd/user/codex-master-watchdog.timer`

@@ -394,7 +394,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(claim_props["poll_interval_seconds"]["maximum"], MAX_WAIT_POLL_SECONDS)
         self.assertEqual(DEFAULT_WATCHDOG_IDLE_SECONDS, 60)
         self.assertEqual(DEFAULT_WATCHDOG_POLL_SECONDS, 15)
-        self.assertEqual(DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS, 120)
+        self.assertEqual(DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS, 15)
         self.assertEqual(watchdog_props["idle_seconds"]["default"], DEFAULT_WATCHDOG_IDLE_SECONDS)
         self.assertEqual(watchdog_props["poll_interval_seconds"]["default"], DEFAULT_WATCHDOG_POLL_SECONDS)
         self.assertEqual(watchdog_props["poll_interval_seconds"]["maximum"], MAX_WAIT_POLL_SECONDS)
@@ -1229,7 +1229,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.4.0+codex.test",
+            "version": "0.4.1+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1256,7 +1256,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.4.0")
+        self.assertEqual(result["expected_tag"], "v0.4.1")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -2006,7 +2006,7 @@ class ServerHelpersTest(unittest.TestCase):
         marker = {
             "watchdog": {
                 "phase": "report_requested",
-                "requested_at_utc": "1970-01-01T00:16:10+00:00",
+                "requested_at_utc": "1970-01-01T00:16:30+00:00",
                 "assignment_id": "assign-1",
                 "planned_action": "interrupt",
                 "raw_log_bytes": 100,
@@ -2026,7 +2026,7 @@ class ServerHelpersTest(unittest.TestCase):
         payload = result["results"][0]
         self.assertEqual(payload["watchdog_state"], "waiting_for_report")
         self.assertEqual(payload["action_taken"], "none")
-        self.assertEqual(payload["report_elapsed_seconds"], 30)
+        self.assertEqual(payload["report_elapsed_seconds"], 10)
         mock_report.assert_not_called()
         mock_interrupt.assert_not_called()
 
@@ -3943,6 +3943,18 @@ class CliLifecycleTest(unittest.TestCase):
         mock_call_tool.assert_not_called()
         payload = json.loads(mock_print.call_args.args[0])
         self.assertEqual(payload["error"], "timeout_seconds must be >= 0")
+
+    @patch("codex_master.server.print_json")
+    @patch("codex_master.server.call_tool", return_value={"status": "ok", "raw_output": "not_returned"})
+    def test_cli_watchdog_quiet_suppresses_success_json(self, mock_call_tool, mock_print_json) -> None:
+        result = main_cli(["watchdog", "all", "--manage-unclaimed", "--quiet"])
+
+        self.assertEqual(result, 0)
+        mock_call_tool.assert_called_once()
+        name, args = mock_call_tool.call_args.args
+        self.assertEqual(name, "fleet_watchdog")
+        self.assertTrue(args["manage_unclaimed"])
+        mock_print_json.assert_not_called()
 
     @patch("codex_master.server.ensure_state")
     @patch("builtins.print")
