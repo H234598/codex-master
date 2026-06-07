@@ -7,7 +7,18 @@ from pathlib import Path
 import os
 from unittest.mock import patch
 
-from codex_master.server import handle_rpc, main_cli, redact, start_agent, strip_ansi, trim_chars, trim_lines
+from codex_master.server import (
+    MAX_ASSIGNMENT_LIST_ITEMS,
+    MAX_SEND_TEXT,
+    MAX_TASK_TEXT,
+    handle_rpc,
+    main_cli,
+    redact,
+    start_agent,
+    strip_ansi,
+    trim_chars,
+    trim_lines,
+)
 
 
 class ServerHelpersTest(unittest.TestCase):
@@ -48,6 +59,11 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("worktree_status", names)
         self.assertIn("commit_ready_check", names)
         self.assertIn("master_plugin_status", names)
+        by_name = {tool["name"]: tool for tool in response["result"]["tools"]}
+        assign_props = by_name["agent_assign"]["inputSchema"]["properties"]
+        self.assertEqual(assign_props["task"]["maxLength"], MAX_TASK_TEXT)
+        self.assertEqual(assign_props["context"]["maxItems"], MAX_ASSIGNMENT_LIST_ITEMS)
+        self.assertEqual(by_name["agent_send"]["inputSchema"]["properties"]["text"]["maxLength"], MAX_SEND_TEXT)
 
     def test_initialize_rejects_unsupported_protocol(self) -> None:
         response = handle_rpc(
@@ -597,6 +613,32 @@ class ServerHelpersTest(unittest.TestCase):
                         },
                     }
                 )
+                long_task = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 28,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "agent_assign_readonly",
+                            "arguments": {"agent": "a", "task": "x" * (MAX_TASK_TEXT + 1)},
+                        },
+                    }
+                )
+                too_many_context_items = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 29,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "agent_assign_readonly",
+                            "arguments": {
+                                "agent": "a",
+                                "task": "nur lesen",
+                                "context": ["x"] * (MAX_ASSIGNMENT_LIST_ITEMS + 1),
+                            },
+                        },
+                    }
+                )
 
         self.assertTrue(readonly["result"]["isError"])
         self.assertIn("must not include write paths", readonly["result"]["content"][0]["text"])
@@ -606,6 +648,26 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("skill not found", missing_skill["result"]["content"][0]["text"])
         self.assertTrue(outside_scope["result"]["isError"])
         self.assertIn("write paths must stay inside scope", outside_scope["result"]["content"][0]["text"])
+        self.assertTrue(long_task["result"]["isError"])
+        self.assertIn("task exceeds", long_task["result"]["content"][0]["text"])
+        self.assertTrue(too_many_context_items["result"]["isError"])
+        self.assertIn("context must contain at most", too_many_context_items["result"]["content"][0]["text"])
+
+    def test_agent_send_rejects_oversized_text_before_tmux(self) -> None:
+        response = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 41,
+                "method": "tools/call",
+                "params": {
+                    "name": "agent_send",
+                    "arguments": {"agent": "a", "text": "x" * (MAX_SEND_TEXT + 1)},
+                },
+            }
+        )
+
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("text exceeds", response["result"]["content"][0]["text"])
 
 
 class CliLifecycleTest(unittest.TestCase):

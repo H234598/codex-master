@@ -59,6 +59,14 @@ MAX_CAPABILITY_PLUGINS = 20
 MAX_ASSIGNMENT_RECORDS = 100
 MAX_ASSIGNMENT_LOG_RECORDS = 500
 MAX_ASSIGNMENT_TEXT = 12000
+MAX_SEND_TEXT = 12000
+MAX_TASK_TEXT = 4000
+MAX_TEXT_FIELD = 1000
+MAX_ASSIGNMENT_LIST_ITEMS = 50
+MAX_AGENTIN_NAME = 80
+MAX_SKILL_REF = 300
+MAX_PATH_TEXT = 1000
+MAX_ASSIGNMENT_ID = 200
 DEFAULT_AGENTIN_NAMES = {"a": "Mila", "b": "Nora"}
 
 
@@ -252,6 +260,8 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
             "raw_output": "not_returned",
         }
 
+    cwd = bounded_text(cwd, field="cwd", max_chars=MAX_PATH_TEXT) if cwd is not None else None
+    prompt = bounded_text(prompt, field="prompt", max_chars=MAX_SEND_TEXT, strip=False) if prompt is not None else None
     start_cwd = Path(cwd or os.getcwd()).expanduser().resolve()
     if not start_cwd.exists() or not start_cwd.is_dir():
         raise AgentError(f"cwd is not a directory: {start_cwd}")
@@ -447,18 +457,53 @@ def skills_agent(agent: str, include_names: bool = False, limit: int = 80) -> di
     return result
 
 
-def as_string_list(value: Any, *, field: str) -> list[str]:
+def bounded_text(
+    value: Any,
+    *,
+    field: str,
+    max_chars: int,
+    required: bool = False,
+    strip: bool = True,
+) -> str | None:
+    if value is None:
+        if required:
+            raise AgentError(f"{field} must be a non-empty string")
+        return None
+    if not isinstance(value, str):
+        raise AgentError(f"{field} must be a string")
+    text = value.strip() if strip else value
+    if required and not text.strip():
+        raise AgentError(f"{field} must be a non-empty string")
+    if len(text) > max_chars:
+        raise AgentError(f"{field} exceeds {max_chars} characters")
+    return text
+
+
+def as_string_list(
+    value: Any,
+    *,
+    field: str,
+    max_items: int = MAX_ASSIGNMENT_LIST_ITEMS,
+    max_chars: int = MAX_TEXT_FIELD,
+) -> list[str]:
     if value is None:
         return []
     if isinstance(value, str):
-        return [value]
+        text = value.strip()
+        if len(text) > max_chars:
+            raise AgentError(f"{field} items must not exceed {max_chars} characters")
+        return [text] if text else []
     if not isinstance(value, list):
         raise AgentError(f"{field} must be a string or list of strings")
+    if len(value) > max_items:
+        raise AgentError(f"{field} must contain at most {max_items} items")
     result: list[str] = []
     for item in value:
         if not isinstance(item, str):
             raise AgentError(f"{field} must contain only strings")
         text = item.strip()
+        if len(text) > max_chars:
+            raise AgentError(f"{field} items must not exceed {max_chars} characters")
         if text:
             result.append(text)
     return result
@@ -497,12 +542,11 @@ def skill_matches(agent: str, skill_ref: str, limit: int = 8) -> list[dict[str, 
     return matches
 
 
-def skill_match_agent(agent: str, skill_ref: str, limit: int = 8) -> dict[str, Any]:
-    if not isinstance(skill_ref, str) or not skill_ref.strip():
-        raise AgentError("skill must be a non-empty string")
+def skill_match_agent(agent: str, skill_ref: Any, limit: int = 8) -> dict[str, Any]:
+    skill_ref = bounded_text(skill_ref, field="skill", max_chars=MAX_SKILL_REF, required=True) or ""
     limit = max(1, min(int(limit), MAX_SKILL_NAMES))
     matches = skill_matches(agent, skill_ref, limit)
-    skill_safe, _changed = redact(skill_ref.strip())
+    skill_safe, _changed = redact(skill_ref)
     return {
         "agent": agent,
         "skill": trim_chars(skill_safe, 300),
@@ -565,7 +609,8 @@ def path_is_within(path: Path, scope: Path) -> bool:
         return False
 
 
-def scope_check(scope: list[str], write_paths: list[str], cwd: str | None = None) -> dict[str, Any]:
+def scope_check(scope: list[str], write_paths: list[str], cwd: Any = None) -> dict[str, Any]:
+    cwd = bounded_text(cwd, field="cwd", max_chars=MAX_PATH_TEXT) if cwd is not None else None
     base = Path(cwd or os.getcwd()).expanduser().resolve(strict=False)
     scope_paths = [path for item in scope if (path := normalize_scope_path(item, base)) is not None]
     violations: list[str] = []
@@ -657,12 +702,12 @@ def assign_agent(
     agent: str,
     *,
     role: str,
-    task: str,
-    scope: list[str],
+    task: Any,
+    scope: Any,
     skill: str | None = None,
-    write_paths: list[str] | None = None,
-    context: list[str] | None = None,
-    forbidden: list[str] | None = None,
+    write_paths: Any = None,
+    context: Any = None,
+    forbidden: Any = None,
     name: str | None = None,
     enter: bool = True,
     allow_missing_skill: bool = False,
@@ -671,12 +716,13 @@ def assign_agent(
     role = role.strip().lower()
     if role not in {"exploriererin", "arbeitsbiene"}:
         raise AgentError("role must be 'exploriererin' or 'arbeitsbiene'")
-    if not isinstance(task, str) or not task.strip():
-        raise AgentError("task must be a non-empty string")
-
-    write_paths = write_paths or []
-    context = context or []
-    forbidden = forbidden or []
+    task = bounded_text(task, field="task", max_chars=MAX_TASK_TEXT, required=True) or ""
+    skill = bounded_text(skill, field="skill", max_chars=MAX_SKILL_REF) if skill is not None else None
+    name = bounded_text(name, field="name", max_chars=MAX_AGENTIN_NAME) if name is not None else None
+    scope = as_string_list(scope, field="scope", max_chars=MAX_PATH_TEXT)
+    write_paths = as_string_list(write_paths, field="write_paths", max_chars=MAX_PATH_TEXT)
+    context = as_string_list(context, field="context")
+    forbidden = as_string_list(forbidden, field="forbidden")
     if role == "exploriererin" and write_paths:
         raise AgentError("exploriererin assignments must not include write paths")
     if role == "arbeitsbiene" and not write_paths:
@@ -695,7 +741,7 @@ def assign_agent(
     prompt = assignment_prompt(
         agent=agent,
         role=role,
-        task=task.strip(),
+        task=task,
         scope=scope,
         skill=skill,
         write_paths=write_paths,
@@ -843,8 +889,9 @@ def last_assignment_status(agent: str) -> dict[str, Any]:
     }
 
 
-def request_agent_report(agent: str, assignment_id: str | None = None, enter: bool = True) -> dict[str, Any]:
+def request_agent_report(agent: str, assignment_id: Any = None, enter: bool = True) -> dict[str, Any]:
     if assignment_id:
+        assignment_id = bounded_text(assignment_id, field="assignment_id", max_chars=MAX_ASSIGNMENT_ID) or ""
         safe_id, _changed = redact(assignment_id)
         text = (
             "Bitte liefere einen knappen Bericht zum Assignment "
@@ -876,9 +923,11 @@ def git_excerpt(args: list[str], *, cwd: Path | None = None, chars: int = 4000) 
     }
 
 
-def worktree_create_for_agent(agent: str, path: str | None = None, base_ref: str | None = None) -> dict[str, Any]:
+def worktree_create_for_agent(agent: str, path: Any = None, base_ref: Any = None) -> dict[str, Any]:
     if agent not in {"a", "b"}:
         raise AgentError("agent must be a or b")
+    path = bounded_text(path, field="path", max_chars=MAX_PATH_TEXT) if path is not None else None
+    base_ref = bounded_text(base_ref, field="base_ref", max_chars=MAX_PATH_TEXT) if base_ref is not None else None
     target = Path(path).expanduser() if path else repo_root() / ".codex-master-worktrees" / f"agent-{agent}-{now_id()}"
     target = target.resolve(strict=False)
     if target.exists():
@@ -900,7 +949,8 @@ def worktree_create_for_agent(agent: str, path: str | None = None, base_ref: str
     }
 
 
-def worktree_status(path: str | None = None) -> dict[str, Any]:
+def worktree_status(path: Any = None) -> dict[str, Any]:
+    path = bounded_text(path, field="path", max_chars=MAX_PATH_TEXT) if path is not None else None
     target = Path(path).expanduser().resolve(strict=False) if path else repo_root()
     return {
         "path": str(target),
@@ -1096,6 +1146,7 @@ def uninstall(unregister: bool = True, remove_symlink: bool = False, install_pat
 
 
 def send_agent(agent: str, text: str, enter: bool = True) -> dict[str, Any]:
+    text = bounded_text(text, field="text", max_chars=MAX_SEND_TEXT, required=True, strip=False) or ""
     cfg = AGENTS[agent]
     session = cfg["session"]
     if not tmux_alive(session):
@@ -1245,7 +1296,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         selected = agent_ids(str(args.get("agent", "all")))
         return multi_agent_result(
             selected,
-            lambda agent: skill_match_agent(agent, str(args.get("skill", "")), int(args.get("limit", 8))),
+            lambda agent: skill_match_agent(agent, args.get("skill"), int(args.get("limit", 8))),
         )
     if name == "agent_capabilities":
         selected = agent_ids(str(args.get("agent", "all")))
@@ -1254,7 +1305,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return scope_check(
             as_string_list(args.get("scope"), field="scope"),
             as_string_list(args.get("write_paths"), field="write_paths"),
-            args.get("cwd") if isinstance(args.get("cwd"), str) else None,
+            args.get("cwd"),
         )
     if name == "agent_assign":
         selected = agent_ids(str(args.get("agent", "")))
@@ -1263,12 +1314,12 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return assign_agent(
             selected[0],
             role=str(args.get("role", "")),
-            task=str(args.get("task", "")),
-            scope=as_string_list(args.get("scope"), field="scope"),
+            task=args.get("task"),
+            scope=args.get("scope"),
             skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
-            write_paths=as_string_list(args.get("write_paths"), field="write_paths"),
-            context=as_string_list(args.get("context"), field="context"),
-            forbidden=as_string_list(args.get("forbidden"), field="forbidden"),
+            write_paths=args.get("write_paths"),
+            context=args.get("context"),
+            forbidden=args.get("forbidden"),
             name=args.get("name") if isinstance(args.get("name"), str) else None,
             enter=bool(args.get("enter", True)),
             allow_missing_skill=bool(args.get("allow_missing_skill", False)),
@@ -1281,11 +1332,11 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return assign_agent(
             selected[0],
             role="exploriererin",
-            task=str(args.get("task", "")),
-            scope=as_string_list(args.get("scope"), field="scope"),
+            task=args.get("task"),
+            scope=args.get("scope"),
             skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
-            context=as_string_list(args.get("context"), field="context"),
-            forbidden=as_string_list(args.get("forbidden"), field="forbidden"),
+            context=args.get("context"),
+            forbidden=args.get("forbidden"),
             name=args.get("name") if isinstance(args.get("name"), str) else None,
             enter=bool(args.get("enter", True)),
             allow_missing_skill=bool(args.get("allow_missing_skill", False)),
@@ -1298,12 +1349,12 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return assign_agent(
             selected[0],
             role="arbeitsbiene",
-            task=str(args.get("task", "")),
-            scope=as_string_list(args.get("scope"), field="scope"),
+            task=args.get("task"),
+            scope=args.get("scope"),
             skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
-            write_paths=as_string_list(args.get("write_paths"), field="write_paths"),
-            context=as_string_list(args.get("context"), field="context"),
-            forbidden=as_string_list(args.get("forbidden"), field="forbidden"),
+            write_paths=args.get("write_paths"),
+            context=args.get("context"),
+            forbidden=args.get("forbidden"),
             name=args.get("name") if isinstance(args.get("name"), str) else None,
             enter=bool(args.get("enter", True)),
             allow_missing_skill=bool(args.get("allow_missing_skill", False)),
@@ -1322,7 +1373,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             raise AgentError("agent_report_request requires exactly one agent: a or b")
         return request_agent_report(
             selected[0],
-            args.get("assignment_id") if isinstance(args.get("assignment_id"), str) else None,
+            args.get("assignment_id"),
             bool(args.get("enter", True)),
         )
     if name == "worktree_create_for_agent":
@@ -1331,11 +1382,11 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             raise AgentError("worktree_create_for_agent requires exactly one agent: a or b")
         return worktree_create_for_agent(
             selected[0],
-            args.get("path") if isinstance(args.get("path"), str) else None,
-            args.get("base_ref") if isinstance(args.get("base_ref"), str) else None,
+            args.get("path"),
+            args.get("base_ref"),
         )
     if name == "worktree_status":
-        return worktree_status(args.get("path") if isinstance(args.get("path"), str) else None)
+        return worktree_status(args.get("path"))
     if name == "integration_status":
         return integration_status()
     if name == "commit_ready_check":
@@ -1370,6 +1421,28 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     raise AgentError(f"unknown tool: {name}")
 
 
+def text_schema(max_chars: int, **extra: Any) -> dict[str, Any]:
+    schema: dict[str, Any] = {"type": "string", "maxLength": max_chars}
+    schema.update(extra)
+    return schema
+
+
+def text_array_schema(
+    *,
+    max_items: int = MAX_ASSIGNMENT_LIST_ITEMS,
+    max_chars: int = MAX_TEXT_FIELD,
+    default: list[str] | None = None,
+) -> dict[str, Any]:
+    schema: dict[str, Any] = {
+        "type": "array",
+        "maxItems": max_items,
+        "items": text_schema(max_chars),
+    }
+    if default is not None:
+        schema["default"] = default
+    return schema
+
+
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "agent_start",
@@ -1378,8 +1451,8 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "agent": {"type": "string", "enum": ["a", "b", "both"], "default": "both"},
-                "cwd": {"type": "string", "description": "Working directory. Defaults to the MCP server cwd."},
-                "prompt": {"type": "string", "description": "Optional initial prompt passed to Codex."},
+                "cwd": text_schema(MAX_PATH_TEXT, description="Working directory. Defaults to the MCP server cwd."),
+                "prompt": text_schema(MAX_SEND_TEXT, description="Optional initial prompt passed to Codex."),
             },
             "additionalProperties": False,
         },
@@ -1401,7 +1474,7 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["agent", "text"],
             "properties": {
                 "agent": {"type": "string", "enum": ["a", "b"]},
-                "text": {"type": "string"},
+                "text": text_schema(MAX_SEND_TEXT),
                 "enter": {"type": "boolean", "default": True},
             },
             "additionalProperties": False,
@@ -1462,7 +1535,7 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["skill"],
             "properties": {
                 "agent": {"type": "string", "enum": ["a", "b", "all"], "default": "all"},
-                "skill": {"type": "string"},
+                "skill": text_schema(MAX_SKILL_REF),
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_SKILL_NAMES, "default": 8},
             },
             "additionalProperties": False,
@@ -1483,9 +1556,9 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "scope": {"type": "array", "items": {"type": "string"}, "default": []},
-                "write_paths": {"type": "array", "items": {"type": "string"}, "default": []},
-                "cwd": {"type": "string"},
+                "scope": text_array_schema(max_chars=MAX_PATH_TEXT, default=[]),
+                "write_paths": text_array_schema(max_chars=MAX_PATH_TEXT, default=[]),
+                "cwd": text_schema(MAX_PATH_TEXT),
             },
             "additionalProperties": False,
         },
@@ -1499,13 +1572,13 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "agent": {"type": "string", "enum": ["a", "b"]},
                 "role": {"type": "string", "enum": ["exploriererin", "arbeitsbiene"]},
-                "task": {"type": "string"},
-                "skill": {"type": "string"},
-                "scope": {"type": "array", "items": {"type": "string"}, "default": []},
-                "write_paths": {"type": "array", "items": {"type": "string"}, "default": []},
-                "context": {"type": "array", "items": {"type": "string"}, "default": []},
-                "forbidden": {"type": "array", "items": {"type": "string"}, "default": []},
-                "name": {"type": "string"},
+                "task": text_schema(MAX_TASK_TEXT),
+                "skill": text_schema(MAX_SKILL_REF),
+                "scope": text_array_schema(max_chars=MAX_PATH_TEXT, default=[]),
+                "write_paths": text_array_schema(max_chars=MAX_PATH_TEXT, default=[]),
+                "context": text_array_schema(default=[]),
+                "forbidden": text_array_schema(default=[]),
+                "name": text_schema(MAX_AGENTIN_NAME),
                 "enter": {"type": "boolean", "default": True},
                 "allow_missing_skill": {"type": "boolean", "default": False},
                 "allow_subagents": {"type": "boolean", "default": False},
@@ -1521,12 +1594,12 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["agent", "task"],
             "properties": {
                 "agent": {"type": "string", "enum": ["a", "b"]},
-                "task": {"type": "string"},
-                "skill": {"type": "string"},
-                "scope": {"type": "array", "items": {"type": "string"}, "default": []},
-                "context": {"type": "array", "items": {"type": "string"}, "default": []},
-                "forbidden": {"type": "array", "items": {"type": "string"}, "default": []},
-                "name": {"type": "string"},
+                "task": text_schema(MAX_TASK_TEXT),
+                "skill": text_schema(MAX_SKILL_REF),
+                "scope": text_array_schema(max_chars=MAX_PATH_TEXT, default=[]),
+                "context": text_array_schema(default=[]),
+                "forbidden": text_array_schema(default=[]),
+                "name": text_schema(MAX_AGENTIN_NAME),
                 "enter": {"type": "boolean", "default": True},
                 "allow_missing_skill": {"type": "boolean", "default": False},
                 "allow_subagents": {"type": "boolean", "default": False},
@@ -1542,13 +1615,13 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["agent", "task", "write_paths"],
             "properties": {
                 "agent": {"type": "string", "enum": ["a", "b"]},
-                "task": {"type": "string"},
-                "skill": {"type": "string"},
-                "scope": {"type": "array", "items": {"type": "string"}, "default": []},
-                "write_paths": {"type": "array", "items": {"type": "string"}},
-                "context": {"type": "array", "items": {"type": "string"}, "default": []},
-                "forbidden": {"type": "array", "items": {"type": "string"}, "default": []},
-                "name": {"type": "string"},
+                "task": text_schema(MAX_TASK_TEXT),
+                "skill": text_schema(MAX_SKILL_REF),
+                "scope": text_array_schema(max_chars=MAX_PATH_TEXT, default=[]),
+                "write_paths": text_array_schema(max_chars=MAX_PATH_TEXT),
+                "context": text_array_schema(default=[]),
+                "forbidden": text_array_schema(default=[]),
+                "name": text_schema(MAX_AGENTIN_NAME),
                 "enter": {"type": "boolean", "default": True},
                 "allow_missing_skill": {"type": "boolean", "default": False},
                 "allow_subagents": {"type": "boolean", "default": False},
@@ -1586,7 +1659,7 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["agent"],
             "properties": {
                 "agent": {"type": "string", "enum": ["a", "b"]},
-                "assignment_id": {"type": "string"},
+                "assignment_id": text_schema(MAX_ASSIGNMENT_ID),
                 "enter": {"type": "boolean", "default": True},
             },
             "additionalProperties": False,
@@ -1600,8 +1673,8 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["agent"],
             "properties": {
                 "agent": {"type": "string", "enum": ["a", "b"]},
-                "path": {"type": "string"},
-                "base_ref": {"type": "string"},
+                "path": text_schema(MAX_PATH_TEXT),
+                "base_ref": text_schema(MAX_PATH_TEXT),
             },
             "additionalProperties": False,
         },
@@ -1611,7 +1684,7 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Return capped git status and worktree metadata.",
         "inputSchema": {
             "type": "object",
-            "properties": {"path": {"type": "string"}},
+            "properties": {"path": text_schema(MAX_PATH_TEXT)},
             "additionalProperties": False,
         },
     },

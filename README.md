@@ -139,6 +139,10 @@ response.
 
 `assign-write` also gates write paths through `agent_scope_check`; a write path
 outside the declared scope is rejected before anything is sent to an Agentin.
+Assignment and send inputs are bounded before tmux interaction: free sends and
+start prompts are capped at 12,000 characters, assignment tasks at 4,000
+characters, names at 80 characters, skill refs at 300 characters, path-like
+fields at 1,000 characters, and assignment lists at 50 items.
 
 Model policy: Agentin A and Agentin B run on `gpt-5.4-mini` by default. Read-only
 Exploriererin assignments keep that model. Arbeitsbiene write assignments are

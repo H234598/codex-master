@@ -87,6 +87,9 @@ Data minimization:
   must not return prompt text or Agentin responses.
 - Assignment audit retention is bounded to the newest 500 valid metadata
   records in a local `0600` JSONL file.
+- Assignment inputs are bounded before tmux interaction: sends/start prompts
+  12,000 chars, tasks 4,000 chars, names 80 chars, skill refs 300 chars,
+  path-like fields 1,000 chars, and assignment lists 50 items.
 - Use `tail` only for an explicit capped, ANSI-stripped, redacted excerpt.
 - Do not read raw tmux logs directly unless the user explicitly requests it and
   the privacy impact is acceptable.
