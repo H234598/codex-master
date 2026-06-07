@@ -21,6 +21,9 @@ from codex_master.server import (
     MAX_SKILL_NAMES,
     MAX_TASK_TEXT,
     RAW_LOG_TRUNCATION_MARKER,
+    COMMAND_TIMEOUT_RETURN_CODE,
+    DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    DEFAULT_TMUX_TIMEOUT_SECONDS,
     allowed_raw_log_path,
     append_bounded_raw_log,
     agent_home_process_summary,
@@ -34,6 +37,8 @@ from codex_master.server import (
     record_assignment,
     redact,
     replace_private_text,
+    run_command,
+    run_tmux,
     start_agent,
     strip_ansi,
     trim_chars,
@@ -97,6 +102,29 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(skill_props["plugins_offset"]["minimum"], 0)
         self.assertEqual(skill_props["plugins_limit"]["default"], MAX_CAPABILITY_PLUGINS)
         self.assertEqual(skill_props["plugins_limit"]["maximum"], MAX_SKILL_NAMES)
+
+    @patch("codex_master.server.subprocess.run")
+    def test_run_command_returns_bounded_timeout_result(self, mock_run) -> None:
+        mock_run.side_effect = subprocess.TimeoutExpired(["git", "status"], DEFAULT_COMMAND_TIMEOUT_SECONDS)
+
+        result = run_command(["git", "status"])
+
+        self.assertEqual(result.returncode, COMMAND_TIMEOUT_RETURN_CODE)
+        self.assertIn("timed out", result.stderr)
+        self.assertEqual(mock_run.call_args.kwargs["timeout"], DEFAULT_COMMAND_TIMEOUT_SECONDS)
+
+    @patch("codex_master.server.subprocess.run")
+    def test_run_tmux_returns_bounded_timeout_result(self, mock_run) -> None:
+        mock_run.side_effect = subprocess.TimeoutExpired(
+            ["tmux", "capture-pane"], DEFAULT_TMUX_TIMEOUT_SECONDS, output="partial"
+        )
+
+        result = run_tmux(["capture-pane"], check=False)
+
+        self.assertEqual(result.returncode, COMMAND_TIMEOUT_RETURN_CODE)
+        self.assertEqual(result.stdout, "partial")
+        self.assertIn("timed out", result.stderr)
+        self.assertEqual(mock_run.call_args.kwargs["timeout"], DEFAULT_TMUX_TIMEOUT_SECONDS)
 
     def test_initialize_rejects_unsupported_protocol(self) -> None:
         response = handle_rpc(

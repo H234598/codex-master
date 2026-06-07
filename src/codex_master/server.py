@@ -75,6 +75,9 @@ MAX_ASSIGNMENT_ID = 200
 MAX_RPC_MESSAGE_BYTES = 1024 * 1024
 MAX_ERROR_CHARS = 1200
 MAX_META_BYTES = 64 * 1024
+COMMAND_TIMEOUT_RETURN_CODE = 124
+DEFAULT_TMUX_TIMEOUT_SECONDS = 10
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
 DEFAULT_AGENTIN_NAMES = {"a": "Mila", "b": "Nora"}
 RAW_LOG_TRUNCATION_MARKER = b"\n... codex-master-mcp retained the last raw log bytes ...\n"
 
@@ -163,15 +166,45 @@ def agent_ids(agent: str) -> list[str]:
     return [agent]
 
 
-def run_tmux(args: list[str], *, input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["tmux", *args],
-        input=input_text,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=check,
-    )
+def timeout_output_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def timeout_completed_process(args: list[str], exc: subprocess.TimeoutExpired, label: str) -> subprocess.CompletedProcess[str]:
+    stdout = timeout_output_text(exc.stdout)
+    stderr = timeout_output_text(exc.stderr)
+    if not stderr:
+        stderr = f"{label} timed out after {exc.timeout} seconds"
+    return subprocess.CompletedProcess(args, COMMAND_TIMEOUT_RETURN_CODE, stdout, stderr)
+
+
+def run_tmux(
+    args: list[str],
+    *,
+    input_text: str | None = None,
+    check: bool = True,
+    timeout: int = DEFAULT_TMUX_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    command = ["tmux", *args]
+    try:
+        return subprocess.run(
+            command,
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=check,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        cp = timeout_completed_process(command, exc, "tmux command")
+        if check:
+            raise subprocess.CalledProcessError(cp.returncode, cp.args, output=cp.stdout, stderr=cp.stderr) from exc
+        return cp
 
 
 def run_command(
@@ -180,8 +213,24 @@ def run_command(
     check: bool = False,
     cwd: Path | str | None = None,
     env: dict[str, str] | None = None,
+    timeout: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check, cwd=cwd, env=env)
+    try:
+        return subprocess.run(
+            args,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=check,
+            cwd=cwd,
+            env=env,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        cp = timeout_completed_process(args, exc, "command")
+        if check:
+            raise subprocess.CalledProcessError(cp.returncode, cp.args, output=cp.stdout, stderr=cp.stderr) from exc
+        return cp
 
 
 def tmux_alive(session: str) -> bool:

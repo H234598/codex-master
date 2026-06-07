@@ -28,7 +28,8 @@ ignore non-regular raw-log targets. Tmux control errors are redacted and bounded
 before they are returned or raised. MCP tool responses do not return raw output
 by default and expose raw-log presence without returning local raw-log paths.
 Existing metadata under the old `codex-agent-mcp` state directory is still read
-as a migration fallback.
+as a migration fallback. External `tmux`, `git`, and `codex mcp` subprocesses
+are timeout-bounded so MCP calls fail closed instead of hanging indefinitely.
 
 ## Tools
 
@@ -210,6 +211,8 @@ during pruning, and the file is rewritten with `0600` permissions. Private state
 appends refuse symlink paths, Agentin metadata is written atomically, and
 temporary replace files are created with no-follow exclusive semantics. Managed
 state directories must be real directories, not symlinks or regular files.
+External process calls are timeout-bounded and return structured timeout
+failures instead of blocking the MCP server indefinitely.
 
 Use `tail` only when an explicit, capped excerpt is needed. Normal status and
 send operations do not return Agentin output.
