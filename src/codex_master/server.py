@@ -20,6 +20,7 @@ import stat as stat_module
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -334,6 +335,97 @@ def ensure_mcp_startup_timeout_configured(config_path: Path | None = None) -> di
         "config_path": "not_returned",
         "raw_output": "not_returned",
     }
+
+
+def codex_client_mcp_config_status(
+    config_path: Path | None = None,
+    command_path: Path = DEFAULT_INSTALL_PATH,
+) -> dict[str, Any]:
+    path = config_path or codex_config_path()
+    path = path.expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    result: dict[str, Any] = {
+        "name": "codex_client_mcp_config",
+        "path": PATH_NOT_RETURNED,
+        "path_state": "missing",
+        "exists": False,
+        "regular_file": False,
+        "symlink": False,
+        "server": MCP_SERVER_NAME,
+        "server_declared": False,
+        "command_configured": False,
+        "command_matches_install_path": False,
+        "startup_timeout_sec": None,
+        "startup_timeout_ok": False,
+        "startup_timeout_recommended_sec": RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
+        "ok": False,
+        "raw_output": "not_returned",
+    }
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        result["reason"] = "codex_config_missing"
+        return result
+    except OSError:
+        result["path_state"] = "error"
+        result["reason"] = "codex_config_unreadable"
+        return result
+    result.update(
+        {
+            "path_state": "set",
+            "exists": True,
+            "regular_file": stat_module.S_ISREG(current.st_mode),
+            "symlink": stat_module.S_ISLNK(current.st_mode),
+        }
+    )
+    if result["symlink"] or not result["regular_file"]:
+        result["reason"] = "codex_config_not_regular_file"
+        return result
+    try:
+        text = read_private_regular_text(path, MAX_CODEX_CONFIG_BYTES, "could not read codex config")
+    except AgentError:
+        result["reason"] = "codex_config_unreadable"
+        return result
+    try:
+        payload = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        result["reason"] = "codex_config_invalid_toml"
+        return result
+    mcp_servers = payload.get("mcp_servers")
+    server_config = mcp_servers.get(MCP_SERVER_NAME) if isinstance(mcp_servers, dict) else None
+    if not isinstance(server_config, dict):
+        result["reason"] = "mcp_server_not_declared"
+        return result
+
+    command = server_config.get("command")
+    command_configured = isinstance(command, str) and bool(command.strip())
+    startup_timeout = server_config.get("startup_timeout_sec")
+    startup_timeout_sec = (
+        startup_timeout if isinstance(startup_timeout, int) and not isinstance(startup_timeout, bool) else None
+    )
+    startup_timeout_ok = (
+        startup_timeout_sec is not None and startup_timeout_sec >= RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS
+    )
+    command_matches = command_configured and command.strip() == str(command_path)
+    result.update(
+        {
+            "server_declared": True,
+            "command_configured": command_configured,
+            "command_matches_install_path": command_matches,
+            "startup_timeout_sec": startup_timeout_sec,
+            "startup_timeout_ok": startup_timeout_ok,
+            "ok": command_matches and startup_timeout_ok,
+        }
+    )
+    if not result["ok"]:
+        if not command_configured:
+            result["reason"] = "mcp_command_missing"
+        elif not command_matches:
+            result["reason"] = "mcp_command_mismatch"
+        else:
+            result["reason"] = "mcp_startup_timeout_too_low"
+    return result
 
 
 def assert_install_context_allows_master_registration() -> None:
@@ -2713,12 +2805,14 @@ def master_plugin_status() -> dict[str, Any]:
     mcp_registration = check_mcp_registration(DEFAULT_INSTALL_PATH)
     startup_self_test = mcp_command_startup_self_test(DEFAULT_INSTALL_PATH)
     cache_status = plugin_cache_status(root)
+    client_config = codex_client_mcp_config_status(command_path=DEFAULT_INSTALL_PATH)
     return {
         "ok": (
             bool(app_bridge.get("ok"))
             and bool(mcp_registration.get("ok"))
             and bool(startup_self_test.get("ok"))
             and bool(cache_status.get("ok"))
+            and bool(client_config.get("ok"))
         ),
         "repo": PATH_NOT_RETURNED,
         "repo_state": "set",
@@ -2730,6 +2824,7 @@ def master_plugin_status() -> dict[str, Any]:
         "skill": repo_file_status(skill),
         "app_bridge": app_bridge,
         "mcp_registration": mcp_registration,
+        "client_config": client_config,
         "startup_self_test": startup_self_test,
         "installed_source_worktree_state": installed_source_worktree_state(
             resolve_path_no_throw(DEFAULT_INSTALL_PATH) if DEFAULT_INSTALL_PATH.is_symlink() else None,
@@ -2745,6 +2840,7 @@ def master_namespace_status() -> dict[str, Any]:
     startup_self_test = mcp_command_startup_self_test(DEFAULT_INSTALL_PATH)
     tools_list_self_test = mcp_command_tools_list_self_test(DEFAULT_INSTALL_PATH)
     cache_status = plugin_cache_status(repo_root())
+    client_config = codex_client_mcp_config_status(command_path=DEFAULT_INSTALL_PATH)
     tool_names = {tool["name"] for tool in TOOLS if isinstance(tool.get("name"), str)}
     local_tool_contract = {
         "tool_count": len(tool_names),
@@ -2757,13 +2853,15 @@ def master_namespace_status() -> dict[str, Any]:
         tools_list_self_test.get("ok")
     )
     plugin_cache_ready = bool(cache_status.get("ok"))
-    namespace_ready = server_ready and plugin_cache_ready
+    client_config_ready = bool(client_config.get("ok"))
+    namespace_ready = server_ready and plugin_cache_ready and client_config_ready
     return {
         "ok": namespace_ready,
         "server_name": MCP_SERVER_NAME,
         "expected_mcp_server": MCP_SERVER_NAME,
         "mcp_server_ready": server_ready,
         "plugin_cache_ready": plugin_cache_ready,
+        "client_config_ready": client_config_ready,
         "namespace_ready": namespace_ready,
         "expected_tools": {
             "master_app_bridge_status": local_tool_contract["master_app_bridge_status"],
@@ -2775,6 +2873,7 @@ def master_namespace_status() -> dict[str, Any]:
         "startup_self_test": startup_self_test,
         "tools_list_self_test": tools_list_self_test,
         "plugin_cache": cache_status,
+        "client_config": client_config,
         "app_bridge": master_app_bridge_status(),
         "codex_home_context": codex_home_context(),
         "running_process_summary": codex_related_process_summary(),
@@ -2924,6 +3023,7 @@ def doctor() -> dict[str, Any]:
         )
     registration = check_mcp_registration(install_path)
     checks.append({"name": "mcp_registered", **registration})
+    checks.append(codex_client_mcp_config_status(command_path=install_path))
     checks.append(
         {
             "name": "mcp_startup_timeout_configured",

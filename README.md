@@ -102,9 +102,10 @@ when an assignment explicitly allows it.
 `plugin-status` and `namespace-status` also report whether the repo plugin
 manifest version is installed in the local plugin cache, without returning cache
 paths.
-For `namespace-status`, top-level `ok` means both the MCP server and the local
-plugin cache are ready; `mcp_server_ready` remains separate for isolating server
-startup from stale client/plugin state.
+For `namespace-status`, top-level `ok` means the MCP server, local plugin cache,
+and active Codex client config are ready. `mcp_server_ready`,
+`plugin_cache_ready`, and `client_config_ready` remain separate for isolating
+server startup from stale client/plugin state or a mismatched `CODEX_HOME`.
 
 ## Local CLI
 

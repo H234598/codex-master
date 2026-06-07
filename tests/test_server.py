@@ -74,6 +74,7 @@ from codex_master.server import (
     worktree_create_for_agent,
     worktree_status,
     codex_home_context,
+    codex_client_mcp_config_status,
     ensure_mcp_startup_timeout_configured,
     mcp_startup_timeout_seconds,
     updated_mcp_startup_timeout_config,
@@ -232,6 +233,77 @@ class ServerHelpersTest(unittest.TestCase):
                 ensure_mcp_startup_timeout_configured(link)
 
         self.assertNotIn(str(target), str(raised.exception))
+
+    def test_codex_client_mcp_config_status_detects_ready_config_without_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = Path(tmpdir) / ".codex" / "config.toml"
+            install_path = Path(tmpdir) / "bin" / "codex-master-mcp"
+            config.parent.mkdir()
+            config.write_text(
+                "\n".join(
+                    [
+                        "[mcp_servers.codex-master-mcp]",
+                        f'command = "{install_path}"',
+                        "startup_timeout_sec = 120",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = codex_client_mcp_config_status(config, install_path)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["server_declared"])
+        self.assertTrue(result["command_matches_install_path"])
+        self.assertTrue(result["startup_timeout_ok"])
+        self.assertEqual(result["path"], "not_returned")
+        self.assertNotIn(str(install_path), json.dumps(result, sort_keys=True))
+
+    def test_codex_client_mcp_config_status_detects_mismatch_without_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = Path(tmpdir) / ".codex" / "config.toml"
+            install_path = Path(tmpdir) / "bin" / "codex-master-mcp"
+            wrong_path = Path(tmpdir) / "bin" / "wrong-mcp"
+            config.parent.mkdir()
+            config.write_text(
+                "\n".join(
+                    [
+                        "[mcp_servers.codex-master-mcp]",
+                        f'command = "{wrong_path}"',
+                        "startup_timeout_sec = 30",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = codex_client_mcp_config_status(config, install_path)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["server_declared"])
+        self.assertFalse(result["command_matches_install_path"])
+        self.assertFalse(result["startup_timeout_ok"])
+        self.assertEqual(result["reason"], "mcp_command_mismatch")
+        serialized = json.dumps(result, sort_keys=True)
+        self.assertNotIn(str(install_path), serialized)
+        self.assertNotIn(str(wrong_path), serialized)
+
+    def test_codex_client_mcp_config_status_rejects_symlink_without_reading_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target = tmp_path / "target.toml"
+            link = tmp_path / ".codex" / "config.toml"
+            link.parent.mkdir()
+            target.write_text("SECRET_CONFIG_SHOULD_NOT_BE_READ\n", encoding="utf-8")
+            link.symlink_to(target)
+
+            result = codex_client_mcp_config_status(link, tmp_path / "bin" / "codex-master-mcp")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "codex_config_not_regular_file")
+        self.assertNotIn("SECRET_CONFIG_SHOULD_NOT_BE_READ", json.dumps(result, sort_keys=True))
+        self.assertNotIn(str(target), json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.run_command")
     @patch("codex_master.server.shutil.which", return_value="/usr/bin/codex")
@@ -445,6 +517,7 @@ class ServerHelpersTest(unittest.TestCase):
     @patch("codex_master.server.codex_related_process_summary")
     @patch("codex_master.server.master_app_bridge_status")
     @patch("codex_master.server.plugin_cache_status")
+    @patch("codex_master.server.codex_client_mcp_config_status")
     @patch("codex_master.server.mcp_command_tools_list_self_test")
     @patch("codex_master.server.mcp_command_startup_self_test")
     @patch("codex_master.server.check_mcp_registration")
@@ -453,6 +526,7 @@ class ServerHelpersTest(unittest.TestCase):
         mock_registration,
         mock_startup,
         mock_tools,
+        mock_client_config,
         mock_cache,
         mock_app_bridge,
         mock_processes,
@@ -468,6 +542,7 @@ class ServerHelpersTest(unittest.TestCase):
             "raw_output": "not_returned",
         }
         mock_cache.return_value = {"ok": True, "repo_version_installed": True, "raw_output": "not_returned"}
+        mock_client_config.return_value = {"ok": True, "raw_output": "not_returned"}
         mock_app_bridge.return_value = {"ok": True, "connector_id": "connector_test", "raw_output": "not_returned"}
         mock_processes.return_value = {
             "codex_client_process_count": 2,
@@ -486,12 +561,14 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["client_refresh"]["existing_sessions_may_need_restart"])
         self.assertTrue(result["mcp_server_ready"])
         self.assertTrue(result["plugin_cache_ready"])
+        self.assertTrue(result["client_config_ready"])
         self.assertTrue(result["namespace_ready"])
         self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.codex_related_process_summary")
     @patch("codex_master.server.master_app_bridge_status")
     @patch("codex_master.server.plugin_cache_status")
+    @patch("codex_master.server.codex_client_mcp_config_status")
     @patch("codex_master.server.mcp_command_tools_list_self_test")
     @patch("codex_master.server.mcp_command_startup_self_test")
     @patch("codex_master.server.check_mcp_registration")
@@ -500,6 +577,7 @@ class ServerHelpersTest(unittest.TestCase):
         mock_registration,
         mock_startup,
         mock_tools,
+        mock_client_config,
         mock_cache,
         mock_app_bridge,
         mock_processes,
@@ -520,6 +598,7 @@ class ServerHelpersTest(unittest.TestCase):
             "reason": "repo_plugin_version_not_installed",
             "raw_output": "not_returned",
         }
+        mock_client_config.return_value = {"ok": True, "raw_output": "not_returned"}
         mock_app_bridge.return_value = {"ok": True, "connector_id": "connector_test", "raw_output": "not_returned"}
         mock_processes.return_value = {
             "codex_client_process_count": 2,
@@ -533,8 +612,60 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertTrue(result["mcp_server_ready"])
         self.assertFalse(result["plugin_cache_ready"])
+        self.assertTrue(result["client_config_ready"])
         self.assertFalse(result["namespace_ready"])
         self.assertEqual(result["plugin_cache"]["reason"], "repo_plugin_version_not_installed")
+        self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
+
+    @patch("codex_master.server.codex_related_process_summary")
+    @patch("codex_master.server.master_app_bridge_status")
+    @patch("codex_master.server.plugin_cache_status")
+    @patch("codex_master.server.codex_client_mcp_config_status")
+    @patch("codex_master.server.mcp_command_tools_list_self_test")
+    @patch("codex_master.server.mcp_command_startup_self_test")
+    @patch("codex_master.server.check_mcp_registration")
+    def test_master_namespace_status_fails_when_client_config_is_stale(
+        self,
+        mock_registration,
+        mock_startup,
+        mock_tools,
+        mock_client_config,
+        mock_cache,
+        mock_app_bridge,
+        mock_processes,
+    ) -> None:
+        mock_registration.return_value = {"ok": True, "registered": True, "raw_output": "not_returned"}
+        mock_startup.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
+        mock_tools.return_value = {
+            "ok": True,
+            "status": "ok",
+            "tool_count": 25,
+            "required_tool": "master_app_bridge_status",
+            "required_tool_available": True,
+            "raw_output": "not_returned",
+        }
+        mock_cache.return_value = {"ok": True, "repo_version_installed": True, "raw_output": "not_returned"}
+        mock_client_config.return_value = {
+            "ok": False,
+            "reason": "mcp_command_mismatch",
+            "raw_output": "not_returned",
+        }
+        mock_app_bridge.return_value = {"ok": True, "connector_id": "connector_test", "raw_output": "not_returned"}
+        mock_processes.return_value = {
+            "codex_client_process_count": 2,
+            "mcp_server_process_count": 1,
+            "home_kind_counts": {},
+            "raw_output": "not_returned",
+        }
+
+        result = master_namespace_status()
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["mcp_server_ready"])
+        self.assertTrue(result["plugin_cache_ready"])
+        self.assertFalse(result["client_config_ready"])
+        self.assertFalse(result["namespace_ready"])
+        self.assertEqual(result["client_config"]["reason"], "mcp_command_mismatch")
         self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.subprocess.run")

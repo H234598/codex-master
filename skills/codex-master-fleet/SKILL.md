@@ -106,9 +106,11 @@ Data minimization:
 - `plugin-status` and `namespace-status` report whether the repo plugin
   manifest version is installed in the local plugin cache, without returning
   cache paths.
-- `namespace-status.ok` must mean both the MCP server and the local plugin
-  cache are ready. Keep `mcp_server_ready` separate so server startup can be
-  distinguished from stale client/plugin state.
+- `namespace-status.ok` must mean the MCP server, local plugin cache, and
+  active Codex client config are ready. Keep `mcp_server_ready`,
+  `plugin_cache_ready`, and `client_config_ready` separate so server startup
+  can be distinguished from stale client/plugin state or mismatched
+  `CODEX_HOME`.
 - `doctor` must report the active `CODEX_HOME` category and the
   `codex-master-mcp` `startup_timeout_sec` health without returning the active
   home path.
