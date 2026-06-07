@@ -203,45 +203,58 @@ def write_private_text(path: Path, text: str) -> None:
 
 
 def replace_private_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.{now_id()}.tmp")
-    try:
-        tmp_path.write_text(text, encoding="utf-8")
-        try:
-            tmp_path.chmod(0o600)
-        except PermissionError:
-            pass
-        tmp_path.replace(path)
-        try:
-            path.chmod(0o600)
-        except PermissionError:
-            pass
-    finally:
-        try:
-            tmp_path.unlink()
-        except FileNotFoundError:
-            pass
+    replace_private_bytes(path, text.encode("utf-8"))
 
 
 def replace_private_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.{now_id()}.tmp")
+    tmp_created = False
     try:
-        tmp_path.write_bytes(data)
-        try:
-            tmp_path.chmod(0o600)
-        except PermissionError:
-            pass
+        write_private_new_bytes(tmp_path, data)
+        tmp_created = True
         tmp_path.replace(path)
+        tmp_created = False
         try:
             path.chmod(0o600)
         except PermissionError:
             pass
     finally:
+        if tmp_created:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def write_private_new_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise AgentError(f"could not create private state temp file without following symlinks: {path}") from exc
+    try:
+        current_stat = os.fstat(fd)
+        if not stat_module.S_ISREG(current_stat.st_mode):
+            raise AgentError(f"private state temp path is not a regular file: {path}")
         try:
-            tmp_path.unlink()
+            os.fchmod(fd, 0o600)
+        except PermissionError:
+            pass
+        with os.fdopen(fd, "wb") as fh:
+            fd = -1
+            fh.write(data)
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            path.unlink()
         except FileNotFoundError:
             pass
+        raise
 
 
 def open_private_regular_update(path: Path) -> Any:

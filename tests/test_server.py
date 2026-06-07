@@ -27,6 +27,7 @@ from codex_master.server import (
     read_message,
     record_assignment,
     redact,
+    replace_private_text,
     start_agent,
     strip_ansi,
     trim_chars,
@@ -484,6 +485,26 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(link_is_symlink)
         self.assertEqual(payload, {"safe": True})
         self.assertEqual(mode, 0o600)
+
+    def test_replace_private_text_refuses_preexisting_temp_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            target = Path(tmpdir) / "external.json"
+            target.write_text("external\n", encoding="utf-8")
+            tmp_path = path.with_name(f".{path.name}.fixed.tmp")
+            tmp_path.symlink_to(target)
+
+            with patch("codex_master.server.now_id", return_value="fixed"):
+                with self.assertRaisesRegex(AgentError, "temp file without following symlinks"):
+                    replace_private_text(path, "safe\n")
+
+            target_content = target.read_text(encoding="utf-8")
+            tmp_is_symlink = tmp_path.is_symlink()
+            path_exists = path.exists()
+
+        self.assertEqual(target_content, "external\n")
+        self.assertTrue(tmp_is_symlink)
+        self.assertFalse(path_exists)
 
     def test_record_assignment_refuses_symlink_log_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
