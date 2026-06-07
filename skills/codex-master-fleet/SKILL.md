@@ -18,6 +18,9 @@ Agentinnen unless the intent is to make that instance a Teamleiterin.
 `codex-master-mcp` Agentinnen are fremde Bienen: they are controlled through an
 MCP/plugin boundary. Eigene Bienen are native Subagentinnen spawned without MCP;
 manage those with the `subagent-fleet` / `multi_agent_v1` workflow instead.
+Teamleiterinnen may directly spawn or reserve fremde Bienen with
+`agent_start`, `agent_claim`, and structured `agent_assign*` tools; leases,
+auth checks, and write scopes are the safety boundary.
 Fremde-Eigene Bienen are fremde Bienen whose lease is currently held by the
 Teamleiterin/current controlling instance; coordinate them as leased external
 Bienen, not as native Subagentinnen.
@@ -139,9 +142,11 @@ Data minimization:
   the Agentin to use current search sources or report a tooling/access limit
   instead of guessing. Public responses and assignment audit records still omit
   prompt text and Agentin output.
-- `send` and `assign-*` wait briefly for a visible Codex TUI input prompt before
-  pasting. If an Agentin is still in startup warnings, the mutation should fail
-  closed instead of silently losing the prompt.
+- `send`, `assign-*`, and `report-request` wait briefly for a visible Codex TUI
+  input prompt before pasting. If an Agentin is still in startup warnings, the
+  mutation should fail closed with retryable `agent_input_not_ready`,
+  `paste_attempted: false`, and no raw output instead of silently losing the
+  prompt.
 - `watchdog` is data-sparse and two-phased. When an Agentin is idle, it first
   requests a concise report and stores only a metadata marker. It waits the
   report grace period, default 15 seconds, before `interrupt`, `stop`, or
@@ -169,10 +174,12 @@ Data minimization:
   retries forever by default for busy fremde Bienen, that finite claim waits
   have no 600-second maximum, that the claim poll interval defaults to
   30 seconds and is capped at 900 seconds, that `wait` remains a bounded
-  Agentin-activity wait capped at 10 minutes, that explicit `claim` can recover
-  stopped foreign leases only after its grace period, and whether the hidden
-  lease owner identity is stable across CLI invocations. The identity itself
-  must not be returned.
+  Agentin-activity wait capped at 10 minutes, that `send`/`assign-*`/
+  `report-request` wait up to 15 seconds for a visible TUI input prompt before
+  failing closed without paste, that explicit `claim` can recover stopped
+  foreign leases only after its grace period, and whether the hidden lease owner
+  identity is stable across CLI invocations. The identity itself must not be
+  returned.
 - `status`, `doctor`, `skills`, `capabilities`, `app-bridge-status`,
   `plugin-status`, `namespace-status`, and integration metadata must not return
   local Agentin home, runner, repo, manifest, installed symlink, or

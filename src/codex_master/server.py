@@ -349,9 +349,17 @@ class AgentBusyError(AgentError):
         self.payload = payload
 
 
+class AgentInputNotReadyError(AgentError):
+    """Raised when a tmux-backed Codex TUI is not ready to accept input."""
+
+    def __init__(self, message: str, payload: dict[str, Any]):
+        super().__init__(message)
+        self.payload = payload
+
+
 def public_error_payload(exc: Exception) -> dict[str, Any]:
     payload: dict[str, Any] = {"error": safe_error_text(exc)}
-    if isinstance(exc, AgentBusyError):
+    if isinstance(exc, (AgentBusyError, AgentInputNotReadyError)):
         payload.update(exc.payload)
     return payload
 
@@ -2718,10 +2726,17 @@ def wait_terminal_status(status: dict[str, Any], initial: dict[str, Any]) -> str
         return "blocked_by_limit"
     if not status.get("running"):
         return "not_running"
-    if ((status.get("response_state") or {}).get("state")) == "running_tui_starter_context":
-        return "tui_starter_context"
+    latest_assignment = status.get("last_assignment") if isinstance(status.get("last_assignment"), dict) else {}
+    assignment_created = parse_utc_timestamp(latest_assignment.get("created_at_utc"))
+    raw_log_updated = parse_utc_timestamp(status.get("raw_log_updated_at_utc"))
+    if assignment_created is not None and raw_log_updated is not None and raw_log_updated > assignment_created:
+        return "activity_observed"
     if activity_signature(status) != activity_signature(initial):
         return "activity_observed"
+    if ((status.get("response_state") or {}).get("state")) == "running_tui_starter_context":
+        if assignment_created is not None:
+            return None
+        return "tui_starter_context"
     return None
 
 
@@ -3519,6 +3534,7 @@ def assign_agent(
     allow_unauthenticated: bool = False,
     requires_search: bool = False,
     live_data_topic: str | None = None,
+    operation: str = "agent_assign",
     lease: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
@@ -3578,7 +3594,7 @@ def assign_agent(
     if lease is None:
         lease, release_on_failure = claim_for_agent_mutation(agent)
     try:
-        sent = send_agent(agent, prompt, enter)
+        sent = send_agent(agent, prompt, enter, operation=operation)
     except Exception:
         if release_on_failure:
             release_agent(agent, force=True)
@@ -3782,7 +3798,7 @@ def request_agent_report(
     else:
         text = "Bitte liefere einen knappen Statusbericht: Aufgabe, Stand, Tests, offene Risiken. Keine Rohlogs."
     lease = lease or agent_lease_status(agent)
-    sent = send_agent(agent, text, enter)
+    sent = send_agent(agent, text, enter, operation="agent_report_request")
     return {
         "agent": agent,
         "status": "report_requested",
@@ -5174,6 +5190,22 @@ def master_timeout_policy() -> dict[str, Any]:
         "default_poll_interval_seconds": DEFAULT_WAIT_POLL_SECONDS,
         "maximum_poll_interval_seconds": MAX_WAIT_POLL_SECONDS,
     }
+    send_input_readiness = {
+        "scope": "send_and_assignment_tmux_input_readiness",
+        "applies_to": [
+            "agent_send",
+            "agent_assign",
+            "agent_assign_readonly",
+            "agent_assign_live_data",
+            "agent_assign_write",
+            "agent_report_request",
+        ],
+        "default_timeout_seconds": DEFAULT_SEND_READY_TIMEOUT_SECONDS,
+        "poll_interval_seconds": SEND_READY_POLL_SECONDS,
+        "requires_visible_tui_input_prompt": True,
+        "failure_mode": "fail_closed_without_paste",
+        "raw_output": "not_returned",
+    }
     watchdog = {
         "scope": "fleet_watchdog_idle_supervision",
         "default_idle_seconds": DEFAULT_WATCHDOG_IDLE_SECONDS,
@@ -5189,6 +5221,7 @@ def master_timeout_policy() -> dict[str, Any]:
         "agent_claim_wait": claim_wait,
         "stopped_lease_recovery": stopped_lease_recovery,
         "agent_wait": agent_wait,
+        "send_input_readiness": send_input_readiness,
         "fleet_watchdog": watchdog,
         "agent_selector_policy": selector_policy_status(),
         "server_instance_identity": server_instance_identity_status(),
@@ -5593,6 +5626,7 @@ def send_agent(
     enter: bool = True,
     *,
     ready_timeout_seconds: float = DEFAULT_SEND_READY_TIMEOUT_SECONDS,
+    operation: str = "agent_send",
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     text = bounded_text(text, field="text", max_chars=MAX_SEND_TEXT, required=True, strip=False) or ""
@@ -5602,7 +5636,20 @@ def send_agent(
         raise AgentError(f"agent {agent} is not running")
     readiness = wait_agent_input_ready(agent, ready_timeout_seconds)
     if not readiness["ready"]:
-        raise AgentError("agent input is not ready; retry after Codex TUI startup completes")
+        raise AgentInputNotReadyError(
+            "agent input is not ready; retry after Codex TUI startup completes",
+            {
+                "agent": agent,
+                "error_code": "agent_input_not_ready",
+                "operation": operation,
+                "retryable": True,
+                "retry_after_seconds": 1,
+                "paste_attempted": False,
+                "input_ready": readiness,
+                "raw_output": "not_returned",
+                "response_output": "not_returned",
+            },
+        )
     paste_mode = "bracketed_paste" if "\n" in text else "plain_paste"
     payload = f"{BRACKETED_PASTE_BEGIN}{text}{BRACKETED_PASTE_END}" if paste_mode == "bracketed_paste" else text
     buffer_name = f"codex-master-mcp-{agent}-{int(time.time() * 1000)}"
@@ -5892,6 +5939,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
                 allow_subagents=bool_arg(args, "allow_subagents", False),
                 allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
+                operation="agent_assign",
             ),
         )
     if name == "agent_assign_readonly":
@@ -5911,6 +5959,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
                 allow_subagents=bool_arg(args, "allow_subagents", False),
                 allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
+                operation="agent_assign_readonly",
             ),
         )
     if name == "agent_assign_live_data":
@@ -5932,6 +5981,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
                 requires_search=True,
                 live_data_topic=args.get("live_data_topic") if isinstance(args.get("live_data_topic"), str) else None,
+                operation="agent_assign_live_data",
             ),
         )
     if name == "agent_assign_write":
@@ -5952,6 +6002,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
                 allow_subagents=bool_arg(args, "allow_subagents", False),
                 allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
+                operation="agent_assign_write",
             ),
         )
     if name == "agent_assignments":
@@ -6078,7 +6129,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 fn=lambda: run_with_agent_lease(
                     selected_agent,
                     lambda lease: {
-                        **send_agent(selected_agent, text, bool_arg(args, "enter", True)),
+                        **send_agent(selected_agent, text, bool_arg(args, "enter", True), operation="agent_send"),
                         "lease": lease,
                     },
                 ),
@@ -7285,7 +7336,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "master_timeout_policy",
-        "description": "Report data-sparse timeout and polling policy for MCP startup, Agentin claim retry, Agentin wait, and watchdog supervision.",
+        "description": "Report data-sparse timeout and polling policy for MCP startup, Agentin claim retry, Agentin wait, send/assignment TUI input readiness, and watchdog supervision.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {

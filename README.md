@@ -21,6 +21,10 @@ policy. The default policy is alternating A/B: `1=a1`, `2=b1`, `3=a2`,
 
 The policy is stored in private MCP state and can also be overridden for a
 process with `CODEX_MASTER_AGENT_SELECTOR_SERIES=a,b,c`.
+Teamleiterinnen may spawn fremde Bienen directly through the Masterjet with
+`agent_start`, `agent_claim`, and the structured `agent_assign*` tools. Leases,
+auth checks, and write scopes are the coordination boundary; they are not a
+reason to avoid using available fremde Bienen.
 The original authenticated homes are preserved as `a1` and `b1`. Additional
 homes are intentionally slim and sleeping by default; they have their own
 `CODEX_HOME`, wrapper, config, tmux session name, lease, and metadata, while
@@ -53,10 +57,11 @@ by default and expose raw-log presence without returning local raw-log paths.
 Text is pasted into the Codex TUI through tmux and submitted with `S-Enter`.
 Plain `Enter` can leave multi-line or wrapped prompts sitting in the composer
 instead of starting the model response in current Codex CLI builds.
-Before pasting, `send` and `assign-*` wait briefly for an identifiable Codex TUI
-input prompt. If the Agentin is still in startup warnings or no input prompt is
-visible, the mutation fails closed and returns only metadata instead of losing
-the prompt into the startup screen.
+Before pasting, `send`, `assign-*`, and `report-request` wait briefly for an
+identifiable Codex TUI input prompt. If the Agentin is still in startup warnings
+or no input prompt is visible, the mutation fails closed with retryable
+`agent_input_not_ready`, `paste_attempted: false`, and `raw_output:
+not_returned` instead of losing the prompt into the startup screen.
 Existing metadata under the old `codex-agent-mcp` state directory is still read
 as a migration fallback. External `tmux`, `git`, and `codex mcp` subprocesses
 are timeout-bounded so MCP calls fail closed instead of hanging indefinitely.
@@ -398,6 +403,9 @@ the auth-copy safety model.
   stopped Agentinnen, no managed-home process, and sufficient idle evidence
 - keeps `agent_wait` separate as a bounded activity wait: default 120 seconds,
   maximum 600 seconds
+- reports the `send`/`assign-*`/`report-request` TUI input-readiness gate:
+  default 15 seconds, 0.5 second polling, visible input prompt required,
+  fail-closed without paste via retryable `agent_input_not_ready`
 - reports whether the current CLI/MCP owner identity is stable across
   invocations without returning the identity itself
 

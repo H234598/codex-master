@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 from codex_master.server import (
     AgentError,
     AgentBusyError,
+    AgentInputNotReadyError,
     DEFAULT_CLAIM_WAIT_FOREVER,
     DEFAULT_AGENT_LEASE_SECONDS,
     DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
@@ -38,12 +39,14 @@ from codex_master.server import (
     COMMAND_TIMEOUT_RETURN_CODE,
     DEFAULT_COMMAND_TIMEOUT_SECONDS,
     DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS,
+    DEFAULT_SEND_READY_TIMEOUT_SECONDS,
     DEFAULT_WAIT_POLL_SECONDS,
     DEFAULT_WAIT_SECONDS,
     DEFAULT_WATCHDOG_IDLE_SECONDS,
     DEFAULT_WATCHDOG_POLL_SECONDS,
     DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS,
     DEFAULT_TMUX_TIMEOUT_SECONDS,
+    SEND_READY_POLL_SECONDS,
     agent_ids,
     allowed_raw_log_path,
     append_bounded_raw_log,
@@ -1580,7 +1583,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.0+codex.test",
+            "version": "0.9.1+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1607,7 +1610,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.0")
+        self.assertEqual(result["expected_tag"], "v0.9.1")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -1652,6 +1655,25 @@ class ServerHelpersTest(unittest.TestCase):
         )
         self.assertTrue(result["stopped_lease_recovery"]["requires_agent_not_running"])
         self.assertEqual(result["agent_wait"]["maximum_timeout_seconds"], MAX_WAIT_SECONDS)
+        self.assertEqual(
+            result["send_input_readiness"]["default_timeout_seconds"],
+            DEFAULT_SEND_READY_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(result["send_input_readiness"]["poll_interval_seconds"], SEND_READY_POLL_SECONDS)
+        self.assertEqual(
+            result["send_input_readiness"]["applies_to"],
+            [
+                "agent_send",
+                "agent_assign",
+                "agent_assign_readonly",
+                "agent_assign_live_data",
+                "agent_assign_write",
+                "agent_report_request",
+            ],
+        )
+        self.assertTrue(result["send_input_readiness"]["requires_visible_tui_input_prompt"])
+        self.assertEqual(result["send_input_readiness"]["failure_mode"], "fail_closed_without_paste")
+        self.assertEqual(result["send_input_readiness"]["raw_output"], "not_returned")
         self.assertEqual(result["server_instance_identity"]["identity"], "not_returned")
         self.assertIn(
             result["server_instance_identity"]["source"],
@@ -2405,6 +2427,66 @@ class ServerHelpersTest(unittest.TestCase):
         result = wait_agent("a", timeout_seconds=10, poll_interval_seconds=1)
 
         self.assertEqual(result["status"], "tui_starter_context")
+        self.assertEqual(result["poll_count"], 0)
+        self.assertEqual(result["raw_output"], "not_returned")
+        self.assertEqual(result["response_output"], "not_returned")
+        mock_sleep.assert_not_called()
+
+    @patch("codex_master.server.time.sleep")
+    @patch("codex_master.server.status_agent")
+    def test_wait_agent_waits_past_assigned_tui_starter_context_until_activity(
+        self, mock_status_agent, mock_sleep
+    ) -> None:
+        initial = {
+            "agent": "a",
+            "running": True,
+            "raw_log_bytes": 10,
+            "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
+            "last_assignment": {
+                "assignment_id": "assign-1",
+                "created_at_utc": "2026-06-07T10:00:30+00:00",
+            },
+            "response_state": {"state": "running_tui_starter_context"},
+            "limit_state": {"limited": False},
+            "tui_context": {"state": "starter_placeholder", "evidence": "not_returned"},
+        }
+        current = {
+            **initial,
+            "raw_log_bytes": 20,
+            "raw_log_updated_at_utc": "2026-06-07T10:00:45+00:00",
+        }
+        mock_status_agent.side_effect = [initial, current]
+
+        result = wait_agent("a", timeout_seconds=10, poll_interval_seconds=1)
+
+        self.assertEqual(result["status"], "activity_observed")
+        self.assertEqual(result["poll_count"], 1)
+        self.assertEqual(result["raw_output"], "not_returned")
+        self.assertEqual(result["response_output"], "not_returned")
+        mock_sleep.assert_called_once()
+
+    @patch("codex_master.server.time.sleep")
+    @patch("codex_master.server.status_agent")
+    def test_wait_agent_times_out_in_assigned_tui_starter_context_without_activity(
+        self, mock_status_agent, mock_sleep
+    ) -> None:
+        mock_status_agent.return_value = {
+            "agent": "a",
+            "running": True,
+            "raw_log_bytes": 10,
+            "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
+            "last_assignment": {
+                "assignment_id": "assign-1",
+                "created_at_utc": "2026-06-07T10:00:30+00:00",
+            },
+            "response_state": {"state": "running_tui_starter_context"},
+            "limit_state": {"limited": False},
+            "tui_context": {"state": "starter_placeholder", "evidence": "not_returned"},
+        }
+
+        result = wait_agent("a", timeout_seconds=0, poll_interval_seconds=1)
+
+        self.assertEqual(result["status"], "timeout")
         self.assertEqual(result["poll_count"], 0)
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertEqual(result["response_output"], "not_returned")
@@ -4734,6 +4816,113 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(too_many_context_items["result"]["isError"])
         self.assertIn("context must contain at most", too_many_context_items["result"]["content"][0]["text"])
 
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("codex_master.server.run_tmux")
+    @patch("codex_master.server.wait_agent_input_ready")
+    def test_agent_assign_fails_closed_when_tui_input_is_not_ready(
+        self, mock_wait_ready, mock_run_tmux, _mock_alive
+    ) -> None:
+        mock_wait_ready.return_value = {
+            "ready": False,
+            "poll_count": 1,
+            "timeout_seconds": 0,
+            "evidence": "not_returned",
+            "raw_output": "not_returned",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            state = home / "state"
+            assignment_log = home / "assignments.jsonl"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
+                "codex_master.server.ASSIGNMENT_LOG", assignment_log
+            ), patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                response = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 43,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "agent_assign_readonly",
+                            "arguments": {
+                                "agent": "a",
+                                "scope": ["src"],
+                                "task": "Pruefe geheime Sache.",
+                            },
+                        },
+                    }
+                )
+                ledger = list_assignments("a", limit=10)
+
+        self.assertTrue(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["error_code"], "agent_input_not_ready")
+        self.assertEqual(payload["operation"], "agent_assign_readonly")
+        self.assertTrue(payload["retryable"])
+        self.assertFalse(payload["paste_attempted"])
+        self.assertFalse(payload["input_ready"]["ready"])
+        self.assertEqual(payload["raw_output"], "not_returned")
+        self.assertEqual(payload["response_output"], "not_returned")
+        self.assertNotIn("Pruefe geheime Sache", json.dumps(payload, sort_keys=True))
+        self.assertEqual(ledger["record_count"], 0)
+        mock_run_tmux.assert_not_called()
+
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("codex_master.server.run_tmux")
+    @patch("codex_master.server.wait_agent_input_ready")
+    def test_agent_report_request_fails_closed_when_tui_input_is_not_ready(
+        self, mock_wait_ready, mock_run_tmux, _mock_alive
+    ) -> None:
+        mock_wait_ready.return_value = {
+            "ready": False,
+            "poll_count": 1,
+            "timeout_seconds": 0,
+            "evidence": "not_returned",
+            "raw_output": "not_returned",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            state = home / "state"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                response = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 44,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "agent_report_request",
+                            "arguments": {"agent": "a", "assignment_id": "assign-secret"},
+                        },
+                    }
+                )
+
+        self.assertTrue(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["error_code"], "agent_input_not_ready")
+        self.assertEqual(payload["operation"], "agent_report_request")
+        self.assertTrue(payload["retryable"])
+        self.assertFalse(payload["paste_attempted"])
+        self.assertEqual(payload["raw_output"], "not_returned")
+        self.assertNotIn("assign-secret", json.dumps(payload, sort_keys=True))
+        mock_run_tmux.assert_not_called()
+
     def test_agent_send_rejects_oversized_text_before_tmux(self) -> None:
         response = handle_rpc(
             {
@@ -4801,9 +4990,13 @@ class ServerHelpersTest(unittest.TestCase):
         with patch("codex_master.server.tmux_alive", return_value=True), patch(
             "codex_master.server.pane_tail", return_value="MCP startup incomplete"
         ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux):
-            with self.assertRaisesRegex(AgentError, "input is not ready"):
+            with self.assertRaisesRegex(AgentInputNotReadyError, "input is not ready") as raised:
                 send_agent("a", "single line", ready_timeout_seconds=0)
 
+        self.assertEqual(raised.exception.payload["error_code"], "agent_input_not_ready")
+        self.assertFalse(raised.exception.payload["paste_attempted"])
+        self.assertTrue(raised.exception.payload["retryable"])
+        self.assertEqual(raised.exception.payload["raw_output"], "not_returned")
         self.assertFalse(any(call["args"][0] == "load-buffer" for call in calls))
 
 
