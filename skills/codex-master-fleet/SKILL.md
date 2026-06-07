@@ -100,7 +100,7 @@ Data minimization:
 - Raw logs are local debug artifacts. New raw logs are bounded to 5 MiB per
   file, managed raw-log directories retain at most 20 files by default, and
   log-tail metadata paths must stay inside managed raw-log state. Raw-log
-  symlinks are not followed.
+  symlinks are not followed. Failed starts must remove prepared raw-log files.
 - Assignment inputs are bounded before tmux interaction: sends/start prompts
   12,000 chars, tasks 4,000 chars, names 80 chars, skill refs 300 chars,
   path-like fields 1,000 chars, and assignment lists 50 items.

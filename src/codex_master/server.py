@@ -615,6 +615,7 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
     command = "env CODEX_MASTER_MCP=1 CODEX_AGENT_MCP=1 " + shlex.join(argv)
     cp = run_tmux(["new-session", "-d", "-s", session, "-c", str(start_cwd), command], check=False)
     if cp.returncode != 0:
+        cleanup_failed_start(session, raw_log)
         raise AgentError(f"tmux start failed for agent {agent}: {cp.stderr.strip()}")
 
     pipe_command = raw_log_writer_command(raw_log)

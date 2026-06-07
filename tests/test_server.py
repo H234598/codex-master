@@ -454,6 +454,40 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(len(kill_calls), 1)
             self.assertFalse(any(Path(tmpdir).glob("*.log")))
 
+    @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.write_meta")
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("codex_master.server.run_tmux")
+    def test_start_agent_removes_raw_log_when_new_session_fails(
+        self, mock_run_tmux, _mock_alive, _mock_write_meta, _mock_ensure_state
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = Path(tmpdir) / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux", "new-session"], 1, "", "start failed")
+
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
+                clear=False,
+            ), patch("codex_master.server.RAW_DIR", Path(tmpdir)), patch("codex_master.server.META_DIR", Path(tmpdir)), patch(
+                "codex_master.server.agent_home_process_summary",
+                return_value={
+                    "process_count": 0,
+                    "external_process_count": 0,
+                    "managed_process_count": 0,
+                    "external_processes": [],
+                    "external_processes_truncated": False,
+                    "raw_output": "not_returned",
+                },
+            ):
+                with self.assertRaisesRegex(RuntimeError, "tmux start failed"):
+                    start_agent("a", cwd=tmpdir)
+                leftover_logs = list(Path(tmpdir).glob("*.log"))
+
+        self.assertEqual(leftover_logs, [])
+
     def test_repo_wrapper_works_via_symlink(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         wrapper = repo_root / "bin" / "codex-master-mcp"
