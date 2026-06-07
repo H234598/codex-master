@@ -515,6 +515,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn(str(root), json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.codex_related_process_summary")
+    @patch("codex_master.server.codex_home_context")
     @patch("codex_master.server.master_app_bridge_status")
     @patch("codex_master.server.plugin_cache_status")
     @patch("codex_master.server.codex_client_mcp_config_status")
@@ -529,6 +530,7 @@ class ServerHelpersTest(unittest.TestCase):
         mock_client_config,
         mock_cache,
         mock_app_bridge,
+        mock_home_context,
         mock_processes,
     ) -> None:
         mock_registration.return_value = {"ok": True, "registered": True, "raw_output": "not_returned"}
@@ -543,6 +545,11 @@ class ServerHelpersTest(unittest.TestCase):
         }
         mock_cache.return_value = {"ok": True, "repo_version_installed": True, "raw_output": "not_returned"}
         mock_client_config.return_value = {"ok": True, "raw_output": "not_returned"}
+        mock_home_context.return_value = {
+            "ok": True,
+            "home_kind": "main_default_home",
+            "raw_output": "not_returned",
+        }
         mock_app_bridge.return_value = {"ok": True, "connector_id": "connector_test", "raw_output": "not_returned"}
         mock_processes.return_value = {
             "codex_client_process_count": 2,
@@ -562,10 +569,12 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["mcp_server_ready"])
         self.assertTrue(result["plugin_cache_ready"])
         self.assertTrue(result["client_config_ready"])
+        self.assertTrue(result["active_home_ready"])
         self.assertTrue(result["namespace_ready"])
         self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.codex_related_process_summary")
+    @patch("codex_master.server.codex_home_context")
     @patch("codex_master.server.master_app_bridge_status")
     @patch("codex_master.server.plugin_cache_status")
     @patch("codex_master.server.codex_client_mcp_config_status")
@@ -580,6 +589,7 @@ class ServerHelpersTest(unittest.TestCase):
         mock_client_config,
         mock_cache,
         mock_app_bridge,
+        mock_home_context,
         mock_processes,
     ) -> None:
         mock_registration.return_value = {"ok": True, "registered": True, "raw_output": "not_returned"}
@@ -599,6 +609,11 @@ class ServerHelpersTest(unittest.TestCase):
             "raw_output": "not_returned",
         }
         mock_client_config.return_value = {"ok": True, "raw_output": "not_returned"}
+        mock_home_context.return_value = {
+            "ok": True,
+            "home_kind": "main_default_home",
+            "raw_output": "not_returned",
+        }
         mock_app_bridge.return_value = {"ok": True, "connector_id": "connector_test", "raw_output": "not_returned"}
         mock_processes.return_value = {
             "codex_client_process_count": 2,
@@ -613,11 +628,13 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["mcp_server_ready"])
         self.assertFalse(result["plugin_cache_ready"])
         self.assertTrue(result["client_config_ready"])
+        self.assertTrue(result["active_home_ready"])
         self.assertFalse(result["namespace_ready"])
         self.assertEqual(result["plugin_cache"]["reason"], "repo_plugin_version_not_installed")
         self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.codex_related_process_summary")
+    @patch("codex_master.server.codex_home_context")
     @patch("codex_master.server.master_app_bridge_status")
     @patch("codex_master.server.plugin_cache_status")
     @patch("codex_master.server.codex_client_mcp_config_status")
@@ -632,6 +649,7 @@ class ServerHelpersTest(unittest.TestCase):
         mock_client_config,
         mock_cache,
         mock_app_bridge,
+        mock_home_context,
         mock_processes,
     ) -> None:
         mock_registration.return_value = {"ok": True, "registered": True, "raw_output": "not_returned"}
@@ -650,6 +668,11 @@ class ServerHelpersTest(unittest.TestCase):
             "reason": "mcp_command_mismatch",
             "raw_output": "not_returned",
         }
+        mock_home_context.return_value = {
+            "ok": True,
+            "home_kind": "main_default_home",
+            "raw_output": "not_returned",
+        }
         mock_app_bridge.return_value = {"ok": True, "connector_id": "connector_test", "raw_output": "not_returned"}
         mock_processes.return_value = {
             "codex_client_process_count": 2,
@@ -664,8 +687,66 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["mcp_server_ready"])
         self.assertTrue(result["plugin_cache_ready"])
         self.assertFalse(result["client_config_ready"])
+        self.assertTrue(result["active_home_ready"])
         self.assertFalse(result["namespace_ready"])
         self.assertEqual(result["client_config"]["reason"], "mcp_command_mismatch")
+        self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
+
+    @patch("codex_master.server.codex_related_process_summary")
+    @patch("codex_master.server.codex_home_context")
+    @patch("codex_master.server.master_app_bridge_status")
+    @patch("codex_master.server.plugin_cache_status")
+    @patch("codex_master.server.codex_client_mcp_config_status")
+    @patch("codex_master.server.mcp_command_tools_list_self_test")
+    @patch("codex_master.server.mcp_command_startup_self_test")
+    @patch("codex_master.server.check_mcp_registration")
+    def test_master_namespace_status_fails_inside_managed_agent_home(
+        self,
+        mock_registration,
+        mock_startup,
+        mock_tools,
+        mock_client_config,
+        mock_cache,
+        mock_app_bridge,
+        mock_home_context,
+        mock_processes,
+    ) -> None:
+        mock_registration.return_value = {"ok": True, "registered": True, "raw_output": "not_returned"}
+        mock_startup.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
+        mock_tools.return_value = {
+            "ok": True,
+            "status": "ok",
+            "tool_count": 25,
+            "required_tool": "master_app_bridge_status",
+            "required_tool_available": True,
+            "raw_output": "not_returned",
+        }
+        mock_cache.return_value = {"ok": True, "repo_version_installed": True, "raw_output": "not_returned"}
+        mock_client_config.return_value = {"ok": True, "raw_output": "not_returned"}
+        mock_home_context.return_value = {
+            "ok": False,
+            "home_kind": "managed_agent_home",
+            "mcp_visibility": "not_expected_for_master_mcp",
+            "active_home_path": "not_returned",
+            "raw_output": "not_returned",
+        }
+        mock_app_bridge.return_value = {"ok": True, "connector_id": "connector_test", "raw_output": "not_returned"}
+        mock_processes.return_value = {
+            "codex_client_process_count": 2,
+            "mcp_server_process_count": 1,
+            "home_kind_counts": {"managed_agent_home": 1},
+            "raw_output": "not_returned",
+        }
+
+        result = master_namespace_status()
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["mcp_server_ready"])
+        self.assertTrue(result["plugin_cache_ready"])
+        self.assertTrue(result["client_config_ready"])
+        self.assertFalse(result["active_home_ready"])
+        self.assertFalse(result["namespace_ready"])
+        self.assertEqual(result["codex_home_context"]["home_kind"], "managed_agent_home")
         self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.subprocess.run")

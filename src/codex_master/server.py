@@ -2841,6 +2841,7 @@ def master_namespace_status() -> dict[str, Any]:
     tools_list_self_test = mcp_command_tools_list_self_test(DEFAULT_INSTALL_PATH)
     cache_status = plugin_cache_status(repo_root())
     client_config = codex_client_mcp_config_status(command_path=DEFAULT_INSTALL_PATH)
+    home_context = codex_home_context()
     tool_names = {tool["name"] for tool in TOOLS if isinstance(tool.get("name"), str)}
     local_tool_contract = {
         "tool_count": len(tool_names),
@@ -2854,7 +2855,8 @@ def master_namespace_status() -> dict[str, Any]:
     )
     plugin_cache_ready = bool(cache_status.get("ok"))
     client_config_ready = bool(client_config.get("ok"))
-    namespace_ready = server_ready and plugin_cache_ready and client_config_ready
+    active_home_ready = bool(home_context.get("ok"))
+    namespace_ready = server_ready and plugin_cache_ready and client_config_ready and active_home_ready
     return {
         "ok": namespace_ready,
         "server_name": MCP_SERVER_NAME,
@@ -2862,6 +2864,7 @@ def master_namespace_status() -> dict[str, Any]:
         "mcp_server_ready": server_ready,
         "plugin_cache_ready": plugin_cache_ready,
         "client_config_ready": client_config_ready,
+        "active_home_ready": active_home_ready,
         "namespace_ready": namespace_ready,
         "expected_tools": {
             "master_app_bridge_status": local_tool_contract["master_app_bridge_status"],
@@ -2875,7 +2878,7 @@ def master_namespace_status() -> dict[str, Any]:
         "plugin_cache": cache_status,
         "client_config": client_config,
         "app_bridge": master_app_bridge_status(),
-        "codex_home_context": codex_home_context(),
+        "codex_home_context": home_context,
         "running_process_summary": codex_related_process_summary(),
         "tool_search": {
             "authoritative_for_local_stdio_mcp_tools": False,

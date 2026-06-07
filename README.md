@@ -103,9 +103,10 @@ when an assignment explicitly allows it.
 manifest version is installed in the local plugin cache, without returning cache
 paths.
 For `namespace-status`, top-level `ok` means the MCP server, local plugin cache,
-and active Codex client config are ready. `mcp_server_ready`,
-`plugin_cache_ready`, and `client_config_ready` remain separate for isolating
-server startup from stale client/plugin state or a mismatched `CODEX_HOME`.
+active Codex client config, and active `CODEX_HOME` context are ready.
+`mcp_server_ready`, `plugin_cache_ready`, `client_config_ready`, and
+`active_home_ready` remain separate for isolating server startup from stale
+client/plugin state, a mismatched config, or a managed Agentin home.
 
 ## Local CLI
 
