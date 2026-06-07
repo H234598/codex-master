@@ -226,11 +226,21 @@ def read_json_file(path: Path) -> dict[str, Any]:
         return error
 
 
+def path_present_no_follow(path: Path) -> bool:
+    try:
+        path.lstat()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
 def read_meta(agent: str) -> dict[str, Any]:
     path = meta_path(agent)
-    if not path.exists():
+    if not path_present_no_follow(path):
         legacy_path = LEGACY_META_DIR / f"{agent}.json"
-        if legacy_path.exists() and legacy_path != path:
+        if legacy_path != path and path_present_no_follow(legacy_path):
             data = read_json_file(legacy_path)
             data.setdefault("meta_source", str(legacy_path))
             return data

@@ -593,6 +593,29 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("meta_error", oversized_result)
         self.assertNotIn("payload", oversized_result)
 
+    def test_read_meta_does_not_bypass_primary_symlink_via_legacy_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            meta_dir = Path(tmpdir) / "meta"
+            legacy_meta_dir = Path(tmpdir) / "legacy" / "meta"
+            missing_target = Path(tmpdir) / "missing.json"
+            primary = meta_dir / "a.json"
+            legacy = legacy_meta_dir / "a.json"
+            meta_dir.mkdir()
+            legacy_meta_dir.mkdir(parents=True)
+            primary.symlink_to(missing_target)
+            legacy.write_text('{"legacy": "SHOULD_NOT_BE_USED"}\n', encoding="utf-8")
+
+            with patch("codex_master.server.META_DIR", meta_dir), patch(
+                "codex_master.server.LEGACY_META_DIR", legacy_meta_dir
+            ):
+                result = read_meta("a")
+                primary_still_symlink = primary.is_symlink()
+
+        self.assertIn("meta_error", result)
+        self.assertNotIn("legacy", result)
+        self.assertNotIn("SHOULD_NOT_BE_USED", json.dumps(result, sort_keys=True))
+        self.assertTrue(primary_still_symlink)
+
     def test_replace_private_text_refuses_preexisting_temp_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "state.json"
