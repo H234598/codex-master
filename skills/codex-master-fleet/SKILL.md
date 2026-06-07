@@ -156,7 +156,9 @@ Data minimization:
   chain to be real directories. Install, uninstall, and doctor must resolve
   install symlinks defensively: broken, looping, or unreadable symlinks are
   non-matching, and doctor reports an unreadable target marker instead of
-  crashing.
+  crashing. Install must persist `startup_timeout_sec = 120` for the active MCP
+  registration and refuse Master MCP registration from a managed Agentinnen
+  `CODEX_HOME`.
 - Use `tail` only for an explicit capped, ANSI-stripped, redacted excerpt.
 - Do not read raw tmux logs directly unless the user explicitly requests it and
   the privacy impact is acceptable.

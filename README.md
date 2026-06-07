@@ -115,6 +115,8 @@ python3 -m codex_master.server stop both
 `install`
 - creates `~/.local/bin/codex-master-mcp` as symlink to `bin/codex-master-mcp`
 - registers the command via `codex mcp add codex-master-mcp -- <link>`
+- ensures the active Codex MCP config has `startup_timeout_sec = 120`
+- refuses to register the Master MCP from a managed Agentinnen `CODEX_HOME`
 - requires the install-path parent chain to be real directories, not symlinks
 - treats broken, looping, or unreadable install symlinks as non-matching instead
   of crashing while resolving them
@@ -237,7 +239,8 @@ the Masterjet is responsible for them. `start` refuses to launch an Agentin when
 its home is already used by an external Codex process, and `doctor` reports such
 home conflicts before they become tmux or lock contention. `start` also refuses
 an already-running Masterjet session if a second external process is using the
-same home.
+same home. `install` refuses to register `codex-master-mcp` from a managed
+Agentinnen home so the Masterjet tools stay in the Teamleiterin/main instance.
 
 Assignments are appended to `~/.local/state/codex-master-mcp/assignments.jsonl`
 as metadata only: assignment id, Agentin, role, selected model, skill match

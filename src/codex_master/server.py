@@ -84,12 +84,14 @@ MAX_ASSIGNMENT_ID = 200
 MAX_RPC_MESSAGE_BYTES = 1024 * 1024
 MAX_ERROR_CHARS = 1200
 MAX_META_BYTES = 64 * 1024
+MAX_CODEX_CONFIG_BYTES = 1024 * 1024
 COMMAND_TIMEOUT_RETURN_CODE = 124
 DEFAULT_TMUX_TIMEOUT_SECONDS = 10
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
 RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS = 120
 DEFAULT_AGENTIN_NAMES = {"a": "Mila", "b": "Nora"}
 RAW_LOG_TRUNCATION_MARKER = b"\n... codex-master-mcp retained the last raw log bytes ...\n"
+MCP_SERVER_TABLE_HEADER = f"[mcp_servers.{MCP_SERVER_NAME}]"
 
 
 AGENTS = {
@@ -236,6 +238,86 @@ def codex_home_context() -> dict[str, Any]:
         "active_home_path": "not_returned",
         "raw_output": "not_returned",
     }
+
+
+def codex_config_path() -> Path:
+    codex_home = os.environ.get("CODEX_HOME")
+    root = Path(codex_home).expanduser() if codex_home else Path.home() / ".codex"
+    if not root.is_absolute():
+        root = Path.cwd() / root
+    return root / "config.toml"
+
+
+def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | None]:
+    lines = text.splitlines()
+    previous: int | None = None
+    section_start: int | None = None
+    section_end = len(lines)
+
+    for index, line in enumerate(lines):
+        if line.strip() == MCP_SERVER_TABLE_HEADER:
+            section_start = index
+            break
+
+    if section_start is None:
+        prefix = lines[:]
+        if prefix and prefix[-1].strip():
+            prefix.append("")
+        prefix.extend([MCP_SERVER_TABLE_HEADER, f"startup_timeout_sec = {RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS}"])
+        return "\n".join(prefix) + "\n", True, previous
+
+    for index in range(section_start + 1, len(lines)):
+        stripped = lines[index].lstrip()
+        if stripped.startswith("[") and not stripped.startswith("[["):
+            section_end = index
+            break
+
+    timeout_line_re = re.compile(r"^(\s*startup_timeout_sec\s*=\s*)(\d+)(\s*(?:#.*)?)$")
+    for index in range(section_start + 1, section_end):
+        match = timeout_line_re.match(lines[index])
+        if not match:
+            continue
+        previous = int(match.group(2))
+        if previous >= RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS:
+            return text if text.endswith("\n") else text + "\n", False, previous
+        lines[index] = f"{match.group(1)}{RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS}{match.group(3)}"
+        return "\n".join(lines) + "\n", True, previous
+
+    insert_at = section_end
+    while insert_at > section_start + 1 and not lines[insert_at - 1].strip():
+        insert_at -= 1
+    lines.insert(insert_at, f"startup_timeout_sec = {RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS}")
+    return "\n".join(lines) + "\n", True, previous
+
+
+def ensure_mcp_startup_timeout_configured(config_path: Path | None = None) -> dict[str, Any]:
+    path = config_path or codex_config_path()
+    path = path.expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    ensure_directory_chain_no_symlink(path.parent, "codex config parent directories must be real directories")
+    if path.exists() or path.is_symlink():
+        if path.is_symlink():
+            raise AgentError("codex config path must be a regular file")
+        text = read_private_regular_text(path, MAX_CODEX_CONFIG_BYTES, "could not read codex config")
+    else:
+        text = ""
+    new_text, changed, previous = updated_mcp_startup_timeout_config(text)
+    if changed:
+        replace_private_text(path, new_text)
+    return {
+        "status": "updated" if changed else "already_configured",
+        "startup_timeout_sec": RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
+        "previous_startup_timeout_sec": previous,
+        "config_path": "not_returned",
+        "raw_output": "not_returned",
+    }
+
+
+def assert_install_context_allows_master_registration() -> None:
+    context = codex_home_context()
+    if context["home_kind"] == "managed_agent_home":
+        raise AgentError("refusing to register Master MCP inside a managed Agentin home")
 
 
 def agent_ids(agent: str) -> list[str]:
@@ -2018,6 +2100,8 @@ def doctor() -> dict[str, Any]:
 
 
 def install(register: bool = True, force: bool = False, install_path: Path = DEFAULT_INSTALL_PATH) -> dict[str, Any]:
+    if register:
+        assert_install_context_allows_master_registration()
     wrapper = repo_wrapper_path()
     if not wrapper.exists():
         raise AgentError(f"repo wrapper missing: {wrapper}")
@@ -2043,6 +2127,7 @@ def install(register: bool = True, force: bool = False, install_path: Path = DEF
     registration: dict[str, Any] = {"requested": register, "status": "skipped"}
     if register:
         current = check_mcp_registration(install_path)
+        startup_timeout_config = None
         if current.get("ok"):
             registration = {"requested": True, "status": "already_registered"}
         else:
@@ -2058,6 +2143,19 @@ def install(register: bool = True, force: bool = False, install_path: Path = DEF
                 output, redacted = command_excerpt(add.stdout + add.stderr)
                 raise AgentError(f"codex mcp add failed: {output if not redacted else '<redacted>'}")
             registration = {"requested": True, "status": "registered"}
+        if not current.get("startup_timeout_ok"):
+            startup_timeout_config = ensure_mcp_startup_timeout_configured()
+        else:
+            startup_timeout_config = {
+                "status": "already_configured",
+                "startup_timeout_sec": current.get(
+                    "startup_timeout_sec", RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS
+                ),
+                "previous_startup_timeout_sec": current.get("startup_timeout_sec"),
+                "config_path": "not_returned",
+                "raw_output": "not_returned",
+            }
+        registration["startup_timeout"] = startup_timeout_config
 
     return {
         "ok": True,

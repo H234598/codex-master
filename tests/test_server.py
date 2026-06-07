@@ -64,7 +64,9 @@ from codex_master.server import (
     worktree_create_for_agent,
     worktree_status,
     codex_home_context,
+    ensure_mcp_startup_timeout_configured,
     mcp_startup_timeout_seconds,
+    updated_mcp_startup_timeout_config,
 )
 
 
@@ -151,6 +153,62 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["mcp_visibility"], "not_expected_for_master_mcp")
         self.assertEqual(result["active_home_path"], "not_returned")
         self.assertNotIn(str(agent_home), json.dumps(result, sort_keys=True))
+
+    def test_updated_mcp_startup_timeout_config_updates_or_inserts_value(self) -> None:
+        existing_low = "\n".join(
+            [
+                '[projects."/tmp/example"]',
+                'trust_level = "trusted"',
+                "",
+                "[mcp_servers.codex-master-mcp]",
+                'command = "/tmp/codex-master-mcp"',
+                "startup_timeout_sec = 30",
+                "",
+                "[features]",
+                "memories = true",
+            ]
+        )
+        updated, changed, previous = updated_mcp_startup_timeout_config(existing_low)
+        self.assertTrue(changed)
+        self.assertEqual(previous, 30)
+        self.assertIn("startup_timeout_sec = 120", updated)
+        self.assertIn("[features]", updated)
+
+        existing_high = existing_low.replace("startup_timeout_sec = 30", "startup_timeout_sec = 180")
+        high_updated, high_changed, high_previous = updated_mcp_startup_timeout_config(existing_high)
+        self.assertFalse(high_changed)
+        self.assertEqual(high_previous, 180)
+        self.assertIn("startup_timeout_sec = 180", high_updated)
+
+        missing_value = existing_low.replace("\nstartup_timeout_sec = 30", "")
+        inserted, inserted_changed, inserted_previous = updated_mcp_startup_timeout_config(missing_value)
+        self.assertTrue(inserted_changed)
+        self.assertIsNone(inserted_previous)
+        self.assertIn('command = "/tmp/codex-master-mcp"\nstartup_timeout_sec = 120', inserted)
+
+    def test_ensure_mcp_startup_timeout_configured_is_path_sparse_and_no_follow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = Path(tmpdir) / ".codex" / "config.toml"
+            result = ensure_mcp_startup_timeout_configured(config)
+            content = config.read_text(encoding="utf-8")
+
+        self.assertEqual(result["status"], "updated")
+        self.assertEqual(result["config_path"], "not_returned")
+        self.assertIn("[mcp_servers.codex-master-mcp]", content)
+        self.assertIn("startup_timeout_sec = 120", content)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            target = tmp_path / "target.toml"
+            link = tmp_path / ".codex" / "config.toml"
+            link.parent.mkdir()
+            target.write_text("SECRET_CONFIG_SHOULD_NOT_BE_READ\n", encoding="utf-8")
+            link.symlink_to(target)
+
+            with self.assertRaisesRegex(AgentError, "codex config path must be a regular file") as raised:
+                ensure_mcp_startup_timeout_configured(link)
+
+        self.assertNotIn(str(target), str(raised.exception))
 
     @patch("codex_master.server.run_command")
     @patch("codex_master.server.shutil.which", return_value="/usr/bin/codex")
@@ -2281,6 +2339,7 @@ class CliLifecycleTest(unittest.TestCase):
                     ]
                     result = main_cli(["install", "--path", str(Path(tmp_home) / ".local" / "bin" / "codex-master-mcp")])
                     link_created = (Path(tmp_home) / ".local" / "bin" / "codex-master-mcp").exists()
+                    config_content = (Path(tmp_home) / ".codex" / "config.toml").read_text(encoding="utf-8")
 
         install_link = Path(tmp_home) / ".local" / "bin" / "codex-master-mcp"
         self.assertEqual(result, 0)
@@ -2290,9 +2349,37 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(payload.get("install_path"), str(install_link))
         self.assertEqual(payload.get("target"), str(wrapper_target))
         self.assertEqual(payload.get("symlink"), "created")
-        self.assertEqual(payload.get("mcp"), {"requested": True, "status": "registered"})
+        self.assertEqual(payload["mcp"]["requested"], True)
+        self.assertEqual(payload["mcp"]["status"], "registered")
+        self.assertEqual(payload["mcp"]["startup_timeout"]["status"], "updated")
+        self.assertEqual(payload["mcp"]["startup_timeout"]["startup_timeout_sec"], 120)
+        self.assertEqual(payload["mcp"]["startup_timeout"]["config_path"], "not_returned")
+        self.assertIn("startup_timeout_sec = 120", config_content)
         self.assertTrue(link_created)
         mock_run.assert_any_call(["codex", "mcp", "add", "codex-master-mcp", "--", str(install_link)])
+
+    def test_install_refuses_master_registration_inside_managed_agent_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            agent_home = tmp_path / "agent-a-home"
+            agents = {
+                "a": {"label": "A", "runner": tmp_path / "a-runner", "home": agent_home, "session": "session-a"},
+                "b": {
+                    "label": "B",
+                    "runner": tmp_path / "b-runner",
+                    "home": tmp_path / "agent-b-home",
+                    "session": "session-b",
+                },
+            }
+            with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": str(agent_home)}), patch.dict(
+                "codex_master.server.AGENTS", agents, clear=True
+            ):
+                with self.assertRaisesRegex(AgentError, "managed Agentin home"):
+                    install(register=True, install_path=install_link)
+            link_exists = install_link.exists() or install_link.is_symlink()
+
+        self.assertFalse(link_exists)
 
     @patch("codex_master.server.print_json")
     def test_cli_uninstall_plans_expected_local_unregister_flow(self, mock_print_json) -> None:
