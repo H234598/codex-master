@@ -1,0 +1,21 @@
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local tooling state
+.venv/
+venv/
+ENV/
+env/
+*.egg-info/
+
+# Temporary/cached test state
+.coverage
+.tox/
+.tmp/
+tmp/

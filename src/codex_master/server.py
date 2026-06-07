@@ -1,0 +1,666 @@
+"""MCP server and CLI for controlling two local Codex instances via tmux.
+
+The public tool surface is intentionally data-sparse. Raw terminal output is
+written to local state files only; tool responses return structured status or
+explicitly requested, size-limited, redacted excerpts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+from codex_master import __version__
+
+
+STATE_ROOT = Path(os.environ.get("CODEX_AGENT_MCP_STATE", "~/.local/state/codex-agent-mcp")).expanduser()
+RAW_DIR = STATE_ROOT / "raw"
+META_DIR = STATE_ROOT / "meta"
+BASE_ARGS = ["--yolo", "-s", "danger-full-access", "--search"]
+MAX_TAIL_LINES = 80
+MAX_TAIL_CHARS = 8192
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
+
+
+AGENTS = {
+    "a": {
+        "label": "Codex Agentin A",
+        "runner": Path(os.environ.get("CODEX_AGENT_A_RUNNER", "/home/teladi/.codex-agent-a/codex")),
+        "home": Path(os.environ.get("CODEX_AGENT_A_HOME", "/home/teladi/.codex-agent-a")),
+        "session": os.environ.get("CODEX_AGENT_A_SESSION", "codex_agent_a_mcp"),
+    },
+    "b": {
+        "label": "Codex Agentin B",
+        "runner": Path(os.environ.get("CODEX_AGENT_B_RUNNER", "/home/teladi/.codex-agent-b/codex")),
+        "home": Path(os.environ.get("CODEX_AGENT_B_HOME", "/home/teladi/.codex-agent-b")),
+        "session": os.environ.get("CODEX_AGENT_B_SESSION", "codex_agent_b_mcp"),
+    },
+}
+
+
+ANSI_RE = re.compile(
+    r"(?:\x1B[@-Z\\-_]|\x1B\[[0-?]*[ -/]*[@-~]|\x1B\][^\x07]*(?:\x07|\x1B\\))"
+)
+SECRET_PATTERNS = [
+    re.compile(r"(?i)\b(sk-[A-Za-z0-9_\-]{12,})\b"),
+    re.compile(r"(?i)\b(sess-[A-Za-z0-9_\-]{12,})\b"),
+    re.compile(r"(?i)\b(gh[pousr]_[A-Za-z0-9_]{12,})\b"),
+    re.compile(r"(?i)\b(xox[baprs]-[A-Za-z0-9\-]{12,})\b"),
+    re.compile(
+        r"(?i)\b((?:api|access|auth|bearer|codex|openai)[_\- ]?(?:key|token|secret))\s*[:=]\s*['\"]?([^'\"\s]{8,})"
+    ),
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"),
+    re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
+]
+
+
+class AgentError(RuntimeError):
+    """Raised for expected agent-control failures."""
+
+
+def ensure_state() -> None:
+    for path in (STATE_ROOT, RAW_DIR, META_DIR):
+        path.mkdir(parents=True, exist_ok=True)
+        try:
+            path.chmod(0o700)
+        except PermissionError:
+            pass
+
+
+def now_id() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def agent_ids(agent: str) -> list[str]:
+    if agent in ("all", "both"):
+        return ["a", "b"]
+    if agent not in AGENTS:
+        raise AgentError(f"unknown agent: {agent!r}; expected a, b, both, or all")
+    return [agent]
+
+
+def run_tmux(args: list[str], *, input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["tmux", *args],
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=check,
+    )
+
+
+def tmux_alive(session: str) -> bool:
+    return run_tmux(["has-session", "-t", session], check=False).returncode == 0
+
+
+def meta_path(agent: str) -> Path:
+    return META_DIR / f"{agent}.json"
+
+
+def read_meta(agent: str) -> dict[str, Any]:
+    path = meta_path(agent)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"meta_error": f"could not read {path}"}
+
+
+def write_meta(agent: str, data: dict[str, Any]) -> None:
+    path = meta_path(agent)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except PermissionError:
+        pass
+
+
+def pane_pid(session: str) -> int | None:
+    if not tmux_alive(session):
+        return None
+    cp = run_tmux(["display-message", "-p", "-t", session, "#{pane_pid}"], check=False)
+    if cp.returncode != 0:
+        return None
+    text = cp.stdout.strip()
+    return int(text) if text.isdigit() else None
+
+
+def cleanup_failed_start(session: str, raw_log: Path) -> None:
+    if tmux_alive(session):
+        run_tmux(["kill-session", "-t", session], check=False)
+    try:
+        raw_log.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -> dict[str, Any]:
+    ensure_state()
+    cfg = AGENTS[agent]
+    runner = cfg["runner"]
+    session = cfg["session"]
+    if not runner.exists():
+        raise AgentError(f"runner missing for agent {agent}: {runner}")
+    if tmux_alive(session):
+        return {
+            "agent": agent,
+            "status": "already_running",
+            "backend": "tmux",
+            "session": session,
+            "pid": pane_pid(session),
+            "meta": read_meta(agent),
+            "raw_output": "not_returned",
+        }
+
+    start_cwd = Path(cwd or os.getcwd()).expanduser().resolve()
+    if not start_cwd.exists() or not start_cwd.is_dir():
+        raise AgentError(f"cwd is not a directory: {start_cwd}")
+
+    run_id = f"{now_id()}-{agent}"
+    raw_log = RAW_DIR / f"{run_id}.log"
+    raw_log.touch(mode=0o600, exist_ok=False)
+    try:
+        raw_log.chmod(0o600)
+    except PermissionError:
+        pass
+
+    argv = [str(runner), *BASE_ARGS]
+    if prompt:
+        argv.append(prompt)
+
+    command = "env CODEX_AGENT_MCP=1 " + shlex.join(argv)
+    cp = run_tmux(["new-session", "-d", "-s", session, "-c", str(start_cwd), command], check=False)
+    if cp.returncode != 0:
+        raise AgentError(f"tmux start failed for agent {agent}: {cp.stderr.strip()}")
+
+    pipe_command = "cat >> " + shlex.quote(str(raw_log))
+    pipe = run_tmux(["pipe-pane", "-o", "-t", session, pipe_command], check=False)
+    if pipe.returncode != 0:
+        cleanup_failed_start(session, raw_log)
+        raise AgentError(f"tmux pipe-pane failed for agent {agent}: {pipe.stderr.strip()}")
+
+    data = {
+        "agent": agent,
+        "backend": "tmux",
+        "label": cfg["label"],
+        "session": session,
+        "home": str(cfg["home"]),
+        "runner": str(runner),
+        "cwd": str(start_cwd),
+        "args": BASE_ARGS,
+        "started_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "run_id": run_id,
+        "raw_log": str(raw_log),
+        "raw_log_policy": "local_only_not_returned_by_default",
+    }
+    write_meta(agent, data)
+    return {
+        "agent": agent,
+        "status": "started",
+        "backend": "tmux",
+        "session": session,
+        "pid": pane_pid(session),
+        "cwd": str(start_cwd),
+        "raw_log": str(raw_log),
+        "raw_output": "not_returned",
+    }
+
+
+def stop_agent(agent: str) -> dict[str, Any]:
+    cfg = AGENTS[agent]
+    session = cfg["session"]
+    was_running = tmux_alive(session)
+    if was_running:
+        cp = run_tmux(["kill-session", "-t", session], check=False)
+        if cp.returncode != 0:
+            raise AgentError(f"tmux stop failed for agent {agent}: {cp.stderr.strip()}")
+    return {"agent": agent, "status": "stopped" if was_running else "not_running", "session": session}
+
+
+def status_agent(agent: str) -> dict[str, Any]:
+    ensure_state()
+    cfg = AGENTS[agent]
+    session = cfg["session"]
+    meta = read_meta(agent)
+    raw_log = meta.get("raw_log")
+    raw_size = None
+    if raw_log:
+        try:
+            raw_size = Path(raw_log).stat().st_size
+        except OSError:
+            raw_size = None
+    return {
+        "agent": agent,
+        "label": cfg["label"],
+        "backend": "tmux",
+        "running": tmux_alive(session),
+        "session": session,
+        "pid": pane_pid(session),
+        "home": str(cfg["home"]),
+        "runner": str(cfg["runner"]),
+        "started_at_utc": meta.get("started_at_utc"),
+        "cwd": meta.get("cwd"),
+        "raw_log": raw_log,
+        "raw_log_bytes": raw_size,
+        "raw_output": "not_returned",
+    }
+
+
+def send_agent(agent: str, text: str, enter: bool = True) -> dict[str, Any]:
+    cfg = AGENTS[agent]
+    session = cfg["session"]
+    if not tmux_alive(session):
+        raise AgentError(f"agent {agent} is not running")
+    buffer_name = f"codex-agent-mcp-{agent}-{int(time.time() * 1000)}"
+    cp = run_tmux(["load-buffer", "-b", buffer_name, "-"], input_text=text, check=False)
+    if cp.returncode != 0:
+        raise AgentError(f"tmux load-buffer failed for agent {agent}: {cp.stderr.strip()}")
+    cp = run_tmux(["paste-buffer", "-d", "-b", buffer_name, "-t", session], check=False)
+    if cp.returncode != 0:
+        raise AgentError(f"tmux paste-buffer failed for agent {agent}: {cp.stderr.strip()}")
+    if enter:
+        cp = run_tmux(["send-keys", "-t", session, "Enter"], check=False)
+        if cp.returncode != 0:
+            raise AgentError(f"tmux send Enter failed for agent {agent}: {cp.stderr.strip()}")
+    return {
+        "agent": agent,
+        "status": "sent",
+        "chars": len(text),
+        "submitted": enter,
+        "response_output": "not_returned",
+    }
+
+
+def interrupt_agent(agent: str) -> dict[str, Any]:
+    cfg = AGENTS[agent]
+    session = cfg["session"]
+    if not tmux_alive(session):
+        raise AgentError(f"agent {agent} is not running")
+    cp = run_tmux(["send-keys", "-t", session, "C-c"], check=False)
+    if cp.returncode != 0:
+        raise AgentError(f"tmux interrupt failed for agent {agent}: {cp.stderr.strip()}")
+    return {"agent": agent, "status": "interrupt_sent", "response_output": "not_returned"}
+
+
+def strip_ansi(text: str) -> str:
+    text = ANSI_RE.sub("", text)
+    return text.replace("\r", "\n")
+
+
+def redact(text: str) -> tuple[str, bool]:
+    redacted = text
+    changed = False
+    for pattern in SECRET_PATTERNS:
+        next_text = pattern.sub(
+            lambda m: m.group(1) + "=<redacted>" if m.lastindex and m.lastindex >= 2 else "<redacted>",
+            redacted,
+        )
+        changed = changed or next_text != redacted
+        redacted = next_text
+    return redacted, changed
+
+
+def trim_lines(text: str, max_lines: int) -> str:
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return "\n".join(lines)
+    return "\n".join([f"... truncated to last {max_lines} lines ...", *lines[-max_lines:]])
+
+
+def trim_chars(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return "... truncated to last characters ...\n" + text[-max_chars:]
+
+
+def read_log_tail(path: Path, approx_bytes: int) -> str:
+    if not path.exists():
+        return ""
+    with path.open("rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        fh.seek(max(0, size - approx_bytes), os.SEEK_SET)
+        return fh.read().decode("utf-8", errors="replace")
+
+
+def pane_tail(agent: str, lines: int) -> str:
+    cfg = AGENTS[agent]
+    session = cfg["session"]
+    if not tmux_alive(session):
+        return ""
+    cp = run_tmux(["capture-pane", "-p", "-t", session, "-S", f"-{lines}"], check=False)
+    if cp.returncode != 0:
+        return ""
+    return cp.stdout
+
+
+def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pane") -> dict[str, Any]:
+    ensure_state()
+    lines = max(1, min(int(lines), MAX_TAIL_LINES))
+    chars = max(1, min(int(chars), MAX_TAIL_CHARS))
+    if source not in ("pane", "log"):
+        raise AgentError("source must be 'pane' or 'log'")
+    meta = read_meta(agent)
+    if source == "pane":
+        raw = pane_tail(agent, lines)
+    else:
+        raw_log = meta.get("raw_log")
+        raw = read_log_tail(Path(raw_log), chars * 4) if raw_log else ""
+    cleaned = strip_ansi(raw)
+    redacted, was_redacted = redact(cleaned)
+    cleaned = trim_lines(redacted, lines)
+    cleaned = trim_chars(cleaned, chars)
+    return {
+        "agent": agent,
+        "source": source,
+        "lines_limit": lines,
+        "chars_limit": chars,
+        "redaction_applied": was_redacted,
+        "raw_log": meta.get("raw_log"),
+        "output": cleaned,
+    }
+
+
+def negotiate_protocol_version(requested: str | None) -> str:
+    if requested in SUPPORTED_PROTOCOL_VERSIONS:
+        return requested
+    raise AgentError("Unsupported protocol version")
+
+
+def multi_agent_result(selected: list[str], fn: Any) -> dict[str, Any]:
+    results = []
+    for agent in selected:
+        try:
+            results.append(fn(agent))
+        except Exception as exc:
+            results.append({"agent": agent, "error": str(exc)})
+    return {"results": results}
+
+
+def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    if name == "agent_start":
+        selected = agent_ids(str(args.get("agent", "both")))
+        return multi_agent_result(selected, lambda agent: start_agent(agent, args.get("cwd"), args.get("prompt")))
+    if name == "agent_stop":
+        selected = agent_ids(str(args.get("agent", "both")))
+        return multi_agent_result(selected, stop_agent)
+    if name == "agent_status":
+        selected = agent_ids(str(args.get("agent", "all")))
+        return multi_agent_result(selected, status_agent)
+    if name == "agent_send":
+        selected = agent_ids(str(args.get("agent", "")))
+        if len(selected) != 1:
+            raise AgentError("agent_send requires exactly one agent: a or b")
+        text = args.get("text")
+        if not isinstance(text, str) or text == "":
+            raise AgentError("agent_send requires non-empty text")
+        return send_agent(selected[0], text, bool(args.get("enter", True)))
+    if name == "agent_interrupt":
+        selected = agent_ids(str(args.get("agent", "")))
+        if len(selected) != 1:
+            raise AgentError("agent_interrupt requires exactly one agent: a or b")
+        return interrupt_agent(selected[0])
+    if name == "agent_safe_tail":
+        selected = agent_ids(str(args.get("agent", "")))
+        if len(selected) != 1:
+            raise AgentError("agent_safe_tail requires exactly one agent: a or b")
+        return safe_tail(
+            selected[0],
+            int(args.get("lines", 40)),
+            int(args.get("chars", 4000)),
+            str(args.get("source", "pane")),
+        )
+    raise AgentError(f"unknown tool: {name}")
+
+
+TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "agent_start",
+        "description": "Start Codex agent A, B, or both in persistent tmux sessions with --yolo -s danger-full-access --search. Does not return raw output.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string", "enum": ["a", "b", "both"], "default": "both"},
+                "cwd": {"type": "string", "description": "Working directory. Defaults to the MCP server cwd."},
+                "prompt": {"type": "string", "description": "Optional initial prompt passed to Codex."},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_status",
+        "description": "Return structured status for Codex agent A, B, or all agents. Does not return raw output.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"agent": {"type": "string", "enum": ["a", "b", "all"], "default": "all"}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_send",
+        "description": "Send text to one running agent through its tmux PTY. The agent response is not returned automatically.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["agent", "text"],
+            "properties": {
+                "agent": {"type": "string", "enum": ["a", "b"]},
+                "text": {"type": "string"},
+                "enter": {"type": "boolean", "default": True},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_interrupt",
+        "description": "Send Ctrl-C to one running agent. Does not return raw output.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["agent"],
+            "properties": {"agent": {"type": "string", "enum": ["a", "b"]}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_stop",
+        "description": "Stop Codex agent A, B, or both by killing the managed tmux session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"agent": {"type": "string", "enum": ["a", "b", "both"], "default": "both"}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_safe_tail",
+        "description": "Explicitly request a small, ANSI-stripped, redacted output excerpt from one agent. Raw logs remain local.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["agent"],
+            "properties": {
+                "agent": {"type": "string", "enum": ["a", "b"]},
+                "source": {"type": "string", "enum": ["pane", "log"], "default": "pane"},
+                "lines": {"type": "integer", "minimum": 1, "maximum": MAX_TAIL_LINES, "default": 40},
+                "chars": {"type": "integer", "minimum": 1, "maximum": MAX_TAIL_CHARS, "default": 4000},
+            },
+            "additionalProperties": False,
+        },
+    },
+]
+
+
+def rpc_result(message_id: Any, result: Any) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": message_id, "result": result}
+
+
+def rpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": message_id, "error": {"code": code, "message": message}}
+
+
+def handle_rpc(msg: dict[str, Any]) -> dict[str, Any] | None:
+    method = msg.get("method")
+    message_id = msg.get("id")
+    if method == "initialize":
+        requested = (msg.get("params") or {}).get("protocolVersion")
+        try:
+            protocol_version = negotiate_protocol_version(requested)
+        except AgentError:
+            return rpc_error(
+                message_id,
+                -32602,
+                "Unsupported protocol version",
+            )
+        return rpc_result(
+            message_id,
+            {
+                "protocolVersion": protocol_version,
+                "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+                "serverInfo": {"name": "codex-agent-mcp", "version": __version__},
+            },
+        )
+    if method == "tools/list":
+        return rpc_result(message_id, {"tools": TOOLS})
+    if method == "resources/list":
+        return rpc_result(message_id, {"resources": []})
+    if method == "prompts/list":
+        return rpc_result(message_id, {"prompts": []})
+    if method == "tools/call":
+        params = msg.get("params") or {}
+        name = params.get("name")
+        args = params.get("arguments") or {}
+        try:
+            payload = call_tool(str(name), args if isinstance(args, dict) else {})
+            text = json.dumps(payload, indent=2, sort_keys=True)
+            return rpc_result(message_id, {"content": [{"type": "text", "text": text}], "isError": False})
+        except Exception as exc:
+            text = json.dumps({"error": str(exc)}, indent=2, sort_keys=True)
+            return rpc_result(message_id, {"content": [{"type": "text", "text": text}], "isError": True})
+    if method in ("notifications/initialized", "notifications/cancelled"):
+        return None
+    if message_id is None:
+        return None
+    return rpc_error(message_id, -32601, f"method not found: {method}")
+
+
+def read_message() -> dict[str, Any] | None:
+    first = sys.stdin.buffer.readline()
+    if not first:
+        return None
+    if first.startswith(b"Content-Length:"):
+        length = int(first.decode("ascii").split(":", 1)[1].strip())
+        while True:
+            line = sys.stdin.buffer.readline()
+            if line in (b"\r\n", b"\n", b""):
+                break
+        body = sys.stdin.buffer.read(length)
+        return json.loads(body.decode("utf-8"))
+    stripped = first.strip()
+    if stripped:
+        return json.loads(stripped.decode("utf-8"))
+    return None
+
+
+def write_message(message: dict[str, Any]) -> None:
+    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii"))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+
+def serve_mcp() -> int:
+    ensure_state()
+    while True:
+        try:
+            msg = read_message()
+            if msg is None:
+                return 0
+            response = handle_rpc(msg)
+            if response is not None:
+                write_message(response)
+        except Exception as exc:
+            try:
+                write_message(rpc_error(None, -32000, str(exc)))
+            except Exception:
+                return 1
+
+
+def print_json(payload: Any) -> int:
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+def main_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Control local Codex agent A/B via tmux, or run as MCP stdio server.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_start = sub.add_parser("start")
+    p_start.add_argument("agent", choices=["a", "b", "both"], nargs="?", default="both")
+    p_start.add_argument("--cwd")
+    p_start.add_argument("--prompt")
+
+    p_status = sub.add_parser("status")
+    p_status.add_argument("agent", choices=["a", "b", "all"], nargs="?", default="all")
+
+    p_send = sub.add_parser("send")
+    p_send.add_argument("agent", choices=["a", "b"])
+    p_send.add_argument("text")
+    p_send.add_argument("--no-enter", action="store_true")
+
+    p_interrupt = sub.add_parser("interrupt")
+    p_interrupt.add_argument("agent", choices=["a", "b"])
+
+    p_stop = sub.add_parser("stop")
+    p_stop.add_argument("agent", choices=["a", "b", "both"], nargs="?", default="both")
+
+    p_tail = sub.add_parser("tail")
+    p_tail.add_argument("agent", choices=["a", "b"])
+    p_tail.add_argument("--source", choices=["pane", "log"], default="pane")
+    p_tail.add_argument("--lines", type=int, default=20)
+    p_tail.add_argument("--chars", type=int, default=2000)
+
+    sub.add_parser("tools")
+
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "start":
+            return print_json(call_tool("agent_start", {"agent": args.agent, "cwd": args.cwd, "prompt": args.prompt}))
+        if args.command == "status":
+            return print_json(call_tool("agent_status", {"agent": args.agent}))
+        if args.command == "send":
+            return print_json(call_tool("agent_send", {"agent": args.agent, "text": args.text, "enter": not args.no_enter}))
+        if args.command == "interrupt":
+            return print_json(call_tool("agent_interrupt", {"agent": args.agent}))
+        if args.command == "stop":
+            return print_json(call_tool("agent_stop", {"agent": args.agent}))
+        if args.command == "tail":
+            return print_json(
+                call_tool(
+                    "agent_safe_tail",
+                    {"agent": args.agent, "source": args.source, "lines": args.lines, "chars": args.chars},
+                )
+            )
+        if args.command == "tools":
+            return print_json({"tools": TOOLS})
+    except Exception as exc:
+        print(json.dumps({"error": str(exc)}, indent=2, sort_keys=True))
+        return 1
+    return 2
+
+
+def main() -> int:
+    if len(sys.argv) > 1:
+        return main_cli(sys.argv[1:])
+    return serve_mcp()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
