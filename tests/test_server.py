@@ -23,6 +23,8 @@ from codex_master.server import (
     MAX_WAIT_POLL_SECONDS,
     MAX_WAIT_SECONDS,
     RAW_LOG_TRUNCATION_MARKER,
+    BRACKETED_PASTE_BEGIN,
+    BRACKETED_PASTE_END,
     COMMAND_TIMEOUT_RETURN_CODE,
     DEFAULT_COMMAND_TIMEOUT_SECONDS,
     DEFAULT_WAIT_POLL_SECONDS,
@@ -52,6 +54,7 @@ from codex_master.server import (
     resolve_path_no_throw,
     run_command,
     run_tmux,
+    send_agent,
     start_agent,
     strip_ansi,
     trim_chars,
@@ -2271,6 +2274,45 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertTrue(response["result"]["isError"])
         self.assertIn("text must not exceed", response["result"]["content"][0]["text"])
+
+    def test_send_agent_uses_bracketed_paste_for_multiline_text(self) -> None:
+        calls = []
+
+        def fake_run_tmux(args, *, input_text=None, check=True, timeout=10):
+            calls.append({"args": args, "input_text": input_text, "check": check, "timeout": timeout})
+            return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
+
+        with patch("codex_master.server.tmux_alive", return_value=True), patch(
+            "codex_master.server.run_tmux", side_effect=fake_run_tmux
+        ):
+            result = send_agent("a", "line 1\nline 2", enter=True)
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(result["chars"], len("line 1\nline 2"))
+        self.assertEqual(result["paste_mode"], "bracketed_paste")
+        self.assertEqual(result["response_output"], "not_returned")
+        load_call = next(call for call in calls if call["args"][0] == "load-buffer")
+        self.assertEqual(load_call["input_text"], f"{BRACKETED_PASTE_BEGIN}line 1\nline 2{BRACKETED_PASTE_END}")
+        self.assertTrue(any(call["args"][0] == "paste-buffer" for call in calls))
+        self.assertTrue(any(call["args"][-1] == "Enter" for call in calls))
+
+    def test_send_agent_keeps_single_line_plain_paste(self) -> None:
+        calls = []
+
+        def fake_run_tmux(args, *, input_text=None, check=True, timeout=10):
+            calls.append({"args": args, "input_text": input_text, "check": check, "timeout": timeout})
+            return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
+
+        with patch("codex_master.server.tmux_alive", return_value=True), patch(
+            "codex_master.server.run_tmux", side_effect=fake_run_tmux
+        ):
+            result = send_agent("a", "single line", enter=False)
+
+        self.assertEqual(result["paste_mode"], "plain_paste")
+        self.assertFalse(result["submitted"])
+        load_call = next(call for call in calls if call["args"][0] == "load-buffer")
+        self.assertEqual(load_call["input_text"], "single line")
+        self.assertFalse(any(call["args"][-1] == "Enter" for call in calls))
 
 
 class CliLifecycleTest(unittest.TestCase):

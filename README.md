@@ -214,6 +214,9 @@ they are returned. `tools/call` validates tool names, object-shaped params and
 arguments, unknown argument names, required fields, value types, enums, and
 declared bounds before dispatch. Local CLI tool commands pass through the same
 schema validation, with omitted optional arguments removed before validation.
+Multiline `send` and `assign-*` payloads are wrapped with bracketed-paste
+markers before tmux paste so Codex TUI treats the template as one prompt instead
+of separate submitted lines.
 
 Raw logs are local debug artifacts, not normal API data. The tmux pipe writes
 through a bounded local writer, `doctor` reports the configured raw-log policy,

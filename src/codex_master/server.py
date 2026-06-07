@@ -92,6 +92,8 @@ RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS = 120
 DEFAULT_AGENTIN_NAMES = {"a": "Mila", "b": "Nora"}
 RAW_LOG_TRUNCATION_MARKER = b"\n... codex-master-mcp retained the last raw log bytes ...\n"
 MCP_SERVER_TABLE_HEADER = f"[mcp_servers.{MCP_SERVER_NAME}]"
+BRACKETED_PASTE_BEGIN = "\x1b[200~"
+BRACKETED_PASTE_END = "\x1b[201~"
 
 
 AGENTS = {
@@ -2203,8 +2205,10 @@ def send_agent(agent: str, text: str, enter: bool = True) -> dict[str, Any]:
     session = cfg["session"]
     if not tmux_alive(session):
         raise AgentError(f"agent {agent} is not running")
+    paste_mode = "bracketed_paste" if "\n" in text else "plain_paste"
+    payload = f"{BRACKETED_PASTE_BEGIN}{text}{BRACKETED_PASTE_END}" if paste_mode == "bracketed_paste" else text
     buffer_name = f"codex-master-mcp-{agent}-{int(time.time() * 1000)}"
-    cp = run_tmux(["load-buffer", "-b", buffer_name, "-"], input_text=text, check=False)
+    cp = run_tmux(["load-buffer", "-b", buffer_name, "-"], input_text=payload, check=False)
     if cp.returncode != 0:
         raise AgentError(f"tmux load-buffer failed for agent {agent}: {command_error_text(cp.stderr)}")
     cp = run_tmux(["paste-buffer", "-d", "-b", buffer_name, "-t", session], check=False)
@@ -2218,6 +2222,7 @@ def send_agent(agent: str, text: str, enter: bool = True) -> dict[str, Any]:
         "agent": agent,
         "status": "sent",
         "chars": len(text),
+        "paste_mode": paste_mode,
         "submitted": enter,
         "response_output": "not_returned",
     }

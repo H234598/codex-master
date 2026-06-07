@@ -147,7 +147,9 @@ Data minimization:
   params and arguments, unknown argument names, required fields, value types,
   enums, and declared bounds before dispatch. Local CLI tool commands must pass
   through the same schema validation, with omitted optional arguments removed
-  before validation.
+  before validation. Multiline sends and assignments must use bracketed paste
+  before tmux paste so the Codex TUI receives one prompt, not separate submitted
+  lines.
 - Worktree creation must reject existing targets, including broken symlinks,
   and require every target parent directory to be a real directory.
 - Worktree status must reject symlinks and non-directory targets before running
