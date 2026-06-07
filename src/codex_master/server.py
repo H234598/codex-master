@@ -69,6 +69,8 @@ MAX_WAIT_SECONDS = 600
 DEFAULT_WAIT_POLL_SECONDS = 30
 MAX_WAIT_POLL_SECONDS = 900
 DEFAULT_CLAIM_WAIT_FOREVER = True
+DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS = 120
+MAX_STOPPED_LEASE_RECOVERY_GRACE_SECONDS = 7200
 DEFAULT_WATCHDOG_IDLE_SECONDS = 60
 MAX_WATCHDOG_IDLE_SECONDS = 24 * 60 * 60
 DEFAULT_WATCHDOG_POLL_SECONDS = 15
@@ -1099,6 +1101,15 @@ def normalize_claim_wait_seconds(value: Any) -> int | None:
     return number
 
 
+def normalize_stopped_lease_recovery_grace_seconds(value: Any) -> int:
+    return normalize_int_field(
+        value,
+        field="stopped_grace_seconds",
+        minimum=0,
+        maximum=MAX_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
+    )
+
+
 def normalize_poll_interval_seconds(value: Any) -> int:
     return normalize_int_field(
         value,
@@ -1210,6 +1221,53 @@ def agent_busy_error(agent: str, lease: dict[str, Any]) -> AgentBusyError:
     )
 
 
+def stopped_foreign_lease_recovery_status(
+    agent: str,
+    lease: dict[str, Any],
+    *,
+    stopped_grace_seconds: int,
+) -> dict[str, Any]:
+    status = status_agent(agent)
+    raw_idle = status.get("raw_log_idle_seconds")
+    home_process_count = status.get("home_process_count")
+    home_external_process_count = status.get("home_external_process_count")
+    blockers: list[str] = []
+    if lease.get("state") != "held":
+        blockers.append("lease_not_held")
+    if lease.get("held_by_this_server"):
+        blockers.append("lease_held_by_this_server")
+    if status.get("running"):
+        blockers.append("agent_running")
+    if not isinstance(raw_idle, int):
+        blockers.append("missing_idle_evidence")
+    elif raw_idle < stopped_grace_seconds:
+        blockers.append("within_stopped_grace")
+    if isinstance(home_process_count, int) and home_process_count > 0:
+        blockers.append("agent_home_has_processes")
+    elif home_process_count is None:
+        blockers.append("missing_home_process_evidence")
+    if isinstance(home_external_process_count, int) and home_external_process_count > 0:
+        blockers.append("agent_home_has_external_processes")
+    elif home_external_process_count is None:
+        blockers.append("missing_home_external_process_evidence")
+    recoverable = not blockers
+    return {
+        "recoverable": recoverable,
+        "reason": "stopped_foreign_lease_orphan" if recoverable else "not_recoverable",
+        "lease_state": lease.get("state"),
+        "running": bool(status.get("running")),
+        "raw_log_idle_seconds": raw_idle if isinstance(raw_idle, int) else None,
+        "stopped_grace_seconds": stopped_grace_seconds,
+        "home_process_count": home_process_count if isinstance(home_process_count, int) else None,
+        "home_external_process_count": (
+            home_external_process_count if isinstance(home_external_process_count, int) else None
+        ),
+        "blockers": blockers,
+        "raw_output": "not_returned",
+        "response_output": "not_returned",
+    }
+
+
 def agent_lease_status(agent: str) -> dict[str, Any]:
     ensure_state()
     try:
@@ -1260,15 +1318,32 @@ def remove_agent_lease(agent: str) -> bool:
     return True
 
 
-def claim_agent(agent: str, ttl_seconds: int = DEFAULT_AGENT_LEASE_SECONDS, force: bool = False) -> dict[str, Any]:
+def claim_agent(
+    agent: str,
+    ttl_seconds: int = DEFAULT_AGENT_LEASE_SECONDS,
+    force: bool = False,
+    recover_stopped: bool = False,
+    stopped_grace_seconds: int = DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
+) -> dict[str, Any]:
     ensure_state()
     ttl_seconds = normalize_lease_seconds(ttl_seconds)
+    stopped_grace_seconds = normalize_stopped_lease_recovery_grace_seconds(stopped_grace_seconds)
     current = read_agent_lease_record(agent)
     current_public = public_agent_lease(agent, current)
+    stopped_recovery = None
     if current_public["state"] == "held" and not current_public["held_by_this_server"] and not force:
-        raise agent_busy_error(agent, current_public)
+        if recover_stopped:
+            stopped_recovery = stopped_foreign_lease_recovery_status(
+                agent,
+                current_public,
+                stopped_grace_seconds=stopped_grace_seconds,
+            )
+        if not stopped_recovery or not stopped_recovery["recoverable"]:
+            raise agent_busy_error(agent, current_public)
     if current_public["state"] == "held" and current_public["held_by_this_server"]:
         status = "renewed"
+    elif current_public["state"] == "held" and stopped_recovery and stopped_recovery["recoverable"]:
+        status = "claimed_stopped_orphan"
     elif current_public["state"] == "held" and force:
         status = "forced"
     elif current_public["state"] == "expired":
@@ -1276,13 +1351,16 @@ def claim_agent(agent: str, ttl_seconds: int = DEFAULT_AGENT_LEASE_SECONDS, forc
     else:
         status = "claimed"
     record = write_agent_lease(agent, ttl_seconds)
-    return {
+    result = {
         "agent": agent,
         "status": status,
         "lease": public_agent_lease(agent, record),
         "previous_lease": current_public,
         "raw_output": "not_returned",
     }
+    if stopped_recovery is not None:
+        result["stopped_lease_recovery"] = stopped_recovery
+    return result
 
 
 def release_agent(agent: str, force: bool = False) -> dict[str, Any]:
@@ -1330,9 +1408,12 @@ def claim_agent_with_wait(
     force: bool = False,
     wait_seconds: int | str | None = None,
     poll_interval_seconds: int = DEFAULT_WAIT_POLL_SECONDS,
+    recover_stopped: bool = True,
+    stopped_grace_seconds: int = DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
 ) -> dict[str, Any]:
     wait_seconds = normalize_claim_wait_seconds(wait_seconds)
     poll_interval_seconds = normalize_poll_interval_seconds(poll_interval_seconds)
+    stopped_grace_seconds = normalize_stopped_lease_recovery_grace_seconds(stopped_grace_seconds)
     started = time.monotonic()
     wait_forever = wait_seconds is None
     deadline = None if wait_forever else started + wait_seconds
@@ -1341,12 +1422,20 @@ def claim_agent_with_wait(
         try:
             result = call_agent_lifecycle(
                 agent,
-                lambda: claim_agent(agent, ttl_seconds=ttl_seconds, force=force),
+                lambda: claim_agent(
+                    agent,
+                    ttl_seconds=ttl_seconds,
+                    force=force,
+                    recover_stopped=recover_stopped,
+                    stopped_grace_seconds=stopped_grace_seconds,
+                ),
             )
             result["waited_seconds"] = max(0, int(time.monotonic() - started))
             result["poll_count"] = polls
             result["wait_forever"] = wait_forever
             result["wait_limit_seconds"] = None if wait_forever else wait_seconds
+            result["recover_stopped"] = recover_stopped
+            result["stopped_grace_seconds"] = stopped_grace_seconds
             return result
         except AgentBusyError:
             if deadline is not None and time.monotonic() >= deadline:
@@ -4558,6 +4647,15 @@ def master_timeout_policy() -> dict[str, Any]:
         "default_poll_interval_seconds": DEFAULT_WAIT_POLL_SECONDS,
         "maximum_poll_interval_seconds": MAX_WAIT_POLL_SECONDS,
     }
+    stopped_lease_recovery = {
+        "scope": "stopped_foreign_agentin_lease_recovery",
+        "default_enabled_for_explicit_claim": True,
+        "default_grace_seconds": DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
+        "maximum_grace_seconds": MAX_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
+        "requires_agent_not_running": True,
+        "requires_no_agent_home_processes": True,
+        "requires_idle_evidence": True,
+    }
     agent_wait = {
         "scope": "agentin_activity_wait_after_activation",
         "default_timeout_seconds": DEFAULT_WAIT_SECONDS,
@@ -4578,6 +4676,7 @@ def master_timeout_policy() -> dict[str, Any]:
         "ok": bool(startup_timeout["ok"]),
         "mcp_startup_timeout": startup_timeout,
         "agent_claim_wait": claim_wait,
+        "stopped_lease_recovery": stopped_lease_recovery,
         "agent_wait": agent_wait,
         "fleet_watchdog": watchdog,
         "server_instance_identity": server_instance_identity_status(),
@@ -5317,6 +5416,8 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             bool_arg(args, "force", False),
             wait_seconds,
             int_arg(args, "poll_interval_seconds", DEFAULT_WAIT_POLL_SECONDS),
+            bool_arg(args, "recover_stopped", True),
+            int_arg(args, "stopped_grace_seconds", DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS),
         )
     if name == "agent_release":
         selected = agent_ids(str(args.get("agent", "")))
@@ -5433,6 +5534,17 @@ TOOLS: list[dict[str, Any]] = [
                     "minimum": 1,
                     "maximum": MAX_WAIT_POLL_SECONDS,
                     "default": DEFAULT_WAIT_POLL_SECONDS,
+                },
+                "recover_stopped": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "For explicit claims, recover a foreign held lease only when the Agentin is stopped, idle evidence exceeds stopped_grace_seconds, and no Agentin-home process is present.",
+                },
+                "stopped_grace_seconds": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
+                    "default": DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
                 },
                 "force": {"type": "boolean", "default": False},
             },
@@ -6043,6 +6155,9 @@ def main_cli(argv: list[str]) -> int:
     p_claim.add_argument("--forever", dest="wait_forever", action="store_true", default=None)
     p_claim.add_argument("--no-wait", dest="wait_forever", action="store_false")
     p_claim.add_argument("--poll-interval-seconds", type=int, default=DEFAULT_WAIT_POLL_SECONDS)
+    p_claim.add_argument("--recover-stopped", dest="recover_stopped", action="store_true", default=True)
+    p_claim.add_argument("--no-recover-stopped", dest="recover_stopped", action="store_false")
+    p_claim.add_argument("--stopped-grace-seconds", type=int, default=DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS)
     p_claim.add_argument("--force", action="store_true")
 
     p_release = sub.add_parser("release")
@@ -6225,6 +6340,8 @@ def main_cli(argv: list[str]) -> int:
                         "wait_seconds": wait_seconds,
                         "wait_forever": wait_forever,
                         "poll_interval_seconds": args.poll_interval_seconds,
+                        "recover_stopped": args.recover_stopped,
+                        "stopped_grace_seconds": args.stopped_grace_seconds,
                         "force": args.force,
                     },
                 )

@@ -87,6 +87,7 @@ cd /home/teladi/codex-master
 ./bin/codex-master-mcp lease-status all
 ./bin/codex-master-mcp claim b --forever --poll-interval-seconds 30
 ./bin/codex-master-mcp claim b --no-wait
+./bin/codex-master-mcp claim b --no-recover-stopped
 ./bin/codex-master-mcp wait a --timeout-seconds 120 --poll-interval-seconds 30
 ./bin/codex-master-mcp watchdog all --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 15 --action interrupt --manage-unclaimed --quiet
 ./bin/codex-master-mcp start both --cwd /home/teladi/codex-master
@@ -142,9 +143,10 @@ Data minimization:
   retries forever by default for busy fremde Bienen, that finite claim waits
   have no 600-second maximum, that the claim poll interval defaults to
   30 seconds and is capped at 900 seconds, that `wait` remains a bounded
-  Agentin-activity wait capped at 10 minutes, and whether the hidden lease owner
-  identity is stable across CLI invocations. The identity itself must not be
-  returned.
+  Agentin-activity wait capped at 10 minutes, that explicit `claim` can recover
+  stopped foreign leases only after its grace period, and whether the hidden
+  lease owner identity is stable across CLI invocations. The identity itself
+  must not be returned.
 - `status`, `doctor`, `skills`, `capabilities`, `app-bridge-status`,
   `plugin-status`, `namespace-status`, and integration metadata must not return
   local Agentin home, runner, repo, manifest, installed symlink, or
@@ -188,10 +190,14 @@ Data minimization:
   client identity, prompt text, Agentin output, or state paths. `claim` retries
   forever by default for busy fremde Bienen, may also accept explicit finite
   waits without a 600-second cap, and must sleep between retries without holding
-  the Agentin lifecycle lock. Short-lived CLI invocations should derive a
-  stable hidden owner from `CODEX_THREAD_ID` when available; use
-  `CODEX_MASTER_MCP_INSTANCE_ID` only as an explicit override for controlled
-  sessions.
+  the Agentin lifecycle lock. Explicit `claim` may recover a foreign held lease
+  only when the Agentin is not running, no process is using that managed
+  Agentin home, and local idle evidence is at least the stopped-grace threshold
+  old, default 120 seconds. This stopped-orphan recovery must not apply to
+  implicit send/report/interrupt mutations and must never override a running
+  foreign Agentin. Short-lived CLI invocations should derive a stable hidden
+  owner from `CODEX_THREAD_ID` when available; use `CODEX_MASTER_MCP_INSTANCE_ID`
+  only as an explicit override for controlled sessions.
 - Fresh `start` leases are transient and must be released after a successful
   launch, so short-lived local CLI commands do not block the next command. A
   pre-existing same-client claim must be preserved; use `claim` explicitly when

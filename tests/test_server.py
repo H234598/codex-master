@@ -13,6 +13,7 @@ from codex_master.server import (
     AgentBusyError,
     DEFAULT_CLAIM_WAIT_FOREVER,
     DEFAULT_AGENT_LEASE_SECONDS,
+    DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
     MAX_ASSIGNMENT_LIST_ITEMS,
     MAX_ASSIGNMENT_LOG_BYTES,
     MAX_CAPABILITY_PLUGINS,
@@ -25,6 +26,7 @@ from codex_master.server import (
     MAX_TASK_TEXT,
     MAX_WAIT_POLL_SECONDS,
     MAX_WAIT_SECONDS,
+    MAX_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
     RAW_LOG_TRUNCATION_MARKER,
     BRACKETED_PASTE_BEGIN,
     BRACKETED_PASTE_END,
@@ -402,6 +404,9 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(claim_props["wait_forever"]["default"], DEFAULT_CLAIM_WAIT_FOREVER)
         self.assertEqual(claim_props["poll_interval_seconds"]["default"], DEFAULT_WAIT_POLL_SECONDS)
         self.assertEqual(claim_props["poll_interval_seconds"]["maximum"], MAX_WAIT_POLL_SECONDS)
+        self.assertTrue(claim_props["recover_stopped"]["default"])
+        self.assertEqual(claim_props["stopped_grace_seconds"]["default"], DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS)
+        self.assertEqual(claim_props["stopped_grace_seconds"]["maximum"], MAX_STOPPED_LEASE_RECOVERY_GRACE_SECONDS)
         self.assertEqual(DEFAULT_WATCHDOG_IDLE_SECONDS, 60)
         self.assertEqual(DEFAULT_WATCHDOG_POLL_SECONDS, 15)
         self.assertEqual(DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS, 15)
@@ -1363,7 +1368,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.6.0+codex.test",
+            "version": "0.6.1+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1390,7 +1395,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.6.0")
+        self.assertEqual(result["expected_tag"], "v0.6.1")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -1424,6 +1429,16 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(result["agent_claim_wait"]["finite_wait_seconds_has_maximum"])
         self.assertIsNone(result["agent_claim_wait"]["maximum_wait_seconds"])
         self.assertEqual(result["agent_claim_wait"]["default_poll_interval_seconds"], DEFAULT_WAIT_POLL_SECONDS)
+        self.assertTrue(result["stopped_lease_recovery"]["default_enabled_for_explicit_claim"])
+        self.assertEqual(
+            result["stopped_lease_recovery"]["default_grace_seconds"],
+            DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
+        )
+        self.assertEqual(
+            result["stopped_lease_recovery"]["maximum_grace_seconds"],
+            MAX_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
+        )
+        self.assertTrue(result["stopped_lease_recovery"]["requires_agent_not_running"])
         self.assertEqual(result["agent_wait"]["maximum_timeout_seconds"], MAX_WAIT_SECONDS)
         self.assertEqual(result["server_instance_identity"]["identity"], "not_returned")
         self.assertIn(
@@ -2729,6 +2744,100 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(payload["raw_output"], "not_returned")
         self.assertNotIn("owner-one", json.dumps(payload, sort_keys=True))
 
+    def test_agent_claim_recovers_stopped_foreign_lease_after_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            stopped_status = {
+                "running": False,
+                "raw_log_idle_seconds": DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS + 1,
+                "home_process_count": 0,
+                "home_external_process_count": 0,
+                "raw_output": "not_returned",
+                "response_output": "not_returned",
+            }
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch(
+                "codex_master.server.LEASE_DIR", state / "leases"
+            ):
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                    first = claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"), patch(
+                    "codex_master.server.status_agent", return_value=stopped_status
+                ):
+                    recovered = claim_agent("a", recover_stopped=True)
+
+        self.assertEqual(first["status"], "claimed")
+        self.assertEqual(recovered["status"], "claimed_stopped_orphan")
+        self.assertEqual(recovered["previous_lease"]["holder"], "other_server")
+        self.assertTrue(recovered["stopped_lease_recovery"]["recoverable"])
+        self.assertEqual(recovered["stopped_lease_recovery"]["reason"], "stopped_foreign_lease_orphan")
+        self.assertEqual(recovered["lease"]["holder"], "this_server")
+        self.assertEqual(recovered["raw_output"], "not_returned")
+        self.assertNotIn("owner-one", json.dumps(recovered, sort_keys=True))
+
+    def test_agent_claim_does_not_recover_running_foreign_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            running_status = {
+                "running": True,
+                "raw_log_idle_seconds": DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS + 1,
+                "home_process_count": 0,
+                "home_external_process_count": 0,
+                "raw_output": "not_returned",
+                "response_output": "not_returned",
+            }
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch(
+                "codex_master.server.LEASE_DIR", state / "leases"
+            ):
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                    claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"), patch(
+                    "codex_master.server.status_agent", return_value=running_status
+                ):
+                    with self.assertRaises(AgentBusyError) as caught:
+                        claim_agent("a", recover_stopped=True)
+
+        payload = caught.exception.payload
+        self.assertEqual(payload["error_code"], "agent_lease_held_by_other_client")
+        self.assertEqual(payload["lease"]["holder"], "other_server")
+        self.assertNotIn("owner-one", json.dumps(payload, sort_keys=True))
+
+    def test_agent_claim_does_not_recover_foreign_lease_inside_stopped_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            recent_status = {
+                "running": False,
+                "raw_log_idle_seconds": DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS - 1,
+                "home_process_count": 0,
+                "home_external_process_count": 0,
+                "raw_output": "not_returned",
+                "response_output": "not_returned",
+            }
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch(
+                "codex_master.server.LEASE_DIR", state / "leases"
+            ):
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                    claim_agent("b", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"), patch(
+                    "codex_master.server.status_agent", return_value=recent_status
+                ):
+                    with self.assertRaises(AgentBusyError):
+                        claim_agent("b", recover_stopped=True)
+
     def test_agent_release_requires_holder_or_force(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -2884,6 +2993,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["status"], "claimed")
         self.assertTrue(result["wait_forever"])
         self.assertIsNone(result["wait_limit_seconds"])
+        self.assertTrue(result["recover_stopped"])
+        self.assertEqual(result["stopped_grace_seconds"], DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS)
         self.assertEqual(result["poll_count"], 1)
         mock_sleep.assert_called_once_with(30.0)
 
@@ -2901,6 +3012,8 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["wait_forever"])
         self.assertEqual(result["wait_limit_seconds"], MAX_WAIT_SECONDS + 1)
+        self.assertTrue(result["recover_stopped"])
+        self.assertEqual(result["stopped_grace_seconds"], DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS)
 
     def test_wait_agent_rejects_invalid_direct_interval_values(self) -> None:
         with self.assertRaisesRegex(AgentError, "timeout_seconds must be an integer"):
@@ -4210,6 +4323,8 @@ class CliLifecycleTest(unittest.TestCase):
                 "ttl_seconds": DEFAULT_AGENT_LEASE_SECONDS,
                 "wait_forever": True,
                 "poll_interval_seconds": DEFAULT_WAIT_POLL_SECONDS,
+                "recover_stopped": True,
+                "stopped_grace_seconds": DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
                 "force": False,
             },
         )
@@ -4230,6 +4345,8 @@ class CliLifecycleTest(unittest.TestCase):
                 "wait_seconds": 0,
                 "wait_forever": False,
                 "poll_interval_seconds": DEFAULT_WAIT_POLL_SECONDS,
+                "recover_stopped": True,
+                "stopped_grace_seconds": DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
                 "force": False,
             },
         )
@@ -4250,6 +4367,29 @@ class CliLifecycleTest(unittest.TestCase):
                 "wait_seconds": MAX_WAIT_SECONDS + 1,
                 "wait_forever": False,
                 "poll_interval_seconds": DEFAULT_WAIT_POLL_SECONDS,
+                "recover_stopped": True,
+                "stopped_grace_seconds": DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
+                "force": False,
+            },
+        )
+
+    @patch("codex_master.server.print_json")
+    @patch("codex_master.server.call_tool", return_value={"status": "claimed", "raw_output": "not_returned"})
+    def test_cli_claim_can_disable_stopped_lease_recovery(self, mock_call_tool, mock_print_json) -> None:
+        mock_print_json.return_value = 0
+
+        result = main_cli(["claim", "b", "--no-recover-stopped", "--stopped-grace-seconds", "300"])
+
+        self.assertEqual(result, 0)
+        mock_call_tool.assert_called_once_with(
+            "agent_claim",
+            {
+                "agent": "b",
+                "ttl_seconds": DEFAULT_AGENT_LEASE_SECONDS,
+                "wait_forever": True,
+                "poll_interval_seconds": DEFAULT_WAIT_POLL_SECONDS,
+                "recover_stopped": False,
+                "stopped_grace_seconds": 300,
                 "force": False,
             },
         )

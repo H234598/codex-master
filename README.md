@@ -46,6 +46,11 @@ identity. `agent_claim` retries forever by default when a fremde Biene is busy;
 finite `wait_seconds` values remain available but are not capped at 600 seconds.
 Use `--no-wait` for a single immediate claim attempt. The default poll interval
 is 30 seconds and the maximum poll interval is 900 seconds.
+Explicit claims also recover a foreign held lease when the Agentin is no longer
+running, no process is using that Agentin home, and local idle evidence is at
+least 120 seconds old. This stopped-orphan recovery can be disabled with
+`--no-recover-stopped`; it does not apply to implicit send/report/interrupt
+mutations and it never overrides a running foreign Agentin.
 Short-lived CLI invocations derive a stable, hidden owner from `CODEX_THREAD_ID`
 when Codex provides it, so the same Schwesterinstanz can claim, assign, request
 reports, and release across separate CLI calls. `CODEX_MASTER_MCP_INSTANCE_ID`
@@ -94,7 +99,7 @@ in the user journal.
   without raw output
 - `agent_lease_status`: data-sparse lease state for Agentin `a`, `b`, or `all`
 - `agent_claim`: claim or renew one Agentin, retrying forever by default when
-  she is busy
+  she is busy; explicit claims may recover stopped orphan leases after grace
 - `agent_release`: release this MCP client's Agentin claim; force only after
   checking status
 - `agent_wait`: wait for activity/stop/limit metadata without raw output,
@@ -167,6 +172,7 @@ python3 -m codex_master.server status
 python3 -m codex_master.server lease-status all
 python3 -m codex_master.server claim b --forever --poll-interval-seconds 30
 python3 -m codex_master.server claim b --no-wait
+python3 -m codex_master.server claim b --no-recover-stopped
 python3 -m codex_master.server wait a --timeout-seconds 120 --poll-interval-seconds 30
 python3 -m codex_master.server watchdog all --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 15 --action interrupt --manage-unclaimed --quiet
 python3 -m codex_master.server capabilities all
@@ -294,6 +300,8 @@ python3 -m codex_master.server stop both
 - reports that `agent_claim` retries forever by default for busy fremde Bienen,
   while finite claim waits are still accepted without a 600 second cap
 - reports that claim polling defaults to 30 seconds and is capped at 900 seconds
+- reports stopped foreign lease recovery defaults for explicit claims: only
+  stopped Agentinnen, no managed-home process, and sufficient idle evidence
 - keeps `agent_wait` separate as a bounded activity wait: default 120 seconds,
   maximum 600 seconds
 - reports whether the current CLI/MCP owner identity is stable across
@@ -418,8 +426,12 @@ preserved.
 Use `claim` when a Codex-CLI instance should wait for a busy Agentin; it retries
 forever by default with bounded polling intervals. Use `claim --no-wait` for a
 single immediate attempt, or `claim --wait-seconds ...` for an explicit finite
-limit. Lease state is metadata only and does not return the client identity,
-prompt text, Agentin output, or local state path.
+limit. Explicit `claim` recovers a stopped foreign lease only after the stopped
+grace period, default 120 seconds, when the Agentin is not running and no
+process is using that managed Agentin home. Use `claim --no-recover-stopped`
+when an operator wants strict TTL-only behavior. Lease state is metadata only
+and does not return the client identity, prompt text, Agentin output, or local
+state path.
 
 Raw logs are local debug artifacts, not normal API data. The tmux pipe writes
 through a bounded local writer, `doctor` reports the configured raw-log policy,
