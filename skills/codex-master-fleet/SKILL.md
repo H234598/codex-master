@@ -121,6 +121,12 @@ Data minimization:
   by the current server. The systemd supervisor may additionally manage
   unclaimed or expired leases via `--manage-unclaimed --quiet`; it must still
   skip active leases held by other clients.
+- The watchdog user service should keep conservative systemd hardening:
+  `NoNewPrivileges`, `PrivateTmp`, `LockPersonality`,
+  `MemoryDenyWriteExecute`, `RestrictRealtime`, `RestrictSUIDSGID`, native
+  syscall architecture, and `UMask=0077`. Do not add `ProtectHome` or similar
+  home-blocking settings unless the service is redesigned around explicit
+  `ReadWritePaths`, because it needs Codex config, tmux IPC, and managed state.
 - `status`, `doctor`, `skills`, `capabilities`, `app-bridge-status`,
   `plugin-status`, `namespace-status`, and integration metadata must not return
   local Agentin home, runner, repo, manifest, installed symlink, or

@@ -1229,7 +1229,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.4.1+codex.test",
+            "version": "0.4.2+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1256,7 +1256,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.4.1")
+        self.assertEqual(result["expected_tag"], "v0.4.2")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -3924,6 +3924,21 @@ class ServerHelpersTest(unittest.TestCase):
 
 
 class CliLifecycleTest(unittest.TestCase):
+    def test_watchdog_systemd_service_keeps_hardening_directives(self) -> None:
+        service = Path(__file__).resolve().parents[1] / "systemd" / "user" / "codex-master-watchdog.service"
+        text = service.read_text(encoding="utf-8")
+
+        self.assertIn("NoNewPrivileges=yes", text)
+        self.assertIn("PrivateTmp=yes", text)
+        self.assertIn("LockPersonality=yes", text)
+        self.assertIn("MemoryDenyWriteExecute=yes", text)
+        self.assertIn("RestrictRealtime=yes", text)
+        self.assertIn("RestrictSUIDSGID=yes", text)
+        self.assertIn("SystemCallArchitectures=native", text)
+        self.assertIn("UMask=0077", text)
+        self.assertIn("--report-grace-seconds 15", text)
+        self.assertIn("--quiet", text)
+
     @patch("codex_master.server.print_json")
     @patch("codex_master.server.call_tool", return_value={"ok": True})
     def test_cli_tool_validation_drops_omitted_optional_arguments(self, mock_call_tool, mock_print_json) -> None:
