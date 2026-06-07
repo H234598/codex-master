@@ -183,9 +183,10 @@ same home.
 Assignments are appended to `~/.local/state/codex-master-mcp/assignments.jsonl`
 as metadata only: assignment id, Agentin, role, selected model, skill match
 status, scope, write paths, counts, and flags. Prompt text and Agentin responses
-are not stored or returned. The audit file is retained as a bounded local JSONL
-ledger: the newest 500 valid metadata records are kept, invalid legacy lines are
-dropped during pruning, and the file is rewritten with `0600` permissions.
+are not stored or returned, and assignment query responses do not return the
+local audit file path. The audit file is retained as a bounded local JSONL ledger:
+the newest 500 valid metadata records are kept, invalid legacy lines are dropped
+during pruning, and the file is rewritten with `0600` permissions.
 
 Use `tail` only when an explicit, capped excerpt is needed. Normal status and
 send operations do not return Agentin output.

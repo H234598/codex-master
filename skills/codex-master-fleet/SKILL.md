@@ -94,7 +94,7 @@ Data minimization:
   and truncation flags so callers can deliberately enumerate more pages without
   broad dumping.
 - `assignments` and `last-assignment` return only assignment metadata. They
-  must not return prompt text or Agentin responses.
+  must not return prompt text, Agentin responses, or local audit file paths.
 - Assignment audit retention is bounded to the newest 500 valid metadata
   records in a local `0600` JSONL file.
 - Raw logs are local debug artifacts. New raw logs are bounded to 5 MiB per

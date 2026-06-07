@@ -1229,7 +1229,7 @@ def list_assignments(agent: str = "all", limit: int = 20) -> dict[str, Any]:
         "retained_count": len(records),
         "retention_limit": MAX_ASSIGNMENT_LOG_RECORDS,
         "records_truncated": len(records) > limit,
-        "log_path": str(ASSIGNMENT_LOG),
+        "log_path": "not_returned",
         "prompt_output": "not_returned",
         "response_output": "not_returned",
         "raw_output": "not_returned",

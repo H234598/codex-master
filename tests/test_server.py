@@ -758,6 +758,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(ledger_response["result"]["isError"])
         ledger = json.loads(ledger_response["result"]["content"][0]["text"])
         self.assertEqual(ledger["record_count"], 1)
+        self.assertEqual(ledger["log_path"], "not_returned")
         record = ledger["records"][0]
         self.assertEqual(record["assignment_id"], assignment_id)
         self.assertEqual(record["agent"], "a")
@@ -819,6 +820,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(ledger["record_count"], 3)
         self.assertEqual(ledger["retained_count"], 3)
         self.assertEqual(ledger["retention_limit"], 3)
+        self.assertEqual(ledger["log_path"], "not_returned")
         self.assertFalse(ledger["records_truncated"])
         self.assertEqual([record["scope"] for record in ledger["records"]], [["src/2"], ["src/3"], ["src/4"]])
         self.assertEqual(len(lines), 3)
