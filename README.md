@@ -58,9 +58,9 @@ It also classifies a known Codex TUI starter/placeholder context without
 returning pane text, so callers can tell when an Agentin did not receive the
 assignment as productive input.
 Public `status`, `skills`, `capabilities`, `app-bridge-status`,
-`plugin-status`, `namespace-status`, and `doctor` responses do not return local Agentin home,
-runner, repo, manifest, or working directory paths; they return state/category
-metadata such as `path_state`,
+`plugin-status`, `namespace-status`, `release-status`, and `doctor` responses do
+not return local Agentin home, runner, repo, manifest, or working directory
+paths; they return state/category metadata such as `path_state`,
 `home_kind`, and `cwd_state` instead.
 Public scope checks, worktree status, command excerpts, and assignment audit
 reads redact absolute local paths as well; assignment prompts still receive the
@@ -106,6 +106,8 @@ and is capped at 900 seconds.
   MCP registration status
 - `master_namespace_status`: diagnose `codex-master-mcp` registration, startup,
   plugin-cache drift, and `tools/list` visibility for new clients
+- `master_release_status`: diagnose release drift across package version, plugin
+  manifest version, local tags, and GitHub releases
 - `agent_doctor`: structured diagnostics without raw output
 
 `/mcp` should show `codex-master-mcp` only in the Teamleiterin/main Codex
@@ -154,6 +156,7 @@ python3 -m codex_master.server commit-ready-check
 python3 -m codex_master.server app-bridge-status
 python3 -m codex_master.server plugin-status
 python3 -m codex_master.server namespace-status
+python3 -m codex_master.server release-status
 python3 -m codex_master.server send a "Kurzer Auftrag"
 python3 -m codex_master.server release b
 python3 -m codex_master.server tail a --source pane --lines 20 --chars 2000
@@ -177,10 +180,12 @@ python3 -m codex_master.server stop both
 - rejects hardlinked plugin source files and keeps only the current plus the
   most recent valid cached plugin versions, without pruning invalid or symlinked
   cache entries
+- creates nonce-suffixed plugin-cache temp directories and never removes a
+  pre-existing temp directory that this sync did not create
 - refuses to register the Master MCP from a managed Agentinnen `CODEX_HOME`
 - requires the install-path parent chain to be real directories, not symlinks
 - creates or replaces the install symlink via an atomic same-directory
-  temporary symlink and rename
+  temporary symlink and directory-fd-bound rename
 - treats broken, looping, or unreadable install symlinks as non-matching instead
   of crashing while resolving them
 - returns JSON without agent output, install path, repo-wrapper target path, or
@@ -371,7 +376,7 @@ local audit file path. The audit file is retained as a bounded local JSONL ledge
 the newest 500 valid metadata records are kept, invalid legacy lines are dropped
 during pruning, and the file is rewritten with `0600` permissions. Private state
 appends refuse symlink paths, Agentin metadata is written atomically, and
-temporary replace files are created with no-follow exclusive semantics. Managed
+nonce-suffixed temporary replace files are created with no-follow exclusive semantics. Managed
 state directories and their parent chains must be real directories, not symlinks
 or regular files.
 External process calls are timeout-bounded and return structured timeout

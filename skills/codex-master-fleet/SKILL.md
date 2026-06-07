@@ -100,6 +100,7 @@ cd /home/teladi/codex-master
 ./bin/codex-master-mcp app-bridge-status
 ./bin/codex-master-mcp plugin-status
 ./bin/codex-master-mcp namespace-status
+./bin/codex-master-mcp release-status
 ./bin/codex-master-mcp release b
 ```
 
@@ -168,8 +169,8 @@ Data minimization:
   records in a local `0600` JSONL file. Assignment-log reads require regular
   files, are capped, and use generic errors. Private state appends refuse
   symlink paths, and private state file/directory errors must not expose local
-  state paths. Agentin metadata is written atomically, and temporary replace
-  files are created with no-follow exclusive semantics. Agentin metadata reads
+  state paths. Agentin metadata is written atomically, and nonce-suffixed
+  temporary replace files are created with no-follow exclusive semantics. Agentin metadata reads
   reject symlinked and oversized files, and metadata presence checks do not
   follow symlinks. Metadata read errors and legacy source markers must not
   expose local file paths. Managed state directories and their parent chains
@@ -224,9 +225,11 @@ Data minimization:
   a runtime allowlist and exclude `.git`, tests, bytecode, test caches, hidden
   files, editor swap files, and backup/patch leftovers. Plugin-cache sync must
   reject hardlinked source files and retain only the current plus recent valid
-  cached versions without pruning invalid or symlinked cache entries. Install
+  cached versions without pruning invalid, symlinked, or pre-existing temp
+  cache entries it did not create. Install
   symlink creation/replacement must use an atomic same-directory temporary
-  symlink rename. Public install responses must not return plugin-cache paths.
+  symlink rename bound to a verified parent directory fd. Public install
+  responses must not return plugin-cache paths.
   Registering installs must data-sparse self-test both the repo
   wrapper and the installed command path before registration. Public install
   responses must not return the install path or repo-wrapper target path; return
@@ -241,6 +244,11 @@ Data minimization:
   creation/refresh is still an external ChatGPT settings action against a
   reachable HTTPS `/mcp` endpoint; the local stdio MCP is not published by the
   App Bridge manifest alone.
+- `release-status` must remain diagnostic and data-sparse: it may return
+  public version/tag names, release drift counts, and blocker/warning codes, but
+  not local repo paths or raw `git`/`gh` command output. It should make stale
+  GitHub releases and local tags without GitHub releases visible without
+  forcing a release.
 - Use `tail` only for an explicit capped, ANSI-stripped, redacted excerpt.
 - Do not read raw tmux logs directly unless the user explicitly requests it and
   the privacy impact is acceptable.

@@ -90,6 +90,7 @@ from codex_master.server import (
     mcp_command_tools_list_self_test,
     mcp_tools_list_probe_result,
     master_namespace_status,
+    master_release_status,
     plugin_cache_status,
     plugin_manifest_version,
 )
@@ -366,6 +367,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("master_app_bridge_status", names)
         self.assertIn("master_plugin_status", names)
         self.assertIn("master_namespace_status", names)
+        self.assertIn("master_release_status", names)
         by_name = {tool["name"]: tool for tool in response["result"]["tools"]}
         assign_props = by_name["agent_assign"]["inputSchema"]["properties"]
         claim_props = by_name["agent_claim"]["inputSchema"]["properties"]
@@ -543,6 +545,42 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(entry_exists)
         self.assertEqual(tmp_entries, [])
+
+    def test_sync_plugin_cache_from_repo_preserves_preexisting_temp_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            root = tmp_path / "repo"
+            cache = tmp_path / "cache"
+            cache.mkdir()
+            version = "0.3.7+codex.test"
+            tmp_entry = cache / f".{version}.tmp.fixed.nonce"
+            tmp_entry.mkdir()
+            marker = tmp_entry / "marker"
+            marker.write_text("owned by another sync\n", encoding="utf-8")
+            (root / ".codex-plugin").mkdir(parents=True)
+            (root / "bin").mkdir()
+            (root / "skills").mkdir()
+            (root / "src" / "codex_master").mkdir(parents=True)
+            payload = {"name": "codex-master", "version": version}
+            (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
+            (root / ".app.json").write_text("{}", encoding="utf-8")
+            (root / ".mcp.json").write_text("{}", encoding="utf-8")
+            (root / "README.md").write_text("readme", encoding="utf-8")
+            (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
+            (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
+            (root / "skills" / "SKILL.md").write_text("skill", encoding="utf-8")
+            (root / "src" / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
+            fixed_uuid = type("FixedUuid", (), {"hex": "nonce"})()
+
+            with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False), patch(
+                "codex_master.server.now_id", return_value="fixed"
+            ), patch("codex_master.server.uuid.uuid4", return_value=fixed_uuid):
+                with self.assertRaisesRegex(AgentError, "could_not_sync_plugin_cache") as raised:
+                    sync_plugin_cache_from_repo(root, cache)
+            marker_content = marker.read_text(encoding="utf-8")
+
+        self.assertEqual(marker_content, "owned by another sync\n")
+        self.assertNotIn(str(tmp_entry), str(raised.exception))
 
     def test_sync_plugin_cache_from_repo_rejects_hardlink_sources(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -787,6 +825,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["server_name"], "codex-master-mcp")
         self.assertTrue(result["expected_tools"]["master_app_bridge_status"])
         self.assertTrue(result["expected_tools"]["master_namespace_status"])
+        self.assertTrue(result["expected_tools"]["master_release_status"])
         self.assertFalse(result["tool_search"]["authoritative_for_local_stdio_mcp_tools"])
         self.assertTrue(result["client_refresh"]["existing_sessions_may_need_restart"])
         self.assertTrue(result["mcp_server_ready"])
@@ -970,6 +1009,58 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(result["active_home_ready"])
         self.assertFalse(result["namespace_ready"])
         self.assertEqual(result["codex_home_context"]["home_kind"], "managed_agent_home")
+        self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
+
+    @patch("codex_master.server.plugin_manifest_version")
+    @patch("codex_master.server.shutil.which", return_value="/usr/bin/gh")
+    @patch("codex_master.server.run_command")
+    def test_master_release_status_detects_release_drift_without_paths(
+        self,
+        mock_run_command,
+        _mock_which,
+        mock_plugin_manifest,
+    ) -> None:
+        mock_plugin_manifest.return_value = {
+            "ok": True,
+            "version": "0.3.7+codex.test",
+            "raw_output": "not_returned",
+        }
+
+        def fake_run(command, cwd=None, env=None, timeout_seconds=None):
+            if command[:5] == ["git", "tag", "--merged", "HEAD", "--sort=-v:refname"]:
+                return subprocess.CompletedProcess(command, 0, "v0.3.0\nv0.2.22\n", "")
+            if command == ["git", "rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(command, 0, "HEADSHA\n", "")
+            if command == ["git", "rev-list", "--count", "v0.3.0..HEAD"]:
+                return subprocess.CompletedProcess(command, 0, "6\n", "")
+            if command == ["gh", "release", "list", "--limit", "100"]:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    "v0.3.0\tLatest\tv0.3.0\t2026-06-07T16:05:40Z\n"
+                    "v0.2.21\t\tv0.2.21\t2026-06-07T15:41:37Z\n",
+                    "",
+                )
+            return subprocess.CompletedProcess(command, 1, "", "unexpected")
+
+        mock_run_command.side_effect = fake_run
+
+        result = master_release_status()
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["release_needed"])
+        self.assertEqual(result["expected_tag"], "v0.3.7")
+        self.assertFalse(result["current_tag_exists"])
+        self.assertFalse(result["current_version_has_github_release"])
+        self.assertEqual(result["latest_local_tag"], "v0.3.0")
+        self.assertEqual(result["latest_github_release_tag"], "v0.3.0")
+        self.assertEqual(result["commits_since_latest_github_release"], 6)
+        self.assertEqual(result["local_tag_without_github_release_count"], 1)
+        self.assertIn("current_version_tag_missing", result["blockers"])
+        self.assertIn("github_release_missing_for_current_version", result["blockers"])
+        self.assertIn("latest_github_release_behind_head", result["warnings"])
+        self.assertIn("local_tags_without_github_release", result["warnings"])
+        self.assertEqual(result["raw_output"], "not_returned")
         self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.subprocess.run")
@@ -1874,15 +1965,18 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("SHOULD_NOT_BE_USED", json.dumps(result, sort_keys=True))
         self.assertTrue(primary_still_symlink)
 
-    def test_replace_private_text_refuses_preexisting_temp_symlink(self) -> None:
+    def test_replace_private_text_refuses_preexisting_nonce_temp_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "state.json"
             target = Path(tmpdir) / "external.json"
             target.write_text("external\n", encoding="utf-8")
-            tmp_path = path.with_name(f".{path.name}.fixed.tmp")
+            tmp_path = path.with_name(f".{path.name}.fixed.nonce.tmp")
             tmp_path.symlink_to(target)
+            fixed_uuid = type("FixedUuid", (), {"hex": "nonce"})()
 
-            with patch("codex_master.server.now_id", return_value="fixed"):
+            with patch("codex_master.server.now_id", return_value="fixed"), patch(
+                "codex_master.server.uuid.uuid4", return_value=fixed_uuid
+            ):
                 with self.assertRaisesRegex(AgentError, "temp file without following symlinks") as raised:
                     replace_private_text(path, "safe\n")
 
@@ -1895,6 +1989,30 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(target_content, "external\n")
         self.assertTrue(tmp_is_symlink)
         self.assertFalse(path_exists)
+
+    def test_replace_private_text_uses_nonce_temp_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "state.json"
+            target = Path(tmpdir) / "external.json"
+            target.write_text("external\n", encoding="utf-8")
+            predictable_tmp = path.with_name(f".{path.name}.fixed.tmp")
+            predictable_tmp.symlink_to(target)
+            fixed_uuid = type("FixedUuid", (), {"hex": "nonce"})()
+
+            with patch("codex_master.server.now_id", return_value="fixed"), patch(
+                "codex_master.server.uuid.uuid4", return_value=fixed_uuid
+            ):
+                replace_private_text(path, "safe\n")
+
+            target_content = target.read_text(encoding="utf-8")
+            written_content = path.read_text(encoding="utf-8")
+            predictable_tmp_is_symlink = predictable_tmp.is_symlink()
+            nonce_tmp_exists = path.with_name(f".{path.name}.fixed.nonce.tmp").exists()
+
+        self.assertEqual(target_content, "external\n")
+        self.assertEqual(written_content, "safe\n")
+        self.assertTrue(predictable_tmp_is_symlink)
+        self.assertFalse(nonce_tmp_exists)
 
     def test_ensure_state_rejects_symlink_state_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3751,6 +3869,40 @@ class CliLifecycleTest(unittest.TestCase):
             still_symlink = install_link.is_symlink()
 
         self.assertTrue(still_symlink)
+
+    @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
+    @patch("codex_master.server.repo_wrapper_path")
+    @patch("codex_master.server.ensure_directory_chain_no_symlink")
+    def test_install_refuses_parent_swap_after_validation_without_redirecting(
+        self, mock_ensure_chain, mock_wrapper_path, _mock_registration
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            real_bin = tmp_path / "real-bin"
+            link_bin = tmp_path / "link-bin"
+            redirected = real_bin / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            real_bin.mkdir()
+            link_bin.mkdir()
+            mock_wrapper_path.return_value = wrapper
+
+            def swap_parent(path, _error_text):
+                if Path(path) == link_bin:
+                    link_bin.rmdir()
+                    link_bin.symlink_to(real_bin, target_is_directory=True)
+
+            mock_ensure_chain.side_effect = swap_parent
+
+            with self.assertRaisesRegex(AgentError, "could_not_write_install_symlink") as raised:
+                install(register=False, force=True, install_path=link_bin / "codex-master-mcp", sync_plugin_cache=False)
+
+            redirected_exists = redirected.exists() or redirected.is_symlink()
+
+        self.assertFalse(redirected_exists)
+        self.assertNotIn(str(link_bin), str(raised.exception))
+        self.assertNotIn(str(real_bin), str(raised.exception))
 
     @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
     @patch("codex_master.server.repo_wrapper_path")

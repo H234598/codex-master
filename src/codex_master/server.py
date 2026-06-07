@@ -109,6 +109,7 @@ APP_BRIDGE_NAME = "codex-master"
 SERVER_INSTANCE_ID = os.environ.get("CODEX_MASTER_MCP_INSTANCE_ID") or uuid.uuid4().hex
 APP_BRIDGE_ID_PREFIXES = ("connector_", "asdk_app_")
 PLUGIN_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]{0,199}$")
+RELEASE_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+(?:[A-Za-z0-9.+_-]*)?$")
 BRACKETED_PASTE_BEGIN = "\x1b[200~"
 BRACKETED_PASTE_END = "\x1b[201~"
 PATH_NOT_RETURNED = "not_returned"
@@ -878,7 +879,7 @@ def read_private_regular_text(path: Path, max_bytes: int, error_text: str) -> st
 
 def replace_private_bytes(path: Path, data: bytes) -> None:
     ensure_private_dir(path.parent)
-    tmp_path = path.with_name(f".{path.name}.{now_id()}.tmp")
+    tmp_path = path.with_name(f".{path.name}.{now_id()}.{uuid.uuid4().hex}.tmp")
     tmp_created = False
     try:
         write_private_new_bytes(tmp_path, data)
@@ -2912,15 +2913,44 @@ def installed_source_worktree_state(installed_target: Path | None, wrapper: Path
     return repo_worktree_safety()
 
 
-def replace_install_symlink(install_path: Path, wrapper: Path) -> None:
-    tmp_link = install_path.parent / f".{install_path.name}.tmp.{now_id()}.{uuid.uuid4().hex}"
+def open_real_directory_fd(path: Path, error_text: str) -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        tmp_link.symlink_to(wrapper)
-        os.replace(tmp_link, install_path)
+        fd = os.open(path, flags)
     except OSError as exc:
-        with contextlib.suppress(OSError):
-            tmp_link.unlink()
+        raise AgentError(error_text) from exc
+    try:
+        current = os.fstat(fd)
+        if not stat_module.S_ISDIR(current.st_mode):
+            raise AgentError(error_text)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def replace_install_symlink(install_path: Path, wrapper: Path) -> None:
+    tmp_name = f".{install_path.name}.tmp.{now_id()}.{uuid.uuid4().hex}"
+    parent_fd = -1
+    tmp_created = False
+    try:
+        parent_fd = open_real_directory_fd(install_path.parent, "could_not_write_install_symlink")
+        os.symlink(wrapper, tmp_name, dir_fd=parent_fd)
+        tmp_created = True
+        os.replace(tmp_name, install_path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        tmp_created = False
+    except OSError as exc:
         raise AgentError("could_not_write_install_symlink") from exc
+    finally:
+        if tmp_created and parent_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name, dir_fd=parent_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
 
 def integration_status() -> dict[str, Any]:
@@ -3354,11 +3384,16 @@ def sync_plugin_cache_from_repo(
             raise AgentError("plugin cache root must be a real directory")
 
     target_entry = target_cache / version
-    tmp_entry = target_cache / f".{version}.tmp.{now_id()}"
+    tmp_entry = target_cache / f".{version}.tmp.{now_id()}.{uuid.uuid4().hex}"
     copied_files = 0
     copied_directories = 0
+    tmp_entry_created = False
     try:
-        tmp_entry.mkdir(mode=0o755, exist_ok=False)
+        try:
+            tmp_entry.mkdir(mode=0o755, exist_ok=False)
+        except OSError as exc:
+            raise AgentError("could_not_sync_plugin_cache") from exc
+        tmp_entry_created = True
         copied_directories += 1
         for name in PLUGIN_CACHE_ALLOWED_FILES:
             src = source_root / name
@@ -3380,8 +3415,9 @@ def sync_plugin_cache_from_repo(
         except OSError as exc:
             raise AgentError("could_not_sync_plugin_cache") from exc
     except Exception:
-        with contextlib.suppress(Exception):
-            remove_real_plugin_cache_dir(tmp_entry)
+        if tmp_entry_created:
+            with contextlib.suppress(Exception):
+                remove_real_plugin_cache_dir(tmp_entry)
         raise
 
     retention = prune_plugin_cache_versions(target_cache, keep_version=version, max_versions=retained_versions)
@@ -3509,6 +3545,110 @@ def master_plugin_status() -> dict[str, Any]:
     }
 
 
+def version_without_build_metadata(version: str) -> str:
+    return version.split("+", 1)[0]
+
+
+def git_first_line(args: list[str], *, cwd: Path | None = None) -> str:
+    cp = run_command(["git", *args], cwd=cwd or repo_root())
+    if cp.returncode != 0:
+        return ""
+    return cp.stdout.splitlines()[0].strip() if cp.stdout.splitlines() else ""
+
+
+def git_count(args: list[str], *, cwd: Path | None = None) -> int | None:
+    text = git_first_line(args, cwd=cwd)
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def git_release_tags(root: Path) -> list[str]:
+    cp = run_command(["git", "tag", "--merged", "HEAD", "--sort=-v:refname", "--list", "v[0-9]*"], cwd=root)
+    if cp.returncode != 0:
+        return []
+    return [line.strip() for line in cp.stdout.splitlines() if RELEASE_TAG_RE.fullmatch(line.strip())]
+
+
+def github_release_tags(root: Path) -> dict[str, Any]:
+    if not shutil.which("gh"):
+        return {"available": False, "status": "gh_unavailable", "tags": [], "raw_output": "not_returned"}
+    cp = run_command(["gh", "release", "list", "--limit", "100"], cwd=root)
+    if cp.returncode != 0:
+        return {"available": False, "status": "gh_release_list_failed", "tags": [], "raw_output": "not_returned"}
+    tags: list[str] = []
+    for line in cp.stdout.splitlines():
+        columns = [column.strip() for column in line.split("\t") if column.strip()]
+        tag = next((column for column in columns if RELEASE_TAG_RE.fullmatch(column)), None)
+        if tag and tag not in tags:
+            tags.append(tag)
+    return {"available": True, "status": "ok", "tags": tags, "raw_output": "not_returned"}
+
+
+def master_release_status() -> dict[str, Any]:
+    root = repo_root()
+    package_version = __version__
+    plugin_manifest = plugin_manifest_version(root)
+    plugin_version = plugin_manifest.get("version") if plugin_manifest.get("ok") else ""
+    plugin_base_version = version_without_build_metadata(str(plugin_version)) if plugin_version else ""
+    expected_tag = f"v{package_version}"
+    local_tags = git_release_tags(root)
+    head_commit = git_first_line(["rev-parse", "HEAD"], cwd=root)
+    current_tag_exists = expected_tag in local_tags
+    current_tag_commit = git_first_line(["rev-list", "-n", "1", expected_tag], cwd=root) if current_tag_exists else ""
+    current_tag_points_at_head = bool(current_tag_commit and head_commit and current_tag_commit == head_commit)
+    latest_local_tag = local_tags[0] if local_tags else ""
+    commits_since_latest_local_tag = (
+        git_count(["rev-list", "--count", f"{latest_local_tag}..HEAD"], cwd=root) if latest_local_tag else None
+    )
+    gh_releases = github_release_tags(root)
+    github_tags = gh_releases["tags"]
+    latest_github_release_tag = github_tags[0] if github_tags else ""
+    commits_since_latest_github_release = (
+        git_count(["rev-list", "--count", f"{latest_github_release_tag}..HEAD"], cwd=root)
+        if latest_github_release_tag
+        else None
+    )
+    local_without_github = [tag for tag in local_tags if tag not in set(github_tags)] if gh_releases["available"] else []
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if plugin_base_version != package_version:
+        blockers.append("plugin_version_mismatch")
+    if not current_tag_exists:
+        blockers.append("current_version_tag_missing")
+    elif not current_tag_points_at_head:
+        blockers.append("current_version_tag_not_at_head")
+    if gh_releases["available"] and expected_tag not in github_tags:
+        blockers.append("github_release_missing_for_current_version")
+    if commits_since_latest_github_release:
+        warnings.append("latest_github_release_behind_head")
+    if local_without_github:
+        warnings.append("local_tags_without_github_release")
+    return {
+        "ok": not blockers,
+        "release_needed": bool(blockers or commits_since_latest_github_release),
+        "package_version": package_version,
+        "plugin_version": plugin_version,
+        "plugin_base_version": plugin_base_version,
+        "expected_tag": expected_tag,
+        "current_tag_exists": current_tag_exists,
+        "current_tag_points_at_head": current_tag_points_at_head,
+        "latest_local_tag": latest_local_tag,
+        "commits_since_latest_local_tag": commits_since_latest_local_tag,
+        "latest_github_release_tag": latest_github_release_tag,
+        "commits_since_latest_github_release": commits_since_latest_github_release,
+        "github_release_status": gh_releases["status"],
+        "github_release_available": gh_releases["available"],
+        "current_version_has_github_release": expected_tag in github_tags,
+        "local_tag_without_github_release_count": len(local_without_github),
+        "local_tags_without_github_release": local_without_github[:10],
+        "blockers": blockers,
+        "warnings": warnings,
+        "raw_output": "not_returned",
+    }
+
+
 def master_namespace_status() -> dict[str, Any]:
     registration = check_mcp_registration(DEFAULT_INSTALL_PATH)
     startup_self_test = mcp_command_startup_self_test(DEFAULT_INSTALL_PATH)
@@ -3522,6 +3662,7 @@ def master_namespace_status() -> dict[str, Any]:
         "master_app_bridge_status": "master_app_bridge_status" in tool_names,
         "master_plugin_status": "master_plugin_status" in tool_names,
         "master_namespace_status": "master_namespace_status" in tool_names,
+        "master_release_status": "master_release_status" in tool_names,
         "raw_output": "not_returned",
     }
     server_ready = bool(registration.get("ok")) and bool(startup_self_test.get("ok")) and bool(
@@ -3544,6 +3685,7 @@ def master_namespace_status() -> dict[str, Any]:
             "master_app_bridge_status": local_tool_contract["master_app_bridge_status"],
             "master_plugin_status": local_tool_contract["master_plugin_status"],
             "master_namespace_status": local_tool_contract["master_namespace_status"],
+            "master_release_status": local_tool_contract["master_release_status"],
         },
         "local_tool_contract": local_tool_contract,
         "mcp_registration": registration,
@@ -4178,6 +4320,8 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return master_plugin_status()
     if name == "master_namespace_status":
         return master_namespace_status()
+    if name == "master_release_status":
+        return master_release_status()
     if name == "agent_doctor":
         return doctor()
     if name == "agent_send":
@@ -4639,6 +4783,11 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
+        "name": "master_release_status",
+        "description": "Report data-sparse release drift across package version, plugin manifest version, local git tags, and GitHub releases.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
         "name": "agent_doctor",
         "description": "Return structured diagnostics for installation, MCP registration, runners, and tmux sessions. Does not return raw output.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -4979,6 +5128,7 @@ def main_cli(argv: list[str]) -> int:
     sub.add_parser("app-bridge-status")
     sub.add_parser("plugin-status")
     sub.add_parser("namespace-status")
+    sub.add_parser("release-status")
 
     p_install = sub.add_parser("install")
     p_install.add_argument("--no-register", action="store_true")
@@ -5159,6 +5309,8 @@ def main_cli(argv: list[str]) -> int:
             return print_json(call_validated_tool("master_plugin_status", {}))
         if args.command == "namespace-status":
             return print_json(call_validated_tool("master_namespace_status", {}))
+        if args.command == "release-status":
+            return print_json(call_validated_tool("master_release_status", {}))
         if args.command == "install":
             return print_json(
                 install(
