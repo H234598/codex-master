@@ -463,6 +463,86 @@ def raw_log_writer_command(raw_log: Path) -> str:
     return shlex.join(argv)
 
 
+def read_proc_environ(pid_dir: Path) -> dict[str, str]:
+    try:
+        raw = (pid_dir / "environ").read_bytes()
+    except OSError:
+        return {}
+    env: dict[str, str] = {}
+    for item in raw.split(b"\0"):
+        if not item or b"=" not in item:
+            continue
+        key, value = item.split(b"=", 1)
+        env[key.decode("utf-8", errors="replace")] = value.decode("utf-8", errors="replace")
+    return env
+
+
+def read_proc_status(pid_dir: Path) -> dict[str, str]:
+    try:
+        lines = (pid_dir / "status").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return {}
+    result: dict[str, str] = {}
+    for line in lines:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        if key in {"Name", "State", "PPid", "Tgid"}:
+            result[key] = value.strip()
+    return result
+
+
+def same_path_text(left: str, right: Path) -> bool:
+    try:
+        return Path(left).expanduser().resolve(strict=False) == right.expanduser().resolve(strict=False)
+    except OSError:
+        return False
+
+
+def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[dict[str, Any]]:
+    cfg = AGENTS[agent]
+    home = cfg["home"]
+    processes: list[dict[str, Any]] = []
+    if not proc_root.exists():
+        return processes
+    for pid_dir in proc_root.iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        env = read_proc_environ(pid_dir)
+        if not same_path_text(env.get("CODEX_HOME", ""), home):
+            continue
+        status = read_proc_status(pid_dir)
+        managed = env.get("CODEX_AGENT_MCP") == "1" or env.get("CODEX_MASTER_MCP") == "1"
+        ppid_parts = status.get("PPid", "0").split()
+        ppid = int(ppid_parts[0]) if ppid_parts and ppid_parts[0].isdigit() else None
+        processes.append(
+            {
+                "pid": int(pid_dir.name),
+                "ppid": ppid,
+                "name": status.get("Name") or "unknown",
+                "state": status.get("State") or "unknown",
+                "managed_by_masterjet": managed,
+                "raw_output": "not_returned",
+            }
+        )
+    return sorted(processes, key=lambda item: item["pid"])
+
+
+def agent_home_process_summary(agent: str, proc_root: Path = Path("/proc")) -> dict[str, Any]:
+    processes = agent_home_processes(agent, proc_root)
+    external = [item for item in processes if not item["managed_by_masterjet"]]
+    return {
+        "agent": agent,
+        "home": str(AGENTS[agent]["home"]),
+        "process_count": len(processes),
+        "external_process_count": len(external),
+        "managed_process_count": len(processes) - len(external),
+        "external_processes": external[:10],
+        "external_processes_truncated": len(external) > 10,
+        "raw_output": "not_returned",
+    }
+
+
 def pane_pid(session: str) -> int | None:
     if not tmux_alive(session):
         return None
@@ -490,6 +570,7 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
     if not runner.exists():
         raise AgentError(f"runner missing for agent {agent}: {runner}")
     if tmux_alive(session):
+        process_summary = agent_home_process_summary(agent)
         return {
             "agent": agent,
             "status": "already_running",
@@ -497,8 +578,16 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
             "session": session,
             "pid": pane_pid(session),
             "meta": read_meta(agent),
+            "home_external_process_count": process_summary["external_process_count"],
             "raw_output": "not_returned",
         }
+
+    process_summary = agent_home_process_summary(agent)
+    if process_summary["external_process_count"]:
+        raise AgentError(
+            f"agent {agent} CODEX_HOME is already used by {process_summary['external_process_count']} external process(es); "
+            "stop them or use a separate CODEX_HOME before starting through codex-master-mcp"
+        )
 
     cwd = bounded_text(cwd, field="cwd", max_chars=MAX_PATH_TEXT) if cwd is not None else None
     prompt = bounded_text(prompt, field="prompt", max_chars=MAX_SEND_TEXT, strip=False) if prompt is not None else None
@@ -580,6 +669,7 @@ def status_agent(agent: str) -> dict[str, Any]:
     meta = read_meta(agent)
     raw_log = meta.get("raw_log")
     raw_log_path = allowed_raw_log_path(raw_log)
+    process_summary = agent_home_process_summary(agent)
     raw_size = None
     if raw_log_path:
         try:
@@ -604,6 +694,9 @@ def status_agent(agent: str) -> dict[str, Any]:
         "raw_log_max_bytes": MAX_RAW_LOG_BYTES,
         "raw_log_policy": "local_only_bounded_not_returned_by_default",
         "raw_log_path_valid": (raw_log_path is not None) if raw_log else True,
+        "home_process_count": process_summary["process_count"],
+        "home_external_process_count": process_summary["external_process_count"],
+        "home_external_processes_truncated": process_summary["external_processes_truncated"],
         "raw_output": "not_returned",
     }
 
@@ -1317,6 +1410,7 @@ def doctor() -> dict[str, Any]:
         },
     ]
     for agent, cfg in AGENTS.items():
+        process_summary = agent_home_process_summary(agent)
         checks.extend(
             [
                 {"name": f"agent_{agent}_home_exists", "ok": cfg["home"].is_dir(), "path": str(cfg["home"])},
@@ -1326,6 +1420,15 @@ def doctor() -> dict[str, Any]:
                     "path": str(cfg["runner"]),
                 },
                 {"name": f"agent_{agent}_tmux_running", "ok": tmux_alive(cfg["session"]), "session": cfg["session"]},
+                {
+                    "name": f"agent_{agent}_home_not_used_externally",
+                    "ok": process_summary["external_process_count"] == 0,
+                    "home": process_summary["home"],
+                    "external_process_count": process_summary["external_process_count"],
+                    "external_processes": process_summary["external_processes"],
+                    "external_processes_truncated": process_summary["external_processes_truncated"],
+                    "raw_output": "not_returned",
+                },
             ]
         )
     registration = check_mcp_registration(install_path)

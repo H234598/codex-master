@@ -46,6 +46,9 @@ unless the intent is to make that instance a Teamleiterin.
 - Agentin A/B may start native Subagentinnen only when the assignment explicitly
   allows it. Nested Subagentinnen must stay inside the assigned scope and write
   paths. They must not use `codex-master-mcp` to control the fleet.
+- Do not manually start Agentin A/B with the same `CODEX_HOME` while the
+  Masterjet manages them. Use `doctor` if a terminal looks stuck; `start`
+  blocks when an Agentin home is already used externally.
 
 ## MCP Visibility
 

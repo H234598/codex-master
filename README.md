@@ -170,6 +170,11 @@ forbids nested delegation. Even with the flag, nested Agentinnen stay inside the
 assigned scope and write paths; they do not use `codex-master-mcp` and they do
 not commit, push, or release.
 
+Do not start Agentin A or Agentin B manually with the same `CODEX_HOME` while
+the Masterjet is responsible for them. `start` refuses to launch an Agentin when
+its home is already used by an external Codex process, and `doctor` reports such
+home conflicts before they become tmux or lock contention.
+
 Assignments are appended to `~/.local/state/codex-master-mcp/assignments.jsonl`
 as metadata only: assignment id, Agentin, role, selected model, skill match
 status, scope, write paths, counts, and flags. Prompt text and Agentin responses

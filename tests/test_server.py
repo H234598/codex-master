@@ -16,6 +16,7 @@ from codex_master.server import (
     MAX_TASK_TEXT,
     RAW_LOG_TRUNCATION_MARKER,
     append_bounded_raw_log,
+    agent_home_process_summary,
     handle_rpc,
     main_cli,
     prune_raw_logs,
@@ -291,6 +292,64 @@ class ServerHelpersTest(unittest.TestCase):
             target_content = target.read_bytes()
 
         self.assertEqual(target_content, b"target")
+
+    def test_agent_home_process_summary_flags_external_codex_home_users(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "agent-home"
+            home.mkdir()
+            proc_root = Path(tmpdir) / "proc"
+            external = proc_root / "100"
+            managed = proc_root / "101"
+            external.mkdir(parents=True)
+            managed.mkdir()
+            external.joinpath("environ").write_bytes(f"CODEX_HOME={home}\0".encode("utf-8"))
+            external.joinpath("status").write_text("Name:\tcodex\nState:\tS (sleeping)\nPPid:\t1\n", encoding="utf-8")
+            managed.joinpath("environ").write_bytes(f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0".encode("utf-8"))
+            managed.joinpath("status").write_text("Name:\tcodex\nState:\tS (sleeping)\nPPid:\t1\n", encoding="utf-8")
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                summary = agent_home_process_summary("a", proc_root)
+
+        self.assertEqual(summary["process_count"], 2)
+        self.assertEqual(summary["managed_process_count"], 1)
+        self.assertEqual(summary["external_process_count"], 1)
+        self.assertEqual(summary["external_processes"][0]["pid"], 100)
+        self.assertEqual(summary["external_processes"][0]["raw_output"], "not_returned")
+
+    @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("codex_master.server.run_tmux")
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 1,
+            "external_process_count": 1,
+            "managed_process_count": 0,
+            "external_processes": [{"pid": 100, "raw_output": "not_returned"}],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
+    def test_start_agent_blocks_external_codex_home_user(
+        self, mock_summary, mock_run_tmux, _mock_tmux_alive, _mock_ensure_state
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = Path(tmpdir) / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
+                clear=False,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "CODEX_HOME is already used"):
+                    start_agent("a", cwd=tmpdir)
+
+        mock_summary.assert_called_once_with("a")
+        mock_run_tmux.assert_not_called()
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.write_meta")
