@@ -71,6 +71,7 @@ MAX_AGENTIN_NAME = 80
 MAX_SKILL_REF = 300
 MAX_PATH_TEXT = 1000
 MAX_ASSIGNMENT_ID = 200
+MAX_RPC_MESSAGE_BYTES = 1024 * 1024
 DEFAULT_AGENTIN_NAMES = {"a": "Mila", "b": "Nora"}
 RAW_LOG_TRUNCATION_MARKER = b"\n... codex-master-mcp retained the last raw log bytes ...\n"
 
@@ -2183,17 +2184,35 @@ def handle_rpc(msg: dict[str, Any]) -> dict[str, Any] | None:
     return rpc_error(message_id, -32601, f"method not found: {method}")
 
 
+def parse_content_length(line: bytes, max_bytes: int = MAX_RPC_MESSAGE_BYTES) -> int:
+    try:
+        length = int(line.decode("ascii").split(":", 1)[1].strip())
+    except (IndexError, UnicodeDecodeError, ValueError) as exc:
+        raise AgentError("invalid Content-Length header") from exc
+    if length <= 0:
+        raise AgentError("Content-Length must be positive")
+    if length > max_bytes:
+        raise AgentError(f"Content-Length exceeds {max_bytes} bytes")
+    return length
+
+
 def read_message() -> dict[str, Any] | None:
-    first = sys.stdin.buffer.readline()
+    first = sys.stdin.buffer.readline(MAX_RPC_MESSAGE_BYTES + 1)
+    if len(first) > MAX_RPC_MESSAGE_BYTES:
+        raise AgentError(f"RPC message line exceeds {MAX_RPC_MESSAGE_BYTES} bytes")
     if not first:
         return None
     if first.startswith(b"Content-Length:"):
-        length = int(first.decode("ascii").split(":", 1)[1].strip())
+        length = parse_content_length(first)
         while True:
-            line = sys.stdin.buffer.readline()
+            line = sys.stdin.buffer.readline(MAX_RPC_MESSAGE_BYTES + 1)
+            if len(line) > MAX_RPC_MESSAGE_BYTES:
+                raise AgentError(f"RPC header line exceeds {MAX_RPC_MESSAGE_BYTES} bytes")
             if line in (b"\r\n", b"\n", b""):
                 break
         body = sys.stdin.buffer.read(length)
+        if len(body) != length:
+            raise AgentError("incomplete RPC message body")
         return json.loads(body.decode("utf-8"))
     stripped = first.strip()
     if stripped:

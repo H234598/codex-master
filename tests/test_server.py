@@ -1,3 +1,4 @@
+import io
 import json
 import stat
 import subprocess
@@ -8,8 +9,10 @@ import os
 from unittest.mock import patch
 
 from codex_master.server import (
+    AgentError,
     MAX_ASSIGNMENT_LIST_ITEMS,
     MAX_CAPABILITY_PLUGINS,
+    MAX_RPC_MESSAGE_BYTES,
     MAX_RAW_LOG_BYTES,
     MAX_SEND_TEXT,
     MAX_SKILL_NAMES,
@@ -20,12 +23,18 @@ from codex_master.server import (
     handle_rpc,
     main_cli,
     prune_raw_logs,
+    read_message,
     redact,
     start_agent,
     strip_ansi,
     trim_chars,
     trim_lines,
 )
+
+
+class FakeStdin:
+    def __init__(self, data: bytes):
+        self.buffer = io.BytesIO(data)
 
 
 class ServerHelpersTest(unittest.TestCase):
@@ -106,6 +115,23 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIsNotNone(resources)
         self.assertEqual(resources["result"], {"resources": []})
         self.assertEqual(prompts["result"], {"prompts": []})
+
+    def test_read_message_rejects_oversized_content_length(self) -> None:
+        data = f"Content-Length: {MAX_RPC_MESSAGE_BYTES + 1}\r\n\r\n".encode("ascii")
+        with patch("sys.stdin", FakeStdin(data)):
+            with self.assertRaisesRegex(AgentError, "Content-Length exceeds"):
+                read_message()
+
+    def test_read_message_rejects_oversized_json_line(self) -> None:
+        data = b"{" + (b"x" * MAX_RPC_MESSAGE_BYTES)
+        with patch("sys.stdin", FakeStdin(data)):
+            with self.assertRaisesRegex(AgentError, "RPC message line exceeds"):
+                read_message()
+
+    def test_read_message_rejects_incomplete_content_body(self) -> None:
+        with patch("sys.stdin", FakeStdin(b"Content-Length: 20\r\n\r\n{}")):
+            with self.assertRaisesRegex(AgentError, "incomplete RPC message body"):
+                read_message()
 
     def test_mcp_tool_call_error_is_structured(self) -> None:
         response = handle_rpc(

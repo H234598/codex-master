@@ -105,7 +105,7 @@ Data minimization:
   12,000 chars, tasks 4,000 chars, names 80 chars, skill refs 300 chars,
   path-like fields 1,000 chars, and assignment lists 50 items. MCP boolean and
   integer arguments are type-checked; stringified values are rejected instead of
-  being coerced.
+  being coerced. Incoming MCP frames are capped at 1 MiB before JSON parsing.
 - Use `tail` only for an explicit capped, ANSI-stripped, redacted excerpt.
 - Do not read raw tmux logs directly unless the user explicitly requests it and
   the privacy impact is acceptable.
