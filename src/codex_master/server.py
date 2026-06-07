@@ -382,6 +382,16 @@ def is_real_directory_no_symlink(path: Path) -> bool:
     return stat_module.S_ISDIR(mode)
 
 
+def is_regular_executable_no_symlink(path: Path) -> bool:
+    try:
+        mode = path.lstat().st_mode
+    except OSError:
+        return False
+    if not stat_module.S_ISREG(mode):
+        return False
+    return os.access(path, os.X_OK)
+
+
 def managed_raw_dirs() -> tuple[Path, ...]:
     legacy_raw = LEGACY_STATE_ROOT / "raw"
     dirs = [RAW_DIR]
@@ -679,8 +689,8 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
     cfg = AGENTS[agent]
     runner = cfg["runner"]
     session = cfg["session"]
-    if not runner.exists():
-        raise AgentError(f"runner missing for agent {agent}: {runner}")
+    if not is_regular_executable_no_symlink(runner):
+        raise AgentError(f"runner for agent {agent} must be a regular executable file")
     if tmux_alive(session):
         process_summary = agent_home_process_summary(agent)
         if process_summary["external_process_count"]:
@@ -1539,8 +1549,9 @@ def doctor() -> dict[str, Any]:
                 {"name": f"agent_{agent}_home_exists", "ok": cfg["home"].is_dir(), "path": str(cfg["home"])},
                 {
                     "name": f"agent_{agent}_runner_executable",
-                    "ok": cfg["runner"].exists() and os.access(cfg["runner"], os.X_OK),
+                    "ok": is_regular_executable_no_symlink(cfg["runner"]),
                     "path": str(cfg["runner"]),
+                    "symlink_allowed": False,
                 },
                 {
                     "name": f"agent_{agent}_tmux_session_state",

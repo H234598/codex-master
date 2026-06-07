@@ -813,6 +813,28 @@ class ServerHelpersTest(unittest.TestCase):
         mock_run_tmux.assert_not_called()
 
     @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.run_tmux")
+    def test_start_agent_refuses_symlink_runner(self, mock_run_tmux, _mock_ensure_state) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "target-codex"
+            runner = Path(tmpdir) / "codex"
+            target.write_text("#!/bin/sh\n", encoding="utf-8")
+            target.chmod(target.stat().st_mode | stat.S_IXUSR)
+            runner.symlink_to(target)
+
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
+                clear=False,
+            ):
+                with self.assertRaisesRegex(AgentError, "regular executable file"):
+                    start_agent("a", cwd=tmpdir)
+                runner_is_symlink = runner.is_symlink()
+
+        self.assertTrue(runner_is_symlink)
+        mock_run_tmux.assert_not_called()
+
+    @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.read_meta", return_value={})
     @patch("codex_master.server.pane_pid", return_value=321)
     @patch("codex_master.server.tmux_alive", return_value=True)
@@ -1743,6 +1765,9 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertTrue(session_state["ok"])
         self.assertFalse(session_state["running"])
         self.assertEqual(session_state["severity"], "info")
+        runner_check = next(item for item in payload["checks"] if item["name"] == "agent_a_runner_executable")
+        self.assertFalse(runner_check["ok"])
+        self.assertFalse(runner_check["symlink_allowed"])
         retention = next(item for item in payload["checks"] if item["name"] == "raw_log_retention_configured")
         self.assertEqual(retention["max_bytes_per_file"], MAX_RAW_LOG_BYTES)
         self.assertEqual(retention["raw_output"], "not_returned")
