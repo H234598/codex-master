@@ -139,7 +139,9 @@ Data minimization:
   Tool and RPC error texts are ANSI-stripped, redacted, and length-bounded
   before they are returned. `tools/call` validates tool names, object-shaped
   params and arguments, unknown argument names, required fields, value types,
-  enums, and declared bounds before dispatch.
+  enums, and declared bounds before dispatch. Local CLI tool commands must pass
+  through the same schema validation, with omitted optional arguments removed
+  before validation.
 - Worktree creation must reject existing targets, including broken symlinks,
   and require every target parent directory to be a real directory.
 - Worktree status must reject symlinks and non-directory targets before running

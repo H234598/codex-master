@@ -2724,6 +2724,15 @@ def validate_tool_call(name: Any, args: Any) -> tuple[str, dict[str, Any]]:
     return name, args
 
 
+def compact_optional_args(args: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in args.items() if value is not None}
+
+
+def call_validated_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    validated_name, validated_args = validate_tool_call(name, compact_optional_args(args))
+    return call_tool(validated_name, validated_args)
+
+
 def validate_schema_value(field: str, value: Any, schema: dict[str, Any]) -> None:
     value_type = schema.get("type")
     if value_type == "string":
@@ -3024,12 +3033,12 @@ def main_cli(argv: list[str]) -> int:
         if args.command == "raw-log-writer":
             return write_bounded_raw_log(Path(args.path), args.max_bytes)
         if args.command == "start":
-            return print_json(call_tool("agent_start", {"agent": args.agent, "cwd": args.cwd, "prompt": args.prompt}))
+            return print_json(call_validated_tool("agent_start", {"agent": args.agent, "cwd": args.cwd, "prompt": args.prompt}))
         if args.command == "status":
-            return print_json(call_tool("agent_status", {"agent": args.agent}))
+            return print_json(call_validated_tool("agent_status", {"agent": args.agent}))
         if args.command == "wait":
             return print_json(
-                call_tool(
+                call_validated_tool(
                     "agent_wait",
                     {
                         "agent": args.agent,
@@ -3039,21 +3048,21 @@ def main_cli(argv: list[str]) -> int:
                 )
             )
         if args.command == "send":
-            return print_json(call_tool("agent_send", {"agent": args.agent, "text": args.text, "enter": not args.no_enter}))
+            return print_json(call_validated_tool("agent_send", {"agent": args.agent, "text": args.text, "enter": not args.no_enter}))
         if args.command == "interrupt":
-            return print_json(call_tool("agent_interrupt", {"agent": args.agent}))
+            return print_json(call_validated_tool("agent_interrupt", {"agent": args.agent}))
         if args.command == "stop":
-            return print_json(call_tool("agent_stop", {"agent": args.agent}))
+            return print_json(call_validated_tool("agent_stop", {"agent": args.agent}))
         if args.command == "tail":
             return print_json(
-                call_tool(
+                call_validated_tool(
                     "agent_safe_tail",
                     {"agent": args.agent, "source": args.source, "lines": args.lines, "chars": args.chars},
                 )
             )
         if args.command == "skills":
             return print_json(
-                call_tool(
+                call_validated_tool(
                     "agent_skills",
                     {
                         "agent": args.agent,
@@ -3066,19 +3075,19 @@ def main_cli(argv: list[str]) -> int:
                 )
             )
         if args.command == "skill-match":
-            return print_json(call_tool("agent_skill_match", {"agent": args.agent, "skill": args.skill, "limit": args.limit}))
+            return print_json(call_validated_tool("agent_skill_match", {"agent": args.agent, "skill": args.skill, "limit": args.limit}))
         if args.command == "capabilities":
-            return print_json(call_tool("agent_capabilities", {"agent": args.agent}))
+            return print_json(call_validated_tool("agent_capabilities", {"agent": args.agent}))
         if args.command == "scope-check":
             return print_json(
-                call_tool(
+                call_validated_tool(
                     "agent_scope_check",
                     {"scope": args.scope, "write_paths": args.write_paths, "cwd": args.cwd},
                 )
             )
         if args.command == "assign":
             return print_json(
-                call_tool(
+                call_validated_tool(
                     "agent_assign",
                     {
                         "agent": args.agent,
@@ -3098,7 +3107,7 @@ def main_cli(argv: list[str]) -> int:
             )
         if args.command == "assign-readonly":
             return print_json(
-                call_tool(
+                call_validated_tool(
                     "agent_assign_readonly",
                     {
                         "agent": args.agent,
@@ -3116,7 +3125,7 @@ def main_cli(argv: list[str]) -> int:
             )
         if args.command == "assign-write":
             return print_json(
-                call_tool(
+                call_validated_tool(
                     "agent_assign_write",
                     {
                         "agent": args.agent,
@@ -3134,31 +3143,31 @@ def main_cli(argv: list[str]) -> int:
                 )
             )
         if args.command == "assignments":
-            return print_json(call_tool("agent_assignments", {"agent": args.agent, "limit": args.limit}))
+            return print_json(call_validated_tool("agent_assignments", {"agent": args.agent, "limit": args.limit}))
         if args.command == "last-assignment":
-            return print_json(call_tool("agent_last_assignment_status", {"agent": args.agent}))
+            return print_json(call_validated_tool("agent_last_assignment_status", {"agent": args.agent}))
         if args.command == "report-request":
             return print_json(
-                call_tool(
+                call_validated_tool(
                     "agent_report_request",
                     {"agent": args.agent, "assignment_id": args.assignment_id, "enter": not args.no_enter},
                 )
             )
         if args.command == "worktree-create":
             return print_json(
-                call_tool(
+                call_validated_tool(
                     "worktree_create_for_agent",
                     {"agent": args.agent, "path": args.path, "base_ref": args.base_ref},
                 )
             )
         if args.command == "worktree-status":
-            return print_json(call_tool("worktree_status", {"path": args.path}))
+            return print_json(call_validated_tool("worktree_status", {"path": args.path}))
         if args.command == "integration-status":
-            return print_json(call_tool("integration_status", {}))
+            return print_json(call_validated_tool("integration_status", {}))
         if args.command == "commit-ready-check":
-            return print_json(call_tool("commit_ready_check", {"run_tests": not args.no_tests}))
+            return print_json(call_validated_tool("commit_ready_check", {"run_tests": not args.no_tests}))
         if args.command == "plugin-status":
-            return print_json(call_tool("master_plugin_status", {}))
+            return print_json(call_validated_tool("master_plugin_status", {}))
         if args.command == "install":
             return print_json(
                 install(

@@ -2174,6 +2174,26 @@ class ServerHelpersTest(unittest.TestCase):
 
 
 class CliLifecycleTest(unittest.TestCase):
+    @patch("codex_master.server.print_json")
+    @patch("codex_master.server.call_tool", return_value={"ok": True})
+    def test_cli_tool_validation_drops_omitted_optional_arguments(self, mock_call_tool, mock_print_json) -> None:
+        mock_print_json.return_value = 0
+
+        result = main_cli(["start", "a"])
+
+        self.assertEqual(result, 0)
+        mock_call_tool.assert_called_once_with("agent_start", {"agent": "a"})
+
+    @patch("codex_master.server.call_tool")
+    @patch("builtins.print")
+    def test_cli_tool_validation_rejects_out_of_bounds_arguments(self, mock_print, mock_call_tool) -> None:
+        result = main_cli(["wait", "a", "--timeout-seconds", "-1"])
+
+        self.assertEqual(result, 1)
+        mock_call_tool.assert_not_called()
+        payload = json.loads(mock_print.call_args.args[0])
+        self.assertEqual(payload["error"], "timeout_seconds must be >= 0")
+
     @patch("codex_master.server.run_command")
     @patch("codex_master.server.print_json")
     def test_cli_install_plans_expected_local_install_flow(self, mock_print_json, mock_run) -> None:

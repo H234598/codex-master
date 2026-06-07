@@ -204,7 +204,8 @@ being coerced. Incoming MCP frames are capped at 1 MiB before JSON parsing.
 Tool and RPC error texts are ANSI-stripped, redacted, and length-bounded before
 they are returned. `tools/call` validates tool names, object-shaped params and
 arguments, unknown argument names, required fields, value types, enums, and
-declared bounds before dispatch.
+declared bounds before dispatch. Local CLI tool commands pass through the same
+schema validation, with omitted optional arguments removed before validation.
 
 Raw logs are local debug artifacts, not normal API data. The tmux pipe writes
 through a bounded local writer, `doctor` reports the configured raw-log policy,
