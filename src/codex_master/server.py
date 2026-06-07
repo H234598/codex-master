@@ -2456,8 +2456,11 @@ def install(register: bool = True, force: bool = False, install_path: Path = DEF
 
     return {
         "ok": True,
-        "install_path": str(install_path),
-        "target": str(wrapper),
+        "install_path": PATH_NOT_RETURNED,
+        "install_path_state": "set",
+        "install_path_kind": "configured_install_path",
+        "target": PATH_NOT_RETURNED,
+        "target_state": "repo_wrapper",
         "symlink": symlink_status,
         "startup_self_test": startup_self_test,
         "mcp": registration,

@@ -2497,7 +2497,6 @@ class CliLifecycleTest(unittest.TestCase):
 
         mock_print_json.side_effect = _capture
         with tempfile.TemporaryDirectory() as tmp_home:
-            wrapper_target = Path(__file__).resolve().parents[1] / "bin" / "codex-master-mcp"
             local_bin = Path(tmp_home) / ".local" / "bin"
             local_bin.mkdir(parents=True, exist_ok=True)
             with patch.dict("os.environ", {"HOME": tmp_home}):
@@ -2527,8 +2526,11 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(len(captured_payloads), 1)
         payload = captured_payloads[0]
         self.assertEqual(payload.get("ok"), True)
-        self.assertEqual(payload.get("install_path"), str(install_link))
-        self.assertEqual(payload.get("target"), str(wrapper_target))
+        self.assertEqual(payload.get("install_path"), "not_returned")
+        self.assertEqual(payload.get("install_path_state"), "set")
+        self.assertEqual(payload.get("install_path_kind"), "configured_install_path")
+        self.assertEqual(payload.get("target"), "not_returned")
+        self.assertEqual(payload.get("target_state"), "repo_wrapper")
         self.assertEqual(payload.get("symlink"), "created")
         self.assertEqual(payload["mcp"]["requested"], True)
         self.assertEqual(payload["mcp"]["status"], "registered")
@@ -2539,6 +2541,10 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(payload["startup_self_test"]["raw_output"], "not_returned")
         self.assertIn("startup_timeout_sec = 120", config_content)
         self.assertTrue(link_created)
+        payload_text = json.dumps(payload, sort_keys=True)
+        self.assertNotIn(str(install_link), payload_text)
+        self.assertNotIn(str(Path(__file__).resolve().parents[1] / "bin" / "codex-master-mcp"), payload_text)
+        self.assertNotIn(str(Path(tmp_home)), payload_text)
         mock_run.assert_any_call(["codex", "mcp", "add", "codex-master-mcp", "--", str(install_link)])
 
     @patch("codex_master.server.mcp_command_startup_self_test")

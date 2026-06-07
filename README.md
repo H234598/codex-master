@@ -132,7 +132,7 @@ python3 -m codex_master.server stop both
 - requires the install-path parent chain to be real directories, not symlinks
 - treats broken, looping, or unreadable install symlinks as non-matching instead
   of crashing while resolving them
-- returns JSON and no agent output
+- returns JSON without agent output, install path, or repo-wrapper target path
 
 `uninstall`
 - unregisters from `codex mcp remove codex-master-mcp`
