@@ -46,6 +46,7 @@ from codex_master.server import (
     write_bounded_raw_log,
     write_meta,
     worktree_create_for_agent,
+    worktree_status,
 )
 
 
@@ -1241,6 +1242,49 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["status"], "created")
         self.assertEqual(mock_run_command.call_args.args[0], ["git", "worktree", "add", str(expected_target)])
         self.assertEqual(mock_run_command.call_args.kwargs["cwd"], repo)
+
+    @patch("codex_master.server.run_command")
+    def test_worktree_status_refuses_symlink_path_without_git_call(self, mock_run_command) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            real_dir = tmp_path / "real"
+            link_dir = tmp_path / "linked"
+            real_dir.mkdir()
+            link_dir.symlink_to(real_dir, target_is_directory=True)
+
+            with self.assertRaisesRegex(AgentError, "worktree status path must be a real directory") as raised:
+                worktree_status(str(link_dir))
+
+        mock_run_command.assert_not_called()
+        self.assertNotIn(str(link_dir), str(raised.exception))
+        self.assertNotIn(str(real_dir), str(raised.exception))
+
+    @patch("codex_master.server.run_command")
+    def test_worktree_status_refuses_non_directory_without_git_call(self, mock_run_command) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = Path(tmpdir) / "not-a-dir"
+            file_path.write_text("x\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(AgentError, "worktree status path must be a real directory") as raised:
+                worktree_status(str(file_path))
+
+        mock_run_command.assert_not_called()
+        self.assertNotIn(str(file_path), str(raised.exception))
+
+    @patch("codex_master.server.run_command")
+    def test_worktree_status_relative_path_is_repo_scoped_and_real_directory(self, mock_run_command) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            target = repo / ".codex-master-worktrees" / "agent-a"
+            target.mkdir(parents=True)
+            mock_run_command.return_value = subprocess.CompletedProcess(["git"], 0, "", "")
+
+            with patch("codex_master.server.repo_root", return_value=repo):
+                result = worktree_status(".codex-master-worktrees/agent-a")
+
+        self.assertEqual(result["path"], str(target))
+        self.assertEqual(mock_run_command.call_args_list[0].args[0], ["git", "status", "--short"])
+        self.assertEqual(mock_run_command.call_args_list[0].kwargs["cwd"], target)
 
     def test_repo_wrapper_works_via_symlink(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]

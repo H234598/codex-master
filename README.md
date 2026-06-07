@@ -169,6 +169,8 @@ response.
 outside the declared scope is rejected before anything is sent to an Agentin.
 Worktree creation refuses existing targets, including broken symlinks, and
 requires every parent directory in the target path to be a real directory.
+Worktree status also refuses symlinks and non-directory targets before running
+`git status`.
 Assignment and send inputs are bounded before tmux interaction: free sends and
 start prompts are capped at 12,000 characters, assignment tasks at 4,000
 characters, names at 80 characters, skill refs at 300 characters, path-like

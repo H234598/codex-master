@@ -1524,7 +1524,13 @@ def worktree_create_for_agent(agent: str, path: Any = None, base_ref: Any = None
 
 def worktree_status(path: Any = None) -> dict[str, Any]:
     path = bounded_text(path, field="path", max_chars=MAX_PATH_TEXT) if path is not None else None
-    target = Path(path).expanduser().resolve(strict=False) if path else repo_root()
+    target = Path(path).expanduser() if path else repo_root()
+    if not target.is_absolute():
+        target = repo_root() / target
+    target = target.absolute()
+    if not is_real_directory_no_symlink(target):
+        raise AgentError("worktree status path must be a real directory")
+    target = target.resolve(strict=False)
     return {
         "path": str(target),
         "status": git_excerpt(["status", "--short"], cwd=target),
