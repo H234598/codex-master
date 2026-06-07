@@ -594,7 +594,18 @@ def append_bounded_raw_log(path: Path, chunk: bytes, max_bytes: int = MAX_RAW_LO
         fh.write(new_content)
 
 
+def validate_raw_log_writer_max_bytes(max_bytes: Any) -> int:
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
+        raise AgentError("raw log max_bytes must be an integer")
+    if max_bytes < 1:
+        raise AgentError("raw log max_bytes must be >= 1")
+    if max_bytes > MAX_RAW_LOG_BYTES:
+        raise AgentError(f"raw log max_bytes must be <= {MAX_RAW_LOG_BYTES}")
+    return max_bytes
+
+
 def write_bounded_raw_log(path: Path, max_bytes: int = MAX_RAW_LOG_BYTES) -> int:
+    max_bytes = validate_raw_log_writer_max_bytes(max_bytes)
     ensure_state()
     allowed = allowed_raw_log_path(str(path))
     if allowed is None:

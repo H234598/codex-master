@@ -864,6 +864,13 @@ class ServerHelpersTest(unittest.TestCase):
                 with self.assertRaisesRegex(AgentError, "must not be a symlink"):
                     write_bounded_raw_log(raw_dir / "agent.log", max_bytes=128)
 
+    def test_write_bounded_raw_log_rejects_out_of_policy_max_bytes_before_state(self) -> None:
+        with patch("codex_master.server.ensure_state") as mock_ensure_state:
+            with self.assertRaisesRegex(AgentError, f"raw log max_bytes must be <= {MAX_RAW_LOG_BYTES}"):
+                write_bounded_raw_log(Path("/tmp/agent.log"), max_bytes=MAX_RAW_LOG_BYTES + 1)
+
+        mock_ensure_state.assert_not_called()
+
     def test_write_meta_replaces_symlink_without_touching_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             meta_dir = Path(tmpdir) / "meta"
@@ -2193,6 +2200,16 @@ class CliLifecycleTest(unittest.TestCase):
         mock_call_tool.assert_not_called()
         payload = json.loads(mock_print.call_args.args[0])
         self.assertEqual(payload["error"], "timeout_seconds must be >= 0")
+
+    @patch("codex_master.server.ensure_state")
+    @patch("builtins.print")
+    def test_cli_raw_log_writer_rejects_out_of_policy_max_bytes(self, mock_print, mock_ensure_state) -> None:
+        result = main_cli(["raw-log-writer", "/tmp/agent.log", "--max-bytes", str(MAX_RAW_LOG_BYTES + 1)])
+
+        self.assertEqual(result, 1)
+        mock_ensure_state.assert_not_called()
+        payload = json.loads(mock_print.call_args.args[0])
+        self.assertEqual(payload["error"], f"raw log max_bytes must be <= {MAX_RAW_LOG_BYTES}")
 
     @patch("codex_master.server.run_command")
     @patch("codex_master.server.print_json")

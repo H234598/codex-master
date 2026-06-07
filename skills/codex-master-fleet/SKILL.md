@@ -118,9 +118,11 @@ Data minimization:
   file, managed raw-log directories retain at most 20 files by default, and
   log-tail metadata paths must stay inside managed raw-log state. Prepared
   raw-log files are created with no-follow exclusive semantics, and raw-log
-  symlinks are not followed. The direct raw-log writer verifies real managed
-  state directories before accepting log input, and symlinked legacy raw-log
-  directories are ignored. Safe-tail log reads only regular raw-log files.
+  symlinks are not followed. The direct raw-log writer rejects `--max-bytes`
+  values outside the active raw-log policy before touching state or paths,
+  verifies real managed state directories before accepting log input, and
+  symlinked legacy raw-log directories are ignored. Safe-tail log reads only
+  regular raw-log files.
   Tmux control errors are redacted and bounded before they are returned or
   raised. Public tool responses expose raw-log presence without returning local
   raw-log paths. Failed starts must remove prepared raw-log files. External
