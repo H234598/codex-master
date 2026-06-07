@@ -588,10 +588,32 @@ class ServerHelpersTest(unittest.TestCase):
                 symlink_still_exists = symlink_meta.is_symlink()
 
         self.assertIn("meta_error", symlink_result)
+        self.assertEqual(symlink_result["meta_error"], "could_not_read")
+        self.assertNotIn(str(meta_dir), json.dumps(symlink_result, sort_keys=True))
         self.assertNotIn("SECRET_META_SHOULD_NOT_LEAK", json.dumps(symlink_result, sort_keys=True))
         self.assertTrue(symlink_still_exists)
         self.assertIn("meta_error", oversized_result)
+        self.assertEqual(oversized_result["meta_error"], "could_not_read")
+        self.assertNotIn(str(meta_dir), json.dumps(oversized_result, sort_keys=True))
         self.assertNotIn("payload", oversized_result)
+
+    def test_read_meta_uses_generic_legacy_source_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            meta_dir = Path(tmpdir) / "meta"
+            legacy_meta_dir = Path(tmpdir) / "legacy" / "meta"
+            legacy = legacy_meta_dir / "a.json"
+            meta_dir.mkdir()
+            legacy_meta_dir.mkdir(parents=True)
+            legacy.write_text('{"safe": true}\n', encoding="utf-8")
+
+            with patch("codex_master.server.META_DIR", meta_dir), patch(
+                "codex_master.server.LEGACY_META_DIR", legacy_meta_dir
+            ):
+                result = read_meta("a")
+
+        self.assertEqual(result["safe"], True)
+        self.assertEqual(result["meta_source"], "legacy")
+        self.assertNotIn(str(legacy_meta_dir), json.dumps(result, sort_keys=True))
 
     def test_read_meta_does_not_bypass_primary_symlink_via_legacy_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -612,6 +634,8 @@ class ServerHelpersTest(unittest.TestCase):
                 primary_still_symlink = primary.is_symlink()
 
         self.assertIn("meta_error", result)
+        self.assertEqual(result["meta_error"], "could_not_read")
+        self.assertNotIn(str(meta_dir), json.dumps(result, sort_keys=True))
         self.assertNotIn("legacy", result)
         self.assertNotIn("SHOULD_NOT_BE_USED", json.dumps(result, sort_keys=True))
         self.assertTrue(primary_still_symlink)

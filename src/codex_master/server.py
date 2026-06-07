@@ -192,7 +192,7 @@ def meta_path(agent: str) -> Path:
 
 
 def read_json_file(path: Path) -> dict[str, Any]:
-    error = {"meta_error": f"could not read {path}"}
+    error = {"meta_error": "could_not_read"}
     try:
         current_stat = path.lstat()
     except OSError:
@@ -242,7 +242,7 @@ def read_meta(agent: str) -> dict[str, Any]:
         legacy_path = LEGACY_META_DIR / f"{agent}.json"
         if legacy_path != path and path_present_no_follow(legacy_path):
             data = read_json_file(legacy_path)
-            data.setdefault("meta_source", str(legacy_path))
+            data.setdefault("meta_source", "legacy")
             return data
         return {}
     return read_json_file(path)
