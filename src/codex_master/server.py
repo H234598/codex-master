@@ -102,6 +102,7 @@ MAX_CODEX_CONFIG_BYTES = 1024 * 1024
 MAX_PLUGIN_MANIFEST_BYTES = 64 * 1024
 MAX_PLUGIN_CACHE_VERSIONS = 20
 MAX_PLUGIN_CACHE_RETAINED_VERSIONS = 5
+MAX_PAGED_OFFSET = 10_000_000
 PLUGIN_CACHE_ALLOWED_FILES = (".app.json", ".mcp.json", "README.md", "pyproject.toml")
 PLUGIN_CACHE_ALLOWED_DIRS = (".codex-plugin", "bin", "skills", "src", "systemd")
 PLUGIN_CACHE_EXCLUDED_NAMES = (".git", ".pytest_cache", ".mypy_cache", ".ruff_cache", "__pycache__")
@@ -1064,12 +1065,9 @@ def lease_utc(timestamp: float | int | None) -> str | None:
 
 
 def normalize_int_field(value: Any, *, field: str, minimum: int, maximum: int) -> int:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise AgentError(f"{field} must be an integer")
-    try:
-        number = int(value)
-    except (TypeError, ValueError) as exc:
-        raise AgentError(f"{field} must be an integer") from exc
+    number = value
     if number < minimum:
         raise AgentError(f"{field} must be >= {minimum}")
     if number > maximum:
@@ -2707,8 +2705,8 @@ def is_regular_file_no_symlink(path: Path) -> bool:
 
 
 def paged_mapping(items: dict[str, int], offset: int, limit: int) -> tuple[dict[str, int], bool]:
-    offset = max(0, int(offset))
-    limit = max(0, int(limit))
+    offset = normalize_int_field(offset, field="offset", minimum=0, maximum=MAX_PAGED_OFFSET)
+    limit = normalize_int_field(limit, field="limit", minimum=0, maximum=MAX_PAGED_OFFSET)
     sorted_items = sorted(items.items())
     page = dict(sorted_items[offset : offset + limit])
     return page, offset + limit < len(sorted_items)
@@ -2724,10 +2722,20 @@ def skills_agent(
 ) -> dict[str, Any]:
     cfg = AGENTS[agent]
     home = cfg["home"]
-    limit = max(0, min(int(limit), MAX_SKILL_NAMES))
-    names_offset = max(0, int(names_offset))
-    plugins_offset = max(0, int(plugins_offset))
-    plugins_limit = max(0, min(int(plugins_limit), MAX_SKILL_NAMES))
+    limit = normalize_int_field(limit, field="limit", minimum=0, maximum=MAX_SKILL_NAMES)
+    names_offset = normalize_int_field(names_offset, field="names_offset", minimum=0, maximum=MAX_PAGED_OFFSET)
+    plugins_offset = normalize_int_field(
+        plugins_offset,
+        field="plugins_offset",
+        minimum=0,
+        maximum=MAX_PAGED_OFFSET,
+    )
+    plugins_limit = normalize_int_field(
+        plugins_limit,
+        field="plugins_limit",
+        minimum=0,
+        maximum=MAX_SKILL_NAMES,
+    )
 
     all_paths: list[Path] = []
     roots: list[dict[str, Any]] = []
@@ -2882,7 +2890,7 @@ def skill_matches(agent: str, skill_ref: str, limit: int = 8) -> list[dict[str, 
 
 def skill_match_agent(agent: str, skill_ref: Any, limit: int = 8) -> dict[str, Any]:
     skill_ref = bounded_text(skill_ref, field="skill", max_chars=MAX_SKILL_REF, required=True) or ""
-    limit = max(1, min(int(limit), MAX_SKILL_NAMES))
+    limit = normalize_int_field(limit, field="limit", minimum=1, maximum=MAX_SKILL_NAMES)
     matches = skill_matches(agent, skill_ref, limit)
     skill_safe, _changed = redact(skill_ref)
     return {
@@ -3182,7 +3190,13 @@ def record_assignment(record: dict[str, Any]) -> None:
 
 
 def prune_assignment_log(max_records: int | None = None) -> None:
-    max_records = max(1, int(max_records if max_records is not None else MAX_ASSIGNMENT_LOG_RECORDS))
+    default_max_records = MAX_ASSIGNMENT_LOG_RECORDS
+    max_records = normalize_int_field(
+        max_records if max_records is not None else default_max_records,
+        field="max_records",
+        minimum=1,
+        maximum=default_max_records,
+    )
     if not ASSIGNMENT_LOG.exists():
         return
     lines = read_private_regular_text(
@@ -3210,7 +3224,7 @@ def list_assignments(agent: str = "all", limit: int = 20) -> dict[str, Any]:
     ensure_state()
     if agent not in {"a", "b", "all"}:
         raise AgentError("agent must be a, b, or all")
-    limit = max(1, min(int(limit), MAX_ASSIGNMENT_RECORDS))
+    limit = normalize_int_field(limit, field="limit", minimum=1, maximum=MAX_ASSIGNMENT_RECORDS)
     records: list[dict[str, Any]] = []
     if ASSIGNMENT_LOG.exists():
         for line in read_private_regular_text(
@@ -5111,7 +5125,7 @@ def command_error_text(value: Any) -> str:
 
 
 def read_log_tail(path: Path, approx_bytes: int) -> str:
-    approx_bytes = max(1, int(approx_bytes))
+    approx_bytes = normalize_int_field(approx_bytes, field="approx_bytes", minimum=1, maximum=MAX_RAW_LOG_BYTES)
     try:
         current_stat = path.lstat()
     except OSError:
@@ -5154,8 +5168,8 @@ def pane_tail(agent: str, lines: int) -> str:
 
 def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pane") -> dict[str, Any]:
     ensure_state()
-    lines = max(1, min(int(lines), MAX_TAIL_LINES))
-    chars = max(1, min(int(chars), MAX_TAIL_CHARS))
+    lines = normalize_int_field(lines, field="lines", minimum=1, maximum=MAX_TAIL_LINES)
+    chars = normalize_int_field(chars, field="chars", minimum=1, maximum=MAX_TAIL_CHARS)
     if source not in ("pane", "log"):
         raise AgentError("source must be 'pane' or 'log'")
     meta = read_meta(agent)
@@ -5464,6 +5478,7 @@ def text_array_schema(
     *,
     max_items: int = MAX_ASSIGNMENT_LIST_ITEMS,
     max_chars: int = MAX_TEXT_FIELD,
+    min_items: int | None = None,
     default: list[str] | None = None,
 ) -> dict[str, Any]:
     schema: dict[str, Any] = {
@@ -5471,6 +5486,8 @@ def text_array_schema(
         "maxItems": max_items,
         "items": text_schema(max_chars),
     }
+    if min_items is not None:
+        schema["minItems"] = min_items
     if default is not None:
         schema["default"] = default
     return schema
@@ -5787,7 +5804,7 @@ TOOLS: list[dict[str, Any]] = [
                 "task": text_schema(MAX_TASK_TEXT),
                 "skill": text_schema(MAX_SKILL_REF),
                 "scope": text_array_schema(max_chars=MAX_PATH_TEXT, default=[]),
-                "write_paths": text_array_schema(max_chars=MAX_PATH_TEXT),
+                "write_paths": text_array_schema(max_chars=MAX_PATH_TEXT, min_items=1),
                 "context": text_array_schema(default=[]),
                 "forbidden": text_array_schema(default=[]),
                 "name": text_schema(MAX_AGENTIN_NAME),
@@ -5976,6 +5993,9 @@ def validate_schema_value(field: str, value: Any, schema: dict[str, Any]) -> Non
     if value_type == "array":
         if not isinstance(value, list):
             raise AgentError(f"{field} must be an array")
+        min_items = schema.get("minItems")
+        if isinstance(min_items, int) and len(value) < min_items:
+            raise AgentError(f"{field} must contain at least {min_items} item(s)")
         max_items = schema.get("maxItems")
         if isinstance(max_items, int) and len(value) > max_items:
             raise AgentError(f"{field} must contain at most {max_items} items")
@@ -6151,9 +6171,11 @@ def main_cli(argv: list[str]) -> int:
     p_claim = sub.add_parser("claim")
     p_claim.add_argument("agent", choices=["a", "b"])
     p_claim.add_argument("--ttl-seconds", type=int, default=DEFAULT_AGENT_LEASE_SECONDS)
-    p_claim.add_argument("--wait-seconds", type=int)
-    p_claim.add_argument("--forever", dest="wait_forever", action="store_true", default=None)
-    p_claim.add_argument("--no-wait", dest="wait_forever", action="store_false")
+    p_claim_wait = p_claim.add_mutually_exclusive_group()
+    p_claim_wait.add_argument("--wait-seconds", type=int)
+    p_claim_wait.add_argument("--forever", dest="wait_forever", action="store_true")
+    p_claim_wait.add_argument("--no-wait", dest="wait_forever", action="store_false")
+    p_claim.set_defaults(wait_forever=None)
     p_claim.add_argument("--poll-interval-seconds", type=int, default=DEFAULT_WAIT_POLL_SECONDS)
     p_claim.add_argument("--recover-stopped", dest="recover_stopped", action="store_true", default=True)
     p_claim.add_argument("--no-recover-stopped", dest="recover_stopped", action="store_false")

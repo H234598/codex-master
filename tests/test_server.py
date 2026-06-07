@@ -16,12 +16,15 @@ from codex_master.server import (
     DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
     MAX_ASSIGNMENT_LIST_ITEMS,
     MAX_ASSIGNMENT_LOG_BYTES,
+    MAX_ASSIGNMENT_RECORDS,
     MAX_CAPABILITY_PLUGINS,
     MAX_ERROR_CHARS,
     MAX_META_BYTES,
     MAX_RPC_MESSAGE_BYTES,
     MAX_RAW_LOG_BYTES,
     MAX_SEND_TEXT,
+    MAX_TAIL_CHARS,
+    MAX_TAIL_LINES,
     MAX_SKILL_NAMES,
     MAX_TASK_TEXT,
     MAX_WAIT_POLL_SECONDS,
@@ -65,12 +68,16 @@ from codex_master.server import (
     main_cli,
     master_timeout_policy,
     master_watchdog_status,
+    list_assignments,
     prune_raw_logs,
     raw_log_retention_status,
     read_message,
     read_meta,
+    safe_tail,
+    skills_agent,
     record_assignment,
     redact,
+    paged_mapping,
     release_agent,
     replace_private_text,
     resolve_path_no_throw,
@@ -81,6 +88,7 @@ from codex_master.server import (
     start_agent,
     start_agent_with_lease,
     strip_ansi,
+    skill_match_agent,
     sync_plugin_cache_from_repo,
     trim_chars,
     trim_lines,
@@ -388,6 +396,7 @@ class ServerHelpersTest(unittest.TestCase):
         claim_props = by_name["agent_claim"]["inputSchema"]["properties"]
         wait_props = by_name["agent_wait"]["inputSchema"]["properties"]
         watchdog_props = by_name["fleet_watchdog"]["inputSchema"]["properties"]
+        assign_write_props = by_name["agent_assign_write"]["inputSchema"]["properties"]
         skill_props = by_name["agent_skills"]["inputSchema"]["properties"]
         self.assertEqual(assign_props["task"]["maxLength"], MAX_TASK_TEXT)
         self.assertEqual(assign_props["context"]["maxItems"], MAX_ASSIGNMENT_LIST_ITEMS)
@@ -414,6 +423,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(watchdog_props["poll_interval_seconds"]["default"], DEFAULT_WATCHDOG_POLL_SECONDS)
         self.assertEqual(watchdog_props["poll_interval_seconds"]["maximum"], MAX_WAIT_POLL_SECONDS)
         self.assertEqual(watchdog_props["report_grace_seconds"]["default"], DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS)
+        self.assertEqual(assign_write_props["write_paths"]["minItems"], 1)
         self.assertEqual(by_name["agent_send"]["inputSchema"]["properties"]["text"]["maxLength"], MAX_SEND_TEXT)
         self.assertEqual(skill_props["limit"]["maximum"], MAX_SKILL_NAMES)
         self.assertEqual(skill_props["names_offset"]["minimum"], 0)
@@ -1368,7 +1378,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.6.1+codex.test",
+            "version": "0.6.2+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1395,7 +1405,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.6.1")
+        self.assertEqual(result["expected_tag"], "v0.6.2")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -1582,6 +1592,42 @@ class ServerHelpersTest(unittest.TestCase):
         integer_payload = json.loads(integer_response["result"]["content"][0]["text"])
         self.assertEqual(integer_payload["error"], "limit must be an integer")
 
+    def test_paged_mapping_rejects_direct_non_integer_inputs(self) -> None:
+        with self.assertRaisesRegex(AgentError, "offset must be an integer"):
+            paged_mapping({"a": 1}, offset="0", limit=1)
+        with self.assertRaisesRegex(AgentError, "offset must be >= 0"):
+            paged_mapping({"a": 1}, offset=-1, limit=1)
+        with self.assertRaisesRegex(AgentError, "limit must be an integer"):
+            paged_mapping({"a": 1}, offset=0, limit=True)
+
+    def test_skills_agent_rejects_non_integer_and_out_of_bounds_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": Path(tmpdir) / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                with self.assertRaisesRegex(AgentError, "limit must be an integer"):
+                    skills_agent("a", limit="10")
+                with self.assertRaisesRegex(AgentError, f"plugins_limit must be <= {MAX_SKILL_NAMES}"):
+                    skills_agent("a", plugins_limit=MAX_SKILL_NAMES + 1)
+                with self.assertRaisesRegex(AgentError, "names_offset must be >= 0"):
+                    skills_agent("a", names_offset=-1)
+
+    def test_skill_match_agent_rejects_invalid_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": Path(tmpdir) / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                with self.assertRaisesRegex(AgentError, "limit must be an integer"):
+                    skill_match_agent("a", "some-skill", limit="8")
+                with self.assertRaisesRegex(AgentError, "limit must be >= 1"):
+                    skill_match_agent("a", "some-skill", limit=0)
+
     def test_mcp_tool_call_validates_params_and_argument_shape(self) -> None:
         params_response = handle_rpc({"jsonrpc": "2.0", "id": 33, "method": "tools/call", "params": "not-an-object"})
         arguments_response = handle_rpc(
@@ -1658,6 +1704,17 @@ class ServerHelpersTest(unittest.TestCase):
                 "params": {"name": "agent_scope_check", "arguments": {"scope": "src"}},
             }
         )
+        empty_write_paths = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "tools/call",
+                "params": {
+                    "name": "agent_assign_write",
+                    "arguments": {"agent": "a", "task": "Fix.", "write_paths": []},
+                },
+            }
+        )
 
         self.assertTrue(wrong_type["result"]["isError"])
         wrong_type_payload = json.loads(wrong_type["result"]["content"][0]["text"])
@@ -1671,6 +1728,9 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(bad_array["result"]["isError"])
         bad_array_payload = json.loads(bad_array["result"]["content"][0]["text"])
         self.assertEqual(bad_array_payload["error"], "scope must be an array")
+        self.assertTrue(empty_write_paths["result"]["isError"])
+        empty_write_paths_payload = json.loads(empty_write_paths["result"]["content"][0]["text"])
+        self.assertEqual(empty_write_paths_payload["error"], "write_paths must contain at least 1 item(s)")
 
     def test_agent_wait_tool_validates_bounds(self) -> None:
         response = handle_rpc(
@@ -1739,6 +1799,21 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(payload["chars_limit"], 8192)
         self.assertTrue(payload["output"].startswith("... truncated to last characters ..."))
         self.assertNotIn("sk-verylongtoken01234567890", payload["output"])
+
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("codex_master.server.pane_tail", return_value="")
+    @patch("codex_master.server.ensure_state")
+    def test_safe_tail_direct_calls_reject_invalid_limits(
+        self, _mock_ensure_state, _mock_pane_tail, _mock_tmux_alive
+    ) -> None:
+        with self.assertRaisesRegex(AgentError, "lines must be an integer"):
+            safe_tail("a", lines="40", chars=4000)
+        with self.assertRaisesRegex(AgentError, "chars must be an integer"):
+            safe_tail("a", lines=40, chars=False)
+        with self.assertRaisesRegex(AgentError, "lines must be >= 1"):
+            safe_tail("a", lines=0, chars=4000)
+        with self.assertRaisesRegex(AgentError, f"chars must be <= {MAX_TAIL_CHARS}"):
+            safe_tail("a", lines=1, chars=MAX_TAIL_CHARS + 1)
 
     @patch("codex_master.server.ensure_state")
     def test_safe_tail_log_source_reads_caps_and_redacts(self, _mock_ensure_state) -> None:
@@ -3891,6 +3966,18 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("/home/teladi/private", payload_text)
         self.assertNotIn("/home/teladi/secret-skill", payload_text)
 
+    @patch("codex_master.server.ensure_state")
+    def test_list_assignments_rejects_invalid_limits(self, _mock_ensure_state) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assignment_log = Path(tmpdir) / "assignments.jsonl"
+            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+                with self.assertRaisesRegex(AgentError, "limit must be an integer"):
+                    list_assignments("a", limit="10")
+                with self.assertRaisesRegex(AgentError, "limit must be >= 1"):
+                    list_assignments("a", limit=0)
+                with self.assertRaisesRegex(AgentError, f"limit must be <= {MAX_ASSIGNMENT_RECORDS}"):
+                    list_assignments("a", limit=MAX_ASSIGNMENT_RECORDS + 1)
+
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.send_agent")
     def test_agent_assign_sends_structured_prompt_without_returning_prompt(self, mock_send_agent, _mock_alive) -> None:
@@ -4393,6 +4480,14 @@ class CliLifecycleTest(unittest.TestCase):
                 "force": False,
             },
         )
+
+    @patch("codex_master.server.call_tool")
+    def test_cli_claim_rejects_conflicting_wait_modes(self, mock_call_tool) -> None:
+        with patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as raised:
+            main_cli(["claim", "b", "--forever", "--no-wait"])
+
+        self.assertEqual(raised.exception.code, 2)
+        mock_call_tool.assert_not_called()
 
     @patch("codex_master.server.call_tool")
     @patch("builtins.print")
