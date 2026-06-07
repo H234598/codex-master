@@ -51,6 +51,9 @@ BASE_ARGS = [
 ]
 MAX_TAIL_LINES = 80
 MAX_TAIL_CHARS = 8192
+MAX_RAW_LOG_BYTES = 5 * 1024 * 1024
+MAX_RAW_LOG_FILES = 20
+RAW_LOG_CHUNK_BYTES = 64 * 1024
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
 MCP_SERVER_NAME = "codex-master-mcp"
 DEFAULT_INSTALL_PATH = Path("~/.local/bin/codex-master-mcp").expanduser()
@@ -68,6 +71,7 @@ MAX_SKILL_REF = 300
 MAX_PATH_TEXT = 1000
 MAX_ASSIGNMENT_ID = 200
 DEFAULT_AGENTIN_NAMES = {"a": "Mila", "b": "Nora"}
+RAW_LOG_TRUNCATION_MARKER = b"\n... codex-master-mcp retained the last raw log bytes ...\n"
 
 
 AGENTS = {
@@ -113,6 +117,7 @@ def ensure_state() -> None:
             path.chmod(0o700)
         except PermissionError:
             pass
+    prune_raw_logs()
 
 
 def now_id() -> str:
@@ -223,6 +228,204 @@ def replace_private_text(path: Path, text: str) -> None:
             pass
 
 
+def replace_private_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{now_id()}.tmp")
+    try:
+        tmp_path.write_bytes(data)
+        try:
+            tmp_path.chmod(0o600)
+        except PermissionError:
+            pass
+        tmp_path.replace(path)
+        try:
+            path.chmod(0o600)
+        except PermissionError:
+            pass
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def managed_raw_dirs() -> tuple[Path, ...]:
+    legacy_raw = LEGACY_STATE_ROOT / "raw"
+    dirs = [RAW_DIR]
+    if legacy_raw != RAW_DIR:
+        dirs.append(legacy_raw)
+    return tuple(dirs)
+
+
+def allowed_raw_log_path(raw_log: Any) -> Path | None:
+    if not isinstance(raw_log, str) or not raw_log.strip():
+        return None
+    try:
+        candidate = Path(raw_log).expanduser().resolve(strict=False)
+    except OSError:
+        return None
+    if candidate.suffix != ".log":
+        return None
+    for root in managed_raw_dirs():
+        try:
+            candidate.relative_to(root.resolve(strict=False))
+            return candidate
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def protected_raw_log_paths() -> set[Path]:
+    protected: set[Path] = set()
+    for agent in AGENTS:
+        path = allowed_raw_log_path(read_meta(agent).get("raw_log"))
+        if path is not None:
+            protected.add(path)
+    return protected
+
+
+def bound_raw_log_file(path: Path, max_bytes: int = MAX_RAW_LOG_BYTES) -> bool:
+    max_bytes = max(1, int(max_bytes))
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size <= max_bytes:
+        return False
+    marker = RAW_LOG_TRUNCATION_MARKER[: max(0, max_bytes - 1)]
+    tail_limit = max(0, max_bytes - len(marker))
+    with path.open("rb") as fh:
+        fh.seek(max(0, size - tail_limit), os.SEEK_SET)
+        tail = fh.read(tail_limit)
+    replace_private_bytes(path, marker + tail)
+    return True
+
+
+def append_bounded_raw_log(path: Path, chunk: bytes, max_bytes: int = MAX_RAW_LOG_BYTES) -> None:
+    max_bytes = max(1, int(max_bytes))
+    if not chunk:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(mode=0o600, exist_ok=True)
+    try:
+        path.chmod(0o600)
+    except PermissionError:
+        pass
+    with path.open("r+b") as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        if size + len(chunk) <= max_bytes:
+            fh.write(chunk)
+            return
+        marker = RAW_LOG_TRUNCATION_MARKER[: max(0, max_bytes - 1)]
+        tail_limit = max(0, max_bytes - len(marker) - len(chunk))
+        preserved = b""
+        if tail_limit:
+            fh.seek(max(0, size - tail_limit), os.SEEK_SET)
+            preserved = fh.read(tail_limit)
+        payload_limit = max(0, max_bytes - len(marker) - len(preserved))
+        payload = chunk[-payload_limit:] if payload_limit else b""
+        new_content = marker + preserved + payload
+        if len(new_content) > max_bytes:
+            tail_limit = max(0, max_bytes - len(marker))
+            new_content = marker + new_content[-tail_limit:]
+        fh.seek(0)
+        fh.truncate()
+        fh.write(new_content)
+
+
+def write_bounded_raw_log(path: Path, max_bytes: int = MAX_RAW_LOG_BYTES) -> int:
+    allowed = allowed_raw_log_path(str(path))
+    if allowed is None:
+        raise AgentError("raw log path is outside managed raw log state")
+    while True:
+        chunk = sys.stdin.buffer.read(RAW_LOG_CHUNK_BYTES)
+        if not chunk:
+            return 0
+        append_bounded_raw_log(allowed, chunk, max_bytes)
+
+
+def prune_raw_logs(max_files: int = MAX_RAW_LOG_FILES, max_bytes: int = MAX_RAW_LOG_BYTES) -> dict[str, Any]:
+    max_files = max(1, int(max_files))
+    max_bytes = max(1, int(max_bytes))
+    protected = protected_raw_log_paths()
+    deleted = 0
+    truncated = 0
+    retained = 0
+    for raw_dir in managed_raw_dirs():
+        if not raw_dir.exists():
+            continue
+        logs = sorted(
+            (path for path in raw_dir.glob("*.log") if path.is_file()),
+            key=lambda path: (path.stat().st_mtime, path.name),
+            reverse=True,
+        )
+        keep: set[Path] = set(protected)
+        for path in logs[:max_files]:
+            keep.add(path.resolve(strict=False))
+        for path in logs:
+            resolved = path.resolve(strict=False)
+            try:
+                path.chmod(0o600)
+            except PermissionError:
+                pass
+            if resolved not in protected and path.stat().st_size > max_bytes:
+                truncated += 1 if bound_raw_log_file(path, max_bytes) else 0
+            if resolved in keep:
+                retained += 1
+                continue
+            try:
+                path.unlink()
+                deleted += 1
+            except FileNotFoundError:
+                pass
+    return {
+        "max_files_per_dir": max_files,
+        "max_bytes_per_file": max_bytes,
+        "retained_count": retained,
+        "deleted_count": deleted,
+        "truncated_count": truncated,
+        "raw_output": "not_returned",
+    }
+
+
+def raw_log_retention_status() -> dict[str, Any]:
+    file_count = 0
+    total_bytes = 0
+    oversized_count = 0
+    for raw_dir in managed_raw_dirs():
+        if not raw_dir.exists():
+            continue
+        for path in raw_dir.glob("*.log"):
+            if not path.is_file():
+                continue
+            file_count += 1
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            total_bytes += size
+            oversized_count += int(size > MAX_RAW_LOG_BYTES)
+    return {
+        "managed_dirs": [str(path) for path in managed_raw_dirs()],
+        "max_files_per_dir": MAX_RAW_LOG_FILES,
+        "max_bytes_per_file": MAX_RAW_LOG_BYTES,
+        "file_count": file_count,
+        "total_bytes": total_bytes,
+        "oversized_count": oversized_count,
+        "raw_output": "not_returned",
+    }
+
+
+def raw_log_writer_command(raw_log: Path) -> str:
+    wrapper = repo_wrapper_path()
+    if wrapper.exists() and os.access(wrapper, os.X_OK):
+        argv = [str(wrapper), "raw-log-writer", str(raw_log), "--max-bytes", str(MAX_RAW_LOG_BYTES)]
+    else:
+        argv = [sys.executable, "-m", "codex_master.server", "raw-log-writer", str(raw_log), "--max-bytes", str(MAX_RAW_LOG_BYTES)]
+    return shlex.join(argv)
+
+
 def pane_pid(session: str) -> int | None:
     if not tmux_alive(session):
         return None
@@ -283,7 +486,7 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
     if cp.returncode != 0:
         raise AgentError(f"tmux start failed for agent {agent}: {cp.stderr.strip()}")
 
-    pipe_command = "cat >> " + shlex.quote(str(raw_log))
+    pipe_command = raw_log_writer_command(raw_log)
     pipe = run_tmux(["pipe-pane", "-o", "-t", session, pipe_command], check=False)
     if pipe.returncode != 0:
         cleanup_failed_start(session, raw_log)
@@ -303,7 +506,8 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
         "started_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "run_id": run_id,
         "raw_log": str(raw_log),
-        "raw_log_policy": "local_only_not_returned_by_default",
+        "raw_log_policy": "local_only_bounded_not_returned_by_default",
+        "raw_log_max_bytes": MAX_RAW_LOG_BYTES,
     }
     write_meta(agent, data)
     return {
@@ -316,6 +520,7 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
         "model": DEFAULT_AGENT_MODEL,
         "model_reasoning_effort": DEFAULT_AGENT_MODEL_EFFORT,
         "raw_log": str(raw_log),
+        "raw_log_max_bytes": MAX_RAW_LOG_BYTES,
         "raw_output": "not_returned",
     }
 
@@ -337,10 +542,11 @@ def status_agent(agent: str) -> dict[str, Any]:
     session = cfg["session"]
     meta = read_meta(agent)
     raw_log = meta.get("raw_log")
+    raw_log_path = allowed_raw_log_path(raw_log)
     raw_size = None
-    if raw_log:
+    if raw_log_path:
         try:
-            raw_size = Path(raw_log).stat().st_size
+            raw_size = raw_log_path.stat().st_size
         except OSError:
             raw_size = None
     return {
@@ -356,8 +562,11 @@ def status_agent(agent: str) -> dict[str, Any]:
         "cwd": meta.get("cwd"),
         "model": meta.get("model") or DEFAULT_AGENT_MODEL,
         "model_reasoning_effort": meta.get("model_reasoning_effort") or DEFAULT_AGENT_MODEL_EFFORT,
-        "raw_log": raw_log,
+        "raw_log": str(raw_log_path) if raw_log_path else None,
         "raw_log_bytes": raw_size,
+        "raw_log_max_bytes": MAX_RAW_LOG_BYTES,
+        "raw_log_policy": "local_only_bounded_not_returned_by_default",
+        "raw_log_path_valid": (raw_log_path is not None) if raw_log else True,
         "raw_output": "not_returned",
     }
 
@@ -1049,6 +1258,7 @@ def check_mcp_registration(command_path: Path = DEFAULT_INSTALL_PATH) -> dict[st
 
 
 def doctor() -> dict[str, Any]:
+    ensure_state()
     wrapper = repo_wrapper_path()
     install_path = DEFAULT_INSTALL_PATH
     installed_target = None
@@ -1083,6 +1293,7 @@ def doctor() -> dict[str, Any]:
         )
     registration = check_mcp_registration(install_path)
     checks.append({"name": "mcp_registered", **registration})
+    checks.append({"name": "raw_log_retention_configured", "ok": True, **raw_log_retention_status()})
     return {"ok": all(check["ok"] for check in checks), "checks": checks, "raw_output": "not_returned"}
 
 
@@ -1265,7 +1476,10 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
         raw = pane_tail(agent, lines)
     else:
         raw_log = meta.get("raw_log")
-        raw = read_log_tail(Path(raw_log), chars * 4) if raw_log else ""
+        raw_log_path = allowed_raw_log_path(raw_log)
+        if raw_log and raw_log_path is None:
+            raise AgentError("raw_log path is outside managed raw log state")
+        raw = read_log_tail(raw_log_path, chars * 4) if raw_log_path else ""
     cleaned = strip_ansi(raw)
     redacted, was_redacted = redact(cleaned)
     cleaned = trim_lines(redacted, lines)
@@ -1276,7 +1490,7 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
         "lines_limit": lines,
         "chars_limit": chars,
         "redaction_applied": was_redacted,
-        "raw_log": meta.get("raw_log"),
+        "raw_log": str(allowed_raw_log_path(meta.get("raw_log"))) if meta.get("raw_log") else None,
         "output": cleaned,
     }
 
@@ -1978,8 +2192,14 @@ def main_cli(argv: list[str]) -> int:
     sub.add_parser("doctor")
     sub.add_parser("tools")
 
+    p_raw_log_writer = sub.add_parser("raw-log-writer", help=argparse.SUPPRESS)
+    p_raw_log_writer.add_argument("path")
+    p_raw_log_writer.add_argument("--max-bytes", type=int, default=MAX_RAW_LOG_BYTES)
+
     args = parser.parse_args(argv)
     try:
+        if args.command == "raw-log-writer":
+            return write_bounded_raw_log(Path(args.path), args.max_bytes)
         if args.command == "start":
             return print_json(call_tool("agent_start", {"agent": args.agent, "cwd": args.cwd, "prompt": args.prompt}))
         if args.command == "status":

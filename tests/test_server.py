@@ -10,11 +10,15 @@ from unittest.mock import patch
 from codex_master.server import (
     MAX_ASSIGNMENT_LIST_ITEMS,
     MAX_CAPABILITY_PLUGINS,
+    MAX_RAW_LOG_BYTES,
     MAX_SEND_TEXT,
     MAX_SKILL_NAMES,
     MAX_TASK_TEXT,
+    RAW_LOG_TRUNCATION_MARKER,
+    append_bounded_raw_log,
     handle_rpc,
     main_cli,
+    prune_raw_logs,
     redact,
     start_agent,
     strip_ansi,
@@ -174,7 +178,9 @@ class ServerHelpersTest(unittest.TestCase):
                 "first\nsecond\n\x1b[32mOPENAI_API_KEY=sk-logtoken1234567890\x1b[0m\n",
                 encoding="utf-8",
             )
-            with patch("codex_master.server.read_meta", return_value={"raw_log": str(log_path)}):
+            with patch("codex_master.server.RAW_DIR", Path(tmpdir)), patch(
+                "codex_master.server.read_meta", return_value={"raw_log": str(log_path)}
+            ):
                 response = handle_rpc(
                     {
                         "jsonrpc": "2.0",
@@ -195,6 +201,60 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("sk-logtoken1234567890", payload["output"])
         self.assertIn("OPENAI_API_KEY=<redacted>", payload["output"])
         self.assertTrue(payload["redaction_applied"])
+
+    @patch("codex_master.server.ensure_state")
+    def test_safe_tail_log_source_rejects_unmanaged_meta_path(self, _mock_ensure_state) -> None:
+        with patch("codex_master.server.read_meta", return_value={"raw_log": "/etc/passwd"}):
+            response = handle_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 19,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "agent_safe_tail",
+                        "arguments": {"agent": "a", "source": "log", "lines": 2, "chars": 4000},
+                    },
+                }
+            )
+
+        self.assertIsNotNone(response)
+        self.assertTrue(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertIn("outside managed raw log state", payload["error"])
+
+    def test_append_bounded_raw_log_caps_file_size(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_path = Path(tmpdir) / "agent.log"
+            append_bounded_raw_log(log_path, b"a" * 80, max_bytes=128)
+            append_bounded_raw_log(log_path, b"b" * 160, max_bytes=128)
+            data = log_path.read_bytes()
+
+        self.assertLessEqual(len(data), 128)
+        self.assertIn(RAW_LOG_TRUNCATION_MARKER.strip(), data)
+        self.assertTrue(data.endswith(b"b" * min(160, 128 - len(RAW_LOG_TRUNCATION_MARKER))))
+
+    def test_prune_raw_logs_bounds_count_and_size(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw"
+            raw_dir.mkdir()
+            for index in range(4):
+                log_path = raw_dir / f"log-{index}.log"
+                log_path.write_bytes(bytes([65 + index]) * 200)
+                os.utime(log_path, (1000 + index, 1000 + index))
+            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
+                "codex_master.server.LEGACY_STATE_ROOT", Path(tmpdir) / "legacy"
+            ), patch("codex_master.server.META_DIR", Path(tmpdir) / "meta"), patch(
+                "codex_master.server.LEGACY_META_DIR", Path(tmpdir) / "legacy" / "meta"
+            ):
+                result = prune_raw_logs(max_files=2, max_bytes=80)
+                logs = sorted(raw_dir.glob("*.log"))
+                log_names = [path.name for path in logs]
+                log_sizes = [path.stat().st_size for path in logs]
+
+        self.assertEqual(result["deleted_count"], 2)
+        self.assertEqual(len(logs), 2)
+        self.assertEqual(log_names, ["log-2.log", "log-3.log"])
+        self.assertTrue(all(size <= 80 for size in log_sizes))
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.write_meta")
@@ -859,7 +919,14 @@ class CliLifecycleTest(unittest.TestCase):
                     (Path(tmp_home) / "a").mkdir(parents=True)
                     (Path(tmp_home) / "b-runner").write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
                     (Path(tmp_home) / "b").mkdir(parents=True)
-                    result = main_cli(["doctor"])
+                    with patch("codex_master.server.STATE_ROOT", Path(tmp_home) / "state"), patch(
+                        "codex_master.server.RAW_DIR", Path(tmp_home) / "state" / "raw"
+                    ), patch(
+                        "codex_master.server.META_DIR", Path(tmp_home) / "state" / "meta"
+                    ), patch("codex_master.server.LEGACY_STATE_ROOT", Path(tmp_home) / "legacy-state"), patch(
+                        "codex_master.server.LEGACY_META_DIR", Path(tmp_home) / "legacy-state" / "meta"
+                    ):
+                        result = main_cli(["doctor"])
 
         self.assertEqual(result, 0)
         self.assertEqual(len(captured_payloads), 1)
@@ -870,6 +937,9 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertTrue(any(item["name"] == "tmux_available" and item["ok"] is True for item in payload["checks"]))
         self.assertTrue(any(item["name"] == "codex_available" and item["ok"] is True for item in payload["checks"]))
         self.assertTrue(any(item["name"] == "mcp_registered" for item in payload["checks"]))
+        retention = next(item for item in payload["checks"] if item["name"] == "raw_log_retention_configured")
+        self.assertEqual(retention["max_bytes_per_file"], MAX_RAW_LOG_BYTES)
+        self.assertEqual(retention["raw_output"], "not_returned")
         payload_text = json.dumps(payload, sort_keys=True)
         self.assertNotIn("sk-doctor-test-secret", payload_text)
         self.assertNotIn("sess-doctor-test", payload_text)

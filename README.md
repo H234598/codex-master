@@ -13,9 +13,11 @@ with the default model `gpt-5.4-mini` and:
 ```
 
 It uses `tmux` as the PTY backend. Full terminal output is written only to local
-state files under `~/.local/state/codex-master-mcp/raw/`. MCP tool responses do
-not return raw output by default. Existing metadata under the old
-`codex-agent-mcp` state directory is still read as a migration fallback.
+state files under `~/.local/state/codex-master-mcp/raw/`. New raw logs are
+bounded to 5 MiB per file, and managed raw-log directories keep at most 20 files
+by default. MCP tool responses do not return raw output by default. Existing
+metadata under the old `codex-agent-mcp` state directory is still read as a
+migration fallback.
 
 ## Tools
 
@@ -150,6 +152,12 @@ Assignment and send inputs are bounded before tmux interaction: free sends and
 start prompts are capped at 12,000 characters, assignment tasks at 4,000
 characters, names at 80 characters, skill refs at 300 characters, path-like
 fields at 1,000 characters, and assignment lists at 50 items.
+
+Raw logs are local debug artifacts, not normal API data. The tmux pipe writes
+through a bounded local writer, `doctor` reports the configured raw-log policy,
+and `tail --source log` refuses metadata paths outside the managed raw-log state.
+Use `tail` only when an explicit, capped, ANSI-stripped, redacted excerpt is
+needed.
 
 Model policy: Agentin A and Agentin B run on `gpt-5.4-mini` by default. Read-only
 Exploriererin assignments keep that model. Arbeitsbiene write assignments are
