@@ -571,6 +571,11 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
         raise AgentError(f"runner missing for agent {agent}: {runner}")
     if tmux_alive(session):
         process_summary = agent_home_process_summary(agent)
+        if process_summary["external_process_count"]:
+            raise AgentError(
+                f"agent {agent} is already running in tmux, but CODEX_HOME is also used by "
+                f"{process_summary['external_process_count']} external process(es); stop the external process(es) first"
+            )
         return {
             "agent": agent,
             "status": "already_running",

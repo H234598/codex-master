@@ -352,6 +352,68 @@ class ServerHelpersTest(unittest.TestCase):
         mock_run_tmux.assert_not_called()
 
     @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.read_meta", return_value={})
+    @patch("codex_master.server.pane_pid", return_value=321)
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 1,
+            "external_process_count": 0,
+            "managed_process_count": 1,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
+    def test_start_agent_already_running_allows_managed_session_without_external_home_user(
+        self, _mock_summary, _mock_tmux_alive, _mock_pane_pid, _mock_read_meta, _mock_ensure_state
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = Path(tmpdir) / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
+                clear=False,
+            ):
+                result = start_agent("a", cwd=tmpdir)
+
+        self.assertEqual(result["status"], "already_running")
+        self.assertEqual(result["home_external_process_count"], 0)
+        self.assertEqual(result["raw_output"], "not_returned")
+
+    @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.pane_pid", return_value=321)
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 2,
+            "external_process_count": 1,
+            "managed_process_count": 1,
+            "external_processes": [{"pid": 100, "raw_output": "not_returned"}],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
+    def test_start_agent_blocks_external_codex_home_user_even_when_tmux_session_exists(
+        self, _mock_summary, _mock_tmux_alive, _mock_pane_pid, _mock_ensure_state
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = Path(tmpdir) / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
+                clear=False,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "already running in tmux"):
+                    start_agent("a", cwd=tmpdir)
+
+    @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.write_meta")
     @patch("codex_master.server.pane_pid", return_value=123)
     @patch("codex_master.server.tmux_alive", side_effect=[False, True])

@@ -48,7 +48,8 @@ unless the intent is to make that instance a Teamleiterin.
   paths. They must not use `codex-master-mcp` to control the fleet.
 - Do not manually start Agentin A/B with the same `CODEX_HOME` while the
   Masterjet manages them. Use `doctor` if a terminal looks stuck; `start`
-  blocks when an Agentin home is already used externally.
+  blocks when an Agentin home is already used externally, including when a
+  Masterjet tmux session already exists.
 - A stopped Agentin is a normal informational `doctor` session state, not a
   failed health check.
 

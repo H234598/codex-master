@@ -175,7 +175,9 @@ not commit, push, or release.
 Do not start Agentin A or Agentin B manually with the same `CODEX_HOME` while
 the Masterjet is responsible for them. `start` refuses to launch an Agentin when
 its home is already used by an external Codex process, and `doctor` reports such
-home conflicts before they become tmux or lock contention.
+home conflicts before they become tmux or lock contention. `start` also refuses
+an already-running Masterjet session if a second external process is using the
+same home.
 
 Assignments are appended to `~/.local/state/codex-master-mcp/assignments.jsonl`
 as metadata only: assignment id, Agentin, role, selected model, skill match
