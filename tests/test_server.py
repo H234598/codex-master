@@ -27,6 +27,7 @@ from codex_master.server import (
     BRACKETED_PASTE_END,
     COMMAND_TIMEOUT_RETURN_CODE,
     DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS,
     DEFAULT_WAIT_POLL_SECONDS,
     DEFAULT_WAIT_SECONDS,
     DEFAULT_TMUX_TIMEOUT_SECONDS,
@@ -43,6 +44,8 @@ from codex_master.server import (
     ensure_state,
     handle_rpc,
     install,
+    installed_source_worktree_state,
+    mcp_command_startup_self_test,
     mcp_registration_command_matches,
     main_cli,
     prune_raw_logs,
@@ -2500,9 +2503,67 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(payload["mcp"]["startup_timeout"]["status"], "updated")
         self.assertEqual(payload["mcp"]["startup_timeout"]["startup_timeout_sec"], 120)
         self.assertEqual(payload["mcp"]["startup_timeout"]["config_path"], "not_returned")
+        self.assertTrue(payload["startup_self_test"]["ok"])
+        self.assertEqual(payload["startup_self_test"]["raw_output"], "not_returned")
         self.assertIn("startup_timeout_sec = 120", config_content)
         self.assertTrue(link_created)
         mock_run.assert_any_call(["codex", "mcp", "add", "codex-master-mcp", "--", str(install_link)])
+
+    @patch("codex_master.server.mcp_command_startup_self_test")
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_refuses_failed_startup_self_test_before_writing_link(
+        self, mock_wrapper_path, mock_self_test
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            mock_wrapper_path.return_value = wrapper
+            mock_self_test.return_value = {"ok": False, "status": "failed", "raw_output": "not_returned"}
+
+            with self.assertRaisesRegex(AgentError, "startup self-test"):
+                install(register=True, install_path=install_link)
+            link_exists = install_link.exists() or install_link.is_symlink()
+
+        self.assertFalse(link_exists)
+
+    @patch("codex_master.server.subprocess.run")
+    def test_mcp_command_startup_self_test_is_data_sparse(self, mock_run) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["codex-master-mcp"],
+            0,
+            'Content-Length: 77\r\n\r\n{"jsonrpc":"2.0","id":1,"serverInfo":{"name":"codex-master-mcp"}} SECRET',
+            "",
+        )
+
+        result = mcp_command_startup_self_test(Path("/tmp/codex-master-mcp"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["raw_output"], "not_returned")
+        self.assertNotIn("SECRET", json.dumps(result, sort_keys=True))
+        self.assertEqual(mock_run.call_args.kwargs["timeout"], DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS)
+
+    @patch("codex_master.server.run_command")
+    def test_installed_source_worktree_state_warns_without_paths(self, mock_run) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["git", "status", "--porcelain=v1"],
+            0,
+            " M src/codex_master/server.py\n?? SECRET_PATH_SHOULD_NOT_RETURN\n",
+            "",
+        )
+
+        wrapper = Path("/tmp/repo/bin/codex-master-mcp")
+        result = installed_source_worktree_state(wrapper, wrapper)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "dirty")
+        self.assertEqual(result["severity"], "warning")
+        self.assertEqual(result["tracked_change_count"], 1)
+        self.assertEqual(result["untracked_count"], 1)
+        self.assertEqual(result["raw_output"], "not_returned")
+        self.assertNotIn("SECRET_PATH_SHOULD_NOT_RETURN", json.dumps(result, sort_keys=True))
 
     def test_install_refuses_master_registration_inside_managed_agent_home(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

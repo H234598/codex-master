@@ -118,6 +118,8 @@ python3 -m codex_master.server stop both
 
 `install`
 - creates `~/.local/bin/codex-master-mcp` as symlink to `bin/codex-master-mcp`
+- verifies that the repo wrapper can answer an MCP `initialize` probe before
+  registering it with Codex
 - registers the command via `codex mcp add codex-master-mcp -- <link>`
 - ensures the active Codex MCP config has `startup_timeout_sec = 120`
 - refuses to register the Master MCP from a managed Agentinnen `CODEX_HOME`
@@ -141,6 +143,8 @@ python3 -m codex_master.server stop both
   `startup_timeout_sec >= 120`
 - reports whether the active `CODEX_HOME` looks like the main default home, a
   managed Agentinnen home, or a custom home without returning the path
+- warns, without returning file paths, when the installed MCP points at this
+  repo while the worktree has tracked or untracked changes
 - reports broken, looping, or unreadable install symlinks as a failed
   `installed_symlink` check with an unreadable target marker
 - treats stopped Agentinnen as informational session state, not as a failed

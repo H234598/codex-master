@@ -88,6 +88,7 @@ MAX_CODEX_CONFIG_BYTES = 1024 * 1024
 COMMAND_TIMEOUT_RETURN_CODE = 124
 DEFAULT_TMUX_TIMEOUT_SECONDS = 10
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
+DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS = 10
 RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS = 120
 DEFAULT_AGENTIN_NAMES = {"a": "Mila", "b": "Nora"}
 RAW_LOG_TRUNCATION_MARKER = b"\n... codex-master-mcp retained the last raw log bytes ...\n"
@@ -395,6 +396,57 @@ def run_command(
         if check:
             raise subprocess.CalledProcessError(cp.returncode, cp.args, output=cp.stdout, stderr=cp.stderr) from exc
         return cp
+
+
+def mcp_initialize_probe_payload() -> str:
+    return json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "codex-master-install-probe", "version": "0"},
+            },
+        },
+        separators=(",", ":"),
+    ) + "\n"
+
+
+def mcp_command_startup_self_test(
+    command_path: Path,
+    *,
+    timeout: int = DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    command = [str(command_path)]
+    try:
+        cp = subprocess.run(
+            command,
+            input=mcp_initialize_probe_payload(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "status": "timeout",
+            "timeout_seconds": timeout,
+            "raw_output": "not_returned",
+        }
+
+    output = cp.stdout + cp.stderr
+    ok = cp.returncode == 0 and MCP_SERVER_NAME in output and '"id":1' in output
+    return {
+        "ok": ok,
+        "status": "ok" if ok else "failed",
+        "returncode": cp.returncode,
+        "timeout_seconds": timeout,
+        "raw_output": "not_returned",
+    }
 
 
 def tmux_alive(session: str) -> bool:
@@ -2031,6 +2083,43 @@ def normalize_install_path(path: Path) -> Path:
     return normalized.absolute()
 
 
+def repo_worktree_safety() -> dict[str, Any]:
+    cp = run_command(["git", "status", "--porcelain=v1"], cwd=repo_root())
+    if cp.returncode != 0:
+        return {
+            "name": "installed_source_worktree_state",
+            "ok": False,
+            "status": "unknown",
+            "severity": "warning",
+            "raw_output": "not_returned",
+        }
+    lines = [line for line in cp.stdout.splitlines() if line]
+    untracked_count = sum(1 for line in lines if line.startswith("??"))
+    tracked_change_count = len(lines) - untracked_count
+    clean = not lines
+    return {
+        "name": "installed_source_worktree_state",
+        "ok": True,
+        "status": "clean" if clean else "dirty",
+        "severity": "info" if clean else "warning",
+        "tracked_change_count": tracked_change_count,
+        "untracked_count": untracked_count,
+        "raw_output": "not_returned",
+    }
+
+
+def installed_source_worktree_state(installed_target: Path | None, wrapper: Path) -> dict[str, Any]:
+    if installed_target != wrapper:
+        return {
+            "name": "installed_source_worktree_state",
+            "ok": True,
+            "status": "not_applicable",
+            "severity": "info",
+            "raw_output": "not_returned",
+        }
+    return repo_worktree_safety()
+
+
 def integration_status() -> dict[str, Any]:
     return {
         "repo": str(repo_root()),
@@ -2078,6 +2167,11 @@ def master_plugin_status() -> dict[str, Any]:
         "mcp_manifest": {"path": str(mcp_manifest), "exists": mcp_manifest.is_file()},
         "skill": {"path": str(skill), "exists": skill.is_file()},
         "mcp_registration": check_mcp_registration(DEFAULT_INSTALL_PATH),
+        "startup_self_test": mcp_command_startup_self_test(DEFAULT_INSTALL_PATH),
+        "installed_source_worktree_state": installed_source_worktree_state(
+            resolve_path_no_throw(DEFAULT_INSTALL_PATH) if DEFAULT_INSTALL_PATH.is_symlink() else None,
+            repo_wrapper_path(),
+        ),
         "codex_home_context": codex_home_context(),
         "raw_output": "not_returned",
     }
@@ -2151,6 +2245,7 @@ def doctor() -> dict[str, Any]:
             "path": str(install_path),
             "target": installed_target,
         },
+        installed_source_worktree_state(resolved_install_path, wrapper),
     ]
     for agent, cfg in AGENTS.items():
         process_summary = agent_home_process_summary(agent)
@@ -2206,6 +2301,11 @@ def install(register: bool = True, force: bool = False, install_path: Path = DEF
         raise AgentError(f"repo wrapper missing: {wrapper}")
     if not os.access(wrapper, os.X_OK):
         raise AgentError(f"repo wrapper is not executable: {wrapper}")
+    startup_self_test: dict[str, Any] = {"requested": register, "status": "skipped", "raw_output": "not_returned"}
+    if register:
+        startup_self_test = {"requested": True, **mcp_command_startup_self_test(wrapper)}
+        if not startup_self_test["ok"]:
+            raise AgentError("repo wrapper failed MCP startup self-test")
 
     install_path = normalize_install_path(install_path)
     ensure_directory_chain_no_symlink(install_path.parent, "install parent directories must be real directories")
@@ -2261,6 +2361,7 @@ def install(register: bool = True, force: bool = False, install_path: Path = DEF
         "install_path": str(install_path),
         "target": str(wrapper),
         "symlink": symlink_status,
+        "startup_self_test": startup_self_test,
         "mcp": registration,
         "raw_output": "not_returned",
     }
