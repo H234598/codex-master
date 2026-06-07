@@ -38,6 +38,12 @@ Agentin B can still run independently while concurrent starts/stops/sends for
 the same Agentin cannot interleave. If `tmux new-session` fails before this
 process created a session, cleanup removes only the prepared raw log and does
 not kill an existing session that may belong to another MCP process.
+Mutating tools also use a per-Agentin lease, so two Codex-CLI instances cannot
+silently assign or send into the same Agentin at the same time. Lease conflicts
+return structured retry metadata (`error_code`, `retryable`,
+`retry_after_seconds`, and remaining lease seconds) without exposing client
+identity. `agent_claim` can wait and retry in bounded polling loops; its default
+poll interval is 30 seconds and the maximum poll interval is 900 seconds.
 `agent_status` classifies bounded pane/log text without returning it, so callers
 can distinguish likely daily, weekly, token, quota, or rate limits from ordinary
 "no response yet" states. The classification keeps default Agentinnen-model
@@ -57,13 +63,18 @@ reads redact absolute local paths as well; assignment prompts still receive the
 explicit paths that the Teamleiterin assigned.
 `agent_wait` lets callers wait for activity, process exit, or a classified
 limit without automatically receiving Agentin output. It defaults to 120 seconds
-and is capped at 10 minutes per call.
+and is capped at 10 minutes per call. Its poll interval defaults to 30 seconds
+and is capped at 900 seconds.
 
 ## Tools
 
 - `agent_start`: start Agentin `a`, `b`, or `both`
 - `agent_status`: structured status, response state, and limit classification
   without raw output
+- `agent_lease_status`: data-sparse lease state for Agentin `a`, `b`, or `all`
+- `agent_claim`: claim or renew one Agentin, optionally waiting and retrying
+- `agent_release`: release this MCP client's Agentin claim; force only after
+  checking status
 - `agent_wait`: wait for activity/stop/limit metadata without raw output,
   defaulting to 120 seconds and capped at 10 minutes per call
 - `agent_send`: send text to one running Agentin
@@ -107,6 +118,10 @@ active Codex client config, and active `CODEX_HOME` context are ready.
 `mcp_server_ready`, `plugin_cache_ready`, `client_config_ready`, and
 `active_home_ready` remain separate for isolating server startup from stale
 client/plugin state, a mismatched config, or a managed Agentin home.
+`running_process_summary.namespace_visibility` reports only aggregate client
+home categories so sibling Codex sessions can identify when custom homes need
+their own MCP config or when managed Agentin homes are expected not to expose
+Master MCP tools.
 
 ## Local CLI
 
@@ -118,7 +133,9 @@ python3 -m codex_master.server uninstall       # remove mcp registration and loc
 
 python3 -m codex_master.server start both --cwd /home/teladi/codex-master
 python3 -m codex_master.server status
-python3 -m codex_master.server wait a --timeout-seconds 120 --poll-interval-seconds 2
+python3 -m codex_master.server lease-status all
+python3 -m codex_master.server claim b --wait-seconds 600 --poll-interval-seconds 30
+python3 -m codex_master.server wait a --timeout-seconds 120 --poll-interval-seconds 30
 python3 -m codex_master.server capabilities all
 python3 -m codex_master.server skills all
 python3 -m codex_master.server skills a --include-names --limit 20 --names-offset 20 --plugins-offset 20 --plugins-limit 20
@@ -134,6 +151,7 @@ python3 -m codex_master.server app-bridge-status
 python3 -m codex_master.server plugin-status
 python3 -m codex_master.server namespace-status
 python3 -m codex_master.server send a "Kurzer Auftrag"
+python3 -m codex_master.server release b
 python3 -m codex_master.server tail a --source pane --lines 20 --chars 2000
 python3 -m codex_master.server stop both
 ```
@@ -287,6 +305,13 @@ schema validation, with omitted optional arguments removed before validation.
 Multiline `send` and `assign-*` payloads are wrapped with bracketed-paste
 markers before tmux paste so Codex TUI treats the template as one prompt instead
 of separate submitted lines.
+
+Before mutating one Agentin, `start`, `assign-*`, `send`, `report-request`,
+`interrupt`, and `stop` check or renew a per-Agentin lease. A second MCP client
+gets a structured retryable error instead of writing into the same tmux session.
+Use `claim --wait-seconds ...` when a Codex-CLI instance should wait for a busy
+Agentin and retry with bounded polling. Lease state is metadata only and does
+not return the client identity, prompt text, Agentin output, or local state path.
 
 Raw logs are local debug artifacts, not normal API data. The tmux pipe writes
 through a bounded local writer, `doctor` reports the configured raw-log policy,

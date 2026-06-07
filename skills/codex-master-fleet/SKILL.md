@@ -69,7 +69,9 @@ Prefer structured tools over raw `send`:
 cd /home/teladi/codex-master
 ./bin/codex-master-mcp doctor
 ./bin/codex-master-mcp status
-./bin/codex-master-mcp wait a --timeout-seconds 120 --poll-interval-seconds 2
+./bin/codex-master-mcp lease-status all
+./bin/codex-master-mcp claim b --wait-seconds 600 --poll-interval-seconds 30
+./bin/codex-master-mcp wait a --timeout-seconds 120 --poll-interval-seconds 30
 ./bin/codex-master-mcp start both --cwd /home/teladi/codex-master
 ./bin/codex-master-mcp capabilities all
 ./bin/codex-master-mcp skills all
@@ -86,6 +88,7 @@ cd /home/teladi/codex-master
 ./bin/codex-master-mcp app-bridge-status
 ./bin/codex-master-mcp plugin-status
 ./bin/codex-master-mcp namespace-status
+./bin/codex-master-mcp release b
 ```
 
 Data minimization:
@@ -111,6 +114,10 @@ Data minimization:
   `mcp_server_ready`, `plugin_cache_ready`, `client_config_ready`, and
   `active_home_ready` separate so server startup can be distinguished from
   stale client/plugin state, mismatched config, or a managed Agentin home.
+- `running_process_summary.namespace_visibility` must return only aggregate
+  client-home categories. Use it to distinguish custom homes that need their
+  own MCP config from managed Agentin homes that are expected not to expose
+  Master MCP tools.
 - `doctor` must report the active `CODEX_HOME` category and the
   `codex-master-mcp` `startup_timeout_sec` health without returning the active
   home path.
@@ -123,7 +130,15 @@ Data minimization:
   assignment, and inferred-limit model metadata.
 - `wait` may poll status for bounded time, defaulting to 120 seconds and
   currently capped at 10 minutes, and return activity/stop/limit metadata, but
-  it must not return Agentin output.
+  it must not return Agentin output. The default poll interval is 30 seconds;
+  the maximum poll interval is 900 seconds.
+- Mutating tools must use a per-Agentin lease so two Codex-CLI clients cannot
+  silently send assignments or text into the same Agentin. Lease conflicts must
+  be structured and retryable with `error_code`, `retryable`,
+  `retry_after_seconds`, and remaining lease seconds, but without returning
+  client identity, prompt text, Agentin output, or state paths. `claim` may wait
+  and retry in bounded polling loops without holding the Agentin lifecycle lock
+  while sleeping.
 - `capabilities` returns a bounded first plugin page plus counts/truncation
   flags, not a complete broad plugin inventory.
 - `skills` returns bounded plugin/name pages plus total counts, offsets, limits,

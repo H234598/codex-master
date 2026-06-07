@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from codex_master.server import (
     AgentError,
+    DEFAULT_AGENT_LEASE_SECONDS,
     MAX_ASSIGNMENT_LIST_ITEMS,
     MAX_ASSIGNMENT_LOG_BYTES,
     MAX_CAPABILITY_PLUGINS,
@@ -37,6 +38,7 @@ from codex_master.server import (
     agent_home_process_summary,
     check_mcp_registration,
     call_tool,
+    claim_agent,
     classify_limit_text,
     classify_tui_context,
     codex_related_process_summary,
@@ -57,6 +59,7 @@ from codex_master.server import (
     read_meta,
     record_assignment,
     redact,
+    release_agent,
     replace_private_text,
     resolve_path_no_throw,
     run_command,
@@ -342,6 +345,9 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("agent_start", names)
         self.assertIn("agent_safe_tail", names)
         self.assertIn("agent_wait", names)
+        self.assertIn("agent_lease_status", names)
+        self.assertIn("agent_claim", names)
+        self.assertIn("agent_release", names)
         self.assertIn("agent_assign", names)
         self.assertIn("agent_assignments", names)
         self.assertIn("agent_skill_match", names)
@@ -356,16 +362,22 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("master_namespace_status", names)
         by_name = {tool["name"]: tool for tool in response["result"]["tools"]}
         assign_props = by_name["agent_assign"]["inputSchema"]["properties"]
+        claim_props = by_name["agent_claim"]["inputSchema"]["properties"]
         wait_props = by_name["agent_wait"]["inputSchema"]["properties"]
         skill_props = by_name["agent_skills"]["inputSchema"]["properties"]
         self.assertEqual(assign_props["task"]["maxLength"], MAX_TASK_TEXT)
         self.assertEqual(assign_props["context"]["maxItems"], MAX_ASSIGNMENT_LIST_ITEMS)
         self.assertEqual(DEFAULT_WAIT_SECONDS, 120)
         self.assertEqual(MAX_WAIT_SECONDS, 600)
+        self.assertEqual(DEFAULT_WAIT_POLL_SECONDS, 30)
+        self.assertEqual(MAX_WAIT_POLL_SECONDS, 900)
         self.assertEqual(wait_props["timeout_seconds"]["default"], DEFAULT_WAIT_SECONDS)
         self.assertEqual(wait_props["timeout_seconds"]["maximum"], MAX_WAIT_SECONDS)
         self.assertEqual(wait_props["poll_interval_seconds"]["default"], DEFAULT_WAIT_POLL_SECONDS)
         self.assertEqual(wait_props["poll_interval_seconds"]["maximum"], MAX_WAIT_POLL_SECONDS)
+        self.assertEqual(claim_props["wait_seconds"]["maximum"], MAX_WAIT_SECONDS)
+        self.assertEqual(claim_props["poll_interval_seconds"]["default"], DEFAULT_WAIT_POLL_SECONDS)
+        self.assertEqual(claim_props["poll_interval_seconds"]["maximum"], MAX_WAIT_POLL_SECONDS)
         self.assertEqual(by_name["agent_send"]["inputSchema"]["properties"]["text"]["maxLength"], MAX_SEND_TEXT)
         self.assertEqual(skill_props["limit"]["maximum"], MAX_SKILL_NAMES)
         self.assertEqual(skill_props["names_offset"]["minimum"], 0)
@@ -512,7 +524,29 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["home_kind_counts"]["unknown"], 1)
         self.assertEqual(result["home_kind_counts"]["managed_agent_home"], 1)
         self.assertEqual(result["home_kind_counts"]["custom_home"], 1)
+        self.assertEqual(result["namespace_visibility"]["main_default_home_clients"], 0)
+        self.assertEqual(result["namespace_visibility"]["custom_home_clients"], 1)
+        self.assertEqual(result["namespace_visibility"]["managed_agent_home_clients"], 1)
+        self.assertEqual(result["namespace_visibility"]["unknown_home_clients"], 1)
+        self.assertTrue(result["namespace_visibility"]["custom_home_clients_need_own_mcp_config"])
+        self.assertTrue(result["namespace_visibility"]["managed_agent_home_clients_expect_no_master_mcp"])
+        self.assertTrue(result["namespace_visibility"]["unknown_home_clients_need_manual_check"])
+        self.assertEqual(result["namespace_visibility"]["raw_output"], "not_returned")
         self.assertNotIn(str(root), json.dumps(result, sort_keys=True))
+
+    def test_codex_related_process_summary_has_stable_shape_without_proc(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing_proc = Path(tmpdir) / "missing-proc"
+
+            result = codex_related_process_summary(missing_proc)
+
+        self.assertEqual(result["codex_client_process_count"], 0)
+        self.assertEqual(result["mcp_server_process_count"], 0)
+        self.assertFalse(result["namespace_visibility"]["custom_home_clients_need_own_mcp_config"])
+        self.assertFalse(result["namespace_visibility"]["managed_agent_home_clients_expect_no_master_mcp"])
+        self.assertFalse(result["namespace_visibility"]["unknown_home_clients_need_manual_check"])
+        self.assertEqual(result["namespace_visibility"]["raw_output"], "not_returned")
+        self.assertNotIn(str(missing_proc), json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.codex_related_process_summary")
     @patch("codex_master.server.codex_home_context")
@@ -1820,9 +1854,73 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertTrue(lock_still_symlink)
 
+    def test_agent_lease_blocks_other_client_with_retry_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch(
+                "codex_master.server.LEASE_DIR", state / "leases"
+            ):
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                    first = claim_agent("b", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
+                    response = handle_rpc(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 49,
+                            "method": "tools/call",
+                            "params": {"name": "agent_send", "arguments": {"agent": "b", "text": "hi"}},
+                        }
+                    )
+
+        self.assertEqual(first["status"], "claimed")
+        self.assertTrue(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["error_code"], "agent_lease_held_by_other_client")
+        self.assertTrue(payload["retryable"])
+        self.assertGreaterEqual(payload["retry_after_seconds"], 1)
+        self.assertEqual(payload["lease"]["holder"], "other_server")
+        self.assertEqual(payload["raw_output"], "not_returned")
+        self.assertNotIn("owner-one", json.dumps(payload, sort_keys=True))
+
+    def test_agent_release_requires_holder_or_force(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch(
+                "codex_master.server.LEASE_DIR", state / "leases"
+            ):
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                    claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
+                    blocked = handle_rpc(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 50,
+                            "method": "tools/call",
+                            "params": {"name": "agent_release", "arguments": {"agent": "a"}},
+                        }
+                    )
+                    forced = release_agent("a", force=True)
+
+        self.assertTrue(blocked["result"]["isError"])
+        blocked_payload = json.loads(blocked["result"]["content"][0]["text"])
+        self.assertEqual(blocked_payload["error_code"], "agent_lease_held_by_other_client")
+        self.assertEqual(forced["status"], "released")
+        self.assertEqual(forced["lease"]["state"], "unclaimed")
+
     @patch("codex_master.server.start_agent", return_value={"agent": "a", "status": "started"})
+    @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.agent_lifecycle_lock")
-    def test_call_tool_agent_start_acquires_lifecycle_lock(self, mock_lock, mock_start_agent) -> None:
+    def test_call_tool_agent_start_acquires_lifecycle_lock(self, mock_lock, _mock_alive, mock_start_agent) -> None:
         events = []
 
         class FakeLock:
@@ -2617,17 +2715,25 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("/home/teladi/private", payload_text)
         self.assertNotIn("/home/teladi/secret-skill", payload_text)
 
+    @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.send_agent")
-    def test_agent_assign_sends_structured_prompt_without_returning_prompt(self, mock_send_agent) -> None:
+    def test_agent_assign_sends_structured_prompt_without_returning_prompt(self, mock_send_agent, _mock_alive) -> None:
         mock_send_agent.return_value = {"agent": "a", "status": "sent", "response_output": "not_returned"}
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
+            state = home / "state"
             assignment_log = home / "assignments.jsonl"
             skill = home / ".tmp" / "plugins" / "plugins" / "codex-security" / "skills" / "security-scan" / "SKILL.md"
             skill.parent.mkdir(parents=True, exist_ok=True)
             skill.write_text("Skill body must not be returned\n", encoding="utf-8")
 
-            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log), patch.dict(
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
+                "codex_master.server.ASSIGNMENT_LOG", assignment_log
+            ), patch.dict(
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
@@ -2704,13 +2810,21 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("Pruefe nur lesend.", ledger_text)
         self.assertNotIn("Skill body must not be returned", ledger_text)
 
+    @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.send_agent")
-    def test_assignment_log_retention_prunes_metadata_records(self, mock_send_agent) -> None:
+    def test_assignment_log_retention_prunes_metadata_records(self, mock_send_agent, _mock_alive) -> None:
         mock_send_agent.return_value = {"agent": "a", "status": "sent", "response_output": "not_returned"}
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
+            state = home / "state"
             assignment_log = home / "assignments.jsonl"
-            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log), patch(
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
+                "codex_master.server.ASSIGNMENT_LOG", assignment_log
+            ), patch(
                 "codex_master.server.MAX_ASSIGNMENT_LOG_RECORDS", 3
             ), patch.dict(
                 "codex_master.server.AGENTS",
@@ -2760,17 +2874,25 @@ class ServerHelpersTest(unittest.TestCase):
         ledger_text = json.dumps(ledger, sort_keys=True)
         self.assertNotIn("Pruefe nur lesend", ledger_text)
 
+    @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.send_agent")
-    def test_agent_assign_allows_nested_subagents_only_when_explicit(self, mock_send_agent) -> None:
+    def test_agent_assign_allows_nested_subagents_only_when_explicit(self, mock_send_agent, _mock_alive) -> None:
         mock_send_agent.return_value = {"agent": "b", "status": "sent", "response_output": "not_returned"}
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
+            state = home / "state"
             assignment_log = home / "assignments.jsonl"
             skill = home / ".tmp" / "plugins" / "plugins" / "github" / "skills" / "gh-fix-ci" / "SKILL.md"
             skill.parent.mkdir(parents=True, exist_ok=True)
             skill.write_text("body\n", encoding="utf-8")
 
-            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log), patch.dict(
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
+                "codex_master.server.ASSIGNMENT_LOG", assignment_log
+            ), patch.dict(
                 "codex_master.server.AGENTS",
                 {"b": {"label": "B", "runner": home / "codex", "home": home, "session": "session-b"}},
                 clear=False,

@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,7 @@ LEGACY_STATE_ROOT = Path("~/.local/state/codex-agent-mcp").expanduser()
 RAW_DIR = STATE_ROOT / "raw"
 META_DIR = STATE_ROOT / "meta"
 LOCK_DIR = STATE_ROOT / "locks"
+LEASE_DIR = STATE_ROOT / "leases"
 ASSIGNMENT_LOG = STATE_ROOT / "assignments.jsonl"
 LEGACY_META_DIR = LEGACY_STATE_ROOT / "meta"
 DEFAULT_AGENT_MODEL = "gpt-5.4-mini"
@@ -63,8 +65,10 @@ MAX_LIMIT_STATUS_BYTES = 16 * 1024
 IDLE_RESPONSE_SECONDS = 300
 DEFAULT_WAIT_SECONDS = 120
 MAX_WAIT_SECONDS = 600
-DEFAULT_WAIT_POLL_SECONDS = 2
-MAX_WAIT_POLL_SECONDS = 10
+DEFAULT_WAIT_POLL_SECONDS = 30
+MAX_WAIT_POLL_SECONDS = 900
+DEFAULT_AGENT_LEASE_SECONDS = 1800
+MAX_AGENT_LEASE_SECONDS = 7200
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
 MCP_SERVER_NAME = "codex-master-mcp"
 DEFAULT_INSTALL_PATH = Path("~/.local/bin/codex-master-mcp").expanduser()
@@ -97,6 +101,7 @@ DEFAULT_AGENTIN_NAMES = {"a": "Mila", "b": "Nora"}
 RAW_LOG_TRUNCATION_MARKER = b"\n... codex-master-mcp retained the last raw log bytes ...\n"
 MCP_SERVER_TABLE_HEADER = f"[mcp_servers.{MCP_SERVER_NAME}]"
 APP_BRIDGE_NAME = "codex-master"
+SERVER_INSTANCE_ID = os.environ.get("CODEX_MASTER_MCP_INSTANCE_ID") or uuid.uuid4().hex
 APP_BRIDGE_ID_PREFIXES = ("connector_", "asdk_app_")
 PLUGIN_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]{0,199}$")
 BRACKETED_PASTE_BEGIN = "\x1b[200~"
@@ -141,8 +146,23 @@ class AgentError(RuntimeError):
     """Raised for expected agent-control failures."""
 
 
+class AgentBusyError(AgentError):
+    """Raised when an Agentin is leased by a different MCP client."""
+
+    def __init__(self, message: str, payload: dict[str, Any]):
+        super().__init__(message)
+        self.payload = payload
+
+
+def public_error_payload(exc: Exception) -> dict[str, Any]:
+    payload: dict[str, Any] = {"error": safe_error_text(exc)}
+    if isinstance(exc, AgentBusyError):
+        payload.update(exc.payload)
+    return payload
+
+
 def ensure_state() -> None:
-    for path in (STATE_ROOT, RAW_DIR, META_DIR, LOCK_DIR):
+    for path in (STATE_ROOT, RAW_DIR, META_DIR, LOCK_DIR, LEASE_DIR):
         ensure_private_dir(path)
     prune_raw_logs()
 
@@ -921,6 +941,243 @@ def agent_lifecycle_lock(agent: str) -> Any:
                 pass
 
 
+def agent_lease_path(agent: str) -> Path:
+    if agent not in {"a", "b"}:
+        raise AgentError("agent must be a or b")
+    return LEASE_DIR / f"{agent}.json"
+
+
+def lease_utc(timestamp: float | int | None) -> str | None:
+    if timestamp is None:
+        return None
+    try:
+        return _dt.datetime.fromtimestamp(float(timestamp), _dt.timezone.utc).isoformat()
+    except (OverflowError, OSError, TypeError, ValueError):
+        return None
+
+
+def normalize_lease_seconds(value: Any) -> int:
+    if isinstance(value, bool):
+        raise AgentError("ttl_seconds must be an integer")
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError) as exc:
+        raise AgentError("ttl_seconds must be an integer") from exc
+    if seconds < 1:
+        raise AgentError("ttl_seconds must be >= 1")
+    if seconds > MAX_AGENT_LEASE_SECONDS:
+        raise AgentError(f"ttl_seconds must be <= {MAX_AGENT_LEASE_SECONDS}")
+    return seconds
+
+
+def read_agent_lease_record(agent: str) -> dict[str, Any] | None:
+    path = agent_lease_path(agent)
+    if not path_present_no_follow(path):
+        return None
+    data = read_json_file(path)
+    if data.get("meta_error"):
+        raise AgentError("could_not_read_agent_lease")
+    if data.get("agent") != agent or not isinstance(data.get("owner"), str):
+        raise AgentError("could_not_read_agent_lease")
+    return data
+
+
+def public_agent_lease(agent: str, record: dict[str, Any] | None = None) -> dict[str, Any]:
+    now = time.time()
+    if not record:
+        return {
+            "agent": agent,
+            "state": "unclaimed",
+            "holder": "none",
+            "held_by_this_server": False,
+            "expires_at_utc": None,
+            "seconds_remaining": 0,
+            "ttl_seconds": DEFAULT_AGENT_LEASE_SECONDS,
+            "raw_output": "not_returned",
+        }
+    try:
+        expires_at = float(record.get("expires_at_epoch", 0))
+    except (TypeError, ValueError):
+        expires_at = 0.0
+    active = expires_at > now
+    held_by_this_server = active and record.get("owner") == SERVER_INSTANCE_ID
+    holder = "this_server" if held_by_this_server else "other_server" if active else "none"
+    return {
+        "agent": agent,
+        "state": "held" if active else "expired",
+        "holder": holder,
+        "held_by_this_server": held_by_this_server,
+        "expires_at_utc": lease_utc(expires_at),
+        "seconds_remaining": max(0, int(expires_at - now)) if active else 0,
+        "ttl_seconds": record.get("ttl_seconds") if isinstance(record.get("ttl_seconds"), int) else None,
+        "raw_output": "not_returned",
+    }
+
+
+def agent_busy_error(agent: str, lease: dict[str, Any]) -> AgentBusyError:
+    seconds_remaining = int(lease.get("seconds_remaining") or 0)
+    retry_after = max(1, min(seconds_remaining or 1, 30))
+    return AgentBusyError(
+        f"agent {agent} is leased by another MCP client",
+        {
+            "error_code": "agent_lease_held_by_other_client",
+            "agent": agent,
+            "retryable": True,
+            "retry_after_seconds": retry_after,
+            "lease_seconds_remaining": seconds_remaining,
+            "lease": lease,
+            "raw_output": "not_returned",
+        },
+    )
+
+
+def agent_lease_status(agent: str) -> dict[str, Any]:
+    ensure_state()
+    try:
+        return public_agent_lease(agent, read_agent_lease_record(agent))
+    except AgentError:
+        return {
+            "agent": agent,
+            "state": "unreadable",
+            "holder": "unknown",
+            "held_by_this_server": False,
+            "expires_at_utc": None,
+            "seconds_remaining": 0,
+            "ttl_seconds": None,
+            "raw_output": "not_returned",
+        }
+
+
+def write_agent_lease(agent: str, ttl_seconds: int) -> dict[str, Any]:
+    now = time.time()
+    expires_at = now + ttl_seconds
+    record = {
+        "agent": agent,
+        "owner": SERVER_INSTANCE_ID,
+        "created_at_utc": _dt.datetime.fromtimestamp(now, _dt.timezone.utc).isoformat(),
+        "updated_at_utc": _dt.datetime.fromtimestamp(now, _dt.timezone.utc).isoformat(),
+        "expires_at_epoch": expires_at,
+        "expires_at_utc": lease_utc(expires_at),
+        "ttl_seconds": ttl_seconds,
+    }
+    replace_private_text(agent_lease_path(agent), json.dumps(record, indent=2, sort_keys=True) + "\n")
+    return record
+
+
+def remove_agent_lease(agent: str) -> bool:
+    path = agent_lease_path(agent)
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise AgentError("could_not_read_agent_lease") from exc
+    if not stat_module.S_ISREG(current.st_mode) or stat_module.S_ISLNK(current.st_mode):
+        raise AgentError("agent lease path is not a regular file")
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def claim_agent(agent: str, ttl_seconds: int = DEFAULT_AGENT_LEASE_SECONDS, force: bool = False) -> dict[str, Any]:
+    ensure_state()
+    ttl_seconds = normalize_lease_seconds(ttl_seconds)
+    current = read_agent_lease_record(agent)
+    current_public = public_agent_lease(agent, current)
+    if current_public["state"] == "held" and not current_public["held_by_this_server"] and not force:
+        raise agent_busy_error(agent, current_public)
+    if current_public["state"] == "held" and current_public["held_by_this_server"]:
+        status = "renewed"
+    elif current_public["state"] == "held" and force:
+        status = "forced"
+    elif current_public["state"] == "expired":
+        status = "claimed_expired"
+    else:
+        status = "claimed"
+    record = write_agent_lease(agent, ttl_seconds)
+    return {
+        "agent": agent,
+        "status": status,
+        "lease": public_agent_lease(agent, record),
+        "previous_lease": current_public,
+        "raw_output": "not_returned",
+    }
+
+
+def release_agent(agent: str, force: bool = False) -> dict[str, Any]:
+    ensure_state()
+    current = read_agent_lease_record(agent)
+    current_public = public_agent_lease(agent, current)
+    if current_public["state"] != "held":
+        if current_public["state"] == "expired":
+            remove_agent_lease(agent)
+        return {
+            "agent": agent,
+            "status": "not_held",
+            "previous_lease": current_public,
+            "lease": public_agent_lease(agent),
+            "raw_output": "not_returned",
+        }
+    if not current_public["held_by_this_server"] and not force:
+        raise agent_busy_error(agent, current_public)
+    remove_agent_lease(agent)
+    return {
+        "agent": agent,
+        "status": "released",
+        "previous_lease": current_public,
+        "lease": public_agent_lease(agent),
+        "raw_output": "not_returned",
+    }
+
+
+def require_agent_lease(agent: str, ttl_seconds: int = DEFAULT_AGENT_LEASE_SECONDS) -> dict[str, Any]:
+    return claim_agent(agent, ttl_seconds=ttl_seconds, force=False)["lease"]
+
+
+def claim_for_agent_mutation(agent: str) -> tuple[dict[str, Any], bool]:
+    claim = claim_agent(agent)
+    return claim["lease"], claim["status"] in {"claimed", "claimed_expired"}
+
+
+def ensure_agent_lease_available(agent: str, *, force: bool = False) -> dict[str, Any]:
+    current = read_agent_lease_record(agent)
+    current_public = public_agent_lease(agent, current)
+    if current_public["state"] == "held" and not current_public["held_by_this_server"] and not force:
+        raise agent_busy_error(agent, current_public)
+    return current_public
+
+
+def claim_agent_with_wait(
+    agent: str,
+    ttl_seconds: int = DEFAULT_AGENT_LEASE_SECONDS,
+    force: bool = False,
+    wait_seconds: int = 0,
+    poll_interval_seconds: int = DEFAULT_WAIT_POLL_SECONDS,
+) -> dict[str, Any]:
+    wait_seconds = max(0, min(int(wait_seconds), MAX_WAIT_SECONDS))
+    poll_interval_seconds = max(1, min(int(poll_interval_seconds), MAX_WAIT_POLL_SECONDS))
+    started = time.monotonic()
+    deadline = started + wait_seconds
+    polls = 0
+    while True:
+        try:
+            result = call_agent_lifecycle(
+                agent,
+                lambda: claim_agent(agent, ttl_seconds=ttl_seconds, force=force),
+            )
+            result["waited_seconds"] = max(0, int(time.monotonic() - started))
+            result["poll_count"] = polls
+            return result
+        except AgentBusyError:
+            if time.monotonic() >= deadline:
+                raise
+            remaining = max(0.0, deadline - time.monotonic())
+            time.sleep(min(float(poll_interval_seconds), remaining))
+            polls += 1
+
+
 def is_real_directory_no_symlink(path: Path) -> bool:
     try:
         mode = path.lstat().st_mode
@@ -1261,6 +1518,16 @@ def codex_related_process_summary(proc_root: Path = Path("/proc")) -> dict[str, 
             "codex_client_process_count": 0,
             "mcp_server_process_count": 0,
             "home_kind_counts": home_kind_counts,
+            "namespace_visibility": {
+                "main_default_home_clients": 0,
+                "custom_home_clients": 0,
+                "managed_agent_home_clients": 0,
+                "unknown_home_clients": 0,
+                "custom_home_clients_need_own_mcp_config": False,
+                "managed_agent_home_clients_expect_no_master_mcp": False,
+                "unknown_home_clients_need_manual_check": False,
+                "raw_output": "not_returned",
+            },
             "raw_output": "not_returned",
         }
 
@@ -1297,6 +1564,16 @@ def codex_related_process_summary(proc_root: Path = Path("/proc")) -> dict[str, 
         "codex_client_process_count": client_count,
         "mcp_server_process_count": mcp_server_count,
         "home_kind_counts": home_kind_counts,
+        "namespace_visibility": {
+            "main_default_home_clients": home_kind_counts["main_default_home"],
+            "custom_home_clients": home_kind_counts["custom_home"],
+            "managed_agent_home_clients": home_kind_counts["managed_agent_home"],
+            "unknown_home_clients": home_kind_counts["unknown"],
+            "custom_home_clients_need_own_mcp_config": home_kind_counts["custom_home"] > 0,
+            "managed_agent_home_clients_expect_no_master_mcp": home_kind_counts["managed_agent_home"] > 0,
+            "unknown_home_clients_need_manual_check": home_kind_counts["unknown"] > 0,
+            "raw_output": "not_returned",
+        },
         "raw_output": "not_returned",
     }
 
@@ -1320,7 +1597,12 @@ def cleanup_failed_start(session: str, raw_log: Path, *, kill_session: bool) -> 
         pass
 
 
-def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -> dict[str, Any]:
+def start_agent(
+    agent: str,
+    cwd: str | None = None,
+    prompt: str | None = None,
+    lease: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     ensure_state()
     cfg = AGENTS[agent]
     runner = cfg["runner"]
@@ -1340,6 +1622,7 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
             "backend": "tmux",
             "session": session,
             "pid": pane_pid(session),
+            "lease": agent_lease_status(agent),
             "meta": public_agent_meta(read_meta(agent)),
             "home_external_process_count": process_summary["external_process_count"],
             "raw_output": "not_returned",
@@ -1370,12 +1653,16 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
     cp = run_tmux(["new-session", "-d", "-s", session, "-c", str(start_cwd), command], check=False)
     if cp.returncode != 0:
         cleanup_failed_start(session, raw_log, kill_session=False)
+        if lease and lease.get("held_by_this_server"):
+            release_agent(agent, force=True)
         raise AgentError(f"tmux start failed for agent {agent}: {command_error_text(cp.stderr)}")
 
     pipe_command = raw_log_writer_command(raw_log)
     pipe = run_tmux(["pipe-pane", "-o", "-t", session, pipe_command], check=False)
     if pipe.returncode != 0:
         cleanup_failed_start(session, raw_log, kill_session=True)
+        if lease and lease.get("held_by_this_server"):
+            release_agent(agent, force=True)
         raise AgentError(f"tmux pipe-pane failed for agent {agent}: {command_error_text(pipe.stderr)}")
 
     data = {
@@ -1404,6 +1691,7 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
         "pid": pane_pid(session),
         "cwd": PATH_NOT_RETURNED,
         "cwd_state": "set",
+        "lease": lease or agent_lease_status(agent),
         "model": DEFAULT_AGENT_MODEL,
         "model_reasoning_effort": DEFAULT_AGENT_MODEL_EFFORT,
         "raw_log": "not_returned",
@@ -1412,15 +1700,53 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
     }
 
 
-def stop_agent(agent: str) -> dict[str, Any]:
+def start_agent_with_lease(agent: str, cwd: Any = None, prompt: Any = None) -> dict[str, Any]:
+    if tmux_alive(AGENTS[agent]["session"]):
+        return start_agent(agent, cwd, prompt)
+    lease = require_agent_lease(agent)
+    try:
+        return start_agent(agent, cwd, prompt, lease=lease)
+    except Exception:
+        if lease.get("held_by_this_server"):
+            release_agent(agent, force=True)
+        raise
+
+
+def stop_agent(agent: str, force: bool = False) -> dict[str, Any]:
     cfg = AGENTS[agent]
     session = cfg["session"]
     was_running = tmux_alive(session)
     if was_running:
+        ensure_agent_lease_available(agent, force=force)
+    if was_running:
         cp = run_tmux(["kill-session", "-t", session], check=False)
         if cp.returncode != 0:
             raise AgentError(f"tmux stop failed for agent {agent}: {command_error_text(cp.stderr)}")
-    return {"agent": agent, "status": "stopped" if was_running else "not_running", "session": session}
+        release = release_agent(agent, force=True)
+    else:
+        release = {"status": "skipped", "lease": agent_lease_status(agent), "raw_output": "not_returned"}
+    return {
+        "agent": agent,
+        "status": "stopped" if was_running else "not_running",
+        "session": session,
+        "lease": release["lease"],
+        "raw_output": "not_returned",
+    }
+
+
+def require_running_agent(agent: str) -> None:
+    if not tmux_alive(AGENTS[agent]["session"]):
+        raise AgentError(f"agent {agent} is not running")
+
+
+def run_with_agent_lease(agent: str, fn: Any) -> dict[str, Any]:
+    lease, release_on_failure = claim_for_agent_mutation(agent)
+    try:
+        return fn(lease)
+    except Exception:
+        if release_on_failure:
+            release_agent(agent, force=True)
+        raise
 
 
 def raw_log_metadata(raw_log_path: Path | None) -> dict[str, Any]:
@@ -1751,6 +2077,7 @@ def status_agent(agent: str) -> dict[str, Any]:
         "cwd_state": public_path_state(meta.get("cwd")),
         "model": meta.get("model") or DEFAULT_AGENT_MODEL,
         "model_reasoning_effort": meta.get("model_reasoning_effort") or DEFAULT_AGENT_MODEL_EFFORT,
+        "lease": agent_lease_status(agent),
         "last_assignment": latest_assignment,
         "tui_context": tui_context,
         "limit_state": limit_state,
@@ -2158,6 +2485,7 @@ def assign_agent(
     enter: bool = True,
     allow_missing_skill: bool = False,
     allow_subagents: bool = False,
+    lease: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     role = role.strip().lower()
     if role not in {"exploriererin", "arbeitsbiene"}:
@@ -2199,7 +2527,15 @@ def assign_agent(
     if len(prompt) > MAX_ASSIGNMENT_TEXT:
         raise AgentError(f"assignment prompt exceeds {MAX_ASSIGNMENT_TEXT} characters")
 
-    sent = send_agent(agent, prompt, enter)
+    release_on_failure = False
+    if lease is None:
+        lease, release_on_failure = claim_for_agent_mutation(agent)
+    try:
+        sent = send_agent(agent, prompt, enter)
+    except Exception:
+        if release_on_failure:
+            release_agent(agent, force=True)
+        raise
     assignment_id = f"{now_id()}-{agent}"
     record_assignment(
         {
@@ -2220,6 +2556,13 @@ def assign_agent(
             "forbidden_count": len(forbidden),
             "write_policy": "read_only" if role == "exploriererin" else "explicit_paths_only",
             "allow_subagents": allow_subagents,
+            "lease": {
+                "state": lease.get("state"),
+                "holder": lease.get("holder"),
+                "held_by_this_server": lease.get("held_by_this_server"),
+                "expires_at_utc": lease.get("expires_at_utc"),
+                "raw_output": "not_returned",
+            },
             "submitted": enter,
             "prompt_chars": len(prompt),
             "prompt_output": "not_returned",
@@ -2238,6 +2581,7 @@ def assign_agent(
         "write_policy": "read_only" if role == "exploriererin" else "explicit_paths_only",
         "write_path_count": len(write_paths),
         "subagents_allowed": allow_subagents,
+        "lease": lease,
         "prompt_chars": len(prompt),
         "prompt_output": "not_returned",
         "response_output": "not_returned",
@@ -2352,7 +2696,12 @@ def last_assignment_status(agent: str) -> dict[str, Any]:
     }
 
 
-def request_agent_report(agent: str, assignment_id: Any = None, enter: bool = True) -> dict[str, Any]:
+def request_agent_report(
+    agent: str,
+    assignment_id: Any = None,
+    enter: bool = True,
+    lease: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if assignment_id:
         assignment_id = bounded_text(assignment_id, field="assignment_id", max_chars=MAX_ASSIGNMENT_ID) or ""
         safe_id, _changed = redact(assignment_id)
@@ -2363,12 +2712,14 @@ def request_agent_report(agent: str, assignment_id: Any = None, enter: bool = Tr
         )
     else:
         text = "Bitte liefere einen knappen Statusbericht: Aufgabe, Stand, Tests, offene Risiken. Keine Rohlogs."
+    lease = lease or agent_lease_status(agent)
     sent = send_agent(agent, text, enter)
     return {
         "agent": agent,
         "status": "report_requested",
         "submitted": enter,
         "assignment_id": assignment_id,
+        "lease": lease,
         "prompt_output": "not_returned",
         "response_output": "not_returned",
         "send": sent,
@@ -3180,15 +3531,16 @@ def send_agent(agent: str, text: str, enter: bool = True) -> dict[str, Any]:
     }
 
 
-def interrupt_agent(agent: str) -> dict[str, Any]:
+def interrupt_agent(agent: str, force: bool = False) -> dict[str, Any]:
     cfg = AGENTS[agent]
     session = cfg["session"]
     if not tmux_alive(session):
         raise AgentError(f"agent {agent} is not running")
+    lease = claim_agent(agent, force=force)["lease"]
     cp = run_tmux(["send-keys", "-t", session, "C-c"], check=False)
     if cp.returncode != 0:
         raise AgentError(f"tmux interrupt failed for agent {agent}: {command_error_text(cp.stderr)}")
-    return {"agent": agent, "status": "interrupt_sent", "response_output": "not_returned"}
+    return {"agent": agent, "status": "interrupt_sent", "lease": lease, "response_output": "not_returned"}
 
 
 def strip_ansi(text: str) -> str:
@@ -3334,11 +3686,14 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         selected = agent_ids(str(args.get("agent", "both")))
         return multi_agent_result(
             selected,
-            lambda agent: call_agent_lifecycle(agent, lambda: start_agent(agent, args.get("cwd"), args.get("prompt"))),
+            lambda agent: call_agent_lifecycle(agent, lambda: start_agent_with_lease(agent, args.get("cwd"), args.get("prompt"))),
         )
     if name == "agent_stop":
         selected = agent_ids(str(args.get("agent", "both")))
-        return multi_agent_result(selected, lambda agent: call_agent_lifecycle(agent, lambda: stop_agent(agent)))
+        return multi_agent_result(
+            selected,
+            lambda agent: call_agent_lifecycle(agent, lambda: stop_agent(agent, bool_arg(args, "force", False))),
+        )
     if name == "agent_status":
         selected = agent_ids(str(args.get("agent", "all")))
         return multi_agent_result(selected, status_agent)
@@ -3452,10 +3807,14 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             raise AgentError("agent_report_request requires exactly one agent: a or b")
         return call_agent_lifecycle(
             selected[0],
-            lambda: request_agent_report(
+            lambda: run_with_agent_lease(
                 selected[0],
-                args.get("assignment_id"),
-                bool_arg(args, "enter", True),
+                lambda lease: request_agent_report(
+                    selected[0],
+                    args.get("assignment_id"),
+                    bool_arg(args, "enter", True),
+                    lease=lease,
+                ),
             ),
         )
     if name == "worktree_create_for_agent":
@@ -3488,12 +3847,43 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         text = args.get("text")
         if not isinstance(text, str) or text == "":
             raise AgentError("agent_send requires non-empty text")
-        return call_agent_lifecycle(selected[0], lambda: send_agent(selected[0], text, bool_arg(args, "enter", True)))
+        return call_agent_lifecycle(
+            selected[0],
+            lambda: run_with_agent_lease(
+                selected[0],
+                lambda lease: {
+                    **send_agent(selected[0], text, bool_arg(args, "enter", True)),
+                    "lease": lease,
+                },
+            ),
+        )
     if name == "agent_interrupt":
         selected = agent_ids(str(args.get("agent", "")))
         if len(selected) != 1:
             raise AgentError("agent_interrupt requires exactly one agent: a or b")
-        return call_agent_lifecycle(selected[0], lambda: interrupt_agent(selected[0]))
+        return call_agent_lifecycle(
+            selected[0],
+            lambda: interrupt_agent(selected[0], bool_arg(args, "force", False)),
+        )
+    if name == "agent_claim":
+        selected = agent_ids(str(args.get("agent", "")))
+        if len(selected) != 1:
+            raise AgentError("agent_claim requires exactly one agent: a or b")
+        return claim_agent_with_wait(
+            selected[0],
+            int_arg(args, "ttl_seconds", DEFAULT_AGENT_LEASE_SECONDS),
+            bool_arg(args, "force", False),
+            int_arg(args, "wait_seconds", 0),
+            int_arg(args, "poll_interval_seconds", DEFAULT_WAIT_POLL_SECONDS),
+        )
+    if name == "agent_release":
+        selected = agent_ids(str(args.get("agent", "")))
+        if len(selected) != 1:
+            raise AgentError("agent_release requires exactly one agent: a or b")
+        return call_agent_lifecycle(selected[0], lambda: release_agent(selected[0], bool_arg(args, "force", False)))
+    if name == "agent_lease_status":
+        selected = agent_ids(str(args.get("agent", "all")))
+        return multi_agent_result(selected, agent_lease_status)
     if name == "agent_safe_tail":
         selected = agent_ids(str(args.get("agent", "")))
         if len(selected) != 1:
@@ -3567,6 +3957,59 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "agent_lease_status",
+        "description": "Return data-sparse per-Agentin lease state for multi-client collision avoidance.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"agent": {"type": "string", "enum": ["a", "b", "all"], "default": "all"}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_claim",
+        "description": "Claim or renew one Agentin for this MCP client before sending work. Does not return client identity.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["agent"],
+            "properties": {
+                "agent": {"type": "string", "enum": ["a", "b"]},
+                "ttl_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_AGENT_LEASE_SECONDS,
+                    "default": DEFAULT_AGENT_LEASE_SECONDS,
+                },
+                "wait_seconds": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_WAIT_SECONDS,
+                    "default": 0,
+                },
+                "poll_interval_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_WAIT_POLL_SECONDS,
+                    "default": DEFAULT_WAIT_POLL_SECONDS,
+                },
+                "force": {"type": "boolean", "default": False},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_release",
+        "description": "Release this MCP client's claim on one Agentin. Force only after checking status.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["agent"],
+            "properties": {
+                "agent": {"type": "string", "enum": ["a", "b"]},
+                "force": {"type": "boolean", "default": False},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "agent_wait",
         "description": "Wait briefly for one Agentin to show activity, stop, or hit a classified limit. Returns metadata and status only; does not return raw output.",
         "inputSchema": {
@@ -3610,7 +4053,10 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "required": ["agent"],
-            "properties": {"agent": {"type": "string", "enum": ["a", "b"]}},
+            "properties": {
+                "agent": {"type": "string", "enum": ["a", "b"]},
+                "force": {"type": "boolean", "default": False},
+            },
             "additionalProperties": False,
         },
     },
@@ -3619,7 +4065,10 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Stop Codex Agentin A, B, or both by killing the managed tmux session.",
         "inputSchema": {
             "type": "object",
-            "properties": {"agent": {"type": "string", "enum": ["a", "b", "both"], "default": "both"}},
+            "properties": {
+                "agent": {"type": "string", "enum": ["a", "b", "both"], "default": "both"},
+                "force": {"type": "boolean", "default": False},
+            },
             "additionalProperties": False,
         },
     },
@@ -3978,7 +4427,7 @@ def handle_rpc(msg: dict[str, Any]) -> dict[str, Any] | None:
             text = json.dumps(payload, indent=2, sort_keys=True)
             return rpc_result(message_id, {"content": [{"type": "text", "text": text}], "isError": False})
         except Exception as exc:
-            text = json.dumps({"error": safe_error_text(exc)}, indent=2, sort_keys=True)
+            text = json.dumps(public_error_payload(exc), indent=2, sort_keys=True)
             return rpc_result(message_id, {"content": [{"type": "text", "text": text}], "isError": True})
     if method in ("notifications/initialized", "notifications/cancelled"):
         return None
@@ -4076,9 +4525,25 @@ def main_cli(argv: list[str]) -> int:
 
     p_interrupt = sub.add_parser("interrupt")
     p_interrupt.add_argument("agent", choices=["a", "b"])
+    p_interrupt.add_argument("--force", action="store_true")
 
     p_stop = sub.add_parser("stop")
     p_stop.add_argument("agent", choices=["a", "b", "both"], nargs="?", default="both")
+    p_stop.add_argument("--force", action="store_true")
+
+    p_lease_status = sub.add_parser("lease-status")
+    p_lease_status.add_argument("agent", choices=["a", "b", "all"], nargs="?", default="all")
+
+    p_claim = sub.add_parser("claim")
+    p_claim.add_argument("agent", choices=["a", "b"])
+    p_claim.add_argument("--ttl-seconds", type=int, default=DEFAULT_AGENT_LEASE_SECONDS)
+    p_claim.add_argument("--wait-seconds", type=int, default=0)
+    p_claim.add_argument("--poll-interval-seconds", type=int, default=DEFAULT_WAIT_POLL_SECONDS)
+    p_claim.add_argument("--force", action="store_true")
+
+    p_release = sub.add_parser("release")
+    p_release.add_argument("agent", choices=["a", "b"])
+    p_release.add_argument("--force", action="store_true")
 
     p_tail = sub.add_parser("tail")
     p_tail.add_argument("agent", choices=["a", "b"])
@@ -4214,9 +4679,26 @@ def main_cli(argv: list[str]) -> int:
         if args.command == "send":
             return print_json(call_validated_tool("agent_send", {"agent": args.agent, "text": args.text, "enter": not args.no_enter}))
         if args.command == "interrupt":
-            return print_json(call_validated_tool("agent_interrupt", {"agent": args.agent}))
+            return print_json(call_validated_tool("agent_interrupt", {"agent": args.agent, "force": args.force}))
         if args.command == "stop":
-            return print_json(call_validated_tool("agent_stop", {"agent": args.agent}))
+            return print_json(call_validated_tool("agent_stop", {"agent": args.agent, "force": args.force}))
+        if args.command == "lease-status":
+            return print_json(call_validated_tool("agent_lease_status", {"agent": args.agent}))
+        if args.command == "claim":
+            return print_json(
+                call_validated_tool(
+                    "agent_claim",
+                    {
+                        "agent": args.agent,
+                        "ttl_seconds": args.ttl_seconds,
+                        "wait_seconds": args.wait_seconds,
+                        "poll_interval_seconds": args.poll_interval_seconds,
+                        "force": args.force,
+                    },
+                )
+            )
+        if args.command == "release":
+            return print_json(call_validated_tool("agent_release", {"agent": args.agent, "force": args.force}))
         if args.command == "tail":
             return print_json(
                 call_validated_tool(
@@ -4357,7 +4839,7 @@ def main_cli(argv: list[str]) -> int:
         if args.command == "tools":
             return print_json({"tools": TOOLS})
     except Exception as exc:
-        print(json.dumps({"error": safe_error_text(exc)}, indent=2, sort_keys=True))
+        print(json.dumps(public_error_payload(exc), indent=2, sort_keys=True))
         return 1
     return 2
 
