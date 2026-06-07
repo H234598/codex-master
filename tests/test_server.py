@@ -39,6 +39,7 @@ from codex_master.server import (
     call_tool,
     classify_limit_text,
     classify_tui_context,
+    codex_related_process_summary,
     DEFAULT_AGENT_MODEL,
     doctor,
     ensure_state,
@@ -76,6 +77,9 @@ from codex_master.server import (
     ensure_mcp_startup_timeout_configured,
     mcp_startup_timeout_seconds,
     updated_mcp_startup_timeout_config,
+    mcp_command_tools_list_self_test,
+    mcp_tools_list_probe_result,
+    master_namespace_status,
 )
 
 
@@ -275,6 +279,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("commit_ready_check", names)
         self.assertIn("master_app_bridge_status", names)
         self.assertIn("master_plugin_status", names)
+        self.assertIn("master_namespace_status", names)
         by_name = {tool["name"]: tool for tool in response["result"]["tools"]}
         assign_props = by_name["agent_assign"]["inputSchema"]["properties"]
         wait_props = by_name["agent_wait"]["inputSchema"]["properties"]
@@ -303,6 +308,118 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["connector_id_kind"], "connector")
         self.assertTrue(result["connector_id_format_ok"])
         self.assertTrue(result["plugin_apps"]["ok"])
+        self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
+
+    def test_mcp_tools_list_probe_result_detects_required_tool_without_returning_names(self) -> None:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"tools": [{"name": "agent_status"}, {"name": "master_app_bridge_status"}]},
+        }
+        output = "Content-Length: 123\r\n\r\n" + json.dumps(payload)
+
+        result = mcp_tools_list_probe_result(output, "master_app_bridge_status")
+
+        self.assertTrue(result["response_found"])
+        self.assertEqual(result["tool_count"], 2)
+        self.assertTrue(result["required_tool_available"])
+        self.assertNotIn("agent_status", json.dumps(result, sort_keys=True))
+
+    @patch("codex_master.server.subprocess.run")
+    def test_mcp_command_tools_list_self_test_is_data_sparse(self, mock_run) -> None:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"tools": [{"name": "master_app_bridge_status"}]},
+        }
+        mock_run.return_value = subprocess.CompletedProcess(["/tmp/codex-master-mcp"], 0, json.dumps(payload), "")
+
+        result = mcp_command_tools_list_self_test(Path("/tmp/codex-master-mcp"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["tool_count"], 1)
+        self.assertTrue(result["required_tool_available"])
+        self.assertEqual(result["raw_output"], "not_returned")
+        self.assertNotIn("/tmp/codex-master-mcp", json.dumps(result, sort_keys=True))
+
+    def test_codex_related_process_summary_is_aggregate_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home = root / "home"
+            agent_home = root / "agent-a-home"
+            custom_home = root / "custom-home"
+            agents = {
+                "a": {"label": "A", "runner": root / "a-runner", "home": agent_home, "session": "session-a"},
+                "b": {"label": "B", "runner": root / "b-runner", "home": root / "agent-b-home", "session": "session-b"},
+            }
+
+            def write_proc(pid: str, name: str, argv: list[str], env: dict[str, str]) -> None:
+                proc = root / pid
+                proc.mkdir()
+                proc.joinpath("status").write_text(f"Name:\t{name}\nState:\tS (sleeping)\nPPid:\t1\n", encoding="utf-8")
+                proc.joinpath("cmdline").write_bytes(b"\0".join(item.encode("utf-8") for item in argv) + b"\0")
+                proc.joinpath("environ").write_bytes(
+                    b"\0".join(f"{key}={value}".encode("utf-8") for key, value in env.items()) + b"\0"
+                )
+
+            write_proc("100", "node", ["/usr/bin/node", "/x/node_modules/@openai/codex/bin/codex.js"], {})
+            write_proc("101", "codex", ["/tmp/codex"], {"CODEX_HOME": str(agent_home)})
+            write_proc("102", "codex", ["/tmp/codex"], {"CODEX_HOME": str(custom_home)})
+            write_proc("103", "python3", ["python3", "-m", "codex_master.server"], {})
+            write_proc("104", "bash", ["bash"], {})
+
+            with patch.dict("os.environ", {"HOME": str(home)}, clear=False), patch.dict(
+                "codex_master.server.AGENTS", agents, clear=True
+            ):
+                result = codex_related_process_summary(root)
+
+        self.assertEqual(result["codex_client_process_count"], 3)
+        self.assertEqual(result["mcp_server_process_count"], 1)
+        self.assertEqual(result["home_kind_counts"]["unknown"], 1)
+        self.assertEqual(result["home_kind_counts"]["managed_agent_home"], 1)
+        self.assertEqual(result["home_kind_counts"]["custom_home"], 1)
+        self.assertNotIn(str(root), json.dumps(result, sort_keys=True))
+
+    @patch("codex_master.server.codex_related_process_summary")
+    @patch("codex_master.server.master_app_bridge_status")
+    @patch("codex_master.server.mcp_command_tools_list_self_test")
+    @patch("codex_master.server.mcp_command_startup_self_test")
+    @patch("codex_master.server.check_mcp_registration")
+    def test_master_namespace_status_explains_client_visibility_without_raw_output(
+        self,
+        mock_registration,
+        mock_startup,
+        mock_tools,
+        mock_app_bridge,
+        mock_processes,
+    ) -> None:
+        mock_registration.return_value = {"ok": True, "registered": True, "raw_output": "not_returned"}
+        mock_startup.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
+        mock_tools.return_value = {
+            "ok": True,
+            "status": "ok",
+            "tool_count": 25,
+            "required_tool": "master_app_bridge_status",
+            "required_tool_available": True,
+            "raw_output": "not_returned",
+        }
+        mock_app_bridge.return_value = {"ok": True, "connector_id": "connector_test", "raw_output": "not_returned"}
+        mock_processes.return_value = {
+            "codex_client_process_count": 2,
+            "mcp_server_process_count": 1,
+            "home_kind_counts": {},
+            "raw_output": "not_returned",
+        }
+
+        result = master_namespace_status()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["server_name"], "codex-master-mcp")
+        self.assertTrue(result["expected_tools"]["master_app_bridge_status"])
+        self.assertTrue(result["expected_tools"]["master_namespace_status"])
+        self.assertFalse(result["tool_search"]["authoritative_for_local_stdio_mcp_tools"])
+        self.assertTrue(result["client_refresh"]["existing_sessions_may_need_restart"])
         self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.subprocess.run")

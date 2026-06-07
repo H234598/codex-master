@@ -213,6 +213,21 @@ def normalized_compare_path(path: Path) -> Path:
 
 def codex_home_context() -> dict[str, Any]:
     raw_codex_home = os.environ.get("CODEX_HOME")
+    classification = classify_codex_home(raw_codex_home)
+
+    return {
+        "name": "codex_home_context",
+        "ok": classification["ok"],
+        "codex_home_env": "set" if raw_codex_home else "unset",
+        "home_kind": classification["home_kind"],
+        "matched_agent": classification["matched_agent"],
+        "mcp_visibility": classification["mcp_visibility"],
+        "active_home_path": "not_returned",
+        "raw_output": "not_returned",
+    }
+
+
+def classify_codex_home(raw_codex_home: str | None) -> dict[str, Any]:
     active_home = Path(raw_codex_home).expanduser() if raw_codex_home else Path.home() / ".codex"
     active_home_cmp = normalized_compare_path(active_home)
     default_home_cmp = normalized_compare_path(Path.home() / ".codex")
@@ -224,27 +239,24 @@ def codex_home_context() -> dict[str, Any]:
             break
 
     if matched_agent:
-        home_kind = "managed_agent_home"
-        visibility = "not_expected_for_master_mcp"
-        ok = False
-    elif active_home_cmp == default_home_cmp:
-        home_kind = "main_default_home"
-        visibility = "expected_if_registered"
-        ok = True
-    else:
-        home_kind = "custom_home"
-        visibility = "depends_on_custom_home_registration"
-        ok = True
-
+        return {
+            "ok": False,
+            "home_kind": "managed_agent_home",
+            "matched_agent": matched_agent,
+            "mcp_visibility": "not_expected_for_master_mcp",
+        }
+    if active_home_cmp == default_home_cmp:
+        return {
+            "ok": True,
+            "home_kind": "main_default_home",
+            "matched_agent": None,
+            "mcp_visibility": "expected_if_registered",
+        }
     return {
-        "name": "codex_home_context",
-        "ok": ok,
-        "codex_home_env": "set" if raw_codex_home else "unset",
-        "home_kind": home_kind,
-        "matched_agent": matched_agent,
-        "mcp_visibility": visibility,
-        "active_home_path": "not_returned",
-        "raw_output": "not_returned",
+        "ok": True,
+        "home_kind": "custom_home",
+        "matched_agent": None,
+        "mcp_visibility": "depends_on_custom_home_registration",
     }
 
 
@@ -419,15 +431,41 @@ def mcp_initialize_probe_payload() -> str:
     ) + "\n"
 
 
-def mcp_probe_response_ok(output: str) -> bool:
+def mcp_tools_list_probe_payload() -> str:
+    messages = [
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "codex-master-tools-probe", "version": "0"},
+            },
+        },
+        {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+    ]
+    return "".join(json.dumps(message, separators=(",", ":")) + "\n" for message in messages)
+
+
+def iter_json_objects(text: str) -> list[dict[str, Any]]:
     decoder = json.JSONDecoder()
-    for index, char in enumerate(output):
+    payloads: list[dict[str, Any]] = []
+    for index, char in enumerate(text):
         if char != "{":
             continue
         try:
-            payload, _end = decoder.raw_decode(output[index:])
+            payload, _end = decoder.raw_decode(text[index:])
         except json.JSONDecodeError:
             continue
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return payloads
+
+
+def mcp_probe_response_ok(output: str) -> bool:
+    for payload in iter_json_objects(output):
         if not isinstance(payload, dict) or payload.get("id") != 1:
             continue
         if payload.get("jsonrpc") != "2.0":
@@ -443,6 +481,33 @@ def mcp_probe_response_ok(output: str) -> bool:
         if isinstance(server_info, dict) and server_info.get("name") == MCP_SERVER_NAME:
             return True
     return False
+
+
+def mcp_tools_list_probe_result(output: str, required_tool: str) -> dict[str, Any]:
+    for payload in iter_json_objects(output):
+        if payload.get("id") != 2 or payload.get("jsonrpc") != "2.0":
+            continue
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            break
+        tools = result.get("tools")
+        if not isinstance(tools, list):
+            break
+        names = [tool.get("name") for tool in tools if isinstance(tool, dict) and isinstance(tool.get("name"), str)]
+        return {
+            "response_found": True,
+            "tool_count": len(names),
+            "required_tool": required_tool,
+            "required_tool_available": required_tool in names,
+            "raw_output": "not_returned",
+        }
+    return {
+        "response_found": False,
+        "tool_count": 0,
+        "required_tool": required_tool,
+        "required_tool_available": False,
+        "raw_output": "not_returned",
+    }
 
 
 def mcp_command_startup_self_test(
@@ -483,6 +548,55 @@ def mcp_command_startup_self_test(
         "status": "ok" if ok else "failed",
         "returncode": cp.returncode,
         "timeout_seconds": timeout,
+        "raw_output": "not_returned",
+    }
+
+
+def mcp_command_tools_list_self_test(
+    command_path: Path,
+    *,
+    required_tool: str = "master_app_bridge_status",
+    timeout: int = DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    command = [str(command_path)]
+    try:
+        cp = subprocess.run(
+            command,
+            input=mcp_tools_list_probe_payload(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout,
+        )
+    except OSError:
+        return {
+            "ok": False,
+            "status": "unavailable",
+            "timeout_seconds": timeout,
+            "required_tool": required_tool,
+            "required_tool_available": False,
+            "raw_output": "not_returned",
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "status": "timeout",
+            "timeout_seconds": timeout,
+            "required_tool": required_tool,
+            "required_tool_available": False,
+            "raw_output": "not_returned",
+        }
+
+    output = cp.stdout + cp.stderr
+    tools_result = mcp_tools_list_probe_result(output, required_tool)
+    ok = cp.returncode == 0 and tools_result["response_found"] and tools_result["required_tool_available"]
+    return {
+        "ok": ok,
+        "status": "ok" if ok else "failed",
+        "returncode": cp.returncode,
+        "timeout_seconds": timeout,
+        **tools_result,
         "raw_output": "not_returned",
     }
 
@@ -965,6 +1079,14 @@ def read_proc_status(pid_dir: Path) -> dict[str, str]:
     return result
 
 
+def read_proc_cmdline(pid_dir: Path) -> list[str]:
+    try:
+        raw = (pid_dir / "cmdline").read_bytes()
+    except OSError:
+        return []
+    return [item.decode("utf-8", errors="replace") for item in raw.split(b"\0") if item]
+
+
 def same_path_text(left: str, right: Path) -> bool:
     try:
         return Path(left).expanduser().resolve(strict=False) == right.expanduser().resolve(strict=False)
@@ -1027,6 +1149,60 @@ def agent_home_process_summary(agent: str, proc_root: Path = Path("/proc")) -> d
         "managed_process_count": len(processes) - len(external),
         "external_processes": external[:10],
         "external_processes_truncated": len(external) > 10,
+        "raw_output": "not_returned",
+    }
+
+
+def codex_related_process_summary(proc_root: Path = Path("/proc")) -> dict[str, Any]:
+    home_kind_counts = {
+        "main_default_home": 0,
+        "custom_home": 0,
+        "managed_agent_home": 0,
+        "unknown": 0,
+    }
+    client_count = 0
+    mcp_server_count = 0
+    if not proc_root.exists():
+        return {
+            "codex_client_process_count": 0,
+            "mcp_server_process_count": 0,
+            "home_kind_counts": home_kind_counts,
+            "raw_output": "not_returned",
+        }
+
+    for pid_dir in proc_root.iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        status = read_proc_status(pid_dir)
+        name = (status.get("Name") or "").lower()
+        argv = read_proc_cmdline(pid_dir)
+        joined = "\0".join(argv).lower()
+        if "codex_master.server" in joined or "codex-master-mcp" in joined:
+            mcp_server_count += 1
+            continue
+
+        argv_names = {Path(item).name.lower() for item in argv if item}
+        codex_client = (
+            name == "codex"
+            or "codex" in argv_names
+            or "@openai/codex" in joined
+            or "node_modules/@openai/codex" in joined
+        )
+        if not codex_client:
+            continue
+
+        client_count += 1
+        env = read_proc_environ(pid_dir)
+        if env:
+            home_kind = str(classify_codex_home(env.get("CODEX_HOME"))["home_kind"])
+        else:
+            home_kind = "unknown"
+        home_kind_counts[home_kind if home_kind in home_kind_counts else "unknown"] += 1
+
+    return {
+        "codex_client_process_count": client_count,
+        "mcp_server_process_count": mcp_server_count,
+        "home_kind_counts": home_kind_counts,
         "raw_output": "not_returned",
     }
 
@@ -2393,6 +2569,52 @@ def master_plugin_status() -> dict[str, Any]:
     }
 
 
+def master_namespace_status() -> dict[str, Any]:
+    registration = check_mcp_registration(DEFAULT_INSTALL_PATH)
+    startup_self_test = mcp_command_startup_self_test(DEFAULT_INSTALL_PATH)
+    tools_list_self_test = mcp_command_tools_list_self_test(DEFAULT_INSTALL_PATH)
+    tool_names = {tool["name"] for tool in TOOLS if isinstance(tool.get("name"), str)}
+    local_tool_contract = {
+        "tool_count": len(tool_names),
+        "master_app_bridge_status": "master_app_bridge_status" in tool_names,
+        "master_plugin_status": "master_plugin_status" in tool_names,
+        "master_namespace_status": "master_namespace_status" in tool_names,
+        "raw_output": "not_returned",
+    }
+    server_ready = bool(registration.get("ok")) and bool(startup_self_test.get("ok")) and bool(
+        tools_list_self_test.get("ok")
+    )
+    return {
+        "ok": server_ready,
+        "server_name": MCP_SERVER_NAME,
+        "expected_mcp_server": MCP_SERVER_NAME,
+        "expected_tools": {
+            "master_app_bridge_status": local_tool_contract["master_app_bridge_status"],
+            "master_plugin_status": local_tool_contract["master_plugin_status"],
+            "master_namespace_status": local_tool_contract["master_namespace_status"],
+        },
+        "local_tool_contract": local_tool_contract,
+        "mcp_registration": registration,
+        "startup_self_test": startup_self_test,
+        "tools_list_self_test": tools_list_self_test,
+        "app_bridge": master_app_bridge_status(),
+        "codex_home_context": codex_home_context(),
+        "running_process_summary": codex_related_process_summary(),
+        "tool_search": {
+            "authoritative_for_local_stdio_mcp_tools": False,
+            "note": "Use /mcp or this MCP tools/list probe for the local namespace.",
+            "raw_output": "not_returned",
+        },
+        "client_refresh": {
+            "existing_sessions_may_need_restart": True,
+            "reason": "Codex clients can cache MCP tool metadata for a running session.",
+            "recommended_action_if_missing_in_client": "run_install_force_then_restart_affected_codex_cli",
+            "raw_output": "not_returned",
+        },
+        "raw_output": "not_returned",
+    }
+
+
 def mcp_get_field(output: str, field: str) -> str | None:
     for line in output.splitlines():
         key, separator, value = line.partition(":")
@@ -2974,6 +3196,8 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return master_app_bridge_status()
     if name == "master_plugin_status":
         return master_plugin_status()
+    if name == "master_namespace_status":
+        return master_namespace_status()
     if name == "agent_doctor":
         return doctor()
     if name == "agent_send":
@@ -3340,6 +3564,11 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
+        "name": "master_namespace_status",
+        "description": "Diagnose whether codex-master-mcp is registered, starts, and exposes its MCP tools to new clients. Does not return raw output.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
         "name": "agent_doctor",
         "description": "Return structured diagnostics for installation, MCP registration, runners, and tmux sessions. Does not return raw output.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -3663,6 +3892,7 @@ def main_cli(argv: list[str]) -> int:
 
     sub.add_parser("app-bridge-status")
     sub.add_parser("plugin-status")
+    sub.add_parser("namespace-status")
 
     p_install = sub.add_parser("install")
     p_install.add_argument("--no-register", action="store_true")
@@ -3823,6 +4053,8 @@ def main_cli(argv: list[str]) -> int:
             return print_json(call_validated_tool("master_app_bridge_status", {}))
         if args.command == "plugin-status":
             return print_json(call_validated_tool("master_plugin_status", {}))
+        if args.command == "namespace-status":
+            return print_json(call_validated_tool("master_namespace_status", {}))
         if args.command == "install":
             return print_json(
                 install(

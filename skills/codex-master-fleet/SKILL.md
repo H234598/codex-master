@@ -85,19 +85,24 @@ cd /home/teladi/codex-master
 ./bin/codex-master-mcp commit-ready-check
 ./bin/codex-master-mcp app-bridge-status
 ./bin/codex-master-mcp plugin-status
+./bin/codex-master-mcp namespace-status
 ```
 
 Data minimization:
 
 - `status`, `wait`, `start`, `send`, `assign-*`, `doctor`, `skills`,
-  `capabilities`, `app-bridge-status`, and `plugin-status` do not return
-  Agentin terminal output.
+  `capabilities`, `app-bridge-status`, `plugin-status`, and
+  `namespace-status` do not return Agentin terminal output.
 - `status`, `doctor`, `skills`, `capabilities`, `app-bridge-status`,
-  `plugin-status`, and integration metadata must not return local Agentin home,
-  runner, repo, manifest, installed symlink, or working-directory paths. Use
-  state/category fields such as `path_state`, `home_kind`, `cwd_state`, and
-  target-state markers instead. Raw-log retention diagnostics may return counts
-  and byte totals, but not managed raw-log directory paths.
+  `plugin-status`, `namespace-status`, and integration metadata must not return
+  local Agentin home, runner, repo, manifest, installed symlink, or
+  working-directory paths. Use state/category fields such as `path_state`,
+  `home_kind`, `cwd_state`, and target-state markers instead. Raw-log retention
+  diagnostics may return counts and byte totals, but not managed raw-log
+  directory paths.
+- `namespace-status` is the local diagnostic for whether `codex-master-mcp` is
+  registered, starts, and exposes its MCP `tools/list` to new clients.
+  `tool_search` is not authoritative for the local stdio MCP namespace.
 - `doctor` must report the active `CODEX_HOME` category and the
   `codex-master-mcp` `startup_timeout_sec` health without returning the active
   home path.

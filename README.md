@@ -48,7 +48,7 @@ It also classifies a known Codex TUI starter/placeholder context without
 returning pane text, so callers can tell when an Agentin did not receive the
 assignment as productive input.
 Public `status`, `skills`, `capabilities`, `app-bridge-status`,
-`plugin-status`, and `doctor` responses do not return local Agentin home,
+`plugin-status`, `namespace-status`, and `doctor` responses do not return local Agentin home,
 runner, repo, manifest, or working directory paths; they return state/category
 metadata such as `path_state`,
 `home_kind`, and `cwd_state` instead.
@@ -88,12 +88,16 @@ and is capped at 10 minutes per call.
 - `commit_ready_check`: fixed readiness checks for integration/commit
 - `master_app_bridge_status`: App Bridge manifest and connector-ID status
 - `master_plugin_status`: plugin packaging, App Bridge, and MCP registration status
+- `master_namespace_status`: diagnose `codex-master-mcp` registration, startup,
+  and `tools/list` visibility for new clients
 - `agent_doctor`: structured diagnostics without raw output
 
 `/mcp` should show `codex-master-mcp` only in the Teamleiterin/main Codex
 instance. Agentin A and Agentin B intentionally do not receive Masterjet MCP
 tools; they are controlled from outside and may only use native Subagentinnen
 when an assignment explicitly allows it.
+`tool_search` is not authoritative for the local stdio MCP namespace; use
+`/mcp` in the affected Codex client or `namespace-status` from this repo.
 
 ## Local CLI
 
@@ -119,6 +123,7 @@ python3 -m codex_master.server integration-status
 python3 -m codex_master.server commit-ready-check
 python3 -m codex_master.server app-bridge-status
 python3 -m codex_master.server plugin-status
+python3 -m codex_master.server namespace-status
 python3 -m codex_master.server send a "Kurzer Auftrag"
 python3 -m codex_master.server tail a --source pane --lines 20 --chars 2000
 python3 -m codex_master.server stop both
