@@ -85,6 +85,7 @@ MAX_RPC_MESSAGE_BYTES = 1024 * 1024
 MAX_ERROR_CHARS = 1200
 MAX_META_BYTES = 64 * 1024
 MAX_CODEX_CONFIG_BYTES = 1024 * 1024
+MAX_PLUGIN_MANIFEST_BYTES = 64 * 1024
 COMMAND_TIMEOUT_RETURN_CODE = 124
 DEFAULT_TMUX_TIMEOUT_SECONDS = 10
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
@@ -93,6 +94,8 @@ RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS = 120
 DEFAULT_AGENTIN_NAMES = {"a": "Mila", "b": "Nora"}
 RAW_LOG_TRUNCATION_MARKER = b"\n... codex-master-mcp retained the last raw log bytes ...\n"
 MCP_SERVER_TABLE_HEADER = f"[mcp_servers.{MCP_SERVER_NAME}]"
+APP_BRIDGE_NAME = "codex-master"
+APP_BRIDGE_ID_PREFIXES = ("connector_", "asdk_app_")
 BRACKETED_PASTE_BEGIN = "\x1b[200~"
 BRACKETED_PASTE_END = "\x1b[201~"
 PATH_NOT_RETURNED = "not_returned"
@@ -2241,17 +2244,144 @@ def commit_ready_check(run_tests: bool = True) -> dict[str, Any]:
     return {"ok": all(check["ok"] for check in checks), "checks": checks, "raw_output": "not_returned"}
 
 
+def repo_file_status(path: Path) -> dict[str, Any]:
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        return {"path": PATH_NOT_RETURNED, "path_state": "missing", "exists": False, "regular_file": False}
+    except OSError:
+        return {"path": PATH_NOT_RETURNED, "path_state": "error", "exists": False, "regular_file": False}
+    return {
+        "path": PATH_NOT_RETURNED,
+        "path_state": "set",
+        "exists": True,
+        "regular_file": stat_module.S_ISREG(current.st_mode),
+        "symlink": stat_module.S_ISLNK(current.st_mode),
+    }
+
+
+def read_repo_json_object(path: Path, label: str) -> dict[str, Any]:
+    text = read_private_regular_text(path, MAX_PLUGIN_MANIFEST_BYTES, f"{label} could not be read")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise AgentError(f"{label} must contain valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise AgentError(f"{label} must contain a JSON object")
+    return payload
+
+
+def normalize_plugin_contract_path(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    path = Path(value)
+    if path.is_absolute():
+        return None
+    normalized = path.as_posix().rstrip("/")
+    return normalized or None
+
+
+def plugin_declares_app_manifest(root: Path) -> dict[str, Any]:
+    manifest = root / ".codex-plugin" / "plugin.json"
+    status = repo_file_status(manifest)
+    result: dict[str, Any] = {
+        "path": PATH_NOT_RETURNED,
+        "path_state": status["path_state"],
+        "exists": status["exists"],
+        "declared": False,
+        "ok": False,
+        "raw_output": "not_returned",
+    }
+    if not status["regular_file"]:
+        result["reason"] = "plugin_manifest_not_regular_file"
+        return result
+    try:
+        payload = read_repo_json_object(manifest, "plugin manifest")
+    except AgentError as exc:
+        result["reason"] = safe_error_text(exc)
+        return result
+    normalized = normalize_plugin_contract_path(payload.get("apps"))
+    result.update(
+        {
+            "declared": normalized is not None,
+            "target": normalized or "",
+            "ok": normalized == ".app.json",
+        }
+    )
+    return result
+
+
+def app_id_kind(app_id: str) -> str:
+    if app_id.startswith("connector_"):
+        return "connector"
+    if app_id.startswith("asdk_app_"):
+        return "app"
+    return "custom"
+
+
+def master_app_bridge_status() -> dict[str, Any]:
+    root = repo_root()
+    manifest = root / ".app.json"
+    app_manifest = repo_file_status(manifest)
+    plugin_apps = plugin_declares_app_manifest(root)
+    result: dict[str, Any] = {
+        "ok": False,
+        "app_name": APP_BRIDGE_NAME,
+        "app_manifest": app_manifest,
+        "plugin_apps": plugin_apps,
+        "registration_mode": "local_plugin_app_manifest",
+        "chatgpt_connector_registration": "create_or_refresh_in_chatgpt_developer_mode",
+        "raw_output": "not_returned",
+    }
+    if not app_manifest["regular_file"]:
+        result["reason"] = "app_manifest_not_regular_file"
+        return result
+    try:
+        payload = read_repo_json_object(manifest, "app manifest")
+    except AgentError as exc:
+        result["reason"] = safe_error_text(exc)
+        return result
+    apps = payload.get("apps")
+    if not isinstance(apps, dict):
+        result["reason"] = "apps_not_object"
+        return result
+    app_entry = apps.get(APP_BRIDGE_NAME)
+    if not isinstance(app_entry, dict):
+        result["reason"] = "codex_master_app_missing"
+        return result
+    connector_id = app_entry.get("id")
+    if not isinstance(connector_id, str) or not connector_id.strip():
+        result["reason"] = "connector_id_missing"
+        return result
+    connector_id = connector_id.strip()
+    id_prefix_ok = connector_id.startswith(APP_BRIDGE_ID_PREFIXES)
+    result.update(
+        {
+            "connector_id": connector_id,
+            "connector_id_kind": app_id_kind(connector_id),
+            "connector_id_format_ok": id_prefix_ok,
+            "ok": id_prefix_ok and bool(plugin_apps.get("ok")),
+        }
+    )
+    if not result["ok"]:
+        result["reason"] = "plugin_or_connector_id_not_ready"
+    return result
+
+
 def master_plugin_status() -> dict[str, Any]:
     root = repo_root()
     manifest = root / ".codex-plugin" / "plugin.json"
     mcp_manifest = root / ".mcp.json"
+    app_manifest = root / ".app.json"
     skill = root / "skills" / "codex-master-fleet" / "SKILL.md"
     return {
         "repo": PATH_NOT_RETURNED,
         "repo_state": "set",
-        "plugin_manifest": {"path": PATH_NOT_RETURNED, "path_state": "set", "exists": manifest.is_file()},
-        "mcp_manifest": {"path": PATH_NOT_RETURNED, "path_state": "set", "exists": mcp_manifest.is_file()},
-        "skill": {"path": PATH_NOT_RETURNED, "path_state": "set", "exists": skill.is_file()},
+        "plugin_manifest": repo_file_status(manifest),
+        "mcp_manifest": repo_file_status(mcp_manifest),
+        "app_manifest": repo_file_status(app_manifest),
+        "skill": repo_file_status(skill),
+        "app_bridge": master_app_bridge_status(),
         "mcp_registration": check_mcp_registration(DEFAULT_INSTALL_PATH),
         "startup_self_test": mcp_command_startup_self_test(DEFAULT_INSTALL_PATH),
         "installed_source_worktree_state": installed_source_worktree_state(
@@ -2840,6 +2970,8 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return integration_status()
     if name == "commit_ready_check":
         return commit_ready_check(bool_arg(args, "run_tests", True))
+    if name == "master_app_bridge_status":
+        return master_app_bridge_status()
     if name == "master_plugin_status":
         return master_plugin_status()
     if name == "agent_doctor":
@@ -3198,8 +3330,13 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "master_app_bridge_status",
+        "description": "Return codex-master App Bridge manifest and connector-ID status without local paths.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
         "name": "master_plugin_status",
-        "description": "Return plugin packaging and MCP registration status for codex-master.",
+        "description": "Return plugin packaging, App Bridge, and MCP registration status for codex-master.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
@@ -3524,6 +3661,7 @@ def main_cli(argv: list[str]) -> int:
     p_commit_ready = sub.add_parser("commit-ready-check")
     p_commit_ready.add_argument("--no-tests", action="store_true")
 
+    sub.add_parser("app-bridge-status")
     sub.add_parser("plugin-status")
 
     p_install = sub.add_parser("install")
@@ -3681,6 +3819,8 @@ def main_cli(argv: list[str]) -> int:
             return print_json(call_validated_tool("integration_status", {}))
         if args.command == "commit-ready-check":
             return print_json(call_validated_tool("commit_ready_check", {"run_tests": not args.no_tests}))
+        if args.command == "app-bridge-status":
+            return print_json(call_validated_tool("master_app_bridge_status", {}))
         if args.command == "plugin-status":
             return print_json(call_validated_tool("master_plugin_status", {}))
         if args.command == "install":

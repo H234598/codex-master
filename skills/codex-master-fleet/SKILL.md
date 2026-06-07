@@ -83,19 +83,21 @@ cd /home/teladi/codex-master
 ./bin/codex-master-mcp report-request a
 ./bin/codex-master-mcp integration-status
 ./bin/codex-master-mcp commit-ready-check
+./bin/codex-master-mcp app-bridge-status
 ./bin/codex-master-mcp plugin-status
 ```
 
 Data minimization:
 
 - `status`, `wait`, `start`, `send`, `assign-*`, `doctor`, `skills`,
-  `capabilities`, and `plugin-status` do not return Agentin terminal output.
-- `status`, `doctor`, `skills`, `capabilities`, `plugin-status`, and
-  integration metadata must not return local Agentin home, runner, repo,
-  manifest, installed symlink, or working-directory paths. Use state/category
-  fields such as `path_state`, `home_kind`, `cwd_state`, and target-state
-  markers instead. Raw-log retention diagnostics may return counts and byte
-  totals, but not managed raw-log directory paths.
+  `capabilities`, `app-bridge-status`, and `plugin-status` do not return
+  Agentin terminal output.
+- `status`, `doctor`, `skills`, `capabilities`, `app-bridge-status`,
+  `plugin-status`, and integration metadata must not return local Agentin home,
+  runner, repo, manifest, installed symlink, or working-directory paths. Use
+  state/category fields such as `path_state`, `home_kind`, `cwd_state`, and
+  target-state markers instead. Raw-log retention diagnostics may return counts
+  and byte totals, but not managed raw-log directory paths.
 - `doctor` must report the active `CODEX_HOME` category and the
   `codex-master-mcp` `startup_timeout_sec` health without returning the active
   home path.
@@ -178,6 +180,13 @@ Data minimization:
   self-test, tolerate unavailable commands without raw error output, and warn
   without returning changed file names when the installed MCP points at a dirty
   repo worktree.
+- The App Bridge identity lives in `.app.json`, declared from
+  `.codex-plugin/plugin.json` via `apps: "./.app.json"`. `app-bridge-status`
+  may return the connector ID because it is not secret, but it must not return
+  local manifest paths or raw file contents. ChatGPT Developer Mode connector
+  creation/refresh is still an external ChatGPT settings action against a
+  reachable HTTPS `/mcp` endpoint; the local stdio MCP is not published by the
+  App Bridge manifest alone.
 - Use `tail` only for an explicit capped, ANSI-stripped, redacted excerpt.
 - Do not read raw tmux logs directly unless the user explicitly requests it and
   the privacy impact is acceptable.

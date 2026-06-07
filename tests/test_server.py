@@ -48,6 +48,7 @@ from codex_master.server import (
     mcp_command_startup_self_test,
     mcp_probe_response_ok,
     mcp_registration_command_matches,
+    master_app_bridge_status,
     main_cli,
     prune_raw_logs,
     raw_log_retention_status,
@@ -272,6 +273,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("agent_assign_write", names)
         self.assertIn("worktree_status", names)
         self.assertIn("commit_ready_check", names)
+        self.assertIn("master_app_bridge_status", names)
         self.assertIn("master_plugin_status", names)
         by_name = {tool["name"]: tool for tool in response["result"]["tools"]}
         assign_props = by_name["agent_assign"]["inputSchema"]["properties"]
@@ -291,6 +293,17 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(skill_props["plugins_offset"]["minimum"], 0)
         self.assertEqual(skill_props["plugins_limit"]["default"], MAX_CAPABILITY_PLUGINS)
         self.assertEqual(skill_props["plugins_limit"]["maximum"], MAX_SKILL_NAMES)
+
+    def test_master_app_bridge_status_is_path_sparse_and_reads_connector_id(self) -> None:
+        result = master_app_bridge_status()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["app_name"], "codex-master")
+        self.assertEqual(result["connector_id"], "connector_26697a678b7ec999dc005131eb5c087c")
+        self.assertEqual(result["connector_id_kind"], "connector")
+        self.assertTrue(result["connector_id_format_ok"])
+        self.assertTrue(result["plugin_apps"]["ok"])
+        self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.subprocess.run")
     def test_run_command_returns_bounded_timeout_result(self, mock_run) -> None:

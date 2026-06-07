@@ -47,9 +47,10 @@ the latest assignment model, and the model inferred for the detected limit.
 It also classifies a known Codex TUI starter/placeholder context without
 returning pane text, so callers can tell when an Agentin did not receive the
 assignment as productive input.
-Public `status`, `skills`, `capabilities`, `plugin-status`, and `doctor`
-responses do not return local Agentin home, runner, repo, manifest, or working
-directory paths; they return state/category metadata such as `path_state`,
+Public `status`, `skills`, `capabilities`, `app-bridge-status`,
+`plugin-status`, and `doctor` responses do not return local Agentin home,
+runner, repo, manifest, or working directory paths; they return state/category
+metadata such as `path_state`,
 `home_kind`, and `cwd_state` instead.
 Public scope checks, worktree status, command excerpts, and assignment audit
 reads redact absolute local paths as well; assignment prompts still receive the
@@ -85,7 +86,8 @@ and is capped at 10 minutes per call.
 - `worktree_status`: capped git status and worktree metadata
 - `integration_status`: repo status, diff stat, and recent assignment metadata
 - `commit_ready_check`: fixed readiness checks for integration/commit
-- `master_plugin_status`: plugin packaging and MCP registration status
+- `master_app_bridge_status`: App Bridge manifest and connector-ID status
+- `master_plugin_status`: plugin packaging, App Bridge, and MCP registration status
 - `agent_doctor`: structured diagnostics without raw output
 
 `/mcp` should show `codex-master-mcp` only in the Teamleiterin/main Codex
@@ -115,6 +117,7 @@ python3 -m codex_master.server assignments all --limit 20
 python3 -m codex_master.server last-assignment a
 python3 -m codex_master.server integration-status
 python3 -m codex_master.server commit-ready-check
+python3 -m codex_master.server app-bridge-status
 python3 -m codex_master.server plugin-status
 python3 -m codex_master.server send a "Kurzer Auftrag"
 python3 -m codex_master.server tail a --source pane --lines 20 --chars 2000
@@ -184,6 +187,37 @@ python3 -m codex_master.server stop both
 - reports `plugin_count`, `plugin_page_count`, `plugins_limit`, and
   `plugins_truncated` instead of dumping every plugin name when many are
   installed
+
+## App Bridge
+
+The plugin includes `.app.json` and declares it through
+`.codex-plugin/plugin.json`:
+
+```json
+{
+  "apps": {
+    "codex-master": {
+      "id": "connector_26697a678b7ec999dc005131eb5c087c"
+    }
+  }
+}
+```
+
+This is the local App Bridge identity for the `codex-master` plugin. It keeps
+the existing data-sparse MCP tool surface and lets Codex associate the plugin
+with a stable connector ID. The ID is intentionally not a secret.
+
+For a ChatGPT Developer Mode connector, ChatGPT still has to create or refresh
+the connector against a reachable public HTTPS `/mcp` endpoint. The current
+Masterjet MCP runs as a local stdio MCP for Codex, so `.app.json` organizes the
+plugin-side bridge identity; it does not publish the repo to a Marketplace or
+turn the local stdio command into a hosted HTTP connector by itself.
+
+Check the bridge state without local paths:
+
+```sh
+python3 -m codex_master.server app-bridge-status
+```
 
 ## Steering Skills
 
