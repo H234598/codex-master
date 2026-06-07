@@ -32,6 +32,12 @@ as a migration fallback. External `tmux`, `git`, and `codex mcp` subprocesses
 are timeout-bounded so MCP calls fail closed instead of hanging indefinitely.
 MCP registration checks compare the exact `command:` field from
 `codex mcp get`, not a broad substring in command output.
+Agentin lifecycle operations that mutate or send into tmux sessions are
+serialized per Agentin with private no-follow lock files, so Agentin A and
+Agentin B can still run independently while concurrent starts/stops/sends for
+the same Agentin cannot interleave. If `tmux new-session` fails before this
+process created a session, cleanup removes only the prepared raw log and does
+not kill an existing session that may belong to another MCP process.
 
 ## Tools
 

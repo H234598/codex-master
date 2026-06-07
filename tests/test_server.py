@@ -26,8 +26,10 @@ from codex_master.server import (
     DEFAULT_TMUX_TIMEOUT_SECONDS,
     allowed_raw_log_path,
     append_bounded_raw_log,
+    agent_lifecycle_lock,
     agent_home_process_summary,
     check_mcp_registration,
+    call_tool,
     doctor,
     ensure_state,
     handle_rpc,
@@ -934,6 +936,49 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(summary["external_processes"][0]["pid"], 100)
         self.assertEqual(summary["external_processes"][0]["raw_output"], "not_returned")
 
+    def test_agent_lifecycle_lock_refuses_symlink_lock_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            state_root = tmp_path / "state"
+            lock_dir = state_root / "locks"
+            lock_dir.mkdir(parents=True)
+            target = tmp_path / "outside.lock"
+            target.write_text("outside", encoding="utf-8")
+            lock_path = lock_dir / "agent-a.lock"
+            lock_path.symlink_to(target)
+
+            with patch("codex_master.server.STATE_ROOT", state_root), patch("codex_master.server.LOCK_DIR", lock_dir):
+                with self.assertRaisesRegex(AgentError, "without following symlinks"):
+                    with agent_lifecycle_lock("a"):
+                        pass
+                lock_still_symlink = lock_path.is_symlink()
+
+        self.assertTrue(lock_still_symlink)
+
+    @patch("codex_master.server.start_agent", return_value={"agent": "a", "status": "started"})
+    @patch("codex_master.server.agent_lifecycle_lock")
+    def test_call_tool_agent_start_acquires_lifecycle_lock(self, mock_lock, mock_start_agent) -> None:
+        events = []
+
+        class FakeLock:
+            def __init__(self, agent: str):
+                self.agent = agent
+
+            def __enter__(self):
+                events.append(("lock", self.agent))
+
+            def __exit__(self, exc_type, exc, tb):
+                events.append(("unlock", self.agent))
+                return False
+
+        mock_lock.side_effect = lambda agent: FakeLock(agent)
+
+        result = call_tool("agent_start", {"agent": "a", "cwd": "/tmp/work", "prompt": "hi"})
+
+        self.assertEqual(result["results"], [{"agent": "a", "status": "started"}])
+        self.assertEqual(events, [("lock", "a"), ("unlock", "a")])
+        mock_start_agent.assert_called_once_with("a", "/tmp/work", "hi")
+
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.tmux_alive", return_value=False)
     @patch("codex_master.server.run_tmux")
@@ -1167,6 +1212,43 @@ class ServerHelpersTest(unittest.TestCase):
                     start_agent("a", cwd=tmpdir)
                 leftover_logs = list(Path(tmpdir).glob("*.log"))
 
+        self.assertEqual(leftover_logs, [])
+
+    @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.write_meta")
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("codex_master.server.run_tmux")
+    def test_start_agent_does_not_kill_session_when_new_session_fails(
+        self, mock_run_tmux, _mock_alive, _mock_write_meta, _mock_ensure_state
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = Path(tmpdir) / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux", "new-session"], 1, "", "duplicate session")
+
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
+                clear=False,
+            ), patch("codex_master.server.RAW_DIR", Path(tmpdir)), patch("codex_master.server.META_DIR", Path(tmpdir)), patch(
+                "codex_master.server.agent_home_process_summary",
+                return_value={
+                    "process_count": 0,
+                    "external_process_count": 0,
+                    "managed_process_count": 0,
+                    "external_processes": [],
+                    "external_processes_truncated": False,
+                    "raw_output": "not_returned",
+                },
+            ):
+                with self.assertRaisesRegex(RuntimeError, "tmux start failed"):
+                    start_agent("a", cwd=tmpdir)
+
+            kill_calls = [call for call in mock_run_tmux.call_args_list if call.args[0][0] == "kill-session"]
+            leftover_logs = list(Path(tmpdir).glob("*.log"))
+
+        self.assertEqual(kill_calls, [])
         self.assertEqual(leftover_logs, [])
 
     @patch("codex_master.server.ensure_state")

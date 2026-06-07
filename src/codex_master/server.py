@@ -8,7 +8,9 @@ explicitly requested, size-limited, redacted excerpts.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as _dt
+import fcntl
 import json
 import os
 import re
@@ -32,6 +34,7 @@ STATE_ROOT = Path(
 LEGACY_STATE_ROOT = Path("~/.local/state/codex-agent-mcp").expanduser()
 RAW_DIR = STATE_ROOT / "raw"
 META_DIR = STATE_ROOT / "meta"
+LOCK_DIR = STATE_ROOT / "locks"
 ASSIGNMENT_LOG = STATE_ROOT / "assignments.jsonl"
 LEGACY_META_DIR = LEGACY_STATE_ROOT / "meta"
 DEFAULT_AGENT_MODEL = "gpt-5.4-mini"
@@ -119,7 +122,7 @@ class AgentError(RuntimeError):
 
 
 def ensure_state() -> None:
-    for path in (STATE_ROOT, RAW_DIR, META_DIR):
+    for path in (STATE_ROOT, RAW_DIR, META_DIR, LOCK_DIR):
         ensure_private_dir(path)
     prune_raw_logs()
 
@@ -462,6 +465,26 @@ def open_private_regular_update(path: Path) -> Any:
         raise
 
 
+@contextlib.contextmanager
+def agent_lifecycle_lock(agent: str) -> Any:
+    if agent not in {"a", "b"}:
+        raise AgentError("agent must be a or b")
+    ensure_private_dir(STATE_ROOT)
+    ensure_private_dir(LOCK_DIR)
+    lock_path = LOCK_DIR / f"agent-{agent}.lock"
+    with open_private_regular_update(lock_path) as fh:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            yield
+        except OSError as exc:
+            raise AgentError("could not acquire agent lifecycle lock") from exc
+        finally:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+
+
 def is_real_directory_no_symlink(path: Path) -> bool:
     try:
         mode = path.lstat().st_mode
@@ -763,8 +786,8 @@ def pane_pid(session: str) -> int | None:
     return int(text) if text.isdigit() else None
 
 
-def cleanup_failed_start(session: str, raw_log: Path) -> None:
-    if tmux_alive(session):
+def cleanup_failed_start(session: str, raw_log: Path, *, kill_session: bool) -> None:
+    if kill_session and tmux_alive(session):
         run_tmux(["kill-session", "-t", session], check=False)
     try:
         raw_log.unlink()
@@ -821,13 +844,13 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
     command = "env CODEX_MASTER_MCP=1 CODEX_AGENT_MCP=1 " + shlex.join(argv)
     cp = run_tmux(["new-session", "-d", "-s", session, "-c", str(start_cwd), command], check=False)
     if cp.returncode != 0:
-        cleanup_failed_start(session, raw_log)
+        cleanup_failed_start(session, raw_log, kill_session=False)
         raise AgentError(f"tmux start failed for agent {agent}: {command_error_text(cp.stderr)}")
 
     pipe_command = raw_log_writer_command(raw_log)
     pipe = run_tmux(["pipe-pane", "-o", "-t", session, pipe_command], check=False)
     if pipe.returncode != 0:
-        cleanup_failed_start(session, raw_log)
+        cleanup_failed_start(session, raw_log, kill_session=True)
         raise AgentError(f"tmux pipe-pane failed for agent {agent}: {command_error_text(pipe.stderr)}")
 
     data = {
@@ -1940,13 +1963,21 @@ def multi_agent_result(selected: list[str], fn: Any) -> dict[str, Any]:
     return {"results": results}
 
 
+def call_agent_lifecycle(agent: str, fn: Any) -> dict[str, Any]:
+    with agent_lifecycle_lock(agent):
+        return fn()
+
+
 def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "agent_start":
         selected = agent_ids(str(args.get("agent", "both")))
-        return multi_agent_result(selected, lambda agent: start_agent(agent, args.get("cwd"), args.get("prompt")))
+        return multi_agent_result(
+            selected,
+            lambda agent: call_agent_lifecycle(agent, lambda: start_agent(agent, args.get("cwd"), args.get("prompt"))),
+        )
     if name == "agent_stop":
         selected = agent_ids(str(args.get("agent", "both")))
-        return multi_agent_result(selected, stop_agent)
+        return multi_agent_result(selected, lambda agent: call_agent_lifecycle(agent, lambda: stop_agent(agent)))
     if name == "agent_status":
         selected = agent_ids(str(args.get("agent", "all")))
         return multi_agent_result(selected, status_agent)
@@ -1980,54 +2011,63 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         selected = agent_ids(str(args.get("agent", "")))
         if len(selected) != 1:
             raise AgentError("agent_assign requires exactly one agent: a or b")
-        return assign_agent(
+        return call_agent_lifecycle(
             selected[0],
-            role=str(args.get("role", "")),
-            task=args.get("task"),
-            scope=args.get("scope"),
-            skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
-            write_paths=args.get("write_paths"),
-            context=args.get("context"),
-            forbidden=args.get("forbidden"),
-            name=args.get("name") if isinstance(args.get("name"), str) else None,
-            enter=bool_arg(args, "enter", True),
-            allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
-            allow_subagents=bool_arg(args, "allow_subagents", False),
+            lambda: assign_agent(
+                selected[0],
+                role=str(args.get("role", "")),
+                task=args.get("task"),
+                scope=args.get("scope"),
+                skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
+                write_paths=args.get("write_paths"),
+                context=args.get("context"),
+                forbidden=args.get("forbidden"),
+                name=args.get("name") if isinstance(args.get("name"), str) else None,
+                enter=bool_arg(args, "enter", True),
+                allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
+                allow_subagents=bool_arg(args, "allow_subagents", False),
+            ),
         )
     if name == "agent_assign_readonly":
         selected = agent_ids(str(args.get("agent", "")))
         if len(selected) != 1:
             raise AgentError("agent_assign_readonly requires exactly one agent: a or b")
-        return assign_agent(
+        return call_agent_lifecycle(
             selected[0],
-            role="exploriererin",
-            task=args.get("task"),
-            scope=args.get("scope"),
-            skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
-            context=args.get("context"),
-            forbidden=args.get("forbidden"),
-            name=args.get("name") if isinstance(args.get("name"), str) else None,
-            enter=bool_arg(args, "enter", True),
-            allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
-            allow_subagents=bool_arg(args, "allow_subagents", False),
+            lambda: assign_agent(
+                selected[0],
+                role="exploriererin",
+                task=args.get("task"),
+                scope=args.get("scope"),
+                skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
+                context=args.get("context"),
+                forbidden=args.get("forbidden"),
+                name=args.get("name") if isinstance(args.get("name"), str) else None,
+                enter=bool_arg(args, "enter", True),
+                allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
+                allow_subagents=bool_arg(args, "allow_subagents", False),
+            ),
         )
     if name == "agent_assign_write":
         selected = agent_ids(str(args.get("agent", "")))
         if len(selected) != 1:
             raise AgentError("agent_assign_write requires exactly one agent: a or b")
-        return assign_agent(
+        return call_agent_lifecycle(
             selected[0],
-            role="arbeitsbiene",
-            task=args.get("task"),
-            scope=args.get("scope"),
-            skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
-            write_paths=args.get("write_paths"),
-            context=args.get("context"),
-            forbidden=args.get("forbidden"),
-            name=args.get("name") if isinstance(args.get("name"), str) else None,
-            enter=bool_arg(args, "enter", True),
-            allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
-            allow_subagents=bool_arg(args, "allow_subagents", False),
+            lambda: assign_agent(
+                selected[0],
+                role="arbeitsbiene",
+                task=args.get("task"),
+                scope=args.get("scope"),
+                skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
+                write_paths=args.get("write_paths"),
+                context=args.get("context"),
+                forbidden=args.get("forbidden"),
+                name=args.get("name") if isinstance(args.get("name"), str) else None,
+                enter=bool_arg(args, "enter", True),
+                allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
+                allow_subagents=bool_arg(args, "allow_subagents", False),
+            ),
         )
     if name == "agent_assignments":
         return list_assignments(str(args.get("agent", "all")), int_arg(args, "limit", 20))
@@ -2040,10 +2080,13 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         selected = agent_ids(str(args.get("agent", "")))
         if len(selected) != 1:
             raise AgentError("agent_report_request requires exactly one agent: a or b")
-        return request_agent_report(
+        return call_agent_lifecycle(
             selected[0],
-            args.get("assignment_id"),
-            bool_arg(args, "enter", True),
+            lambda: request_agent_report(
+                selected[0],
+                args.get("assignment_id"),
+                bool_arg(args, "enter", True),
+            ),
         )
     if name == "worktree_create_for_agent":
         selected = agent_ids(str(args.get("agent", "")))
@@ -2071,12 +2114,12 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         text = args.get("text")
         if not isinstance(text, str) or text == "":
             raise AgentError("agent_send requires non-empty text")
-        return send_agent(selected[0], text, bool_arg(args, "enter", True))
+        return call_agent_lifecycle(selected[0], lambda: send_agent(selected[0], text, bool_arg(args, "enter", True)))
     if name == "agent_interrupt":
         selected = agent_ids(str(args.get("agent", "")))
         if len(selected) != 1:
             raise AgentError("agent_interrupt requires exactly one agent: a or b")
-        return interrupt_agent(selected[0])
+        return call_agent_lifecycle(selected[0], lambda: interrupt_agent(selected[0]))
     if name == "agent_safe_tail":
         selected = agent_ids(str(args.get("agent", "")))
         if len(selected) != 1:
