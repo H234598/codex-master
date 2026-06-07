@@ -89,6 +89,10 @@ Data minimization:
 
 - `status`, `start`, `send`, `assign-*`, `doctor`, `skills`, `capabilities`,
   and `plugin-status` do not return Agentin terminal output.
+- `status` may classify bounded pane/log text into metadata-only response and
+  limit states, but it must not return the classified text. Daily, weekly,
+  token, quota, and rate limits must keep default Agentinnen-model limits
+  separate from Spark write-model limits.
 - `capabilities` returns a bounded first plugin page plus counts/truncation
   flags, not a complete broad plugin inventory.
 - `skills` returns bounded plugin/name pages plus total counts, offsets, limits,

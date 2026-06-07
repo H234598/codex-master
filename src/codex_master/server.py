@@ -58,6 +58,8 @@ MAX_TAIL_CHARS = 8192
 MAX_RAW_LOG_BYTES = 5 * 1024 * 1024
 MAX_RAW_LOG_FILES = 20
 RAW_LOG_CHUNK_BYTES = 64 * 1024
+MAX_LIMIT_STATUS_BYTES = 16 * 1024
+IDLE_RESPONSE_SECONDS = 300
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
 MCP_SERVER_NAME = "codex-master-mcp"
 DEFAULT_INSTALL_PATH = Path("~/.local/bin/codex-master-mcp").expanduser()
@@ -897,6 +899,153 @@ def stop_agent(agent: str) -> dict[str, Any]:
     return {"agent": agent, "status": "stopped" if was_running else "not_running", "session": session}
 
 
+def raw_log_metadata(raw_log_path: Path | None) -> dict[str, Any]:
+    if raw_log_path is None:
+        return {"bytes": None, "updated_at_utc": None, "idle_seconds": None}
+    try:
+        current_stat = raw_log_path.lstat()
+    except OSError:
+        return {"bytes": None, "updated_at_utc": None, "idle_seconds": None}
+    if not stat_module.S_ISREG(current_stat.st_mode):
+        return {"bytes": None, "updated_at_utc": None, "idle_seconds": None}
+    updated = _dt.datetime.fromtimestamp(current_stat.st_mtime, _dt.timezone.utc)
+    idle_seconds = max(0, int(time.time() - current_stat.st_mtime))
+    return {
+        "bytes": current_stat.st_size,
+        "updated_at_utc": updated.isoformat(),
+        "idle_seconds": idle_seconds,
+    }
+
+
+def latest_assignment_summary(agent: str) -> dict[str, Any] | None:
+    try:
+        result = list_assignments(agent, 1)
+    except AgentError:
+        return None
+    records = result.get("records")
+    if not isinstance(records, list) or not records:
+        return None
+    record = records[-1]
+    if not isinstance(record, dict):
+        return None
+    return {
+        "assignment_id": record.get("assignment_id"),
+        "created_at_utc": record.get("created_at_utc"),
+        "role": record.get("role"),
+        "model": record.get("model"),
+        "raw_output": "not_returned",
+    }
+
+
+def limit_model_pool(model: Any) -> str:
+    text = str(model or "").lower()
+    if "spark" in text or WRITE_AGENT_MODEL in text:
+        return "spark_write_model"
+    if DEFAULT_AGENT_MODEL in text or "5.4" in text:
+        return "default_agent_model"
+    return "unknown"
+
+
+def infer_limit_model(text: str, meta: dict[str, Any], latest_assignment: dict[str, Any] | None) -> str:
+    lowered = text.lower()
+    if re.search(r"\b(?:gpt[- ]?5\.3[- ]?codex[- ]?spark|codex[- ]?spark|spark)\b", lowered):
+        return WRITE_AGENT_MODEL
+    if re.search(r"\b(?:gpt[- ]?5\.4[- ]?mini|gpt[- ]?5\.4|5\.4[- ]?mini)\b", lowered):
+        return DEFAULT_AGENT_MODEL
+    if latest_assignment and isinstance(latest_assignment.get("model"), str):
+        return latest_assignment["model"]
+    if isinstance(meta.get("model"), str):
+        return meta["model"]
+    return "unknown"
+
+
+def classify_limit_text(text: str, meta: dict[str, Any] | None = None, latest_assignment: dict[str, Any] | None = None) -> dict[str, Any]:
+    meta = meta or {}
+    cleaned = strip_ansi(text)
+    lowered = cleaned.lower()
+    has_limit = any(
+        re.search(pattern, lowered)
+        for pattern in (
+            r"\brate limit(?:ed|s)?\b",
+            r"\busage limit\b",
+            r"\blimit (?:reached|exceeded|hit)\b",
+            r"\bquota (?:exceeded|reached)\b",
+            r"\btoo many requests\b",
+            r"\bout of tokens\b",
+            r"\btoken (?:limit|budget|quota)\b",
+            r"\bcontext (?:length|window).{0,80}\b(?:exceeded|full|limit)\b",
+        )
+    )
+    window = "unknown"
+    if re.search(r"\b(?:daily|per day|today|24h|24 hours)\b", lowered):
+        window = "daily"
+    elif re.search(r"\b(?:weekly|per week|this week|7d|7 days)\b", lowered):
+        window = "weekly"
+
+    limit_kind = "unknown"
+    if re.search(r"\b(?:token|context length|context window)\b", lowered):
+        limit_kind = "token"
+    elif re.search(r"\brate limit|too many requests\b", lowered):
+        limit_kind = "rate"
+    elif re.search(r"\bquota\b", lowered):
+        limit_kind = "quota"
+    elif has_limit:
+        limit_kind = "usage"
+
+    detected = has_limit or (window != "unknown" and "limit" in lowered)
+    model = infer_limit_model(cleaned, meta, latest_assignment)
+    role = latest_assignment.get("role") if latest_assignment else "unknown"
+    if role not in {"exploriererin", "arbeitsbiene"}:
+        role = "unknown"
+
+    return {
+        "limited": detected,
+        "window": window if detected else "none",
+        "kind": limit_kind if detected else "none",
+        "model": model,
+        "model_pool": limit_model_pool(model),
+        "role": role,
+        "source": "classified_from_bounded_status_text" if cleaned else "no_status_text",
+        "evidence": "not_returned",
+        "raw_output": "not_returned",
+    }
+
+
+def agent_limit_state(
+    agent: str,
+    *,
+    running: bool,
+    meta: dict[str, Any],
+    raw_log_path: Path | None,
+    latest_assignment: dict[str, Any] | None,
+) -> dict[str, Any]:
+    samples: list[str] = []
+    if running:
+        samples.append(pane_tail(agent, MAX_TAIL_LINES))
+    if raw_log_path:
+        samples.append(read_log_tail(raw_log_path, MAX_LIMIT_STATUS_BYTES))
+    return classify_limit_text("\n".join(item for item in samples if item), meta, latest_assignment)
+
+
+def agent_response_state(running: bool, limit_state: dict[str, Any], raw_log_info: dict[str, Any]) -> dict[str, Any]:
+    if limit_state.get("limited"):
+        state = "blocked_by_limit"
+    elif not running:
+        state = "not_running"
+    elif raw_log_info.get("idle_seconds") is None:
+        state = "running_no_output_observed"
+    elif int(raw_log_info["idle_seconds"]) >= IDLE_RESPONSE_SECONDS:
+        state = "running_idle"
+    else:
+        state = "running_recent_output"
+    return {
+        "state": state,
+        "idle_threshold_seconds": IDLE_RESPONSE_SECONDS,
+        "response_output": "not_returned",
+        "raw_output": "not_returned",
+    }
+
+
 def status_agent(agent: str) -> dict[str, Any]:
     ensure_state()
     cfg = AGENTS[agent]
@@ -905,17 +1054,21 @@ def status_agent(agent: str) -> dict[str, Any]:
     raw_log = meta.get("raw_log")
     raw_log_path = allowed_raw_log_path(raw_log)
     process_summary = agent_home_process_summary(agent)
-    raw_size = None
-    if raw_log_path:
-        try:
-            raw_size = raw_log_path.stat().st_size
-        except OSError:
-            raw_size = None
+    running = tmux_alive(session)
+    raw_log_info = raw_log_metadata(raw_log_path)
+    latest_assignment = latest_assignment_summary(agent)
+    limit_state = agent_limit_state(
+        agent,
+        running=running,
+        meta=meta,
+        raw_log_path=raw_log_path,
+        latest_assignment=latest_assignment,
+    )
     return {
         "agent": agent,
         "label": cfg["label"],
         "backend": "tmux",
-        "running": tmux_alive(session),
+        "running": running,
         "session": session,
         "pid": pane_pid(session),
         "home": str(cfg["home"]),
@@ -924,8 +1077,13 @@ def status_agent(agent: str) -> dict[str, Any]:
         "cwd": meta.get("cwd"),
         "model": meta.get("model") or DEFAULT_AGENT_MODEL,
         "model_reasoning_effort": meta.get("model_reasoning_effort") or DEFAULT_AGENT_MODEL_EFFORT,
+        "last_assignment": latest_assignment,
+        "limit_state": limit_state,
+        "response_state": agent_response_state(running, limit_state, raw_log_info),
         "raw_log": "not_returned" if raw_log else None,
-        "raw_log_bytes": raw_size,
+        "raw_log_bytes": raw_log_info["bytes"],
+        "raw_log_updated_at_utc": raw_log_info["updated_at_utc"],
+        "raw_log_idle_seconds": raw_log_info["idle_seconds"],
         "raw_log_max_bytes": MAX_RAW_LOG_BYTES,
         "raw_log_policy": "local_only_bounded_not_returned_by_default",
         "raw_log_path_valid": (raw_log_path is not None) if raw_log else True,
@@ -2185,7 +2343,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "agent_status",
-        "description": "Return structured status for Codex Agentin A, B, or all Agentinnen. Does not return raw output.",
+        "description": "Return structured status for Codex Agentin A, B, or all Agentinnen, including data-sparse response and limit classification. Does not return raw output.",
         "inputSchema": {
             "type": "object",
             "properties": {"agent": {"type": "string", "enum": ["a", "b", "all"], "default": "all"}},

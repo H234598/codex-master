@@ -38,11 +38,17 @@ Agentin B can still run independently while concurrent starts/stops/sends for
 the same Agentin cannot interleave. If `tmux new-session` fails before this
 process created a session, cleanup removes only the prepared raw log and does
 not kill an existing session that may belong to another MCP process.
+`agent_status` classifies bounded pane/log text without returning it, so callers
+can distinguish likely daily, weekly, token, quota, or rate limits from ordinary
+"no response yet" states. The classification keeps default Agentinnen-model
+limits separate from Spark write-model limits and reports only metadata plus
+`evidence: not_returned`.
 
 ## Tools
 
 - `agent_start`: start Agentin `a`, `b`, or `both`
-- `agent_status`: structured status without raw output
+- `agent_status`: structured status, response state, and limit classification
+  without raw output
 - `agent_send`: send text to one running Agentin
 - `agent_interrupt`: send Ctrl-C to one running Agentin
 - `agent_stop`: stop Agentin `a`, `b`, or `both`

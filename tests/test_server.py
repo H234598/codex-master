@@ -30,6 +30,8 @@ from codex_master.server import (
     agent_home_process_summary,
     check_mcp_registration,
     call_tool,
+    classify_limit_text,
+    DEFAULT_AGENT_MODEL,
     doctor,
     ensure_state,
     handle_rpc,
@@ -51,6 +53,7 @@ from codex_master.server import (
     trim_chars,
     trim_lines,
     uninstall,
+    WRITE_AGENT_MODEL,
     write_bounded_raw_log,
     write_meta,
     worktree_create_for_agent,
@@ -525,7 +528,94 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(payload["raw_log"], "not_returned")
         self.assertNotIn(str(fifo_path), json.dumps(payload, sort_keys=True))
 
+    def test_classify_limit_text_distinguishes_default_daily_and_spark_weekly(self) -> None:
+        default_limit = classify_limit_text(
+            "Daily usage limit reached for gpt-5.4-mini. Try again tomorrow.",
+            {},
+            None,
+        )
+        spark_limit = classify_limit_text(
+            "Weekly limit reached for Codex Spark.",
+            {},
+            {"role": "arbeitsbiene", "model": WRITE_AGENT_MODEL},
+        )
+
+        self.assertTrue(default_limit["limited"])
+        self.assertEqual(default_limit["window"], "daily")
+        self.assertEqual(default_limit["kind"], "usage")
+        self.assertEqual(default_limit["model"], DEFAULT_AGENT_MODEL)
+        self.assertEqual(default_limit["model_pool"], "default_agent_model")
+        self.assertTrue(spark_limit["limited"])
+        self.assertEqual(spark_limit["window"], "weekly")
+        self.assertEqual(spark_limit["model"], WRITE_AGENT_MODEL)
+        self.assertEqual(spark_limit["model_pool"], "spark_write_model")
+        self.assertEqual(spark_limit["role"], "arbeitsbiene")
+        self.assertEqual(spark_limit["evidence"], "not_returned")
+
     @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.pane_pid", return_value=None)
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 0,
+            "external_process_count": 0,
+            "managed_process_count": 0,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
+    def test_agent_status_reports_limit_state_without_returning_output(
+        self, _mock_summary, _mock_tmux_alive, _mock_pane_pid, _mock_ensure_state
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            raw_dir = tmp_path / "raw"
+            raw_dir.mkdir()
+            log_path = raw_dir / "agent.log"
+            log_path.write_text(
+                "Weekly limit reached for Codex Spark.\nOPENAI_API_KEY=sk-logtoken1234567890\n",
+                encoding="utf-8",
+            )
+            runner = tmp_path / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": tmp_path, "session": "test_session"}},
+                clear=False,
+            ), patch("codex_master.server.RAW_DIR", raw_dir), patch(
+                "codex_master.server.read_meta", return_value={"raw_log": str(log_path), "model": DEFAULT_AGENT_MODEL}
+            ), patch(
+                "codex_master.server.latest_assignment_summary",
+                return_value={"assignment_id": "1-a", "role": "arbeitsbiene", "model": WRITE_AGENT_MODEL},
+            ):
+                response = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 49,
+                        "method": "tools/call",
+                        "params": {"name": "agent_status", "arguments": {"agent": "a"}},
+                    }
+                )
+
+        self.assertIsNotNone(response)
+        self.assertFalse(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])["results"][0]
+        self.assertEqual(payload["limit_state"]["limited"], True)
+        self.assertEqual(payload["limit_state"]["window"], "weekly")
+        self.assertEqual(payload["limit_state"]["model_pool"], "spark_write_model")
+        self.assertEqual(payload["response_state"]["state"], "blocked_by_limit")
+        payload_text = json.dumps(payload, sort_keys=True)
+        self.assertNotIn("Weekly limit reached", payload_text)
+        self.assertNotIn("sk-logtoken1234567890", payload_text)
+        self.assertNotIn(str(log_path), payload_text)
+
+    @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.latest_assignment_summary", return_value=None)
+    @patch("codex_master.server.pane_tail", return_value="")
     @patch("codex_master.server.pane_pid", return_value=456)
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch(
@@ -540,7 +630,7 @@ class ServerHelpersTest(unittest.TestCase):
         },
     )
     def test_agent_status_does_not_return_raw_log_path(
-        self, _mock_summary, _mock_tmux_alive, _mock_pane_pid, _mock_ensure_state
+        self, _mock_summary, _mock_tmux_alive, _mock_pane_pid, _mock_pane_tail, _mock_latest, _mock_ensure_state
     ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
