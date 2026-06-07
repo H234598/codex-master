@@ -230,6 +230,10 @@ The repo contains a generic, machine-readable `codex-agent-pool.json` plus
 `b1` marked as the authenticated source homes and the C series intentionally
 unauthenticated.
 
+The spec is only the map. The actual auth material is still the per-home
+`auth.json`, for example `~/.codex-agents/a1/auth.json`. Normal install never
+copies auth material.
+
 Two install paths are supported:
 
 ```sh
@@ -240,7 +244,16 @@ Two install paths are supported:
 Use `--codex-bin` when the Codex CLI binary is not `/usr/local/bin/codex`.
 Normal install never copies auth material. For bulk auth propagation, run
 `pool copy_auth` first without `--yes` to inspect counts, then repeat with
-`--yes` when intentional. See `docs/agent-pool.md` for the full command set.
+`--yes` when intentional. `copy_auth` copies only `auth.json`, skips the source
+Agentin when she is part of the target selector, and never returns auth content.
+
+Do not use symlinks or hardlinks for `auth.json` in the normal pool model.
+Auth files are small; copies keep each Agentin isolated. Symlinks cross the
+no-follow trust boundary, and hardlinks share one inode across multiple
+Agentinnen.
+
+See `docs/agent-pool.md` for the full command set and `docs/auth-copy.md` for
+the auth-copy safety model.
 
 ## Install-Contract (CLI)
 

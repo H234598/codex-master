@@ -1495,7 +1495,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.8.1+codex.test",
+            "version": "0.8.2+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1522,7 +1522,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.8.1")
+        self.assertEqual(result["expected_tag"], "v0.8.2")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
