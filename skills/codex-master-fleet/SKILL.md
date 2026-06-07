@@ -65,6 +65,7 @@ cd /home/teladi/codex-master
 ./bin/codex-master-mcp start both --cwd /home/teladi/codex-master
 ./bin/codex-master-mcp capabilities all
 ./bin/codex-master-mcp skills all
+./bin/codex-master-mcp skills a --include-names --limit 20 --names-offset 20 --plugins-offset 20 --plugins-limit 20
 ./bin/codex-master-mcp skill-match all codex-security:security-scan
 ./bin/codex-master-mcp scope-check --scope src --write-path src/codex_master/server.py
 ./bin/codex-master-mcp assign-readonly a --skill codex-security:security-scan --scope src/codex_master/server.py --task "Pruefe nur lesend und berichte knapp."
@@ -81,8 +82,11 @@ Data minimization:
 
 - `status`, `start`, `send`, `assign-*`, `doctor`, `skills`, `capabilities`,
   and `plugin-status` do not return Agentin terminal output.
-- `capabilities` returns a capped plugin sample plus counts/truncation flags,
-  not a complete broad plugin inventory.
+- `capabilities` returns a bounded first plugin page plus counts/truncation
+  flags, not a complete broad plugin inventory.
+- `skills` returns bounded plugin/name pages plus total counts, offsets, limits,
+  and truncation flags so callers can deliberately enumerate more pages without
+  broad dumping.
 - `assignments` and `last-assignment` return only assignment metadata. They
   must not return prompt text or Agentin responses.
 - Assignment audit retention is bounded to the newest 500 valid metadata

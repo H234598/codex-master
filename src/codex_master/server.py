@@ -403,10 +403,28 @@ def list_skill_files(root: Path) -> list[Path]:
     return sorted(path for path in root.rglob("SKILL.md") if path.is_file())
 
 
-def skills_agent(agent: str, include_names: bool = False, limit: int = 80) -> dict[str, Any]:
+def paged_mapping(items: dict[str, int], offset: int, limit: int) -> tuple[dict[str, int], bool]:
+    offset = max(0, int(offset))
+    limit = max(0, int(limit))
+    sorted_items = sorted(items.items())
+    page = dict(sorted_items[offset : offset + limit])
+    return page, offset + limit < len(sorted_items)
+
+
+def skills_agent(
+    agent: str,
+    include_names: bool = False,
+    limit: int = 80,
+    names_offset: int = 0,
+    plugins_offset: int = 0,
+    plugins_limit: int = MAX_CAPABILITY_PLUGINS,
+) -> dict[str, Any]:
     cfg = AGENTS[agent]
     home = cfg["home"]
     limit = max(0, min(int(limit), MAX_SKILL_NAMES))
+    names_offset = max(0, int(names_offset))
+    plugins_offset = max(0, int(plugins_offset))
+    plugins_limit = max(0, min(int(plugins_limit), MAX_SKILL_NAMES))
 
     all_paths: list[Path] = []
     roots: list[dict[str, Any]] = []
@@ -420,7 +438,8 @@ def skills_agent(agent: str, include_names: bool = False, limit: int = 80) -> di
     system_skills: list[str] = []
     names: list[dict[str, str]] = []
 
-    for path in sorted(set(all_paths)):
+    unique_paths = sorted(set(all_paths))
+    for index, path in enumerate(unique_paths):
         parsed = parse_skill_path(home, path)
         source = parsed["source"]
         by_source[source] = by_source.get(source, 0) + 1
@@ -428,7 +447,7 @@ def skills_agent(agent: str, include_names: bool = False, limit: int = 80) -> di
             by_plugin[parsed["plugin"]] = by_plugin.get(parsed["plugin"], 0) + 1
         if source == "system":
             system_skills.append(parsed["name"])
-        if include_names and len(names) < limit:
+        if include_names and index >= names_offset and len(names) < limit:
             names.append(
                 {
                     "name": parsed["name"],
@@ -438,6 +457,7 @@ def skills_agent(agent: str, include_names: bool = False, limit: int = 80) -> di
                 }
             )
 
+    plugins, plugins_truncated = paged_mapping(by_plugin, plugins_offset, plugins_limit)
     result: dict[str, Any] = {
         "agent": agent,
         "label": cfg["label"],
@@ -446,14 +466,20 @@ def skills_agent(agent: str, include_names: bool = False, limit: int = 80) -> di
         "roots": roots,
         "by_source": dict(sorted(by_source.items())),
         "system_skills": sorted(set(system_skills)),
-        "plugins": dict(sorted(by_plugin.items())),
+        "plugin_count": len(by_plugin),
+        "plugins_offset": plugins_offset,
+        "plugins_limit": plugins_limit,
+        "plugins": plugins,
+        "plugins_truncated": plugins_truncated,
         "skill_file_contents": "not_returned",
         "raw_output": "not_returned",
     }
     if include_names:
+        result["names_total"] = len(unique_paths)
+        result["names_offset"] = names_offset
         result["names_limit"] = limit
         result["names"] = names
-        result["names_truncated"] = len(set(all_paths)) > len(names)
+        result["names_truncated"] = names_offset + len(names) < len(unique_paths)
     return result
 
 
@@ -557,16 +583,8 @@ def skill_match_agent(agent: str, skill_ref: Any, limit: int = 8) -> dict[str, A
         "raw_output": "not_returned",
     }
 
-
-def capped_mapping(items: dict[str, int], limit: int) -> tuple[dict[str, int], bool]:
-    sorted_items = sorted(items.items())
-    capped = dict(sorted_items[:limit])
-    return capped, len(sorted_items) > limit
-
-
 def capabilities_agent(agent: str) -> dict[str, Any]:
     inventory = skills_agent(agent, include_names=False)
-    plugins, plugins_truncated = capped_mapping(inventory["plugins"], MAX_CAPABILITY_PLUGINS)
     return {
         "agent": agent,
         "label": AGENTS[agent]["label"],
@@ -580,10 +598,12 @@ def capabilities_agent(agent: str) -> dict[str, Any]:
         },
         "skill_count": inventory["total"],
         "system_skills": inventory["system_skills"],
-        "plugin_count": len(inventory["plugins"]),
-        "plugins_limit": MAX_CAPABILITY_PLUGINS,
-        "plugins": plugins,
-        "plugins_truncated": plugins_truncated,
+        "plugin_count": inventory["plugin_count"],
+        "plugin_page_count": len(inventory["plugins"]),
+        "plugins_offset": inventory["plugins_offset"],
+        "plugins_limit": inventory["plugins_limit"],
+        "plugins": inventory["plugins"],
+        "plugins_truncated": inventory["plugins_truncated"],
         "master_mcp_tools": "not_configured_for_agent",
         "native_subagents": "assignment_gated",
         "write_policy": "explicit_paths_only",
@@ -1291,7 +1311,13 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         selected = agent_ids(str(args.get("agent", "all")))
         include_names = bool(args.get("include_names", False))
         limit = int(args.get("limit", 80))
-        return multi_agent_result(selected, lambda agent: skills_agent(agent, include_names, limit))
+        names_offset = int(args.get("names_offset", 0))
+        plugins_offset = int(args.get("plugins_offset", 0))
+        plugins_limit = int(args.get("plugins_limit", MAX_CAPABILITY_PLUGINS))
+        return multi_agent_result(
+            selected,
+            lambda agent: skills_agent(agent, include_names, limit, names_offset, plugins_offset, plugins_limit),
+        )
     if name == "agent_skill_match":
         selected = agent_ids(str(args.get("agent", "all")))
         return multi_agent_result(
@@ -1523,6 +1549,14 @@ TOOLS: list[dict[str, Any]] = [
                 "agent": {"type": "string", "enum": ["a", "b", "all"], "default": "all"},
                 "include_names": {"type": "boolean", "default": False},
                 "limit": {"type": "integer", "minimum": 0, "maximum": MAX_SKILL_NAMES, "default": 80},
+                "names_offset": {"type": "integer", "minimum": 0, "default": 0},
+                "plugins_offset": {"type": "integer", "minimum": 0, "default": 0},
+                "plugins_limit": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_SKILL_NAMES,
+                    "default": MAX_CAPABILITY_PLUGINS,
+                },
             },
             "additionalProperties": False,
         },
@@ -1848,6 +1882,9 @@ def main_cli(argv: list[str]) -> int:
     p_skills.add_argument("agent", choices=["a", "b", "all"], nargs="?", default="all")
     p_skills.add_argument("--include-names", action="store_true")
     p_skills.add_argument("--limit", type=int, default=80)
+    p_skills.add_argument("--names-offset", type=int, default=0)
+    p_skills.add_argument("--plugins-offset", type=int, default=0)
+    p_skills.add_argument("--plugins-limit", type=int, default=MAX_CAPABILITY_PLUGINS)
 
     p_skill_match = sub.add_parser("skill-match")
     p_skill_match.add_argument("agent", choices=["a", "b", "all"], nargs="?", default="all")
@@ -1964,7 +2001,14 @@ def main_cli(argv: list[str]) -> int:
             return print_json(
                 call_tool(
                     "agent_skills",
-                    {"agent": args.agent, "include_names": args.include_names, "limit": args.limit},
+                    {
+                        "agent": args.agent,
+                        "include_names": args.include_names,
+                        "limit": args.limit,
+                        "names_offset": args.names_offset,
+                        "plugins_offset": args.plugins_offset,
+                        "plugins_limit": args.plugins_limit,
+                    },
                 )
             )
         if args.command == "skill-match":

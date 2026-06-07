@@ -9,7 +9,9 @@ from unittest.mock import patch
 
 from codex_master.server import (
     MAX_ASSIGNMENT_LIST_ITEMS,
+    MAX_CAPABILITY_PLUGINS,
     MAX_SEND_TEXT,
+    MAX_SKILL_NAMES,
     MAX_TASK_TEXT,
     handle_rpc,
     main_cli,
@@ -61,9 +63,15 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("master_plugin_status", names)
         by_name = {tool["name"]: tool for tool in response["result"]["tools"]}
         assign_props = by_name["agent_assign"]["inputSchema"]["properties"]
+        skill_props = by_name["agent_skills"]["inputSchema"]["properties"]
         self.assertEqual(assign_props["task"]["maxLength"], MAX_TASK_TEXT)
         self.assertEqual(assign_props["context"]["maxItems"], MAX_ASSIGNMENT_LIST_ITEMS)
         self.assertEqual(by_name["agent_send"]["inputSchema"]["properties"]["text"]["maxLength"], MAX_SEND_TEXT)
+        self.assertEqual(skill_props["limit"]["maximum"], MAX_SKILL_NAMES)
+        self.assertEqual(skill_props["names_offset"]["minimum"], 0)
+        self.assertEqual(skill_props["plugins_offset"]["minimum"], 0)
+        self.assertEqual(skill_props["plugins_limit"]["default"], MAX_CAPABILITY_PLUGINS)
+        self.assertEqual(skill_props["plugins_limit"]["maximum"], MAX_SKILL_NAMES)
 
     def test_initialize_rejects_unsupported_protocol(self) -> None:
         response = handle_rpc(
@@ -274,6 +282,22 @@ class ServerHelpersTest(unittest.TestCase):
                         },
                     }
                 )
+                names_page = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 18,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "agent_skills",
+                            "arguments": {
+                                "agent": "a",
+                                "include_names": True,
+                                "limit": 2,
+                                "names_offset": 2,
+                            },
+                        },
+                    }
+                )
 
         self.assertIsNotNone(response)
         self.assertFalse(response["result"]["isError"])
@@ -283,14 +307,28 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(payload["by_source"]["system"], 2)
         self.assertEqual(payload["by_source"]["plugin_cache"], 1)
         self.assertEqual(payload["by_source"]["tmp_plugin_cache"], 1)
+        self.assertEqual(payload["plugin_count"], 2)
+        self.assertEqual(payload["plugins_limit"], 20)
         self.assertEqual(payload["plugins"]["github@openai-curated"], 1)
         self.assertEqual(payload["plugins"]["codex-security@tmp"], 1)
+        self.assertFalse(payload["plugins_truncated"])
         self.assertEqual(payload["skill_file_contents"], "not_returned")
         self.assertEqual(payload["raw_output"], "not_returned")
+        self.assertEqual(payload["names_total"], 4)
+        self.assertEqual(payload["names_offset"], 0)
         self.assertEqual(payload["names_limit"], 2)
         self.assertEqual(len(payload["names"]), 2)
         self.assertTrue(payload["names_truncated"])
         self.assertNotIn("SECRET_SKILL_CONTENT_SHOULD_NOT_LEAK", payload_text)
+
+        self.assertFalse(names_page["result"]["isError"])
+        names_page_payload = json.loads(names_page["result"]["content"][0]["text"])["results"][0]
+        self.assertEqual(names_page_payload["names_total"], 4)
+        self.assertEqual(names_page_payload["names_offset"], 2)
+        self.assertEqual(names_page_payload["names_limit"], 2)
+        self.assertEqual(len(names_page_payload["names"]), 2)
+        self.assertFalse(names_page_payload["names_truncated"])
+        self.assertNotIn("SECRET_SKILL_CONTENT_SHOULD_NOT_LEAK", json.dumps(names_page_payload, sort_keys=True))
 
     def test_skill_match_and_capabilities_are_data_sparse(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -308,6 +346,25 @@ class ServerHelpersTest(unittest.TestCase):
                 {"b": {"label": "B", "runner": home / "codex", "home": home, "session": "session-b"}},
                 clear=False,
             ):
+                skills = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 42,
+                        "method": "tools/call",
+                        "params": {"name": "agent_skills", "arguments": {"agent": "b"}},
+                    }
+                )
+                skills_next_page = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 43,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "agent_skills",
+                            "arguments": {"agent": "b", "plugins_offset": 20, "plugins_limit": 10},
+                        },
+                    }
+                )
                 match = handle_rpc(
                     {
                         "jsonrpc": "2.0",
@@ -325,6 +382,22 @@ class ServerHelpersTest(unittest.TestCase):
                     }
                 )
 
+        self.assertFalse(skills["result"]["isError"])
+        skills_payload = json.loads(skills["result"]["content"][0]["text"])["results"][0]
+        self.assertEqual(skills_payload["plugin_count"], 26)
+        self.assertEqual(skills_payload["plugins_offset"], 0)
+        self.assertEqual(skills_payload["plugins_limit"], 20)
+        self.assertTrue(skills_payload["plugins_truncated"])
+        self.assertEqual(len(skills_payload["plugins"]), 20)
+
+        self.assertFalse(skills_next_page["result"]["isError"])
+        next_page_payload = json.loads(skills_next_page["result"]["content"][0]["text"])["results"][0]
+        self.assertEqual(next_page_payload["plugin_count"], 26)
+        self.assertEqual(next_page_payload["plugins_offset"], 20)
+        self.assertEqual(next_page_payload["plugins_limit"], 10)
+        self.assertEqual(len(next_page_payload["plugins"]), 6)
+        self.assertFalse(next_page_payload["plugins_truncated"])
+
         self.assertFalse(match["result"]["isError"])
         match_payload = json.loads(match["result"]["content"][0]["text"])["results"][0]
         match_text = json.dumps(match_payload, sort_keys=True)
@@ -337,9 +410,12 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(capability_payload["models"]["default"], "gpt-5.4-mini")
         self.assertEqual(capability_payload["models"]["write"], "gpt-5.3-codex-spark")
         self.assertEqual(capability_payload["master_mcp_tools"], "not_configured_for_agent")
+        self.assertEqual(capability_payload["plugin_count"], 26)
+        self.assertEqual(capability_payload["plugin_page_count"], 20)
+        self.assertEqual(capability_payload["plugins_offset"], 0)
         self.assertEqual(capability_payload["plugins_limit"], 20)
         self.assertTrue(capability_payload["plugins_truncated"])
-        self.assertLessEqual(len(capability_payload["plugins"]), 20)
+        self.assertEqual(len(capability_payload["plugins"]), 20)
 
     def test_scope_check_blocks_writes_outside_scope(self) -> None:
         response = handle_rpc(

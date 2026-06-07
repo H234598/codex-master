@@ -28,7 +28,7 @@ not return raw output by default. Existing metadata under the old
 - `agent_skills`: data-sparse skill inventory without file contents
 - `agent_skill_match`: check whether one or all Agentinnen have a named skill
 - `agent_capabilities`: summarized model, skill, and policy capabilities with a
-  capped plugin sample
+  bounded plugin page
 - `agent_scope_check`: verify write paths stay inside assignment scope
 - `agent_assign`: structured, skill-aware assignment with explicit boundaries
 - `agent_assign_readonly`: shortcut for read-only Exploriererin assignments
@@ -60,6 +60,7 @@ python3 -m codex_master.server start both --cwd /home/teladi/codex-master
 python3 -m codex_master.server status
 python3 -m codex_master.server capabilities all
 python3 -m codex_master.server skills all
+python3 -m codex_master.server skills a --include-names --limit 20 --names-offset 20 --plugins-offset 20 --plugins-limit 20
 python3 -m codex_master.server skill-match all codex-security:security-scan
 python3 -m codex_master.server scope-check --scope src/codex_master --write-path src/codex_master/server.py
 python3 -m codex_master.server assign-readonly a --skill codex-security:security-scan --scope src/codex_master/server.py --task "Pruefe nur lesend und berichte knapp."
@@ -94,14 +95,20 @@ python3 -m codex_master.server stop both
 `skills`
 - scans each Agentin home for `SKILL.md` files in `skills/`, `plugins/cache/`,
   and `.tmp/plugins/`
-- returns counts, roots, system-skill names, and plugin skill counts
+- returns counts, roots, system-skill names, and bounded plugin/name pages
+- reports `plugin_count`, `plugins_offset`, `plugins_limit`, and
+  `plugins_truncated` instead of dumping every plugin name when many are
+  installed
+- supports deliberate enumeration through `plugins_offset`/`plugins_limit` and,
+  with `include_names`, `names_offset`/`limit`
 - returns no skill file contents and no Agentin terminal output
 
 `capabilities`
-- returns the model policy, total skill count, system skill names, and a capped
-  plugin-count sample
-- reports `plugin_count`, `plugins_limit`, and `plugins_truncated` instead of
-  dumping every plugin name when many are installed
+- returns the model policy, total skill count, system skill names, and a bounded
+  first plugin page
+- reports `plugin_count`, `plugin_page_count`, `plugins_limit`, and
+  `plugins_truncated` instead of dumping every plugin name when many are
+  installed
 
 ## Steering Skills
 
