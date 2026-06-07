@@ -38,6 +38,7 @@ MAX_TAIL_CHARS = 8192
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
 MCP_SERVER_NAME = "codex-master-mcp"
 DEFAULT_INSTALL_PATH = Path("~/.local/bin/codex-master-mcp").expanduser()
+MAX_SKILL_NAMES = 200
 
 
 AGENTS = {
@@ -285,6 +286,101 @@ def status_agent(agent: str) -> dict[str, Any]:
         "raw_log_bytes": raw_size,
         "raw_output": "not_returned",
     }
+
+
+def skill_scan_roots(home: Path) -> list[tuple[str, Path]]:
+    return [
+        ("system", home / "skills"),
+        ("plugin_cache", home / "plugins" / "cache"),
+        ("tmp_plugin_cache", home / ".tmp" / "plugins"),
+    ]
+
+
+def safe_relative(path: Path, base: Path) -> str:
+    try:
+        return str(path.relative_to(base))
+    except ValueError:
+        return str(path)
+
+
+def parse_skill_path(home: Path, path: Path) -> dict[str, str]:
+    rel = path.relative_to(home)
+    parts = rel.parts
+    info = {"name": path.parent.name, "source": "unknown", "plugin": ""}
+
+    if len(parts) >= 4 and parts[0] == "skills" and parts[1] == ".system":
+        return {"name": parts[2], "source": "system", "plugin": ""}
+
+    if len(parts) >= 6 and parts[:3] == ("plugins", "cache", "openai-curated"):
+        return {"name": path.parent.name, "source": "plugin_cache", "plugin": f"{parts[3]}@openai-curated"}
+
+    if len(parts) >= 6 and parts[:3] == (".tmp", "plugins", "plugins"):
+        return {"name": path.parent.name, "source": "tmp_plugin_cache", "plugin": f"{parts[3]}@tmp"}
+
+    if len(parts) >= 6 and parts[:4] == (".tmp", "plugins", ".agents", "skills"):
+        return {"name": parts[4], "source": "tmp_agent_skills", "plugin": "agents@tmp"}
+
+    return info
+
+
+def list_skill_files(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    return sorted(path for path in root.rglob("SKILL.md") if path.is_file())
+
+
+def skills_agent(agent: str, include_names: bool = False, limit: int = 80) -> dict[str, Any]:
+    cfg = AGENTS[agent]
+    home = cfg["home"]
+    limit = max(0, min(int(limit), MAX_SKILL_NAMES))
+
+    all_paths: list[Path] = []
+    roots: list[dict[str, Any]] = []
+    for kind, root in skill_scan_roots(home):
+        paths = list_skill_files(root)
+        roots.append({"kind": kind, "path": str(root), "exists": root.exists(), "skill_count": len(paths)})
+        all_paths.extend(paths)
+
+    by_source: dict[str, int] = {}
+    by_plugin: dict[str, int] = {}
+    system_skills: list[str] = []
+    names: list[dict[str, str]] = []
+
+    for path in sorted(set(all_paths)):
+        parsed = parse_skill_path(home, path)
+        source = parsed["source"]
+        by_source[source] = by_source.get(source, 0) + 1
+        if parsed["plugin"]:
+            by_plugin[parsed["plugin"]] = by_plugin.get(parsed["plugin"], 0) + 1
+        if source == "system":
+            system_skills.append(parsed["name"])
+        if include_names and len(names) < limit:
+            names.append(
+                {
+                    "name": parsed["name"],
+                    "source": source,
+                    "plugin": parsed["plugin"],
+                    "path": safe_relative(path, home),
+                }
+            )
+
+    result: dict[str, Any] = {
+        "agent": agent,
+        "label": cfg["label"],
+        "home": str(home),
+        "total": len(set(all_paths)),
+        "roots": roots,
+        "by_source": dict(sorted(by_source.items())),
+        "system_skills": sorted(set(system_skills)),
+        "plugins": dict(sorted(by_plugin.items())),
+        "skill_file_contents": "not_returned",
+        "raw_output": "not_returned",
+    }
+    if include_names:
+        result["names_limit"] = limit
+        result["names"] = names
+        result["names_truncated"] = len(set(all_paths)) > len(names)
+    return result
 
 
 def command_excerpt(text: str, chars: int = 1200) -> tuple[str, bool]:
@@ -568,6 +664,11 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "agent_status":
         selected = agent_ids(str(args.get("agent", "all")))
         return multi_agent_result(selected, status_agent)
+    if name == "agent_skills":
+        selected = agent_ids(str(args.get("agent", "all")))
+        include_names = bool(args.get("include_names", False))
+        limit = int(args.get("limit", 80))
+        return multi_agent_result(selected, lambda agent: skills_agent(agent, include_names, limit))
     if name == "agent_doctor":
         return doctor()
     if name == "agent_send":
@@ -663,6 +764,19 @@ TOOLS: list[dict[str, Any]] = [
                 "source": {"type": "string", "enum": ["pane", "log"], "default": "pane"},
                 "lines": {"type": "integer", "minimum": 1, "maximum": MAX_TAIL_LINES, "default": 40},
                 "chars": {"type": "integer", "minimum": 1, "maximum": MAX_TAIL_CHARS, "default": 4000},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_skills",
+        "description": "Return data-sparse skill inventory for one or all Agentinnen. Does not return skill file contents.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string", "enum": ["a", "b", "all"], "default": "all"},
+                "include_names": {"type": "boolean", "default": False},
+                "limit": {"type": "integer", "minimum": 0, "maximum": MAX_SKILL_NAMES, "default": 80},
             },
             "additionalProperties": False,
         },
@@ -804,6 +918,11 @@ def main_cli(argv: list[str]) -> int:
     p_tail.add_argument("--lines", type=int, default=20)
     p_tail.add_argument("--chars", type=int, default=2000)
 
+    p_skills = sub.add_parser("skills")
+    p_skills.add_argument("agent", choices=["a", "b", "all"], nargs="?", default="all")
+    p_skills.add_argument("--include-names", action="store_true")
+    p_skills.add_argument("--limit", type=int, default=80)
+
     p_install = sub.add_parser("install")
     p_install.add_argument("--no-register", action="store_true")
     p_install.add_argument("--force", action="store_true")
@@ -834,6 +953,13 @@ def main_cli(argv: list[str]) -> int:
                 call_tool(
                     "agent_safe_tail",
                     {"agent": args.agent, "source": args.source, "lines": args.lines, "chars": args.chars},
+                )
+            )
+        if args.command == "skills":
+            return print_json(
+                call_tool(
+                    "agent_skills",
+                    {"agent": args.agent, "include_names": args.include_names, "limit": args.limit},
                 )
             )
         if args.command == "install":

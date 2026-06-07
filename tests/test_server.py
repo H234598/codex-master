@@ -213,6 +213,53 @@ class ServerHelpersTest(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertIn("agent_start", {tool["name"] for tool in payload["tools"]})
 
+    def test_agent_skills_inventory_is_metadata_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            skill_paths = [
+                home / "skills" / ".system" / "openai-docs" / "SKILL.md",
+                home / "skills" / ".system" / "imagegen" / "SKILL.md",
+                home / "plugins" / "cache" / "openai-curated" / "github" / "hash" / "skills" / "github" / "SKILL.md",
+                home / ".tmp" / "plugins" / "plugins" / "codex-security" / "skills" / "security-scan" / "SKILL.md",
+            ]
+            for path in skill_paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("SECRET_SKILL_CONTENT_SHOULD_NOT_LEAK\n", encoding="utf-8")
+
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                response = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 17,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "agent_skills",
+                            "arguments": {"agent": "a", "include_names": True, "limit": 2},
+                        },
+                    }
+                )
+
+        self.assertIsNotNone(response)
+        self.assertFalse(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])["results"][0]
+        payload_text = json.dumps(payload, sort_keys=True)
+        self.assertEqual(payload["total"], 4)
+        self.assertEqual(payload["by_source"]["system"], 2)
+        self.assertEqual(payload["by_source"]["plugin_cache"], 1)
+        self.assertEqual(payload["by_source"]["tmp_plugin_cache"], 1)
+        self.assertEqual(payload["plugins"]["github@openai-curated"], 1)
+        self.assertEqual(payload["plugins"]["codex-security@tmp"], 1)
+        self.assertEqual(payload["skill_file_contents"], "not_returned")
+        self.assertEqual(payload["raw_output"], "not_returned")
+        self.assertEqual(payload["names_limit"], 2)
+        self.assertEqual(len(payload["names"]), 2)
+        self.assertTrue(payload["names_truncated"])
+        self.assertNotIn("SECRET_SKILL_CONTENT_SHOULD_NOT_LEAK", payload_text)
+
 
 class CliLifecycleTest(unittest.TestCase):
     @patch("codex_master.server.run_command")
