@@ -1149,10 +1149,6 @@ def release_agent(agent: str, force: bool = False) -> dict[str, Any]:
     }
 
 
-def require_agent_lease(agent: str, ttl_seconds: int = DEFAULT_AGENT_LEASE_SECONDS) -> dict[str, Any]:
-    return claim_agent(agent, ttl_seconds=ttl_seconds, force=False)["lease"]
-
-
 def claim_for_agent_mutation(agent: str) -> tuple[dict[str, Any], bool]:
     claim = claim_agent(agent)
     return claim["lease"], claim["status"] in {"claimed", "claimed_expired"}
@@ -1619,6 +1615,7 @@ def start_agent(
     cwd: str | None = None,
     prompt: str | None = None,
     lease: dict[str, Any] | None = None,
+    release_lease_on_failure: bool = False,
 ) -> dict[str, Any]:
     ensure_state()
     cfg = AGENTS[agent]
@@ -1670,7 +1667,7 @@ def start_agent(
     cp = run_tmux(["new-session", "-d", "-s", session, "-c", str(start_cwd), command], check=False)
     if cp.returncode != 0:
         cleanup_failed_start(session, raw_log, kill_session=False)
-        if lease and lease.get("held_by_this_server"):
+        if release_lease_on_failure and lease and lease.get("held_by_this_server"):
             release_agent(agent, force=True)
         raise AgentError(f"tmux start failed for agent {agent}: {command_error_text(cp.stderr)}")
 
@@ -1678,7 +1675,7 @@ def start_agent(
     pipe = run_tmux(["pipe-pane", "-o", "-t", session, pipe_command], check=False)
     if pipe.returncode != 0:
         cleanup_failed_start(session, raw_log, kill_session=True)
-        if lease and lease.get("held_by_this_server"):
+        if release_lease_on_failure and lease and lease.get("held_by_this_server"):
             release_agent(agent, force=True)
         raise AgentError(f"tmux pipe-pane failed for agent {agent}: {command_error_text(pipe.stderr)}")
 
@@ -1720,13 +1717,25 @@ def start_agent(
 def start_agent_with_lease(agent: str, cwd: Any = None, prompt: Any = None) -> dict[str, Any]:
     if tmux_alive(AGENTS[agent]["session"]):
         return start_agent(agent, cwd, prompt)
-    lease = require_agent_lease(agent)
+    claim = claim_agent(agent)
+    lease = claim["lease"]
+    release_on_completion = claim["status"] in {"claimed", "claimed_expired"}
     try:
-        return start_agent(agent, cwd, prompt, lease=lease)
+        result = start_agent(
+            agent,
+            cwd,
+            prompt,
+            lease=lease,
+            release_lease_on_failure=release_on_completion,
+        )
     except Exception:
-        if lease.get("held_by_this_server"):
+        if release_on_completion and agent_lease_status(agent).get("held_by_this_server"):
             release_agent(agent, force=True)
         raise
+    if release_on_completion and agent_lease_status(agent).get("held_by_this_server"):
+        release = release_agent(agent, force=True)
+        result["lease"] = release["lease"]
+    return result
 
 
 def stop_agent(agent: str, force: bool = False) -> dict[str, Any]:

@@ -139,6 +139,10 @@ Data minimization:
   client identity, prompt text, Agentin output, or state paths. `claim` may wait
   and retry in bounded polling loops without holding the Agentin lifecycle lock
   while sleeping.
+- Fresh `start` leases are transient and must be released after a successful
+  launch, so short-lived local CLI commands do not block the next command. A
+  pre-existing same-client claim must be preserved; use `claim` explicitly when
+  a connected Codex-CLI instance should reserve an Agentin after startup.
 - `capabilities` returns a bounded first plugin page plus counts/truncation
   flags, not a complete broad plugin inventory.
 - `skills` returns bounded plugin/name pages plus total counts, offsets, limits,

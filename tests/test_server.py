@@ -69,6 +69,7 @@ from codex_master.server import (
     run_tmux,
     send_agent,
     start_agent,
+    start_agent_with_lease,
     strip_ansi,
     trim_chars,
     trim_lines,
@@ -1919,6 +1920,73 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(blocked_payload["error_code"], "agent_lease_held_by_other_client")
         self.assertEqual(forced["status"], "released")
         self.assertEqual(forced["lease"]["state"], "unclaimed")
+
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("codex_master.server.start_agent")
+    def test_start_agent_with_lease_releases_fresh_successful_start(self, mock_start_agent, _mock_tmux_alive) -> None:
+        def fake_start(agent, cwd=None, prompt=None, lease=None, release_lease_on_failure=False):
+            return {
+                "agent": agent,
+                "status": "started",
+                "lease": lease,
+                "release_lease_on_failure": release_lease_on_failure,
+                "raw_output": "not_returned",
+            }
+
+        mock_start_agent.side_effect = fake_start
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch(
+                "codex_master.server.LEASE_DIR", state / "leases"
+            ):
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                    result = start_agent_with_lease("a", "/tmp/work", "hi")
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
+                    next_claim = claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
+
+        self.assertEqual(result["status"], "started")
+        self.assertEqual(result["lease"]["state"], "unclaimed")
+        self.assertTrue(mock_start_agent.call_args.kwargs["release_lease_on_failure"])
+        self.assertEqual(next_claim["status"], "claimed")
+
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("codex_master.server.start_agent")
+    def test_start_agent_with_lease_keeps_existing_same_client_claim(self, mock_start_agent, _mock_tmux_alive) -> None:
+        def fake_start(agent, cwd=None, prompt=None, lease=None, release_lease_on_failure=False):
+            return {
+                "agent": agent,
+                "status": "started",
+                "lease": lease,
+                "release_lease_on_failure": release_lease_on_failure,
+                "raw_output": "not_returned",
+            }
+
+        mock_start_agent.side_effect = fake_start
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch(
+                "codex_master.server.LEASE_DIR", state / "leases"
+            ):
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                    claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
+                    result = start_agent_with_lease("a", "/tmp/work", "hi")
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
+                    with self.assertRaisesRegex(AgentError, "leased by another MCP client"):
+                        claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
+
+        self.assertEqual(result["status"], "started")
+        self.assertEqual(result["lease"]["holder"], "this_server")
+        self.assertFalse(mock_start_agent.call_args.kwargs["release_lease_on_failure"])
 
     def test_agent_claim_wait_rejects_invalid_direct_interval_values(self) -> None:
         with self.assertRaisesRegex(AgentError, "wait_seconds must be an integer"):

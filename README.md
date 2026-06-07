@@ -44,6 +44,10 @@ return structured retry metadata (`error_code`, `retryable`,
 `retry_after_seconds`, and remaining lease seconds) without exposing client
 identity. `agent_claim` can wait and retry in bounded polling loops; its default
 poll interval is 30 seconds and the maximum poll interval is 900 seconds.
+`agent_start` uses only a transient fresh lease and releases it after a
+successful start, so short-lived local CLI commands do not block the next
+operator command. Use `agent_claim` explicitly when a connected Codex-CLI
+instance should keep an Agentin reserved after startup.
 `agent_status` classifies bounded pane/log text without returning it, so callers
 can distinguish likely daily, weekly, token, quota, or rate limits from ordinary
 "no response yet" states. The classification keeps default Agentinnen-model
@@ -309,6 +313,10 @@ of separate submitted lines.
 Before mutating one Agentin, `start`, `assign-*`, `send`, `report-request`,
 `interrupt`, and `stop` check or renew a per-Agentin lease. A second MCP client
 gets a structured retryable error instead of writing into the same tmux session.
+Fresh `start` leases are released again after a successful launch; this keeps
+the local CLI usable across separate invocations while still serializing the
+start operation itself. Existing claims held by the same connected client are
+preserved.
 Use `claim --wait-seconds ...` when a Codex-CLI instance should wait for a busy
 Agentin and retry with bounded polling. Lease state is metadata only and does
 not return the client identity, prompt text, Agentin output, or local state path.
