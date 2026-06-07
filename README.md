@@ -180,6 +180,9 @@ python3 -m codex_master.server stop both
 - rejects hardlinked plugin source files and keeps only the current plus the
   most recent valid cached plugin versions, without pruning invalid or symlinked
   cache entries
+- copies regular plugin-cache source files through no-follow file descriptors
+  and verifies source identity after opening, so a source swap cannot redirect
+  cache contents
 - creates nonce-suffixed plugin-cache temp directories and never removes a
   pre-existing temp directory that this sync did not create
 - refuses to register the Master MCP from a managed Agentinnen `CODEX_HOME`
@@ -197,6 +200,8 @@ python3 -m codex_master.server stop both
 - unregisters from `codex mcp remove codex-master-mcp`
 - removes `~/.local/bin/codex-master-mcp`
 - requires the install-path parent chain to be real directories when removing
+- removes the install symlink through the verified parent directory fd, so a
+  parent swap after validation cannot redirect the unlink
 - leaves broken, looping, or unreadable install symlinks in place unless they
   resolve to the repo wrapper
 - returns JSON and no raw secret material

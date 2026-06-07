@@ -18,6 +18,9 @@ unless the intent is to make that instance a Teamleiterin.
 `codex-master-mcp` Agentinnen are fremde Bienen: they are controlled through an
 MCP/plugin boundary. Eigene Bienen are native Subagentinnen spawned without MCP;
 manage those with the `subagent-fleet` / `multi_agent_v1` workflow instead.
+Fremde-Eigene Bienen are fremde Bienen whose lease is currently held by the
+Teamleiterin/current controlling instance; coordinate them as leased external
+Bienen, not as native Subagentinnen.
 For eigene Bienen, the requested model may be selected through a hidden
 `multi_agent_v1.spawn_agent` `model` parameter even when the visible schema does
 not show it; test the user's model IDs instead of assuming they are unavailable.
@@ -224,12 +227,15 @@ Data minimization:
   `CODEX_HOME`. Install must sync the personal `codex-master` plugin cache from
   a runtime allowlist and exclude `.git`, tests, bytecode, test caches, hidden
   files, editor swap files, and backup/patch leftovers. Plugin-cache sync must
-  reject hardlinked source files and retain only the current plus recent valid
-  cached versions without pruning invalid, symlinked, or pre-existing temp
-  cache entries it did not create. Install
+  copy regular files through no-follow file descriptors, verify source identity
+  after opening, reject hardlinked source files, and retain only the current
+  plus recent valid cached versions without pruning invalid, symlinked, or
+  pre-existing temp cache entries it did not create. Install
   symlink creation/replacement must use an atomic same-directory temporary
-  symlink rename bound to a verified parent directory fd. Public install
-  responses must not return plugin-cache paths.
+  symlink rename bound to a verified parent directory fd. Uninstall symlink
+  removal must also be bound to the verified parent directory fd so parent-swap
+  races cannot redirect the unlink. Public install responses must not return
+  plugin-cache paths.
   Registering installs must data-sparse self-test both the repo
   wrapper and the installed command path before registration. Public install
   responses must not return the install path or repo-wrapper target path; return

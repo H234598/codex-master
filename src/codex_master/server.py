@@ -2953,6 +2953,38 @@ def replace_install_symlink(install_path: Path, wrapper: Path) -> None:
             os.close(parent_fd)
 
 
+def remove_install_symlink_if_repo_wrapper(install_path: Path, wrapper: Path) -> str:
+    parent_fd = -1
+    try:
+        parent_fd = open_real_directory_fd(install_path.parent, "could_not_remove_install_symlink")
+        try:
+            current = os.lstat(install_path.name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return "missing"
+        except OSError as exc:
+            raise AgentError("could_not_remove_install_symlink") from exc
+        if not stat_module.S_ISLNK(current.st_mode):
+            return "left_in_place_not_repo_wrapper"
+        try:
+            target_text = os.readlink(install_path.name, dir_fd=parent_fd)
+        except OSError as exc:
+            raise AgentError("could_not_remove_install_symlink") from exc
+        target = Path(target_text)
+        resolved_target = resolve_path_no_throw(target if target.is_absolute() else install_path.parent / target)
+        if resolved_target != wrapper:
+            return "left_in_place_not_repo_wrapper"
+        try:
+            os.unlink(install_path.name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return "missing"
+        except OSError as exc:
+            raise AgentError("could_not_remove_install_symlink") from exc
+        return "removed"
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
 def integration_status() -> dict[str, Any]:
     return {
         "repo": PATH_NOT_RETURNED,
@@ -3222,6 +3254,56 @@ def plugin_cache_status(root: Path | None = None, cache_root: Path | None = None
     return result
 
 
+def copy_regular_plugin_file_no_follow(src: Path, dst: Path, expected_stat: os.stat_result) -> None:
+    source_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        source_flags |= os.O_NOFOLLOW
+    src_fd = -1
+    dst_fd = -1
+    dst_created = False
+    try:
+        src_fd = os.open(src, source_flags)
+        opened_stat = os.fstat(src_fd)
+        if (
+            not stat_module.S_ISREG(opened_stat.st_mode)
+            or getattr(opened_stat, "st_nlink", 1) > 1
+            or opened_stat.st_ino != expected_stat.st_ino
+            or opened_stat.st_dev != expected_stat.st_dev
+        ):
+            raise AgentError("plugin source changed during copy")
+        mode = stat_module.S_IMODE(opened_stat.st_mode)
+        target_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            target_flags |= os.O_NOFOLLOW
+        dst_fd = os.open(dst, target_flags, mode)
+        dst_created = True
+        while True:
+            chunk = os.read(src_fd, RAW_LOG_CHUNK_BYTES)
+            if not chunk:
+                break
+            offset = 0
+            while offset < len(chunk):
+                written = os.write(dst_fd, chunk[offset:])
+                if written <= 0:
+                    raise OSError("plugin cache copy made no progress")
+                offset += written
+        os.fchmod(dst_fd, mode)
+        os.utime(dst_fd, ns=(opened_stat.st_atime_ns, opened_stat.st_mtime_ns))
+        dst_created = False
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError("could_not_sync_plugin_cache") from exc
+    finally:
+        if src_fd >= 0:
+            os.close(src_fd)
+        if dst_fd >= 0:
+            os.close(dst_fd)
+        if dst_created:
+            with contextlib.suppress(OSError):
+                dst.unlink()
+
+
 def copy_plugin_cache_path(src: Path, dst: Path) -> dict[str, int]:
     try:
         src_stat = src.lstat()
@@ -3249,10 +3331,7 @@ def copy_plugin_cache_path(src: Path, dst: Path) -> dict[str, int]:
     if stat_module.S_ISREG(src_stat.st_mode):
         if getattr(src_stat, "st_nlink", 1) > 1:
             raise AgentError("plugin source contains unsupported hardlink")
-        try:
-            shutil.copy2(src, dst)
-        except OSError as exc:
-            raise AgentError("could_not_sync_plugin_cache") from exc
+        copy_regular_plugin_file_no_follow(src, dst, src_stat)
         return {"files": 1, "directories": 0}
     raise AgentError("plugin source contains unsupported file type")
 
@@ -3965,14 +4044,7 @@ def uninstall(unregister: bool = True, remove_symlink: bool = False, install_pat
     if remove_symlink:
         ensure_directory_chain_no_symlink(install_path.parent, "install parent directories must be real directories")
         wrapper = repo_wrapper_path()
-        resolved_install_path = resolve_path_no_throw(install_path) if install_path.is_symlink() else None
-        if install_path.is_symlink() and resolved_install_path == wrapper:
-            install_path.unlink()
-            symlink_status = "removed"
-        elif install_path.exists() or install_path.is_symlink():
-            symlink_status = "left_in_place_not_repo_wrapper"
-        else:
-            symlink_status = "missing"
+        symlink_status = remove_install_symlink_if_repo_wrapper(install_path, wrapper)
 
     return {"ok": True, "mcp": mcp_status, "symlink": symlink_status, "raw_output": "not_returned"}
 

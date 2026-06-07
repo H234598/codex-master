@@ -467,7 +467,9 @@ class ServerHelpersTest(unittest.TestCase):
             (root / ".mcp.json").write_text("{}", encoding="utf-8")
             (root / "README.md").write_text("readme", encoding="utf-8")
             (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
-            (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
+            bin_wrapper = root / "bin" / "codex-master-mcp"
+            bin_wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            bin_wrapper.chmod(bin_wrapper.stat().st_mode | stat.S_IXUSR)
             (root / "skills" / "codex-master-fleet" / "SKILL.md").write_text("skill", encoding="utf-8")
             (root / "src" / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
             (root / "src" / "codex_master" / "__pycache__" / "server.pyc").write_bytes(b"cache")
@@ -487,6 +489,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "app": (entry / ".app.json").exists(),
                 "mcp": (entry / ".mcp.json").exists(),
                 "bin": (entry / "bin" / "codex-master-mcp").exists(),
+                "bin_executable": os.access(entry / "bin" / "codex-master-mcp", os.X_OK),
                 "skill": (entry / "skills" / "codex-master-fleet" / "SKILL.md").exists(),
                 "server": (entry / "src" / "codex_master" / "server.py").exists(),
                 "git": (entry / ".git").exists(),
@@ -505,6 +508,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(copied_state["app"])
         self.assertTrue(copied_state["mcp"])
         self.assertTrue(copied_state["bin"])
+        self.assertTrue(copied_state["bin_executable"])
         self.assertTrue(copied_state["skill"])
         self.assertTrue(copied_state["server"])
         self.assertFalse(copied_state["git"])
@@ -552,7 +556,7 @@ class ServerHelpersTest(unittest.TestCase):
             root = tmp_path / "repo"
             cache = tmp_path / "cache"
             cache.mkdir()
-            version = "0.3.7+codex.test"
+            version = "0.3.8+codex.test"
             tmp_entry = cache / f".{version}.tmp.fixed.nonce"
             tmp_entry.mkdir()
             marker = tmp_entry / "marker"
@@ -610,6 +614,52 @@ class ServerHelpersTest(unittest.TestCase):
             tmp_entries = list(cache.glob(".*.tmp.*")) if cache.exists() else []
 
         self.assertFalse(entry_exists)
+        self.assertEqual(tmp_entries, [])
+
+    def test_sync_plugin_cache_from_repo_rejects_source_swap_to_symlink_during_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            root = tmp_path / "repo"
+            cache = tmp_path / "cache"
+            (root / ".codex-plugin").mkdir(parents=True)
+            (root / "bin").mkdir()
+            (root / "skills").mkdir()
+            (root / "src" / "codex_master").mkdir(parents=True)
+            payload = {"name": "codex-master", "version": "0.3.8+codex.test"}
+            (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
+            (root / ".app.json").write_text("{}", encoding="utf-8")
+            (root / ".mcp.json").write_text("{}", encoding="utf-8")
+            (root / "README.md").write_text("readme", encoding="utf-8")
+            (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
+            (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
+            (root / "skills" / "SKILL.md").write_text("skill", encoding="utf-8")
+            server = root / "src" / "codex_master" / "server.py"
+            server.write_text("print('ok')\n", encoding="utf-8")
+            redirected = tmp_path / "redirected.py"
+            redirected.write_text("SECRET_SHOULD_NOT_COPY\n", encoding="utf-8")
+            real_open = os.open
+            swapped = False
+
+            def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+                nonlocal swapped
+                if not swapped and dir_fd is None and Path(path) == server:
+                    swapped = True
+                    server.unlink()
+                    server.symlink_to(redirected)
+                if dir_fd is None:
+                    return real_open(path, flags, mode)
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False), patch(
+                "codex_master.server.os.open", side_effect=swapping_open
+            ):
+                with self.assertRaisesRegex(AgentError, "could_not_sync_plugin_cache"):
+                    sync_plugin_cache_from_repo(root, cache)
+            entry = cache / "0.3.8+codex.test"
+            tmp_entries = list(cache.glob(".*.tmp.*")) if cache.exists() else []
+
+        self.assertTrue(swapped)
+        self.assertFalse(entry.exists())
         self.assertEqual(tmp_entries, [])
 
     def test_sync_plugin_cache_from_repo_prunes_old_valid_versions_without_touching_invalid_entries(self) -> None:
@@ -1022,7 +1072,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.3.7+codex.test",
+            "version": "0.3.8+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1049,7 +1099,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.3.7")
+        self.assertEqual(result["expected_tag"], "v0.3.8")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -3950,6 +4000,40 @@ class CliLifecycleTest(unittest.TestCase):
             with self.assertRaisesRegex(AgentError, "install parent directories must be real directories") as raised:
                 from codex_master.server import uninstall
 
+                uninstall(unregister=False, remove_symlink=True, install_path=link_bin / "codex-master-mcp")
+
+            redirected_is_symlink = redirected.is_symlink()
+
+        self.assertTrue(redirected_is_symlink)
+        self.assertNotIn(str(link_bin), str(raised.exception))
+        self.assertNotIn(str(real_bin), str(raised.exception))
+
+    @patch("codex_master.server.repo_wrapper_path")
+    @patch("codex_master.server.ensure_directory_chain_no_symlink")
+    def test_uninstall_refuses_parent_swap_after_validation_without_removing_redirected_link(
+        self, mock_ensure_chain, mock_wrapper_path
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            real_bin = tmp_path / "real-bin"
+            link_bin = tmp_path / "link-bin"
+            redirected = real_bin / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            real_bin.mkdir()
+            redirected.symlink_to(wrapper)
+            link_bin.mkdir()
+            mock_wrapper_path.return_value = wrapper
+
+            def swap_parent(path, _error_text):
+                if Path(path) == link_bin:
+                    link_bin.rmdir()
+                    link_bin.symlink_to(real_bin, target_is_directory=True)
+
+            mock_ensure_chain.side_effect = swap_parent
+
+            with self.assertRaisesRegex(AgentError, "could_not_remove_install_symlink") as raised:
                 uninstall(unregister=False, remove_symlink=True, install_path=link_bin / "codex-master-mcp")
 
             redirected_is_symlink = redirected.is_symlink()
