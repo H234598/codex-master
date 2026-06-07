@@ -19,6 +19,38 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Validate plugin manifests
+        run: |
+          python - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          root = Path.cwd()
+          plugin = json.loads((root / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+          app = json.loads((root / ".app.json").read_text(encoding="utf-8"))
+          mcp = json.loads((root / ".mcp.json").read_text(encoding="utf-8"))
+
+          semver = re.compile(
+              r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+              r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+              r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+          )
+          assert plugin["name"] == "codex-master"
+          assert semver.fullmatch(plugin["version"])
+          assert plugin["skills"] == "./skills/"
+          assert plugin["mcpServers"] == "./.mcp.json"
+          assert plugin["apps"] == "./.app.json"
+
+          app_entry = app["apps"]["codex-master"]
+          assert app_entry["id"].startswith(("connector_", "asdk_app_"))
+
+          server = mcp["mcpServers"]["codex-master-mcp"]
+          assert server["command"] == "python3"
+          assert "codex_master.server" in " ".join(server["args"])
+          assert server["startup_timeout_sec"] >= 120
+          PY
+
       - name: Compile Python sources
         run: python -m compileall -q src tests
 
