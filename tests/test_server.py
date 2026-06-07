@@ -705,13 +705,15 @@ class ServerHelpersTest(unittest.TestCase):
             tmp_path.symlink_to(target)
 
             with patch("codex_master.server.now_id", return_value="fixed"):
-                with self.assertRaisesRegex(AgentError, "temp file without following symlinks"):
+                with self.assertRaisesRegex(AgentError, "temp file without following symlinks") as raised:
                     replace_private_text(path, "safe\n")
 
             target_content = target.read_text(encoding="utf-8")
             tmp_is_symlink = tmp_path.is_symlink()
             path_exists = path.exists()
 
+        self.assertNotIn(str(tmp_path), str(raised.exception))
+        self.assertNotIn(str(target), str(raised.exception))
         self.assertEqual(target_content, "external\n")
         self.assertTrue(tmp_is_symlink)
         self.assertFalse(path_exists)
@@ -726,12 +728,14 @@ class ServerHelpersTest(unittest.TestCase):
             with patch("codex_master.server.STATE_ROOT", state_root), patch(
                 "codex_master.server.RAW_DIR", state_root / "raw"
             ), patch("codex_master.server.META_DIR", state_root / "meta"):
-                with self.assertRaisesRegex(AgentError, "must not be a symlink"):
+                with self.assertRaisesRegex(AgentError, "must not be a symlink") as raised:
                     ensure_state()
 
             target_exists = target.is_dir()
             link_is_symlink = state_root.is_symlink()
 
+        self.assertNotIn(str(state_root), str(raised.exception))
+        self.assertNotIn(str(target), str(raised.exception))
         self.assertTrue(target_exists)
         self.assertTrue(link_is_symlink)
 
@@ -743,8 +747,10 @@ class ServerHelpersTest(unittest.TestCase):
             with patch("codex_master.server.STATE_ROOT", state_root), patch(
                 "codex_master.server.RAW_DIR", state_root / "raw"
             ), patch("codex_master.server.META_DIR", state_root / "meta"):
-                with self.assertRaisesRegex(AgentError, "not a directory"):
+                with self.assertRaisesRegex(AgentError, "not a directory") as raised:
                     ensure_state()
+
+        self.assertNotIn(str(state_root), str(raised.exception))
 
     def test_record_assignment_refuses_symlink_log_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -754,11 +760,13 @@ class ServerHelpersTest(unittest.TestCase):
             link.symlink_to(target)
 
             with patch("codex_master.server.ASSIGNMENT_LOG", link), patch("codex_master.server.ensure_state"):
-                with self.assertRaisesRegex(AgentError, "without following symlinks"):
+                with self.assertRaisesRegex(AgentError, "without following symlinks") as raised:
                     record_assignment({"assignment_id": "1", "agent": "a"})
             target_content = target.read_text(encoding="utf-8")
             link_is_symlink = link.is_symlink()
 
+        self.assertNotIn(str(link), str(raised.exception))
+        self.assertNotIn(str(target), str(raised.exception))
         self.assertEqual(target_content, "external\n")
         self.assertTrue(link_is_symlink)
 
@@ -1143,12 +1151,14 @@ class ServerHelpersTest(unittest.TestCase):
             ), patch(
                 "codex_master.server.now_id", return_value="fixed"
             ):
-                with self.assertRaisesRegex(AgentError, "without following symlinks"):
+                with self.assertRaisesRegex(AgentError, "without following symlinks") as raised:
                     start_agent("a", cwd=tmpdir)
                 target_content = target.read_text(encoding="utf-8")
                 link_is_symlink = link.is_symlink()
 
         mock_run_tmux.assert_not_called()
+        self.assertNotIn(str(link), str(raised.exception))
+        self.assertNotIn(str(target), str(raised.exception))
         self.assertEqual(target_content, "external\n")
         self.assertTrue(link_is_symlink)
 

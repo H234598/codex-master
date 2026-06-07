@@ -100,7 +100,8 @@ Data minimization:
 - Assignment audit retention is bounded to the newest 500 valid metadata
   records in a local `0600` JSONL file. Assignment-log reads require regular
   files, are capped, and use generic errors. Private state appends refuse
-  symlink paths, Agentin metadata is written atomically, and temporary replace
+  symlink paths, and private state file/directory errors must not expose local
+  state paths. Agentin metadata is written atomically, and temporary replace
   files are created with no-follow exclusive semantics. Agentin metadata reads
   reject symlinked and oversized files, and metadata presence checks do not
   follow symlinks. Metadata read errors and legacy source markers must not

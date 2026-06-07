@@ -20,12 +20,13 @@ semantics. The direct raw-log writer also requires the managed state directories
 to be real directories, not symlinks, and legacy raw-log directories are ignored
 when they are symlinks. Agentin runners must be regular executable files, not
 symlinks. Assignment-log reads require regular files, are capped, and use
-generic errors. Agentin metadata presence checks do not follow symlinks,
-metadata reads reject symlinked and oversized files, and metadata read errors
-use generic markers rather than local file paths. Safe-tail log reads ignore
-non-regular raw-log targets. Tmux control errors are redacted and bounded before
-they are returned or raised. MCP tool responses do not return raw output by
-default and expose raw-log presence without returning local raw-log paths.
+generic errors. Private state file and directory errors are generic and avoid
+returning local state paths. Agentin metadata presence checks do not follow
+symlinks, metadata reads reject symlinked and oversized files, and metadata read
+errors use generic markers rather than local file paths. Safe-tail log reads
+ignore non-regular raw-log targets. Tmux control errors are redacted and bounded
+before they are returned or raised. MCP tool responses do not return raw output
+by default and expose raw-log presence without returning local raw-log paths.
 Existing metadata under the old `codex-agent-mcp` state directory is still read
 as a migration fallback.
 

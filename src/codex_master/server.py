@@ -128,15 +128,15 @@ def ensure_private_dir(path: Path) -> None:
         path.mkdir(parents=True, exist_ok=False)
         current = path.lstat()
     if stat_module.S_ISLNK(current.st_mode):
-        raise AgentError(f"private state directory must not be a symlink: {path}")
+        raise AgentError("private state directory must not be a symlink")
     if not stat_module.S_ISDIR(current.st_mode):
-        raise AgentError(f"private state path is not a directory: {path}")
+        raise AgentError("private state path is not a directory")
     try:
         current = path.lstat()
     except FileNotFoundError as exc:
-        raise AgentError(f"private state directory disappeared: {path}") from exc
+        raise AgentError("private state directory disappeared") from exc
     if stat_module.S_ISLNK(current.st_mode) or not stat_module.S_ISDIR(current.st_mode):
-        raise AgentError(f"private state directory changed unexpectedly: {path}")
+        raise AgentError("private state directory changed unexpectedly")
     try:
         path.chmod(0o700)
     except PermissionError:
@@ -308,7 +308,7 @@ def read_private_regular_text(path: Path, max_bytes: int, error_text: str) -> st
 
 
 def replace_private_bytes(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)
     tmp_path = path.with_name(f".{path.name}.{now_id()}.tmp")
     tmp_created = False
     try:
@@ -329,18 +329,18 @@ def replace_private_bytes(path: Path, data: bytes) -> None:
 
 
 def write_private_new_bytes(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
         fd = os.open(path, flags, 0o600)
     except OSError as exc:
-        raise AgentError(f"could not create private state temp file without following symlinks: {path}") from exc
+        raise AgentError("could not create private state temp file without following symlinks") from exc
     try:
         current_stat = os.fstat(fd)
         if not stat_module.S_ISREG(current_stat.st_mode):
-            raise AgentError(f"private state temp path is not a regular file: {path}")
+            raise AgentError("private state temp path is not a regular file")
         try:
             os.fchmod(fd, 0o600)
         except PermissionError:
@@ -359,18 +359,18 @@ def write_private_new_bytes(path: Path, data: bytes) -> None:
 
 
 def open_private_regular_update(path: Path) -> Any:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)
     flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
         fd = os.open(path, flags, 0o600)
     except OSError as exc:
-        raise AgentError(f"could not open private state file without following symlinks: {path}") from exc
+        raise AgentError("could not open private state file without following symlinks") from exc
     try:
         current_stat = os.fstat(fd)
         if not stat_module.S_ISREG(current_stat.st_mode):
-            raise AgentError(f"private state path is not a regular file: {path}")
+            raise AgentError("private state path is not a regular file")
         try:
             os.fchmod(fd, 0o600)
         except PermissionError:
