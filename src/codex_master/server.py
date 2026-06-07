@@ -2162,7 +2162,47 @@ def validate_tool_call(name: Any, args: Any) -> tuple[str, dict[str, Any]]:
     missing = [field for field in schema.get("required", []) if field not in args or args[field] is None]
     if missing:
         raise AgentError(f"missing required argument(s) for {name}: {', '.join(missing)}")
+    for field, value in args.items():
+        validate_schema_value(field, value, properties[field])
     return name, args
+
+
+def validate_schema_value(field: str, value: Any, schema: dict[str, Any]) -> None:
+    value_type = schema.get("type")
+    if value_type == "string":
+        if not isinstance(value, str):
+            raise AgentError(f"{field} must be a string")
+        allowed = schema.get("enum")
+        if allowed and value not in allowed:
+            raise AgentError(f"{field} must be one of: {', '.join(allowed)}")
+        max_length = schema.get("maxLength")
+        if isinstance(max_length, int) and len(value) > max_length:
+            raise AgentError(f"{field} must not exceed {max_length} characters")
+        return
+    if value_type == "integer":
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise AgentError(f"{field} must be an integer")
+        minimum = schema.get("minimum")
+        maximum = schema.get("maximum")
+        if isinstance(minimum, int) and value < minimum:
+            raise AgentError(f"{field} must be >= {minimum}")
+        if isinstance(maximum, int) and value > maximum:
+            raise AgentError(f"{field} must be <= {maximum}")
+        return
+    if value_type == "boolean":
+        if not isinstance(value, bool):
+            raise AgentError(f"{field} must be a boolean")
+        return
+    if value_type == "array":
+        if not isinstance(value, list):
+            raise AgentError(f"{field} must be an array")
+        max_items = schema.get("maxItems")
+        if isinstance(max_items, int) and len(value) > max_items:
+            raise AgentError(f"{field} must contain at most {max_items} items")
+        item_schema = schema.get("items", {})
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                validate_schema_value(f"{field}[{index}]", item, item_schema)
 
 
 def rpc_result(message_id: Any, result: Any) -> dict[str, Any]:

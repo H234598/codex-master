@@ -241,6 +241,53 @@ class ServerHelpersTest(unittest.TestCase):
         missing_payload = json.loads(missing_response["result"]["content"][0]["text"])
         self.assertEqual(missing_payload["error"], "missing required argument(s) for agent_send: text")
 
+    def test_mcp_tool_call_enforces_schema_value_types_and_bounds(self) -> None:
+        wrong_type = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 37,
+                "method": "tools/call",
+                "params": {"name": "agent_status", "arguments": {"agent": 1}},
+            }
+        )
+        bad_enum = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 38,
+                "method": "tools/call",
+                "params": {"name": "agent_status", "arguments": {"agent": "both"}},
+            }
+        )
+        over_limit = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 39,
+                "method": "tools/call",
+                "params": {"name": "agent_skills", "arguments": {"limit": MAX_SKILL_NAMES + 1}},
+            }
+        )
+        bad_array = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 40,
+                "method": "tools/call",
+                "params": {"name": "agent_scope_check", "arguments": {"scope": "src"}},
+            }
+        )
+
+        self.assertTrue(wrong_type["result"]["isError"])
+        wrong_type_payload = json.loads(wrong_type["result"]["content"][0]["text"])
+        self.assertEqual(wrong_type_payload["error"], "agent must be a string")
+        self.assertTrue(bad_enum["result"]["isError"])
+        bad_enum_payload = json.loads(bad_enum["result"]["content"][0]["text"])
+        self.assertEqual(bad_enum_payload["error"], "agent must be one of: a, b, all")
+        self.assertTrue(over_limit["result"]["isError"])
+        over_limit_payload = json.loads(over_limit["result"]["content"][0]["text"])
+        self.assertEqual(over_limit_payload["error"], f"limit must be <= {MAX_SKILL_NAMES}")
+        self.assertTrue(bad_array["result"]["isError"])
+        bad_array_payload = json.loads(bad_array["result"]["content"][0]["text"])
+        self.assertEqual(bad_array_payload["error"], "scope must be an array")
+
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.pane_tail")
     @patch("codex_master.server.ensure_state")
@@ -254,7 +301,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 13,
                 "method": "tools/call",
-                "params": {"name": "agent_safe_tail", "arguments": {"agent": "a", "source": "pane", "lines": 120, "chars": 16000}},
+                "params": {"name": "agent_safe_tail", "arguments": {"agent": "a", "source": "pane", "lines": 80, "chars": 8192}},
             }
         )
         self.assertIsNotNone(response)
@@ -282,7 +329,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 14,
                 "method": "tools/call",
-                "params": {"name": "agent_safe_tail", "arguments": {"agent": "a", "source": "pane", "lines": 1, "chars": 40000}},
+                "params": {"name": "agent_safe_tail", "arguments": {"agent": "a", "source": "pane", "lines": 1, "chars": 8192}},
             }
         )
         self.assertIsNotNone(response)
@@ -1099,7 +1146,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(outside_scope["result"]["isError"])
         self.assertIn("write paths must stay inside scope", outside_scope["result"]["content"][0]["text"])
         self.assertTrue(long_task["result"]["isError"])
-        self.assertIn("task exceeds", long_task["result"]["content"][0]["text"])
+        self.assertIn("task must not exceed", long_task["result"]["content"][0]["text"])
         self.assertTrue(too_many_context_items["result"]["isError"])
         self.assertIn("context must contain at most", too_many_context_items["result"]["content"][0]["text"])
 
@@ -1117,7 +1164,7 @@ class ServerHelpersTest(unittest.TestCase):
         )
 
         self.assertTrue(response["result"]["isError"])
-        self.assertIn("text exceeds", response["result"]["content"][0]["text"])
+        self.assertIn("text must not exceed", response["result"]["content"][0]["text"])
 
 
 class CliLifecycleTest(unittest.TestCase):
