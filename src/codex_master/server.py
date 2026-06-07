@@ -39,6 +39,8 @@ SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
 MCP_SERVER_NAME = "codex-master-mcp"
 DEFAULT_INSTALL_PATH = Path("~/.local/bin/codex-master-mcp").expanduser()
 MAX_SKILL_NAMES = 200
+MAX_ASSIGNMENT_TEXT = 12000
+DEFAULT_AGENTIN_NAMES = {"a": "Mila", "b": "Nora"}
 
 
 AGENTS = {
@@ -383,6 +385,180 @@ def skills_agent(agent: str, include_names: bool = False, limit: int = 80) -> di
     return result
 
 
+def as_string_list(value: Any, *, field: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, list):
+        raise AgentError(f"{field} must be a string or list of strings")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise AgentError(f"{field} must contain only strings")
+        text = item.strip()
+        if text:
+            result.append(text)
+    return result
+
+
+def skill_matches(agent: str, skill_ref: str, limit: int = 8) -> list[dict[str, str]]:
+    cfg = AGENTS[agent]
+    home = cfg["home"]
+    wanted = skill_ref.strip().lower()
+    matches: list[dict[str, str]] = []
+
+    for _kind, root in skill_scan_roots(home):
+        for path in list_skill_files(root):
+            parsed = parse_skill_path(home, path)
+            name = parsed["name"].lower()
+            plugin = parsed["plugin"].lower()
+            plugin_base = plugin.split("@", 1)[0] if plugin else ""
+            candidates = {name}
+            if plugin_base:
+                candidates.add(f"{plugin_base}:{name}")
+                candidates.add(f"{plugin_base}/{name}")
+            if plugin:
+                candidates.add(f"{plugin}:{name}")
+                candidates.add(f"{plugin}/{name}")
+            if wanted in candidates:
+                matches.append(
+                    {
+                        "name": parsed["name"],
+                        "source": parsed["source"],
+                        "plugin": parsed["plugin"],
+                        "path": safe_relative(path, home),
+                    }
+                )
+                if len(matches) >= limit:
+                    return matches
+    return matches
+
+
+def bullet_block(items: list[str], fallback: str = "-") -> str:
+    if not items:
+        return fallback
+    return "\n".join(f"- {item}" for item in items)
+
+
+def assignment_prompt(
+    *,
+    agent: str,
+    role: str,
+    task: str,
+    scope: list[str],
+    skill: str | None,
+    write_paths: list[str],
+    context: list[str],
+    forbidden: list[str],
+    name: str | None,
+    allow_subagents: bool,
+) -> str:
+    display_name = (name or DEFAULT_AGENTIN_NAMES.get(agent) or "Arbeitsbiene").strip()
+    skill_line = skill.strip() if skill else "kein spezieller Skill vorgegeben"
+
+    if role == "exploriererin":
+        return "\n".join(
+            [
+                "[EXPLORER_BEE_TASK]",
+                f"Name: {display_name}",
+                "Rolle: Exploriererin",
+                f"Skill: {skill_line}",
+                f"Scope:\n{bullet_block(scope)}",
+                "Darf schreiben: nein",
+                f"Darf eigene Subagentinnen starten: {'ja, nur lesend im Scope' if allow_subagents else 'nein'}",
+                f"Stabiler Kontext:\n{bullet_block(context)}",
+                f"Aufgabe: {task}",
+                f"Grenzen:\n{bullet_block(forbidden)}",
+                "Rueckgabe: knappe Fakten, relevante Dateien/Zeilen, Empfehlung",
+            ]
+        )
+
+    return "\n".join(
+        [
+            "[WORK_BEE_TASK]",
+            f"Name: {display_name}",
+            "Rolle: Arbeitsbiene",
+            f"Skill: {skill_line}",
+            f"Scope:\n{bullet_block(scope)}",
+            f"Darf schreiben: ja, nur:\n{bullet_block(write_paths)}",
+            f"Darf eigene Subagentinnen starten: {'ja, nur innerhalb Scope und Schreibpfaden' if allow_subagents else 'nein'}",
+            f"Stabiler Kontext:\n{bullet_block(context)}",
+            f"Aktuelle Aufgabe: {task}",
+            f"Grenzen:\n{bullet_block(forbidden)}",
+            "Rueckgabe: Root Cause, Aenderung, Tests, offene Risiken",
+        ]
+    )
+
+
+def assign_agent(
+    agent: str,
+    *,
+    role: str,
+    task: str,
+    scope: list[str],
+    skill: str | None = None,
+    write_paths: list[str] | None = None,
+    context: list[str] | None = None,
+    forbidden: list[str] | None = None,
+    name: str | None = None,
+    enter: bool = True,
+    allow_missing_skill: bool = False,
+    allow_subagents: bool = False,
+) -> dict[str, Any]:
+    role = role.strip().lower()
+    if role not in {"exploriererin", "arbeitsbiene"}:
+        raise AgentError("role must be 'exploriererin' or 'arbeitsbiene'")
+    if not isinstance(task, str) or not task.strip():
+        raise AgentError("task must be a non-empty string")
+
+    write_paths = write_paths or []
+    context = context or []
+    forbidden = forbidden or []
+    if role == "exploriererin" and write_paths:
+        raise AgentError("exploriererin assignments must not include write paths")
+    if role == "arbeitsbiene" and not write_paths:
+        raise AgentError("arbeitsbiene assignments require at least one explicit write path")
+
+    matches: list[dict[str, str]] = []
+    if skill:
+        matches = skill_matches(agent, skill)
+        if not matches and not allow_missing_skill:
+            raise AgentError(f"skill not found for agent {agent}: {skill}")
+
+    prompt = assignment_prompt(
+        agent=agent,
+        role=role,
+        task=task.strip(),
+        scope=scope,
+        skill=skill,
+        write_paths=write_paths,
+        context=context,
+        forbidden=forbidden,
+        name=name,
+        allow_subagents=allow_subagents,
+    )
+    if len(prompt) > MAX_ASSIGNMENT_TEXT:
+        raise AgentError(f"assignment prompt exceeds {MAX_ASSIGNMENT_TEXT} characters")
+
+    sent = send_agent(agent, prompt, enter)
+    return {
+        "agent": agent,
+        "status": "assigned",
+        "role": role,
+        "name": name or DEFAULT_AGENTIN_NAMES.get(agent),
+        "skill": {"requested": skill, "available": bool(matches) if skill else None, "matches": matches[:5]},
+        "scope_count": len(scope),
+        "write_policy": "read_only" if role == "exploriererin" else "explicit_paths_only",
+        "write_path_count": len(write_paths),
+        "subagents_allowed": allow_subagents,
+        "prompt_chars": len(prompt),
+        "prompt_output": "not_returned",
+        "response_output": "not_returned",
+        "send": sent,
+    }
+
+
 def command_excerpt(text: str, chars: int = 1200) -> tuple[str, bool]:
     cleaned = strip_ansi(text)
     cleaned, redacted = redact(cleaned)
@@ -669,6 +845,24 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         include_names = bool(args.get("include_names", False))
         limit = int(args.get("limit", 80))
         return multi_agent_result(selected, lambda agent: skills_agent(agent, include_names, limit))
+    if name == "agent_assign":
+        selected = agent_ids(str(args.get("agent", "")))
+        if len(selected) != 1:
+            raise AgentError("agent_assign requires exactly one agent: a or b")
+        return assign_agent(
+            selected[0],
+            role=str(args.get("role", "")),
+            task=str(args.get("task", "")),
+            scope=as_string_list(args.get("scope"), field="scope"),
+            skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
+            write_paths=as_string_list(args.get("write_paths"), field="write_paths"),
+            context=as_string_list(args.get("context"), field="context"),
+            forbidden=as_string_list(args.get("forbidden"), field="forbidden"),
+            name=args.get("name") if isinstance(args.get("name"), str) else None,
+            enter=bool(args.get("enter", True)),
+            allow_missing_skill=bool(args.get("allow_missing_skill", False)),
+            allow_subagents=bool(args.get("allow_subagents", False)),
+        )
     if name == "agent_doctor":
         return doctor()
     if name == "agent_send":
@@ -777,6 +971,29 @@ TOOLS: list[dict[str, Any]] = [
                 "agent": {"type": "string", "enum": ["a", "b", "all"], "default": "all"},
                 "include_names": {"type": "boolean", "default": False},
                 "limit": {"type": "integer", "minimum": 0, "maximum": MAX_SKILL_NAMES, "default": 80},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_assign",
+        "description": "Send a structured, skill-aware assignment to one Agentin with explicit scope and write boundaries. Does not return the prompt or response output.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["agent", "role", "task"],
+            "properties": {
+                "agent": {"type": "string", "enum": ["a", "b"]},
+                "role": {"type": "string", "enum": ["exploriererin", "arbeitsbiene"]},
+                "task": {"type": "string"},
+                "skill": {"type": "string"},
+                "scope": {"type": "array", "items": {"type": "string"}, "default": []},
+                "write_paths": {"type": "array", "items": {"type": "string"}, "default": []},
+                "context": {"type": "array", "items": {"type": "string"}, "default": []},
+                "forbidden": {"type": "array", "items": {"type": "string"}, "default": []},
+                "name": {"type": "string"},
+                "enter": {"type": "boolean", "default": True},
+                "allow_missing_skill": {"type": "boolean", "default": False},
+                "allow_subagents": {"type": "boolean", "default": False},
             },
             "additionalProperties": False,
         },
@@ -923,6 +1140,20 @@ def main_cli(argv: list[str]) -> int:
     p_skills.add_argument("--include-names", action="store_true")
     p_skills.add_argument("--limit", type=int, default=80)
 
+    p_assign = sub.add_parser("assign")
+    p_assign.add_argument("agent", choices=["a", "b"])
+    p_assign.add_argument("--role", choices=["exploriererin", "arbeitsbiene"], required=True)
+    p_assign.add_argument("--task", required=True)
+    p_assign.add_argument("--skill")
+    p_assign.add_argument("--scope", action="append", default=[])
+    p_assign.add_argument("--write-path", dest="write_paths", action="append", default=[])
+    p_assign.add_argument("--context", action="append", default=[])
+    p_assign.add_argument("--forbid", dest="forbidden", action="append", default=[])
+    p_assign.add_argument("--name")
+    p_assign.add_argument("--no-enter", action="store_true")
+    p_assign.add_argument("--allow-missing-skill", action="store_true")
+    p_assign.add_argument("--allow-subagents", action="store_true")
+
     p_install = sub.add_parser("install")
     p_install.add_argument("--no-register", action="store_true")
     p_install.add_argument("--force", action="store_true")
@@ -960,6 +1191,26 @@ def main_cli(argv: list[str]) -> int:
                 call_tool(
                     "agent_skills",
                     {"agent": args.agent, "include_names": args.include_names, "limit": args.limit},
+                )
+            )
+        if args.command == "assign":
+            return print_json(
+                call_tool(
+                    "agent_assign",
+                    {
+                        "agent": args.agent,
+                        "role": args.role,
+                        "task": args.task,
+                        "skill": args.skill,
+                        "scope": args.scope,
+                        "write_paths": args.write_paths,
+                        "context": args.context,
+                        "forbidden": args.forbidden,
+                        "name": args.name,
+                        "enter": not args.no_enter,
+                        "allow_missing_skill": args.allow_missing_skill,
+                        "allow_subagents": args.allow_subagents,
+                    },
                 )
             )
         if args.command == "install":

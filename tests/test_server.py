@@ -38,6 +38,7 @@ class ServerHelpersTest(unittest.TestCase):
         names = {tool["name"] for tool in response["result"]["tools"]}
         self.assertIn("agent_start", names)
         self.assertIn("agent_safe_tail", names)
+        self.assertIn("agent_assign", names)
 
     def test_initialize_rejects_unsupported_protocol(self) -> None:
         response = handle_rpc(
@@ -259,6 +260,165 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(len(payload["names"]), 2)
         self.assertTrue(payload["names_truncated"])
         self.assertNotIn("SECRET_SKILL_CONTENT_SHOULD_NOT_LEAK", payload_text)
+
+    @patch("codex_master.server.send_agent")
+    def test_agent_assign_sends_structured_prompt_without_returning_prompt(self, mock_send_agent) -> None:
+        mock_send_agent.return_value = {"agent": "a", "status": "sent", "response_output": "not_returned"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            skill = home / ".tmp" / "plugins" / "plugins" / "codex-security" / "skills" / "security-scan" / "SKILL.md"
+            skill.parent.mkdir(parents=True, exist_ok=True)
+            skill.write_text("Skill body must not be returned\n", encoding="utf-8")
+
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                response = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 18,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "agent_assign",
+                            "arguments": {
+                                "agent": "a",
+                                "role": "exploriererin",
+                                "skill": "codex-security:security-scan",
+                                "scope": ["src/codex_master/server.py"],
+                                "task": "Pruefe nur lesend.",
+                                "name": "Mila",
+                            },
+                        },
+                    }
+                )
+
+        self.assertIsNotNone(response)
+        self.assertFalse(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["status"], "assigned")
+        self.assertEqual(payload["role"], "exploriererin")
+        self.assertEqual(payload["write_policy"], "read_only")
+        self.assertFalse(payload["subagents_allowed"])
+        self.assertEqual(payload["skill"]["requested"], "codex-security:security-scan")
+        self.assertTrue(payload["skill"]["available"])
+        self.assertEqual(payload["prompt_output"], "not_returned")
+        self.assertEqual(payload["response_output"], "not_returned")
+        payload_text = json.dumps(payload, sort_keys=True)
+        self.assertNotIn("[EXPLORER_BEE_TASK]", payload_text)
+        self.assertNotIn("Skill body must not be returned", payload_text)
+
+        mock_send_agent.assert_called_once()
+        sent_agent, sent_prompt, sent_enter = mock_send_agent.call_args.args
+        self.assertEqual(sent_agent, "a")
+        self.assertTrue(sent_enter)
+        self.assertIn("[EXPLORER_BEE_TASK]", sent_prompt)
+        self.assertIn("Skill: codex-security:security-scan", sent_prompt)
+        self.assertIn("Darf schreiben: nein", sent_prompt)
+        self.assertIn("Darf eigene Subagentinnen starten: nein", sent_prompt)
+
+    @patch("codex_master.server.send_agent")
+    def test_agent_assign_allows_nested_subagents_only_when_explicit(self, mock_send_agent) -> None:
+        mock_send_agent.return_value = {"agent": "b", "status": "sent", "response_output": "not_returned"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            skill = home / ".tmp" / "plugins" / "plugins" / "github" / "skills" / "gh-fix-ci" / "SKILL.md"
+            skill.parent.mkdir(parents=True, exist_ok=True)
+            skill.write_text("body\n", encoding="utf-8")
+
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"b": {"label": "B", "runner": home / "codex", "home": home, "session": "session-b"}},
+                clear=False,
+            ):
+                response = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 22,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "agent_assign",
+                            "arguments": {
+                                "agent": "b",
+                                "role": "arbeitsbiene",
+                                "skill": "github:gh-fix-ci",
+                                "scope": [".github/workflows"],
+                                "write_paths": [".github/workflows/ci.yml"],
+                                "task": "Haerte CI.",
+                                "allow_subagents": True,
+                            },
+                        },
+                    }
+                )
+
+        self.assertIsNotNone(response)
+        self.assertFalse(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertTrue(payload["subagents_allowed"])
+        self.assertEqual(payload["write_policy"], "explicit_paths_only")
+        sent_prompt = mock_send_agent.call_args.args[1]
+        self.assertIn("[WORK_BEE_TASK]", sent_prompt)
+        self.assertIn("Darf eigene Subagentinnen starten: ja, nur innerhalb Scope und Schreibpfaden", sent_prompt)
+
+    def test_agent_assign_enforces_role_write_and_skill_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                readonly = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 19,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "agent_assign",
+                            "arguments": {
+                                "agent": "a",
+                                "role": "exploriererin",
+                                "task": "nur lesen",
+                                "write_paths": ["src/codex_master/server.py"],
+                            },
+                        },
+                    }
+                )
+                worker = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 20,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "agent_assign",
+                            "arguments": {"agent": "a", "role": "arbeitsbiene", "task": "fix"},
+                        },
+                    }
+                )
+                missing_skill = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 21,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "agent_assign",
+                            "arguments": {
+                                "agent": "a",
+                                "role": "exploriererin",
+                                "task": "nur lesen",
+                                "skill": "missing-plugin:missing-skill",
+                            },
+                        },
+                    }
+                )
+
+        self.assertTrue(readonly["result"]["isError"])
+        self.assertIn("must not include write paths", readonly["result"]["content"][0]["text"])
+        self.assertTrue(worker["result"]["isError"])
+        self.assertIn("require at least one explicit write path", worker["result"]["content"][0]["text"])
+        self.assertTrue(missing_skill["result"]["isError"])
+        self.assertIn("skill not found", missing_skill["result"]["content"][0]["text"])
 
 
 class CliLifecycleTest(unittest.TestCase):

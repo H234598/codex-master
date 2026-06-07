@@ -26,6 +26,7 @@ not return raw output by default. Existing metadata under the old
 - `agent_stop`: stop Agentin `a`, `b`, or `both`
 - `agent_safe_tail`: explicit capped, ANSI-stripped, redacted excerpt
 - `agent_skills`: data-sparse skill inventory without file contents
+- `agent_assign`: structured, skill-aware assignment with explicit boundaries
 - `agent_doctor`: structured diagnostics without raw output
 
 ## Local CLI
@@ -39,6 +40,7 @@ python3 -m codex_master.server uninstall       # remove mcp registration and loc
 python3 -m codex_master.server start both --cwd /home/teladi/codex-master
 python3 -m codex_master.server status
 python3 -m codex_master.server skills all
+python3 -m codex_master.server assign a --role exploriererin --skill codex-security:security-scan --scope src/codex_master/server.py --task "Pruefe nur lesend und berichte knapp."
 python3 -m codex_master.server send a "Kurzer Auftrag"
 python3 -m codex_master.server tail a --source pane --lines 20 --chars 2000
 python3 -m codex_master.server stop both
@@ -79,6 +81,34 @@ python3 -m codex_master.server send a "Nutze codex-security:security-scan. Pruef
 python3 -m codex_master.server send b "Nutze github:gh-fix-ci. Pruefe die CI-Konfiguration nur lesend und berichte knapp."
 python3 -m codex_master.server tail a --source pane --lines 20 --chars 2000
 ```
+
+For safer delegation, prefer `assign` over free-form `send`:
+
+```sh
+python3 -m codex_master.server assign a \
+  --role exploriererin \
+  --skill codex-security:security-scan \
+  --scope src/codex_master/server.py \
+  --task "Pruefe nur lesend und berichte knapp."
+
+python3 -m codex_master.server assign b \
+  --role arbeitsbiene \
+  --skill github:gh-fix-ci \
+  --scope .github/workflows \
+  --write-path .github/workflows/ci.yml \
+  --task "Haerte nur die CI-Datei und berichte Root Cause, Aenderung, Tests, Risiken."
+```
+
+`assign` validates named skills by inventory, refuses write paths for
+Exploriererinnen, and requires explicit write paths for Arbeitsbienen. It sends
+the generated prompt through tmux but does not return the prompt or the Agentin
+response.
+
+Agentinnen may start their own native Subagentinnen only when the assignment
+uses `--allow-subagents`. Without that flag, the generated assignment explicitly
+forbids nested delegation. Even with the flag, nested Agentinnen stay inside the
+assigned scope and write paths; they do not use `codex-master-mcp` and they do
+not commit, push, or release.
 
 Use `tail` only when an explicit, capped excerpt is needed. Normal status and
 send operations do not return Agentin output.
