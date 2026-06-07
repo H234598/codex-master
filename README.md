@@ -194,7 +194,8 @@ local audit file path. The audit file is retained as a bounded local JSONL ledge
 the newest 500 valid metadata records are kept, invalid legacy lines are dropped
 during pruning, and the file is rewritten with `0600` permissions. Private state
 appends refuse symlink paths, Agentin metadata is written atomically, and
-temporary replace files are created with no-follow exclusive semantics.
+temporary replace files are created with no-follow exclusive semantics. Managed
+state directories must be real directories, not symlinks or regular files.
 
 Use `tail` only when an explicit, capped excerpt is needed. Normal status and
 send operations do not return Agentin output.

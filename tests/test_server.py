@@ -21,6 +21,7 @@ from codex_master.server import (
     RAW_LOG_TRUNCATION_MARKER,
     append_bounded_raw_log,
     agent_home_process_summary,
+    ensure_state,
     handle_rpc,
     main_cli,
     prune_raw_logs,
@@ -505,6 +506,36 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(target_content, "external\n")
         self.assertTrue(tmp_is_symlink)
         self.assertFalse(path_exists)
+
+    def test_ensure_state_rejects_symlink_state_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "external-state"
+            target.mkdir()
+            state_root = Path(tmpdir) / "state"
+            state_root.symlink_to(target)
+
+            with patch("codex_master.server.STATE_ROOT", state_root), patch(
+                "codex_master.server.RAW_DIR", state_root / "raw"
+            ), patch("codex_master.server.META_DIR", state_root / "meta"):
+                with self.assertRaisesRegex(AgentError, "must not be a symlink"):
+                    ensure_state()
+
+            target_exists = target.is_dir()
+            link_is_symlink = state_root.is_symlink()
+
+        self.assertTrue(target_exists)
+        self.assertTrue(link_is_symlink)
+
+    def test_ensure_state_rejects_file_state_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_root = Path(tmpdir) / "state"
+            state_root.write_text("not a directory\n", encoding="utf-8")
+
+            with patch("codex_master.server.STATE_ROOT", state_root), patch(
+                "codex_master.server.RAW_DIR", state_root / "raw"
+            ), patch("codex_master.server.META_DIR", state_root / "meta"):
+                with self.assertRaisesRegex(AgentError, "not a directory"):
+                    ensure_state()
 
     def test_record_assignment_refuses_symlink_log_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

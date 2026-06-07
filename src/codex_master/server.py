@@ -115,12 +115,30 @@ class AgentError(RuntimeError):
 
 def ensure_state() -> None:
     for path in (STATE_ROOT, RAW_DIR, META_DIR):
-        path.mkdir(parents=True, exist_ok=True)
-        try:
-            path.chmod(0o700)
-        except PermissionError:
-            pass
+        ensure_private_dir(path)
     prune_raw_logs()
+
+
+def ensure_private_dir(path: Path) -> None:
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        path.mkdir(parents=True, exist_ok=False)
+        current = path.lstat()
+    if stat_module.S_ISLNK(current.st_mode):
+        raise AgentError(f"private state directory must not be a symlink: {path}")
+    if not stat_module.S_ISDIR(current.st_mode):
+        raise AgentError(f"private state path is not a directory: {path}")
+    try:
+        current = path.lstat()
+    except FileNotFoundError as exc:
+        raise AgentError(f"private state directory disappeared: {path}") from exc
+    if stat_module.S_ISLNK(current.st_mode) or not stat_module.S_ISDIR(current.st_mode):
+        raise AgentError(f"private state directory changed unexpectedly: {path}")
+    try:
+        path.chmod(0o700)
+    except PermissionError:
+        pass
 
 
 def now_id() -> str:

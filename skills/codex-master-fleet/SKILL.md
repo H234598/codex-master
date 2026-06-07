@@ -98,7 +98,8 @@ Data minimization:
 - Assignment audit retention is bounded to the newest 500 valid metadata
   records in a local `0600` JSONL file. Private state appends refuse symlink
   paths, Agentin metadata is written atomically, and temporary replace files
-  are created with no-follow exclusive semantics.
+  are created with no-follow exclusive semantics. Managed state directories
+  must be real directories, not symlinks or regular files.
 - Raw logs are local debug artifacts. New raw logs are bounded to 5 MiB per
   file, managed raw-log directories retain at most 20 files by default, and
   log-tail metadata paths must stay inside managed raw-log state. Raw-log
