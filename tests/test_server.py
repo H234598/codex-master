@@ -71,6 +71,7 @@ from codex_master.server import (
     start_agent,
     start_agent_with_lease,
     strip_ansi,
+    sync_plugin_cache_from_repo,
     trim_chars,
     trim_lines,
     uninstall,
@@ -444,6 +445,94 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["symlink_entry_count"], 1)
         self.assertEqual(result["installed_versions"], [])
         self.assertNotIn(str(target), json.dumps(result, sort_keys=True))
+
+    def test_sync_plugin_cache_from_repo_copies_runtime_allowlist_without_paths_or_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            root = tmp_path / "repo"
+            cache = tmp_path / "cache"
+            (root / ".codex-plugin").mkdir(parents=True)
+            (root / "bin").mkdir()
+            (root / "skills" / "codex-master-fleet").mkdir(parents=True)
+            (root / "src" / "codex_master" / "__pycache__").mkdir(parents=True)
+            (root / "tests" / "__pycache__").mkdir(parents=True)
+            (root / ".git").mkdir()
+            (root / ".pytest_cache").mkdir()
+            payload = {"name": "codex-master", "version": "0.3.4+codex.test"}
+            (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
+            (root / ".app.json").write_text("{}", encoding="utf-8")
+            (root / ".mcp.json").write_text("{}", encoding="utf-8")
+            (root / "README.md").write_text("readme", encoding="utf-8")
+            (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
+            (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
+            (root / "skills" / "codex-master-fleet" / "SKILL.md").write_text("skill", encoding="utf-8")
+            (root / "src" / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
+            (root / "src" / "codex_master" / "__pycache__" / "server.pyc").write_bytes(b"cache")
+            (root / "tests" / "test_server.py").write_text("should not copy", encoding="utf-8")
+            (root / ".git" / "config").write_text("secret", encoding="utf-8")
+            (root / ".pytest_cache" / "README.md").write_text("cache", encoding="utf-8")
+
+            with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False):
+                result = sync_plugin_cache_from_repo(root, cache)
+
+            entry = cache / "0.3.4+codex.test"
+            copied_state = {
+                "manifest": (entry / ".codex-plugin" / "plugin.json").exists(),
+                "app": (entry / ".app.json").exists(),
+                "mcp": (entry / ".mcp.json").exists(),
+                "bin": (entry / "bin" / "codex-master-mcp").exists(),
+                "skill": (entry / "skills" / "codex-master-fleet" / "SKILL.md").exists(),
+                "server": (entry / "src" / "codex_master" / "server.py").exists(),
+                "git": (entry / ".git").exists(),
+                "pytest_cache": (entry / ".pytest_cache").exists(),
+                "tests": (entry / "tests").exists(),
+                "pycache": (entry / "src" / "codex_master" / "__pycache__").exists(),
+            }
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "synced")
+        self.assertEqual(result["cache_entry"], "not_returned")
+        self.assertTrue(copied_state["manifest"])
+        self.assertTrue(copied_state["app"])
+        self.assertTrue(copied_state["mcp"])
+        self.assertTrue(copied_state["bin"])
+        self.assertTrue(copied_state["skill"])
+        self.assertTrue(copied_state["server"])
+        self.assertFalse(copied_state["git"])
+        self.assertFalse(copied_state["pytest_cache"])
+        self.assertFalse(copied_state["tests"])
+        self.assertFalse(copied_state["pycache"])
+        self.assertTrue(result["plugin_cache"]["repo_version_installed"])
+        self.assertNotIn(str(entry), json.dumps(result, sort_keys=True))
+        self.assertNotIn(str(cache), json.dumps(result, sort_keys=True))
+
+    def test_sync_plugin_cache_from_repo_rejects_symlink_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            root = tmp_path / "repo"
+            cache = tmp_path / "cache"
+            (root / ".codex-plugin").mkdir(parents=True)
+            (root / "bin").mkdir()
+            (root / "skills").mkdir()
+            (root / "src" / "codex_master").mkdir(parents=True)
+            payload = {"name": "codex-master", "version": "0.3.4+codex.test"}
+            (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
+            (root / ".app.json").write_text("{}", encoding="utf-8")
+            (root / ".mcp.json").write_text("{}", encoding="utf-8")
+            (root / "README.md").write_text("readme", encoding="utf-8")
+            (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
+            (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
+            (root / "skills" / "codex-master-fleet").symlink_to(root / "src", target_is_directory=True)
+            (root / "src" / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
+
+            with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False):
+                with self.assertRaisesRegex(AgentError, "unsupported symlink"):
+                    sync_plugin_cache_from_repo(root, cache)
+            entry_exists = (cache / "0.3.4+codex.test").exists()
+            tmp_entries = list(cache.glob(".*.tmp.*")) if cache.exists() else []
+
+        self.assertFalse(entry_exists)
+        self.assertEqual(tmp_entries, [])
 
     def test_plugin_manifest_version_is_path_sparse(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3289,6 +3378,10 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(payload["mcp"]["startup_timeout"]["config_path"], "not_returned")
         self.assertTrue(payload["startup_self_test"]["ok"])
         self.assertEqual(payload["startup_self_test"]["raw_output"], "not_returned")
+        self.assertTrue(payload["plugin_cache_install"]["ok"])
+        self.assertEqual(payload["plugin_cache_install"]["status"], "synced")
+        self.assertEqual(payload["plugin_cache_install"]["cache_entry"], "not_returned")
+        self.assertEqual(payload["plugin_cache_install"]["plugin_cache"]["path"], "not_returned")
         self.assertIn("startup_timeout_sec = 120", config_content)
         self.assertTrue(link_created)
         payload_text = json.dumps(payload, sort_keys=True)
@@ -3333,7 +3426,7 @@ class CliLifecycleTest(unittest.TestCase):
             mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
             mock_registration.return_value = {"registered": True, "ok": True, "startup_timeout_ok": True}
 
-            install(register=True, install_path=install_link)
+            install(register=True, install_path=install_link, sync_plugin_cache=False)
 
         self.assertEqual(mock_self_test.call_args_list[0].args[0], wrapper)
         self.assertEqual(mock_self_test.call_args_list[1].args[0], install_link)

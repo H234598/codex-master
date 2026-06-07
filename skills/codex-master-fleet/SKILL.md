@@ -15,6 +15,10 @@ the persisted delegation templates.
 This skill is for the controlling instance. Do not install it into Agentin A/B
 unless the intent is to make that instance a Teamleiterin.
 
+`codex-master-mcp` Agentinnen are fremde Bienen: they are controlled through an
+MCP/plugin boundary. Eigene Bienen are native Subagentinnen spawned without MCP;
+manage those with the `subagent-fleet` / `multi_agent_v1` workflow instead.
+
 ## Model Policy
 
 - Agentin A and Agentin B run on `gpt-5.4-mini` by default with medium
@@ -46,6 +50,9 @@ unless the intent is to make that instance a Teamleiterin.
 - Agentin A/B may start native Subagentinnen only when the assignment explicitly
   allows it. Nested Subagentinnen must stay inside the assigned scope and write
   paths. They must not use `codex-master-mcp` to control the fleet.
+- Use codex-master-mcp for fremde Bienen and native `multi_agent_v1`
+  Subagentinnen for eigene Bienen. Keep their ownership, scopes, and reporting
+  separate so the Teamleiterin can integrate safely.
 - Do not manually start Agentin A/B with the same `CODEX_HOME` while the
   Masterjet manages them. Use `doctor` if a terminal looks stuck; `start`
   blocks when an Agentin home is already used externally, including when a
@@ -205,7 +212,10 @@ Data minimization:
   non-matching, and doctor reports an unreadable target marker instead of
   crashing. Install must persist `startup_timeout_sec = 120` for the active MCP
   registration and refuse Master MCP registration from a managed Agentinnen
-  `CODEX_HOME`. Registering installs must data-sparse self-test both the repo
+  `CODEX_HOME`. Install must sync the personal `codex-master` plugin cache from
+  a runtime allowlist and exclude `.git`, tests, bytecode, and test caches.
+  Public install responses must not return plugin-cache paths. Registering
+  installs must data-sparse self-test both the repo
   wrapper and the installed command path before registration. Public install
   responses must not return the install path or repo-wrapper target path; return
   state/kind fields instead. `doctor` must run the same data-sparse startup

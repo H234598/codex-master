@@ -92,6 +92,9 @@ MAX_META_BYTES = 64 * 1024
 MAX_CODEX_CONFIG_BYTES = 1024 * 1024
 MAX_PLUGIN_MANIFEST_BYTES = 64 * 1024
 MAX_PLUGIN_CACHE_VERSIONS = 20
+PLUGIN_CACHE_ALLOWED_FILES = (".app.json", ".mcp.json", "README.md", "pyproject.toml")
+PLUGIN_CACHE_ALLOWED_DIRS = (".codex-plugin", "bin", "skills", "src")
+PLUGIN_CACHE_EXCLUDED_NAMES = (".git", ".pytest_cache", ".mypy_cache", ".ruff_cache", "__pycache__")
 COMMAND_TIMEOUT_RETURN_CODE = 124
 DEFAULT_TMUX_TIMEOUT_SECONDS = 10
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
@@ -3016,9 +3019,17 @@ def codex_plugin_cache_root() -> Path:
     return root / "plugins" / "cache" / "personal" / APP_BRIDGE_NAME
 
 
+def normalize_plugin_cache_root(cache_root: Path | None = None) -> Path:
+    target_cache = cache_root or codex_plugin_cache_root()
+    target_cache = target_cache.expanduser()
+    if not target_cache.is_absolute():
+        target_cache = Path.cwd() / target_cache
+    return target_cache.absolute()
+
+
 def plugin_cache_status(root: Path | None = None, cache_root: Path | None = None) -> dict[str, Any]:
     repo_version = plugin_manifest_version(root)
-    target_cache = cache_root or codex_plugin_cache_root()
+    target_cache = normalize_plugin_cache_root(cache_root)
     result: dict[str, Any] = {
         "marketplace": "personal",
         "plugin_name": APP_BRIDGE_NAME,
@@ -3118,6 +3129,134 @@ def plugin_cache_status(root: Path | None = None, cache_root: Path | None = None
     if not result["ok"]:
         result["reason"] = "repo_plugin_version_not_installed"
     return result
+
+
+def copy_plugin_cache_path(src: Path, dst: Path) -> dict[str, int]:
+    try:
+        src_stat = src.lstat()
+    except OSError as exc:
+        raise AgentError("could_not_sync_plugin_cache") from exc
+    if stat_module.S_ISLNK(src_stat.st_mode):
+        raise AgentError("plugin source contains unsupported symlink")
+    if stat_module.S_ISDIR(src_stat.st_mode):
+        try:
+            dst.mkdir(mode=0o755, exist_ok=False)
+        except OSError as exc:
+            raise AgentError("could_not_sync_plugin_cache") from exc
+        counts = {"files": 0, "directories": 1}
+        try:
+            entries = sorted(src.iterdir(), key=lambda entry: entry.name)
+        except OSError as exc:
+            raise AgentError("could_not_sync_plugin_cache") from exc
+        for entry in entries:
+            if entry.name in PLUGIN_CACHE_EXCLUDED_NAMES or entry.name.endswith((".pyc", ".pyo")):
+                continue
+            child_counts = copy_plugin_cache_path(entry, dst / entry.name)
+            counts["files"] += child_counts["files"]
+            counts["directories"] += child_counts["directories"]
+        return counts
+    if stat_module.S_ISREG(src_stat.st_mode):
+        try:
+            shutil.copy2(src, dst)
+        except OSError as exc:
+            raise AgentError("could_not_sync_plugin_cache") from exc
+        return {"files": 1, "directories": 0}
+    raise AgentError("plugin source contains unsupported file type")
+
+
+def remove_real_plugin_cache_dir(path: Path) -> None:
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise AgentError("could_not_sync_plugin_cache") from exc
+    if stat_module.S_ISLNK(current.st_mode) or not stat_module.S_ISDIR(current.st_mode):
+        raise AgentError("plugin cache entry is not a real directory")
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        raise AgentError("could_not_sync_plugin_cache") from exc
+
+
+def sync_plugin_cache_from_repo(root: Path | None = None, cache_root: Path | None = None) -> dict[str, Any]:
+    context = codex_home_context()
+    if not context.get("ok"):
+        raise AgentError("plugin cache install is not allowed from a managed Agentin home")
+
+    source_root = root or repo_root()
+    source_root = source_root.expanduser()
+    if not source_root.is_absolute():
+        source_root = Path.cwd() / source_root
+    source_root = source_root.absolute()
+    if not is_real_directory_no_symlink(source_root):
+        raise AgentError("plugin source root must be a real directory")
+
+    manifest = plugin_manifest_version(source_root)
+    if not manifest.get("ok"):
+        raise AgentError("plugin manifest name or version is invalid")
+    version = manifest["version"]
+    target_cache = normalize_plugin_cache_root(cache_root)
+    ensure_directory_chain_no_symlink(target_cache.parent, "plugin cache parent directories must be real directories")
+    try:
+        target_stat = target_cache.lstat()
+    except FileNotFoundError:
+        try:
+            target_cache.mkdir(mode=0o755)
+        except OSError as exc:
+            raise AgentError("could_not_sync_plugin_cache") from exc
+    except OSError as exc:
+        raise AgentError("could_not_sync_plugin_cache") from exc
+    else:
+        if stat_module.S_ISLNK(target_stat.st_mode) or not stat_module.S_ISDIR(target_stat.st_mode):
+            raise AgentError("plugin cache root must be a real directory")
+
+    target_entry = target_cache / version
+    tmp_entry = target_cache / f".{version}.tmp.{now_id()}"
+    copied_files = 0
+    copied_directories = 0
+    try:
+        tmp_entry.mkdir(mode=0o755, exist_ok=False)
+        copied_directories += 1
+        for name in PLUGIN_CACHE_ALLOWED_FILES:
+            src = source_root / name
+            if not path_present_no_follow(src):
+                raise AgentError("plugin source is missing a required file")
+            counts = copy_plugin_cache_path(src, tmp_entry / name)
+            copied_files += counts["files"]
+            copied_directories += counts["directories"]
+        for name in PLUGIN_CACHE_ALLOWED_DIRS:
+            src = source_root / name
+            if not path_present_no_follow(src):
+                raise AgentError("plugin source is missing a required directory")
+            counts = copy_plugin_cache_path(src, tmp_entry / name)
+            copied_files += counts["files"]
+            copied_directories += counts["directories"]
+        remove_real_plugin_cache_dir(target_entry)
+        try:
+            tmp_entry.rename(target_entry)
+        except OSError as exc:
+            raise AgentError("could_not_sync_plugin_cache") from exc
+    except Exception:
+        with contextlib.suppress(Exception):
+            remove_real_plugin_cache_dir(tmp_entry)
+        raise
+
+    status = plugin_cache_status(source_root, target_cache)
+    return {
+        "ok": bool(status.get("ok")),
+        "status": "synced" if status.get("ok") else "sync_incomplete",
+        "marketplace": "personal",
+        "plugin_name": APP_BRIDGE_NAME,
+        "version": version,
+        "cache_entry": PATH_NOT_RETURNED,
+        "cache_entry_state": "set",
+        "copied_files": copied_files,
+        "copied_directories": copied_directories,
+        "excluded_artifacts": ["git", "bytecode", "test_cache", "repo_tests"],
+        "plugin_cache": status,
+        "raw_output": "not_returned",
+    }
 
 
 def app_id_kind(app_id: str) -> str:
@@ -3423,7 +3562,12 @@ def doctor() -> dict[str, Any]:
     return {"ok": all(check["ok"] for check in checks), "checks": checks, "raw_output": "not_returned"}
 
 
-def install(register: bool = True, force: bool = False, install_path: Path = DEFAULT_INSTALL_PATH) -> dict[str, Any]:
+def install(
+    register: bool = True,
+    force: bool = False,
+    install_path: Path = DEFAULT_INSTALL_PATH,
+    sync_plugin_cache: bool = True,
+) -> dict[str, Any]:
     if register:
         assert_install_context_allows_master_registration()
     wrapper = repo_wrapper_path()
@@ -3488,6 +3632,11 @@ def install(register: bool = True, force: bool = False, install_path: Path = DEF
                 "raw_output": "not_returned",
             }
         registration["startup_timeout"] = startup_timeout_config
+    plugin_cache_install = (
+        sync_plugin_cache_from_repo()
+        if sync_plugin_cache
+        else {"requested": False, "status": "skipped", "raw_output": "not_returned"}
+    )
 
     return {
         "ok": True,
@@ -3499,6 +3648,7 @@ def install(register: bool = True, force: bool = False, install_path: Path = DEF
         "symlink": symlink_status,
         "startup_self_test": startup_self_test,
         "mcp": registration,
+        "plugin_cache_install": plugin_cache_install,
         "raw_output": "not_returned",
     }
 
@@ -4680,6 +4830,7 @@ def main_cli(argv: list[str]) -> int:
 
     p_install = sub.add_parser("install")
     p_install.add_argument("--no-register", action="store_true")
+    p_install.add_argument("--no-plugin-cache", action="store_true")
     p_install.add_argument("--force", action="store_true")
     p_install.add_argument("--path", default=str(DEFAULT_INSTALL_PATH))
 
@@ -4862,6 +5013,7 @@ def main_cli(argv: list[str]) -> int:
                     register=not args.no_register,
                     force=args.force,
                     install_path=Path(args.path),
+                    sync_plugin_cache=not args.no_plugin_cache,
                 )
             )
         if args.command == "uninstall":

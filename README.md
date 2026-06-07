@@ -170,11 +170,17 @@ python3 -m codex_master.server stop both
   registration
 - registers the command via `codex mcp add codex-master-mcp -- <link>`
 - ensures the active Codex MCP config has `startup_timeout_sec = 120`
+- syncs the personal `codex-master` plugin cache from a runtime allowlist
+  (`.codex-plugin`, `.app.json`, `.mcp.json`, `bin`, `skills`, `src`, README,
+  and package metadata) while excluding `.git`, tests, bytecode, and test caches
 - refuses to register the Master MCP from a managed Agentinnen `CODEX_HOME`
 - requires the install-path parent chain to be real directories, not symlinks
 - treats broken, looping, or unreadable install symlinks as non-matching instead
   of crashing while resolving them
-- returns JSON without agent output, install path, or repo-wrapper target path
+- returns JSON without agent output, install path, repo-wrapper target path, or
+  plugin-cache paths
+- accepts `--no-plugin-cache` only for explicit diagnostic installs that should
+  leave the personal plugin cache untouched
 
 `uninstall`
 - unregisters from `codex mcp remove codex-master-mcp`
