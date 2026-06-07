@@ -73,6 +73,7 @@ MAX_PATH_TEXT = 1000
 MAX_ASSIGNMENT_ID = 200
 MAX_RPC_MESSAGE_BYTES = 1024 * 1024
 MAX_ERROR_CHARS = 1200
+MAX_META_BYTES = 64 * 1024
 DEFAULT_AGENTIN_NAMES = {"a": "Mila", "b": "Nora"}
 RAW_LOG_TRUNCATION_MARKER = b"\n... codex-master-mcp retained the last raw log bytes ...\n"
 
@@ -191,10 +192,38 @@ def meta_path(agent: str) -> Path:
 
 
 def read_json_file(path: Path) -> dict[str, Any]:
+    error = {"meta_error": f"could not read {path}"}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {"meta_error": f"could not read {path}"}
+        current_stat = path.lstat()
+    except OSError:
+        return error
+    if not stat_module.S_ISREG(current_stat.st_mode) or current_stat.st_size > MAX_META_BYTES:
+        return error
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(path, flags)
+        opened_stat = os.fstat(fd)
+        if not stat_module.S_ISREG(opened_stat.st_mode) or opened_stat.st_size > MAX_META_BYTES:
+            return error
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            raw = fh.read(MAX_META_BYTES + 1)
+    except OSError:
+        return error
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+    if len(raw) > MAX_META_BYTES:
+        return error
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return error
 
 
 def read_meta(agent: str) -> dict[str, Any]:

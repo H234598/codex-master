@@ -13,6 +13,7 @@ from codex_master.server import (
     MAX_ASSIGNMENT_LIST_ITEMS,
     MAX_CAPABILITY_PLUGINS,
     MAX_ERROR_CHARS,
+    MAX_META_BYTES,
     MAX_RPC_MESSAGE_BYTES,
     MAX_RAW_LOG_BYTES,
     MAX_SEND_TEXT,
@@ -26,6 +27,7 @@ from codex_master.server import (
     main_cli,
     prune_raw_logs,
     read_message,
+    read_meta,
     record_assignment,
     redact,
     replace_private_text,
@@ -506,6 +508,31 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(link_is_symlink)
         self.assertEqual(payload, {"safe": True})
         self.assertEqual(mode, 0o600)
+
+    def test_read_meta_refuses_symlink_and_oversized_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            meta_dir = Path(tmpdir) / "meta"
+            legacy_meta_dir = Path(tmpdir) / "legacy" / "meta"
+            meta_dir.mkdir()
+            target = Path(tmpdir) / "target.json"
+            target.write_text('{"secret": "SECRET_META_SHOULD_NOT_LEAK"}\n', encoding="utf-8")
+            symlink_meta = meta_dir / "a.json"
+            symlink_meta.symlink_to(target)
+            oversized_meta = meta_dir / "b.json"
+            oversized_meta.write_text('{"payload": "' + ("x" * MAX_META_BYTES) + '"}\n', encoding="utf-8")
+
+            with patch("codex_master.server.META_DIR", meta_dir), patch(
+                "codex_master.server.LEGACY_META_DIR", legacy_meta_dir
+            ):
+                symlink_result = read_meta("a")
+                oversized_result = read_meta("b")
+                symlink_still_exists = symlink_meta.is_symlink()
+
+        self.assertIn("meta_error", symlink_result)
+        self.assertNotIn("SECRET_META_SHOULD_NOT_LEAK", json.dumps(symlink_result, sort_keys=True))
+        self.assertTrue(symlink_still_exists)
+        self.assertIn("meta_error", oversized_result)
+        self.assertNotIn("payload", oversized_result)
 
     def test_replace_private_text_refuses_preexisting_temp_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
