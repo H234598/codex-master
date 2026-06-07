@@ -72,6 +72,7 @@ MAX_SKILL_REF = 300
 MAX_PATH_TEXT = 1000
 MAX_ASSIGNMENT_ID = 200
 MAX_RPC_MESSAGE_BYTES = 1024 * 1024
+MAX_ERROR_CHARS = 1200
 DEFAULT_AGENTIN_NAMES = {"a": "Mila", "b": "Nora"}
 RAW_LOG_TRUNCATION_MARKER = b"\n... codex-master-mcp retained the last raw log bytes ...\n"
 
@@ -1598,6 +1599,12 @@ def trim_chars(text: str, max_chars: int) -> str:
     return "... truncated to last characters ...\n" + text[-max_chars:]
 
 
+def safe_error_text(value: Any, max_chars: int = MAX_ERROR_CHARS) -> str:
+    cleaned = strip_ansi(str(value))
+    redacted, _changed = redact(cleaned)
+    return trim_chars(redacted, max_chars)
+
+
 def read_log_tail(path: Path, approx_bytes: int) -> str:
     if not path.exists():
         return ""
@@ -1661,7 +1668,7 @@ def multi_agent_result(selected: list[str], fn: Any) -> dict[str, Any]:
         try:
             results.append(fn(agent))
         except Exception as exc:
-            results.append({"agent": agent, "error": str(exc)})
+            results.append({"agent": agent, "error": safe_error_text(exc)})
     return {"results": results}
 
 
@@ -2136,7 +2143,7 @@ def rpc_result(message_id: Any, result: Any) -> dict[str, Any]:
 
 
 def rpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
-    return {"jsonrpc": "2.0", "id": message_id, "error": {"code": code, "message": message}}
+    return {"jsonrpc": "2.0", "id": message_id, "error": {"code": code, "message": safe_error_text(message)}}
 
 
 def handle_rpc(msg: dict[str, Any]) -> dict[str, Any] | None:
@@ -2175,7 +2182,7 @@ def handle_rpc(msg: dict[str, Any]) -> dict[str, Any] | None:
             text = json.dumps(payload, indent=2, sort_keys=True)
             return rpc_result(message_id, {"content": [{"type": "text", "text": text}], "isError": False})
         except Exception as exc:
-            text = json.dumps({"error": str(exc)}, indent=2, sort_keys=True)
+            text = json.dumps({"error": safe_error_text(exc)}, indent=2, sort_keys=True)
             return rpc_result(message_id, {"content": [{"type": "text", "text": text}], "isError": True})
     if method in ("notifications/initialized", "notifications/cancelled"):
         return None
@@ -2239,7 +2246,7 @@ def serve_mcp() -> int:
                 write_message(response)
         except Exception as exc:
             try:
-                write_message(rpc_error(None, -32000, str(exc)))
+                write_message(rpc_error(None, -32000, safe_error_text(exc)))
             except Exception:
                 return 1
 
@@ -2532,7 +2539,7 @@ def main_cli(argv: list[str]) -> int:
         if args.command == "tools":
             return print_json({"tools": TOOLS})
     except Exception as exc:
-        print(json.dumps({"error": str(exc)}, indent=2, sort_keys=True))
+        print(json.dumps({"error": safe_error_text(exc)}, indent=2, sort_keys=True))
         return 1
     return 2
 

@@ -12,6 +12,7 @@ from codex_master.server import (
     AgentError,
     MAX_ASSIGNMENT_LIST_ITEMS,
     MAX_CAPABILITY_PLUGINS,
+    MAX_ERROR_CHARS,
     MAX_RPC_MESSAGE_BYTES,
     MAX_RAW_LOG_BYTES,
     MAX_SEND_TEXT,
@@ -145,6 +146,29 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(response["result"]["isError"])
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertIn("error", payload)
+
+    def test_mcp_error_text_is_redacted_and_bounded(self) -> None:
+        secret_tool = "unknown-" + ("x" * 1800) + "-OPENAI_API_KEY=sk-testtoken1234567890"
+        response = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 28,
+                "method": "tools/call",
+                "params": {"name": secret_tool, "arguments": {}},
+            }
+        )
+        method_response = handle_rpc(
+            {"jsonrpc": "2.0", "id": 29, "method": "bad OPENAI_API_KEY=sk-testtoken1234567890"}
+        )
+
+        self.assertTrue(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertNotIn("sk-testtoken1234567890", payload["error"])
+        self.assertIn("OPENAI_API_KEY=<redacted>", payload["error"])
+        self.assertLessEqual(len(payload["error"]), MAX_ERROR_CHARS + 40)
+        self.assertEqual(method_response["error"]["code"], -32601)
+        self.assertNotIn("sk-testtoken1234567890", method_response["error"]["message"])
+        self.assertIn("OPENAI_API_KEY=<redacted>", method_response["error"]["message"])
 
     def test_mcp_tool_call_rejects_stringified_booleans_and_integers(self) -> None:
         boolean_response = handle_rpc(
