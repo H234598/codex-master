@@ -103,7 +103,9 @@ Data minimization:
   symlinks are not followed. Failed starts must remove prepared raw-log files.
 - Assignment inputs are bounded before tmux interaction: sends/start prompts
   12,000 chars, tasks 4,000 chars, names 80 chars, skill refs 300 chars,
-  path-like fields 1,000 chars, and assignment lists 50 items.
+  path-like fields 1,000 chars, and assignment lists 50 items. MCP boolean and
+  integer arguments are type-checked; stringified values are rejected instead of
+  being coerced.
 - Use `tail` only for an explicit capped, ANSI-stripped, redacted excerpt.
 - Do not read raw tmux logs directly unless the user explicitly requests it and
   the privacy impact is acceptable.

@@ -153,7 +153,9 @@ outside the declared scope is rejected before anything is sent to an Agentin.
 Assignment and send inputs are bounded before tmux interaction: free sends and
 start prompts are capped at 12,000 characters, assignment tasks at 4,000
 characters, names at 80 characters, skill refs at 300 characters, path-like
-fields at 1,000 characters, and assignment lists at 50 items.
+fields at 1,000 characters, and assignment lists at 50 items. MCP boolean and
+integer arguments are type-checked; stringified values are rejected instead of
+being coerced.
 
 Raw logs are local debug artifacts, not normal API data. The tmux pipe writes
 through a bounded local writer, `doctor` reports the configured raw-log policy,

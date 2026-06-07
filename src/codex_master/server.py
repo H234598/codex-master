@@ -1676,11 +1676,11 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return multi_agent_result(selected, status_agent)
     if name == "agent_skills":
         selected = agent_ids(str(args.get("agent", "all")))
-        include_names = bool(args.get("include_names", False))
-        limit = int(args.get("limit", 80))
-        names_offset = int(args.get("names_offset", 0))
-        plugins_offset = int(args.get("plugins_offset", 0))
-        plugins_limit = int(args.get("plugins_limit", MAX_CAPABILITY_PLUGINS))
+        include_names = bool_arg(args, "include_names", False)
+        limit = int_arg(args, "limit", 80)
+        names_offset = int_arg(args, "names_offset", 0)
+        plugins_offset = int_arg(args, "plugins_offset", 0)
+        plugins_limit = int_arg(args, "plugins_limit", MAX_CAPABILITY_PLUGINS)
         return multi_agent_result(
             selected,
             lambda agent: skills_agent(agent, include_names, limit, names_offset, plugins_offset, plugins_limit),
@@ -1689,7 +1689,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         selected = agent_ids(str(args.get("agent", "all")))
         return multi_agent_result(
             selected,
-            lambda agent: skill_match_agent(agent, args.get("skill"), int(args.get("limit", 8))),
+            lambda agent: skill_match_agent(agent, args.get("skill"), int_arg(args, "limit", 8)),
         )
     if name == "agent_capabilities":
         selected = agent_ids(str(args.get("agent", "all")))
@@ -1714,9 +1714,9 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             context=args.get("context"),
             forbidden=args.get("forbidden"),
             name=args.get("name") if isinstance(args.get("name"), str) else None,
-            enter=bool(args.get("enter", True)),
-            allow_missing_skill=bool(args.get("allow_missing_skill", False)),
-            allow_subagents=bool(args.get("allow_subagents", False)),
+            enter=bool_arg(args, "enter", True),
+            allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
+            allow_subagents=bool_arg(args, "allow_subagents", False),
         )
     if name == "agent_assign_readonly":
         selected = agent_ids(str(args.get("agent", "")))
@@ -1731,9 +1731,9 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             context=args.get("context"),
             forbidden=args.get("forbidden"),
             name=args.get("name") if isinstance(args.get("name"), str) else None,
-            enter=bool(args.get("enter", True)),
-            allow_missing_skill=bool(args.get("allow_missing_skill", False)),
-            allow_subagents=bool(args.get("allow_subagents", False)),
+            enter=bool_arg(args, "enter", True),
+            allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
+            allow_subagents=bool_arg(args, "allow_subagents", False),
         )
     if name == "agent_assign_write":
         selected = agent_ids(str(args.get("agent", "")))
@@ -1749,12 +1749,12 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             context=args.get("context"),
             forbidden=args.get("forbidden"),
             name=args.get("name") if isinstance(args.get("name"), str) else None,
-            enter=bool(args.get("enter", True)),
-            allow_missing_skill=bool(args.get("allow_missing_skill", False)),
-            allow_subagents=bool(args.get("allow_subagents", False)),
+            enter=bool_arg(args, "enter", True),
+            allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
+            allow_subagents=bool_arg(args, "allow_subagents", False),
         )
     if name == "agent_assignments":
-        return list_assignments(str(args.get("agent", "all")), int(args.get("limit", 20)))
+        return list_assignments(str(args.get("agent", "all")), int_arg(args, "limit", 20))
     if name == "agent_last_assignment_status":
         selected = agent_ids(str(args.get("agent", "")))
         if len(selected) != 1:
@@ -1767,7 +1767,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return request_agent_report(
             selected[0],
             args.get("assignment_id"),
-            bool(args.get("enter", True)),
+            bool_arg(args, "enter", True),
         )
     if name == "worktree_create_for_agent":
         selected = agent_ids(str(args.get("agent", "")))
@@ -1783,7 +1783,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "integration_status":
         return integration_status()
     if name == "commit_ready_check":
-        return commit_ready_check(bool(args.get("run_tests", True)))
+        return commit_ready_check(bool_arg(args, "run_tests", True))
     if name == "master_plugin_status":
         return master_plugin_status()
     if name == "agent_doctor":
@@ -1795,7 +1795,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         text = args.get("text")
         if not isinstance(text, str) or text == "":
             raise AgentError("agent_send requires non-empty text")
-        return send_agent(selected[0], text, bool(args.get("enter", True)))
+        return send_agent(selected[0], text, bool_arg(args, "enter", True))
     if name == "agent_interrupt":
         selected = agent_ids(str(args.get("agent", "")))
         if len(selected) != 1:
@@ -1807,11 +1807,25 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             raise AgentError("agent_safe_tail requires exactly one agent: a or b")
         return safe_tail(
             selected[0],
-            int(args.get("lines", 40)),
-            int(args.get("chars", 4000)),
+            int_arg(args, "lines", 40),
+            int_arg(args, "chars", 4000),
             str(args.get("source", "pane")),
         )
     raise AgentError(f"unknown tool: {name}")
+
+
+def bool_arg(args: dict[str, Any], name: str, default: bool) -> bool:
+    value = args.get(name, default)
+    if isinstance(value, bool):
+        return value
+    raise AgentError(f"{name} must be a boolean")
+
+
+def int_arg(args: dict[str, Any], name: str, default: int) -> int:
+    value = args.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise AgentError(f"{name} must be an integer")
+    return value
 
 
 def text_schema(max_chars: int, **extra: Any) -> dict[str, Any]:

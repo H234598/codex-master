@@ -120,6 +120,34 @@ class ServerHelpersTest(unittest.TestCase):
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertIn("error", payload)
 
+    def test_mcp_tool_call_rejects_stringified_booleans_and_integers(self) -> None:
+        boolean_response = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 31,
+                "method": "tools/call",
+                "params": {
+                    "name": "agent_assign_readonly",
+                    "arguments": {"agent": "a", "task": "Pruefe.", "enter": "false"},
+                },
+            }
+        )
+        integer_response = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 32,
+                "method": "tools/call",
+                "params": {"name": "agent_skills", "arguments": {"agent": "a", "limit": "2"}},
+            }
+        )
+
+        self.assertTrue(boolean_response["result"]["isError"])
+        boolean_payload = json.loads(boolean_response["result"]["content"][0]["text"])
+        self.assertEqual(boolean_payload["error"], "enter must be a boolean")
+        self.assertTrue(integer_response["result"]["isError"])
+        integer_payload = json.loads(integer_response["result"]["content"][0]["text"])
+        self.assertEqual(integer_payload["error"], "limit must be an integer")
+
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.pane_tail")
     @patch("codex_master.server.ensure_state")
