@@ -841,6 +841,70 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(names_page_payload["names_truncated"])
         self.assertNotIn("SECRET_SKILL_CONTENT_SHOULD_NOT_LEAK", json.dumps(names_page_payload, sort_keys=True))
 
+    def test_agent_skills_inventory_ignores_symlinked_skill_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            real_skill = home / "skills" / ".system" / "real-skill" / "SKILL.md"
+            linked_skill = home / "skills" / ".system" / "linked-skill" / "SKILL.md"
+            outside_skill = Path(tmpdir) / "outside" / "SKILL.md"
+            symlink_root = home / "plugins" / "cache"
+            outside_root = Path(tmpdir) / "outside-cache"
+            outside_root_skill = outside_root / "openai-curated" / "github" / "hash" / "skills" / "linked" / "SKILL.md"
+
+            real_skill.parent.mkdir(parents=True, exist_ok=True)
+            real_skill.write_text("real\n", encoding="utf-8")
+            outside_skill.parent.mkdir(parents=True, exist_ok=True)
+            outside_skill.write_text("SECRET_SKILL_CONTENT_SHOULD_NOT_LEAK\n", encoding="utf-8")
+            linked_skill.parent.mkdir(parents=True, exist_ok=True)
+            linked_skill.symlink_to(outside_skill)
+            outside_root_skill.parent.mkdir(parents=True, exist_ok=True)
+            outside_root_skill.write_text("outside-root\n", encoding="utf-8")
+            symlink_root.parent.mkdir(parents=True, exist_ok=True)
+            symlink_root.symlink_to(outside_root)
+
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                skills = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 44,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "agent_skills",
+                            "arguments": {"agent": "a", "include_names": True},
+                        },
+                    }
+                )
+                match = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 45,
+                        "method": "tools/call",
+                        "params": {"name": "agent_skill_match", "arguments": {"agent": "a", "skill": "linked-skill"}},
+                    }
+                )
+
+        self.assertFalse(skills["result"]["isError"])
+        skills_payload = json.loads(skills["result"]["content"][0]["text"])["results"][0]
+        payload_text = json.dumps(skills_payload, sort_keys=True)
+        self.assertEqual(skills_payload["total"], 1)
+        self.assertEqual(skills_payload["roots"][0]["skill_count"], 1)
+        self.assertEqual(skills_payload["roots"][1]["skill_count"], 0)
+        self.assertEqual(skills_payload["names_total"], 1)
+        self.assertEqual(skills_payload["names"][0]["name"], "real-skill")
+        self.assertEqual(skills_payload["names"][0]["plugin"], "")
+        self.assertEqual(skills_payload["names"][0]["source"], "system")
+        self.assertNotIn("linked-skill", payload_text)
+        self.assertNotIn("SECRET_SKILL_CONTENT_SHOULD_NOT_LEAK", payload_text)
+
+        self.assertFalse(match["result"]["isError"])
+        match_payload = json.loads(match["result"]["content"][0]["text"])["results"][0]
+        self.assertFalse(match_payload["available"])
+        self.assertEqual(match_payload["skill_file_contents"], "not_returned")
+
     def test_skill_match_and_capabilities_are_data_sparse(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)

@@ -92,7 +92,8 @@ Data minimization:
   flags, not a complete broad plugin inventory.
 - `skills` returns bounded plugin/name pages plus total counts, offsets, limits,
   and truncation flags so callers can deliberately enumerate more pages without
-  broad dumping.
+  broad dumping. Symlinked skill roots and symlinked `SKILL.md` files are
+  ignored instead of being followed.
 - `assignments` and `last-assignment` return only assignment metadata. They
   must not return prompt text, Agentin responses, or local audit file paths.
 - Assignment audit retention is bounded to the newest 500 valid metadata

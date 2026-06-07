@@ -768,9 +768,23 @@ def parse_skill_path(home: Path, path: Path) -> dict[str, str]:
 
 
 def list_skill_files(root: Path) -> list[Path]:
-    if not root.exists():
+    try:
+        root_mode = root.lstat().st_mode
+    except FileNotFoundError:
         return []
-    return sorted(path for path in root.rglob("SKILL.md") if path.is_file())
+    except OSError:
+        return []
+    if stat_module.S_ISLNK(root_mode) or not stat_module.S_ISDIR(root_mode):
+        return []
+    return sorted(path for path in root.rglob("SKILL.md") if is_regular_file_no_symlink(path))
+
+
+def is_regular_file_no_symlink(path: Path) -> bool:
+    try:
+        mode = path.lstat().st_mode
+    except OSError:
+        return False
+    return stat_module.S_ISREG(mode)
 
 
 def paged_mapping(items: dict[str, int], offset: int, limit: int) -> tuple[dict[str, int], bool]:

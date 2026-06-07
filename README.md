@@ -99,6 +99,8 @@ python3 -m codex_master.server stop both
 `skills`
 - scans each Agentin home for `SKILL.md` files in `skills/`, `plugins/cache/`,
   and `.tmp/plugins/`
+- ignores symlinked skill roots and symlinked `SKILL.md` files instead of
+  following them
 - returns counts, roots, system-skill names, and bounded plugin/name pages
 - reports `plugin_count`, `plugins_offset`, `plugins_limit`, and
   `plugins_truncated` instead of dumping every plugin name when many are
