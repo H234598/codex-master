@@ -104,6 +104,7 @@ from codex_master.server import (
     sync_plugin_cache_from_repo,
     trim_chars,
     trim_lines,
+    tui_accepts_input,
     uninstall,
     wait_agent,
     WRITE_AGENT_MODEL,
@@ -143,6 +144,14 @@ class ServerHelpersTest(unittest.TestCase):
 
     def test_strip_ansi(self) -> None:
         self.assertEqual(strip_ansi("\x1b[31mred\x1b[0m\r\n"), "red\n\n")
+
+    def test_tui_accepts_input_requires_visible_tail_prompt_marker_line(self) -> None:
+        self.assertTrue(tui_accepts_input("some status\n› Ready"))
+        self.assertTrue(tui_accepts_input("\x1b[32m›\x1b[0m Ready"))
+        self.assertFalse(tui_accepts_input("assistant output used › as punctuation\nno prompt"))
+        self.assertFalse(tui_accepts_input("Find and fix a bug in @filename\nImprove documentation in @filename"))
+        old_prompt = "› old prompt\n" + "\n".join(f"line {index}" for index in range(9))
+        self.assertFalse(tui_accepts_input(old_prompt))
 
     def test_trim_limits(self) -> None:
         truncated_lines = trim_lines("line1\nline2\nline3", 1)
@@ -1583,7 +1592,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.1+codex.test",
+            "version": "0.9.2+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1610,7 +1619,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.1")
+        self.assertEqual(result["expected_tag"], "v0.9.2")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")

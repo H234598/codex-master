@@ -58,10 +58,11 @@ Text is pasted into the Codex TUI through tmux and submitted with `S-Enter`.
 Plain `Enter` can leave multi-line or wrapped prompts sitting in the composer
 instead of starting the model response in current Codex CLI builds.
 Before pasting, `send`, `assign-*`, and `report-request` wait briefly for an
-identifiable Codex TUI input prompt. If the Agentin is still in startup warnings
-or no input prompt is visible, the mutation fails closed with retryable
-`agent_input_not_ready`, `paste_attempted: false`, and `raw_output:
-not_returned` instead of losing the prompt into the startup screen.
+identifiable Codex TUI input prompt marker in the current visible pane tail. If
+the Agentin is still in startup warnings, only shows starter text, or no input
+prompt is visible, the mutation fails closed with retryable
+`agent_input_not_ready`, `paste_attempted: false`, and
+`raw_output: not_returned` instead of losing the prompt into the startup screen.
 Existing metadata under the old `codex-agent-mcp` state directory is still read
 as a migration fallback. External `tmux`, `git`, and `codex mcp` subprocesses
 are timeout-bounded so MCP calls fail closed instead of hanging indefinitely.

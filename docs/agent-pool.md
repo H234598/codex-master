@@ -97,11 +97,12 @@ Running Agentinnen are driven through tmux. The Masterjet pastes text into the
 Codex TUI and submits with `S-Enter`; plain `Enter` can remain in the composer
 for multi-line or wrapped prompts in current Codex CLI builds.
 Before pasting, `send`, `assign-*`, and `report-request` wait briefly for a
-visible Codex TUI input prompt. If the TUI is still starting or only startup
-warnings are visible, the mutation fails closed with retryable
-`agent_input_not_ready` and `paste_attempted: false` instead of silently losing
-the prompt. `timeout-policy` reports this readiness gate with its default
-15 second timeout and 0.5 second poll interval.
+visible Codex TUI input prompt marker in the current visible pane tail. If the
+TUI is still starting, only shows starter text, or only startup warnings are
+visible, the mutation fails closed with retryable `agent_input_not_ready` and
+`paste_attempted: false` instead of silently losing the prompt. `timeout-policy`
+reports this readiness gate with its default 15 second timeout and 0.5 second
+poll interval.
 
 For weather, news, prices, schedules, and other current-data tasks, prefer
 `assign-live-data` over raw `send`. It is a read-only Exploriererin assignment

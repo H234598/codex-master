@@ -143,7 +143,8 @@ Data minimization:
   instead of guessing. Public responses and assignment audit records still omit
   prompt text and Agentin output.
 - `send`, `assign-*`, and `report-request` wait briefly for a visible Codex TUI
-  input prompt before pasting. If an Agentin is still in startup warnings, the
+  input prompt marker in the current visible pane tail before pasting. If an
+  Agentin is still in startup warnings or only starter text is visible, the
   mutation should fail closed with retryable `agent_input_not_ready`,
   `paste_attempted: false`, and no raw output instead of silently losing the
   prompt.

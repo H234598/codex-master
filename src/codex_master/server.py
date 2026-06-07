@@ -250,6 +250,7 @@ BRACKETED_PASTE_BEGIN = "\x1b[200~"
 BRACKETED_PASTE_END = "\x1b[201~"
 CODEX_TUI_SUBMIT_KEY = "S-Enter"
 CODEX_TUI_INPUT_MARKERS = ("›",)
+CODEX_TUI_INPUT_MARKER_WINDOW_LINES = 8
 PATH_NOT_RETURNED = "not_returned"
 
 
@@ -5587,10 +5588,11 @@ def tui_accepts_input(text: str) -> bool:
     cleaned = strip_ansi(text)
     if not cleaned.strip():
         return False
-    if any(marker in cleaned for marker in CODEX_TUI_INPUT_MARKERS):
-        return True
-    context = classify_tui_context(cleaned, True)
-    return context["state"] == "starter_placeholder"
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    for line in lines[-CODEX_TUI_INPUT_MARKER_WINDOW_LINES:]:
+        if any(line.startswith(marker) for marker in CODEX_TUI_INPUT_MARKERS):
+            return True
+    return False
 
 
 def wait_agent_input_ready(agent: str, timeout_seconds: float = DEFAULT_SEND_READY_TIMEOUT_SECONDS) -> dict[str, Any]:
