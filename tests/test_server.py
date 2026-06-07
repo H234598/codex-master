@@ -25,11 +25,13 @@ from codex_master.server import (
     main_cli,
     prune_raw_logs,
     read_message,
+    record_assignment,
     redact,
     start_agent,
     strip_ansi,
     trim_chars,
     trim_lines,
+    write_meta,
 )
 
 
@@ -460,6 +462,44 @@ class ServerHelpersTest(unittest.TestCase):
             target_content = target.read_bytes()
 
         self.assertEqual(target_content, b"target")
+
+    def test_write_meta_replaces_symlink_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            meta_dir = Path(tmpdir) / "meta"
+            meta_dir.mkdir()
+            target = Path(tmpdir) / "target.json"
+            target.write_text('{"external": true}\n', encoding="utf-8")
+            link = meta_dir / "a.json"
+            link.symlink_to(target)
+
+            with patch("codex_master.server.META_DIR", meta_dir):
+                write_meta("a", {"safe": True})
+
+            mode = stat.S_IMODE(link.stat().st_mode)
+            payload = json.loads(link.read_text(encoding="utf-8"))
+            target_content = target.read_text(encoding="utf-8")
+            link_is_symlink = link.is_symlink()
+
+        self.assertEqual(target_content, '{"external": true}\n')
+        self.assertFalse(link_is_symlink)
+        self.assertEqual(payload, {"safe": True})
+        self.assertEqual(mode, 0o600)
+
+    def test_record_assignment_refuses_symlink_log_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "external.jsonl"
+            target.write_text("external\n", encoding="utf-8")
+            link = Path(tmpdir) / "assignments.jsonl"
+            link.symlink_to(target)
+
+            with patch("codex_master.server.ASSIGNMENT_LOG", link), patch("codex_master.server.ensure_state"):
+                with self.assertRaisesRegex(AgentError, "without following symlinks"):
+                    record_assignment({"assignment_id": "1", "agent": "a"})
+            target_content = target.read_text(encoding="utf-8")
+            link_is_symlink = link.is_symlink()
+
+        self.assertEqual(target_content, "external\n")
+        self.assertTrue(link_is_symlink)
 
     def test_agent_home_process_summary_flags_external_codex_home_users(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

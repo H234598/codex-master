@@ -193,21 +193,13 @@ def read_meta(agent: str) -> dict[str, Any]:
 
 def write_meta(agent: str, data: dict[str, Any]) -> None:
     path = meta_path(agent)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    try:
-        path.chmod(0o600)
-    except PermissionError:
-        pass
+    replace_private_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
 def write_private_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(text)
-    try:
-        path.chmod(0o600)
-    except PermissionError:
-        pass
+    with open_private_regular_update(path) as fh:
+        fh.seek(0, os.SEEK_END)
+        fh.write(text.encode("utf-8"))
 
 
 def replace_private_text(path: Path, text: str) -> None:
