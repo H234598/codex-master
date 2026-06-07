@@ -92,6 +92,8 @@ python3 -m codex_master.server stop both
 `doctor`
 - checks availability of required tooling (`codex`, `tmux`) and MCP state directory
 - reports a structured `checks` object
+- treats stopped Agentinnen as informational session state, not as a failed
+  health check
 - redacts known secret shapes in output
 
 `skills`

@@ -49,6 +49,8 @@ unless the intent is to make that instance a Teamleiterin.
 - Do not manually start Agentin A/B with the same `CODEX_HOME` while the
   Masterjet manages them. Use `doctor` if a terminal looks stuck; `start`
   blocks when an Agentin home is already used externally.
+- A stopped Agentin is a normal informational `doctor` session state, not a
+  failed health check.
 
 ## MCP Visibility
 

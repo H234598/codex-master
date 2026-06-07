@@ -1411,6 +1411,7 @@ def doctor() -> dict[str, Any]:
     ]
     for agent, cfg in AGENTS.items():
         process_summary = agent_home_process_summary(agent)
+        running = tmux_alive(cfg["session"])
         checks.extend(
             [
                 {"name": f"agent_{agent}_home_exists", "ok": cfg["home"].is_dir(), "path": str(cfg["home"])},
@@ -1419,7 +1420,13 @@ def doctor() -> dict[str, Any]:
                     "ok": cfg["runner"].exists() and os.access(cfg["runner"], os.X_OK),
                     "path": str(cfg["runner"]),
                 },
-                {"name": f"agent_{agent}_tmux_running", "ok": tmux_alive(cfg["session"]), "session": cfg["session"]},
+                {
+                    "name": f"agent_{agent}_tmux_session_state",
+                    "ok": True,
+                    "running": running,
+                    "session": cfg["session"],
+                    "severity": "info",
+                },
                 {
                     "name": f"agent_{agent}_home_not_used_externally",
                     "ok": process_summary["external_process_count"] == 0,
