@@ -108,6 +108,41 @@ DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
 DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS = 10
 RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS = 120
 DEFAULT_AGENTIN_NAMES = {"a": "Mila", "b": "Nora"}
+WATCHDOG_SERVICE_NAME = "codex-master-watchdog.service"
+WATCHDOG_TIMER_NAME = "codex-master-watchdog.timer"
+MAX_SYSTEMD_UNIT_BYTES = 64 * 1024
+MAX_SYSTEMD_SECURITY_OUTPUT_BYTES = 64 * 1024
+WATCHDOG_REQUIRED_HARDENING_DIRECTIVES = (
+    "CapabilityBoundingSet=",
+    "KeyringMode=private",
+    "NoNewPrivileges=yes",
+    "PrivateTmp=yes",
+    "PrivateDevices=yes",
+    "ProtectClock=yes",
+    "ProtectControlGroups=yes",
+    "ProtectHostname=yes",
+    "ProtectKernelLogs=yes",
+    "ProtectKernelModules=yes",
+    "ProtectKernelTunables=yes",
+    "ProtectSystem=strict",
+    "ReadWritePaths=%h/.local/state/codex-master-mcp %t",
+    "IPAddressDeny=any",
+    "LockPersonality=yes",
+    "MemoryDenyWriteExecute=yes",
+    "RestrictAddressFamilies=AF_UNIX",
+    "RestrictNamespaces=yes",
+    "RestrictRealtime=yes",
+    "RestrictSUIDSGID=yes",
+    "SystemCallArchitectures=native",
+    "UMask=0077",
+)
+WATCHDOG_REQUIRED_EXEC_FLAGS = (
+    "--idle-seconds 60",
+    "--poll-interval-seconds 15",
+    "--report-grace-seconds 15",
+    "--manage-unclaimed",
+    "--quiet",
+)
 RAW_LOG_TRUNCATION_MARKER = b"\n... codex-master-mcp retained the last raw log bytes ...\n"
 MCP_SERVER_TABLE_HEADER = f"[mcp_servers.{MCP_SERVER_NAME}]"
 APP_BRIDGE_NAME = "codex-master"
@@ -4293,6 +4328,161 @@ def master_release_status() -> dict[str, Any]:
     }
 
 
+def parse_systemctl_show(output: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for line in output.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key:
+            result[key] = value
+    return result
+
+
+def systemctl_user_show(unit: str, properties: tuple[str, ...]) -> dict[str, Any]:
+    command = ["systemctl", "--user", "show", unit, "--no-pager"]
+    for prop in properties:
+        command.extend(["--property", prop])
+    cp = run_command(command)
+    parsed = parse_systemctl_show(cp.stdout)
+    return {
+        "ok": cp.returncode == 0,
+        "unit": unit,
+        "returncode": cp.returncode,
+        "properties": {prop: parsed.get(prop, "") for prop in properties},
+        "raw_output": "not_returned",
+    }
+
+
+def safe_unit_text(path: Path, status: dict[str, Any]) -> tuple[str, bool]:
+    if not status.get("regular_file") or status.get("symlink"):
+        return "", False
+    try:
+        return read_private_regular_text(path, MAX_SYSTEMD_UNIT_BYTES, "systemd unit could not be read"), True
+    except AgentError:
+        return "", False
+
+
+def watchdog_unit_file_status(root: Path | None = None, systemd_user_dir: Path | None = None) -> dict[str, Any]:
+    root = root or repo_root()
+    installed_dir = systemd_user_dir or (Path.home() / ".config" / "systemd" / "user")
+    repo_service = root / "systemd" / "user" / WATCHDOG_SERVICE_NAME
+    repo_timer = root / "systemd" / "user" / WATCHDOG_TIMER_NAME
+    installed_service = installed_dir / WATCHDOG_SERVICE_NAME
+    installed_timer = installed_dir / WATCHDOG_TIMER_NAME
+
+    repo_service_status = repo_file_status(repo_service)
+    repo_timer_status = repo_file_status(repo_timer)
+    installed_service_status = repo_file_status(installed_service)
+    installed_timer_status = repo_file_status(installed_timer)
+    repo_service_text, repo_service_readable = safe_unit_text(repo_service, repo_service_status)
+    repo_timer_text, repo_timer_readable = safe_unit_text(repo_timer, repo_timer_status)
+    installed_service_text, installed_service_readable = safe_unit_text(installed_service, installed_service_status)
+    installed_timer_text, installed_timer_readable = safe_unit_text(installed_timer, installed_timer_status)
+    hardening_directives = {
+        directive: directive in installed_service_text for directive in WATCHDOG_REQUIRED_HARDENING_DIRECTIVES
+    }
+    exec_flags = {flag: flag in installed_service_text for flag in WATCHDOG_REQUIRED_EXEC_FLAGS}
+    hardening_ok = installed_service_readable and all(hardening_directives.values())
+    exec_flags_ok = installed_service_readable and all(exec_flags.values())
+    service_matches_repo = (
+        installed_service_readable and repo_service_readable and installed_service_text == repo_service_text
+    )
+    timer_matches_repo = installed_timer_readable and repo_timer_readable and installed_timer_text == repo_timer_text
+    ok = hardening_ok and exec_flags_ok and service_matches_repo and timer_matches_repo
+    return {
+        "ok": ok,
+        "service": {
+            "repo": repo_service_status,
+            "installed": installed_service_status,
+            "repo_readable": repo_service_readable,
+            "installed_readable": installed_service_readable,
+            "matches_repo": service_matches_repo,
+            "hardening_ok": hardening_ok,
+            "hardening_directives": hardening_directives,
+            "exec_flags_ok": exec_flags_ok,
+            "exec_flags": exec_flags,
+        },
+        "timer": {
+            "repo": repo_timer_status,
+            "installed": installed_timer_status,
+            "repo_readable": repo_timer_readable,
+            "installed_readable": installed_timer_readable,
+            "matches_repo": timer_matches_repo,
+        },
+        "raw_output": "not_returned",
+    }
+
+
+def watchdog_security_status() -> dict[str, Any]:
+    if not shutil.which("systemd-analyze"):
+        return {"ok": False, "available": False, "status": "systemd_analyze_unavailable", "raw_output": "not_returned"}
+    cp = run_command(["systemd-analyze", "--user", "security", WATCHDOG_SERVICE_NAME, "--no-pager"])
+    text = strip_ansi((cp.stdout + "\n" + cp.stderr)[-MAX_SYSTEMD_SECURITY_OUTPUT_BYTES:])
+    match = re.search(r"Overall exposure level[^:]*:\s*([0-9]+(?:\.[0-9]+)?)\s+([A-Z]+)", text)
+    exposure_score: float | None = None
+    exposure_level = ""
+    if match:
+        exposure_score = float(match.group(1))
+        exposure_level = match.group(2)
+    parsed = exposure_score is not None
+    acceptable = parsed and exposure_score <= 4.0 and exposure_level in {"OK", "SAFE"}
+    return {
+        "ok": cp.returncode == 0 and acceptable,
+        "available": True,
+        "status": "ok" if cp.returncode == 0 and parsed else ("unparsed" if cp.returncode == 0 else "failed"),
+        "returncode": cp.returncode,
+        "exposure_score": exposure_score,
+        "exposure_level": exposure_level,
+        "threshold_score": 4.0,
+        "raw_output": "not_returned",
+    }
+
+
+def master_watchdog_status(root: Path | None = None, systemd_user_dir: Path | None = None) -> dict[str, Any]:
+    timer_properties = (
+        "LoadState",
+        "ActiveState",
+        "SubState",
+        "Result",
+        "Unit",
+        "NextElapseUSecRealtime",
+        "LastTriggerUSec",
+    )
+    service_properties = ("LoadState", "ActiveState", "SubState", "Result", "ExecMainCode", "ExecMainStatus")
+    timer = systemctl_user_show(WATCHDOG_TIMER_NAME, timer_properties)
+    service = systemctl_user_show(WATCHDOG_SERVICE_NAME, service_properties)
+    unit_files = watchdog_unit_file_status(root=root, systemd_user_dir=systemd_user_dir)
+    security = watchdog_security_status()
+    timer_props = timer.get("properties", {})
+    service_props = service.get("properties", {})
+    timer_ok = (
+        bool(timer.get("ok"))
+        and timer_props.get("LoadState") == "loaded"
+        and timer_props.get("ActiveState") == "active"
+        and timer_props.get("SubState") in {"waiting", "running", "elapsed"}
+    )
+    service_ok = (
+        bool(service.get("ok"))
+        and service_props.get("LoadState") == "loaded"
+        and service_props.get("Result") in {"", "success"}
+        and service_props.get("ExecMainStatus") in {"", "0"}
+    )
+    checks = {
+        "timer_active": timer_ok,
+        "service_last_run_success": service_ok,
+        "unit_files_hardened_and_current": bool(unit_files.get("ok")),
+        "security_score_ok": bool(security.get("ok")),
+    }
+    return {
+        "ok": all(checks.values()),
+        "checks": checks,
+        "timer": timer,
+        "service": service,
+        "unit_files": unit_files,
+        "security": security,
+        "raw_output": "not_returned",
+    }
+
+
 def master_namespace_status() -> dict[str, Any]:
     registration = check_mcp_registration(DEFAULT_INSTALL_PATH)
     startup_self_test = mcp_command_startup_self_test(DEFAULT_INSTALL_PATH)
@@ -4307,6 +4497,7 @@ def master_namespace_status() -> dict[str, Any]:
         "master_plugin_status": "master_plugin_status" in tool_names,
         "master_namespace_status": "master_namespace_status" in tool_names,
         "master_release_status": "master_release_status" in tool_names,
+        "master_watchdog_status": "master_watchdog_status" in tool_names,
         "raw_output": "not_returned",
     }
     server_ready = bool(registration.get("ok")) and bool(startup_self_test.get("ok")) and bool(
@@ -4330,6 +4521,7 @@ def master_namespace_status() -> dict[str, Any]:
             "master_plugin_status": local_tool_contract["master_plugin_status"],
             "master_namespace_status": local_tool_contract["master_namespace_status"],
             "master_release_status": local_tool_contract["master_release_status"],
+            "master_watchdog_status": local_tool_contract["master_watchdog_status"],
         },
         "local_tool_contract": local_tool_contract,
         "mcp_registration": registration,
@@ -4970,6 +5162,8 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return master_namespace_status()
     if name == "master_release_status":
         return master_release_status()
+    if name == "master_watchdog_status":
+        return master_watchdog_status()
     if name == "agent_doctor":
         return doctor()
     if name == "agent_send":
@@ -5469,6 +5663,11 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
+        "name": "master_watchdog_status",
+        "description": "Report data-sparse systemd Fleetwatchdog health, unit hardening, and security-score status without raw output.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
         "name": "agent_doctor",
         "description": "Return structured diagnostics for installation, MCP registration, runners, and tmux sessions. Does not return raw output.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -5821,6 +6020,7 @@ def main_cli(argv: list[str]) -> int:
     sub.add_parser("plugin-status")
     sub.add_parser("namespace-status")
     sub.add_parser("release-status")
+    sub.add_parser("watchdog-status")
 
     p_install = sub.add_parser("install")
     p_install.add_argument("--no-register", action="store_true")
@@ -6020,6 +6220,8 @@ def main_cli(argv: list[str]) -> int:
             return print_json(call_validated_tool("master_namespace_status", {}))
         if args.command == "release-status":
             return print_json(call_validated_tool("master_release_status", {}))
+        if args.command == "watchdog-status":
+            return print_json(call_validated_tool("master_watchdog_status", {}))
         if args.command == "install":
             return print_json(
                 install(

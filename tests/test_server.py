@@ -59,6 +59,7 @@ from codex_master.server import (
     mcp_registration_command_matches,
     master_app_bridge_status,
     main_cli,
+    master_watchdog_status,
     prune_raw_logs,
     raw_log_retention_status,
     read_message,
@@ -373,6 +374,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("master_plugin_status", names)
         self.assertIn("master_namespace_status", names)
         self.assertIn("master_release_status", names)
+        self.assertIn("master_watchdog_status", names)
         by_name = {tool["name"]: tool for tool in response["result"]["tools"]}
         assign_props = by_name["agent_assign"]["inputSchema"]["properties"]
         claim_props = by_name["agent_claim"]["inputSchema"]["properties"]
@@ -405,6 +407,129 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(skill_props["plugins_offset"]["minimum"], 0)
         self.assertEqual(skill_props["plugins_limit"]["default"], MAX_CAPABILITY_PLUGINS)
         self.assertEqual(skill_props["plugins_limit"]["maximum"], MAX_SKILL_NAMES)
+
+    def test_master_watchdog_status_reports_hardened_systemd_state_without_paths(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        service_text = (source_root / "systemd" / "user" / "codex-master-watchdog.service").read_text(encoding="utf-8")
+        timer_text = (source_root / "systemd" / "user" / "codex-master-watchdog.timer").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            systemd_user = Path(tmp) / "systemd-user"
+            (root / "systemd" / "user").mkdir(parents=True)
+            systemd_user.mkdir()
+            (root / "systemd" / "user" / "codex-master-watchdog.service").write_text(service_text, encoding="utf-8")
+            (root / "systemd" / "user" / "codex-master-watchdog.timer").write_text(timer_text, encoding="utf-8")
+            (systemd_user / "codex-master-watchdog.service").write_text(service_text, encoding="utf-8")
+            (systemd_user / "codex-master-watchdog.timer").write_text(timer_text, encoding="utf-8")
+
+            def fake_run(command, *, check=False, cwd=None, env=None, timeout=DEFAULT_COMMAND_TIMEOUT_SECONDS):
+                if command[:3] == ["systemctl", "--user", "show"] and command[3] == "codex-master-watchdog.timer":
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        stdout=(
+                            "LoadState=loaded\n"
+                            "ActiveState=active\n"
+                            "SubState=waiting\n"
+                            "Result=success\n"
+                            "Unit=codex-master-watchdog.service\n"
+                            "NextElapseUSecRealtime=Sun 2026-06-07 19:00:00 CEST\n"
+                            "LastTriggerUSec=Sun 2026-06-07 18:45:00 CEST\n"
+                        ),
+                        stderr="",
+                    )
+                if command[:3] == ["systemctl", "--user", "show"] and command[3] == "codex-master-watchdog.service":
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        stdout=(
+                            "LoadState=loaded\n"
+                            "ActiveState=inactive\n"
+                            "SubState=dead\n"
+                            "Result=success\n"
+                            "ExecMainCode=1\n"
+                            "ExecMainStatus=0\n"
+                        ),
+                        stderr="",
+                    )
+                if command[:3] == ["systemd-analyze", "--user", "security"]:
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        stdout="Overall exposure level for codex-master-watchdog.service: 3.1 OK\n",
+                        stderr="",
+                    )
+                return subprocess.CompletedProcess(command, 1, stdout="", stderr="unexpected")
+
+            with patch("codex_master.server.run_command", side_effect=fake_run), patch(
+                "codex_master.server.shutil.which", return_value="/usr/bin/systemd-analyze"
+            ):
+                result = master_watchdog_status(root=root, systemd_user_dir=systemd_user)
+
+        payload = json.dumps(result, sort_keys=True)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["checks"]["timer_active"])
+        self.assertTrue(result["checks"]["service_last_run_success"])
+        self.assertTrue(result["unit_files"]["service"]["hardening_ok"])
+        self.assertTrue(result["unit_files"]["service"]["matches_repo"])
+        self.assertTrue(result["unit_files"]["timer"]["matches_repo"])
+        self.assertEqual(result["security"]["exposure_score"], 3.1)
+        self.assertEqual(result["security"]["exposure_level"], "OK")
+        self.assertIn('"raw_output": "not_returned"', payload)
+        self.assertNotIn(tmp, payload)
+        self.assertNotIn(str(root), payload)
+        self.assertNotIn(str(systemd_user), payload)
+
+    def test_master_watchdog_status_detects_missing_hardening_directive(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        service_text = (source_root / "systemd" / "user" / "codex-master-watchdog.service").read_text(encoding="utf-8")
+        timer_text = (source_root / "systemd" / "user" / "codex-master-watchdog.timer").read_text(encoding="utf-8")
+        weakened_service = service_text.replace("IPAddressDeny=any\n", "")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            systemd_user = Path(tmp) / "systemd-user"
+            (root / "systemd" / "user").mkdir(parents=True)
+            systemd_user.mkdir()
+            (root / "systemd" / "user" / "codex-master-watchdog.service").write_text(service_text, encoding="utf-8")
+            (root / "systemd" / "user" / "codex-master-watchdog.timer").write_text(timer_text, encoding="utf-8")
+            (systemd_user / "codex-master-watchdog.service").write_text(weakened_service, encoding="utf-8")
+            (systemd_user / "codex-master-watchdog.timer").write_text(timer_text, encoding="utf-8")
+
+            def fake_run(command, *, check=False, cwd=None, env=None, timeout=DEFAULT_COMMAND_TIMEOUT_SECONDS):
+                if command[:3] == ["systemctl", "--user", "show"] and command[3] == "codex-master-watchdog.timer":
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        stdout="LoadState=loaded\nActiveState=active\nSubState=waiting\nResult=success\n",
+                        stderr="",
+                    )
+                if command[:3] == ["systemctl", "--user", "show"] and command[3] == "codex-master-watchdog.service":
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        stdout="LoadState=loaded\nActiveState=inactive\nSubState=dead\nResult=success\nExecMainStatus=0\n",
+                        stderr="",
+                    )
+                if command[:3] == ["systemd-analyze", "--user", "security"]:
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        stdout="Overall exposure level for codex-master-watchdog.service: 3.1 OK\n",
+                        stderr="",
+                    )
+                return subprocess.CompletedProcess(command, 1, stdout="", stderr="unexpected")
+
+            with patch("codex_master.server.run_command", side_effect=fake_run), patch(
+                "codex_master.server.shutil.which", return_value="/usr/bin/systemd-analyze"
+            ):
+                result = master_watchdog_status(root=root, systemd_user_dir=systemd_user)
+
+        payload = json.dumps(result, sort_keys=True)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["unit_files"]["service"]["hardening_ok"])
+        self.assertFalse(result["unit_files"]["service"]["hardening_directives"]["IPAddressDeny=any"])
+        self.assertFalse(result["unit_files"]["service"]["matches_repo"])
+        self.assertNotIn(tmp, payload)
 
     def test_master_app_bridge_status_is_path_sparse_and_reads_connector_id(self) -> None:
         result = master_app_bridge_status()
@@ -1229,7 +1354,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.4.3+codex.test",
+            "version": "0.5.0+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1256,7 +1381,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.4.3")
+        self.assertEqual(result["expected_tag"], "v0.5.0")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -3984,6 +4109,17 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(name, "fleet_watchdog")
         self.assertTrue(args["manage_unclaimed"])
         mock_print_json.assert_not_called()
+
+    @patch("codex_master.server.print_json")
+    @patch("codex_master.server.call_tool", return_value={"ok": True, "raw_output": "not_returned"})
+    def test_cli_watchdog_status_routes_to_master_tool(self, mock_call_tool, mock_print_json) -> None:
+        mock_print_json.return_value = 0
+
+        result = main_cli(["watchdog-status"])
+
+        self.assertEqual(result, 0)
+        mock_call_tool.assert_called_once_with("master_watchdog_status", {})
+        mock_print_json.assert_called_once()
 
     @patch("codex_master.server.ensure_state")
     @patch("builtins.print")

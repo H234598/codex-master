@@ -58,9 +58,9 @@ It also classifies a known Codex TUI starter/placeholder context without
 returning pane text, so callers can tell when an Agentin did not receive the
 assignment as productive input.
 Public `status`, `skills`, `capabilities`, `app-bridge-status`,
-`plugin-status`, `namespace-status`, `release-status`, and `doctor` responses do
-not return local Agentin home, runner, repo, manifest, or working directory
-paths; they return state/category metadata such as `path_state`,
+`plugin-status`, `namespace-status`, `release-status`, `watchdog-status`, and
+`doctor` responses do not return local Agentin home, runner, repo, manifest, or
+working directory paths; they return state/category metadata such as `path_state`,
 `home_kind`, and `cwd_state` instead.
 Public scope checks, worktree status, command excerpts, and assignment audit
 reads redact absolute local paths as well; assignment prompts still receive the
@@ -119,6 +119,8 @@ in the user journal.
   plugin-cache drift, and `tools/list` visibility for new clients
 - `master_release_status`: diagnose release drift across package version, plugin
   manifest version, local tags, and GitHub releases
+- `master_watchdog_status`: diagnose systemd Fleetwatchdog health, installed
+  unit hardening, and aggregate security-score status
 - `agent_doctor`: structured diagnostics without raw output
 
 `/mcp` should show `codex-master-mcp` only in the Teamleiterin/main Codex
@@ -169,6 +171,7 @@ python3 -m codex_master.server app-bridge-status
 python3 -m codex_master.server plugin-status
 python3 -m codex_master.server namespace-status
 python3 -m codex_master.server release-status
+python3 -m codex_master.server watchdog-status
 python3 -m codex_master.server send a "Kurzer Auftrag"
 python3 -m codex_master.server release b
 python3 -m codex_master.server tail a --source pane --lines 20 --chars 2000
@@ -263,6 +266,15 @@ python3 -m codex_master.server stop both
   `NoNewPrivileges`, `MemoryDenyWriteExecute`, native syscall architecture,
   and `UMask=0077`; it intentionally keeps normal user home read access because
   the watchdog needs Codex config, tmux IPC, and managed state files
+
+`watchdog-status`
+- reports whether the systemd timer is active and whether the last service run
+  succeeded, without returning raw `systemctl` output
+- checks that the installed watchdog service and timer match the repo copies
+  and that the service still contains the required hardening directives and
+  watchdog flags
+- parses only the aggregate `systemd-analyze security` exposure score and
+  level; raw analyzer output and local unit paths are not returned
 
 `skills`
 - scans each Agentin home for `SKILL.md` files in `skills/`, `plugins/cache/`,

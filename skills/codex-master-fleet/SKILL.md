@@ -105,14 +105,16 @@ cd /home/teladi/codex-master
 ./bin/codex-master-mcp plugin-status
 ./bin/codex-master-mcp namespace-status
 ./bin/codex-master-mcp release-status
+./bin/codex-master-mcp watchdog-status
 ./bin/codex-master-mcp release b
 ```
 
 Data minimization:
 
 - `status`, `wait`, `watchdog`, `start`, `send`, `assign-*`, `doctor`,
-  `skills`, `capabilities`, `app-bridge-status`, `plugin-status`, and
-  `namespace-status` do not return Agentin terminal output.
+  `skills`, `capabilities`, `app-bridge-status`, `plugin-status`,
+  `namespace-status`, `release-status`, and `watchdog-status` do not return
+  Agentin terminal output.
 - `watchdog` is data-sparse and two-phased. When an Agentin is idle, it first
   requests a concise report and stores only a metadata marker. It waits the
   report grace period, default 15 seconds, before `interrupt`, `stop`, or
@@ -129,6 +131,11 @@ Data minimization:
   not add `ProtectHome` or similar home-blocking settings unless the service is
   redesigned around explicit read/write paths, because it needs Codex config,
   tmux IPC, and managed state.
+- `watchdog-status` is diagnostic and data-sparse. It may return systemd timer
+  and service health metadata, installed-unit match booleans, required
+  hardening directive booleans, watchdog flag booleans, and the aggregate
+  `systemd-analyze security` exposure score/level. It must not return local
+  unit paths or raw `systemctl`/`systemd-analyze` output.
 - `status`, `doctor`, `skills`, `capabilities`, `app-bridge-status`,
   `plugin-status`, `namespace-status`, and integration metadata must not return
   local Agentin home, runner, repo, manifest, installed symlink, or
