@@ -85,7 +85,8 @@ cd /home/teladi/codex-master
 ./bin/codex-master-mcp doctor
 ./bin/codex-master-mcp status
 ./bin/codex-master-mcp lease-status all
-./bin/codex-master-mcp claim b --wait-seconds 600 --poll-interval-seconds 30
+./bin/codex-master-mcp claim b --forever --poll-interval-seconds 30
+./bin/codex-master-mcp claim b --no-wait
 ./bin/codex-master-mcp wait a --timeout-seconds 120 --poll-interval-seconds 30
 ./bin/codex-master-mcp watchdog all --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 15 --action interrupt --manage-unclaimed --quiet
 ./bin/codex-master-mcp start both --cwd /home/teladi/codex-master
@@ -106,6 +107,7 @@ cd /home/teladi/codex-master
 ./bin/codex-master-mcp namespace-status
 ./bin/codex-master-mcp release-status
 ./bin/codex-master-mcp watchdog-status
+./bin/codex-master-mcp timeout-policy
 ./bin/codex-master-mcp release b
 ```
 
@@ -113,8 +115,8 @@ Data minimization:
 
 - `status`, `wait`, `watchdog`, `start`, `send`, `assign-*`, `doctor`,
   `skills`, `capabilities`, `app-bridge-status`, `plugin-status`,
-  `namespace-status`, `release-status`, and `watchdog-status` do not return
-  Agentin terminal output.
+  `namespace-status`, `release-status`, `watchdog-status`, and
+  `timeout-policy` do not return Agentin terminal output.
 - `watchdog` is data-sparse and two-phased. When an Agentin is idle, it first
   requests a concise report and stores only a metadata marker. It waits the
   report grace period, default 15 seconds, before `interrupt`, `stop`, or
@@ -136,6 +138,13 @@ Data minimization:
   hardening directive booleans, watchdog flag booleans, and the aggregate
   `systemd-analyze security` exposure score/level. It must not return local
   unit paths or raw `systemctl`/`systemd-analyze` output.
+- `timeout-policy` is diagnostic and data-sparse. It must show that `claim`
+  retries forever by default for busy fremde Bienen, that finite claim waits
+  have no 600-second maximum, that the claim poll interval defaults to
+  30 seconds and is capped at 900 seconds, that `wait` remains a bounded
+  Agentin-activity wait capped at 10 minutes, and whether the hidden lease owner
+  identity is stable across CLI invocations. The identity itself must not be
+  returned.
 - `status`, `doctor`, `skills`, `capabilities`, `app-bridge-status`,
   `plugin-status`, `namespace-status`, and integration metadata must not return
   local Agentin home, runner, repo, manifest, installed symlink, or
@@ -176,9 +185,13 @@ Data minimization:
   silently send assignments or text into the same Agentin. Lease conflicts must
   be structured and retryable with `error_code`, `retryable`,
   `retry_after_seconds`, and remaining lease seconds, but without returning
-  client identity, prompt text, Agentin output, or state paths. `claim` may wait
-  and retry in bounded polling loops without holding the Agentin lifecycle lock
-  while sleeping.
+  client identity, prompt text, Agentin output, or state paths. `claim` retries
+  forever by default for busy fremde Bienen, may also accept explicit finite
+  waits without a 600-second cap, and must sleep between retries without holding
+  the Agentin lifecycle lock. Short-lived CLI invocations should derive a
+  stable hidden owner from `CODEX_THREAD_ID` when available; use
+  `CODEX_MASTER_MCP_INSTANCE_ID` only as an explicit override for controlled
+  sessions.
 - Fresh `start` leases are transient and must be released after a successful
   launch, so short-lived local CLI commands do not block the next command. A
   pre-existing same-client claim must be preserved; use `claim` explicitly when

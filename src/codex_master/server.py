@@ -11,6 +11,7 @@ import argparse
 import contextlib
 import datetime as _dt
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -67,6 +68,7 @@ DEFAULT_WAIT_SECONDS = 120
 MAX_WAIT_SECONDS = 600
 DEFAULT_WAIT_POLL_SECONDS = 30
 MAX_WAIT_POLL_SECONDS = 900
+DEFAULT_CLAIM_WAIT_FOREVER = True
 DEFAULT_WATCHDOG_IDLE_SECONDS = 60
 MAX_WATCHDOG_IDLE_SECONDS = 24 * 60 * 60
 DEFAULT_WATCHDOG_POLL_SECONDS = 15
@@ -146,7 +148,40 @@ WATCHDOG_REQUIRED_EXEC_FLAGS = (
 RAW_LOG_TRUNCATION_MARKER = b"\n... codex-master-mcp retained the last raw log bytes ...\n"
 MCP_SERVER_TABLE_HEADER = f"[mcp_servers.{MCP_SERVER_NAME}]"
 APP_BRIDGE_NAME = "codex-master"
-SERVER_INSTANCE_ID = os.environ.get("CODEX_MASTER_MCP_INSTANCE_ID") or uuid.uuid4().hex
+def default_server_instance_id() -> str:
+    explicit = os.environ.get("CODEX_MASTER_MCP_INSTANCE_ID")
+    if explicit:
+        return explicit
+    thread_id = os.environ.get("CODEX_THREAD_ID")
+    if thread_id:
+        digest = hashlib.sha256(f"codex-master-mcp:{thread_id}".encode("utf-8")).hexdigest()
+        return f"codex-thread-{digest[:32]}"
+    return uuid.uuid4().hex
+
+
+SERVER_INSTANCE_ID = default_server_instance_id()
+
+
+def server_instance_identity_status() -> dict[str, Any]:
+    explicit = os.environ.get("CODEX_MASTER_MCP_INSTANCE_ID")
+    thread_id = os.environ.get("CODEX_THREAD_ID")
+    if explicit:
+        source = "explicit_env"
+        stable = True
+    elif thread_id:
+        source = "codex_thread_id_hash"
+        stable = True
+    else:
+        source = "process_uuid"
+        stable = False
+    return {
+        "source": source,
+        "stable_across_cli_invocations": stable,
+        "explicit_override_env": "CODEX_MASTER_MCP_INSTANCE_ID",
+        "thread_env_detected": bool(thread_id),
+        "identity": "not_returned",
+        "raw_output": "not_returned",
+    }
 APP_BRIDGE_ID_PREFIXES = ("connector_", "asdk_app_")
 PLUGIN_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]{0,199}$")
 RELEASE_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+(?:[A-Za-z0-9.+_-]*)?$")
@@ -1048,6 +1083,22 @@ def normalize_wait_seconds(value: Any) -> int:
     return normalize_int_field(value, field="wait_seconds", minimum=0, maximum=MAX_WAIT_SECONDS)
 
 
+def normalize_claim_wait_seconds(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() in {"forever", "infinite", "unbounded", "unlimited"}:
+        return None
+    if isinstance(value, bool):
+        raise AgentError("wait_seconds must be an integer or forever")
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise AgentError("wait_seconds must be an integer or forever") from exc
+    if number < 0:
+        raise AgentError("wait_seconds must be >= 0")
+    return number
+
+
 def normalize_poll_interval_seconds(value: Any) -> int:
     return normalize_int_field(
         value,
@@ -1277,13 +1328,14 @@ def claim_agent_with_wait(
     agent: str,
     ttl_seconds: int = DEFAULT_AGENT_LEASE_SECONDS,
     force: bool = False,
-    wait_seconds: int = 0,
+    wait_seconds: int | str | None = None,
     poll_interval_seconds: int = DEFAULT_WAIT_POLL_SECONDS,
 ) -> dict[str, Any]:
-    wait_seconds = normalize_wait_seconds(wait_seconds)
+    wait_seconds = normalize_claim_wait_seconds(wait_seconds)
     poll_interval_seconds = normalize_poll_interval_seconds(poll_interval_seconds)
     started = time.monotonic()
-    deadline = started + wait_seconds
+    wait_forever = wait_seconds is None
+    deadline = None if wait_forever else started + wait_seconds
     polls = 0
     while True:
         try:
@@ -1293,12 +1345,17 @@ def claim_agent_with_wait(
             )
             result["waited_seconds"] = max(0, int(time.monotonic() - started))
             result["poll_count"] = polls
+            result["wait_forever"] = wait_forever
+            result["wait_limit_seconds"] = None if wait_forever else wait_seconds
             return result
         except AgentBusyError:
-            if time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 raise
-            remaining = max(0.0, deadline - time.monotonic())
-            time.sleep(min(float(poll_interval_seconds), remaining))
+            sleep_seconds = float(poll_interval_seconds)
+            if deadline is not None:
+                remaining = max(0.0, deadline - time.monotonic())
+                sleep_seconds = min(sleep_seconds, remaining)
+            time.sleep(sleep_seconds)
             polls += 1
 
 
@@ -4483,6 +4540,59 @@ def master_watchdog_status(root: Path | None = None, systemd_user_dir: Path | No
     }
 
 
+def master_timeout_policy() -> dict[str, Any]:
+    client_config = codex_client_mcp_config_status(command_path=DEFAULT_INSTALL_PATH)
+    startup_timeout = {
+        "scope": "codex_cli_mcp_server_startup",
+        "configured_seconds": client_config.get("startup_timeout_sec"),
+        "recommended_min_seconds": RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
+        "ok": bool(client_config.get("startup_timeout_ok")),
+    }
+    claim_wait = {
+        "scope": "agentin_lease_claim_wait_for_busy_fleet_bee",
+        "default_wait_mode": "forever",
+        "default_wait_forever": DEFAULT_CLAIM_WAIT_FOREVER,
+        "finite_wait_seconds_has_maximum": False,
+        "maximum_wait_seconds": None,
+        "recommended_activation_wait_mode": "forever",
+        "default_poll_interval_seconds": DEFAULT_WAIT_POLL_SECONDS,
+        "maximum_poll_interval_seconds": MAX_WAIT_POLL_SECONDS,
+    }
+    agent_wait = {
+        "scope": "agentin_activity_wait_after_activation",
+        "default_timeout_seconds": DEFAULT_WAIT_SECONDS,
+        "maximum_timeout_seconds": MAX_WAIT_SECONDS,
+        "default_poll_interval_seconds": DEFAULT_WAIT_POLL_SECONDS,
+        "maximum_poll_interval_seconds": MAX_WAIT_POLL_SECONDS,
+    }
+    watchdog = {
+        "scope": "fleet_watchdog_idle_supervision",
+        "default_idle_seconds": DEFAULT_WATCHDOG_IDLE_SECONDS,
+        "maximum_idle_seconds": MAX_WATCHDOG_IDLE_SECONDS,
+        "default_poll_interval_seconds": DEFAULT_WATCHDOG_POLL_SECONDS,
+        "maximum_poll_interval_seconds": MAX_WAIT_POLL_SECONDS,
+        "default_report_grace_seconds": DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS,
+        "maximum_report_grace_seconds": MAX_WATCHDOG_REPORT_GRACE_SECONDS,
+    }
+    return {
+        "ok": bool(startup_timeout["ok"]),
+        "mcp_startup_timeout": startup_timeout,
+        "agent_claim_wait": claim_wait,
+        "agent_wait": agent_wait,
+        "fleet_watchdog": watchdog,
+        "server_instance_identity": server_instance_identity_status(),
+        "client_config": {
+            "ok": bool(client_config.get("ok")),
+            "server_declared": bool(client_config.get("server_declared")),
+            "command_configured": bool(client_config.get("command_configured")),
+            "startup_timeout_ok": bool(client_config.get("startup_timeout_ok")),
+            "path": PATH_NOT_RETURNED,
+            "raw_output": "not_returned",
+        },
+        "raw_output": "not_returned",
+    }
+
+
 def master_namespace_status() -> dict[str, Any]:
     registration = check_mcp_registration(DEFAULT_INSTALL_PATH)
     startup_self_test = mcp_command_startup_self_test(DEFAULT_INSTALL_PATH)
@@ -4498,6 +4608,7 @@ def master_namespace_status() -> dict[str, Any]:
         "master_namespace_status": "master_namespace_status" in tool_names,
         "master_release_status": "master_release_status" in tool_names,
         "master_watchdog_status": "master_watchdog_status" in tool_names,
+        "master_timeout_policy": "master_timeout_policy" in tool_names,
         "raw_output": "not_returned",
     }
     server_ready = bool(registration.get("ok")) and bool(startup_self_test.get("ok")) and bool(
@@ -4522,6 +4633,7 @@ def master_namespace_status() -> dict[str, Any]:
             "master_namespace_status": local_tool_contract["master_namespace_status"],
             "master_release_status": local_tool_contract["master_release_status"],
             "master_watchdog_status": local_tool_contract["master_watchdog_status"],
+            "master_timeout_policy": local_tool_contract["master_timeout_policy"],
         },
         "local_tool_contract": local_tool_contract,
         "mcp_registration": registration,
@@ -5164,6 +5276,8 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return master_release_status()
     if name == "master_watchdog_status":
         return master_watchdog_status()
+    if name == "master_timeout_policy":
+        return master_timeout_policy()
     if name == "agent_doctor":
         return doctor()
     if name == "agent_send":
@@ -5195,11 +5309,13 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         selected = agent_ids(str(args.get("agent", "")))
         if len(selected) != 1:
             raise AgentError("agent_claim requires exactly one agent: a or b")
+        wait_forever = bool_arg(args, "wait_forever", "wait_seconds" not in args and DEFAULT_CLAIM_WAIT_FOREVER)
+        wait_seconds: int | str | None = None if wait_forever else int_arg(args, "wait_seconds", 0)
         return claim_agent_with_wait(
             selected[0],
             int_arg(args, "ttl_seconds", DEFAULT_AGENT_LEASE_SECONDS),
             bool_arg(args, "force", False),
-            int_arg(args, "wait_seconds", 0),
+            wait_seconds,
             int_arg(args, "poll_interval_seconds", DEFAULT_WAIT_POLL_SECONDS),
         )
     if name == "agent_release":
@@ -5308,9 +5424,10 @@ TOOLS: list[dict[str, Any]] = [
                 "wait_seconds": {
                     "type": "integer",
                     "minimum": 0,
-                    "maximum": MAX_WAIT_SECONDS,
                     "default": 0,
+                    "description": "Finite wait limit. Omit this and keep wait_forever true to retry until the Agentin becomes free.",
                 },
+                "wait_forever": {"type": "boolean", "default": DEFAULT_CLAIM_WAIT_FOREVER},
                 "poll_interval_seconds": {
                     "type": "integer",
                     "minimum": 1,
@@ -5668,6 +5785,11 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
+        "name": "master_timeout_policy",
+        "description": "Report data-sparse timeout and polling policy for MCP startup, Agentin claim retry, Agentin wait, and watchdog supervision.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
         "name": "agent_doctor",
         "description": "Return structured diagnostics for installation, MCP registration, runners, and tmux sessions. Does not return raw output.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -5917,7 +6039,9 @@ def main_cli(argv: list[str]) -> int:
     p_claim = sub.add_parser("claim")
     p_claim.add_argument("agent", choices=["a", "b"])
     p_claim.add_argument("--ttl-seconds", type=int, default=DEFAULT_AGENT_LEASE_SECONDS)
-    p_claim.add_argument("--wait-seconds", type=int, default=0)
+    p_claim.add_argument("--wait-seconds", type=int)
+    p_claim.add_argument("--forever", dest="wait_forever", action="store_true", default=None)
+    p_claim.add_argument("--no-wait", dest="wait_forever", action="store_false")
     p_claim.add_argument("--poll-interval-seconds", type=int, default=DEFAULT_WAIT_POLL_SECONDS)
     p_claim.add_argument("--force", action="store_true")
 
@@ -6021,6 +6145,7 @@ def main_cli(argv: list[str]) -> int:
     sub.add_parser("namespace-status")
     sub.add_parser("release-status")
     sub.add_parser("watchdog-status")
+    sub.add_parser("timeout-policy")
 
     p_install = sub.add_parser("install")
     p_install.add_argument("--no-register", action="store_true")
@@ -6085,13 +6210,20 @@ def main_cli(argv: list[str]) -> int:
         if args.command == "lease-status":
             return print_json(call_validated_tool("agent_lease_status", {"agent": args.agent}))
         if args.command == "claim":
+            wait_forever = args.wait_forever
+            wait_seconds = args.wait_seconds
+            if wait_forever is None:
+                wait_forever = wait_seconds is None
+            if wait_forever is False and wait_seconds is None:
+                wait_seconds = 0
             return print_json(
                 call_validated_tool(
                     "agent_claim",
                     {
                         "agent": args.agent,
                         "ttl_seconds": args.ttl_seconds,
-                        "wait_seconds": args.wait_seconds,
+                        "wait_seconds": wait_seconds,
+                        "wait_forever": wait_forever,
                         "poll_interval_seconds": args.poll_interval_seconds,
                         "force": args.force,
                     },
@@ -6222,6 +6354,8 @@ def main_cli(argv: list[str]) -> int:
             return print_json(call_validated_tool("master_release_status", {}))
         if args.command == "watchdog-status":
             return print_json(call_validated_tool("master_watchdog_status", {}))
+        if args.command == "timeout-policy":
+            return print_json(call_validated_tool("master_timeout_policy", {}))
         if args.command == "install":
             return print_json(
                 install(

@@ -42,8 +42,15 @@ Mutating tools also use a per-Agentin lease, so two Codex-CLI instances cannot
 silently assign or send into the same Agentin at the same time. Lease conflicts
 return structured retry metadata (`error_code`, `retryable`,
 `retry_after_seconds`, and remaining lease seconds) without exposing client
-identity. `agent_claim` can wait and retry in bounded polling loops; its default
-poll interval is 30 seconds and the maximum poll interval is 900 seconds.
+identity. `agent_claim` retries forever by default when a fremde Biene is busy;
+finite `wait_seconds` values remain available but are not capped at 600 seconds.
+Use `--no-wait` for a single immediate claim attempt. The default poll interval
+is 30 seconds and the maximum poll interval is 900 seconds.
+Short-lived CLI invocations derive a stable, hidden owner from `CODEX_THREAD_ID`
+when Codex provides it, so the same Schwesterinstanz can claim, assign, request
+reports, and release across separate CLI calls. `CODEX_MASTER_MCP_INSTANCE_ID`
+remains an explicit override for controlled sessions. The derived identity is
+never returned in public responses.
 `agent_start` uses only a transient fresh lease and releases it after a
 successful start, so short-lived local CLI commands do not block the next
 operator command. Use `agent_claim` explicitly when a connected Codex-CLI
@@ -58,9 +65,10 @@ It also classifies a known Codex TUI starter/placeholder context without
 returning pane text, so callers can tell when an Agentin did not receive the
 assignment as productive input.
 Public `status`, `skills`, `capabilities`, `app-bridge-status`,
-`plugin-status`, `namespace-status`, `release-status`, `watchdog-status`, and
-`doctor` responses do not return local Agentin home, runner, repo, manifest, or
-working directory paths; they return state/category metadata such as `path_state`,
+`plugin-status`, `namespace-status`, `release-status`, `watchdog-status`,
+`timeout-policy`, and `doctor` responses do not return local Agentin home,
+runner, repo, manifest, or working directory paths; they return state/category
+metadata such as `path_state`,
 `home_kind`, and `cwd_state` instead.
 Public scope checks, worktree status, command excerpts, and assignment audit
 reads redact absolute local paths as well; assignment prompts still receive the
@@ -85,7 +93,8 @@ in the user journal.
 - `agent_status`: structured status, response state, and limit classification
   without raw output
 - `agent_lease_status`: data-sparse lease state for Agentin `a`, `b`, or `all`
-- `agent_claim`: claim or renew one Agentin, optionally waiting and retrying
+- `agent_claim`: claim or renew one Agentin, retrying forever by default when
+  she is busy
 - `agent_release`: release this MCP client's Agentin claim; force only after
   checking status
 - `agent_wait`: wait for activity/stop/limit metadata without raw output,
@@ -121,6 +130,9 @@ in the user journal.
   manifest version, local tags, and GitHub releases
 - `master_watchdog_status`: diagnose systemd Fleetwatchdog health, installed
   unit hardening, and aggregate security-score status
+- `master_timeout_policy`: report effective timeout and polling policy for MCP
+  startup, Agentin claim retry, Agentin wait, watchdog supervision, and
+  hidden CLI lease identity source
 - `agent_doctor`: structured diagnostics without raw output
 
 `/mcp` should show `codex-master-mcp` only in the Teamleiterin/main Codex
@@ -153,7 +165,8 @@ python3 -m codex_master.server uninstall       # remove mcp registration and loc
 python3 -m codex_master.server start both --cwd /home/teladi/codex-master
 python3 -m codex_master.server status
 python3 -m codex_master.server lease-status all
-python3 -m codex_master.server claim b --wait-seconds 600 --poll-interval-seconds 30
+python3 -m codex_master.server claim b --forever --poll-interval-seconds 30
+python3 -m codex_master.server claim b --no-wait
 python3 -m codex_master.server wait a --timeout-seconds 120 --poll-interval-seconds 30
 python3 -m codex_master.server watchdog all --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 15 --action interrupt --manage-unclaimed --quiet
 python3 -m codex_master.server capabilities all
@@ -172,6 +185,7 @@ python3 -m codex_master.server plugin-status
 python3 -m codex_master.server namespace-status
 python3 -m codex_master.server release-status
 python3 -m codex_master.server watchdog-status
+python3 -m codex_master.server timeout-policy
 python3 -m codex_master.server send a "Kurzer Auftrag"
 python3 -m codex_master.server release b
 python3 -m codex_master.server tail a --source pane --lines 20 --chars 2000
@@ -275,6 +289,15 @@ python3 -m codex_master.server stop both
   watchdog flags
 - parses only the aggregate `systemd-analyze security` exposure score and
   level; raw analyzer output and local unit paths are not returned
+
+`timeout-policy`
+- reports that `agent_claim` retries forever by default for busy fremde Bienen,
+  while finite claim waits are still accepted without a 600 second cap
+- reports that claim polling defaults to 30 seconds and is capped at 900 seconds
+- keeps `agent_wait` separate as a bounded activity wait: default 120 seconds,
+  maximum 600 seconds
+- reports whether the current CLI/MCP owner identity is stable across
+  invocations without returning the identity itself
 
 `skills`
 - scans each Agentin home for `SKILL.md` files in `skills/`, `plugins/cache/`,
@@ -392,9 +415,11 @@ Fresh `start` leases are released again after a successful launch; this keeps
 the local CLI usable across separate invocations while still serializing the
 start operation itself. Existing claims held by the same connected client are
 preserved.
-Use `claim --wait-seconds ...` when a Codex-CLI instance should wait for a busy
-Agentin and retry with bounded polling. Lease state is metadata only and does
-not return the client identity, prompt text, Agentin output, or local state path.
+Use `claim` when a Codex-CLI instance should wait for a busy Agentin; it retries
+forever by default with bounded polling intervals. Use `claim --no-wait` for a
+single immediate attempt, or `claim --wait-seconds ...` for an explicit finite
+limit. Lease state is metadata only and does not return the client identity,
+prompt text, Agentin output, or local state path.
 
 Raw logs are local debug artifacts, not normal API data. The tmux pipe writes
 through a bounded local writer, `doctor` reports the configured raw-log policy,

@@ -10,6 +10,8 @@ from unittest.mock import patch
 
 from codex_master.server import (
     AgentError,
+    AgentBusyError,
+    DEFAULT_CLAIM_WAIT_FOREVER,
     DEFAULT_AGENT_LEASE_SECONDS,
     MAX_ASSIGNMENT_LIST_ITEMS,
     MAX_ASSIGNMENT_LOG_BYTES,
@@ -59,6 +61,7 @@ from codex_master.server import (
     mcp_registration_command_matches,
     master_app_bridge_status,
     main_cli,
+    master_timeout_policy,
     master_watchdog_status,
     prune_raw_logs,
     raw_log_retention_status,
@@ -72,6 +75,7 @@ from codex_master.server import (
     run_command,
     run_tmux,
     send_agent,
+    server_instance_identity_status,
     start_agent,
     start_agent_with_lease,
     strip_ansi,
@@ -89,6 +93,7 @@ from codex_master.server import (
     codex_client_mcp_config_status,
     ensure_private_dir,
     ensure_mcp_startup_timeout_configured,
+    default_server_instance_id,
     fleet_watchdog,
     mcp_startup_timeout_seconds,
     updated_mcp_startup_timeout_config,
@@ -375,6 +380,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("master_namespace_status", names)
         self.assertIn("master_release_status", names)
         self.assertIn("master_watchdog_status", names)
+        self.assertIn("master_timeout_policy", names)
         by_name = {tool["name"]: tool for tool in response["result"]["tools"]}
         assign_props = by_name["agent_assign"]["inputSchema"]["properties"]
         claim_props = by_name["agent_claim"]["inputSchema"]["properties"]
@@ -391,7 +397,9 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(wait_props["timeout_seconds"]["maximum"], MAX_WAIT_SECONDS)
         self.assertEqual(wait_props["poll_interval_seconds"]["default"], DEFAULT_WAIT_POLL_SECONDS)
         self.assertEqual(wait_props["poll_interval_seconds"]["maximum"], MAX_WAIT_POLL_SECONDS)
-        self.assertEqual(claim_props["wait_seconds"]["maximum"], MAX_WAIT_SECONDS)
+        self.assertEqual(DEFAULT_CLAIM_WAIT_FOREVER, True)
+        self.assertNotIn("maximum", claim_props["wait_seconds"])
+        self.assertEqual(claim_props["wait_forever"]["default"], DEFAULT_CLAIM_WAIT_FOREVER)
         self.assertEqual(claim_props["poll_interval_seconds"]["default"], DEFAULT_WAIT_POLL_SECONDS)
         self.assertEqual(claim_props["poll_interval_seconds"]["maximum"], MAX_WAIT_POLL_SECONDS)
         self.assertEqual(DEFAULT_WATCHDOG_IDLE_SECONDS, 60)
@@ -1158,6 +1166,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["expected_tools"]["master_app_bridge_status"])
         self.assertTrue(result["expected_tools"]["master_namespace_status"])
         self.assertTrue(result["expected_tools"]["master_release_status"])
+        self.assertTrue(result["expected_tools"]["master_timeout_policy"])
         self.assertFalse(result["tool_search"]["authoritative_for_local_stdio_mcp_tools"])
         self.assertTrue(result["client_refresh"]["existing_sessions_may_need_restart"])
         self.assertTrue(result["mcp_server_ready"])
@@ -1354,7 +1363,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.5.0+codex.test",
+            "version": "0.6.0+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1381,7 +1390,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.5.0")
+        self.assertEqual(result["expected_tag"], "v0.6.0")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -1392,6 +1401,36 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("github_release_missing_for_current_version", result["blockers"])
         self.assertIn("latest_github_release_behind_head", result["warnings"])
         self.assertIn("local_tags_without_github_release", result["warnings"])
+        self.assertEqual(result["raw_output"], "not_returned")
+        self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
+
+    @patch("codex_master.server.codex_client_mcp_config_status")
+    def test_master_timeout_policy_reports_unbounded_claim_wait_without_paths(self, mock_client_config) -> None:
+        mock_client_config.return_value = {
+            "ok": True,
+            "server_declared": True,
+            "command_configured": True,
+            "startup_timeout_ok": True,
+            "startup_timeout_sec": 120,
+            "raw_output": "not_returned",
+        }
+
+        result = master_timeout_policy()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mcp_startup_timeout"]["configured_seconds"], 120)
+        self.assertEqual(result["agent_claim_wait"]["default_wait_mode"], "forever")
+        self.assertTrue(result["agent_claim_wait"]["default_wait_forever"])
+        self.assertFalse(result["agent_claim_wait"]["finite_wait_seconds_has_maximum"])
+        self.assertIsNone(result["agent_claim_wait"]["maximum_wait_seconds"])
+        self.assertEqual(result["agent_claim_wait"]["default_poll_interval_seconds"], DEFAULT_WAIT_POLL_SECONDS)
+        self.assertEqual(result["agent_wait"]["maximum_timeout_seconds"], MAX_WAIT_SECONDS)
+        self.assertEqual(result["server_instance_identity"]["identity"], "not_returned")
+        self.assertIn(
+            result["server_instance_identity"]["source"],
+            {"explicit_env", "codex_thread_id_hash", "process_uuid"},
+        )
+        self.assertEqual(result["client_config"]["path"], "not_returned")
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
 
@@ -2788,12 +2827,80 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(mock_start_agent.call_args.kwargs["release_lease_on_failure"])
 
     def test_agent_claim_wait_rejects_invalid_direct_interval_values(self) -> None:
-        with self.assertRaisesRegex(AgentError, "wait_seconds must be an integer"):
+        with self.assertRaisesRegex(AgentError, "wait_seconds must be an integer or forever"):
             claim_agent_with_wait("a", wait_seconds="nope")
         with self.assertRaisesRegex(AgentError, "poll_interval_seconds must be an integer"):
             claim_agent_with_wait("a", poll_interval_seconds=True)
         with self.assertRaisesRegex(AgentError, f"poll_interval_seconds must be <= {MAX_WAIT_POLL_SECONDS}"):
             claim_agent_with_wait("a", poll_interval_seconds=MAX_WAIT_POLL_SECONDS + 1)
+
+    def test_default_server_instance_id_prefers_explicit_override(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"CODEX_MASTER_MCP_INSTANCE_ID": "explicit-owner", "CODEX_THREAD_ID": "thread-one"},
+            clear=False,
+        ):
+            self.assertEqual(default_server_instance_id(), "explicit-owner")
+
+    def test_default_server_instance_id_uses_stable_hashed_thread_id(self) -> None:
+        with patch.dict("os.environ", {"CODEX_THREAD_ID": "thread-one"}, clear=True):
+            first = default_server_instance_id()
+            second = default_server_instance_id()
+        with patch.dict("os.environ", {"CODEX_THREAD_ID": "thread-two"}, clear=True):
+            other = default_server_instance_id()
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, other)
+        self.assertTrue(first.startswith("codex-thread-"))
+        self.assertNotIn("thread-one", first)
+
+    def test_server_instance_identity_status_is_stable_and_path_sparse(self) -> None:
+        with patch.dict("os.environ", {"CODEX_THREAD_ID": "thread-one"}, clear=True):
+            result = server_instance_identity_status()
+
+        self.assertEqual(result["source"], "codex_thread_id_hash")
+        self.assertTrue(result["stable_across_cli_invocations"])
+        self.assertTrue(result["thread_env_detected"])
+        self.assertEqual(result["identity"], "not_returned")
+        self.assertEqual(result["raw_output"], "not_returned")
+
+    @patch("codex_master.server.time.sleep")
+    @patch("codex_master.server.call_agent_lifecycle")
+    def test_agent_claim_wait_defaults_to_forever_and_retries_until_free(self, mock_lifecycle, mock_sleep) -> None:
+        success = {
+            "agent": "a",
+            "status": "claimed",
+            "lease": {"state": "held", "holder": "this_server", "raw_output": "not_returned"},
+            "previous_lease": {"state": "unclaimed", "raw_output": "not_returned"},
+            "raw_output": "not_returned",
+        }
+        mock_lifecycle.side_effect = [
+            AgentBusyError("agent is busy", {"error_code": "agent_busy", "raw_output": "not_returned"}),
+            success,
+        ]
+
+        result = claim_agent_with_wait("a", poll_interval_seconds=30)
+
+        self.assertEqual(result["status"], "claimed")
+        self.assertTrue(result["wait_forever"])
+        self.assertIsNone(result["wait_limit_seconds"])
+        self.assertEqual(result["poll_count"], 1)
+        mock_sleep.assert_called_once_with(30.0)
+
+    @patch("codex_master.server.call_agent_lifecycle")
+    def test_agent_claim_wait_finite_seconds_has_no_600_second_maximum(self, mock_lifecycle) -> None:
+        mock_lifecycle.return_value = {
+            "agent": "a",
+            "status": "claimed",
+            "lease": {"state": "held", "holder": "this_server", "raw_output": "not_returned"},
+            "previous_lease": {"state": "unclaimed", "raw_output": "not_returned"},
+            "raw_output": "not_returned",
+        }
+
+        result = claim_agent_with_wait("a", wait_seconds=MAX_WAIT_SECONDS + 1)
+
+        self.assertFalse(result["wait_forever"])
+        self.assertEqual(result["wait_limit_seconds"], MAX_WAIT_SECONDS + 1)
 
     def test_wait_agent_rejects_invalid_direct_interval_values(self) -> None:
         with self.assertRaisesRegex(AgentError, "timeout_seconds must be an integer"):
@@ -4088,6 +4195,65 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result, 0)
         mock_call_tool.assert_called_once_with("agent_start", {"agent": "a"})
 
+    @patch("codex_master.server.print_json")
+    @patch("codex_master.server.call_tool", return_value={"status": "claimed", "raw_output": "not_returned"})
+    def test_cli_claim_defaults_to_wait_forever(self, mock_call_tool, mock_print_json) -> None:
+        mock_print_json.return_value = 0
+
+        result = main_cli(["claim", "b"])
+
+        self.assertEqual(result, 0)
+        mock_call_tool.assert_called_once_with(
+            "agent_claim",
+            {
+                "agent": "b",
+                "ttl_seconds": DEFAULT_AGENT_LEASE_SECONDS,
+                "wait_forever": True,
+                "poll_interval_seconds": DEFAULT_WAIT_POLL_SECONDS,
+                "force": False,
+            },
+        )
+
+    @patch("codex_master.server.print_json")
+    @patch("codex_master.server.call_tool", return_value={"status": "claimed", "raw_output": "not_returned"})
+    def test_cli_claim_no_wait_keeps_immediate_attempt_available(self, mock_call_tool, mock_print_json) -> None:
+        mock_print_json.return_value = 0
+
+        result = main_cli(["claim", "b", "--no-wait"])
+
+        self.assertEqual(result, 0)
+        mock_call_tool.assert_called_once_with(
+            "agent_claim",
+            {
+                "agent": "b",
+                "ttl_seconds": DEFAULT_AGENT_LEASE_SECONDS,
+                "wait_seconds": 0,
+                "wait_forever": False,
+                "poll_interval_seconds": DEFAULT_WAIT_POLL_SECONDS,
+                "force": False,
+            },
+        )
+
+    @patch("codex_master.server.print_json")
+    @patch("codex_master.server.call_tool", return_value={"status": "claimed", "raw_output": "not_returned"})
+    def test_cli_claim_finite_wait_is_unbounded_by_schema(self, mock_call_tool, mock_print_json) -> None:
+        mock_print_json.return_value = 0
+
+        result = main_cli(["claim", "b", "--wait-seconds", str(MAX_WAIT_SECONDS + 1)])
+
+        self.assertEqual(result, 0)
+        mock_call_tool.assert_called_once_with(
+            "agent_claim",
+            {
+                "agent": "b",
+                "ttl_seconds": DEFAULT_AGENT_LEASE_SECONDS,
+                "wait_seconds": MAX_WAIT_SECONDS + 1,
+                "wait_forever": False,
+                "poll_interval_seconds": DEFAULT_WAIT_POLL_SECONDS,
+                "force": False,
+            },
+        )
+
     @patch("codex_master.server.call_tool")
     @patch("builtins.print")
     def test_cli_tool_validation_rejects_out_of_bounds_arguments(self, mock_print, mock_call_tool) -> None:
@@ -4119,6 +4285,17 @@ class CliLifecycleTest(unittest.TestCase):
 
         self.assertEqual(result, 0)
         mock_call_tool.assert_called_once_with("master_watchdog_status", {})
+        mock_print_json.assert_called_once()
+
+    @patch("codex_master.server.print_json")
+    @patch("codex_master.server.call_tool", return_value={"ok": True, "raw_output": "not_returned"})
+    def test_cli_timeout_policy_routes_to_master_tool(self, mock_call_tool, mock_print_json) -> None:
+        mock_print_json.return_value = 0
+
+        result = main_cli(["timeout-policy"])
+
+        self.assertEqual(result, 0)
+        mock_call_tool.assert_called_once_with("master_timeout_policy", {})
         mock_print_json.assert_called_once()
 
     @patch("codex_master.server.ensure_state")
