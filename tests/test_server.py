@@ -31,6 +31,9 @@ from codex_master.server import (
     DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS,
     DEFAULT_WAIT_POLL_SECONDS,
     DEFAULT_WAIT_SECONDS,
+    DEFAULT_WATCHDOG_IDLE_SECONDS,
+    DEFAULT_WATCHDOG_POLL_SECONDS,
+    DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS,
     DEFAULT_TMUX_TIMEOUT_SECONDS,
     allowed_raw_log_path,
     append_bounded_raw_log,
@@ -85,6 +88,7 @@ from codex_master.server import (
     codex_client_mcp_config_status,
     ensure_private_dir,
     ensure_mcp_startup_timeout_configured,
+    fleet_watchdog,
     mcp_startup_timeout_seconds,
     updated_mcp_startup_timeout_config,
     mcp_command_tools_list_self_test,
@@ -352,6 +356,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("agent_start", names)
         self.assertIn("agent_safe_tail", names)
         self.assertIn("agent_wait", names)
+        self.assertIn("fleet_watchdog", names)
         self.assertIn("agent_lease_status", names)
         self.assertIn("agent_claim", names)
         self.assertIn("agent_release", names)
@@ -372,6 +377,7 @@ class ServerHelpersTest(unittest.TestCase):
         assign_props = by_name["agent_assign"]["inputSchema"]["properties"]
         claim_props = by_name["agent_claim"]["inputSchema"]["properties"]
         wait_props = by_name["agent_wait"]["inputSchema"]["properties"]
+        watchdog_props = by_name["fleet_watchdog"]["inputSchema"]["properties"]
         skill_props = by_name["agent_skills"]["inputSchema"]["properties"]
         self.assertEqual(assign_props["task"]["maxLength"], MAX_TASK_TEXT)
         self.assertEqual(assign_props["context"]["maxItems"], MAX_ASSIGNMENT_LIST_ITEMS)
@@ -386,6 +392,13 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(claim_props["wait_seconds"]["maximum"], MAX_WAIT_SECONDS)
         self.assertEqual(claim_props["poll_interval_seconds"]["default"], DEFAULT_WAIT_POLL_SECONDS)
         self.assertEqual(claim_props["poll_interval_seconds"]["maximum"], MAX_WAIT_POLL_SECONDS)
+        self.assertEqual(DEFAULT_WATCHDOG_IDLE_SECONDS, 60)
+        self.assertEqual(DEFAULT_WATCHDOG_POLL_SECONDS, 15)
+        self.assertEqual(DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS, 120)
+        self.assertEqual(watchdog_props["idle_seconds"]["default"], DEFAULT_WATCHDOG_IDLE_SECONDS)
+        self.assertEqual(watchdog_props["poll_interval_seconds"]["default"], DEFAULT_WATCHDOG_POLL_SECONDS)
+        self.assertEqual(watchdog_props["poll_interval_seconds"]["maximum"], MAX_WAIT_POLL_SECONDS)
+        self.assertEqual(watchdog_props["report_grace_seconds"]["default"], DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS)
         self.assertEqual(by_name["agent_send"]["inputSchema"]["properties"]["text"]["maxLength"], MAX_SEND_TEXT)
         self.assertEqual(skill_props["limit"]["maximum"], MAX_SKILL_NAMES)
         self.assertEqual(skill_props["names_offset"]["minimum"], 0)
@@ -449,6 +462,44 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["installed_versions"], [])
         self.assertNotIn(str(target), json.dumps(result, sort_keys=True))
 
+    def test_plugin_cache_status_rejects_cache_root_swap_without_counting_redirected_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            root = tmp_path / "repo"
+            cache = tmp_path / "cache"
+            backup_cache = tmp_path / "cache-backup"
+            redirected_cache = tmp_path / "redirected-cache"
+            version = "0.3.8+codex.test"
+            manifest = root / ".codex-plugin" / "plugin.json"
+            redirected_manifest = redirected_cache / version / ".codex-plugin" / "plugin.json"
+            manifest.parent.mkdir(parents=True)
+            redirected_manifest.parent.mkdir(parents=True)
+            payload = {"name": "codex-master", "version": version}
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            redirected_manifest.write_text(json.dumps(payload), encoding="utf-8")
+            cache.mkdir()
+            real_open = os.open
+            swapped = False
+
+            def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+                nonlocal swapped
+                if not swapped and dir_fd is None and Path(path) == cache:
+                    swapped = True
+                    cache.rename(backup_cache)
+                    cache.symlink_to(redirected_cache, target_is_directory=True)
+                if dir_fd is None:
+                    return real_open(path, flags, mode)
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            with patch("codex_master.server.os.open", side_effect=swapping_open):
+                result = plugin_cache_status(root, cache)
+
+        self.assertTrue(swapped)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["repo_version_installed"])
+        self.assertEqual(result["installed_version_count"], 0)
+        self.assertNotIn(str(redirected_cache), json.dumps(result, sort_keys=True))
+
     def test_sync_plugin_cache_from_repo_copies_runtime_allowlist_without_paths_or_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -457,6 +508,7 @@ class ServerHelpersTest(unittest.TestCase):
             (root / ".codex-plugin").mkdir(parents=True)
             (root / "bin").mkdir()
             (root / "skills" / "codex-master-fleet").mkdir(parents=True)
+            (root / "systemd" / "user").mkdir(parents=True)
             (root / "src" / "codex_master" / "__pycache__").mkdir(parents=True)
             (root / "tests" / "__pycache__").mkdir(parents=True)
             (root / ".git").mkdir()
@@ -491,6 +543,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "bin": (entry / "bin" / "codex-master-mcp").exists(),
                 "bin_executable": os.access(entry / "bin" / "codex-master-mcp", os.X_OK),
                 "skill": (entry / "skills" / "codex-master-fleet" / "SKILL.md").exists(),
+                "systemd": (entry / "systemd" / "user").exists(),
                 "server": (entry / "src" / "codex_master" / "server.py").exists(),
                 "git": (entry / ".git").exists(),
                 "pytest_cache": (entry / ".pytest_cache").exists(),
@@ -510,6 +563,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(copied_state["bin"])
         self.assertTrue(copied_state["bin_executable"])
         self.assertTrue(copied_state["skill"])
+        self.assertTrue(copied_state["systemd"])
         self.assertTrue(copied_state["server"])
         self.assertFalse(copied_state["git"])
         self.assertFalse(copied_state["pytest_cache"])
@@ -530,6 +584,7 @@ class ServerHelpersTest(unittest.TestCase):
             (root / ".codex-plugin").mkdir(parents=True)
             (root / "bin").mkdir()
             (root / "skills").mkdir()
+            (root / "systemd" / "user").mkdir(parents=True)
             (root / "src" / "codex_master").mkdir(parents=True)
             payload = {"name": "codex-master", "version": "0.3.4+codex.test"}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -564,6 +619,7 @@ class ServerHelpersTest(unittest.TestCase):
             (root / ".codex-plugin").mkdir(parents=True)
             (root / "bin").mkdir()
             (root / "skills").mkdir()
+            (root / "systemd" / "user").mkdir(parents=True)
             (root / "src" / "codex_master").mkdir(parents=True)
             payload = {"name": "codex-master", "version": version}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -594,6 +650,7 @@ class ServerHelpersTest(unittest.TestCase):
             (root / ".codex-plugin").mkdir(parents=True)
             (root / "bin").mkdir()
             (root / "skills").mkdir()
+            (root / "systemd" / "user").mkdir(parents=True)
             (root / "src" / "codex_master").mkdir(parents=True)
             payload = {"name": "codex-master", "version": "0.3.5+codex.test"}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -624,6 +681,7 @@ class ServerHelpersTest(unittest.TestCase):
             (root / ".codex-plugin").mkdir(parents=True)
             (root / "bin").mkdir()
             (root / "skills").mkdir()
+            (root / "systemd" / "user").mkdir(parents=True)
             (root / "src" / "codex_master").mkdir(parents=True)
             payload = {"name": "codex-master", "version": "0.3.8+codex.test"}
             (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -642,7 +700,7 @@ class ServerHelpersTest(unittest.TestCase):
 
             def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
                 nonlocal swapped
-                if not swapped and dir_fd is None and Path(path) == server:
+                if not swapped and dir_fd is not None and path == "server.py":
                     swapped = True
                     server.unlink()
                     server.symlink_to(redirected)
@@ -662,6 +720,104 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(entry.exists())
         self.assertEqual(tmp_entries, [])
 
+    def test_sync_plugin_cache_from_repo_rejects_directory_swap_to_symlink_during_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            root = tmp_path / "repo"
+            cache = tmp_path / "cache"
+            (root / ".codex-plugin").mkdir(parents=True)
+            (root / "bin").mkdir()
+            (root / "skills").mkdir()
+            (root / "systemd" / "user").mkdir(parents=True)
+            (root / "src" / "codex_master").mkdir(parents=True)
+            payload = {"name": "codex-master", "version": "0.3.8+codex.test"}
+            (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
+            (root / ".app.json").write_text("{}", encoding="utf-8")
+            (root / ".mcp.json").write_text("{}", encoding="utf-8")
+            (root / "README.md").write_text("readme", encoding="utf-8")
+            (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
+            (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
+            (root / "skills" / "SKILL.md").write_text("skill", encoding="utf-8")
+            source_dir = root / "src"
+            backup_dir = root / "src-backup"
+            (source_dir / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
+            redirected_dir = tmp_path / "redirected-src"
+            (redirected_dir / "codex_master").mkdir(parents=True)
+            (redirected_dir / "codex_master" / "server.py").write_text("SECRET_SHOULD_NOT_COPY\n", encoding="utf-8")
+            real_open = os.open
+            swapped = False
+
+            def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+                nonlocal swapped
+                if not swapped and dir_fd is None and Path(path) == source_dir:
+                    swapped = True
+                    source_dir.rename(backup_dir)
+                    source_dir.symlink_to(redirected_dir, target_is_directory=True)
+                if dir_fd is None:
+                    return real_open(path, flags, mode)
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False), patch(
+                "codex_master.server.os.open", side_effect=swapping_open
+            ):
+                with self.assertRaisesRegex(AgentError, "could_not_sync_plugin_cache"):
+                    sync_plugin_cache_from_repo(root, cache)
+            entry = cache / "0.3.8+codex.test"
+            tmp_entries = list(cache.glob(".*.tmp.*")) if cache.exists() else []
+
+        self.assertTrue(swapped)
+        self.assertFalse(entry.exists())
+        self.assertEqual(tmp_entries, [])
+
+    def test_sync_plugin_cache_from_repo_rejects_cache_root_swap_before_temp_create(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            root = tmp_path / "repo"
+            cache = tmp_path / "cache"
+            backup_cache = tmp_path / "cache-backup"
+            redirected_cache = tmp_path / "redirected-cache"
+            cache.mkdir()
+            redirected_cache.mkdir()
+            (root / ".codex-plugin").mkdir(parents=True)
+            (root / "bin").mkdir()
+            (root / "skills").mkdir()
+            (root / "systemd" / "user").mkdir(parents=True)
+            (root / "src" / "codex_master").mkdir(parents=True)
+            version = "0.3.8+codex.test"
+            payload = {"name": "codex-master", "version": version}
+            (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
+            (root / ".app.json").write_text("{}", encoding="utf-8")
+            (root / ".mcp.json").write_text("{}", encoding="utf-8")
+            (root / "README.md").write_text("readme", encoding="utf-8")
+            (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
+            (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
+            (root / "skills" / "SKILL.md").write_text("skill", encoding="utf-8")
+            (root / "src" / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
+            real_open = os.open
+            swapped = False
+
+            def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
+                nonlocal swapped
+                if not swapped and dir_fd is None and Path(path) == cache:
+                    swapped = True
+                    cache.rename(backup_cache)
+                    cache.symlink_to(redirected_cache, target_is_directory=True)
+                if dir_fd is None:
+                    return real_open(path, flags, mode)
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False), patch(
+                "codex_master.server.os.open", side_effect=swapping_open
+            ):
+                with self.assertRaisesRegex(AgentError, "could_not_sync_plugin_cache"):
+                    sync_plugin_cache_from_repo(root, cache)
+            redirected_entries = list(redirected_cache.iterdir())
+            backup_entries = list(backup_cache.iterdir())
+
+        self.assertTrue(swapped)
+        self.assertEqual(redirected_entries, [])
+        self.assertEqual(backup_entries, [])
+
     def test_sync_plugin_cache_from_repo_prunes_old_valid_versions_without_touching_invalid_entries(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -670,6 +826,7 @@ class ServerHelpersTest(unittest.TestCase):
             (root / ".codex-plugin").mkdir(parents=True)
             (root / "bin").mkdir()
             (root / "skills").mkdir()
+            (root / "systemd" / "user").mkdir(parents=True)
             (root / "src" / "codex_master").mkdir(parents=True)
             current = "0.3.5+codex.current"
             payload = {"name": "codex-master", "version": current}
@@ -1072,7 +1229,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.3.8+codex.test",
+            "version": "0.4.0+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1099,7 +1256,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.3.8")
+        self.assertEqual(result["expected_tag"], "v0.4.0")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -1790,6 +1947,154 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertEqual(result["response_output"], "not_returned")
         mock_sleep.assert_not_called()
+
+    def test_fleet_watchdog_requests_report_before_interrupt(self) -> None:
+        meta_store: dict[str, object] = {}
+
+        def fake_read_meta(_agent: str) -> dict[str, object]:
+            return dict(meta_store)
+
+        def fake_write_meta(_agent: str, data: dict[str, object]) -> None:
+            meta_store.clear()
+            meta_store.update(data)
+
+        status = {
+            "agent": "a",
+            "running": True,
+            "lease": {"state": "held", "held_by_this_server": True, "raw_output": "not_returned"},
+            "response_state": {"state": "running_recent_output"},
+            "raw_log_idle_seconds": 90,
+            "raw_log_bytes": 100,
+            "raw_log_updated_at_utc": "1970-01-01T00:15:00+00:00",
+            "last_assignment": {"assignment_id": "assign-1", "created_at_utc": "2026-06-07T09:58:00+00:00"},
+        }
+        report = {
+            "status": "report_requested",
+            "submitted": True,
+            "assignment_id": "assign-1",
+            "send": {"status": "sent"},
+        }
+        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "codex_master.server.status_agent", return_value=status
+        ), patch("codex_master.server.read_meta", side_effect=fake_read_meta), patch(
+            "codex_master.server.write_meta", side_effect=fake_write_meta
+        ), patch("codex_master.server.request_agent_report", return_value=report) as mock_report, patch(
+            "codex_master.server.interrupt_agent"
+        ) as mock_interrupt:
+            result = fleet_watchdog("a")
+
+        payload = result["results"][0]
+        self.assertEqual(payload["watchdog_state"], "report_requested")
+        self.assertEqual(payload["action_taken"], "report_request")
+        self.assertEqual(payload["report_request"]["send_status"], "sent")
+        self.assertEqual(meta_store["watchdog"]["phase"], "report_requested")
+        self.assertEqual(meta_store["watchdog"]["planned_action"], "interrupt")
+        mock_report.assert_called_once()
+        mock_interrupt.assert_not_called()
+
+    def test_fleet_watchdog_waits_during_report_grace(self) -> None:
+        status = {
+            "agent": "a",
+            "running": True,
+            "lease": {"state": "held", "held_by_this_server": True, "raw_output": "not_returned"},
+            "response_state": {"state": "running_recent_output"},
+            "raw_log_idle_seconds": 90,
+            "raw_log_bytes": 100,
+            "raw_log_updated_at_utc": "1970-01-01T00:15:00+00:00",
+            "last_assignment": {"assignment_id": "assign-1", "created_at_utc": "2026-06-07T09:58:00+00:00"},
+        }
+        marker = {
+            "watchdog": {
+                "phase": "report_requested",
+                "requested_at_utc": "1970-01-01T00:16:10+00:00",
+                "assignment_id": "assign-1",
+                "planned_action": "interrupt",
+                "raw_log_bytes": 100,
+                "raw_log_updated_at_utc": "1970-01-01T00:15:00+00:00",
+                "report_grace_seconds": DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS,
+            }
+        }
+        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "codex_master.server.time.time", return_value=1000.0
+        ), patch("codex_master.server.status_agent", return_value=status), patch(
+            "codex_master.server.read_meta", return_value=marker
+        ), patch("codex_master.server.request_agent_report") as mock_report, patch(
+            "codex_master.server.interrupt_agent"
+        ) as mock_interrupt:
+            result = fleet_watchdog("a")
+
+        payload = result["results"][0]
+        self.assertEqual(payload["watchdog_state"], "waiting_for_report")
+        self.assertEqual(payload["action_taken"], "none")
+        self.assertEqual(payload["report_elapsed_seconds"], 30)
+        mock_report.assert_not_called()
+        mock_interrupt.assert_not_called()
+
+    def test_fleet_watchdog_interrupts_after_report_grace_without_activity(self) -> None:
+        status = {
+            "agent": "a",
+            "running": True,
+            "lease": {"state": "held", "held_by_this_server": True, "raw_output": "not_returned"},
+            "response_state": {"state": "running_recent_output"},
+            "raw_log_idle_seconds": 240,
+            "raw_log_bytes": 100,
+            "raw_log_updated_at_utc": "1970-01-01T00:12:00+00:00",
+            "last_assignment": {"assignment_id": "assign-1", "created_at_utc": "2026-06-07T09:58:00+00:00"},
+        }
+        marker = {
+            "watchdog": {
+                "phase": "report_requested",
+                "requested_at_utc": "1970-01-01T00:13:00+00:00",
+                "assignment_id": "assign-1",
+                "planned_action": "interrupt",
+                "raw_log_bytes": 100,
+                "raw_log_updated_at_utc": "1970-01-01T00:12:00+00:00",
+                "report_grace_seconds": DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS,
+            }
+        }
+        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "codex_master.server.time.time", return_value=1000.0
+        ), patch("codex_master.server.status_agent", return_value=status), patch(
+            "codex_master.server.read_meta", return_value=marker
+        ), patch("codex_master.server.write_meta") as mock_write_meta, patch(
+            "codex_master.server.request_agent_report"
+        ) as mock_report, patch(
+            "codex_master.server.interrupt_agent",
+            return_value={"agent": "a", "status": "interrupt_sent", "lease": status["lease"], "raw_output": "not_returned"},
+        ) as mock_interrupt:
+            result = fleet_watchdog("a")
+
+        payload = result["results"][0]
+        self.assertEqual(payload["watchdog_state"], "action_sent")
+        self.assertEqual(payload["action_taken"], "interrupt")
+        self.assertEqual(payload["action_result"]["status"], "interrupt_sent")
+        mock_report.assert_not_called()
+        mock_interrupt.assert_called_once_with("a", force=False)
+        mock_write_meta.assert_called_once_with("a", {})
+
+    def test_fleet_watchdog_skips_other_client_lease(self) -> None:
+        status = {
+            "agent": "a",
+            "running": True,
+            "lease": {"state": "held", "held_by_this_server": False, "raw_output": "not_returned"},
+            "response_state": {"state": "running_recent_output"},
+            "raw_log_idle_seconds": 90,
+            "raw_log_bytes": 100,
+            "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
+            "last_assignment": {"assignment_id": "assign-1", "created_at_utc": "2026-06-07T09:58:00+00:00"},
+        }
+        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "codex_master.server.status_agent", return_value=status
+        ), patch("codex_master.server.request_agent_report") as mock_report, patch(
+            "codex_master.server.interrupt_agent"
+        ) as mock_interrupt:
+            result = fleet_watchdog("a")
+
+        payload = result["results"][0]
+        self.assertEqual(payload["watchdog_state"], "skipped_not_leased_by_this_server")
+        self.assertEqual(payload["action_taken"], "none")
+        mock_report.assert_not_called()
+        mock_interrupt.assert_not_called()
 
     def test_append_bounded_raw_log_caps_file_size(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

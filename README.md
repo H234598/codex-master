@@ -69,6 +69,14 @@ explicit paths that the Teamleiterin assigned.
 limit without automatically receiving Agentin output. It defaults to 120 seconds
 and is capped at 10 minutes per call. Its poll interval defaults to 30 seconds
 and is capped at 900 seconds.
+`fleet_watchdog` checks idle Agentinnen without reading raw output. It defaults
+to a 60 second idle threshold and asks the Agentin for a concise report before
+any escalation. The report grace window defaults to 120 seconds, so the 15
+second systemd timer gives the Agentin several checks to report before a later
+run can interrupt, stop, or release it. By default the watchdog only mutates
+Agentinnen leased by the current server; the systemd supervisor uses
+`--manage-unclaimed` to handle unclaimed or expired leases while still skipping
+active leases held by other clients.
 
 ## Tools
 
@@ -81,6 +89,8 @@ and is capped at 900 seconds.
   checking status
 - `agent_wait`: wait for activity/stop/limit metadata without raw output,
   defaulting to 120 seconds and capped at 10 minutes per call
+- `fleet_watchdog`: request a report from idle Agentinnen, wait a grace window,
+  then optionally interrupt, stop, or release without raw output
 - `agent_send`: send text to one running Agentin
 - `agent_interrupt`: send Ctrl-C to one running Agentin
 - `agent_stop`: stop Agentin `a`, `b`, or `both`
@@ -142,6 +152,7 @@ python3 -m codex_master.server status
 python3 -m codex_master.server lease-status all
 python3 -m codex_master.server claim b --wait-seconds 600 --poll-interval-seconds 30
 python3 -m codex_master.server wait a --timeout-seconds 120 --poll-interval-seconds 30
+python3 -m codex_master.server watchdog all --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 120 --action interrupt --manage-unclaimed
 python3 -m codex_master.server capabilities all
 python3 -m codex_master.server skills all
 python3 -m codex_master.server skills a --include-names --limit 20 --names-offset 20 --plugins-offset 20 --plugins-limit 20
@@ -174,9 +185,10 @@ python3 -m codex_master.server stop both
 - registers the command via `codex mcp add codex-master-mcp -- <link>`
 - ensures the active Codex MCP config has `startup_timeout_sec = 120`
 - syncs the personal `codex-master` plugin cache from a runtime allowlist
-  (`.codex-plugin`, `.app.json`, `.mcp.json`, `bin`, `skills`, `src`, README,
-  and package metadata) while excluding `.git`, tests, bytecode, test caches,
-  hidden files, editor swap files, and backup/patch leftovers
+  (`.codex-plugin`, `.app.json`, `.mcp.json`, `bin`, `skills`, `src`,
+  `systemd`, README, and package metadata) while excluding `.git`, tests,
+  bytecode, test caches, hidden files, editor swap files, and backup/patch
+  leftovers
 - rejects hardlinked plugin source files and keeps only the current plus the
   most recent valid cached plugin versions, without pruning invalid or symlinked
   cache entries
@@ -225,6 +237,22 @@ python3 -m codex_master.server stop both
 - treats stopped Agentinnen as informational session state, not as a failed
   health check
 - redacts known secret shapes in output
+
+`watchdog`
+- classifies idle state from structured `status` metadata and raw-log metadata
+  only; it does not call `tail` or return Agentin output
+- defaults to `idle_seconds=60`, `poll_interval_seconds=15`,
+  `report_grace_seconds=120`, and `action=interrupt`
+- always asks the Agentin for a concise report before `interrupt`, `stop`, or
+  `release`
+- stores only a metadata marker with request time, assignment ID, planned
+  action, and raw-log counters; no prompt text, responses, or raw logs are
+  stored in the marker
+- skips active leases held by other clients; `--manage-unclaimed` may supervise
+  only unclaimed or expired leases in addition to this server's own lease
+- is installed as an optional `systemd --user` top layer through
+  `systemd/user/codex-master-watchdog.service` and
+  `systemd/user/codex-master-watchdog.timer`
 
 `skills`
 - scans each Agentin home for `SKILL.md` files in `skills/`, `plugins/cache/`,

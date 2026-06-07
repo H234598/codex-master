@@ -67,6 +67,11 @@ DEFAULT_WAIT_SECONDS = 120
 MAX_WAIT_SECONDS = 600
 DEFAULT_WAIT_POLL_SECONDS = 30
 MAX_WAIT_POLL_SECONDS = 900
+DEFAULT_WATCHDOG_IDLE_SECONDS = 60
+MAX_WATCHDOG_IDLE_SECONDS = 24 * 60 * 60
+DEFAULT_WATCHDOG_POLL_SECONDS = 15
+DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS = 120
+MAX_WATCHDOG_REPORT_GRACE_SECONDS = 10 * 60
 DEFAULT_AGENT_LEASE_SECONDS = 1800
 MAX_AGENT_LEASE_SECONDS = 7200
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
@@ -94,7 +99,7 @@ MAX_PLUGIN_MANIFEST_BYTES = 64 * 1024
 MAX_PLUGIN_CACHE_VERSIONS = 20
 MAX_PLUGIN_CACHE_RETAINED_VERSIONS = 5
 PLUGIN_CACHE_ALLOWED_FILES = (".app.json", ".mcp.json", "README.md", "pyproject.toml")
-PLUGIN_CACHE_ALLOWED_DIRS = (".codex-plugin", "bin", "skills", "src")
+PLUGIN_CACHE_ALLOWED_DIRS = (".codex-plugin", "bin", "skills", "src", "systemd")
 PLUGIN_CACHE_EXCLUDED_NAMES = (".git", ".pytest_cache", ".mypy_cache", ".ruff_cache", "__pycache__")
 PLUGIN_CACHE_EXCLUDED_SUFFIXES = (".pyc", ".pyo", ".swp", ".swo", ".tmp", ".bak", ".orig", ".rej", "~")
 COMMAND_TIMEOUT_RETURN_CODE = 124
@@ -1015,6 +1020,47 @@ def normalize_poll_interval_seconds(value: Any) -> int:
         minimum=1,
         maximum=MAX_WAIT_POLL_SECONDS,
     )
+
+
+def normalize_watchdog_idle_seconds(value: Any) -> int:
+    return normalize_int_field(
+        value,
+        field="idle_seconds",
+        minimum=1,
+        maximum=MAX_WATCHDOG_IDLE_SECONDS,
+    )
+
+
+def normalize_watchdog_report_grace_seconds(value: Any) -> int:
+    return normalize_int_field(
+        value,
+        field="report_grace_seconds",
+        minimum=0,
+        maximum=MAX_WATCHDOG_REPORT_GRACE_SECONDS,
+    )
+
+
+def parse_utc_timestamp(value: Any) -> float | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = _dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+    return parsed.timestamp()
+
+
+def age_seconds_from_utc(value: Any, *, now: float | None = None) -> int | None:
+    timestamp = parse_utc_timestamp(value)
+    if timestamp is None:
+        return None
+    current = time.time() if now is None else now
+    return max(0, int(current - timestamp))
 
 
 def read_agent_lease_record(agent: str) -> dict[str, Any] | None:
@@ -2157,6 +2203,279 @@ def status_agent(agent: str) -> dict[str, Any]:
     }
 
 
+def watchdog_marker(meta: dict[str, Any]) -> dict[str, Any]:
+    value = meta.get("watchdog")
+    return value if isinstance(value, dict) else {}
+
+
+def update_watchdog_marker(agent: str, marker: dict[str, Any] | None) -> None:
+    meta = read_meta(agent)
+    if meta.get("meta_error"):
+        raise AgentError("could_not_update_watchdog_metadata")
+    if marker is None:
+        meta.pop("watchdog", None)
+    else:
+        meta["watchdog"] = marker
+    write_meta(agent, meta)
+
+
+def watchdog_effective_idle(status: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
+    raw_idle = status.get("raw_log_idle_seconds")
+    if isinstance(raw_idle, int) and not isinstance(raw_idle, bool):
+        return {
+            "effective_idle_seconds": max(0, raw_idle),
+            "activity_source": "raw_log",
+            "activity_at_utc": status.get("raw_log_updated_at_utc"),
+            "raw_output": "not_returned",
+        }
+    latest_assignment = status.get("last_assignment") if isinstance(status.get("last_assignment"), dict) else {}
+    assignment_age = age_seconds_from_utc(latest_assignment.get("created_at_utc"), now=now)
+    if assignment_age is not None:
+        return {
+            "effective_idle_seconds": assignment_age,
+            "activity_source": "last_assignment_age",
+            "activity_at_utc": latest_assignment.get("created_at_utc"),
+            "raw_output": "not_returned",
+        }
+    started_age = age_seconds_from_utc(status.get("started_at_utc"), now=now)
+    if started_age is not None:
+        return {
+            "effective_idle_seconds": started_age,
+            "activity_source": "session_start_age",
+            "activity_at_utc": status.get("started_at_utc"),
+            "raw_output": "not_returned",
+        }
+    return {
+        "effective_idle_seconds": None,
+        "activity_source": "insufficient_idle_evidence",
+        "activity_at_utc": None,
+        "raw_output": "not_returned",
+    }
+
+
+def watchdog_marker_matches(marker: dict[str, Any], *, action: str, assignment_id: Any) -> bool:
+    if marker.get("phase") != "report_requested":
+        return False
+    if marker.get("planned_action") != action:
+        return False
+    marker_assignment = marker.get("assignment_id")
+    if marker_assignment and assignment_id and marker_assignment != assignment_id:
+        return False
+    return bool(marker.get("requested_at_utc"))
+
+
+def watchdog_output_changed_since_marker(status: dict[str, Any], marker: dict[str, Any]) -> bool:
+    marker_bytes = marker.get("raw_log_bytes")
+    current_bytes = status.get("raw_log_bytes")
+    if (
+        isinstance(marker_bytes, int)
+        and not isinstance(marker_bytes, bool)
+        and isinstance(current_bytes, int)
+        and not isinstance(current_bytes, bool)
+        and current_bytes > marker_bytes
+    ):
+        return True
+    requested_at = parse_utc_timestamp(marker.get("requested_at_utc"))
+    activity_at = parse_utc_timestamp(status.get("raw_log_updated_at_utc"))
+    return bool(requested_at is not None and activity_at is not None and activity_at > requested_at)
+
+
+def public_watchdog_report_result(result: dict[str, Any]) -> dict[str, Any]:
+    send = result.get("send") if isinstance(result.get("send"), dict) else {}
+    return {
+        "status": result.get("status"),
+        "submitted": result.get("submitted"),
+        "assignment_id": result.get("assignment_id"),
+        "send_status": send.get("status"),
+        "raw_output": "not_returned",
+        "response_output": "not_returned",
+    }
+
+
+def public_watchdog_action_result(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": result.get("status"),
+        "lease": result.get("lease"),
+        "raw_output": "not_returned",
+        "response_output": "not_returned",
+    }
+
+
+def watchdog_action(agent: str, action: str, *, release_after_interrupt: bool) -> dict[str, Any]:
+    if action == "none":
+        return {"agent": agent, "status": "no_action", "raw_output": "not_returned"}
+    if action == "interrupt":
+        result = interrupt_agent(agent, force=False)
+        if release_after_interrupt and agent_lease_status(agent).get("held_by_this_server"):
+            result["watchdog_release"] = release_agent(agent, force=True)
+        return result
+    if action == "stop":
+        return stop_agent(agent, force=False)
+    if action == "release":
+        return release_agent(agent, force=False)
+    raise AgentError("watchdog action must be interrupt, stop, release, or none")
+
+
+def watchdog_agent(
+    agent: str,
+    *,
+    idle_seconds: int,
+    action: str,
+    report_grace_seconds: int,
+    require_lease: bool,
+    manage_unclaimed: bool,
+    dry_run: bool,
+) -> dict[str, Any]:
+    now = time.time()
+    status = status_agent(agent)
+    lease = status.get("lease") if isinstance(status.get("lease"), dict) else {}
+    response_state = (status.get("response_state") or {}).get("state")
+    latest_assignment = status.get("last_assignment") if isinstance(status.get("last_assignment"), dict) else {}
+    assignment_id = latest_assignment.get("assignment_id")
+    idle = watchdog_effective_idle(status, now=now)
+    lease_state = lease.get("state")
+    held_by_this_server = bool(lease.get("held_by_this_server"))
+    unclaimed_or_expired = lease_state in {"unclaimed", "expired"}
+    lease_allowed = held_by_this_server or (manage_unclaimed and unclaimed_or_expired)
+    base = {
+        "agent": agent,
+        "running": bool(status.get("running")),
+        "lease_state": lease_state,
+        "held_by_this_server": held_by_this_server,
+        "manage_unclaimed": manage_unclaimed,
+        "response_state": response_state,
+        "effective_idle_seconds": idle["effective_idle_seconds"],
+        "activity_source": idle["activity_source"],
+        "idle_threshold_seconds": idle_seconds,
+        "report_grace_seconds": report_grace_seconds,
+        "planned_action": action,
+        "dry_run": dry_run,
+        "raw_output": "not_returned",
+        "response_output": "not_returned",
+    }
+    if not status.get("running"):
+        return {**base, "watchdog_state": "skipped_not_running", "action_taken": "none"}
+    if require_lease and not lease_allowed:
+        return {**base, "watchdog_state": "skipped_not_leased_by_this_server", "action_taken": "none"}
+    effective_idle = idle["effective_idle_seconds"]
+    if effective_idle is None:
+        return {**base, "watchdog_state": "skipped_insufficient_idle_evidence", "action_taken": "none"}
+    if effective_idle < idle_seconds and response_state != "blocked_by_limit":
+        meta = read_meta(agent)
+        if watchdog_marker(meta) and not dry_run and lease_allowed:
+            update_watchdog_marker(agent, None)
+        return {**base, "watchdog_state": "active", "action_taken": "none"}
+
+    meta = read_meta(agent)
+    marker = watchdog_marker(meta)
+    marker_is_current = watchdog_marker_matches(marker, action=action, assignment_id=assignment_id)
+    output_changed = marker_is_current and watchdog_output_changed_since_marker(status, marker)
+    if marker_is_current and output_changed:
+        if not dry_run:
+            update_watchdog_marker(agent, None)
+        marker_is_current = False
+
+    if action != "none" and not marker_is_current:
+        if dry_run:
+            return {**base, "watchdog_state": "would_request_report", "action_taken": "none"}
+        report = request_agent_report(agent, assignment_id=assignment_id, lease=lease)
+        requested_at_utc = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        update_watchdog_marker(
+            agent,
+            {
+                "phase": "report_requested",
+                "requested_at_utc": requested_at_utc,
+                "assignment_id": assignment_id,
+                "planned_action": action,
+                "raw_log_bytes": status.get("raw_log_bytes"),
+                "raw_log_updated_at_utc": status.get("raw_log_updated_at_utc"),
+                "idle_seconds": effective_idle,
+                "idle_threshold_seconds": idle_seconds,
+                "report_grace_seconds": report_grace_seconds,
+            },
+        )
+        return {
+            **base,
+            "watchdog_state": "report_requested",
+            "action_taken": "report_request",
+            "report_request": public_watchdog_report_result(report),
+            "next_action_after_seconds": report_grace_seconds,
+        }
+
+    if marker_is_current:
+        elapsed = age_seconds_from_utc(marker.get("requested_at_utc"), now=now)
+        if elapsed is None:
+            elapsed = 0
+        if elapsed < report_grace_seconds:
+            return {
+                **base,
+                "watchdog_state": "waiting_for_report",
+                "action_taken": "none",
+                "report_elapsed_seconds": elapsed,
+                "next_action_after_seconds": max(0, report_grace_seconds - elapsed),
+            }
+
+    if dry_run:
+        return {**base, "watchdog_state": f"would_{action}", "action_taken": "none"}
+    release_after_interrupt = manage_unclaimed and unclaimed_or_expired and action == "interrupt"
+    result = watchdog_action(agent, action, release_after_interrupt=release_after_interrupt)
+    update_watchdog_marker(agent, None)
+    return {
+        **base,
+        "watchdog_state": "action_sent" if action != "none" else "no_action",
+        "action_taken": action,
+        "action_result": public_watchdog_action_result(result),
+    }
+
+
+def fleet_watchdog(
+    agent: str = "all",
+    *,
+    idle_seconds: int = DEFAULT_WATCHDOG_IDLE_SECONDS,
+    poll_interval_seconds: int = DEFAULT_WATCHDOG_POLL_SECONDS,
+    action: str = "interrupt",
+    report_grace_seconds: int = DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS,
+    require_lease: bool = True,
+    manage_unclaimed: bool = False,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    selected = agent_ids(agent)
+    idle_seconds = normalize_watchdog_idle_seconds(idle_seconds)
+    poll_interval_seconds = normalize_poll_interval_seconds(poll_interval_seconds)
+    report_grace_seconds = normalize_watchdog_report_grace_seconds(report_grace_seconds)
+    if action not in {"interrupt", "stop", "release", "none"}:
+        raise AgentError("watchdog action must be interrupt, stop, release, or none")
+    results = multi_agent_result(
+        selected,
+        lambda item: call_agent_lifecycle(
+            item,
+            lambda: watchdog_agent(
+                item,
+                idle_seconds=idle_seconds,
+                action=action,
+                report_grace_seconds=report_grace_seconds,
+                require_lease=require_lease,
+                manage_unclaimed=manage_unclaimed,
+                dry_run=dry_run,
+            ),
+        ),
+    )["results"]
+    return {
+        "status": "ok",
+        "agent": agent,
+        "idle_seconds": idle_seconds,
+        "poll_interval_seconds": poll_interval_seconds,
+        "report_grace_seconds": report_grace_seconds,
+        "action": action,
+        "require_lease": require_lease,
+        "manage_unclaimed": manage_unclaimed,
+        "dry_run": dry_run,
+        "results": results,
+        "raw_output": "not_returned",
+        "response_output": "not_returned",
+    }
+
+
 def skill_scan_roots(home: Path) -> list[tuple[str, Path]]:
     return [
         ("system", home / "skills"),
@@ -3194,48 +3513,97 @@ def plugin_cache_status(root: Path | None = None, cache_root: Path | None = None
         return result
 
     versions: list[str] = []
+    cache_fd = -1
     try:
-        entries = list(target_cache.iterdir())
+        cache_fd = open_directory_no_follow_matching(
+            target_cache,
+            current,
+            error_text="plugin_cache_unreadable",
+            changed_text="plugin_cache_changed",
+        )
+        entry_names = sorted(os.listdir(cache_fd))
+    except AgentError as exc:
+        result["reason"] = "plugin_cache_unreadable"
+        if "changed" in str(exc):
+            result["reason"] = "plugin_cache_changed"
+        return result
     except OSError:
         result["reason"] = "plugin_cache_unreadable"
         return result
+    finally:
+        if cache_fd >= 0:
+            os.close(cache_fd)
 
-    for entry in entries:
-        try:
-            entry_stat = entry.lstat()
-        except OSError:
-            result["unreadable_entry_count"] += 1
-            continue
-        if stat_module.S_ISLNK(entry_stat.st_mode):
-            result["symlink_entry_count"] += 1
-            continue
-        if not stat_module.S_ISDIR(entry_stat.st_mode):
-            result["invalid_entry_count"] += 1
-            continue
-        entry_version = public_plugin_version(entry.name)
-        if not entry_version:
-            result["invalid_entry_count"] += 1
-            continue
+    cache_fd = -1
+    try:
+        cache_fd = open_directory_no_follow_matching(
+            target_cache,
+            current,
+            error_text="plugin_cache_unreadable",
+            changed_text="plugin_cache_changed",
+        )
+        for entry_name in entry_names:
+            try:
+                entry_stat = os.stat(entry_name, dir_fd=cache_fd, follow_symlinks=False)
+            except OSError:
+                result["unreadable_entry_count"] += 1
+                continue
+            if stat_module.S_ISLNK(entry_stat.st_mode):
+                result["symlink_entry_count"] += 1
+                continue
+            if not stat_module.S_ISDIR(entry_stat.st_mode):
+                result["invalid_entry_count"] += 1
+                continue
+            entry_version = public_plugin_version(entry_name)
+            if not entry_version:
+                result["invalid_entry_count"] += 1
+                continue
 
-        plugin_dir = entry / ".codex-plugin"
-        try:
-            plugin_dir_stat = plugin_dir.lstat()
-        except OSError:
-            result["unreadable_entry_count"] += 1
-            continue
-        if stat_module.S_ISLNK(plugin_dir_stat.st_mode) or not stat_module.S_ISDIR(plugin_dir_stat.st_mode):
-            result["invalid_entry_count"] += 1
-            continue
-        try:
-            payload = read_repo_json_object(plugin_dir / "plugin.json", "cached plugin manifest")
-        except AgentError:
-            result["unreadable_entry_count"] += 1
-            continue
-        cached_version = public_plugin_version(payload.get("version"))
-        if payload.get("name") != APP_BRIDGE_NAME or cached_version != entry_version:
-            result["invalid_entry_count"] += 1
-            continue
-        versions.append(entry_version)
+            entry_fd = -1
+            plugin_dir_fd = -1
+            try:
+                entry_fd = open_directory_no_follow_matching(
+                    entry_name,
+                    entry_stat,
+                    error_text="plugin_cache_entry_unreadable",
+                    changed_text="plugin_cache_entry_changed",
+                    dir_fd=cache_fd,
+                )
+                try:
+                    plugin_dir_stat = os.stat(".codex-plugin", dir_fd=entry_fd, follow_symlinks=False)
+                except OSError:
+                    result["unreadable_entry_count"] += 1
+                    continue
+                if stat_module.S_ISLNK(plugin_dir_stat.st_mode) or not stat_module.S_ISDIR(plugin_dir_stat.st_mode):
+                    result["invalid_entry_count"] += 1
+                    continue
+                plugin_dir_fd = open_directory_no_follow_matching(
+                    ".codex-plugin",
+                    plugin_dir_stat,
+                    error_text="plugin_cache_entry_unreadable",
+                    changed_text="plugin_cache_entry_changed",
+                    dir_fd=entry_fd,
+                )
+                payload = read_json_object_from_dir_fd(plugin_dir_fd, "plugin.json", "cached plugin manifest")
+            except AgentError:
+                result["unreadable_entry_count"] += 1
+                continue
+            finally:
+                if plugin_dir_fd >= 0:
+                    os.close(plugin_dir_fd)
+                if entry_fd >= 0:
+                    os.close(entry_fd)
+            cached_version = public_plugin_version(payload.get("version"))
+            if payload.get("name") != APP_BRIDGE_NAME or cached_version != entry_version:
+                result["invalid_entry_count"] += 1
+                continue
+            versions.append(entry_version)
+    except AgentError as exc:
+        result["reason"] = "plugin_cache_changed" if "changed" in str(exc) else "plugin_cache_unreadable"
+        return result
+    finally:
+        if cache_fd >= 0:
+            os.close(cache_fd)
 
     versions = sorted(set(versions))
     repo_version_text = repo_version.get("version") if repo_version.get("ok") else ""
@@ -3252,6 +3620,73 @@ def plugin_cache_status(root: Path | None = None, cache_root: Path | None = None
     if not result["ok"]:
         result["reason"] = "repo_plugin_version_not_installed"
     return result
+
+
+def source_identity_matches(opened_stat: os.stat_result, expected_stat: os.stat_result) -> bool:
+    return opened_stat.st_ino == expected_stat.st_ino and opened_stat.st_dev == expected_stat.st_dev
+
+
+def open_directory_no_follow_matching(
+    path: Path | str,
+    expected_stat: os.stat_result,
+    *,
+    error_text: str,
+    changed_text: str,
+    dir_fd: int | None = None,
+) -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags) if dir_fd is None else os.open(path, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        raise AgentError(error_text) from exc
+    try:
+        opened_stat = os.fstat(fd)
+        if not stat_module.S_ISDIR(opened_stat.st_mode) or not source_identity_matches(opened_stat, expected_stat):
+            raise AgentError(changed_text)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def read_json_object_from_dir_fd(dir_fd: int, name: str, label: str) -> dict[str, Any]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
+        current = os.fstat(fd)
+        if not stat_module.S_ISREG(current.st_mode) or current.st_size > MAX_PLUGIN_MANIFEST_BYTES:
+            raise AgentError(f"{label} could not be read")
+        raw = b""
+        remaining = MAX_PLUGIN_MANIFEST_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, RAW_LOG_CHUNK_BYTES))
+            if not chunk:
+                break
+            raw += chunk
+            remaining -= len(chunk)
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError(f"{label} could not be read") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) > MAX_PLUGIN_MANIFEST_BYTES:
+        raise AgentError(f"{label} could not be read")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AgentError(f"{label} must contain valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise AgentError(f"{label} must contain a JSON object")
+    return payload
 
 
 def copy_regular_plugin_file_no_follow(src: Path, dst: Path, expected_stat: os.stat_result) -> None:
@@ -3303,6 +3738,121 @@ def copy_regular_plugin_file_no_follow(src: Path, dst: Path, expected_stat: os.s
             with contextlib.suppress(OSError):
                 dst.unlink()
 
+def open_plugin_source_dir_no_follow(src: Path, expected_stat: os.stat_result) -> int:
+    return open_directory_no_follow_matching(
+        src,
+        expected_stat,
+        error_text="could_not_sync_plugin_cache",
+        changed_text="plugin source changed during copy",
+    )
+
+
+def copy_regular_plugin_file_from_dir_no_follow(
+    src_dir_fd: int, name: str, dst: Path, expected_stat: os.stat_result
+) -> None:
+    source_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        source_flags |= os.O_NOFOLLOW
+    src_fd = -1
+    dst_fd = -1
+    dst_created = False
+    try:
+        src_fd = os.open(name, source_flags, dir_fd=src_dir_fd)
+        opened_stat = os.fstat(src_fd)
+        if (
+            not stat_module.S_ISREG(opened_stat.st_mode)
+            or getattr(opened_stat, "st_nlink", 1) > 1
+            or not source_identity_matches(opened_stat, expected_stat)
+        ):
+            raise AgentError("plugin source changed during copy")
+        mode = stat_module.S_IMODE(opened_stat.st_mode)
+        target_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            target_flags |= os.O_NOFOLLOW
+        dst_fd = os.open(dst, target_flags, mode)
+        dst_created = True
+        while True:
+            chunk = os.read(src_fd, RAW_LOG_CHUNK_BYTES)
+            if not chunk:
+                break
+            offset = 0
+            while offset < len(chunk):
+                written = os.write(dst_fd, chunk[offset:])
+                if written <= 0:
+                    raise OSError("plugin cache copy made no progress")
+                offset += written
+        os.fchmod(dst_fd, mode)
+        os.utime(dst_fd, ns=(opened_stat.st_atime_ns, opened_stat.st_mtime_ns))
+        dst_created = False
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError("could_not_sync_plugin_cache") from exc
+    finally:
+        if src_fd >= 0:
+            os.close(src_fd)
+        if dst_fd >= 0:
+            os.close(dst_fd)
+        if dst_created:
+            with contextlib.suppress(OSError):
+                dst.unlink()
+
+
+def copy_plugin_cache_dir_fd(src_fd: int, dst: Path) -> dict[str, int]:
+    try:
+        entry_names = sorted(os.listdir(src_fd))
+    except OSError as exc:
+        raise AgentError("could_not_sync_plugin_cache") from exc
+    counts = {"files": 0, "directories": 0}
+    for name in entry_names:
+        if plugin_cache_name_excluded(name):
+            continue
+        try:
+            entry_stat = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise AgentError("could_not_sync_plugin_cache") from exc
+        if stat_module.S_ISLNK(entry_stat.st_mode):
+            raise AgentError("plugin source contains unsupported symlink")
+        child_dst = dst / name
+        if stat_module.S_ISDIR(entry_stat.st_mode):
+            try:
+                child_dst.mkdir(mode=0o755, exist_ok=False)
+            except OSError as exc:
+                raise AgentError("could_not_sync_plugin_cache") from exc
+            child_fd = -1
+            try:
+                child_fd = os.open(
+                    name,
+                    os.O_RDONLY
+                    | (os.O_DIRECTORY if hasattr(os, "O_DIRECTORY") else 0)
+                    | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0),
+                    dir_fd=src_fd,
+                )
+                opened_stat = os.fstat(child_fd)
+                if not stat_module.S_ISDIR(opened_stat.st_mode) or not source_identity_matches(
+                    opened_stat, entry_stat
+                ):
+                    raise AgentError("plugin source changed during copy")
+                child_counts = copy_plugin_cache_dir_fd(child_fd, child_dst)
+            except AgentError:
+                raise
+            except OSError as exc:
+                raise AgentError("could_not_sync_plugin_cache") from exc
+            finally:
+                if child_fd >= 0:
+                    os.close(child_fd)
+            counts["directories"] += 1 + child_counts["directories"]
+            counts["files"] += child_counts["files"]
+            continue
+        if stat_module.S_ISREG(entry_stat.st_mode):
+            if getattr(entry_stat, "st_nlink", 1) > 1:
+                raise AgentError("plugin source contains unsupported hardlink")
+            copy_regular_plugin_file_from_dir_no_follow(src_fd, name, child_dst, entry_stat)
+            counts["files"] += 1
+            continue
+        raise AgentError("plugin source contains unsupported file type")
+    return counts
+
 
 def copy_plugin_cache_path(src: Path, dst: Path) -> dict[str, int]:
     try:
@@ -3317,16 +3867,15 @@ def copy_plugin_cache_path(src: Path, dst: Path) -> dict[str, int]:
         except OSError as exc:
             raise AgentError("could_not_sync_plugin_cache") from exc
         counts = {"files": 0, "directories": 1}
+        src_fd = -1
         try:
-            entries = sorted(src.iterdir(), key=lambda entry: entry.name)
-        except OSError as exc:
-            raise AgentError("could_not_sync_plugin_cache") from exc
-        for entry in entries:
-            if plugin_cache_name_excluded(entry.name):
-                continue
-            child_counts = copy_plugin_cache_path(entry, dst / entry.name)
-            counts["files"] += child_counts["files"]
-            counts["directories"] += child_counts["directories"]
+            src_fd = open_plugin_source_dir_no_follow(src, src_stat)
+            child_counts = copy_plugin_cache_dir_fd(src_fd, dst)
+        finally:
+            if src_fd >= 0:
+                os.close(src_fd)
+        counts["files"] += child_counts["files"]
+        counts["directories"] += child_counts["directories"]
         return counts
     if stat_module.S_ISREG(src_stat.st_mode):
         if getattr(src_stat, "st_nlink", 1) > 1:
@@ -3456,20 +4005,32 @@ def sync_plugin_cache_from_repo(
             target_cache.mkdir(mode=0o755)
         except OSError as exc:
             raise AgentError("could_not_sync_plugin_cache") from exc
+        try:
+            target_stat = target_cache.lstat()
+        except OSError as exc:
+            raise AgentError("could_not_sync_plugin_cache") from exc
     except OSError as exc:
         raise AgentError("could_not_sync_plugin_cache") from exc
     else:
         if stat_module.S_ISLNK(target_stat.st_mode) or not stat_module.S_ISDIR(target_stat.st_mode):
             raise AgentError("plugin cache root must be a real directory")
 
-    target_entry = target_cache / version
-    tmp_entry = target_cache / f".{version}.tmp.{now_id()}.{uuid.uuid4().hex}"
+    cache_fd = -1
+    tmp_name = f".{version}.tmp.{now_id()}.{uuid.uuid4().hex}"
     copied_files = 0
     copied_directories = 0
     tmp_entry_created = False
     try:
+        cache_fd = open_directory_no_follow_matching(
+            target_cache,
+            target_stat,
+            error_text="could_not_sync_plugin_cache",
+            changed_text="plugin cache root changed during sync",
+        )
+        cache_fd_path = Path(f"/proc/self/fd/{cache_fd}")
+        tmp_entry = cache_fd_path / tmp_name
         try:
-            tmp_entry.mkdir(mode=0o755, exist_ok=False)
+            os.mkdir(tmp_name, mode=0o755, dir_fd=cache_fd)
         except OSError as exc:
             raise AgentError("could_not_sync_plugin_cache") from exc
         tmp_entry_created = True
@@ -3488,9 +4049,10 @@ def sync_plugin_cache_from_repo(
             counts = copy_plugin_cache_path(src, tmp_entry / name)
             copied_files += counts["files"]
             copied_directories += counts["directories"]
-        remove_real_plugin_cache_dir(target_entry)
+        remove_real_plugin_cache_dir(cache_fd_path / version)
         try:
-            tmp_entry.rename(target_entry)
+            os.replace(tmp_name, version, src_dir_fd=cache_fd, dst_dir_fd=cache_fd)
+            tmp_entry_created = False
         except OSError as exc:
             raise AgentError("could_not_sync_plugin_cache") from exc
     except Exception:
@@ -3498,6 +4060,9 @@ def sync_plugin_cache_from_repo(
             with contextlib.suppress(Exception):
                 remove_real_plugin_cache_dir(tmp_entry)
         raise
+    finally:
+        if cache_fd >= 0:
+            os.close(cache_fd)
 
     retention = prune_plugin_cache_versions(target_cache, keep_version=version, max_versions=retained_versions)
     status = plugin_cache_status(source_root, target_cache)
@@ -4260,6 +4825,17 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             int_arg(args, "timeout_seconds", DEFAULT_WAIT_SECONDS),
             int_arg(args, "poll_interval_seconds", DEFAULT_WAIT_POLL_SECONDS),
         )
+    if name == "fleet_watchdog":
+        return fleet_watchdog(
+            str(args.get("agent", "all")),
+            idle_seconds=int_arg(args, "idle_seconds", DEFAULT_WATCHDOG_IDLE_SECONDS),
+            poll_interval_seconds=int_arg(args, "poll_interval_seconds", DEFAULT_WATCHDOG_POLL_SECONDS),
+            action=str(args.get("action", "interrupt")),
+            report_grace_seconds=int_arg(args, "report_grace_seconds", DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS),
+            require_lease=bool_arg(args, "require_lease", True),
+            manage_unclaimed=bool_arg(args, "manage_unclaimed", False),
+            dry_run=bool_arg(args, "dry_run", False),
+        )
     if name == "agent_skills":
         selected = agent_ids(str(args.get("agent", "all")))
         include_names = bool_arg(args, "include_names", False)
@@ -4585,6 +5161,39 @@ TOOLS: list[dict[str, Any]] = [
                     "maximum": MAX_WAIT_POLL_SECONDS,
                     "default": DEFAULT_WAIT_POLL_SECONDS,
                 },
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "fleet_watchdog",
+        "description": "Check idle Agentinnen and request a concise report before any configured escalation. Returns metadata only and never raw output.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string", "enum": ["a", "b", "all"], "default": "all"},
+                "idle_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_WATCHDOG_IDLE_SECONDS,
+                    "default": DEFAULT_WATCHDOG_IDLE_SECONDS,
+                },
+                "poll_interval_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_WAIT_POLL_SECONDS,
+                    "default": DEFAULT_WATCHDOG_POLL_SECONDS,
+                },
+                "report_grace_seconds": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_WATCHDOG_REPORT_GRACE_SECONDS,
+                    "default": DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS,
+                },
+                "action": {"type": "string", "enum": ["interrupt", "stop", "release", "none"], "default": "interrupt"},
+                "require_lease": {"type": "boolean", "default": True},
+                "manage_unclaimed": {"type": "boolean", "default": False},
+                "dry_run": {"type": "boolean", "default": False},
             },
             "additionalProperties": False,
         },
@@ -5079,6 +5688,16 @@ def main_cli(argv: list[str]) -> int:
     p_wait.add_argument("--timeout-seconds", type=int, default=DEFAULT_WAIT_SECONDS)
     p_wait.add_argument("--poll-interval-seconds", type=int, default=DEFAULT_WAIT_POLL_SECONDS)
 
+    p_watchdog = sub.add_parser("watchdog")
+    p_watchdog.add_argument("agent", choices=["a", "b", "all"], nargs="?", default="all")
+    p_watchdog.add_argument("--idle-seconds", type=int, default=DEFAULT_WATCHDOG_IDLE_SECONDS)
+    p_watchdog.add_argument("--poll-interval-seconds", type=int, default=DEFAULT_WATCHDOG_POLL_SECONDS)
+    p_watchdog.add_argument("--report-grace-seconds", type=int, default=DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS)
+    p_watchdog.add_argument("--action", choices=["interrupt", "stop", "release", "none"], default="interrupt")
+    p_watchdog.add_argument("--no-require-lease", action="store_true")
+    p_watchdog.add_argument("--manage-unclaimed", action="store_true")
+    p_watchdog.add_argument("--dry-run", action="store_true")
+
     p_send = sub.add_parser("send")
     p_send.add_argument("agent", choices=["a", "b"])
     p_send.add_argument("text")
@@ -5236,6 +5855,22 @@ def main_cli(argv: list[str]) -> int:
                         "agent": args.agent,
                         "timeout_seconds": args.timeout_seconds,
                         "poll_interval_seconds": args.poll_interval_seconds,
+                    },
+                )
+            )
+        if args.command == "watchdog":
+            return print_json(
+                call_validated_tool(
+                    "fleet_watchdog",
+                    {
+                        "agent": args.agent,
+                        "idle_seconds": args.idle_seconds,
+                        "poll_interval_seconds": args.poll_interval_seconds,
+                        "report_grace_seconds": args.report_grace_seconds,
+                        "action": args.action,
+                        "require_lease": not args.no_require_lease,
+                        "manage_unclaimed": args.manage_unclaimed,
+                        "dry_run": args.dry_run,
                     },
                 )
             )

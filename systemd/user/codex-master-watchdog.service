@@ -1,0 +1,8 @@
+[Unit]
+Description=Codex Master Fleet Watchdog
+Documentation=man:systemd.service(5)
+
+[Service]
+Type=oneshot
+Environment=CODEX_MASTER_MCP_INSTANCE_ID=codex-master-watchdog
+ExecStart=%h/.local/bin/codex-master-mcp watchdog all --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 120 --action interrupt --manage-unclaimed

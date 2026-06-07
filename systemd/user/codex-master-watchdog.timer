@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Codex Master Fleet Watchdog every 15 seconds
+Documentation=man:systemd.timer(5)
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=15s
+AccuracySec=1s
+Unit=codex-master-watchdog.service
+Persistent=false
+
+[Install]
+WantedBy=timers.target

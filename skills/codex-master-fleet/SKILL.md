@@ -87,6 +87,7 @@ cd /home/teladi/codex-master
 ./bin/codex-master-mcp lease-status all
 ./bin/codex-master-mcp claim b --wait-seconds 600 --poll-interval-seconds 30
 ./bin/codex-master-mcp wait a --timeout-seconds 120 --poll-interval-seconds 30
+./bin/codex-master-mcp watchdog all --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 120 --action interrupt --manage-unclaimed
 ./bin/codex-master-mcp start both --cwd /home/teladi/codex-master
 ./bin/codex-master-mcp capabilities all
 ./bin/codex-master-mcp skills all
@@ -109,9 +110,17 @@ cd /home/teladi/codex-master
 
 Data minimization:
 
-- `status`, `wait`, `start`, `send`, `assign-*`, `doctor`, `skills`,
-  `capabilities`, `app-bridge-status`, `plugin-status`, and
+- `status`, `wait`, `watchdog`, `start`, `send`, `assign-*`, `doctor`,
+  `skills`, `capabilities`, `app-bridge-status`, `plugin-status`, and
   `namespace-status` do not return Agentin terminal output.
+- `watchdog` is data-sparse and two-phased. When an Agentin is idle, it first
+  requests a concise report and stores only a metadata marker. It waits the
+  report grace period, default 120 seconds, before `interrupt`, `stop`, or
+  `release`. The default watchdog idle threshold is 60 seconds; the systemd
+  timer poll interval is 15 seconds. By default it only mutates Agentinnen held
+  by the current server. The systemd supervisor may additionally manage
+  unclaimed or expired leases via `--manage-unclaimed`; it must still skip
+  active leases held by other clients.
 - `status`, `doctor`, `skills`, `capabilities`, `app-bridge-status`,
   `plugin-status`, `namespace-status`, and integration metadata must not return
   local Agentin home, runner, repo, manifest, installed symlink, or
