@@ -2138,6 +2138,33 @@ TOOLS: list[dict[str, Any]] = [
 ]
 
 
+TOOL_SCHEMAS = {tool["name"]: tool["inputSchema"] for tool in TOOLS}
+
+
+def validate_tool_call(name: Any, args: Any) -> tuple[str, dict[str, Any]]:
+    if not isinstance(name, str) or not name.strip():
+        raise AgentError("tools/call requires a known tool name")
+    if name not in TOOL_SCHEMAS:
+        raise AgentError(f"unknown tool: {name}")
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        raise AgentError("tools/call arguments must be an object")
+
+    schema = TOOL_SCHEMAS[name]
+    properties = schema.get("properties", {})
+    if schema.get("additionalProperties") is False:
+        extra = sorted(set(args) - set(properties))
+        if extra:
+            safe_extra = ", ".join(redact_list([str(item) for item in extra], max_items=10))
+            raise AgentError(f"unknown argument(s) for {name}: {safe_extra}")
+
+    missing = [field for field in schema.get("required", []) if field not in args or args[field] is None]
+    if missing:
+        raise AgentError(f"missing required argument(s) for {name}: {', '.join(missing)}")
+    return name, args
+
+
 def rpc_result(message_id: Any, result: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": message_id, "result": result}
 
@@ -2174,11 +2201,12 @@ def handle_rpc(msg: dict[str, Any]) -> dict[str, Any] | None:
     if method == "prompts/list":
         return rpc_result(message_id, {"prompts": []})
     if method == "tools/call":
-        params = msg.get("params") or {}
-        name = params.get("name")
-        args = params.get("arguments") or {}
         try:
-            payload = call_tool(str(name), args if isinstance(args, dict) else {})
+            params = msg.get("params") or {}
+            if not isinstance(params, dict):
+                raise AgentError("tools/call params must be an object")
+            name, args = validate_tool_call(params.get("name"), params.get("arguments", {}))
+            payload = call_tool(name, args)
             text = json.dumps(payload, indent=2, sort_keys=True)
             return rpc_result(message_id, {"content": [{"type": "text", "text": text}], "isError": False})
         except Exception as exc:

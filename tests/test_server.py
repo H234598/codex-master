@@ -198,6 +198,49 @@ class ServerHelpersTest(unittest.TestCase):
         integer_payload = json.loads(integer_response["result"]["content"][0]["text"])
         self.assertEqual(integer_payload["error"], "limit must be an integer")
 
+    def test_mcp_tool_call_validates_params_and_argument_shape(self) -> None:
+        params_response = handle_rpc({"jsonrpc": "2.0", "id": 33, "method": "tools/call", "params": "not-an-object"})
+        arguments_response = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 34,
+                "method": "tools/call",
+                "params": {"name": "agent_status", "arguments": ["not", "an", "object"]},
+            }
+        )
+
+        self.assertTrue(params_response["result"]["isError"])
+        params_payload = json.loads(params_response["result"]["content"][0]["text"])
+        self.assertEqual(params_payload["error"], "tools/call params must be an object")
+        self.assertTrue(arguments_response["result"]["isError"])
+        arguments_payload = json.loads(arguments_response["result"]["content"][0]["text"])
+        self.assertEqual(arguments_payload["error"], "tools/call arguments must be an object")
+
+    def test_mcp_tool_call_enforces_schema_properties_and_required_fields(self) -> None:
+        unknown_response = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 35,
+                "method": "tools/call",
+                "params": {"name": "agent_status", "arguments": {"agent": "a", "surprise": True}},
+            }
+        )
+        missing_response = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 36,
+                "method": "tools/call",
+                "params": {"name": "agent_send", "arguments": {"agent": "a"}},
+            }
+        )
+
+        self.assertTrue(unknown_response["result"]["isError"])
+        unknown_payload = json.loads(unknown_response["result"]["content"][0]["text"])
+        self.assertEqual(unknown_payload["error"], "unknown argument(s) for agent_status: surprise")
+        self.assertTrue(missing_response["result"]["isError"])
+        missing_payload = json.loads(missing_response["result"]["content"][0]["text"])
+        self.assertEqual(missing_payload["error"], "missing required argument(s) for agent_send: text")
+
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.pane_tail")
     @patch("codex_master.server.ensure_state")

@@ -107,7 +107,9 @@ Data minimization:
   integer arguments are type-checked; stringified values are rejected instead of
   being coerced. Incoming MCP frames are capped at 1 MiB before JSON parsing.
   Tool and RPC error texts are ANSI-stripped, redacted, and length-bounded
-  before they are returned.
+  before they are returned. `tools/call` validates tool names, object-shaped
+  params and arguments, unknown argument names, and required fields before
+  dispatch.
 - Use `tail` only for an explicit capped, ANSI-stripped, redacted excerpt.
 - Do not read raw tmux logs directly unless the user explicitly requests it and
   the privacy impact is acceptable.
