@@ -104,7 +104,8 @@ Data minimization:
   directories, not symlinks or regular files.
 - Raw logs are local debug artifacts. New raw logs are bounded to 5 MiB per
   file, managed raw-log directories retain at most 20 files by default, and
-  log-tail metadata paths must stay inside managed raw-log state. Raw-log
+  log-tail metadata paths must stay inside managed raw-log state. Prepared
+  raw-log files are created with no-follow exclusive semantics, and raw-log
   symlinks are not followed. The direct raw-log writer verifies real managed
   state directories before accepting log input, and symlinked legacy raw-log
   directories are ignored. Failed starts must remove prepared raw-log files.

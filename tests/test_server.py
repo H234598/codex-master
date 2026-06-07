@@ -827,6 +827,51 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(leftover_logs, [])
 
+    @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("codex_master.server.run_tmux")
+    def test_start_agent_refuses_preexisting_raw_log_symlink(
+        self, mock_run_tmux, _mock_alive, _mock_ensure_state
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = Path(tmpdir) / "codex"
+            raw_dir = Path(tmpdir) / "raw"
+            target = Path(tmpdir) / "target.log"
+            link = raw_dir / "fixed-a.log"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            raw_dir.mkdir()
+            target.write_text("external\n", encoding="utf-8")
+            link.symlink_to(target)
+
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
+                clear=False,
+            ), patch("codex_master.server.RAW_DIR", raw_dir), patch(
+                "codex_master.server.META_DIR", Path(tmpdir) / "meta"
+            ), patch(
+                "codex_master.server.agent_home_process_summary",
+                return_value={
+                    "process_count": 0,
+                    "external_process_count": 0,
+                    "managed_process_count": 0,
+                    "external_processes": [],
+                    "external_processes_truncated": False,
+                    "raw_output": "not_returned",
+                },
+            ), patch(
+                "codex_master.server.now_id", return_value="fixed"
+            ):
+                with self.assertRaisesRegex(AgentError, "without following symlinks"):
+                    start_agent("a", cwd=tmpdir)
+                target_content = target.read_text(encoding="utf-8")
+                link_is_symlink = link.is_symlink()
+
+        mock_run_tmux.assert_not_called()
+        self.assertEqual(target_content, "external\n")
+        self.assertTrue(link_is_symlink)
+
     def test_repo_wrapper_works_via_symlink(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         wrapper = repo_root / "bin" / "codex-master-mcp"

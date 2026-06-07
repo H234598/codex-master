@@ -667,11 +667,7 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
 
     run_id = f"{now_id()}-{agent}"
     raw_log = RAW_DIR / f"{run_id}.log"
-    raw_log.touch(mode=0o600, exist_ok=False)
-    try:
-        raw_log.chmod(0o600)
-    except PermissionError:
-        pass
+    write_private_new_bytes(raw_log, b"")
 
     argv = [str(runner), *BASE_ARGS]
     if prompt:
