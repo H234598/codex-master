@@ -1043,7 +1043,8 @@ class ServerHelpersTest(unittest.TestCase):
             "id": 2,
             "result": {"tools": [{"name": "agent_status"}, {"name": "master_app_bridge_status"}]},
         }
-        output = "Content-Length: 123\r\n\r\n" + json.dumps(payload)
+        encoded = json.dumps(payload, separators=(",", ":"))
+        output = f"Content-Length: {len(encoded)}\r\n\r\n{encoded}"
 
         result = mcp_tools_list_probe_result(output, "master_app_bridge_status")
 
@@ -1051,6 +1052,24 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["tool_count"], 2)
         self.assertTrue(result["required_tool_available"])
         self.assertNotIn("agent_status", json.dumps(result, sort_keys=True))
+
+    def test_mcp_tools_list_probe_result_rejects_embedded_json(self) -> None:
+        output = (
+            'Content-Length: 123\r\n\r\n{"jsonrpc":"2.0","id":2,'
+            '"result":{"tools":[{"name":"master_app_bridge_status"}]}} SECRET'
+        )
+        result = mcp_tools_list_probe_result(output, "master_app_bridge_status")
+
+        self.assertFalse(result["response_found"])
+        self.assertEqual(result["required_tool_available"], False)
+
+    def test_mcp_tools_list_probe_result_rejects_non_object_json_line(self) -> None:
+        output = '["not-a-json-rpc-message"]\n{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"master_app_bridge_status"}]}}'
+
+        result = mcp_tools_list_probe_result(output, "master_app_bridge_status")
+
+        self.assertFalse(result["response_found"])
+        self.assertFalse(result["required_tool_available"])
 
     @patch("codex_master.server.subprocess.run")
     def test_mcp_command_tools_list_self_test_is_data_sparse(self, mock_run) -> None:
@@ -1069,6 +1088,50 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["required_tool_available"])
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertNotIn("/tmp/codex-master-mcp", json.dumps(result, sort_keys=True))
+
+    @patch("codex_master.server.subprocess.run")
+    def test_mcp_command_tools_list_self_test_accepts_content_length_frames(self, mock_run) -> None:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"tools": [{"name": "master_app_bridge_status"}]},
+        }
+        encoded = json.dumps(payload, separators=(",", ":"))
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["/tmp/codex-master-mcp"],
+            0,
+            f"Content-Length: {len(encoded)}\r\n\r\n{encoded}",
+            "",
+        )
+
+        result = mcp_command_tools_list_self_test(Path("/tmp/codex-master-mcp"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["tool_count"], 1)
+        self.assertTrue(result["required_tool_available"])
+
+    @patch("codex_master.server.subprocess.run")
+    def test_mcp_command_tools_list_self_test_rejects_stderr_only_response(self, mock_run) -> None:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"tools": [{"name": "master_app_bridge_status"}]},
+        }
+        encoded = json.dumps(payload, separators=(",", ":"))
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["/tmp/codex-master-mcp"],
+            0,
+            "",
+            f"Content-Length: {len(encoded)}\r\n\r\n{encoded}",
+        )
+
+        result = mcp_command_tools_list_self_test(Path("/tmp/codex-master-mcp"))
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["tool_count"], 0)
+        self.assertFalse(result["required_tool_available"])
 
     def test_codex_related_process_summary_is_aggregate_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1378,7 +1441,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.6.2+codex.test",
+            "version": "0.6.3+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1405,7 +1468,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.6.2")
+        self.assertEqual(result["expected_tag"], "v0.6.3")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -4652,6 +4715,51 @@ class CliLifecycleTest(unittest.TestCase):
 
     @patch("codex_master.server.subprocess.run")
     def test_mcp_command_startup_self_test_is_data_sparse(self, mock_run) -> None:
+        response = (
+            '{"jsonrpc":"2.0","id":1,'
+            '"result":{"protocolVersion":"2024-11-05","capabilities":{},'
+            '"serverInfo":{"name":"codex-master-mcp"}}}'
+        )
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["codex-master-mcp"],
+            0,
+            response,
+            "",
+        )
+
+        result = mcp_command_startup_self_test(Path("/tmp/codex-master-mcp"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["raw_output"], "not_returned")
+        self.assertEqual(mock_run.call_args.kwargs["timeout"], DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS)
+
+    @patch("codex_master.server.subprocess.run")
+    def test_mcp_command_startup_self_test_accepts_content_length_frames(self, mock_run) -> None:
+        response = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "serverInfo": {"name": "codex-master-mcp"},
+            },
+        }
+        encoded = json.dumps(response, separators=(",", ":"))
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["codex-master-mcp"],
+            0,
+            f"Content-Length: {len(encoded)}\r\n\r\n{encoded}",
+            "",
+        )
+
+        result = mcp_command_startup_self_test(Path("/tmp/codex-master-mcp"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["raw_output"], "not_returned")
+
+    @patch("codex_master.server.subprocess.run")
+    def test_mcp_command_startup_self_test_rejects_embedded_json(self, mock_run) -> None:
         mock_run.return_value = subprocess.CompletedProcess(
             ["codex-master-mcp"],
             0,
@@ -4665,10 +4773,30 @@ class CliLifecycleTest(unittest.TestCase):
 
         result = mcp_command_startup_self_test(Path("/tmp/codex-master-mcp"))
 
-        self.assertTrue(result["ok"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "failed")
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertNotIn("SECRET", json.dumps(result, sort_keys=True))
-        self.assertEqual(mock_run.call_args.kwargs["timeout"], DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS)
+
+    @patch("codex_master.server.subprocess.run")
+    def test_mcp_command_startup_self_test_rejects_stderr_only_response(self, mock_run) -> None:
+        response = (
+            '{"jsonrpc":"2.0","id":1,'
+            '"result":{"protocolVersion":"2024-11-05","capabilities":{},'
+            '"serverInfo":{"name":"codex-master-mcp"}}}'
+        )
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["codex-master-mcp"],
+            0,
+            "",
+            response,
+        )
+
+        result = mcp_command_startup_self_test(Path("/tmp/codex-master-mcp"))
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["raw_output"], "not_returned")
 
     @patch("codex_master.server.subprocess.run")
     def test_mcp_command_startup_self_test_handles_missing_command(self, mock_run) -> None:
@@ -4682,17 +4810,37 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertNotIn("SECRET_PATH_SHOULD_NOT_RETURN", json.dumps(result, sort_keys=True))
 
     def test_mcp_probe_response_requires_json_rpc_server_info(self) -> None:
+        frame = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "serverInfo": {"name": "codex-master-mcp"},
+                },
+            },
+            separators=(",", ":"),
+        )
         self.assertTrue(
             mcp_probe_response_ok(
-                'Content-Length: 181\r\n\r\n{"jsonrpc":"2.0","id":1,'
-                '"result":{"protocolVersion":"2024-11-05","capabilities":{},'
-                '"serverInfo":{"name":"codex-master-mcp"}}}'
+                f"Content-Length: {len(frame)}\r\n\r\n{frame}"
+            )
+        )
+        self.assertTrue(
+            mcp_probe_response_ok(
+                frame
             )
         )
         self.assertFalse(mcp_probe_response_ok('codex-master-mcp finished with "id":1 but no JSON-RPC response'))
         self.assertFalse(
             mcp_probe_response_ok(
                 '{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"codex-master-mcp"}}}'
+            )
+        )
+        self.assertFalse(
+            mcp_probe_response_ok(
+                f"Content-Length: {len(frame)}\r\n\r\n{frame} SECRET"
             )
         )
 

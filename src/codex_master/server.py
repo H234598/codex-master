@@ -671,23 +671,65 @@ def mcp_tools_list_probe_payload() -> str:
     return "".join(json.dumps(message, separators=(",", ":")) + "\n" for message in messages)
 
 
-def iter_json_objects(text: str) -> list[dict[str, Any]]:
-    decoder = json.JSONDecoder()
+def iter_mcp_json_messages(text: str) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
-    for index, char in enumerate(text):
-        if char != "{":
+    remaining = text
+    while remaining:
+        remaining = remaining.lstrip()
+        if not remaining:
+            break
+        if remaining.startswith("Content-Length:"):
+            separator = "\r\n\r\n"
+            header_end = remaining.find(separator)
+            sep_len = len(separator)
+            if header_end < 0:
+                separator = "\n\n"
+                header_end = remaining.find(separator)
+                sep_len = len(separator)
+            if header_end < 0:
+                break
+            header_line = remaining[:header_end].splitlines()[0]
+            try:
+                body_length = parse_content_length(header_line.encode("ascii"))
+            except AgentError:
+                return []
+            body_start = header_end + sep_len
+            body = remaining[body_start : body_start + body_length]
+            if len(body) != body_length:
+                return []
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                return []
+            if isinstance(payload, dict):
+                payloads.append(payload)
+            else:
+                return []
+            remaining = remaining[body_start + body_length :]
+            continue
+
+        next_line, sep, rest = remaining.partition("\n")
+        line = next_line.strip()
+        if not line:
+            if not sep:
+                break
+            remaining = rest
             continue
         try:
-            payload, _end = decoder.raw_decode(text[index:])
+            payload = json.loads(line)
         except json.JSONDecodeError:
-            continue
+            return []
         if isinstance(payload, dict):
             payloads.append(payload)
+        else:
+            return []
+        remaining = rest
+        continue
     return payloads
 
 
 def mcp_probe_response_ok(output: str) -> bool:
-    for payload in iter_json_objects(output):
+    for payload in iter_mcp_json_messages(output):
         if not isinstance(payload, dict) or payload.get("id") != 1:
             continue
         if payload.get("jsonrpc") != "2.0":
@@ -706,7 +748,7 @@ def mcp_probe_response_ok(output: str) -> bool:
 
 
 def mcp_tools_list_probe_result(output: str, required_tool: str) -> dict[str, Any]:
-    for payload in iter_json_objects(output):
+    for payload in iter_mcp_json_messages(output):
         if payload.get("id") != 2 or payload.get("jsonrpc") != "2.0":
             continue
         result = payload.get("result")
@@ -763,7 +805,7 @@ def mcp_command_startup_self_test(
             "raw_output": "not_returned",
         }
 
-    output = cp.stdout + cp.stderr
+    output = cp.stdout
     ok = cp.returncode == 0 and mcp_probe_response_ok(output)
     return {
         "ok": ok,
@@ -810,7 +852,7 @@ def mcp_command_tools_list_self_test(
             "raw_output": "not_returned",
         }
 
-    output = cp.stdout + cp.stderr
+    output = cp.stdout
     tools_result = mcp_tools_list_probe_result(output, required_tool)
     ok = cp.returncode == 0 and tools_result["response_found"] and tools_result["required_tool_available"]
     return {
