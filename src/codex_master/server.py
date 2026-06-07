@@ -1093,17 +1093,72 @@ def limit_model_pool(model: Any) -> str:
     return "unknown"
 
 
-def infer_limit_model(text: str, meta: dict[str, Any], latest_assignment: dict[str, Any] | None) -> str:
+LIMIT_TEXT_PATTERNS = (
+    r"\brate limit(?:ed|s)?\b",
+    r"\busage limit\b",
+    r"\blimit (?:reached|exceeded|hit)\b",
+    r"\bquota (?:exceeded|reached)\b",
+    r"\btoo many requests\b",
+    r"\bout of tokens\b",
+    r"\btoken (?:limit|budget|quota)\b",
+    r"\bcontext (?:length|window).{0,80}\b(?:exceeded|full|limit)\b",
+)
+
+
+def model_from_status_text(text: str) -> str | None:
     lowered = text.lower()
     if re.search(r"\b(?:gpt[- ]?5\.3[- ]?codex[- ]?spark|codex[- ]?spark|spark)\b", lowered):
         return WRITE_AGENT_MODEL
     if re.search(r"\b(?:gpt[- ]?5\.4[- ]?mini|gpt[- ]?5\.4|5\.4[- ]?mini)\b", lowered):
         return DEFAULT_AGENT_MODEL
+    return None
+
+
+def first_limit_evidence(text: str) -> str:
+    lowered = text.lower()
+    for pattern in LIMIT_TEXT_PATTERNS:
+        match = re.search(pattern, lowered)
+        if match:
+            line_start = text.rfind("\n", 0, match.start()) + 1
+            next_line = text.find("\n", match.end())
+            line_end = len(text) if next_line == -1 else next_line
+            start = max(line_start, match.start() - 160)
+            end = min(line_end, match.end() + 160)
+            return text[start:end]
+    return ""
+
+
+def infer_limit_model_info(
+    text: str,
+    meta: dict[str, Any],
+    latest_assignment: dict[str, Any] | None,
+    *,
+    detected: bool,
+) -> tuple[str, str]:
+    assignment_model = latest_assignment.get("model") if latest_assignment else None
+    session_model = meta.get("model") if isinstance(meta.get("model"), str) else None
+
+    if detected:
+        evidence_model = model_from_status_text(first_limit_evidence(text))
+        if evidence_model:
+            return evidence_model, "limit_evidence_text"
+        if isinstance(assignment_model, str):
+            return assignment_model, "assignment_metadata"
+        if isinstance(session_model, str):
+            return session_model, "session_metadata"
+
+    status_model = model_from_status_text(text)
+    if status_model:
+        return status_model, "status_text"
     if latest_assignment and isinstance(latest_assignment.get("model"), str):
-        return latest_assignment["model"]
-    if isinstance(meta.get("model"), str):
-        return meta["model"]
-    return "unknown"
+        return latest_assignment["model"], "assignment_metadata"
+    if isinstance(session_model, str):
+        return session_model, "session_metadata"
+    return "unknown", "unknown"
+
+
+def infer_limit_model(text: str, meta: dict[str, Any], latest_assignment: dict[str, Any] | None) -> str:
+    return infer_limit_model_info(text, meta, latest_assignment, detected=True)[0]
 
 
 def classify_limit_text(text: str, meta: dict[str, Any] | None = None, latest_assignment: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1112,16 +1167,7 @@ def classify_limit_text(text: str, meta: dict[str, Any] | None = None, latest_as
     lowered = cleaned.lower()
     has_limit = any(
         re.search(pattern, lowered)
-        for pattern in (
-            r"\brate limit(?:ed|s)?\b",
-            r"\busage limit\b",
-            r"\blimit (?:reached|exceeded|hit)\b",
-            r"\bquota (?:exceeded|reached)\b",
-            r"\btoo many requests\b",
-            r"\bout of tokens\b",
-            r"\btoken (?:limit|budget|quota)\b",
-            r"\bcontext (?:length|window).{0,80}\b(?:exceeded|full|limit)\b",
-        )
+        for pattern in LIMIT_TEXT_PATTERNS
     )
     window = "unknown"
     if re.search(r"\b(?:daily|per day|today|24h|24 hours)\b", lowered):
@@ -1140,7 +1186,10 @@ def classify_limit_text(text: str, meta: dict[str, Any] | None = None, latest_as
         limit_kind = "usage"
 
     detected = has_limit or (window != "unknown" and "limit" in lowered)
-    model = infer_limit_model(cleaned, meta, latest_assignment)
+    model, model_source = infer_limit_model_info(cleaned, meta, latest_assignment, detected=detected)
+    session_model = meta.get("model") if isinstance(meta.get("model"), str) else "unknown"
+    assignment_model = latest_assignment.get("model") if latest_assignment else None
+    assignment_model_pool = limit_model_pool(assignment_model) if assignment_model else "none"
     role = latest_assignment.get("role") if latest_assignment else "unknown"
     if role not in {"exploriererin", "arbeitsbiene"}:
         role = "unknown"
@@ -1150,7 +1199,12 @@ def classify_limit_text(text: str, meta: dict[str, Any] | None = None, latest_as
         "window": window if detected else "none",
         "kind": limit_kind if detected else "none",
         "model": model,
+        "model_source": model_source,
         "model_pool": limit_model_pool(model),
+        "session_model": session_model,
+        "session_model_pool": limit_model_pool(session_model),
+        "assignment_model": assignment_model,
+        "assignment_model_pool": assignment_model_pool,
         "role": role,
         "source": "classified_from_bounded_status_text" if cleaned else "no_status_text",
         "evidence": "not_returned",

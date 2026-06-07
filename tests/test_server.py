@@ -669,13 +669,37 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(default_limit["window"], "daily")
         self.assertEqual(default_limit["kind"], "usage")
         self.assertEqual(default_limit["model"], DEFAULT_AGENT_MODEL)
+        self.assertEqual(default_limit["model_source"], "limit_evidence_text")
         self.assertEqual(default_limit["model_pool"], "default_agent_model")
+        self.assertEqual(default_limit["session_model"], "unknown")
+        self.assertEqual(default_limit["assignment_model"], None)
         self.assertTrue(spark_limit["limited"])
         self.assertEqual(spark_limit["window"], "weekly")
         self.assertEqual(spark_limit["model"], WRITE_AGENT_MODEL)
+        self.assertEqual(spark_limit["model_source"], "limit_evidence_text")
         self.assertEqual(spark_limit["model_pool"], "spark_write_model")
+        self.assertEqual(spark_limit["assignment_model"], WRITE_AGENT_MODEL)
+        self.assertEqual(spark_limit["assignment_model_pool"], "spark_write_model")
         self.assertEqual(spark_limit["role"], "arbeitsbiene")
         self.assertEqual(spark_limit["evidence"], "not_returned")
+
+    def test_classify_limit_text_prefers_assignment_model_for_unqualified_limit(self) -> None:
+        limit = classify_limit_text(
+            "Session model: gpt-5.4-mini\nWeekly limit reached. Try later.",
+            {"model": DEFAULT_AGENT_MODEL},
+            {"role": "arbeitsbiene", "model": WRITE_AGENT_MODEL},
+        )
+
+        self.assertTrue(limit["limited"])
+        self.assertEqual(limit["window"], "weekly")
+        self.assertEqual(limit["model"], WRITE_AGENT_MODEL)
+        self.assertEqual(limit["model_source"], "assignment_metadata")
+        self.assertEqual(limit["model_pool"], "spark_write_model")
+        self.assertEqual(limit["session_model"], DEFAULT_AGENT_MODEL)
+        self.assertEqual(limit["session_model_pool"], "default_agent_model")
+        self.assertEqual(limit["assignment_model"], WRITE_AGENT_MODEL)
+        self.assertEqual(limit["assignment_model_pool"], "spark_write_model")
+        self.assertEqual(limit["evidence"], "not_returned")
 
     def test_classify_tui_context_detects_starter_placeholder_without_output(self) -> None:
         result = classify_tui_context("Find and fix a bug in @filename\nSECRET_SHOULD_NOT_RETURN", running=True)

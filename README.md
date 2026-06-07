@@ -42,7 +42,8 @@ not kill an existing session that may belong to another MCP process.
 can distinguish likely daily, weekly, token, quota, or rate limits from ordinary
 "no response yet" states. The classification keeps default Agentinnen-model
 limits separate from Spark write-model limits and reports only metadata plus
-`evidence: not_returned`.
+`evidence: not_returned`. Limit metadata separates the running session model,
+the latest assignment model, and the model inferred for the detected limit.
 It also classifies a known Codex TUI starter/placeholder context without
 returning pane text, so callers can tell when an Agentin did not receive the
 assignment as productive input.

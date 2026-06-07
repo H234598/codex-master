@@ -98,7 +98,8 @@ Data minimization:
 - `status` may classify bounded pane/log text into metadata-only response and
   limit states, but it must not return the classified text. Daily, weekly,
   token, quota, and rate limits must keep default Agentinnen-model limits
-  separate from Spark write-model limits.
+  separate from Spark write-model limits, including separate session,
+  assignment, and inferred-limit model metadata.
 - `wait` may poll status for bounded time, defaulting to 120 seconds and
   currently capped at 10 minutes, and return activity/stop/limit metadata, but
   it must not return Agentin output.
