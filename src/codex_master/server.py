@@ -1158,6 +1158,35 @@ def classify_limit_text(text: str, meta: dict[str, Any] | None = None, latest_as
     }
 
 
+def classify_tui_context(text: str, running: bool) -> dict[str, Any]:
+    if not running:
+        state = "not_running"
+        source = "not_running"
+    else:
+        cleaned = strip_ansi(text)
+        lowered = re.sub(r"\s+", " ", cleaned.lower())
+        starter_patterns = (
+            r"\bfind and fix a bug in @filename\b",
+            r"\bwhat can i help(?: you)?(?: with)?\b",
+            r"\bask me anything\b",
+        )
+        if any(re.search(pattern, lowered) for pattern in starter_patterns):
+            state = "starter_placeholder"
+            source = "classified_from_bounded_pane_text"
+        elif cleaned.strip():
+            state = "unknown"
+            source = "classified_from_bounded_pane_text"
+        else:
+            state = "no_pane_text"
+            source = "no_status_text"
+    return {
+        "state": state,
+        "source": source,
+        "evidence": "not_returned",
+        "raw_output": "not_returned",
+    }
+
+
 def agent_limit_state(
     agent: str,
     *,
@@ -1165,20 +1194,28 @@ def agent_limit_state(
     meta: dict[str, Any],
     raw_log_path: Path | None,
     latest_assignment: dict[str, Any] | None,
+    pane_text: str | None = None,
 ) -> dict[str, Any]:
     samples: list[str] = []
     if running:
-        samples.append(pane_tail(agent, MAX_TAIL_LINES))
+        samples.append(pane_text if pane_text is not None else pane_tail(agent, MAX_TAIL_LINES))
     if raw_log_path:
         samples.append(read_log_tail(raw_log_path, MAX_LIMIT_STATUS_BYTES))
     return classify_limit_text("\n".join(item for item in samples if item), meta, latest_assignment)
 
 
-def agent_response_state(running: bool, limit_state: dict[str, Any], raw_log_info: dict[str, Any]) -> dict[str, Any]:
+def agent_response_state(
+    running: bool,
+    limit_state: dict[str, Any],
+    raw_log_info: dict[str, Any],
+    tui_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if limit_state.get("limited"):
         state = "blocked_by_limit"
     elif not running:
         state = "not_running"
+    elif (tui_context or {}).get("state") == "starter_placeholder":
+        state = "running_tui_starter_context"
     elif raw_log_info.get("idle_seconds") is None:
         state = "running_no_output_observed"
     elif int(raw_log_info["idle_seconds"]) >= IDLE_RESPONSE_SECONDS:
@@ -1206,6 +1243,8 @@ def wait_terminal_status(status: dict[str, Any], initial: dict[str, Any]) -> str
         return "blocked_by_limit"
     if not status.get("running"):
         return "not_running"
+    if ((status.get("response_state") or {}).get("state")) == "running_tui_starter_context":
+        return "tui_starter_context"
     if activity_signature(status) != activity_signature(initial):
         return "activity_observed"
     return None
@@ -1255,12 +1294,15 @@ def status_agent(agent: str) -> dict[str, Any]:
     running = tmux_alive(session)
     raw_log_info = raw_log_metadata(raw_log_path)
     latest_assignment = latest_assignment_summary(agent)
+    pane_text = pane_tail(agent, MAX_TAIL_LINES) if running else ""
+    tui_context = classify_tui_context(pane_text, running)
     limit_state = agent_limit_state(
         agent,
         running=running,
         meta=meta,
         raw_log_path=raw_log_path,
         latest_assignment=latest_assignment,
+        pane_text=pane_text,
     )
     return {
         "agent": agent,
@@ -1276,8 +1318,9 @@ def status_agent(agent: str) -> dict[str, Any]:
         "model": meta.get("model") or DEFAULT_AGENT_MODEL,
         "model_reasoning_effort": meta.get("model_reasoning_effort") or DEFAULT_AGENT_MODEL_EFFORT,
         "last_assignment": latest_assignment,
+        "tui_context": tui_context,
         "limit_state": limit_state,
-        "response_state": agent_response_state(running, limit_state, raw_log_info),
+        "response_state": agent_response_state(running, limit_state, raw_log_info, tui_context),
         "raw_log": "not_returned" if raw_log else None,
         "raw_log_bytes": raw_log_info["bytes"],
         "raw_log_updated_at_utc": raw_log_info["updated_at_utc"],

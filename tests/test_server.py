@@ -37,6 +37,7 @@ from codex_master.server import (
     check_mcp_registration,
     call_tool,
     classify_limit_text,
+    classify_tui_context,
     DEFAULT_AGENT_MODEL,
     doctor,
     ensure_state,
@@ -676,6 +677,15 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(spark_limit["role"], "arbeitsbiene")
         self.assertEqual(spark_limit["evidence"], "not_returned")
 
+    def test_classify_tui_context_detects_starter_placeholder_without_output(self) -> None:
+        result = classify_tui_context("Find and fix a bug in @filename\nSECRET_SHOULD_NOT_RETURN", running=True)
+
+        self.assertEqual(result["state"], "starter_placeholder")
+        self.assertEqual(result["source"], "classified_from_bounded_pane_text")
+        self.assertEqual(result["evidence"], "not_returned")
+        self.assertEqual(result["raw_output"], "not_returned")
+        self.assertNotIn("SECRET_SHOULD_NOT_RETURN", json.dumps(result, sort_keys=True))
+
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.pane_pid", return_value=None)
     @patch("codex_master.server.tmux_alive", return_value=False)
@@ -790,6 +800,55 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(payload["raw_log_path_valid"])
         self.assertNotIn(str(log_path), json.dumps(payload, sort_keys=True))
 
+    @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.latest_assignment_summary", return_value=None)
+    @patch("codex_master.server.pane_tail", return_value="Find and fix a bug in @filename\n")
+    @patch("codex_master.server.pane_pid", return_value=456)
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 1,
+            "external_process_count": 0,
+            "managed_process_count": 1,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
+    def test_agent_status_reports_tui_starter_context_without_output(
+        self, _mock_summary, _mock_tmux_alive, _mock_pane_pid, _mock_pane_tail, _mock_latest, _mock_ensure_state
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            runner = tmp_path / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": tmp_path, "session": "test_session"}},
+                clear=False,
+            ), patch("codex_master.server.read_meta", return_value={}):
+                response = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 50,
+                        "method": "tools/call",
+                        "params": {"name": "agent_status", "arguments": {"agent": "a"}},
+                    }
+                )
+
+        self.assertIsNotNone(response)
+        self.assertFalse(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])["results"][0]
+        self.assertEqual(payload["tui_context"]["state"], "starter_placeholder")
+        self.assertEqual(payload["tui_context"]["evidence"], "not_returned")
+        self.assertEqual(payload["response_state"]["state"], "running_tui_starter_context")
+        payload_text = json.dumps(payload, sort_keys=True)
+        self.assertNotIn("Find and fix a bug", payload_text)
+        self.assertNotIn("@filename", payload_text)
+
     @patch("codex_master.server.time.sleep")
     @patch("codex_master.server.status_agent")
     def test_wait_agent_reports_activity_without_output(self, mock_status_agent, mock_sleep) -> None:
@@ -836,6 +895,27 @@ class ServerHelpersTest(unittest.TestCase):
         result = wait_agent("a", timeout_seconds=10, poll_interval_seconds=1)
 
         self.assertEqual(result["status"], "blocked_by_limit")
+        self.assertEqual(result["poll_count"], 0)
+        self.assertEqual(result["raw_output"], "not_returned")
+        self.assertEqual(result["response_output"], "not_returned")
+        mock_sleep.assert_not_called()
+
+    @patch("codex_master.server.time.sleep")
+    @patch("codex_master.server.status_agent")
+    def test_wait_agent_returns_tui_starter_context_immediately(self, mock_status_agent, mock_sleep) -> None:
+        mock_status_agent.return_value = {
+            "agent": "a",
+            "running": True,
+            "raw_log_bytes": 10,
+            "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
+            "response_state": {"state": "running_tui_starter_context"},
+            "limit_state": {"limited": False},
+            "tui_context": {"state": "starter_placeholder", "evidence": "not_returned"},
+        }
+
+        result = wait_agent("a", timeout_seconds=10, poll_interval_seconds=1)
+
+        self.assertEqual(result["status"], "tui_starter_context")
         self.assertEqual(result["poll_count"], 0)
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertEqual(result["response_output"], "not_returned")

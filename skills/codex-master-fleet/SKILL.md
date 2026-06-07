@@ -93,6 +93,8 @@ Data minimization:
 - `doctor` must report the active `CODEX_HOME` category and the
   `codex-master-mcp` `startup_timeout_sec` health without returning the active
   home path.
+- `status` must classify known Codex TUI starter/placeholder context as
+  metadata-only `tui_context` and must not return pane text.
 - `status` may classify bounded pane/log text into metadata-only response and
   limit states, but it must not return the classified text. Daily, weekly,
   token, quota, and rate limits must keep default Agentinnen-model limits

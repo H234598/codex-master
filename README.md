@@ -43,6 +43,9 @@ can distinguish likely daily, weekly, token, quota, or rate limits from ordinary
 "no response yet" states. The classification keeps default Agentinnen-model
 limits separate from Spark write-model limits and reports only metadata plus
 `evidence: not_returned`.
+It also classifies a known Codex TUI starter/placeholder context without
+returning pane text, so callers can tell when an Agentin did not receive the
+assignment as productive input.
 `agent_wait` lets callers wait for activity, process exit, or a classified
 limit without automatically receiving Agentin output. It defaults to 120 seconds
 and is capped at 10 minutes per call.
