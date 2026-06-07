@@ -27,8 +27,10 @@ from codex_master.server import (
     allowed_raw_log_path,
     append_bounded_raw_log,
     agent_home_process_summary,
+    doctor,
     ensure_state,
     handle_rpc,
+    install,
     main_cli,
     prune_raw_logs,
     raw_log_retention_status,
@@ -37,12 +39,14 @@ from codex_master.server import (
     record_assignment,
     redact,
     replace_private_text,
+    resolve_path_no_throw,
     run_command,
     run_tmux,
     start_agent,
     strip_ansi,
     trim_chars,
     trim_lines,
+    uninstall,
     write_bounded_raw_log,
     write_meta,
     worktree_create_for_agent,
@@ -75,6 +79,15 @@ class ServerHelpersTest(unittest.TestCase):
         truncated_chars = trim_chars("abcdef", 3)
         self.assertTrue(truncated_chars.endswith("def"))
         self.assertIn("... truncated to last characters ...", truncated_chars)
+
+    def test_resolve_path_no_throw_returns_none_for_symlink_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            loop = Path(tmpdir) / "loop"
+            loop.symlink_to(loop)
+
+            resolved = resolve_path_no_throw(loop)
+
+        self.assertIsNone(resolved)
 
     def test_mcp_tools_list(self) -> None:
         response = handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
@@ -1966,6 +1979,27 @@ class CliLifecycleTest(unittest.TestCase):
 
     @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
     @patch("codex_master.server.repo_wrapper_path")
+    def test_install_handles_install_path_symlink_loop_without_crashing(
+        self, mock_wrapper_path, _mock_registration
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            install_link = tmp_path / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            install_link.symlink_to(install_link)
+            mock_wrapper_path.return_value = wrapper
+
+            with self.assertRaisesRegex(AgentError, "install path exists and is not this wrapper symlink"):
+                install(register=False, install_path=install_link)
+
+            still_symlink = install_link.is_symlink()
+
+        self.assertTrue(still_symlink)
+
+    @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
+    @patch("codex_master.server.repo_wrapper_path")
     def test_uninstall_refuses_symlink_parent_without_removing_redirected_link(
         self, mock_wrapper_path, _mock_registration
     ) -> None:
@@ -1992,6 +2026,78 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertTrue(redirected_is_symlink)
         self.assertNotIn(str(link_bin), str(raised.exception))
         self.assertNotIn(str(real_bin), str(raised.exception))
+
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_uninstall_leaves_install_path_symlink_loop_without_crashing(self, mock_wrapper_path) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            install_link = tmp_path / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            install_link.symlink_to(install_link)
+            mock_wrapper_path.return_value = wrapper
+
+            result = uninstall(unregister=False, remove_symlink=True, install_path=install_link)
+            still_symlink = install_link.is_symlink()
+
+        self.assertEqual(result["symlink"], "left_in_place_not_repo_wrapper")
+        self.assertTrue(still_symlink)
+
+    @patch("codex_master.server.agent_home_process_summary")
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
+    @patch("codex_master.server.shutil.which")
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_doctor_reports_unreadable_install_symlink_loop_without_crashing(
+        self,
+        mock_wrapper_path,
+        mock_shutil_which,
+        _mock_check_mcp_registration,
+        _mock_tmux_alive,
+        mock_agent_home_process_summary,
+    ) -> None:
+        mock_shutil_which.side_effect = lambda cmd: "/usr/bin/" + cmd if cmd in {"codex", "tmux"} else None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            install_link = tmp_path / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            install_link.symlink_to(install_link)
+            mock_wrapper_path.return_value = wrapper
+            mock_agent_home_process_summary.side_effect = lambda agent: {
+                "home": agent,
+                "external_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+            }
+
+            agents = {
+                "a": {"label": "A", "runner": tmp_path / "a-runner", "home": tmp_path / "a", "session": "session-a"},
+                "b": {"label": "B", "runner": tmp_path / "b-runner", "home": tmp_path / "b", "session": "session-b"},
+            }
+            for cfg in agents.values():
+                cfg["runner"].write_text("#!/bin/sh\n", encoding="utf-8")
+                cfg["runner"].chmod(cfg["runner"].stat().st_mode | stat.S_IXUSR)
+                cfg["home"].mkdir()
+
+            with patch("codex_master.server.DEFAULT_INSTALL_PATH", install_link), patch.dict(
+                "codex_master.server.AGENTS", agents, clear=True
+            ), patch("codex_master.server.STATE_ROOT", tmp_path / "state"), patch(
+                "codex_master.server.RAW_DIR", tmp_path / "state" / "raw"
+            ), patch(
+                "codex_master.server.META_DIR", tmp_path / "state" / "meta"
+            ), patch("codex_master.server.LEGACY_STATE_ROOT", tmp_path / "legacy-state"), patch(
+                "codex_master.server.LEGACY_META_DIR", tmp_path / "legacy-state" / "meta"
+            ):
+                result = doctor()
+
+        installed = next(item for item in result["checks"] if item["name"] == "installed_symlink")
+        self.assertFalse(installed["ok"])
+        self.assertEqual(installed["path"], str(install_link))
+        self.assertEqual(installed["target"], "<unreadable>")
 
     @patch("codex_master.server.tmux_alive", return_value=False)
     @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})

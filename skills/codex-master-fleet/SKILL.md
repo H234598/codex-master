@@ -132,7 +132,10 @@ Data minimization:
 - Worktree status must reject symlinks and non-directory targets before running
   `git status`.
 - Install and uninstall symlink operations must require the install-path parent
-  chain to be real directories.
+  chain to be real directories. Install, uninstall, and doctor must resolve
+  install symlinks defensively: broken, looping, or unreadable symlinks are
+  non-matching, and doctor reports an unreadable target marker instead of
+  crashing.
 - Use `tail` only for an explicit capped, ANSI-stripped, redacted excerpt.
 - Do not read raw tmux logs directly unless the user explicitly requests it and
   the privacy impact is acceptable.

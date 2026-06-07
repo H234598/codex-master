@@ -309,6 +309,15 @@ def path_present_no_follow(path: Path) -> bool:
         return True
 
 
+def resolve_path_no_throw(path: Path) -> Path | None:
+    try:
+        if path.is_symlink():
+            path.stat()
+        return path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+
+
 def read_meta(agent: str) -> dict[str, Any]:
     path = meta_path(agent)
     if not path_present_no_follow(path):
@@ -1620,10 +1629,10 @@ def doctor() -> dict[str, Any]:
     install_path = DEFAULT_INSTALL_PATH
     installed_target = None
     if install_path.is_symlink():
-        try:
-            installed_target = str(install_path.resolve())
-        except OSError:
-            installed_target = "<unreadable>"
+        resolved_install_path = resolve_path_no_throw(install_path)
+        installed_target = str(resolved_install_path) if resolved_install_path else "<unreadable>"
+    else:
+        resolved_install_path = None
     checks: list[dict[str, Any]] = [
         {"name": "tmux_available", "ok": shutil.which("tmux") is not None},
         {"name": "codex_available", "ok": shutil.which("codex") is not None},
@@ -1631,7 +1640,7 @@ def doctor() -> dict[str, Any]:
         {"name": "repo_wrapper_executable", "ok": os.access(wrapper, os.X_OK), "path": str(wrapper)},
         {
             "name": "installed_symlink",
-            "ok": install_path.is_symlink() and install_path.resolve() == wrapper,
+            "ok": install_path.is_symlink() and resolved_install_path == wrapper,
             "path": str(install_path),
             "target": installed_target,
         },
@@ -1682,7 +1691,8 @@ def install(register: bool = True, force: bool = False, install_path: Path = DEF
     install_path = normalize_install_path(install_path)
     ensure_directory_chain_no_symlink(install_path.parent, "install parent directories must be real directories")
     if install_path.exists() or install_path.is_symlink():
-        if install_path.is_symlink() and install_path.resolve() == wrapper:
+        resolved_install_path = resolve_path_no_throw(install_path) if install_path.is_symlink() else None
+        if install_path.is_symlink() and resolved_install_path == wrapper:
             symlink_status = "already_installed"
         elif force:
             install_path.unlink()
@@ -1741,7 +1751,8 @@ def uninstall(unregister: bool = True, remove_symlink: bool = False, install_pat
     if remove_symlink:
         ensure_directory_chain_no_symlink(install_path.parent, "install parent directories must be real directories")
         wrapper = repo_wrapper_path()
-        if install_path.is_symlink() and install_path.resolve() == wrapper:
+        resolved_install_path = resolve_path_no_throw(install_path) if install_path.is_symlink() else None
+        if install_path.is_symlink() and resolved_install_path == wrapper:
             install_path.unlink()
             symlink_status = "removed"
         elif install_path.exists() or install_path.is_symlink():

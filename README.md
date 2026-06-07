@@ -96,17 +96,23 @@ python3 -m codex_master.server stop both
 - creates `~/.local/bin/codex-master-mcp` as symlink to `bin/codex-master-mcp`
 - registers the command via `codex mcp add codex-master-mcp -- <link>`
 - requires the install-path parent chain to be real directories, not symlinks
+- treats broken, looping, or unreadable install symlinks as non-matching instead
+  of crashing while resolving them
 - returns JSON and no agent output
 
 `uninstall`
 - unregisters from `codex mcp remove codex-master-mcp`
 - removes `~/.local/bin/codex-master-mcp`
 - requires the install-path parent chain to be real directories when removing
+- leaves broken, looping, or unreadable install symlinks in place unless they
+  resolve to the repo wrapper
 - returns JSON and no raw secret material
 
 `doctor`
 - checks availability of required tooling (`codex`, `tmux`) and MCP state directory
 - reports a structured `checks` object
+- reports broken, looping, or unreadable install symlinks as a failed
+  `installed_symlink` check with an unreadable target marker
 - treats stopped Agentinnen as informational session state, not as a failed
   health check
 - redacts known secret shapes in output
