@@ -87,9 +87,10 @@ and is capped at 10 minutes per call.
 - `integration_status`: repo status, diff stat, and recent assignment metadata
 - `commit_ready_check`: fixed readiness checks for integration/commit
 - `master_app_bridge_status`: App Bridge manifest and connector-ID status
-- `master_plugin_status`: plugin packaging, App Bridge, and MCP registration status
+- `master_plugin_status`: plugin packaging, plugin-cache drift, App Bridge, and
+  MCP registration status
 - `master_namespace_status`: diagnose `codex-master-mcp` registration, startup,
-  and `tools/list` visibility for new clients
+  plugin-cache drift, and `tools/list` visibility for new clients
 - `agent_doctor`: structured diagnostics without raw output
 
 `/mcp` should show `codex-master-mcp` only in the Teamleiterin/main Codex
@@ -98,6 +99,9 @@ tools; they are controlled from outside and may only use native Subagentinnen
 when an assignment explicitly allows it.
 `tool_search` is not authoritative for the local stdio MCP namespace; use
 `/mcp` in the affected Codex client or `namespace-status` from this repo.
+`plugin-status` and `namespace-status` also report whether the repo plugin
+manifest version is installed in the local plugin cache, without returning cache
+paths.
 
 ## Local CLI
 

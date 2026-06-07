@@ -103,6 +103,9 @@ Data minimization:
 - `namespace-status` is the local diagnostic for whether `codex-master-mcp` is
   registered, starts, and exposes its MCP `tools/list` to new clients.
   `tool_search` is not authoritative for the local stdio MCP namespace.
+- `plugin-status` and `namespace-status` report whether the repo plugin
+  manifest version is installed in the local plugin cache, without returning
+  cache paths.
 - `doctor` must report the active `CODEX_HOME` category and the
   `codex-master-mcp` `startup_timeout_sec` health without returning the active
   home path.

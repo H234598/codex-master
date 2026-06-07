@@ -86,6 +86,7 @@ MAX_ERROR_CHARS = 1200
 MAX_META_BYTES = 64 * 1024
 MAX_CODEX_CONFIG_BYTES = 1024 * 1024
 MAX_PLUGIN_MANIFEST_BYTES = 64 * 1024
+MAX_PLUGIN_CACHE_VERSIONS = 20
 COMMAND_TIMEOUT_RETURN_CODE = 124
 DEFAULT_TMUX_TIMEOUT_SECONDS = 10
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
@@ -96,6 +97,7 @@ RAW_LOG_TRUNCATION_MARKER = b"\n... codex-master-mcp retained the last raw log b
 MCP_SERVER_TABLE_HEADER = f"[mcp_servers.{MCP_SERVER_NAME}]"
 APP_BRIDGE_NAME = "codex-master"
 APP_BRIDGE_ID_PREFIXES = ("connector_", "asdk_app_")
+PLUGIN_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]{0,199}$")
 BRACKETED_PASTE_BEGIN = "\x1b[200~"
 BRACKETED_PASTE_END = "\x1b[201~"
 PATH_NOT_RETURNED = "not_returned"
@@ -2447,6 +2449,51 @@ def read_repo_json_object(path: Path, label: str) -> dict[str, Any]:
     return payload
 
 
+def public_plugin_version(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    version = value.strip()
+    if not PLUGIN_VERSION_RE.fullmatch(version):
+        return None
+    return version
+
+
+def plugin_manifest_version(root: Path | None = None) -> dict[str, Any]:
+    manifest = (root or repo_root()) / ".codex-plugin" / "plugin.json"
+    status = repo_file_status(manifest)
+    result: dict[str, Any] = {
+        "path": PATH_NOT_RETURNED,
+        "path_state": status["path_state"],
+        "exists": status["exists"],
+        "version": "",
+        "version_state": "missing",
+        "name_matches": False,
+        "ok": False,
+        "raw_output": "not_returned",
+    }
+    if not status["regular_file"]:
+        result["reason"] = "plugin_manifest_not_regular_file"
+        return result
+    try:
+        payload = read_repo_json_object(manifest, "plugin manifest")
+    except AgentError as exc:
+        result["reason"] = safe_error_text(exc)
+        return result
+    version = public_plugin_version(payload.get("version"))
+    name_matches = payload.get("name") == APP_BRIDGE_NAME
+    result.update(
+        {
+            "version": version or "",
+            "version_state": "set" if version else "invalid_or_missing",
+            "name_matches": name_matches,
+            "ok": bool(version) and name_matches,
+        }
+    )
+    if not result["ok"]:
+        result["reason"] = "plugin_manifest_name_or_version_invalid"
+    return result
+
+
 def normalize_plugin_contract_path(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -2484,6 +2531,118 @@ def plugin_declares_app_manifest(root: Path) -> dict[str, Any]:
             "ok": normalized == ".app.json",
         }
     )
+    return result
+
+
+def codex_plugin_cache_root() -> Path:
+    codex_home = os.environ.get("CODEX_HOME")
+    root = Path(codex_home).expanduser() if codex_home else Path.home() / ".codex"
+    if not root.is_absolute():
+        root = Path.cwd() / root
+    return root / "plugins" / "cache" / "personal" / APP_BRIDGE_NAME
+
+
+def plugin_cache_status(root: Path | None = None, cache_root: Path | None = None) -> dict[str, Any]:
+    repo_version = plugin_manifest_version(root)
+    target_cache = cache_root or codex_plugin_cache_root()
+    result: dict[str, Any] = {
+        "marketplace": "personal",
+        "plugin_name": APP_BRIDGE_NAME,
+        "path": PATH_NOT_RETURNED,
+        "path_state": "missing",
+        "exists": False,
+        "directory": False,
+        "symlink": False,
+        "repo_manifest": repo_version,
+        "repo_version_installed": False,
+        "installed_version_count": 0,
+        "installed_versions": [],
+        "installed_versions_truncated": False,
+        "symlink_entry_count": 0,
+        "invalid_entry_count": 0,
+        "unreadable_entry_count": 0,
+        "ok": False,
+        "raw_output": "not_returned",
+    }
+    try:
+        current = target_cache.lstat()
+    except FileNotFoundError:
+        result["reason"] = "plugin_cache_missing"
+        return result
+    except OSError:
+        result["path_state"] = "error"
+        result["reason"] = "plugin_cache_unreadable"
+        return result
+    result.update(
+        {
+            "path_state": "set",
+            "exists": True,
+            "directory": stat_module.S_ISDIR(current.st_mode),
+            "symlink": stat_module.S_ISLNK(current.st_mode),
+        }
+    )
+    if result["symlink"] or not result["directory"]:
+        result["reason"] = "plugin_cache_not_real_directory"
+        return result
+
+    versions: list[str] = []
+    try:
+        entries = list(target_cache.iterdir())
+    except OSError:
+        result["reason"] = "plugin_cache_unreadable"
+        return result
+
+    for entry in entries:
+        try:
+            entry_stat = entry.lstat()
+        except OSError:
+            result["unreadable_entry_count"] += 1
+            continue
+        if stat_module.S_ISLNK(entry_stat.st_mode):
+            result["symlink_entry_count"] += 1
+            continue
+        if not stat_module.S_ISDIR(entry_stat.st_mode):
+            result["invalid_entry_count"] += 1
+            continue
+        entry_version = public_plugin_version(entry.name)
+        if not entry_version:
+            result["invalid_entry_count"] += 1
+            continue
+
+        plugin_dir = entry / ".codex-plugin"
+        try:
+            plugin_dir_stat = plugin_dir.lstat()
+        except OSError:
+            result["unreadable_entry_count"] += 1
+            continue
+        if stat_module.S_ISLNK(plugin_dir_stat.st_mode) or not stat_module.S_ISDIR(plugin_dir_stat.st_mode):
+            result["invalid_entry_count"] += 1
+            continue
+        try:
+            payload = read_repo_json_object(plugin_dir / "plugin.json", "cached plugin manifest")
+        except AgentError:
+            result["unreadable_entry_count"] += 1
+            continue
+        cached_version = public_plugin_version(payload.get("version"))
+        if payload.get("name") != APP_BRIDGE_NAME or cached_version != entry_version:
+            result["invalid_entry_count"] += 1
+            continue
+        versions.append(entry_version)
+
+    versions = sorted(set(versions))
+    repo_version_text = repo_version.get("version") if repo_version.get("ok") else ""
+    repo_version_installed = bool(repo_version_text) and repo_version_text in versions
+    result.update(
+        {
+            "repo_version_installed": repo_version_installed,
+            "installed_version_count": len(versions),
+            "installed_versions": versions[-MAX_PLUGIN_CACHE_VERSIONS:],
+            "installed_versions_truncated": len(versions) > MAX_PLUGIN_CACHE_VERSIONS,
+            "ok": repo_version_installed,
+        }
+    )
+    if not result["ok"]:
+        result["reason"] = "repo_plugin_version_not_installed"
     return result
 
 
@@ -2550,16 +2709,28 @@ def master_plugin_status() -> dict[str, Any]:
     mcp_manifest = root / ".mcp.json"
     app_manifest = root / ".app.json"
     skill = root / "skills" / "codex-master-fleet" / "SKILL.md"
+    app_bridge = master_app_bridge_status()
+    mcp_registration = check_mcp_registration(DEFAULT_INSTALL_PATH)
+    startup_self_test = mcp_command_startup_self_test(DEFAULT_INSTALL_PATH)
+    cache_status = plugin_cache_status(root)
     return {
+        "ok": (
+            bool(app_bridge.get("ok"))
+            and bool(mcp_registration.get("ok"))
+            and bool(startup_self_test.get("ok"))
+            and bool(cache_status.get("ok"))
+        ),
         "repo": PATH_NOT_RETURNED,
         "repo_state": "set",
         "plugin_manifest": repo_file_status(manifest),
+        "plugin_manifest_version": plugin_manifest_version(root),
+        "plugin_cache": cache_status,
         "mcp_manifest": repo_file_status(mcp_manifest),
         "app_manifest": repo_file_status(app_manifest),
         "skill": repo_file_status(skill),
-        "app_bridge": master_app_bridge_status(),
-        "mcp_registration": check_mcp_registration(DEFAULT_INSTALL_PATH),
-        "startup_self_test": mcp_command_startup_self_test(DEFAULT_INSTALL_PATH),
+        "app_bridge": app_bridge,
+        "mcp_registration": mcp_registration,
+        "startup_self_test": startup_self_test,
         "installed_source_worktree_state": installed_source_worktree_state(
             resolve_path_no_throw(DEFAULT_INSTALL_PATH) if DEFAULT_INSTALL_PATH.is_symlink() else None,
             repo_wrapper_path(),
@@ -2573,6 +2744,7 @@ def master_namespace_status() -> dict[str, Any]:
     registration = check_mcp_registration(DEFAULT_INSTALL_PATH)
     startup_self_test = mcp_command_startup_self_test(DEFAULT_INSTALL_PATH)
     tools_list_self_test = mcp_command_tools_list_self_test(DEFAULT_INSTALL_PATH)
+    cache_status = plugin_cache_status(repo_root())
     tool_names = {tool["name"] for tool in TOOLS if isinstance(tool.get("name"), str)}
     local_tool_contract = {
         "tool_count": len(tool_names),
@@ -2597,6 +2769,7 @@ def master_namespace_status() -> dict[str, Any]:
         "mcp_registration": registration,
         "startup_self_test": startup_self_test,
         "tools_list_self_test": tools_list_self_test,
+        "plugin_cache": cache_status,
         "app_bridge": master_app_bridge_status(),
         "codex_home_context": codex_home_context(),
         "running_process_summary": codex_related_process_summary(),

@@ -80,6 +80,8 @@ from codex_master.server import (
     mcp_command_tools_list_self_test,
     mcp_tools_list_probe_result,
     master_namespace_status,
+    plugin_cache_status,
+    plugin_manifest_version,
 )
 
 
@@ -310,6 +312,65 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["plugin_apps"]["ok"])
         self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
 
+    def test_plugin_cache_status_detects_installed_repo_version_without_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "repo"
+            cache = Path(tmpdir) / "cache"
+            manifest = root / ".codex-plugin" / "plugin.json"
+            cached_manifest = cache / "0.2.18+codex.test" / ".codex-plugin" / "plugin.json"
+            manifest.parent.mkdir(parents=True)
+            cached_manifest.parent.mkdir(parents=True)
+            payload = {"name": "codex-master", "version": "0.2.18+codex.test"}
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            cached_manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+            result = plugin_cache_status(root, cache)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["repo_version_installed"])
+        self.assertEqual(result["installed_versions"], ["0.2.18+codex.test"])
+        self.assertEqual(result["repo_manifest"]["version"], "0.2.18+codex.test")
+        self.assertEqual(result["path"], "not_returned")
+        self.assertNotIn(str(root), json.dumps(result, sort_keys=True))
+        self.assertNotIn(str(cache), json.dumps(result, sort_keys=True))
+
+    def test_plugin_cache_status_rejects_symlinked_cache_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "repo"
+            cache = Path(tmpdir) / "cache"
+            target = Path(tmpdir) / "target"
+            manifest = root / ".codex-plugin" / "plugin.json"
+            target_manifest = target / ".codex-plugin" / "plugin.json"
+            manifest.parent.mkdir(parents=True)
+            target_manifest.parent.mkdir(parents=True)
+            payload = {"name": "codex-master", "version": "0.2.18+codex.test"}
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            target_manifest.write_text(json.dumps(payload), encoding="utf-8")
+            cache.mkdir()
+            (cache / "0.2.18+codex.test").symlink_to(target, target_is_directory=True)
+
+            result = plugin_cache_status(root, cache)
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["repo_version_installed"])
+        self.assertEqual(result["symlink_entry_count"], 1)
+        self.assertEqual(result["installed_versions"], [])
+        self.assertNotIn(str(target), json.dumps(result, sort_keys=True))
+
+    def test_plugin_manifest_version_is_path_sparse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            manifest = root / ".codex-plugin" / "plugin.json"
+            manifest.parent.mkdir()
+            manifest.write_text(json.dumps({"name": "codex-master", "version": "0.2.18+codex.test"}), encoding="utf-8")
+
+            result = plugin_manifest_version(root)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["version"], "0.2.18+codex.test")
+        self.assertEqual(result["path"], "not_returned")
+        self.assertNotIn(str(root), json.dumps(result, sort_keys=True))
+
     def test_mcp_tools_list_probe_result_detects_required_tool_without_returning_names(self) -> None:
         payload = {
             "jsonrpc": "2.0",
@@ -383,6 +444,7 @@ class ServerHelpersTest(unittest.TestCase):
 
     @patch("codex_master.server.codex_related_process_summary")
     @patch("codex_master.server.master_app_bridge_status")
+    @patch("codex_master.server.plugin_cache_status")
     @patch("codex_master.server.mcp_command_tools_list_self_test")
     @patch("codex_master.server.mcp_command_startup_self_test")
     @patch("codex_master.server.check_mcp_registration")
@@ -391,6 +453,7 @@ class ServerHelpersTest(unittest.TestCase):
         mock_registration,
         mock_startup,
         mock_tools,
+        mock_cache,
         mock_app_bridge,
         mock_processes,
     ) -> None:
@@ -404,6 +467,7 @@ class ServerHelpersTest(unittest.TestCase):
             "required_tool_available": True,
             "raw_output": "not_returned",
         }
+        mock_cache.return_value = {"ok": True, "repo_version_installed": True, "raw_output": "not_returned"}
         mock_app_bridge.return_value = {"ok": True, "connector_id": "connector_test", "raw_output": "not_returned"}
         mock_processes.return_value = {
             "codex_client_process_count": 2,
