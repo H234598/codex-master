@@ -20,12 +20,14 @@ from codex_master.server import (
     MAX_SKILL_NAMES,
     MAX_TASK_TEXT,
     RAW_LOG_TRUNCATION_MARKER,
+    allowed_raw_log_path,
     append_bounded_raw_log,
     agent_home_process_summary,
     ensure_state,
     handle_rpc,
     main_cli,
     prune_raw_logs,
+    raw_log_retention_status,
     read_message,
     read_meta,
     record_assignment,
@@ -455,6 +457,36 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(target_size, 200)
         self.assertEqual(target_mode, 0o644)
         self.assertFalse(link_exists)
+
+    def test_legacy_raw_symlink_is_not_traversed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw"
+            legacy_root = Path(tmpdir) / "legacy"
+            outside_raw = Path(tmpdir) / "outside-raw"
+            raw_dir.mkdir()
+            legacy_root.mkdir()
+            outside_raw.mkdir()
+            outside_log = outside_raw / "outside.log"
+            outside_log.write_bytes(b"x" * 200)
+            legacy_raw = legacy_root / "raw"
+            legacy_raw.symlink_to(outside_raw)
+
+            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
+                "codex_master.server.LEGACY_STATE_ROOT", legacy_root
+            ), patch("codex_master.server.META_DIR", Path(tmpdir) / "meta"), patch(
+                "codex_master.server.LEGACY_META_DIR", legacy_root / "meta"
+            ):
+                allowed = allowed_raw_log_path(str(legacy_raw / "outside.log"))
+                retention = raw_log_retention_status()
+                result = prune_raw_logs(max_files=1, max_bytes=80)
+                outside_exists = outside_log.exists()
+
+        self.assertIsNone(allowed)
+        self.assertEqual(retention["file_count"], 0)
+        self.assertEqual(retention["total_bytes"], 0)
+        self.assertEqual(result["deleted_count"], 0)
+        self.assertEqual(result["truncated_count"], 0)
+        self.assertTrue(outside_exists)
 
     def test_append_bounded_raw_log_rejects_symlink_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

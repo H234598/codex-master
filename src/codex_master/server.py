@@ -327,6 +327,14 @@ def open_private_regular_update(path: Path) -> Any:
         raise
 
 
+def is_real_directory_no_symlink(path: Path) -> bool:
+    try:
+        mode = path.lstat().st_mode
+    except OSError:
+        return False
+    return stat_module.S_ISDIR(mode)
+
+
 def managed_raw_dirs() -> tuple[Path, ...]:
     legacy_raw = LEGACY_STATE_ROOT / "raw"
     dirs = [RAW_DIR]
@@ -345,6 +353,8 @@ def allowed_raw_log_path(raw_log: Any) -> Path | None:
     if candidate.suffix != ".log":
         return None
     for root in managed_raw_dirs():
+        if not is_real_directory_no_symlink(root):
+            continue
         try:
             candidate.relative_to(root.resolve(strict=False))
             return candidate
@@ -431,7 +441,7 @@ def prune_raw_logs(max_files: int = MAX_RAW_LOG_FILES, max_bytes: int = MAX_RAW_
     truncated = 0
     retained = 0
     for raw_dir in managed_raw_dirs():
-        if not raw_dir.exists():
+        if not is_real_directory_no_symlink(raw_dir):
             continue
         logs: list[tuple[Path, os.stat_result]] = []
         for path in raw_dir.glob("*.log"):
@@ -485,7 +495,7 @@ def raw_log_retention_status() -> dict[str, Any]:
     total_bytes = 0
     oversized_count = 0
     for raw_dir in managed_raw_dirs():
-        if not raw_dir.exists():
+        if not is_real_directory_no_symlink(raw_dir):
             continue
         for path in raw_dir.glob("*.log"):
             try:
@@ -798,13 +808,7 @@ def parse_skill_path(home: Path, path: Path) -> dict[str, str]:
 
 
 def list_skill_files(root: Path) -> list[Path]:
-    try:
-        root_mode = root.lstat().st_mode
-    except FileNotFoundError:
-        return []
-    except OSError:
-        return []
-    if stat_module.S_ISLNK(root_mode) or not stat_module.S_ISDIR(root_mode):
+    if not is_real_directory_no_symlink(root):
         return []
     return sorted(path for path in root.rglob("SKILL.md") if is_regular_file_no_symlink(path))
 

@@ -106,8 +106,8 @@ Data minimization:
   file, managed raw-log directories retain at most 20 files by default, and
   log-tail metadata paths must stay inside managed raw-log state. Raw-log
   symlinks are not followed. The direct raw-log writer verifies real managed
-  state directories before accepting log input. Failed starts must remove
-  prepared raw-log files.
+  state directories before accepting log input, and symlinked legacy raw-log
+  directories are ignored. Failed starts must remove prepared raw-log files.
 - Assignment inputs are bounded before tmux interaction: sends/start prompts
   12,000 chars, tasks 4,000 chars, names 80 chars, skill refs 300 chars,
   path-like fields 1,000 chars, and assignment lists 50 items. MCP boolean and
