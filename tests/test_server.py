@@ -136,6 +136,14 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(mcp_registration_command_matches(no_command, Path("/home/teladi/.local/bin/codex-master-mcp")))
         self.assertEqual(mcp_startup_timeout_seconds(output), 120)
 
+    def test_redact_removes_absolute_paths(self) -> None:
+        text, changed = redact("worktree /home/teladi/private/repo\nrelative/path stays\n")
+
+        self.assertTrue(changed)
+        self.assertIn("/<redacted>", text)
+        self.assertIn("relative/path stays", text)
+        self.assertNotIn("/home/teladi/private/repo", text)
+
     def test_codex_home_context_classifies_agent_home_without_returning_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_home:
             tmp_path = Path(tmp_home)
@@ -244,7 +252,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["startup_timeout_sec"], 30)
         self.assertFalse(result["startup_timeout_ok"])
         self.assertFalse(result["ok"])
-        self.assertIn("/tmp/bin/codex-master-mcp-old", result["output_excerpt"])
+        self.assertIn("command: /<redacted>", result["output_excerpt"])
+        self.assertNotIn("/tmp/bin/codex-master-mcp-old", result["output_excerpt"])
 
     def test_mcp_tools_list(self) -> None:
         response = handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
@@ -1819,14 +1828,22 @@ class ServerHelpersTest(unittest.TestCase):
             repo = Path(tmpdir)
             target = repo / ".codex-master-worktrees" / "agent-a"
             target.mkdir(parents=True)
-            mock_run_command.return_value = subprocess.CompletedProcess(["git"], 0, "", "")
+            mock_run_command.side_effect = [
+                subprocess.CompletedProcess(["git"], 0, "", ""),
+                subprocess.CompletedProcess(["git"], 0, f"worktree {repo}\nworktree {target}\n", ""),
+            ]
 
             with patch("codex_master.server.repo_root", return_value=repo):
                 result = worktree_status(".codex-master-worktrees/agent-a")
 
-        self.assertEqual(result["path"], str(target))
+        self.assertEqual(result["path"], "not_returned")
+        self.assertEqual(result["path_state"], "set")
         self.assertEqual(mock_run_command.call_args_list[0].args[0], ["git", "status", "--short"])
         self.assertEqual(mock_run_command.call_args_list[0].kwargs["cwd"], target)
+        result_text = json.dumps(result, sort_keys=True)
+        self.assertNotIn(str(repo), result_text)
+        self.assertNotIn(str(target), result_text)
+        self.assertIn("/<redacted>", result["worktrees"]["output_excerpt"])
 
     def test_repo_wrapper_works_via_symlink(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
@@ -2100,6 +2117,48 @@ class ServerHelpersTest(unittest.TestCase):
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertFalse(payload["allowed"])
         self.assertEqual(payload["violations"], ["tests/test_server.py"])
+        self.assertEqual(payload["cwd"], "not_returned")
+        self.assertEqual(payload["cwd_state"], "set")
+
+    @patch("codex_master.server.ensure_state")
+    def test_assignments_redact_historical_absolute_paths(self, _mock_ensure_state) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assignment_log = Path(tmpdir) / "assignments.jsonl"
+            assignment_log.write_text(
+                json.dumps(
+                    {
+                        "assignment_id": "1-a",
+                        "agent": "a",
+                        "scope": ["/home/teladi/private/repo"],
+                        "write_paths": ["/home/teladi/private/repo/file.py"],
+                        "skill": {"requested": "/home/teladi/secret-skill"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+                response = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 51,
+                        "method": "tools/call",
+                        "params": {"name": "agent_assignments", "arguments": {"agent": "all", "limit": 10}},
+                    }
+                )
+
+        self.assertFalse(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        record = payload["records"][0]
+        self.assertEqual(record["scope"], ["/<redacted>"])
+        self.assertEqual(record["write_paths"], ["/<redacted>"])
+        self.assertEqual(record["skill"]["requested"], "/<redacted>")
+        self.assertEqual(record["prompt_output"], "not_returned")
+        self.assertEqual(record["response_output"], "not_returned")
+        payload_text = json.dumps(payload, sort_keys=True)
+        self.assertNotIn("/home/teladi/private", payload_text)
+        self.assertNotIn("/home/teladi/secret-skill", payload_text)
 
     @patch("codex_master.server.send_agent")
     def test_agent_assign_sends_structured_prompt_without_returning_prompt(self, mock_send_agent) -> None:

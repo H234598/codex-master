@@ -128,6 +128,7 @@ SECRET_PATTERNS = [
     re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"),
     re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
 ]
+ABSOLUTE_PATH_RE = re.compile(r"(?<![\w.-])(?:/[^\s\"'<>:;,)}\]]+)+")
 
 
 class AgentError(RuntimeError):
@@ -1795,7 +1796,8 @@ def scope_check(scope: list[str], write_paths: list[str], cwd: Any = None) -> di
                 violations.append(redact_list([original])[0])
 
     return {
-        "cwd": str(base),
+        "cwd": PATH_NOT_RETURNED,
+        "cwd_state": "set",
         "allowed": not violations,
         "scope": redact_list(scope),
         "write_paths": redact_list(write_paths),
@@ -1978,6 +1980,23 @@ def redact_list(items: list[str], max_items: int = 50) -> list[str]:
     return safe_items
 
 
+def sanitize_assignment_record(record: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(record)
+    for key in ("scope", "write_paths"):
+        values = sanitized.get(key)
+        if isinstance(values, list):
+            sanitized[key] = redact_list([str(item) for item in values], max_items=MAX_ASSIGNMENT_LIST_ITEMS)
+    skill = sanitized.get("skill")
+    if isinstance(skill, dict):
+        sanitized["skill"] = {
+            key: redact(str(value))[0] if isinstance(value, str) else value
+            for key, value in skill.items()
+        }
+    sanitized["prompt_output"] = "not_returned"
+    sanitized["response_output"] = "not_returned"
+    return sanitized
+
+
 def record_assignment(record: dict[str, Any]) -> None:
     ensure_state()
     write_private_text(ASSIGNMENT_LOG, json.dumps(record, sort_keys=True) + "\n")
@@ -2026,7 +2045,7 @@ def list_assignments(agent: str = "all", limit: int = 20) -> dict[str, Any]:
             except json.JSONDecodeError:
                 continue
             if agent == "all" or record.get("agent") == agent:
-                records.append(record)
+                records.append(sanitize_assignment_record(record))
     return {
         "agent": agent,
         "limit": limit,
@@ -2133,7 +2152,8 @@ def worktree_status(path: Any = None) -> dict[str, Any]:
         raise AgentError("worktree status path must be a real directory")
     target = target.resolve(strict=False)
     return {
-        "path": str(target),
+        "path": PATH_NOT_RETURNED,
+        "path_state": "set",
         "status": git_excerpt(["status", "--short"], cwd=target),
         "worktrees": git_excerpt(["worktree", "list", "--porcelain"], cwd=repo_root()),
         "raw_output": "not_returned",
@@ -2553,6 +2573,9 @@ def redact(text: str) -> tuple[str, bool]:
         )
         changed = changed or next_text != redacted
         redacted = next_text
+    path_redacted = ABSOLUTE_PATH_RE.sub("/<redacted>", redacted)
+    changed = changed or path_redacted != redacted
+    redacted = path_redacted
     return redacted, changed
 
 

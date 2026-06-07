@@ -51,6 +51,9 @@ Public `status`, `skills`, `capabilities`, `plugin-status`, and `doctor`
 responses do not return local Agentin home, runner, repo, manifest, or working
 directory paths; they return state/category metadata such as `path_state`,
 `home_kind`, and `cwd_state` instead.
+Public scope checks, worktree status, command excerpts, and assignment audit
+reads redact absolute local paths as well; assignment prompts still receive the
+explicit paths that the Teamleiterin assigned.
 `agent_wait` lets callers wait for activity, process exit, or a classified
 limit without automatically receiving Agentin output. It defaults to 120 seconds
 and is capped at 10 minutes per call.

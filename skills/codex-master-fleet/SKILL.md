@@ -116,7 +116,8 @@ Data minimization:
   broad dumping. Symlinked skill roots and symlinked `SKILL.md` files are
   ignored instead of being followed.
 - `assignments` and `last-assignment` return only assignment metadata. They
-  must not return prompt text, Agentin responses, or local audit file paths.
+  must not return prompt text, Agentin responses, local audit file paths, or
+  absolute local paths from historical `scope`/`write_paths` metadata.
 - Assignment audit retention is bounded to the newest 500 valid metadata
   records in a local `0600` JSONL file. Assignment-log reads require regular
   files, are capped, and use generic errors. Private state appends refuse
@@ -162,7 +163,8 @@ Data minimization:
 - Worktree creation must reject existing targets, including broken symlinks,
   and require every target parent directory to be a real directory.
 - Worktree status must reject symlinks and non-directory targets before running
-  `git status`.
+  `git status`, and public worktree status responses must not return local
+  worktree paths or absolute paths in git worktree excerpts.
 - Install and uninstall symlink operations must require the install-path parent
   chain to be real directories. Install, uninstall, and doctor must resolve
   install symlinks defensively: broken, looping, or unreadable symlinks are
