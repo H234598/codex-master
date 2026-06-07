@@ -33,6 +33,7 @@ from codex_master.server import (
     strip_ansi,
     trim_chars,
     trim_lines,
+    write_bounded_raw_log,
     write_meta,
 )
 
@@ -464,6 +465,25 @@ class ServerHelpersTest(unittest.TestCase):
             target_content = target.read_bytes()
 
         self.assertEqual(target_content, b"target")
+
+    def test_write_bounded_raw_log_requires_real_state_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_root = Path(tmpdir) / "state"
+            outside_raw = Path(tmpdir) / "outside-raw"
+            state_root.mkdir()
+            outside_raw.mkdir()
+            raw_dir = state_root / "raw"
+            raw_dir.symlink_to(outside_raw)
+
+            with patch("codex_master.server.STATE_ROOT", state_root), patch(
+                "codex_master.server.RAW_DIR", raw_dir
+            ), patch("codex_master.server.META_DIR", state_root / "meta"), patch(
+                "codex_master.server.LEGACY_STATE_ROOT", Path(tmpdir) / "legacy"
+            ), patch(
+                "codex_master.server.LEGACY_META_DIR", Path(tmpdir) / "legacy" / "meta"
+            ):
+                with self.assertRaisesRegex(AgentError, "must not be a symlink"):
+                    write_bounded_raw_log(raw_dir / "agent.log", max_bytes=128)
 
     def test_write_meta_replaces_symlink_without_touching_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

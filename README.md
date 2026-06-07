@@ -15,9 +15,10 @@ with the default model `gpt-5.4-mini` and:
 It uses `tmux` as the PTY backend. Full terminal output is written only to local
 state files under `~/.local/state/codex-master-mcp/raw/`. New raw logs are
 bounded to 5 MiB per file, and managed raw-log directories keep at most 20 files
-by default. MCP tool responses do not return raw output by default. Existing
-metadata under the old `codex-agent-mcp` state directory is still read as a
-migration fallback.
+by default. The direct raw-log writer also requires the managed state
+directories to be real directories, not symlinks. MCP tool responses do not
+return raw output by default. Existing metadata under the old `codex-agent-mcp`
+state directory is still read as a migration fallback.
 
 ## Tools
 

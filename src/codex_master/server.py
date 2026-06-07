@@ -382,6 +382,7 @@ def append_bounded_raw_log(path: Path, chunk: bytes, max_bytes: int = MAX_RAW_LO
 
 
 def write_bounded_raw_log(path: Path, max_bytes: int = MAX_RAW_LOG_BYTES) -> int:
+    ensure_state()
     allowed = allowed_raw_log_path(str(path))
     if allowed is None:
         raise AgentError("raw log path is outside managed raw log state")
