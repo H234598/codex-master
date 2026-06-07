@@ -380,6 +380,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("sk-logtoken1234567890", payload["output"])
         self.assertIn("OPENAI_API_KEY=<redacted>", payload["output"])
         self.assertTrue(payload["redaction_applied"])
+        self.assertEqual(payload["raw_log"], "not_returned")
+        self.assertNotIn(str(log_path), json.dumps(payload, sort_keys=True))
 
     @patch("codex_master.server.ensure_state")
     def test_safe_tail_log_source_rejects_unmanaged_meta_path(self, _mock_ensure_state) -> None:
@@ -427,6 +429,59 @@ class ServerHelpersTest(unittest.TestCase):
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertEqual(payload["source"], "log")
         self.assertEqual(payload["output"], "")
+        self.assertEqual(payload["raw_log"], "not_returned")
+        self.assertNotIn(str(fifo_path), json.dumps(payload, sort_keys=True))
+
+    @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.pane_pid", return_value=456)
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 1,
+            "external_process_count": 0,
+            "managed_process_count": 1,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
+    def test_agent_status_does_not_return_raw_log_path(
+        self, _mock_summary, _mock_tmux_alive, _mock_pane_pid, _mock_ensure_state
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            raw_dir = tmp_path / "raw"
+            raw_dir.mkdir()
+            log_path = raw_dir / "agent.log"
+            log_path.write_text("log\n", encoding="utf-8")
+            runner = tmp_path / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": tmp_path, "session": "test_session"}},
+                clear=False,
+            ), patch("codex_master.server.RAW_DIR", raw_dir), patch(
+                "codex_master.server.read_meta", return_value={"raw_log": str(log_path)}
+            ):
+                response = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 48,
+                        "method": "tools/call",
+                        "params": {"name": "agent_status", "arguments": {"agent": "a"}},
+                    }
+                )
+
+        self.assertIsNotNone(response)
+        self.assertFalse(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])["results"][0]
+        self.assertEqual(payload["raw_log"], "not_returned")
+        self.assertEqual(payload["raw_log_bytes"], 4)
+        self.assertTrue(payload["raw_log_path_valid"])
+        self.assertNotIn(str(log_path), json.dumps(payload, sort_keys=True))
 
     def test_append_bounded_raw_log_caps_file_size(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -835,7 +890,7 @@ class ServerHelpersTest(unittest.TestCase):
         mock_run_tmux.assert_not_called()
 
     @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.read_meta", return_value={})
+    @patch("codex_master.server.read_meta", return_value={"raw_log": "/tmp/private-agent.log"})
     @patch("codex_master.server.pane_pid", return_value=321)
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch(
@@ -865,6 +920,8 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "already_running")
         self.assertEqual(result["home_external_process_count"], 0)
+        self.assertEqual(result["meta"]["raw_log"], "not_returned")
+        self.assertNotIn("/tmp/private-agent.log", json.dumps(result, sort_keys=True))
         self.assertEqual(result["raw_output"], "not_returned")
 
     @patch("codex_master.server.ensure_state")
@@ -936,6 +993,48 @@ class ServerHelpersTest(unittest.TestCase):
             kill_calls = [call for call in mock_run_tmux.call_args_list if call.args[0][0] == "kill-session"]
             self.assertEqual(len(kill_calls), 1)
             self.assertFalse(any(Path(tmpdir).glob("*.log")))
+
+    @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.write_meta")
+    @patch("codex_master.server.pane_pid", return_value=123)
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("codex_master.server.run_tmux")
+    def test_start_agent_does_not_return_raw_log_path(
+        self, mock_run_tmux, _mock_alive, _mock_pane_pid, mock_write_meta, _mock_ensure_state
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            runner = tmp_path / "codex"
+            raw_dir = tmp_path / "raw"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            raw_dir.mkdir()
+            mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "", "")
+
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": tmp_path, "session": "test_session"}},
+                clear=False,
+            ), patch("codex_master.server.RAW_DIR", raw_dir), patch("codex_master.server.META_DIR", tmp_path / "meta"), patch(
+                "codex_master.server.now_id", return_value="fixed"
+            ), patch(
+                "codex_master.server.agent_home_process_summary",
+                return_value={
+                    "process_count": 0,
+                    "external_process_count": 0,
+                    "managed_process_count": 0,
+                    "external_processes": [],
+                    "external_processes_truncated": False,
+                    "raw_output": "not_returned",
+                },
+            ):
+                result = start_agent("a", cwd=tmpdir)
+
+            raw_log_path = str(raw_dir / "fixed-a.log")
+
+        self.assertEqual(result["raw_log"], "not_returned")
+        self.assertNotIn(raw_log_path, json.dumps(result, sort_keys=True))
+        self.assertEqual(mock_write_meta.call_args.args[1]["raw_log"], raw_log_path)
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.write_meta")

@@ -25,8 +25,9 @@ metadata reads reject symlinked and oversized files, and metadata read errors
 use generic markers rather than local file paths. Safe-tail log reads ignore
 non-regular raw-log targets. Tmux control errors are redacted and bounded before
 they are returned or raised. MCP tool responses do not return raw output by
-default. Existing metadata under the old `codex-agent-mcp` state directory is
-still read as a migration fallback.
+default and expose raw-log presence without returning local raw-log paths.
+Existing metadata under the old `codex-agent-mcp` state directory is still read
+as a migration fallback.
 
 ## Tools
 

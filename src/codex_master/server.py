@@ -249,6 +249,13 @@ def read_meta(agent: str) -> dict[str, Any]:
     return read_json_file(path)
 
 
+def public_agent_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    public = dict(meta)
+    if "raw_log" in public:
+        public["raw_log"] = "not_returned"
+    return public
+
+
 def write_meta(agent: str, data: dict[str, Any]) -> None:
     path = meta_path(agent)
     replace_private_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
@@ -704,7 +711,7 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
             "backend": "tmux",
             "session": session,
             "pid": pane_pid(session),
-            "meta": read_meta(agent),
+            "meta": public_agent_meta(read_meta(agent)),
             "home_external_process_count": process_summary["external_process_count"],
             "raw_output": "not_returned",
         }
@@ -769,7 +776,7 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
         "cwd": str(start_cwd),
         "model": DEFAULT_AGENT_MODEL,
         "model_reasoning_effort": DEFAULT_AGENT_MODEL_EFFORT,
-        "raw_log": str(raw_log),
+        "raw_log": "not_returned",
         "raw_log_max_bytes": MAX_RAW_LOG_BYTES,
         "raw_output": "not_returned",
     }
@@ -813,7 +820,7 @@ def status_agent(agent: str) -> dict[str, Any]:
         "cwd": meta.get("cwd"),
         "model": meta.get("model") or DEFAULT_AGENT_MODEL,
         "model_reasoning_effort": meta.get("model_reasoning_effort") or DEFAULT_AGENT_MODEL_EFFORT,
-        "raw_log": str(raw_log_path) if raw_log_path else None,
+        "raw_log": "not_returned" if raw_log else None,
         "raw_log_bytes": raw_size,
         "raw_log_max_bytes": MAX_RAW_LOG_BYTES,
         "raw_log_policy": "local_only_bounded_not_returned_by_default",
@@ -1802,7 +1809,7 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
         "lines_limit": lines,
         "chars_limit": chars,
         "redaction_applied": was_redacted,
-        "raw_log": str(allowed_raw_log_path(meta.get("raw_log"))) if meta.get("raw_log") else None,
+        "raw_log": "not_returned" if meta.get("raw_log") else None,
         "output": cleaned,
     }
 
