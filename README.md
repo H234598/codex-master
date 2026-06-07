@@ -47,6 +47,10 @@ the latest assignment model, and the model inferred for the detected limit.
 It also classifies a known Codex TUI starter/placeholder context without
 returning pane text, so callers can tell when an Agentin did not receive the
 assignment as productive input.
+Public `status`, `skills`, `capabilities`, `plugin-status`, and `doctor`
+responses do not return local Agentin home, runner, repo, manifest, or working
+directory paths; they return state/category metadata such as `path_state`,
+`home_kind`, and `cwd_state` instead.
 `agent_wait` lets callers wait for activity, process exit, or a classified
 limit without automatically receiving Agentin output. It defaults to 120 seconds
 and is capped at 10 minutes per call.
@@ -146,6 +150,10 @@ python3 -m codex_master.server stop both
   `startup_timeout_sec >= 120`
 - reports whether the active `CODEX_HOME` looks like the main default home, a
   managed Agentinnen home, or a custom home without returning the path
+- hides local wrapper, install, Agentin home, and Agentin runner paths behind
+  state/category fields while preserving existence and health checks
+- reports raw-log retention counts and sizes without returning managed raw-log
+  directory paths
 - warns, without returning file paths, when the installed MCP points at this
   repo while the worktree has tracked or untracked changes
 - reports broken, looping, or unreadable install symlinks as a failed

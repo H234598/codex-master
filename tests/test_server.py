@@ -770,10 +770,15 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(payload["limit_state"]["window"], "weekly")
         self.assertEqual(payload["limit_state"]["model_pool"], "spark_write_model")
         self.assertEqual(payload["response_state"]["state"], "blocked_by_limit")
+        self.assertEqual(payload["home"], "not_returned")
+        self.assertEqual(payload["home_kind"], "managed_agent_home")
+        self.assertEqual(payload["runner"], "not_returned")
+        self.assertEqual(payload["cwd_state"], "not_set")
         payload_text = json.dumps(payload, sort_keys=True)
         self.assertNotIn("Weekly limit reached", payload_text)
         self.assertNotIn("sk-logtoken1234567890", payload_text)
         self.assertNotIn(str(log_path), payload_text)
+        self.assertNotIn(str(tmp_path), payload_text)
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.latest_assignment_summary", return_value=None)
@@ -826,7 +831,11 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(payload["raw_log"], "not_returned")
         self.assertEqual(payload["raw_log_bytes"], 4)
         self.assertTrue(payload["raw_log_path_valid"])
-        self.assertNotIn(str(log_path), json.dumps(payload, sort_keys=True))
+        payload_text = json.dumps(payload, sort_keys=True)
+        self.assertEqual(payload["home"], "not_returned")
+        self.assertEqual(payload["runner"], "not_returned")
+        self.assertNotIn(str(log_path), payload_text)
+        self.assertNotIn(str(tmp_path), payload_text)
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.latest_assignment_summary", return_value=None)
@@ -874,8 +883,11 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(payload["tui_context"]["evidence"], "not_returned")
         self.assertEqual(payload["response_state"]["state"], "running_tui_starter_context")
         payload_text = json.dumps(payload, sort_keys=True)
+        self.assertEqual(payload["home"], "not_returned")
+        self.assertEqual(payload["runner"], "not_returned")
         self.assertNotIn("Find and fix a bug", payload_text)
         self.assertNotIn("@filename", payload_text)
+        self.assertNotIn(str(tmp_path), payload_text)
 
     @patch("codex_master.server.time.sleep")
     @patch("codex_master.server.status_agent")
@@ -1033,6 +1045,10 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIsNone(allowed)
         self.assertEqual(retention["file_count"], 0)
         self.assertEqual(retention["total_bytes"], 0)
+        self.assertEqual(retention["managed_dirs"], "not_returned")
+        self.assertEqual(retention["managed_dir_count"], 2)
+        self.assertNotIn(str(raw_dir), json.dumps(retention, sort_keys=True))
+        self.assertNotIn(str(legacy_root), json.dumps(retention, sort_keys=True))
         self.assertEqual(result["deleted_count"], 0)
         self.assertEqual(result["truncated_count"], 0)
         self.assertTrue(outside_exists)
@@ -1313,8 +1329,11 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(summary["process_count"], 2)
         self.assertEqual(summary["managed_process_count"], 1)
         self.assertEqual(summary["external_process_count"], 1)
+        self.assertEqual(summary["home"], "not_returned")
+        self.assertEqual(summary["home_kind"], "managed_agent_home")
         self.assertEqual(summary["external_processes"][0]["pid"], 100)
         self.assertEqual(summary["external_processes"][0]["raw_output"], "not_returned")
+        self.assertNotIn(str(home), json.dumps(summary, sort_keys=True))
 
     def test_agent_lifecycle_lock_refuses_symlink_lock_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1884,6 +1903,9 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(payload["plugins"]["github@openai-curated"], 1)
         self.assertEqual(payload["plugins"]["codex-security@tmp"], 1)
         self.assertFalse(payload["plugins_truncated"])
+        self.assertEqual(payload["home"], "not_returned")
+        self.assertEqual(payload["home_kind"], "managed_agent_home")
+        self.assertTrue(all(root["path"] == "not_returned" for root in payload["roots"]))
         self.assertEqual(payload["skill_file_contents"], "not_returned")
         self.assertEqual(payload["raw_output"], "not_returned")
         self.assertEqual(payload["names_total"], 4)
@@ -1892,6 +1914,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(len(payload["names"]), 2)
         self.assertTrue(payload["names_truncated"])
         self.assertNotIn("SECRET_SKILL_CONTENT_SHOULD_NOT_LEAK", payload_text)
+        self.assertNotIn(str(home), payload_text)
 
         self.assertFalse(names_page["result"]["isError"])
         names_page_payload = json.loads(names_page["result"]["content"][0]["text"])["results"][0]
@@ -1901,6 +1924,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(len(names_page_payload["names"]), 2)
         self.assertFalse(names_page_payload["names_truncated"])
         self.assertNotIn("SECRET_SKILL_CONTENT_SHOULD_NOT_LEAK", json.dumps(names_page_payload, sort_keys=True))
+        self.assertNotIn(str(home), json.dumps(names_page_payload, sort_keys=True))
 
     def test_agent_skills_inventory_ignores_symlinked_skill_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1954,12 +1978,16 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(skills_payload["total"], 1)
         self.assertEqual(skills_payload["roots"][0]["skill_count"], 1)
         self.assertEqual(skills_payload["roots"][1]["skill_count"], 0)
+        self.assertEqual(skills_payload["roots"][0]["path"], "not_returned")
+        self.assertEqual(skills_payload["home"], "not_returned")
         self.assertEqual(skills_payload["names_total"], 1)
         self.assertEqual(skills_payload["names"][0]["name"], "real-skill")
         self.assertEqual(skills_payload["names"][0]["plugin"], "")
         self.assertEqual(skills_payload["names"][0]["source"], "system")
         self.assertNotIn("linked-skill", payload_text)
         self.assertNotIn("SECRET_SKILL_CONTENT_SHOULD_NOT_LEAK", payload_text)
+        self.assertNotIn(str(home), payload_text)
+        self.assertNotIn(str(outside_root), payload_text)
 
         self.assertFalse(match["result"]["isError"])
         match_payload = json.loads(match["result"]["content"][0]["text"])["results"][0]
@@ -2021,6 +2049,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(skills["result"]["isError"])
         skills_payload = json.loads(skills["result"]["content"][0]["text"])["results"][0]
         self.assertEqual(skills_payload["plugin_count"], 26)
+        self.assertEqual(skills_payload["home"], "not_returned")
         self.assertEqual(skills_payload["plugins_offset"], 0)
         self.assertEqual(skills_payload["plugins_limit"], 20)
         self.assertTrue(skills_payload["plugins_truncated"])
@@ -2052,6 +2081,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(capability_payload["plugins_limit"], 20)
         self.assertTrue(capability_payload["plugins_truncated"])
         self.assertEqual(len(capability_payload["plugins"]), 20)
+        self.assertEqual(capability_payload["home"], "not_returned")
+        self.assertNotIn(str(home), json.dumps(capability_payload, sort_keys=True))
 
     def test_scope_check_blocks_writes_outside_scope(self) -> None:
         response = handle_rpc(
@@ -2813,8 +2844,10 @@ class CliLifecycleTest(unittest.TestCase):
 
         installed = next(item for item in result["checks"] if item["name"] == "installed_symlink")
         self.assertFalse(installed["ok"])
-        self.assertEqual(installed["path"], str(install_link))
+        self.assertEqual(installed["path"], "not_returned")
         self.assertEqual(installed["target"], "<unreadable>")
+        self.assertEqual(installed["target_state"], "unreadable")
+        self.assertNotIn(str(install_link), json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.tmux_alive", return_value=False)
     @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
@@ -2887,12 +2920,16 @@ class CliLifecycleTest(unittest.TestCase):
         runner_check = next(item for item in payload["checks"] if item["name"] == "agent_a_runner_executable")
         self.assertFalse(runner_check["ok"])
         self.assertFalse(runner_check["symlink_allowed"])
+        self.assertEqual(runner_check["path"], "not_returned")
         retention = next(item for item in payload["checks"] if item["name"] == "raw_log_retention_configured")
         self.assertEqual(retention["max_bytes_per_file"], MAX_RAW_LOG_BYTES)
+        self.assertEqual(retention["managed_dirs"], "not_returned")
         self.assertEqual(retention["raw_output"], "not_returned")
         payload_text = json.dumps(payload, sort_keys=True)
         self.assertNotIn("sk-doctor-test-secret", payload_text)
         self.assertNotIn("sess-doctor-test", payload_text)
+        self.assertNotIn(str(Path(tmp_home) / "a-runner"), payload_text)
+        self.assertNotIn(str(Path(tmp_home) / "a"), payload_text)
 
 if __name__ == "__main__":
     unittest.main()

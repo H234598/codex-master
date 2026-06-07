@@ -95,6 +95,7 @@ RAW_LOG_TRUNCATION_MARKER = b"\n... codex-master-mcp retained the last raw log b
 MCP_SERVER_TABLE_HEADER = f"[mcp_servers.{MCP_SERVER_NAME}]"
 BRACKETED_PASTE_BEGIN = "\x1b[200~"
 BRACKETED_PASTE_END = "\x1b[201~"
+PATH_NOT_RETURNED = "not_returned"
 
 
 AGENTS = {
@@ -911,7 +912,8 @@ def raw_log_retention_status() -> dict[str, Any]:
             total_bytes += size
             oversized_count += int(size > MAX_RAW_LOG_BYTES)
     return {
-        "managed_dirs": [str(path) for path in managed_raw_dirs()],
+        "managed_dirs": PATH_NOT_RETURNED,
+        "managed_dir_count": len(managed_raw_dirs()),
         "max_files_per_dir": MAX_RAW_LOG_FILES,
         "max_bytes_per_file": MAX_RAW_LOG_BYTES,
         "file_count": file_count,
@@ -966,6 +968,20 @@ def same_path_text(left: str, right: Path) -> bool:
         return False
 
 
+def public_path(path: Any) -> str | None:
+    if path is None or str(path) == "":
+        return None
+    return PATH_NOT_RETURNED
+
+
+def public_path_state(path: Any) -> str:
+    return "set" if public_path(path) is not None else "not_set"
+
+
+def public_config_path_state(path: Any) -> str:
+    return "configured" if public_path(path) is not None else "not_configured"
+
+
 def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[dict[str, Any]]:
     cfg = AGENTS[agent]
     home = cfg["home"]
@@ -1000,7 +1016,8 @@ def agent_home_process_summary(agent: str, proc_root: Path = Path("/proc")) -> d
     external = [item for item in processes if not item["managed_by_masterjet"]]
     return {
         "agent": agent,
-        "home": str(AGENTS[agent]["home"]),
+        "home": PATH_NOT_RETURNED,
+        "home_kind": "managed_agent_home",
         "process_count": len(processes),
         "external_process_count": len(external),
         "managed_process_count": len(processes) - len(external),
@@ -1111,7 +1128,8 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
         "backend": "tmux",
         "session": session,
         "pid": pane_pid(session),
-        "cwd": str(start_cwd),
+        "cwd": PATH_NOT_RETURNED,
+        "cwd_state": "set",
         "model": DEFAULT_AGENT_MODEL,
         "model_reasoning_effort": DEFAULT_AGENT_MODEL_EFFORT,
         "raw_log": "not_returned",
@@ -1450,10 +1468,13 @@ def status_agent(agent: str) -> dict[str, Any]:
         "running": running,
         "session": session,
         "pid": pane_pid(session),
-        "home": str(cfg["home"]),
-        "runner": str(cfg["runner"]),
+        "home": PATH_NOT_RETURNED,
+        "home_kind": "managed_agent_home",
+        "runner": PATH_NOT_RETURNED,
+        "runner_state": public_config_path_state(cfg["runner"]),
         "started_at_utc": meta.get("started_at_utc"),
-        "cwd": meta.get("cwd"),
+        "cwd": public_path(meta.get("cwd")),
+        "cwd_state": public_path_state(meta.get("cwd")),
         "model": meta.get("model") or DEFAULT_AGENT_MODEL,
         "model_reasoning_effort": meta.get("model_reasoning_effort") or DEFAULT_AGENT_MODEL_EFFORT,
         "last_assignment": latest_assignment,
@@ -1550,7 +1571,15 @@ def skills_agent(
     roots: list[dict[str, Any]] = []
     for kind, root in skill_scan_roots(home):
         paths = list_skill_files(root)
-        roots.append({"kind": kind, "path": str(root), "exists": root.exists(), "skill_count": len(paths)})
+        roots.append(
+            {
+                "kind": kind,
+                "path": PATH_NOT_RETURNED,
+                "path_state": "configured",
+                "exists": root.exists(),
+                "skill_count": len(paths),
+            }
+        )
         all_paths.extend(paths)
 
     by_source: dict[str, int] = {}
@@ -1581,7 +1610,8 @@ def skills_agent(
     result: dict[str, Any] = {
         "agent": agent,
         "label": cfg["label"],
-        "home": str(home),
+        "home": PATH_NOT_RETURNED,
+        "home_kind": "managed_agent_home",
         "total": len(set(all_paths)),
         "roots": roots,
         "by_source": dict(sorted(by_source.items())),
@@ -1708,7 +1738,8 @@ def capabilities_agent(agent: str) -> dict[str, Any]:
     return {
         "agent": agent,
         "label": AGENTS[agent]["label"],
-        "home": str(AGENTS[agent]["home"]),
+        "home": PATH_NOT_RETURNED,
+        "home_kind": "managed_agent_home",
         "models": {
             "default": DEFAULT_AGENT_MODEL,
             "read_only": DEFAULT_AGENT_MODEL,
@@ -2155,7 +2186,8 @@ def installed_source_worktree_state(installed_target: Path | None, wrapper: Path
 
 def integration_status() -> dict[str, Any]:
     return {
-        "repo": str(repo_root()),
+        "repo": PATH_NOT_RETURNED,
+        "repo_state": "set",
         "status": git_excerpt(["status", "--short"]),
         "diff_stat": git_excerpt(["diff", "--stat"]),
         "assignments": list_assignments("all", 10),
@@ -2195,10 +2227,11 @@ def master_plugin_status() -> dict[str, Any]:
     mcp_manifest = root / ".mcp.json"
     skill = root / "skills" / "codex-master-fleet" / "SKILL.md"
     return {
-        "repo": str(root),
-        "plugin_manifest": {"path": str(manifest), "exists": manifest.is_file()},
-        "mcp_manifest": {"path": str(mcp_manifest), "exists": mcp_manifest.is_file()},
-        "skill": {"path": str(skill), "exists": skill.is_file()},
+        "repo": PATH_NOT_RETURNED,
+        "repo_state": "set",
+        "plugin_manifest": {"path": PATH_NOT_RETURNED, "path_state": "set", "exists": manifest.is_file()},
+        "mcp_manifest": {"path": PATH_NOT_RETURNED, "path_state": "set", "exists": mcp_manifest.is_file()},
+        "skill": {"path": PATH_NOT_RETURNED, "path_state": "set", "exists": skill.is_file()},
         "mcp_registration": check_mcp_registration(DEFAULT_INSTALL_PATH),
         "startup_self_test": mcp_command_startup_self_test(DEFAULT_INSTALL_PATH),
         "installed_source_worktree_state": installed_source_worktree_state(
@@ -2262,21 +2295,41 @@ def doctor() -> dict[str, Any]:
     wrapper = repo_wrapper_path()
     install_path = DEFAULT_INSTALL_PATH
     installed_target = None
+    installed_target_state = "not_symlink"
     if install_path.is_symlink():
         resolved_install_path = resolve_path_no_throw(install_path)
-        installed_target = str(resolved_install_path) if resolved_install_path else "<unreadable>"
+        installed_target_state = (
+            "unreadable"
+            if resolved_install_path is None
+            else "matching_repo_wrapper"
+            if resolved_install_path == wrapper
+            else "different"
+        )
+        installed_target = PATH_NOT_RETURNED if resolved_install_path else "<unreadable>"
     else:
         resolved_install_path = None
     checks: list[dict[str, Any]] = [
         {"name": "tmux_available", "ok": shutil.which("tmux") is not None},
         {"name": "codex_available", "ok": shutil.which("codex") is not None},
-        {"name": "repo_wrapper_exists", "ok": wrapper.exists(), "path": str(wrapper)},
-        {"name": "repo_wrapper_executable", "ok": os.access(wrapper, os.X_OK), "path": str(wrapper)},
+        {
+            "name": "repo_wrapper_exists",
+            "ok": wrapper.exists(),
+            "path": PATH_NOT_RETURNED,
+            "path_state": "set",
+        },
+        {
+            "name": "repo_wrapper_executable",
+            "ok": os.access(wrapper, os.X_OK),
+            "path": PATH_NOT_RETURNED,
+            "path_state": "set",
+        },
         {
             "name": "installed_symlink",
             "ok": install_path.is_symlink() and resolved_install_path == wrapper,
-            "path": str(install_path),
+            "path": PATH_NOT_RETURNED,
+            "path_state": "set",
             "target": installed_target,
+            "target_state": installed_target_state,
         },
         installed_source_worktree_state(resolved_install_path, wrapper),
         {"name": "mcp_startup_self_test", **mcp_command_startup_self_test(install_path)},
@@ -2286,11 +2339,18 @@ def doctor() -> dict[str, Any]:
         running = tmux_alive(cfg["session"])
         checks.extend(
             [
-                {"name": f"agent_{agent}_home_exists", "ok": cfg["home"].is_dir(), "path": str(cfg["home"])},
+                {
+                    "name": f"agent_{agent}_home_exists",
+                    "ok": cfg["home"].is_dir(),
+                    "path": PATH_NOT_RETURNED,
+                    "path_state": "set",
+                    "home_kind": "managed_agent_home",
+                },
                 {
                     "name": f"agent_{agent}_runner_executable",
                     "ok": is_regular_executable_no_symlink(cfg["runner"]),
-                    "path": str(cfg["runner"]),
+                    "path": PATH_NOT_RETURNED,
+                    "path_state": public_config_path_state(cfg["runner"]),
                     "symlink_allowed": False,
                 },
                 {
@@ -2304,6 +2364,7 @@ def doctor() -> dict[str, Any]:
                     "name": f"agent_{agent}_home_not_used_externally",
                     "ok": process_summary["external_process_count"] == 0,
                     "home": process_summary["home"],
+                    "home_kind": process_summary.get("home_kind", "managed_agent_home"),
                     "external_process_count": process_summary["external_process_count"],
                     "external_processes": process_summary["external_processes"],
                     "external_processes_truncated": process_summary["external_processes_truncated"],
