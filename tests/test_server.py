@@ -4,9 +4,10 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+import os
 from unittest.mock import patch
 
-from codex_master.server import handle_rpc, redact, start_agent, strip_ansi, trim_chars, trim_lines
+from codex_master.server import handle_rpc, main_cli, redact, start_agent, strip_ansi, trim_chars, trim_lines
 
 
 class ServerHelpersTest(unittest.TestCase):
@@ -54,7 +55,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         result = response["result"]
         self.assertEqual(result["protocolVersion"], "2025-11-25")
-        self.assertEqual(result["serverInfo"]["name"], "codex-agent-mcp")
+        self.assertEqual(result["serverInfo"]["name"], "codex-master-mcp")
         self.assertIn("tools", result["capabilities"])
         self.assertIn("resources", result["capabilities"])
         self.assertIn("prompts", result["capabilities"])
@@ -198,9 +199,9 @@ class ServerHelpersTest(unittest.TestCase):
 
     def test_repo_wrapper_works_via_symlink(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
-        wrapper = repo_root / "bin" / "codex-agent-mcp"
+        wrapper = repo_root / "bin" / "codex-master-mcp"
         with tempfile.TemporaryDirectory() as tmpdir:
-            symlink = Path(tmpdir) / "codex-agent-mcp"
+            symlink = Path(tmpdir) / "codex-master-mcp"
             symlink.symlink_to(wrapper)
             result = subprocess.run(
                 [str(symlink), "tools"],
@@ -211,6 +212,135 @@ class ServerHelpersTest(unittest.TestCase):
             )
         payload = json.loads(result.stdout)
         self.assertIn("agent_start", {tool["name"] for tool in payload["tools"]})
+
+
+class CliLifecycleTest(unittest.TestCase):
+    @patch("codex_master.server.run_command")
+    @patch("codex_master.server.print_json")
+    def test_cli_install_plans_expected_local_install_flow(self, mock_print_json, mock_run) -> None:
+        captured_payloads = []
+        link_created = False
+
+        def _capture(payload):
+            captured_payloads.append(payload)
+            return 0
+
+        mock_print_json.side_effect = _capture
+        with tempfile.TemporaryDirectory() as tmp_home:
+            wrapper_target = Path(__file__).resolve().parents[1] / "bin" / "codex-master-mcp"
+            local_bin = Path(tmp_home) / ".local" / "bin"
+            local_bin.mkdir(parents=True, exist_ok=True)
+            with patch.dict("os.environ", {"HOME": tmp_home}):
+                with patch("codex_master.server.shutil.which", return_value="/usr/bin/codex"):
+                    mock_run.side_effect = [
+                        subprocess.CompletedProcess(["codex", "mcp", "get", "codex-master-mcp"], 1, "not found", ""),
+                        subprocess.CompletedProcess(
+                            [
+                                "codex",
+                                "mcp",
+                                "add",
+                                "codex-master-mcp",
+                                "--",
+                                str(Path(tmp_home) / ".local" / "bin" / "codex-master-mcp"),
+                            ],
+                            0,
+                            "",
+                            "",
+                        ),
+                    ]
+                    result = main_cli(["install", "--path", str(Path(tmp_home) / ".local" / "bin" / "codex-master-mcp")])
+                    link_created = (Path(tmp_home) / ".local" / "bin" / "codex-master-mcp").exists()
+
+        install_link = Path(tmp_home) / ".local" / "bin" / "codex-master-mcp"
+        self.assertEqual(result, 0)
+        self.assertEqual(len(captured_payloads), 1)
+        payload = captured_payloads[0]
+        self.assertEqual(payload.get("ok"), True)
+        self.assertEqual(payload.get("install_path"), str(install_link))
+        self.assertEqual(payload.get("target"), str(wrapper_target))
+        self.assertEqual(payload.get("symlink"), "created")
+        self.assertEqual(payload.get("mcp"), {"requested": True, "status": "registered"})
+        self.assertTrue(link_created)
+        mock_run.assert_any_call(["codex", "mcp", "add", "codex-master-mcp", "--", str(install_link)])
+
+    @patch("codex_master.server.print_json")
+    def test_cli_uninstall_plans_expected_local_unregister_flow(self, mock_print_json) -> None:
+        captured_payloads = []
+
+        def _capture(payload):
+            captured_payloads.append(payload)
+            return 0
+
+        mock_print_json.side_effect = _capture
+        with tempfile.TemporaryDirectory() as tmp_home:
+            wrapper = Path(__file__).resolve().parents[1] / "bin" / "codex-master-mcp"
+            install_link = Path(tmp_home) / ".local" / "bin" / "codex-master-mcp"
+            install_link.parent.mkdir(parents=True, exist_ok=True)
+            install_link.symlink_to(wrapper)
+            with patch.dict("os.environ", {"HOME": tmp_home}):
+                result = main_cli(
+                    ["uninstall", "--remove-symlink", "--keep-registration", "--path", str(install_link)]
+                )
+
+        self.assertEqual(result, 0)
+        self.assertFalse(install_link.exists())
+        self.assertEqual(len(captured_payloads), 1)
+        payload = captured_payloads[0]
+        self.assertEqual(payload.get("ok"), True)
+        self.assertEqual(payload.get("symlink"), "removed")
+        self.assertEqual(payload.get("mcp"), "skipped")
+
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
+    @patch("codex_master.server.shutil.which")
+    @patch("codex_master.server.print_json")
+    def test_cli_doctor_exposes_health_checks_without_secrets(
+        self, mock_print_json, mock_shutil_which, mock_check_mcp_registration, _mock_tmux_alive
+    ) -> None:
+        captured_payloads = []
+
+        def _capture(payload):
+            captured_payloads.append(payload)
+            return 0
+
+        mock_print_json.side_effect = _capture
+        mock_shutil_which.side_effect = lambda cmd: "/usr/bin/" + cmd if cmd in {"codex", "tmux"} else None
+
+        with tempfile.TemporaryDirectory() as tmp_home:
+            with patch.dict(
+                "os.environ",
+                {
+                    "HOME": tmp_home,
+                    "OPENAI_API_KEY": "sk-doctor-test-secret",
+                    "OPENAI_ACCESS_TOKEN": "sess-doctor-test",
+                },
+            ):
+                with patch.dict(
+                    "codex_master.server.AGENTS",
+                    {
+                        "a": {"label": "A", "runner": Path(tmp_home) / "a-runner", "home": Path(tmp_home) / "a", "session": "session-a"},
+                        "b": {"label": "B", "runner": Path(tmp_home) / "b-runner", "home": Path(tmp_home) / "b", "session": "session-b"},
+                    },
+                    clear=False,
+                ):
+                    (Path(tmp_home) / "a-runner").write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+                    (Path(tmp_home) / "a").mkdir(parents=True)
+                    (Path(tmp_home) / "b-runner").write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+                    (Path(tmp_home) / "b").mkdir(parents=True)
+                    result = main_cli(["doctor"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(captured_payloads), 1)
+        payload = captured_payloads[0]
+        self.assertIn("checks", payload)
+        self.assertIsInstance(payload["checks"], list)
+        self.assertTrue(all(isinstance(item, dict) for item in payload["checks"]))
+        self.assertTrue(any(item["name"] == "tmux_available" and item["ok"] is True for item in payload["checks"]))
+        self.assertTrue(any(item["name"] == "codex_available" and item["ok"] is True for item in payload["checks"]))
+        self.assertTrue(any(item["name"] == "mcp_registered" for item in payload["checks"]))
+        payload_text = json.dumps(payload, sort_keys=True)
+        self.assertNotIn("sk-doctor-test-secret", payload_text)
+        self.assertNotIn("sess-doctor-test", payload_text)
 
 if __name__ == "__main__":
     unittest.main()
