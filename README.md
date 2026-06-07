@@ -172,9 +172,15 @@ python3 -m codex_master.server stop both
 - ensures the active Codex MCP config has `startup_timeout_sec = 120`
 - syncs the personal `codex-master` plugin cache from a runtime allowlist
   (`.codex-plugin`, `.app.json`, `.mcp.json`, `bin`, `skills`, `src`, README,
-  and package metadata) while excluding `.git`, tests, bytecode, and test caches
+  and package metadata) while excluding `.git`, tests, bytecode, test caches,
+  hidden files, editor swap files, and backup/patch leftovers
+- rejects hardlinked plugin source files and keeps only the current plus the
+  most recent valid cached plugin versions, without pruning invalid or symlinked
+  cache entries
 - refuses to register the Master MCP from a managed Agentinnen `CODEX_HOME`
 - requires the install-path parent chain to be real directories, not symlinks
+- creates or replaces the install symlink via an atomic same-directory
+  temporary symlink and rename
 - treats broken, looping, or unreadable install symlinks as non-matching instead
   of crashing while resolving them
 - returns JSON without agent output, install path, repo-wrapper target path, or

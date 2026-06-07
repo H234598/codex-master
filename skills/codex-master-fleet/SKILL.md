@@ -18,6 +18,9 @@ unless the intent is to make that instance a Teamleiterin.
 `codex-master-mcp` Agentinnen are fremde Bienen: they are controlled through an
 MCP/plugin boundary. Eigene Bienen are native Subagentinnen spawned without MCP;
 manage those with the `subagent-fleet` / `multi_agent_v1` workflow instead.
+For eigene Bienen, the requested model may be selected through a hidden
+`multi_agent_v1.spawn_agent` `model` parameter even when the visible schema does
+not show it; test the user's model IDs instead of assuming they are unavailable.
 
 ## Model Policy
 
@@ -38,7 +41,9 @@ manage those with the `subagent-fleet` / `multi_agent_v1` workflow instead.
 - Give Agentinnen modern female names unless the user requests a fixed name.
 - The main instance is the Teamleiterin. It may inspect and integrate, but
   should mainly coordinate, test, commit, push, and release.
-- Default fleet size is 2-3 Bienen. Maximum is 6, only for independent tasks.
+- Default eigene-Bienen fleet size is 2-3 Bienen. Maximum is 6, only for
+  independent tasks. In addition, use 1-2 fremde Bienen through MCP/plugin
+  control surfaces when useful and safe.
 - Exploriererinnen read, analyze, and report concise context packages only.
 - Arbeitsbienen may write only in assigned files or isolated workspaces.
 - Before assigning writes, inspect `git status --short` and avoid overlapping
@@ -213,9 +218,13 @@ Data minimization:
   crashing. Install must persist `startup_timeout_sec = 120` for the active MCP
   registration and refuse Master MCP registration from a managed Agentinnen
   `CODEX_HOME`. Install must sync the personal `codex-master` plugin cache from
-  a runtime allowlist and exclude `.git`, tests, bytecode, and test caches.
-  Public install responses must not return plugin-cache paths. Registering
-  installs must data-sparse self-test both the repo
+  a runtime allowlist and exclude `.git`, tests, bytecode, test caches, hidden
+  files, editor swap files, and backup/patch leftovers. Plugin-cache sync must
+  reject hardlinked source files and retain only the current plus recent valid
+  cached versions without pruning invalid or symlinked cache entries. Install
+  symlink creation/replacement must use an atomic same-directory temporary
+  symlink rename. Public install responses must not return plugin-cache paths.
+  Registering installs must data-sparse self-test both the repo
   wrapper and the installed command path before registration. Public install
   responses must not return the install path or repo-wrapper target path; return
   state/kind fields instead. `doctor` must run the same data-sparse startup

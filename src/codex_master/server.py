@@ -92,9 +92,11 @@ MAX_META_BYTES = 64 * 1024
 MAX_CODEX_CONFIG_BYTES = 1024 * 1024
 MAX_PLUGIN_MANIFEST_BYTES = 64 * 1024
 MAX_PLUGIN_CACHE_VERSIONS = 20
+MAX_PLUGIN_CACHE_RETAINED_VERSIONS = 5
 PLUGIN_CACHE_ALLOWED_FILES = (".app.json", ".mcp.json", "README.md", "pyproject.toml")
 PLUGIN_CACHE_ALLOWED_DIRS = (".codex-plugin", "bin", "skills", "src")
 PLUGIN_CACHE_EXCLUDED_NAMES = (".git", ".pytest_cache", ".mypy_cache", ".ruff_cache", "__pycache__")
+PLUGIN_CACHE_EXCLUDED_SUFFIXES = (".pyc", ".pyo", ".swp", ".swo", ".tmp", ".bak", ".orig", ".rej", "~")
 COMMAND_TIMEOUT_RETURN_CODE = 124
 DEFAULT_TMUX_TIMEOUT_SECONDS = 10
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
@@ -2862,6 +2864,17 @@ def installed_source_worktree_state(installed_target: Path | None, wrapper: Path
     return repo_worktree_safety()
 
 
+def replace_install_symlink(install_path: Path, wrapper: Path) -> None:
+    tmp_link = install_path.parent / f".{install_path.name}.tmp.{now_id()}.{uuid.uuid4().hex}"
+    try:
+        tmp_link.symlink_to(wrapper)
+        os.replace(tmp_link, install_path)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            tmp_link.unlink()
+        raise AgentError("could_not_write_install_symlink") from exc
+
+
 def integration_status() -> dict[str, Any]:
     return {
         "repo": PATH_NOT_RETURNED,
@@ -3149,19 +3162,31 @@ def copy_plugin_cache_path(src: Path, dst: Path) -> dict[str, int]:
         except OSError as exc:
             raise AgentError("could_not_sync_plugin_cache") from exc
         for entry in entries:
-            if entry.name in PLUGIN_CACHE_EXCLUDED_NAMES or entry.name.endswith((".pyc", ".pyo")):
+            if plugin_cache_name_excluded(entry.name):
                 continue
             child_counts = copy_plugin_cache_path(entry, dst / entry.name)
             counts["files"] += child_counts["files"]
             counts["directories"] += child_counts["directories"]
         return counts
     if stat_module.S_ISREG(src_stat.st_mode):
+        if getattr(src_stat, "st_nlink", 1) > 1:
+            raise AgentError("plugin source contains unsupported hardlink")
         try:
             shutil.copy2(src, dst)
         except OSError as exc:
             raise AgentError("could_not_sync_plugin_cache") from exc
         return {"files": 1, "directories": 0}
     raise AgentError("plugin source contains unsupported file type")
+
+
+def plugin_cache_name_excluded(name: str) -> bool:
+    return (
+        name in PLUGIN_CACHE_EXCLUDED_NAMES
+        or name.startswith(".")
+        or name.startswith("#")
+        or name.startswith(".#")
+        or name.endswith(PLUGIN_CACHE_EXCLUDED_SUFFIXES)
+    )
 
 
 def remove_real_plugin_cache_dir(path: Path) -> None:
@@ -3173,13 +3198,82 @@ def remove_real_plugin_cache_dir(path: Path) -> None:
         raise AgentError("could_not_sync_plugin_cache") from exc
     if stat_module.S_ISLNK(current.st_mode) or not stat_module.S_ISDIR(current.st_mode):
         raise AgentError("plugin cache entry is not a real directory")
+    if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+        raise AgentError("safe plugin cache removal is unavailable")
     try:
         shutil.rmtree(path)
     except OSError as exc:
         raise AgentError("could_not_sync_plugin_cache") from exc
 
 
-def sync_plugin_cache_from_repo(root: Path | None = None, cache_root: Path | None = None) -> dict[str, Any]:
+def valid_plugin_cache_entry_version(entry: Path) -> str | None:
+    try:
+        entry_stat = entry.lstat()
+    except OSError:
+        return None
+    if stat_module.S_ISLNK(entry_stat.st_mode) or not stat_module.S_ISDIR(entry_stat.st_mode):
+        return None
+    entry_version = public_plugin_version(entry.name)
+    if not entry_version:
+        return None
+    plugin_dir = entry / ".codex-plugin"
+    try:
+        plugin_dir_stat = plugin_dir.lstat()
+    except OSError:
+        return None
+    if stat_module.S_ISLNK(plugin_dir_stat.st_mode) or not stat_module.S_ISDIR(plugin_dir_stat.st_mode):
+        return None
+    try:
+        payload = read_repo_json_object(plugin_dir / "plugin.json", "cached plugin manifest")
+    except AgentError:
+        return None
+    cached_version = public_plugin_version(payload.get("version"))
+    if payload.get("name") != APP_BRIDGE_NAME or cached_version != entry_version:
+        return None
+    return entry_version
+
+
+def prune_plugin_cache_versions(
+    cache_root: Path,
+    *,
+    keep_version: str,
+    max_versions: int = MAX_PLUGIN_CACHE_RETAINED_VERSIONS,
+) -> dict[str, Any]:
+    max_versions = normalize_int_field(max_versions, field="max_versions", minimum=1, maximum=MAX_PLUGIN_CACHE_VERSIONS)
+    try:
+        entries = list(cache_root.iterdir())
+    except OSError as exc:
+        raise AgentError("could_not_sync_plugin_cache") from exc
+    candidates: list[tuple[float, str, Path]] = []
+    for entry in entries:
+        version = valid_plugin_cache_entry_version(entry)
+        if not version or version == keep_version:
+            continue
+        try:
+            modified = entry.lstat().st_mtime
+        except OSError:
+            continue
+        candidates.append((modified, version, entry))
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    keep_slots = max(0, max_versions - 1)
+    to_prune = candidates[keep_slots:]
+    for _, _, entry in to_prune:
+        remove_real_plugin_cache_dir(entry)
+    retained_old_count = len(candidates) - len(to_prune)
+    return {
+        "max_versions": max_versions,
+        "current_version_retained": True,
+        "retained_old_version_count": retained_old_count,
+        "pruned_version_count": len(to_prune),
+        "raw_output": "not_returned",
+    }
+
+
+def sync_plugin_cache_from_repo(
+    root: Path | None = None,
+    cache_root: Path | None = None,
+    retained_versions: int = MAX_PLUGIN_CACHE_RETAINED_VERSIONS,
+) -> dict[str, Any]:
     context = codex_home_context()
     if not context.get("ok"):
         raise AgentError("plugin cache install is not allowed from a managed Agentin home")
@@ -3242,6 +3336,7 @@ def sync_plugin_cache_from_repo(root: Path | None = None, cache_root: Path | Non
             remove_real_plugin_cache_dir(tmp_entry)
         raise
 
+    retention = prune_plugin_cache_versions(target_cache, keep_version=version, max_versions=retained_versions)
     status = plugin_cache_status(source_root, target_cache)
     return {
         "ok": bool(status.get("ok")),
@@ -3253,7 +3348,17 @@ def sync_plugin_cache_from_repo(root: Path | None = None, cache_root: Path | Non
         "cache_entry_state": "set",
         "copied_files": copied_files,
         "copied_directories": copied_directories,
-        "excluded_artifacts": ["git", "bytecode", "test_cache", "repo_tests"],
+        "excluded_artifacts": [
+            "git",
+            "bytecode",
+            "test_cache",
+            "repo_tests",
+            "hidden_files",
+            "editor_swap",
+            "backup_artifacts",
+            "hardlinks_rejected",
+        ],
+        "retention": retention,
         "plugin_cache": status,
         "raw_output": "not_returned",
     }
@@ -3588,13 +3693,12 @@ def install(
         if install_path.is_symlink() and resolved_install_path == wrapper:
             symlink_status = "already_installed"
         elif force:
-            install_path.unlink()
-            install_path.symlink_to(wrapper)
+            replace_install_symlink(install_path, wrapper)
             symlink_status = "replaced"
         else:
-            raise AgentError(f"install path exists and is not this wrapper symlink: {install_path}")
+            raise AgentError("install path exists and is not this wrapper symlink")
     else:
-        install_path.symlink_to(wrapper)
+        replace_install_symlink(install_path, wrapper)
         symlink_status = "created"
 
     registration: dict[str, Any] = {"requested": register, "status": "skipped"}

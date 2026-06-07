@@ -468,6 +468,9 @@ class ServerHelpersTest(unittest.TestCase):
             (root / "skills" / "codex-master-fleet" / "SKILL.md").write_text("skill", encoding="utf-8")
             (root / "src" / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
             (root / "src" / "codex_master" / "__pycache__" / "server.pyc").write_bytes(b"cache")
+            (root / "src" / "codex_master" / ".env").write_text("SECRET=not-copied", encoding="utf-8")
+            (root / "src" / "codex_master" / "server.py.swp").write_text("swap", encoding="utf-8")
+            (root / "skills" / "codex-master-fleet" / "SKILL.md.tmp").write_text("tmp", encoding="utf-8")
             (root / "tests" / "test_server.py").write_text("should not copy", encoding="utf-8")
             (root / ".git" / "config").write_text("secret", encoding="utf-8")
             (root / ".pytest_cache" / "README.md").write_text("cache", encoding="utf-8")
@@ -487,6 +490,9 @@ class ServerHelpersTest(unittest.TestCase):
                 "pytest_cache": (entry / ".pytest_cache").exists(),
                 "tests": (entry / "tests").exists(),
                 "pycache": (entry / "src" / "codex_master" / "__pycache__").exists(),
+                "hidden_env": (entry / "src" / "codex_master" / ".env").exists(),
+                "swap": (entry / "src" / "codex_master" / "server.py.swp").exists(),
+                "tmp": (entry / "skills" / "codex-master-fleet" / "SKILL.md.tmp").exists(),
             }
 
         self.assertTrue(result["ok"])
@@ -502,6 +508,9 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(copied_state["pytest_cache"])
         self.assertFalse(copied_state["tests"])
         self.assertFalse(copied_state["pycache"])
+        self.assertFalse(copied_state["hidden_env"])
+        self.assertFalse(copied_state["swap"])
+        self.assertFalse(copied_state["tmp"])
         self.assertTrue(result["plugin_cache"]["repo_version_installed"])
         self.assertNotIn(str(entry), json.dumps(result, sort_keys=True))
         self.assertNotIn(str(cache), json.dumps(result, sort_keys=True))
@@ -533,6 +542,92 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(entry_exists)
         self.assertEqual(tmp_entries, [])
+
+    def test_sync_plugin_cache_from_repo_rejects_hardlink_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            root = tmp_path / "repo"
+            cache = tmp_path / "cache"
+            (root / ".codex-plugin").mkdir(parents=True)
+            (root / "bin").mkdir()
+            (root / "skills").mkdir()
+            (root / "src" / "codex_master").mkdir(parents=True)
+            payload = {"name": "codex-master", "version": "0.3.5+codex.test"}
+            (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
+            (root / ".app.json").write_text("{}", encoding="utf-8")
+            (root / ".mcp.json").write_text("{}", encoding="utf-8")
+            (root / "README.md").write_text("readme", encoding="utf-8")
+            (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
+            (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
+            (root / "skills" / "SKILL.md").write_text("skill", encoding="utf-8")
+            server = root / "src" / "codex_master" / "server.py"
+            server.write_text("print('ok')\n", encoding="utf-8")
+            os.link(server, root / "src" / "codex_master" / "server-hardlink.py")
+
+            with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False):
+                with self.assertRaisesRegex(AgentError, "unsupported hardlink"):
+                    sync_plugin_cache_from_repo(root, cache)
+            entry_exists = (cache / "0.3.5+codex.test").exists()
+            tmp_entries = list(cache.glob(".*.tmp.*")) if cache.exists() else []
+
+        self.assertFalse(entry_exists)
+        self.assertEqual(tmp_entries, [])
+
+    def test_sync_plugin_cache_from_repo_prunes_old_valid_versions_without_touching_invalid_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            root = tmp_path / "repo"
+            cache = tmp_path / "cache"
+            (root / ".codex-plugin").mkdir(parents=True)
+            (root / "bin").mkdir()
+            (root / "skills").mkdir()
+            (root / "src" / "codex_master").mkdir(parents=True)
+            current = "0.3.5+codex.current"
+            payload = {"name": "codex-master", "version": current}
+            (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
+            (root / ".app.json").write_text("{}", encoding="utf-8")
+            (root / ".mcp.json").write_text("{}", encoding="utf-8")
+            (root / "README.md").write_text("readme", encoding="utf-8")
+            (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
+            (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
+            (root / "skills" / "SKILL.md").write_text("skill", encoding="utf-8")
+            (root / "src" / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
+            cache.mkdir()
+            old_versions = [f"0.3.{index}+codex.old" for index in range(5)]
+            for index, version in enumerate(old_versions):
+                manifest = cache / version / ".codex-plugin" / "plugin.json"
+                manifest.parent.mkdir(parents=True)
+                manifest.write_text(json.dumps({"name": "codex-master", "version": version}), encoding="utf-8")
+                os.utime(cache / version, (1000 + index, 1000 + index))
+            invalid = cache / "0.3.99+codex.invalid"
+            invalid.mkdir()
+            (invalid / ".codex-plugin").mkdir()
+            (invalid / ".codex-plugin" / "plugin.json").write_text(
+                json.dumps({"name": "different", "version": "0.3.99+codex.invalid"}),
+                encoding="utf-8",
+            )
+            symlink_target = tmp_path / "symlink-target"
+            symlink_target.mkdir()
+            symlink_entry = cache / "0.3.100+codex.symlink"
+            symlink_entry.symlink_to(symlink_target, target_is_directory=True)
+
+            with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False):
+                result = sync_plugin_cache_from_repo(root, cache, retained_versions=3)
+            remaining_versions = sorted(path.name for path in cache.iterdir())
+            symlink_survived = symlink_entry.is_symlink()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["retention"]["max_versions"], 3)
+        self.assertEqual(result["retention"]["pruned_version_count"], 3)
+        self.assertEqual(result["retention"]["retained_old_version_count"], 2)
+        self.assertIn(current, remaining_versions)
+        self.assertIn(old_versions[-1], remaining_versions)
+        self.assertIn(old_versions[-2], remaining_versions)
+        self.assertNotIn(old_versions[0], remaining_versions)
+        self.assertIn("0.3.99+codex.invalid", remaining_versions)
+        self.assertIn("0.3.100+codex.symlink", remaining_versions)
+        self.assertTrue(symlink_survived)
+        self.assertNotIn(str(cache), json.dumps(result, sort_keys=True))
 
     def test_plugin_manifest_version_is_path_sparse(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3594,6 +3689,31 @@ class CliLifecycleTest(unittest.TestCase):
             still_symlink = install_link.is_symlink()
 
         self.assertTrue(still_symlink)
+
+    @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_force_replaces_mismatched_symlink_atomically(
+        self, mock_wrapper_path, _mock_registration
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            other = tmp_path / "other-wrapper"
+            install_link = tmp_path / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            other.write_text("#!/bin/sh\n", encoding="utf-8")
+            install_link.symlink_to(other)
+            mock_wrapper_path.return_value = wrapper
+
+            result = install(register=False, force=True, install_path=install_link, sync_plugin_cache=False)
+            resolved = install_link.resolve(strict=False)
+            tmp_links = list(tmp_path.glob(".codex-master-mcp.tmp.*"))
+
+        self.assertEqual(result["symlink"], "replaced")
+        self.assertEqual(result["install_path"], "not_returned")
+        self.assertEqual(resolved, wrapper)
+        self.assertEqual(tmp_links, [])
 
     @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
     @patch("codex_master.server.repo_wrapper_path")
