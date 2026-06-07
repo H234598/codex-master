@@ -19,6 +19,7 @@ from codex_master.server import (
     MAX_ASSIGNMENT_RECORDS,
     MAX_CAPABILITY_PLUGINS,
     MAX_ERROR_CHARS,
+    MAX_LIVE_DATA_TOPIC,
     MAX_META_BYTES,
     MAX_RPC_MESSAGE_BYTES,
     MAX_RAW_LOG_BYTES,
@@ -390,6 +391,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("agent_capabilities", names)
         self.assertIn("agent_scope_check", names)
         self.assertIn("agent_assign_readonly", names)
+        self.assertIn("agent_assign_live_data", names)
         self.assertIn("agent_assign_write", names)
         self.assertIn("agent_selector_policy", names)
         self.assertIn("agent_selector_preview", names)
@@ -411,6 +413,7 @@ class ServerHelpersTest(unittest.TestCase):
         watchdog_props = by_name["fleet_watchdog"]["inputSchema"]["properties"]
         assign_write_props = by_name["agent_assign_write"]["inputSchema"]["properties"]
         assign_readonly_props = by_name["agent_assign_readonly"]["inputSchema"]["properties"]
+        assign_live_data_props = by_name["agent_assign_live_data"]["inputSchema"]["properties"]
         selector_policy_props = by_name["agent_selector_policy"]["inputSchema"]["properties"]
         skill_props = by_name["agent_skills"]["inputSchema"]["properties"]
         self.assertEqual(assign_props["task"]["maxLength"], MAX_TASK_TEXT)
@@ -436,8 +439,10 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(claim_props["allow_unauthenticated"]["default"])
         self.assertFalse(assign_props["allow_unauthenticated"]["default"])
         self.assertFalse(assign_readonly_props["allow_unauthenticated"]["default"])
+        self.assertFalse(assign_live_data_props["allow_unauthenticated"]["default"])
         self.assertFalse(assign_write_props["allow_unauthenticated"]["default"])
         self.assertFalse(report_props["allow_unauthenticated"]["default"])
+        self.assertEqual(assign_live_data_props["live_data_topic"]["maxLength"], MAX_LIVE_DATA_TOPIC)
         self.assertEqual(selector_policy_props["series"]["maxLength"], 32)
         self.assertEqual(DEFAULT_WATCHDOG_IDLE_SECONDS, 60)
         self.assertEqual(DEFAULT_WATCHDOG_POLL_SECONDS, 15)
@@ -1378,6 +1383,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["expected_tools"]["agent_pool_status"])
         self.assertTrue(result["expected_tools"]["agent_pool_copy_auth"])
         self.assertTrue(result["expected_tools"]["agent_pool_destroy_pool"])
+        self.assertTrue(result["expected_tools"]["agent_assign_live_data"])
         self.assertFalse(result["tool_search"]["authoritative_for_local_stdio_mcp_tools"])
         self.assertTrue(result["client_refresh"]["existing_sessions_may_need_restart"])
         self.assertTrue(result["mcp_server_ready"])
@@ -1574,7 +1580,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.8.3+codex.test",
+            "version": "0.9.0+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1601,7 +1607,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.8.3")
+        self.assertEqual(result["expected_tag"], "v0.9.0")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -4425,6 +4431,82 @@ class ServerHelpersTest(unittest.TestCase):
 
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.send_agent")
+    def test_agent_assign_live_data_requires_search_without_returning_prompt(self, mock_send_agent, _mock_alive) -> None:
+        mock_send_agent.return_value = {"agent": "a", "status": "sent", "response_output": "not_returned"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            state = home / "state"
+            assignment_log = home / "assignments.jsonl"
+
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
+                "codex_master.server.ASSIGNMENT_LOG", assignment_log
+            ), patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                response = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 24,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "agent_assign_live_data",
+                            "arguments": {
+                                "agent": "a",
+                                "scope": ["."],
+                                "task": "Wie ist das Wetter gerade in Berlin?",
+                                "live_data_topic": "Wetter Berlin heute",
+                                "name": "Mila",
+                            },
+                        },
+                    }
+                )
+                ledger_response = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 25,
+                        "method": "tools/call",
+                        "params": {"name": "agent_assignments", "arguments": {"agent": "a", "limit": 1}},
+                    }
+                )
+
+        self.assertIsNotNone(response)
+        self.assertFalse(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["status"], "assigned")
+        self.assertEqual(payload["role"], "exploriererin")
+        self.assertEqual(payload["write_policy"], "read_only")
+        self.assertTrue(payload["requires_search"])
+        self.assertEqual(payload["live_data"]["topic_state"], "set")
+        self.assertEqual(payload["prompt_output"], "not_returned")
+        self.assertEqual(payload["response_output"], "not_returned")
+        self.assertNotIn("Wetter Berlin heute", json.dumps(payload, sort_keys=True))
+
+        sent_prompt = mock_send_agent.call_args.args[1]
+        self.assertIn("[EXPLORER_BEE_TASK]", sent_prompt)
+        self.assertIn("Live-/Webdatenauftrag: ja", sent_prompt)
+        self.assertIn("Wetter Berlin heute", sent_prompt)
+        self.assertIn("Muss Websuche/aktuelle Quellen nutzen", sent_prompt)
+        self.assertIn("nicht raten", sent_prompt)
+
+        self.assertIsNotNone(ledger_response)
+        self.assertFalse(ledger_response["result"]["isError"])
+        ledger = json.loads(ledger_response["result"]["content"][0]["text"])
+        record = ledger["records"][0]
+        self.assertTrue(record["requires_search"])
+        self.assertEqual(record["live_data"]["topic_state"], "set")
+        ledger_text = json.dumps(ledger, sort_keys=True)
+        self.assertNotIn("Wie ist das Wetter gerade in Berlin?", ledger_text)
+        self.assertNotIn("Wetter Berlin heute", ledger_text)
+
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("codex_master.server.send_agent")
     def test_assignment_log_retention_prunes_metadata_records(self, mock_send_agent, _mock_alive) -> None:
         mock_send_agent.return_value = {"agent": "a", "status": "sent", "response_output": "not_returned"}
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4676,8 +4758,8 @@ class ServerHelpersTest(unittest.TestCase):
             return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
         with patch("codex_master.server.tmux_alive", return_value=True), patch(
-            "codex_master.server.run_tmux", side_effect=fake_run_tmux
-        ):
+            "codex_master.server.pane_tail", return_value="› Ready"
+        ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux):
             result = send_agent("a", "line 1\nline 2", enter=True)
 
         self.assertEqual(result["status"], "sent")
@@ -4698,8 +4780,8 @@ class ServerHelpersTest(unittest.TestCase):
             return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
         with patch("codex_master.server.tmux_alive", return_value=True), patch(
-            "codex_master.server.run_tmux", side_effect=fake_run_tmux
-        ):
+            "codex_master.server.pane_tail", return_value="› Ready"
+        ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux):
             result = send_agent("a", "single line", enter=False)
 
         self.assertEqual(result["paste_mode"], "plain_paste")
@@ -4708,6 +4790,21 @@ class ServerHelpersTest(unittest.TestCase):
         load_call = next(call for call in calls if call["args"][0] == "load-buffer")
         self.assertEqual(load_call["input_text"], "single line")
         self.assertFalse(any(call["args"][-1] == CODEX_TUI_SUBMIT_KEY for call in calls))
+
+    def test_send_agent_fails_when_tui_input_is_not_ready(self) -> None:
+        calls = []
+
+        def fake_run_tmux(args, *, input_text=None, check=True, timeout=10):
+            calls.append({"args": args, "input_text": input_text, "check": check, "timeout": timeout})
+            return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
+
+        with patch("codex_master.server.tmux_alive", return_value=True), patch(
+            "codex_master.server.pane_tail", return_value="MCP startup incomplete"
+        ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux):
+            with self.assertRaisesRegex(AgentError, "input is not ready"):
+                send_agent("a", "single line", ready_timeout_seconds=0)
+
+        self.assertFalse(any(call["args"][0] == "load-buffer" for call in calls))
 
 
 class CliLifecycleTest(unittest.TestCase):
@@ -4750,6 +4847,41 @@ class CliLifecycleTest(unittest.TestCase):
 
         self.assertEqual(result, 0)
         mock_call_tool.assert_called_once_with("agent_start", {"agent": "a"})
+
+    @patch("codex_master.server.print_json")
+    @patch("codex_master.server.call_tool", return_value={"status": "assigned", "raw_output": "not_returned"})
+    def test_cli_assign_live_data_dispatches_data_sparse_assignment(self, mock_call_tool, mock_print_json) -> None:
+        mock_print_json.return_value = 0
+
+        result = main_cli(
+            [
+                "assign-live-data",
+                "A1",
+                "--task",
+                "Wie ist das Wetter gerade in Berlin?",
+                "--live-data-topic",
+                "Wetter Berlin heute",
+                "--scope",
+                ".",
+                "--no-enter",
+            ]
+        )
+
+        self.assertEqual(result, 0)
+        mock_call_tool.assert_called_once_with(
+            "agent_assign_live_data",
+            {
+                "agent": "A1",
+                "task": "Wie ist das Wetter gerade in Berlin?",
+                "live_data_topic": "Wetter Berlin heute",
+                "scope": ["."],
+                "context": [],
+                "forbidden": [],
+                "enter": False,
+                "allow_missing_skill": False,
+                "allow_subagents": False,
+            },
+        )
 
     @patch("codex_master.server.print_json")
     @patch("codex_master.server.call_tool", return_value={"status": "claimed", "raw_output": "not_returned"})

@@ -112,6 +112,7 @@ cd /home/teladi/codex-master
 ./bin/codex-master-mcp skill-match all codex-security:security-scan
 ./bin/codex-master-mcp scope-check --scope src --write-path src/codex_master/server.py
 ./bin/codex-master-mcp assign-readonly a1 --skill codex-security:security-scan --scope src/codex_master/server.py --task "Pruefe nur lesend und berichte knapp."
+./bin/codex-master-mcp assign-live-data a1 --task "Wie ist das Wetter gerade in Berlin?" --live-data-topic "Wetter Berlin heute"
 ./bin/codex-master-mcp assign-write b1 --skill github:gh-fix-ci --scope .github/workflows --write-path .github/workflows/ci.yml --task "Haerte nur die CI-Datei."
 ./bin/codex-master-mcp assignments all --limit 20
 ./bin/codex-master-mcp last-assignment a1
@@ -133,6 +134,14 @@ Data minimization:
   `skills`, `capabilities`, `app-bridge-status`, `plugin-status`,
   `namespace-status`, `release-status`, `watchdog-status`, and
   `timeout-policy` do not return Agentin terminal output.
+- For weather, news, prices, schedules, and other current-data tasks, prefer
+  `assign-live-data` over raw `send`. It is a read-only assignment that tells
+  the Agentin to use current search sources or report a tooling/access limit
+  instead of guessing. Public responses and assignment audit records still omit
+  prompt text and Agentin output.
+- `send` and `assign-*` wait briefly for a visible Codex TUI input prompt before
+  pasting. If an Agentin is still in startup warnings, the mutation should fail
+  closed instead of silently losing the prompt.
 - `watchdog` is data-sparse and two-phased. When an Agentin is idle, it first
   requests a concise report and stores only a metadata marker. It waits the
   report grace period, default 15 seconds, before `interrupt`, `stop`, or

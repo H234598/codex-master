@@ -91,6 +91,15 @@ marker. It does not start Agentinnen and does not copy auth by default.
 Running Agentinnen are driven through tmux. The Masterjet pastes text into the
 Codex TUI and submits with `S-Enter`; plain `Enter` can remain in the composer
 for multi-line or wrapped prompts in current Codex CLI builds.
+Before pasting, `send` and `assign-*` wait briefly for a visible Codex TUI input
+prompt. If the TUI is still starting or only startup warnings are visible, the
+mutation fails closed instead of silently losing the prompt.
+
+For weather, news, prices, schedules, and other current-data tasks, prefer
+`assign-live-data` over raw `send`. It is a read-only Exploriererin assignment
+that tells the Agentin to use current search sources or report a tooling/access
+limit instead of guessing. Public tool responses and assignment audit records
+still omit prompt text and Agentin output.
 
 `pool status` counts installed homes, wrappers, configs, auth files, and shared
 asset symlinks. It returns `pool_root: not_returned`, not local paths.
@@ -116,10 +125,10 @@ MCP working mutations require each selected Agentin to have a regular local
 `auth.json` by default. This protects Teamleiterinnen from accidentally
 starting or assigning unauthenticated sleeping homes such as `c2`. The guarded
 tools are `agent_start`, `agent_claim`, `agent_send`, `agent_assign`,
-`agent_assign_readonly`, `agent_assign_write`, and `agent_report_request`.
-Read-only diagnostics, pool inspection, stop, release, and watchdog cleanup
-remain usable. Use `--allow-unauthenticated` only for explicit login/bootstrap
-flows.
+`agent_assign_readonly`, `agent_assign_live_data`, `agent_assign_write`, and
+`agent_report_request`. Read-only diagnostics, pool inspection, stop, release,
+and watchdog cleanup remain usable. Use `--allow-unauthenticated` only for
+explicit login/bootstrap flows.
 
 `copy_auth`:
 

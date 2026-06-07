@@ -69,6 +69,8 @@ DEFAULT_WAIT_SECONDS = 120
 MAX_WAIT_SECONDS = 600
 DEFAULT_WAIT_POLL_SECONDS = 30
 MAX_WAIT_POLL_SECONDS = 900
+DEFAULT_SEND_READY_TIMEOUT_SECONDS = 15
+SEND_READY_POLL_SECONDS = 0.5
 DEFAULT_CLAIM_WAIT_FOREVER = True
 DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS = 120
 MAX_STOPPED_LEASE_RECOVERY_GRACE_SECONDS = 7200
@@ -96,6 +98,7 @@ MAX_AGENTIN_NAME = 80
 MAX_SKILL_REF = 300
 MAX_PATH_TEXT = 1000
 MAX_ASSIGNMENT_ID = 200
+MAX_LIVE_DATA_TOPIC = 400
 MAX_RPC_MESSAGE_BYTES = 1024 * 1024
 MAX_ERROR_CHARS = 1200
 MAX_META_BYTES = 64 * 1024
@@ -246,6 +249,7 @@ RELEASE_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+(?:[A-Za-z0-9.+_-]*)?$")
 BRACKETED_PASTE_BEGIN = "\x1b[200~"
 BRACKETED_PASTE_END = "\x1b[201~"
 CODEX_TUI_SUBMIT_KEY = "S-Enter"
+CODEX_TUI_INPUT_MARKERS = ("›",)
 PATH_NOT_RETURNED = "not_returned"
 
 
@@ -2637,6 +2641,7 @@ def classify_tui_context(text: str, running: bool) -> dict[str, Any]:
         lowered = re.sub(r"\s+", " ", cleaned.lower())
         starter_patterns = (
             r"\bfind and fix a bug in @filename\b",
+            r"\bimprove documentation in @filename\b",
             r"\bwhat can i help(?: you)?(?: with)?\b",
             r"\bask me anything\b",
         )
@@ -3435,10 +3440,23 @@ def assignment_prompt(
     forbidden: list[str],
     name: str | None,
     allow_subagents: bool,
+    requires_search: bool = False,
+    live_data_topic: str | None = None,
 ) -> str:
     display_name = (name or default_agentin_name(agent)).strip()
     skill_line = skill.strip() if skill else "kein spezieller Skill vorgegeben"
     model = assignment_model(role)
+    search_lines: list[str] = []
+    if requires_search:
+        topic = live_data_topic.strip() if live_data_topic else task
+        search_lines = [
+            "Live-/Webdatenauftrag: ja",
+            f"Aktualitaetsfrage: {topic}",
+            "Muss Websuche/aktuelle Quellen nutzen, bevor eine sachliche Antwort gegeben wird.",
+            "Muss Quellen und Zeitbezug knapp nennen, soweit verfuegbar.",
+            "Wenn aktuelle Daten nicht verfuegbar sind, nicht raten; als Tooling-/Zugriffslimit berichten.",
+        ]
+    search_block = bullet_block(search_lines)
 
     if role == "exploriererin":
         return "\n".join(
@@ -3451,6 +3469,7 @@ def assignment_prompt(
                 f"Scope:\n{bullet_block(scope)}",
                 "Darf schreiben: nein",
                 f"Darf eigene Subagentinnen starten: {'ja, nur lesend im Scope' if allow_subagents else 'nein'}",
+                f"Web-/Live-Daten:\n{search_block}",
                 f"Stabiler Kontext:\n{bullet_block(context)}",
                 f"Aufgabe: {task}",
                 f"Grenzen:\n{bullet_block(forbidden)}",
@@ -3468,6 +3487,7 @@ def assignment_prompt(
             f"Scope:\n{bullet_block(scope)}",
             f"Darf schreiben: ja, nur:\n{bullet_block(write_paths)}",
             f"Darf eigene Subagentinnen starten: {'ja, nur innerhalb Scope und Schreibpfaden' if allow_subagents else 'nein'}",
+            f"Web-/Live-Daten:\n{search_block}",
             f"Stabiler Kontext:\n{bullet_block(context)}",
             f"Aktuelle Aufgabe: {task}",
             f"Grenzen:\n{bullet_block(forbidden)}",
@@ -3497,6 +3517,8 @@ def assign_agent(
     allow_missing_skill: bool = False,
     allow_subagents: bool = False,
     allow_unauthenticated: bool = False,
+    requires_search: bool = False,
+    live_data_topic: str | None = None,
     lease: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
@@ -3515,6 +3537,11 @@ def assign_agent(
     write_paths = as_string_list(write_paths, field="write_paths", max_chars=MAX_PATH_TEXT)
     context = as_string_list(context, field="context")
     forbidden = as_string_list(forbidden, field="forbidden")
+    live_data_topic = (
+        bounded_text(live_data_topic, field="live_data_topic", max_chars=MAX_LIVE_DATA_TOPIC)
+        if live_data_topic is not None
+        else None
+    )
     if role == "exploriererin" and write_paths:
         raise AgentError("exploriererin assignments must not include write paths")
     if role == "arbeitsbiene" and not write_paths:
@@ -3541,6 +3568,8 @@ def assign_agent(
         forbidden=forbidden,
         name=name,
         allow_subagents=allow_subagents,
+        requires_search=requires_search,
+        live_data_topic=live_data_topic,
     )
     if len(prompt) > MAX_ASSIGNMENT_TEXT:
         raise AgentError(f"assignment prompt exceeds {MAX_ASSIGNMENT_TEXT} characters")
@@ -3574,6 +3603,12 @@ def assign_agent(
             "forbidden_count": len(forbidden),
             "write_policy": "read_only" if role == "exploriererin" else "explicit_paths_only",
             "allow_subagents": allow_subagents,
+            "requires_search": requires_search,
+            "live_data": {
+                "required": requires_search,
+                "topic_state": "set" if live_data_topic else "task",
+                "raw_output": "not_returned",
+            },
             "lease": {
                 "state": lease.get("state"),
                 "holder": lease.get("holder"),
@@ -3599,6 +3634,12 @@ def assign_agent(
         "write_policy": "read_only" if role == "exploriererin" else "explicit_paths_only",
         "write_path_count": len(write_paths),
         "subagents_allowed": allow_subagents,
+        "requires_search": requires_search,
+        "live_data": {
+            "required": requires_search,
+            "topic_state": "set" if live_data_topic else "task",
+            "raw_output": "not_returned",
+        },
         "auth_gate": auth_gate,
         "lease": lease,
         "prompt_chars": len(prompt),
@@ -5184,6 +5225,7 @@ def master_namespace_status() -> dict[str, Any]:
         "agent_pool_status": "agent_pool_status" in tool_names,
         "agent_pool_copy_auth": "agent_pool_copy_auth" in tool_names,
         "agent_pool_destroy_pool": "agent_pool_destroy_pool" in tool_names,
+        "agent_assign_live_data": "agent_assign_live_data" in tool_names,
         "agent_selector_policy": "agent_selector_policy" in tool_names,
         "agent_selector_preview": "agent_selector_preview" in tool_names,
         "raw_output": "not_returned",
@@ -5216,6 +5258,7 @@ def master_namespace_status() -> dict[str, Any]:
             "agent_pool_status": local_tool_contract["agent_pool_status"],
             "agent_pool_copy_auth": local_tool_contract["agent_pool_copy_auth"],
             "agent_pool_destroy_pool": local_tool_contract["agent_pool_destroy_pool"],
+            "agent_assign_live_data": local_tool_contract["agent_assign_live_data"],
             "agent_selector_policy": local_tool_contract["agent_selector_policy"],
             "agent_selector_preview": local_tool_contract["agent_selector_preview"],
         },
@@ -5507,13 +5550,59 @@ def uninstall(unregister: bool = True, remove_symlink: bool = False, install_pat
     return {"ok": True, "mcp": mcp_status, "symlink": symlink_status, "raw_output": "not_returned"}
 
 
-def send_agent(agent: str, text: str, enter: bool = True) -> dict[str, Any]:
+def tui_accepts_input(text: str) -> bool:
+    cleaned = strip_ansi(text)
+    if not cleaned.strip():
+        return False
+    if any(marker in cleaned for marker in CODEX_TUI_INPUT_MARKERS):
+        return True
+    context = classify_tui_context(cleaned, True)
+    return context["state"] == "starter_placeholder"
+
+
+def wait_agent_input_ready(agent: str, timeout_seconds: float = DEFAULT_SEND_READY_TIMEOUT_SECONDS) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
+    timeout_seconds = max(0.0, float(timeout_seconds))
+    deadline = time.monotonic() + timeout_seconds
+    polls = 0
+    while True:
+        polls += 1
+        text = pane_tail(agent, 24)
+        if tui_accepts_input(text):
+            return {
+                "ready": True,
+                "poll_count": polls,
+                "timeout_seconds": timeout_seconds,
+                "evidence": "not_returned",
+                "raw_output": "not_returned",
+            }
+        if time.monotonic() >= deadline:
+            return {
+                "ready": False,
+                "poll_count": polls,
+                "timeout_seconds": timeout_seconds,
+                "evidence": "not_returned",
+                "raw_output": "not_returned",
+            }
+        time.sleep(min(SEND_READY_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+
+
+def send_agent(
+    agent: str,
+    text: str,
+    enter: bool = True,
+    *,
+    ready_timeout_seconds: float = DEFAULT_SEND_READY_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     text = bounded_text(text, field="text", max_chars=MAX_SEND_TEXT, required=True, strip=False) or ""
     cfg = AGENTS[agent]
     session = cfg["session"]
     if not tmux_alive(session):
         raise AgentError(f"agent {agent} is not running")
+    readiness = wait_agent_input_ready(agent, ready_timeout_seconds)
+    if not readiness["ready"]:
+        raise AgentError("agent input is not ready; retry after Codex TUI startup completes")
     paste_mode = "bracketed_paste" if "\n" in text else "plain_paste"
     payload = f"{BRACKETED_PASTE_BEGIN}{text}{BRACKETED_PASTE_END}" if paste_mode == "bracketed_paste" else text
     buffer_name = f"codex-master-mcp-{agent}-{int(time.time() * 1000)}"
@@ -5534,6 +5623,7 @@ def send_agent(agent: str, text: str, enter: bool = True) -> dict[str, Any]:
         "paste_mode": paste_mode,
         "submitted": enter,
         "submit_key": CODEX_TUI_SUBMIT_KEY if enter else None,
+        "input_ready": readiness,
         "response_output": "not_returned",
     }
 
@@ -5821,6 +5911,27 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
                 allow_subagents=bool_arg(args, "allow_subagents", False),
                 allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
+            ),
+        )
+    if name == "agent_assign_live_data":
+        selected_agent = single_agent_id(str(args.get("agent", "")), "agent_assign_live_data")
+        return call_agent_lifecycle(
+            selected_agent,
+            lambda: assign_agent(
+                selected_agent,
+                role="exploriererin",
+                task=args.get("task"),
+                scope=args.get("scope"),
+                skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
+                context=args.get("context"),
+                forbidden=args.get("forbidden"),
+                name=args.get("name") if isinstance(args.get("name"), str) else None,
+                enter=bool_arg(args, "enter", True),
+                allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
+                allow_subagents=bool_arg(args, "allow_subagents", False),
+                allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
+                requires_search=True,
+                live_data_topic=args.get("live_data_topic") if isinstance(args.get("live_data_topic"), str) else None,
             ),
         )
     if name == "agent_assign_write":
@@ -6996,6 +7107,32 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "agent_assign_live_data",
+        "description": "Shortcut for read-only Web-/Live-Daten assignments. Requires the Agentin to use current search sources or report a tooling/access limit instead of guessing.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["agent", "task"],
+            "properties": {
+                "agent": agent_selector_schema(single=True),
+                "task": text_schema(MAX_TASK_TEXT),
+                "live_data_topic": text_schema(
+                    MAX_LIVE_DATA_TOPIC,
+                    description="Optional concrete current-data topic, for example weather in Berlin today.",
+                ),
+                "skill": text_schema(MAX_SKILL_REF),
+                "scope": text_array_schema(max_chars=MAX_PATH_TEXT, default=[]),
+                "context": text_array_schema(default=[]),
+                "forbidden": text_array_schema(default=[]),
+                "name": text_schema(MAX_AGENTIN_NAME),
+                "enter": {"type": "boolean", "default": True},
+                "allow_missing_skill": {"type": "boolean", "default": False},
+                "allow_subagents": {"type": "boolean", "default": False},
+                "allow_unauthenticated": allow_unauthenticated_schema(),
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "agent_assign_write",
         "description": "Shortcut for an Arbeitsbiene write assignment with required explicit write paths. Does not return the prompt or response output.",
         "inputSchema": {
@@ -7562,6 +7699,20 @@ def main_cli(argv: list[str]) -> int:
     p_assign_readonly.add_argument("--allow-subagents", action="store_true")
     p_assign_readonly.add_argument("--allow-unauthenticated", action="store_true")
 
+    p_assign_live_data = sub.add_parser("assign-live-data")
+    p_assign_live_data.add_argument("agent")
+    p_assign_live_data.add_argument("--task", required=True)
+    p_assign_live_data.add_argument("--live-data-topic")
+    p_assign_live_data.add_argument("--skill")
+    p_assign_live_data.add_argument("--scope", action="append", default=[])
+    p_assign_live_data.add_argument("--context", action="append", default=[])
+    p_assign_live_data.add_argument("--forbid", dest="forbidden", action="append", default=[])
+    p_assign_live_data.add_argument("--name")
+    p_assign_live_data.add_argument("--no-enter", action="store_true")
+    p_assign_live_data.add_argument("--allow-missing-skill", action="store_true")
+    p_assign_live_data.add_argument("--allow-subagents", action="store_true")
+    p_assign_live_data.add_argument("--allow-unauthenticated", action="store_true")
+
     p_assign_write = sub.add_parser("assign-write")
     p_assign_write.add_argument("agent")
     p_assign_write.add_argument("--task", required=True)
@@ -7819,6 +7970,26 @@ def main_cli(argv: list[str]) -> int:
                     {
                         "agent": args.agent,
                         "task": args.task,
+                        "skill": args.skill,
+                        "scope": args.scope,
+                        "context": args.context,
+                        "forbidden": args.forbidden,
+                        "name": args.name,
+                        "enter": not args.no_enter,
+                        "allow_missing_skill": args.allow_missing_skill,
+                        "allow_subagents": args.allow_subagents,
+                        "allow_unauthenticated": True if args.allow_unauthenticated else None,
+                    },
+                )
+            )
+        if args.command == "assign-live-data":
+            return print_json(
+                call_validated_tool(
+                    "agent_assign_live_data",
+                    {
+                        "agent": args.agent,
+                        "task": args.task,
+                        "live_data_topic": args.live_data_topic,
                         "skill": args.skill,
                         "scope": args.scope,
                         "context": args.context,

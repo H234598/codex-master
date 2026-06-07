@@ -53,6 +53,10 @@ by default and expose raw-log presence without returning local raw-log paths.
 Text is pasted into the Codex TUI through tmux and submitted with `S-Enter`.
 Plain `Enter` can leave multi-line or wrapped prompts sitting in the composer
 instead of starting the model response in current Codex CLI builds.
+Before pasting, `send` and `assign-*` wait briefly for an identifiable Codex TUI
+input prompt. If the Agentin is still in startup warnings or no input prompt is
+visible, the mutation fails closed and returns only metadata instead of losing
+the prompt into the startup screen.
 Existing metadata under the old `codex-agent-mcp` state directory is still read
 as a migration fallback. External `tmux`, `git`, and `codex mcp` subprocesses
 are timeout-bounded so MCP calls fail closed instead of hanging indefinitely.
@@ -88,11 +92,11 @@ operator command. Use `agent_claim` explicitly when a connected Codex-CLI
 instance should keep an Agentin reserved after startup.
 Working mutations require a regular per-Agentin `auth.json` by default:
 `agent_start`, `agent_claim`, `agent_send`, `agent_assign`,
-`agent_assign_readonly`, `agent_assign_write`, and `agent_report_request` fail
-closed when auth is missing, symlinked, not a regular file, unreadable, or too
-large. Status/skills/capabilities/lease/pool/stop/release remain available for
-diagnosis and cleanup. Use `--allow-unauthenticated` only for explicit
-login/bootstrap flows.
+`agent_assign_readonly`, `agent_assign_live_data`, `agent_assign_write`, and
+`agent_report_request` fail closed when auth is missing, symlinked, not a
+regular file, unreadable, or too large. Status/skills/capabilities/lease/pool/
+stop/release remain available for diagnosis and cleanup. Use
+`--allow-unauthenticated` only for explicit login/bootstrap flows.
 `agent_status` classifies bounded pane/log text without returning it, so callers
 can distinguish likely daily, weekly, token, quota, or rate limits from ordinary
 "no response yet" states. The classification keeps default Agentinnen-model
@@ -153,6 +157,8 @@ in the user journal.
 - `agent_scope_check`: verify write paths stay inside assignment scope
 - `agent_assign`: structured, skill-aware assignment with explicit boundaries
 - `agent_assign_readonly`: shortcut for read-only Exploriererin assignments
+- `agent_assign_live_data`: shortcut for read-only Web-/Live-Daten assignments
+  that require current sources or an explicit tooling/access-limit report
 - `agent_assign_write`: shortcut for Arbeitsbiene write assignments
 - `agent_assignments`: data-sparse assignment audit log
 - `agent_last_assignment_status`: latest assignment metadata for one Agentin
@@ -229,6 +235,7 @@ python3 -m codex_master.server skills a --include-names --limit 20 --names-offse
 python3 -m codex_master.server skill-match all codex-security:security-scan
 python3 -m codex_master.server scope-check --scope src/codex_master --write-path src/codex_master/server.py
 python3 -m codex_master.server assign-readonly a --skill codex-security:security-scan --scope src/codex_master/server.py --task "Pruefe nur lesend und berichte knapp."
+python3 -m codex_master.server assign-live-data a --task "Wie ist das Wetter gerade in Berlin?" --live-data-topic "Wetter Berlin heute"
 python3 -m codex_master.server assign-write b --scope .github/workflows --write-path .github/workflows/ci.yml --task "Haerte nur die CI-Datei."
 python3 -m codex_master.server assignments all --limit 20
 python3 -m codex_master.server last-assignment a
@@ -458,14 +465,18 @@ python3 -m codex_master.server send b "Nutze github:gh-fix-ci. Pruefe die CI-Kon
 python3 -m codex_master.server tail a --source pane --lines 20 --chars 2000
 ```
 
-For safer delegation, prefer `assign-readonly` and `assign-write` over
-free-form `send`:
+For safer delegation, prefer `assign-readonly`, `assign-live-data`, and
+`assign-write` over free-form `send`:
 
 ```sh
 python3 -m codex_master.server assign-readonly a \
   --skill codex-security:security-scan \
   --scope src/codex_master/server.py \
   --task "Pruefe nur lesend und berichte knapp."
+
+python3 -m codex_master.server assign-live-data a \
+  --task "Wie ist das Wetter gerade in Berlin?" \
+  --live-data-topic "Wetter Berlin heute"
 
 python3 -m codex_master.server assign-write b \
   --skill github:gh-fix-ci \
@@ -478,6 +489,13 @@ python3 -m codex_master.server assign-write b \
 Exploriererinnen, and requires explicit write paths for Arbeitsbienen. It sends
 the generated prompt through tmux but does not return the prompt or the Agentin
 response.
+
+Use `assign-live-data` for weather, news, prices, schedules, or any other
+current-data task. It is read-only, uses the same auth and lease guards as other
+assignments, and injects an explicit requirement to use current search sources
+or report a tooling/access limit instead of guessing. The concrete live-data
+topic is sent only to the Agentin prompt; public responses and assignment audit
+records keep the topic and response content out of returned data.
 
 `assign-write` also gates write paths through `agent_scope_check`; a write path
 outside the declared scope is rejected before anything is sent to an Agentin.
