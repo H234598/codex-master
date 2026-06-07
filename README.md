@@ -30,6 +30,8 @@ by default and expose raw-log presence without returning local raw-log paths.
 Existing metadata under the old `codex-agent-mcp` state directory is still read
 as a migration fallback. External `tmux`, `git`, and `codex mcp` subprocesses
 are timeout-bounded so MCP calls fail closed instead of hanging indefinitely.
+MCP registration checks compare the exact `command:` field from
+`codex mcp get`, not a broad substring in command output.
 
 ## Tools
 

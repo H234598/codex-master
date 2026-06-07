@@ -27,10 +27,12 @@ from codex_master.server import (
     allowed_raw_log_path,
     append_bounded_raw_log,
     agent_home_process_summary,
+    check_mcp_registration,
     doctor,
     ensure_state,
     handle_rpc,
     install,
+    mcp_registration_command_matches,
     main_cli,
     prune_raw_logs,
     raw_log_retention_status,
@@ -88,6 +90,52 @@ class ServerHelpersTest(unittest.TestCase):
             resolved = resolve_path_no_throw(loop)
 
         self.assertIsNone(resolved)
+
+    def test_mcp_registration_command_match_is_exact_command_field(self) -> None:
+        output = "\n".join(
+            [
+                "codex-master-mcp",
+                "  enabled: true",
+                "  transport: stdio",
+                "  command: /home/teladi/.local/bin/codex-master-mcp",
+                "  args: -",
+                "  remove: codex mcp remove codex-master-mcp",
+            ]
+        )
+        suffixed = output.replace("codex-master-mcp", "codex-master-mcp-old", 1).replace(
+            "command: /home/teladi/.local/bin/codex-master-mcp",
+            "command: /home/teladi/.local/bin/codex-master-mcp-old",
+        )
+        no_command = "codex-master-mcp\n  remove: codex mcp remove codex-master-mcp\n"
+
+        self.assertTrue(mcp_registration_command_matches(output, Path("/home/teladi/.local/bin/codex-master-mcp")))
+        self.assertFalse(mcp_registration_command_matches(suffixed, Path("/home/teladi/.local/bin/codex-master-mcp")))
+        self.assertFalse(mcp_registration_command_matches(no_command, Path("/home/teladi/.local/bin/codex-master-mcp")))
+
+    @patch("codex_master.server.run_command")
+    @patch("codex_master.server.shutil.which", return_value="/usr/bin/codex")
+    def test_check_mcp_registration_rejects_substring_command_match(self, _mock_which, mock_run) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["codex", "mcp", "get", "codex-master-mcp"],
+            0,
+            "\n".join(
+                [
+                    "codex-master-mcp",
+                    "  enabled: true",
+                    "  transport: stdio",
+                    "  command: /tmp/bin/codex-master-mcp-old",
+                    "  remove: codex mcp remove codex-master-mcp",
+                ]
+            ),
+            "",
+        )
+
+        result = check_mcp_registration(Path("/tmp/bin/codex-master-mcp"))
+
+        self.assertTrue(result["registered"])
+        self.assertFalse(result["command_matches"])
+        self.assertFalse(result["ok"])
+        self.assertIn("/tmp/bin/codex-master-mcp-old", result["output_excerpt"])
 
     def test_mcp_tools_list(self) -> None:
         response = handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})

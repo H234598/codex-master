@@ -118,6 +118,8 @@ Data minimization:
   raised. Public tool responses expose raw-log presence without returning local
   raw-log paths. Failed starts must remove prepared raw-log files. External
   `tmux`, `git`, and `codex mcp` subprocess calls must be timeout-bounded.
+  MCP registration checks must compare the exact `command:` field reported by
+  `codex mcp get`, not substring-match broad command output.
 - Assignment inputs are bounded before tmux interaction: sends/start prompts
   12,000 chars, tasks 4,000 chars, names 80 chars, skill refs 300 chars,
   path-like fields 1,000 chars, and assignment lists 50 items. MCP boolean and

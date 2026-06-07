@@ -1606,14 +1606,24 @@ def master_plugin_status() -> dict[str, Any]:
     }
 
 
+def mcp_registration_command_matches(output: str, command_path: Path) -> bool:
+    expected = str(command_path)
+    for line in output.splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip() == "command":
+            return value.strip() == expected
+    return False
+
+
 def check_mcp_registration(command_path: Path = DEFAULT_INSTALL_PATH) -> dict[str, Any]:
     codex_path = shutil.which("codex")
     if not codex_path:
         return {"registered": False, "ok": False, "reason": "codex command not found"}
     cp = run_command(["codex", "mcp", "get", MCP_SERVER_NAME])
-    output, redacted = command_excerpt(cp.stdout + cp.stderr)
+    raw_output = cp.stdout + cp.stderr
+    output, redacted = command_excerpt(raw_output)
     registered = cp.returncode == 0
-    command_matches = str(command_path) in output if registered else False
+    command_matches = mcp_registration_command_matches(raw_output, command_path) if registered else False
     return {
         "registered": registered,
         "command_matches": command_matches,
