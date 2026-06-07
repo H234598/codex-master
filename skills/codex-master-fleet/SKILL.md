@@ -94,8 +94,8 @@ Data minimization:
   limit states, but it must not return the classified text. Daily, weekly,
   token, quota, and rate limits must keep default Agentinnen-model limits
   separate from Spark write-model limits.
-- `wait` may poll status for bounded time and return activity/stop/limit
-  metadata, but it must not return Agentin output.
+- `wait` may poll status for bounded time, currently up to 10 minutes, and
+  return activity/stop/limit metadata, but it must not return Agentin output.
 - `capabilities` returns a bounded first plugin page plus counts/truncation
   flags, not a complete broad plugin inventory.
 - `skills` returns bounded plugin/name pages plus total counts, offsets, limits,

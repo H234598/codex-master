@@ -43,15 +43,16 @@ can distinguish likely daily, weekly, token, quota, or rate limits from ordinary
 "no response yet" states. The classification keeps default Agentinnen-model
 limits separate from Spark write-model limits and reports only metadata plus
 `evidence: not_returned`.
-`agent_wait` lets callers wait briefly for activity, process exit, or a
-classified limit without automatically receiving Agentin output.
+`agent_wait` lets callers wait up to 10 minutes for activity, process exit, or
+a classified limit without automatically receiving Agentin output.
 
 ## Tools
 
 - `agent_start`: start Agentin `a`, `b`, or `both`
 - `agent_status`: structured status, response state, and limit classification
   without raw output
-- `agent_wait`: wait for activity/stop/limit metadata without raw output
+- `agent_wait`: wait for activity/stop/limit metadata without raw output,
+  capped at 10 minutes per call
 - `agent_send`: send text to one running Agentin
 - `agent_interrupt`: send Ctrl-C to one running Agentin
 - `agent_stop`: stop Agentin `a`, `b`, or `both`
