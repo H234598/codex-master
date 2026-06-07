@@ -172,8 +172,8 @@ Data minimization:
   files are created with no-follow exclusive semantics. Agentin metadata reads
   reject symlinked and oversized files, and metadata presence checks do not
   follow symlinks. Metadata read errors and legacy source markers must not
-  expose local file paths. Managed state directories must be real directories,
-  not symlinks or regular files.
+  expose local file paths. Managed state directories and their parent chains
+  must be real directories, not symlinks or regular files.
 - Raw logs are local debug artifacts. New raw logs are bounded to 5 MiB per
   file, managed raw-log directories retain at most 20 files by default, and
   log-tail metadata paths must stay inside managed raw-log state. Prepared
@@ -207,7 +207,10 @@ Data minimization:
   before tmux paste so the Codex TUI receives one prompt, not separate submitted
   lines.
 - Worktree creation must reject existing targets, including broken symlinks,
-  and require every target parent directory to be a real directory.
+  and require every target parent directory to be a real directory. Worktree
+  creation and status must stay repo-scoped: relative escapes and absolute
+  targets outside the repo are rejected before running `git`, and create
+  responses return at most repo-relative paths, never absolute local paths.
 - Worktree status must reject symlinks and non-directory targets before running
   `git status`, and public worktree status responses must not return local
   worktree paths or absolute paths in git worktree excerpts.

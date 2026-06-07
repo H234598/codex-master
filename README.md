@@ -17,8 +17,8 @@ state files under `~/.local/state/codex-master-mcp/raw/`. New raw logs are
 bounded to 5 MiB per file, and managed raw-log directories keep at most 20 files
 by default. Prepared raw-log files are created with no-follow exclusive
 semantics. The direct raw-log writer also requires the managed state directories
-to be real directories, not symlinks, and legacy raw-log directories are ignored
-when they are symlinks. Agentin runners must be regular executable files, not
+and their parent chains to be real directories, not symlinks, and legacy raw-log
+directories are ignored when they are symlinks. Agentin runners must be regular executable files, not
 symlinks. Assignment-log reads require regular files, are capped, and use
 generic errors. Private state file and directory errors are generic and avoid
 returning local state paths. Agentin metadata presence checks do not follow
@@ -305,7 +305,10 @@ response.
 outside the declared scope is rejected before anything is sent to an Agentin.
 Worktree creation refuses existing targets, including broken symlinks, and
 requires every parent directory in the target path to be a real directory.
-Worktree status also refuses symlinks and non-directory targets before running
+Worktree creation and status are repo-scoped: relative escapes and absolute
+targets outside the repo are rejected before running `git`, and create responses
+return at most a repo-relative path, never an absolute local path. Worktree
+status also refuses symlinks and non-directory targets before running
 `git status`.
 Assignment and send inputs are bounded before tmux interaction: free sends and
 start prompts are capped at 12,000 characters, assignment tasks at 4,000
@@ -369,7 +372,8 @@ the newest 500 valid metadata records are kept, invalid legacy lines are dropped
 during pruning, and the file is rewritten with `0600` permissions. Private state
 appends refuse symlink paths, Agentin metadata is written atomically, and
 temporary replace files are created with no-follow exclusive semantics. Managed
-state directories must be real directories, not symlinks or regular files.
+state directories and their parent chains must be real directories, not symlinks
+or regular files.
 External process calls are timeout-bounded and return structured timeout
 failures instead of blocking the MCP server indefinitely.
 `agent_doctor` also reports the active `CODEX_HOME` context without returning

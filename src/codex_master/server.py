@@ -173,11 +173,20 @@ def ensure_state() -> None:
 
 
 def ensure_private_dir(path: Path) -> None:
+    path = path.expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path = path.absolute()
+    ensure_directory_chain_no_symlink(path.parent, "private state parent directories must be real directories")
     try:
         current = path.lstat()
     except FileNotFoundError:
-        path.mkdir(parents=True, exist_ok=False)
-        current = path.lstat()
+        try:
+            path.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            current = path.lstat()
+        else:
+            current = path.lstat()
     if stat_module.S_ISLNK(current.st_mode):
         raise AgentError("private state directory must not be a symlink")
     if not stat_module.S_ISDIR(current.st_mode):
@@ -215,6 +224,21 @@ def ensure_directory_chain_no_symlink(path: Path, error_text: str) -> None:
             raise AgentError(error_text) from exc
         if stat_module.S_ISLNK(current_stat.st_mode) or not stat_module.S_ISDIR(current_stat.st_mode):
             raise AgentError(error_text)
+
+
+def directory_chain_is_real_no_symlink(path: Path) -> bool:
+    if not path.is_absolute():
+        return False
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            current_stat = current.lstat()
+        except OSError:
+            return False
+        if stat_module.S_ISLNK(current_stat.st_mode) or not stat_module.S_ISDIR(current_stat.st_mode):
+            return False
+    return True
 
 
 def now_id() -> str:
@@ -2773,29 +2797,47 @@ def git_excerpt(args: list[str], *, cwd: Path | None = None, chars: int = 4000) 
     }
 
 
+def repo_relative_public_path(path: Path, repo: Path) -> str | None:
+    try:
+        rel = path.relative_to(repo)
+    except ValueError:
+        return None
+    text = rel.as_posix()
+    return text or "."
+
+
 def worktree_create_for_agent(agent: str, path: Any = None, base_ref: Any = None) -> dict[str, Any]:
     if agent not in {"a", "b"}:
         raise AgentError("agent must be a or b")
     path = bounded_text(path, field="path", max_chars=MAX_PATH_TEXT) if path is not None else None
     base_ref = bounded_text(base_ref, field="base_ref", max_chars=MAX_PATH_TEXT) if base_ref is not None else None
-    target = Path(path).expanduser() if path else repo_root() / ".codex-master-worktrees" / f"agent-{agent}-{now_id()}"
+    repo = repo_root().resolve(strict=False)
+    target = Path(path).expanduser() if path else repo / ".codex-master-worktrees" / f"agent-{agent}-{now_id()}"
     if not target.is_absolute():
-        target = repo_root() / target
+        target = repo / target
     target = target.absolute()
+    scoped_target = target.resolve(strict=False)
+    if not path_is_within(scoped_target, repo):
+        raise AgentError("worktree path must stay inside repo")
     if path_present_no_follow(target):
         raise AgentError("worktree path already exists")
     ensure_directory_chain_no_symlink(target.parent, "worktree parent directories must be real directories")
     target = target.resolve(strict=False)
+    if not path_is_within(target, repo):
+        raise AgentError("worktree path must stay inside repo")
     args = ["worktree", "add", str(target)]
     if base_ref:
         args.append(base_ref)
-    cp = run_command(["git", *args], cwd=repo_root())
+    cp = run_command(["git", *args], cwd=repo)
     if cp.returncode != 0:
         output, redacted = command_excerpt(cp.stdout + cp.stderr)
         raise AgentError(f"git worktree add failed: {output if not redacted else '<redacted>'}")
+    public_path = repo_relative_public_path(target, repo)
     return {
         "agent": agent,
-        "path": str(target),
+        "path": public_path or PATH_NOT_RETURNED,
+        "path_state": "set" if public_path else "not_returned",
+        "path_kind": "repo_relative" if public_path else "not_returned",
         "base_ref": base_ref,
         "status": "created",
         "raw_output": "not_returned",
@@ -2804,10 +2846,16 @@ def worktree_create_for_agent(agent: str, path: Any = None, base_ref: Any = None
 
 def worktree_status(path: Any = None) -> dict[str, Any]:
     path = bounded_text(path, field="path", max_chars=MAX_PATH_TEXT) if path is not None else None
-    target = Path(path).expanduser() if path else repo_root()
+    repo = repo_root().resolve(strict=False)
+    target = Path(path).expanduser() if path else repo
     if not target.is_absolute():
-        target = repo_root() / target
+        target = repo / target
     target = target.absolute()
+    scoped_target = target.resolve(strict=False)
+    if not path_is_within(scoped_target, repo):
+        raise AgentError("worktree status path must stay inside repo")
+    if not directory_chain_is_real_no_symlink(target.parent):
+        raise AgentError("worktree status parent directories must be real directories")
     if not is_real_directory_no_symlink(target):
         raise AgentError("worktree status path must be a real directory")
     target = target.resolve(strict=False)
@@ -2815,7 +2863,7 @@ def worktree_status(path: Any = None) -> dict[str, Any]:
         "path": PATH_NOT_RETURNED,
         "path_state": "set",
         "status": git_excerpt(["status", "--short"], cwd=target),
-        "worktrees": git_excerpt(["worktree", "list", "--porcelain"], cwd=repo_root()),
+        "worktrees": git_excerpt(["worktree", "list", "--porcelain"], cwd=repo),
         "raw_output": "not_returned",
     }
 

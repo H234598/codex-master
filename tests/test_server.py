@@ -83,6 +83,7 @@ from codex_master.server import (
     worktree_status,
     codex_home_context,
     codex_client_mcp_config_status,
+    ensure_private_dir,
     ensure_mcp_startup_timeout_configured,
     mcp_startup_timeout_seconds,
     updated_mcp_startup_timeout_config,
@@ -1916,6 +1917,22 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(target_exists)
         self.assertTrue(link_is_symlink)
 
+    def test_ensure_private_dir_rejects_symlink_parent_without_creating_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            real_parent = tmp_path / "real-parent"
+            link_parent = tmp_path / "linked-parent"
+            real_parent.mkdir()
+            link_parent.symlink_to(real_parent, target_is_directory=True)
+
+            with self.assertRaisesRegex(AgentError, "parent directories must be real directories") as raised:
+                ensure_private_dir(link_parent / "state")
+
+            redirected_state = real_parent / "state"
+
+        self.assertFalse(redirected_state.exists())
+        self.assertNotIn(str(real_parent), str(raised.exception))
+
     def test_ensure_state_rejects_file_state_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_root = Path(tmpdir) / "state"
@@ -2598,14 +2615,17 @@ class ServerHelpersTest(unittest.TestCase):
     def test_worktree_create_refuses_symlink_parent_without_git_call(self, mock_run_command) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
-            real_parent = tmp_path / "real-parent"
-            link_parent = tmp_path / "linked-parent"
+            repo = tmp_path / "repo"
+            real_parent = repo / "real-parent"
+            link_parent = repo / "linked-parent"
+            repo.mkdir()
             real_parent.mkdir()
             link_parent.symlink_to(real_parent, target_is_directory=True)
             target = link_parent / "agent-a"
 
-            with self.assertRaisesRegex(AgentError, "parent directories must be real directories") as raised:
-                worktree_create_for_agent("a", path=str(target))
+            with patch("codex_master.server.repo_root", return_value=repo):
+                with self.assertRaisesRegex(AgentError, "parent directories must be real directories") as raised:
+                    worktree_create_for_agent("a", path=str(target))
 
             redirected_target = real_parent / "agent-a"
 
@@ -2617,12 +2637,14 @@ class ServerHelpersTest(unittest.TestCase):
     @patch("codex_master.server.run_command")
     def test_worktree_create_refuses_broken_target_symlink_without_git_call(self, mock_run_command) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            target = tmp_path / "agent-a"
-            target.symlink_to(tmp_path / "missing-target")
+            repo = Path(tmpdir) / "repo"
+            repo.mkdir()
+            target = repo / "agent-a"
+            target.symlink_to(repo / "missing-target")
 
-            with self.assertRaisesRegex(AgentError, "worktree path already exists") as raised:
-                worktree_create_for_agent("a", path=str(target))
+            with patch("codex_master.server.repo_root", return_value=repo):
+                with self.assertRaisesRegex(AgentError, "worktree path already exists") as raised:
+                    worktree_create_for_agent("a", path=str(target))
             target_is_symlink = target.is_symlink()
 
         mock_run_command.assert_not_called()
@@ -2640,22 +2662,43 @@ class ServerHelpersTest(unittest.TestCase):
             with patch("codex_master.server.repo_root", return_value=repo):
                 result = worktree_create_for_agent("a", path=relative)
 
-        self.assertEqual(result["path"], str(expected_target))
+        self.assertEqual(result["path"], relative)
+        self.assertEqual(result["path_state"], "set")
+        self.assertEqual(result["path_kind"], "repo_relative")
         self.assertEqual(result["status"], "created")
         self.assertEqual(mock_run_command.call_args.args[0], ["git", "worktree", "add", str(expected_target)])
         self.assertEqual(mock_run_command.call_args.kwargs["cwd"], repo)
+        self.assertNotIn(str(repo), json.dumps(result, sort_keys=True))
+
+    @patch("codex_master.server.run_command")
+    def test_worktree_create_refuses_relative_escape_without_git_call(self, mock_run_command) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            repo = tmp_path / "repo"
+            outside = tmp_path / "outside"
+            repo.mkdir()
+
+            with patch("codex_master.server.repo_root", return_value=repo):
+                with self.assertRaisesRegex(AgentError, "worktree path must stay inside repo") as raised:
+                    worktree_create_for_agent("a", path="../outside/agent-a")
+
+        mock_run_command.assert_not_called()
+        self.assertFalse(outside.exists())
+        self.assertNotIn(str(outside), str(raised.exception))
 
     @patch("codex_master.server.run_command")
     def test_worktree_status_refuses_symlink_path_without_git_call(self, mock_run_command) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            real_dir = tmp_path / "real"
-            link_dir = tmp_path / "linked"
+            repo = Path(tmpdir) / "repo"
+            real_dir = repo / "real"
+            link_dir = repo / "linked"
+            repo.mkdir()
             real_dir.mkdir()
             link_dir.symlink_to(real_dir, target_is_directory=True)
 
-            with self.assertRaisesRegex(AgentError, "worktree status path must be a real directory") as raised:
-                worktree_status(str(link_dir))
+            with patch("codex_master.server.repo_root", return_value=repo):
+                with self.assertRaisesRegex(AgentError, "worktree status path must be a real directory") as raised:
+                    worktree_status(str(link_dir))
 
         mock_run_command.assert_not_called()
         self.assertNotIn(str(link_dir), str(raised.exception))
@@ -2664,11 +2707,14 @@ class ServerHelpersTest(unittest.TestCase):
     @patch("codex_master.server.run_command")
     def test_worktree_status_refuses_non_directory_without_git_call(self, mock_run_command) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            file_path = Path(tmpdir) / "not-a-dir"
+            repo = Path(tmpdir) / "repo"
+            repo.mkdir()
+            file_path = repo / "not-a-dir"
             file_path.write_text("x\n", encoding="utf-8")
 
-            with self.assertRaisesRegex(AgentError, "worktree status path must be a real directory") as raised:
-                worktree_status(str(file_path))
+            with patch("codex_master.server.repo_root", return_value=repo):
+                with self.assertRaisesRegex(AgentError, "worktree status path must be a real directory") as raised:
+                    worktree_status(str(file_path))
 
         mock_run_command.assert_not_called()
         self.assertNotIn(str(file_path), str(raised.exception))
@@ -2695,6 +2741,22 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn(str(repo), result_text)
         self.assertNotIn(str(target), result_text)
         self.assertIn("/<redacted>", result["worktrees"]["output_excerpt"])
+
+    @patch("codex_master.server.run_command")
+    def test_worktree_status_refuses_relative_escape_without_git_call(self, mock_run_command) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            repo = tmp_path / "repo"
+            outside = tmp_path / "outside"
+            repo.mkdir()
+
+            with patch("codex_master.server.repo_root", return_value=repo):
+                with self.assertRaisesRegex(AgentError, "worktree status path must stay inside repo") as raised:
+                    worktree_status("../outside")
+
+        mock_run_command.assert_not_called()
+        self.assertFalse(outside.exists())
+        self.assertNotIn(str(outside), str(raised.exception))
 
     def test_repo_wrapper_works_via_symlink(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
