@@ -87,6 +87,7 @@ MAX_META_BYTES = 64 * 1024
 COMMAND_TIMEOUT_RETURN_CODE = 124
 DEFAULT_TMUX_TIMEOUT_SECONDS = 10
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
+RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS = 120
 DEFAULT_AGENTIN_NAMES = {"a": "Mila", "b": "Nora"}
 RAW_LOG_TRUNCATION_MARKER = b"\n... codex-master-mcp retained the last raw log bytes ...\n"
 
@@ -188,6 +189,53 @@ def repo_root() -> Path:
 
 def repo_wrapper_path() -> Path:
     return repo_root() / "bin" / "codex-master-mcp"
+
+
+def normalized_compare_path(path: Path) -> Path:
+    expanded = path.expanduser()
+    if not expanded.is_absolute():
+        expanded = Path.cwd() / expanded
+    try:
+        return expanded.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return expanded.absolute()
+
+
+def codex_home_context() -> dict[str, Any]:
+    raw_codex_home = os.environ.get("CODEX_HOME")
+    active_home = Path(raw_codex_home).expanduser() if raw_codex_home else Path.home() / ".codex"
+    active_home_cmp = normalized_compare_path(active_home)
+    default_home_cmp = normalized_compare_path(Path.home() / ".codex")
+
+    matched_agent = None
+    for agent, cfg in AGENTS.items():
+        if active_home_cmp == normalized_compare_path(cfg["home"]):
+            matched_agent = agent
+            break
+
+    if matched_agent:
+        home_kind = "managed_agent_home"
+        visibility = "not_expected_for_master_mcp"
+        ok = False
+    elif active_home_cmp == default_home_cmp:
+        home_kind = "main_default_home"
+        visibility = "expected_if_registered"
+        ok = True
+    else:
+        home_kind = "custom_home"
+        visibility = "depends_on_custom_home_registration"
+        ok = True
+
+    return {
+        "name": "codex_home_context",
+        "ok": ok,
+        "codex_home_env": "set" if raw_codex_home else "unset",
+        "home_kind": home_kind,
+        "matched_agent": matched_agent,
+        "mcp_visibility": visibility,
+        "active_home_path": "not_returned",
+        "raw_output": "not_returned",
+    }
 
 
 def agent_ids(agent: str) -> list[str]:
@@ -1849,17 +1897,31 @@ def master_plugin_status() -> dict[str, Any]:
         "mcp_manifest": {"path": str(mcp_manifest), "exists": mcp_manifest.is_file()},
         "skill": {"path": str(skill), "exists": skill.is_file()},
         "mcp_registration": check_mcp_registration(DEFAULT_INSTALL_PATH),
+        "codex_home_context": codex_home_context(),
         "raw_output": "not_returned",
     }
 
 
-def mcp_registration_command_matches(output: str, command_path: Path) -> bool:
-    expected = str(command_path)
+def mcp_get_field(output: str, field: str) -> str | None:
     for line in output.splitlines():
         key, separator, value = line.partition(":")
-        if separator and key.strip() == "command":
-            return value.strip() == expected
-    return False
+        if separator and key.strip() == field:
+            return value.strip()
+    return None
+
+
+def mcp_registration_command_matches(output: str, command_path: Path) -> bool:
+    return mcp_get_field(output, "command") == str(command_path)
+
+
+def mcp_startup_timeout_seconds(output: str) -> int | None:
+    value = mcp_get_field(output, "startup_timeout_sec")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def check_mcp_registration(command_path: Path = DEFAULT_INSTALL_PATH) -> dict[str, Any]:
@@ -1871,9 +1933,16 @@ def check_mcp_registration(command_path: Path = DEFAULT_INSTALL_PATH) -> dict[st
     output, redacted = command_excerpt(raw_output)
     registered = cp.returncode == 0
     command_matches = mcp_registration_command_matches(raw_output, command_path) if registered else False
+    startup_timeout_sec = mcp_startup_timeout_seconds(raw_output) if registered else None
+    startup_timeout_ok = (
+        startup_timeout_sec is not None and startup_timeout_sec >= RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS
+    )
     return {
         "registered": registered,
         "command_matches": command_matches,
+        "startup_timeout_sec": startup_timeout_sec,
+        "startup_timeout_ok": startup_timeout_ok,
+        "startup_timeout_recommended_sec": RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
         "ok": registered and command_matches,
         "redaction_applied": redacted,
         "output_excerpt": output if not registered or not command_matches else "",
@@ -1934,6 +2003,16 @@ def doctor() -> dict[str, Any]:
         )
     registration = check_mcp_registration(install_path)
     checks.append({"name": "mcp_registered", **registration})
+    checks.append(
+        {
+            "name": "mcp_startup_timeout_configured",
+            "ok": bool(registration.get("startup_timeout_ok")),
+            "startup_timeout_sec": registration.get("startup_timeout_sec"),
+            "recommended_sec": RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
+            "raw_output": "not_returned",
+        }
+    )
+    checks.append(codex_home_context())
     checks.append({"name": "raw_log_retention_configured", "ok": True, **raw_log_retention_status()})
     return {"ok": all(check["ok"] for check in checks), "checks": checks, "raw_output": "not_returned"}
 

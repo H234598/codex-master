@@ -131,6 +131,10 @@ python3 -m codex_master.server stop both
 `doctor`
 - checks availability of required tooling (`codex`, `tmux`) and MCP state directory
 - reports a structured `checks` object
+- reports whether the active Codex MCP registration has
+  `startup_timeout_sec >= 120`
+- reports whether the active `CODEX_HOME` looks like the main default home, a
+  managed Agentinnen home, or a custom home without returning the path
 - reports broken, looping, or unreadable install symlinks as a failed
   `installed_symlink` check with an unreadable target marker
 - treats stopped Agentinnen as informational session state, not as a failed
@@ -247,6 +251,9 @@ temporary replace files are created with no-follow exclusive semantics. Managed
 state directories must be real directories, not symlinks or regular files.
 External process calls are timeout-bounded and return structured timeout
 failures instead of blocking the MCP server indefinitely.
+`agent_doctor` also reports the active `CODEX_HOME` context without returning
+the path, and checks that `codex-master-mcp` has a `startup_timeout_sec` of at
+least 120 seconds in the active Codex MCP configuration.
 
 Use `tail` only when an explicit, capped excerpt is needed. Normal status and
 send operations do not return Agentin output.
@@ -257,6 +264,7 @@ This repo is also a local Codex plugin:
 
 - `.codex-plugin/plugin.json`: plugin metadata and Codex UI information
 - `.mcp.json`: starts `codex-master-mcp` from this repo without package install
+  and declares `startup_timeout_sec = 120`
 - `skills/codex-master-fleet/SKILL.md`: Teamleiterin skill for the Masterjet
 
 The plugin is intended for the main/Teamleiterin Codex instance. Agentin A and

@@ -90,6 +90,9 @@ Data minimization:
 
 - `status`, `wait`, `start`, `send`, `assign-*`, `doctor`, `skills`,
   `capabilities`, and `plugin-status` do not return Agentin terminal output.
+- `doctor` must report the active `CODEX_HOME` category and the
+  `codex-master-mcp` `startup_timeout_sec` health without returning the active
+  home path.
 - `status` may classify bounded pane/log text into metadata-only response and
   limit states, but it must not return the classified text. Daily, weekly,
   token, quota, and rate limits must keep default Agentinnen-model limits

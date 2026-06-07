@@ -63,6 +63,8 @@ from codex_master.server import (
     write_meta,
     worktree_create_for_agent,
     worktree_status,
+    codex_home_context,
+    mcp_startup_timeout_seconds,
 )
 
 
@@ -109,6 +111,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "  transport: stdio",
                 "  command: /home/teladi/.local/bin/codex-master-mcp",
                 "  args: -",
+                "  startup_timeout_sec: 120",
                 "  remove: codex mcp remove codex-master-mcp",
             ]
         )
@@ -121,6 +124,33 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(mcp_registration_command_matches(output, Path("/home/teladi/.local/bin/codex-master-mcp")))
         self.assertFalse(mcp_registration_command_matches(suffixed, Path("/home/teladi/.local/bin/codex-master-mcp")))
         self.assertFalse(mcp_registration_command_matches(no_command, Path("/home/teladi/.local/bin/codex-master-mcp")))
+        self.assertEqual(mcp_startup_timeout_seconds(output), 120)
+
+    def test_codex_home_context_classifies_agent_home_without_returning_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_home:
+            tmp_path = Path(tmp_home)
+            agent_home = tmp_path / "agent-a-home-secret"
+            agents = {
+                "a": {"label": "A", "runner": tmp_path / "a-runner", "home": agent_home, "session": "session-a"},
+                "b": {
+                    "label": "B",
+                    "runner": tmp_path / "b-runner",
+                    "home": tmp_path / "agent-b-home",
+                    "session": "session-b",
+                },
+            }
+            with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": str(agent_home)}), patch.dict(
+                "codex_master.server.AGENTS", agents, clear=True
+            ):
+                result = codex_home_context()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["codex_home_env"], "set")
+        self.assertEqual(result["home_kind"], "managed_agent_home")
+        self.assertEqual(result["matched_agent"], "a")
+        self.assertEqual(result["mcp_visibility"], "not_expected_for_master_mcp")
+        self.assertEqual(result["active_home_path"], "not_returned")
+        self.assertNotIn(str(agent_home), json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.run_command")
     @patch("codex_master.server.shutil.which", return_value="/usr/bin/codex")
@@ -134,6 +164,7 @@ class ServerHelpersTest(unittest.TestCase):
                     "  enabled: true",
                     "  transport: stdio",
                     "  command: /tmp/bin/codex-master-mcp-old",
+                    "  startup_timeout_sec: 30",
                     "  remove: codex mcp remove codex-master-mcp",
                 ]
             ),
@@ -144,6 +175,8 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertTrue(result["registered"])
         self.assertFalse(result["command_matches"])
+        self.assertEqual(result["startup_timeout_sec"], 30)
+        self.assertFalse(result["startup_timeout_ok"])
         self.assertFalse(result["ok"])
         self.assertIn("/tmp/bin/codex-master-mcp-old", result["output_excerpt"])
 
@@ -2494,6 +2527,13 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertTrue(any(item["name"] == "codex_available" and item["ok"] is True for item in payload["checks"]))
         self.assertTrue(any(item["name"] == "mcp_registered" for item in payload["checks"]))
         self.assertFalse(next(item for item in payload["checks"] if item["name"] == "mcp_registered")["ok"])
+        startup_timeout = next(item for item in payload["checks"] if item["name"] == "mcp_startup_timeout_configured")
+        self.assertFalse(startup_timeout["ok"])
+        self.assertEqual(startup_timeout["recommended_sec"], 120)
+        home_context = next(item for item in payload["checks"] if item["name"] == "codex_home_context")
+        self.assertTrue(home_context["ok"])
+        self.assertEqual(home_context["home_kind"], "main_default_home")
+        self.assertEqual(home_context["active_home_path"], "not_returned")
         session_state = next(item for item in payload["checks"] if item["name"] == "agent_a_tmux_session_state")
         self.assertTrue(session_state["ok"])
         self.assertFalse(session_state["running"])
