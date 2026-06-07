@@ -6,10 +6,10 @@ Local MCP wrapper for controlling two existing Codex CLI homes:
 - `/home/teladi/.codex-agent-b`
 
 The wrapper starts both instances through their existing `codex` launcher files
-with:
+with the default model `gpt-5.4-mini` and:
 
 ```sh
---yolo -s danger-full-access --search
+--model gpt-5.4-mini -c 'model="gpt-5.4-mini"' -c 'model_reasoning_effort="medium"' --yolo -s danger-full-access --search
 ```
 
 It uses `tmux` as the PTY backend. Full terminal output is written only to local
@@ -26,8 +26,26 @@ not return raw output by default. Existing metadata under the old
 - `agent_stop`: stop Agentin `a`, `b`, or `both`
 - `agent_safe_tail`: explicit capped, ANSI-stripped, redacted excerpt
 - `agent_skills`: data-sparse skill inventory without file contents
+- `agent_skill_match`: check whether one or all Agentinnen have a named skill
+- `agent_capabilities`: summarized model, skill, and policy capabilities
+- `agent_scope_check`: verify write paths stay inside assignment scope
 - `agent_assign`: structured, skill-aware assignment with explicit boundaries
+- `agent_assign_readonly`: shortcut for read-only Exploriererin assignments
+- `agent_assign_write`: shortcut for Arbeitsbiene write assignments
+- `agent_assignments`: data-sparse assignment audit log
+- `agent_last_assignment_status`: latest assignment metadata for one Agentin
+- `agent_report_request`: ask one Agentin for a concise report
+- `worktree_create_for_agent`: create an isolated git worktree for one Agentin
+- `worktree_status`: capped git status and worktree metadata
+- `integration_status`: repo status, diff stat, and recent assignment metadata
+- `commit_ready_check`: fixed readiness checks for integration/commit
+- `master_plugin_status`: plugin packaging and MCP registration status
 - `agent_doctor`: structured diagnostics without raw output
+
+`/mcp` should show `codex-master-mcp` only in the Teamleiterin/main Codex
+instance. Agentin A and Agentin B intentionally do not receive Masterjet MCP
+tools; they are controlled from outside and may only use native Subagentinnen
+when an assignment explicitly allows it.
 
 ## Local CLI
 
@@ -39,8 +57,17 @@ python3 -m codex_master.server uninstall       # remove mcp registration and loc
 
 python3 -m codex_master.server start both --cwd /home/teladi/codex-master
 python3 -m codex_master.server status
+python3 -m codex_master.server capabilities all
 python3 -m codex_master.server skills all
-python3 -m codex_master.server assign a --role exploriererin --skill codex-security:security-scan --scope src/codex_master/server.py --task "Pruefe nur lesend und berichte knapp."
+python3 -m codex_master.server skill-match all codex-security:security-scan
+python3 -m codex_master.server scope-check --scope src/codex_master --write-path src/codex_master/server.py
+python3 -m codex_master.server assign-readonly a --skill codex-security:security-scan --scope src/codex_master/server.py --task "Pruefe nur lesend und berichte knapp."
+python3 -m codex_master.server assign-write b --scope .github/workflows --write-path .github/workflows/ci.yml --task "Haerte nur die CI-Datei."
+python3 -m codex_master.server assignments all --limit 20
+python3 -m codex_master.server last-assignment a
+python3 -m codex_master.server integration-status
+python3 -m codex_master.server commit-ready-check
+python3 -m codex_master.server plugin-status
 python3 -m codex_master.server send a "Kurzer Auftrag"
 python3 -m codex_master.server tail a --source pane --lines 20 --chars 2000
 python3 -m codex_master.server stop both
@@ -82,17 +109,16 @@ python3 -m codex_master.server send b "Nutze github:gh-fix-ci. Pruefe die CI-Kon
 python3 -m codex_master.server tail a --source pane --lines 20 --chars 2000
 ```
 
-For safer delegation, prefer `assign` over free-form `send`:
+For safer delegation, prefer `assign-readonly` and `assign-write` over
+free-form `send`:
 
 ```sh
-python3 -m codex_master.server assign a \
-  --role exploriererin \
+python3 -m codex_master.server assign-readonly a \
   --skill codex-security:security-scan \
   --scope src/codex_master/server.py \
   --task "Pruefe nur lesend und berichte knapp."
 
-python3 -m codex_master.server assign b \
-  --role arbeitsbiene \
+python3 -m codex_master.server assign-write b \
   --skill github:gh-fix-ci \
   --scope .github/workflows \
   --write-path .github/workflows/ci.yml \
@@ -104,14 +130,43 @@ Exploriererinnen, and requires explicit write paths for Arbeitsbienen. It sends
 the generated prompt through tmux but does not return the prompt or the Agentin
 response.
 
+`assign-write` also gates write paths through `agent_scope_check`; a write path
+outside the declared scope is rejected before anything is sent to an Agentin.
+
+Model policy: Agentin A and Agentin B run on `gpt-5.4-mini` by default. Read-only
+Exploriererin assignments keep that model. Arbeitsbiene write assignments are
+marked for `gpt-5.3-codex-spark` in the structured assignment and audit metadata.
+
 Agentinnen may start their own native Subagentinnen only when the assignment
 uses `--allow-subagents`. Without that flag, the generated assignment explicitly
 forbids nested delegation. Even with the flag, nested Agentinnen stay inside the
 assigned scope and write paths; they do not use `codex-master-mcp` and they do
 not commit, push, or release.
 
+Assignments are appended to `~/.local/state/codex-master-mcp/assignments.jsonl`
+as metadata only: assignment id, Agentin, role, selected model, skill match
+status, scope, write paths, counts, and flags. Prompt text and Agentin responses
+are not stored or returned.
+
 Use `tail` only when an explicit, capped excerpt is needed. Normal status and
 send operations do not return Agentin output.
+
+## Plugin
+
+This repo is also a local Codex plugin:
+
+- `.codex-plugin/plugin.json`: plugin metadata and Codex UI information
+- `.mcp.json`: starts `codex-master-mcp` from this repo without package install
+- `skills/codex-master-fleet/SKILL.md`: Teamleiterin skill for the Masterjet
+
+The plugin is intended for the main/Teamleiterin Codex instance. Agentin A and
+Agentin B should keep their separate worker skill and should not receive
+Masterjet MCP tools.
+
+A Marketplace entry is optional. The repo contains the plugin artifacts, and the
+existing `codex-master-mcp` registration can run the MCP server directly. Add a
+personal/local Marketplace entry only if you want Codex's plugin UI to discover
+and install it as a plugin.
 
 ## Checks
 

@@ -1,0 +1,120 @@
+---
+name: codex-master-fleet
+description: Use when managing the local codex-master-mcp Masterjet, Codex Agentinnen A/B, Bienen, Arbeitsbienen, Exploriererinnen, fleet variables, plugin status, or persistent feminine agent delegation rules.
+metadata:
+  short-description: Manage codex-master-mcp and the local Agentinnen fleet
+---
+
+# Codex Master Fleet
+
+Use this skill in the Teamleiterin/main Codex instance when the user refers to
+the Masterjet, `codex-master`, `codex-master-mcp`, Agentin A/B, Bienen,
+Arbeitsbienen, Exploriererinnen, fleet rules, plugin status, telint imports, or
+the persisted delegation templates.
+
+This skill is for the controlling instance. Do not install it into Agentin A/B
+unless the intent is to make that instance a Teamleiterin.
+
+## Model Policy
+
+- Agentin A and Agentin B run on `gpt-5.4-mini` by default with medium
+  reasoning effort.
+- Exploriererin/read-only assignments keep `gpt-5.4-mini`.
+- Arbeitsbiene write assignments are marked for `gpt-5.3-codex-spark` with low
+  reasoning effort.
+- If a running Codex TUI cannot switch model mid-session, the assignment still
+  carries `Modell: gpt-5.3-codex-spark` as the required escalation signal.
+
+## Fleet Policy
+
+- Use feminine wording: `Agentin`, `Biene`, `Arbeitsbiene`,
+  `Exploriererin`, `Teamleiterin`.
+- If masculine agent wording appears, briefly note the mismatch and continue
+  with the feminine term.
+- Give Agentinnen modern female names unless the user requests a fixed name.
+- The main instance is the Teamleiterin. It may inspect and integrate, but
+  should mainly coordinate, test, commit, push, and release.
+- Default fleet size is 2-3 Bienen. Maximum is 6, only for independent tasks.
+- Exploriererinnen read, analyze, and report concise context packages only.
+- Arbeitsbienen may write only in assigned files or isolated workspaces.
+- Before assigning writes, inspect `git status --short` and avoid overlapping
+  write scopes.
+- Security is more important than performance; still keep performance in mind.
+- Version all coding steps. Commit after 10 successful fixes, push after 10
+  commits, release after 10 pushes. Push/release only with green tests and no
+  known critical findings.
+- Agentin A/B may start native Subagentinnen only when the assignment explicitly
+  allows it. Nested Subagentinnen must stay inside the assigned scope and write
+  paths. They must not use `codex-master-mcp` to control the fleet.
+
+## MCP Visibility
+
+In `/mcp`, the main Codex instance should show `codex-master-mcp`. Agentin A and
+Agentin B intentionally should not show the Masterjet MCP tools. If a standard
+instance says that Master MCP Tools are none, then either that instance is not
+the Teamleiterin, or `codex-master-mcp` is not installed/configured there.
+
+## Masterjet Control
+
+Prefer structured tools over raw `send`:
+
+```sh
+cd /home/teladi/codex-master
+./bin/codex-master-mcp doctor
+./bin/codex-master-mcp status
+./bin/codex-master-mcp start both --cwd /home/teladi/codex-master
+./bin/codex-master-mcp capabilities all
+./bin/codex-master-mcp skills all
+./bin/codex-master-mcp skill-match all codex-security:security-scan
+./bin/codex-master-mcp scope-check --scope src --write-path src/codex_master/server.py
+./bin/codex-master-mcp assign-readonly a --skill codex-security:security-scan --scope src/codex_master/server.py --task "Pruefe nur lesend und berichte knapp."
+./bin/codex-master-mcp assign-write b --skill github:gh-fix-ci --scope .github/workflows --write-path .github/workflows/ci.yml --task "Haerte nur die CI-Datei."
+./bin/codex-master-mcp assignments all --limit 20
+./bin/codex-master-mcp last-assignment a
+./bin/codex-master-mcp report-request a
+./bin/codex-master-mcp integration-status
+./bin/codex-master-mcp commit-ready-check
+./bin/codex-master-mcp plugin-status
+```
+
+Data minimization:
+
+- `status`, `start`, `send`, `assign-*`, `doctor`, `skills`, `capabilities`,
+  and `plugin-status` do not return Agentin terminal output.
+- `assignments` and `last-assignment` return only assignment metadata. They
+  must not return prompt text or Agentin responses.
+- Use `tail` only for an explicit capped, ANSI-stripped, redacted excerpt.
+- Do not read raw tmux logs directly unless the user explicitly requests it and
+  the privacy impact is acceptable.
+
+## Delegation Templates
+
+Exploriererin:
+
+```text
+[EXPLORER_BEE_TASK]
+Name: {moderner weiblicher Name}
+Rolle: Exploriererin
+Modell: gpt-5.4-mini
+Scope: {Dateien/Ordner/Webthema}
+Darf schreiben: nein
+Darf eigene Subagentinnen starten: {ja/nein, nur lesend im Scope}
+Aufgabe: {konkrete Frage}
+Rueckgabe: knappe Fakten, relevante Dateien/Zeilen, Empfehlung
+```
+
+Arbeitsbiene:
+
+```text
+[WORK_BEE_TASK]
+Name: {moderner weiblicher Name}
+Rolle: Arbeitsbiene
+Modell: gpt-5.3-codex-spark
+Scope: {Dateien/Ordner}
+Darf schreiben: ja, nur {genaue Pfade}
+Darf eigene Subagentinnen starten: {ja/nein, nur innerhalb Scope und Schreibpfaden}
+Stabiler Kontext: {max. 8 Stichpunkte}
+Aktuelle Aufgabe: {konkreter Fix}
+Grenzen: {was nicht anfassen}
+Rueckgabe: Root Cause, Aenderung, Tests, offene Risiken
+```

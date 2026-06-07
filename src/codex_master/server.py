@@ -31,14 +31,31 @@ STATE_ROOT = Path(
 LEGACY_STATE_ROOT = Path("~/.local/state/codex-agent-mcp").expanduser()
 RAW_DIR = STATE_ROOT / "raw"
 META_DIR = STATE_ROOT / "meta"
+ASSIGNMENT_LOG = STATE_ROOT / "assignments.jsonl"
 LEGACY_META_DIR = LEGACY_STATE_ROOT / "meta"
-BASE_ARGS = ["--yolo", "-s", "danger-full-access", "--search"]
+DEFAULT_AGENT_MODEL = "gpt-5.4-mini"
+DEFAULT_AGENT_MODEL_EFFORT = "medium"
+WRITE_AGENT_MODEL = "gpt-5.3-codex-spark"
+WRITE_AGENT_MODEL_EFFORT = "low"
+BASE_ARGS = [
+    "--model",
+    DEFAULT_AGENT_MODEL,
+    "-c",
+    f'model="{DEFAULT_AGENT_MODEL}"',
+    "-c",
+    f'model_reasoning_effort="{DEFAULT_AGENT_MODEL_EFFORT}"',
+    "--yolo",
+    "-s",
+    "danger-full-access",
+    "--search",
+]
 MAX_TAIL_LINES = 80
 MAX_TAIL_CHARS = 8192
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
 MCP_SERVER_NAME = "codex-master-mcp"
 DEFAULT_INSTALL_PATH = Path("~/.local/bin/codex-master-mcp").expanduser()
 MAX_SKILL_NAMES = 200
+MAX_ASSIGNMENT_RECORDS = 100
 MAX_ASSIGNMENT_TEXT = 12000
 DEFAULT_AGENTIN_NAMES = {"a": "Mila", "b": "Nora"}
 
@@ -119,8 +136,14 @@ def run_tmux(args: list[str], *, input_text: str | None = None, check: bool = Tr
     )
 
 
-def run_command(args: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
+def run_command(
+    args: list[str],
+    *,
+    check: bool = False,
+    cwd: Path | str | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check, cwd=cwd, env=env)
 
 
 def tmux_alive(session: str) -> bool:
@@ -153,6 +176,16 @@ def read_meta(agent: str) -> dict[str, Any]:
 def write_meta(agent: str, data: dict[str, Any]) -> None:
     path = meta_path(agent)
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except PermissionError:
+        pass
+
+
+def write_private_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(text)
     try:
         path.chmod(0o600)
     except PermissionError:
@@ -232,6 +265,8 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
         "runner": str(runner),
         "cwd": str(start_cwd),
         "args": BASE_ARGS,
+        "model": DEFAULT_AGENT_MODEL,
+        "model_reasoning_effort": DEFAULT_AGENT_MODEL_EFFORT,
         "started_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "run_id": run_id,
         "raw_log": str(raw_log),
@@ -245,6 +280,8 @@ def start_agent(agent: str, cwd: str | None = None, prompt: str | None = None) -
         "session": session,
         "pid": pane_pid(session),
         "cwd": str(start_cwd),
+        "model": DEFAULT_AGENT_MODEL,
+        "model_reasoning_effort": DEFAULT_AGENT_MODEL_EFFORT,
         "raw_log": str(raw_log),
         "raw_output": "not_returned",
     }
@@ -284,6 +321,8 @@ def status_agent(agent: str) -> dict[str, Any]:
         "runner": str(cfg["runner"]),
         "started_at_utc": meta.get("started_at_utc"),
         "cwd": meta.get("cwd"),
+        "model": meta.get("model") or DEFAULT_AGENT_MODEL,
+        "model_reasoning_effort": meta.get("model_reasoning_effort") or DEFAULT_AGENT_MODEL_EFFORT,
         "raw_log": raw_log,
         "raw_log_bytes": raw_size,
         "raw_output": "not_returned",
@@ -435,6 +474,87 @@ def skill_matches(agent: str, skill_ref: str, limit: int = 8) -> list[dict[str, 
     return matches
 
 
+def skill_match_agent(agent: str, skill_ref: str, limit: int = 8) -> dict[str, Any]:
+    if not isinstance(skill_ref, str) or not skill_ref.strip():
+        raise AgentError("skill must be a non-empty string")
+    limit = max(1, min(int(limit), MAX_SKILL_NAMES))
+    matches = skill_matches(agent, skill_ref, limit)
+    skill_safe, _changed = redact(skill_ref.strip())
+    return {
+        "agent": agent,
+        "skill": trim_chars(skill_safe, 300),
+        "available": bool(matches),
+        "match_count": len(matches),
+        "matches": matches,
+        "skill_file_contents": "not_returned",
+        "raw_output": "not_returned",
+    }
+
+
+def capabilities_agent(agent: str) -> dict[str, Any]:
+    inventory = skills_agent(agent, include_names=False)
+    return {
+        "agent": agent,
+        "label": AGENTS[agent]["label"],
+        "home": str(AGENTS[agent]["home"]),
+        "models": {
+            "default": DEFAULT_AGENT_MODEL,
+            "read_only": DEFAULT_AGENT_MODEL,
+            "write": WRITE_AGENT_MODEL,
+            "default_reasoning_effort": DEFAULT_AGENT_MODEL_EFFORT,
+            "write_reasoning_effort": WRITE_AGENT_MODEL_EFFORT,
+        },
+        "skill_count": inventory["total"],
+        "system_skills": inventory["system_skills"],
+        "plugins": inventory["plugins"],
+        "master_mcp_tools": "not_configured_for_agent",
+        "native_subagents": "assignment_gated",
+        "write_policy": "explicit_paths_only",
+        "raw_output": "not_returned",
+    }
+
+
+def normalize_scope_path(item: str, cwd: Path) -> Path | None:
+    text = item.strip()
+    if not text or "://" in text:
+        return None
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = cwd / path
+    return path.resolve(strict=False)
+
+
+def path_is_within(path: Path, scope: Path) -> bool:
+    try:
+        path.relative_to(scope)
+        return True
+    except ValueError:
+        return False
+
+
+def scope_check(scope: list[str], write_paths: list[str], cwd: str | None = None) -> dict[str, Any]:
+    base = Path(cwd or os.getcwd()).expanduser().resolve(strict=False)
+    scope_paths = [path for item in scope if (path := normalize_scope_path(item, base)) is not None]
+    violations: list[str] = []
+
+    if write_paths and not scope_paths:
+        violations = redact_list(write_paths)
+    else:
+        for original in write_paths:
+            write_path = normalize_scope_path(original, base)
+            if write_path is None or not any(path_is_within(write_path, scope_path) for scope_path in scope_paths):
+                violations.append(redact_list([original])[0])
+
+    return {
+        "cwd": str(base),
+        "allowed": not violations,
+        "scope": redact_list(scope),
+        "write_paths": redact_list(write_paths),
+        "violations": violations,
+        "raw_output": "not_returned",
+    }
+
+
 def bullet_block(items: list[str], fallback: str = "-") -> str:
     if not items:
         return fallback
@@ -456,6 +576,7 @@ def assignment_prompt(
 ) -> str:
     display_name = (name or DEFAULT_AGENTIN_NAMES.get(agent) or "Arbeitsbiene").strip()
     skill_line = skill.strip() if skill else "kein spezieller Skill vorgegeben"
+    model = assignment_model(role)
 
     if role == "exploriererin":
         return "\n".join(
@@ -463,6 +584,7 @@ def assignment_prompt(
                 "[EXPLORER_BEE_TASK]",
                 f"Name: {display_name}",
                 "Rolle: Exploriererin",
+                f"Modell: {model}",
                 f"Skill: {skill_line}",
                 f"Scope:\n{bullet_block(scope)}",
                 "Darf schreiben: nein",
@@ -479,6 +601,7 @@ def assignment_prompt(
             "[WORK_BEE_TASK]",
             f"Name: {display_name}",
             "Rolle: Arbeitsbiene",
+            f"Modell: {model}",
             f"Skill: {skill_line}",
             f"Scope:\n{bullet_block(scope)}",
             f"Darf schreiben: ja, nur:\n{bullet_block(write_paths)}",
@@ -489,6 +612,12 @@ def assignment_prompt(
             "Rueckgabe: Root Cause, Aenderung, Tests, offene Risiken",
         ]
     )
+
+
+def assignment_model(role: str) -> str:
+    if role == "arbeitsbiene":
+        return WRITE_AGENT_MODEL
+    return DEFAULT_AGENT_MODEL
 
 
 def assign_agent(
@@ -519,6 +648,9 @@ def assign_agent(
         raise AgentError("exploriererin assignments must not include write paths")
     if role == "arbeitsbiene" and not write_paths:
         raise AgentError("arbeitsbiene assignments require at least one explicit write path")
+    scope_result = scope_check(scope, write_paths)
+    if role == "arbeitsbiene" and not scope_result["allowed"]:
+        raise AgentError(f"write paths must stay inside scope: {', '.join(scope_result['violations'])}")
 
     matches: list[dict[str, str]] = []
     if skill:
@@ -526,6 +658,7 @@ def assign_agent(
         if not matches and not allow_missing_skill:
             raise AgentError(f"skill not found for agent {agent}: {skill}")
 
+    model = assignment_model(role)
     prompt = assignment_prompt(
         agent=agent,
         role=role,
@@ -542,11 +675,39 @@ def assign_agent(
         raise AgentError(f"assignment prompt exceeds {MAX_ASSIGNMENT_TEXT} characters")
 
     sent = send_agent(agent, prompt, enter)
+    assignment_id = f"{now_id()}-{agent}"
+    record_assignment(
+        {
+            "assignment_id": assignment_id,
+            "created_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "agent": agent,
+            "role": role,
+            "name": name or DEFAULT_AGENTIN_NAMES.get(agent),
+            "model": model,
+            "skill": {
+                "requested": skill,
+                "available": bool(matches) if skill else None,
+                "match_count": len(matches),
+            },
+            "scope": redact_list(scope),
+            "write_paths": redact_list(write_paths),
+            "context_count": len(context),
+            "forbidden_count": len(forbidden),
+            "write_policy": "read_only" if role == "exploriererin" else "explicit_paths_only",
+            "allow_subagents": allow_subagents,
+            "submitted": enter,
+            "prompt_chars": len(prompt),
+            "prompt_output": "not_returned",
+            "response_output": "not_returned",
+        }
+    )
     return {
+        "assignment_id": assignment_id,
         "agent": agent,
         "status": "assigned",
         "role": role,
         "name": name or DEFAULT_AGENTIN_NAMES.get(agent),
+        "model": model,
         "skill": {"requested": skill, "available": bool(matches) if skill else None, "matches": matches[:5]},
         "scope_count": len(scope),
         "write_policy": "read_only" if role == "exploriererin" else "explicit_paths_only",
@@ -559,10 +720,184 @@ def assign_agent(
     }
 
 
+def redact_list(items: list[str], max_items: int = 50) -> list[str]:
+    safe_items = []
+    for item in items[:max_items]:
+        redacted, _changed = redact(item)
+        safe_items.append(trim_chars(redacted, 300))
+    return safe_items
+
+
+def record_assignment(record: dict[str, Any]) -> None:
+    ensure_state()
+    write_private_text(ASSIGNMENT_LOG, json.dumps(record, sort_keys=True) + "\n")
+
+
+def list_assignments(agent: str = "all", limit: int = 20) -> dict[str, Any]:
+    ensure_state()
+    if agent not in {"a", "b", "all"}:
+        raise AgentError("agent must be a, b, or all")
+    limit = max(1, min(int(limit), MAX_ASSIGNMENT_RECORDS))
+    records: list[dict[str, Any]] = []
+    if ASSIGNMENT_LOG.exists():
+        try:
+            for line in ASSIGNMENT_LOG.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if agent == "all" or record.get("agent") == agent:
+                    records.append(record)
+        except OSError as exc:
+            raise AgentError(f"could not read assignment log: {exc}") from exc
+    return {
+        "agent": agent,
+        "limit": limit,
+        "records": records[-limit:],
+        "record_count": len(records[-limit:]),
+        "log_path": str(ASSIGNMENT_LOG),
+        "prompt_output": "not_returned",
+        "response_output": "not_returned",
+        "raw_output": "not_returned",
+    }
+
+
 def command_excerpt(text: str, chars: int = 1200) -> tuple[str, bool]:
     cleaned = strip_ansi(text)
     cleaned, redacted = redact(cleaned)
     return trim_chars(cleaned, chars), redacted
+
+
+def last_assignment_status(agent: str) -> dict[str, Any]:
+    result = list_assignments(agent, 1)
+    return {
+        "agent": agent,
+        "status": "found" if result["records"] else "none",
+        "record": result["records"][0] if result["records"] else None,
+        "prompt_output": "not_returned",
+        "response_output": "not_returned",
+        "raw_output": "not_returned",
+    }
+
+
+def request_agent_report(agent: str, assignment_id: str | None = None, enter: bool = True) -> dict[str, Any]:
+    if assignment_id:
+        safe_id, _changed = redact(assignment_id)
+        text = (
+            "Bitte liefere einen knappen Bericht zum Assignment "
+            f"{trim_chars(safe_id, 200)}: Status, relevante Dateien/Zeilen, Tests, offene Risiken. "
+            "Keine Rohlogs und keine langen Ausgaben."
+        )
+    else:
+        text = "Bitte liefere einen knappen Statusbericht: Aufgabe, Stand, Tests, offene Risiken. Keine Rohlogs."
+    sent = send_agent(agent, text, enter)
+    return {
+        "agent": agent,
+        "status": "report_requested",
+        "submitted": enter,
+        "assignment_id": assignment_id,
+        "prompt_output": "not_returned",
+        "response_output": "not_returned",
+        "send": sent,
+    }
+
+
+def git_excerpt(args: list[str], *, cwd: Path | None = None, chars: int = 4000) -> dict[str, Any]:
+    cp = run_command(["git", *args], cwd=cwd or repo_root())
+    output, redacted = command_excerpt(cp.stdout + cp.stderr, chars)
+    return {
+        "ok": cp.returncode == 0,
+        "returncode": cp.returncode,
+        "output_excerpt": output,
+        "redaction_applied": redacted,
+    }
+
+
+def worktree_create_for_agent(agent: str, path: str | None = None, base_ref: str | None = None) -> dict[str, Any]:
+    if agent not in {"a", "b"}:
+        raise AgentError("agent must be a or b")
+    target = Path(path).expanduser() if path else repo_root() / ".codex-master-worktrees" / f"agent-{agent}-{now_id()}"
+    target = target.resolve(strict=False)
+    if target.exists():
+        raise AgentError(f"worktree path already exists: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    args = ["worktree", "add", str(target)]
+    if base_ref:
+        args.append(base_ref)
+    cp = run_command(["git", *args], cwd=repo_root())
+    if cp.returncode != 0:
+        output, redacted = command_excerpt(cp.stdout + cp.stderr)
+        raise AgentError(f"git worktree add failed: {output if not redacted else '<redacted>'}")
+    return {
+        "agent": agent,
+        "path": str(target),
+        "base_ref": base_ref,
+        "status": "created",
+        "raw_output": "not_returned",
+    }
+
+
+def worktree_status(path: str | None = None) -> dict[str, Any]:
+    target = Path(path).expanduser().resolve(strict=False) if path else repo_root()
+    return {
+        "path": str(target),
+        "status": git_excerpt(["status", "--short"], cwd=target),
+        "worktrees": git_excerpt(["worktree", "list", "--porcelain"], cwd=repo_root()),
+        "raw_output": "not_returned",
+    }
+
+
+def integration_status() -> dict[str, Any]:
+    return {
+        "repo": str(repo_root()),
+        "status": git_excerpt(["status", "--short"]),
+        "diff_stat": git_excerpt(["diff", "--stat"]),
+        "assignments": list_assignments("all", 10),
+        "raw_output": "not_returned",
+    }
+
+
+def commit_ready_check(run_tests: bool = True) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    repo = repo_root()
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "src" if not env.get("PYTHONPATH") else f"src{os.pathsep}{env['PYTHONPATH']}"
+    commands = [
+        ("diff_check", ["git", "diff", "--check"]),
+        ("compileall", [sys.executable, "-m", "compileall", "-q", "src", "tests"]),
+    ]
+    if run_tests:
+        commands.append(("unittest", [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"]))
+    for name, command in commands:
+        cp = run_command(command, cwd=repo, env=env)
+        output, redacted = command_excerpt(cp.stdout + cp.stderr, 6000)
+        checks.append(
+            {
+                "name": name,
+                "ok": cp.returncode == 0,
+                "returncode": cp.returncode,
+                "output_excerpt": output,
+                "redaction_applied": redacted,
+            }
+        )
+    return {"ok": all(check["ok"] for check in checks), "checks": checks, "raw_output": "not_returned"}
+
+
+def master_plugin_status() -> dict[str, Any]:
+    root = repo_root()
+    manifest = root / ".codex-plugin" / "plugin.json"
+    mcp_manifest = root / ".mcp.json"
+    skill = root / "skills" / "codex-master-fleet" / "SKILL.md"
+    return {
+        "repo": str(root),
+        "plugin_manifest": {"path": str(manifest), "exists": manifest.is_file()},
+        "mcp_manifest": {"path": str(mcp_manifest), "exists": mcp_manifest.is_file()},
+        "skill": {"path": str(skill), "exists": skill.is_file()},
+        "mcp_registration": check_mcp_registration(DEFAULT_INSTALL_PATH),
+        "raw_output": "not_returned",
+    }
 
 
 def check_mcp_registration(command_path: Path = DEFAULT_INSTALL_PATH) -> dict[str, Any]:
@@ -845,6 +1180,21 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         include_names = bool(args.get("include_names", False))
         limit = int(args.get("limit", 80))
         return multi_agent_result(selected, lambda agent: skills_agent(agent, include_names, limit))
+    if name == "agent_skill_match":
+        selected = agent_ids(str(args.get("agent", "all")))
+        return multi_agent_result(
+            selected,
+            lambda agent: skill_match_agent(agent, str(args.get("skill", "")), int(args.get("limit", 8))),
+        )
+    if name == "agent_capabilities":
+        selected = agent_ids(str(args.get("agent", "all")))
+        return multi_agent_result(selected, capabilities_agent)
+    if name == "agent_scope_check":
+        return scope_check(
+            as_string_list(args.get("scope"), field="scope"),
+            as_string_list(args.get("write_paths"), field="write_paths"),
+            args.get("cwd") if isinstance(args.get("cwd"), str) else None,
+        )
     if name == "agent_assign":
         selected = agent_ids(str(args.get("agent", "")))
         if len(selected) != 1:
@@ -863,6 +1213,74 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             allow_missing_skill=bool(args.get("allow_missing_skill", False)),
             allow_subagents=bool(args.get("allow_subagents", False)),
         )
+    if name == "agent_assign_readonly":
+        selected = agent_ids(str(args.get("agent", "")))
+        if len(selected) != 1:
+            raise AgentError("agent_assign_readonly requires exactly one agent: a or b")
+        return assign_agent(
+            selected[0],
+            role="exploriererin",
+            task=str(args.get("task", "")),
+            scope=as_string_list(args.get("scope"), field="scope"),
+            skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
+            context=as_string_list(args.get("context"), field="context"),
+            forbidden=as_string_list(args.get("forbidden"), field="forbidden"),
+            name=args.get("name") if isinstance(args.get("name"), str) else None,
+            enter=bool(args.get("enter", True)),
+            allow_missing_skill=bool(args.get("allow_missing_skill", False)),
+            allow_subagents=bool(args.get("allow_subagents", False)),
+        )
+    if name == "agent_assign_write":
+        selected = agent_ids(str(args.get("agent", "")))
+        if len(selected) != 1:
+            raise AgentError("agent_assign_write requires exactly one agent: a or b")
+        return assign_agent(
+            selected[0],
+            role="arbeitsbiene",
+            task=str(args.get("task", "")),
+            scope=as_string_list(args.get("scope"), field="scope"),
+            skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
+            write_paths=as_string_list(args.get("write_paths"), field="write_paths"),
+            context=as_string_list(args.get("context"), field="context"),
+            forbidden=as_string_list(args.get("forbidden"), field="forbidden"),
+            name=args.get("name") if isinstance(args.get("name"), str) else None,
+            enter=bool(args.get("enter", True)),
+            allow_missing_skill=bool(args.get("allow_missing_skill", False)),
+            allow_subagents=bool(args.get("allow_subagents", False)),
+        )
+    if name == "agent_assignments":
+        return list_assignments(str(args.get("agent", "all")), int(args.get("limit", 20)))
+    if name == "agent_last_assignment_status":
+        selected = agent_ids(str(args.get("agent", "")))
+        if len(selected) != 1:
+            raise AgentError("agent_last_assignment_status requires exactly one agent: a or b")
+        return last_assignment_status(selected[0])
+    if name == "agent_report_request":
+        selected = agent_ids(str(args.get("agent", "")))
+        if len(selected) != 1:
+            raise AgentError("agent_report_request requires exactly one agent: a or b")
+        return request_agent_report(
+            selected[0],
+            args.get("assignment_id") if isinstance(args.get("assignment_id"), str) else None,
+            bool(args.get("enter", True)),
+        )
+    if name == "worktree_create_for_agent":
+        selected = agent_ids(str(args.get("agent", "")))
+        if len(selected) != 1:
+            raise AgentError("worktree_create_for_agent requires exactly one agent: a or b")
+        return worktree_create_for_agent(
+            selected[0],
+            args.get("path") if isinstance(args.get("path"), str) else None,
+            args.get("base_ref") if isinstance(args.get("base_ref"), str) else None,
+        )
+    if name == "worktree_status":
+        return worktree_status(args.get("path") if isinstance(args.get("path"), str) else None)
+    if name == "integration_status":
+        return integration_status()
+    if name == "commit_ready_check":
+        return commit_ready_check(bool(args.get("run_tests", True)))
+    if name == "master_plugin_status":
+        return master_plugin_status()
     if name == "agent_doctor":
         return doctor()
     if name == "agent_send":
@@ -894,7 +1312,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "agent_start",
-        "description": "Start Codex Agentin A, B, or both in persistent tmux sessions with --yolo -s danger-full-access --search. Does not return raw output.",
+        "description": "Start Codex Agentin A, B, or both in persistent tmux sessions with gpt-5.4-mini, --yolo -s danger-full-access --search. Does not return raw output.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -976,8 +1394,44 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "agent_skill_match",
+        "description": "Check whether one or all Agentinnen have a named skill. Does not return skill file contents.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["skill"],
+            "properties": {
+                "agent": {"type": "string", "enum": ["a", "b", "all"], "default": "all"},
+                "skill": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_SKILL_NAMES, "default": 8},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_capabilities",
+        "description": "Return data-sparse capability summaries for one or all Agentinnen.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"agent": {"type": "string", "enum": ["a", "b", "all"], "default": "all"}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_scope_check",
+        "description": "Check whether write paths stay inside declared assignment scope.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "scope": {"type": "array", "items": {"type": "string"}, "default": []},
+                "write_paths": {"type": "array", "items": {"type": "string"}, "default": []},
+                "cwd": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "agent_assign",
-        "description": "Send a structured, skill-aware assignment to one Agentin with explicit scope and write boundaries. Does not return the prompt or response output.",
+        "description": "Send a structured, skill-aware assignment to one Agentin with explicit scope, write boundaries, and model policy. Does not return the prompt or response output.",
         "inputSchema": {
             "type": "object",
             "required": ["agent", "role", "task"],
@@ -997,6 +1451,127 @@ TOOLS: list[dict[str, Any]] = [
             },
             "additionalProperties": False,
         },
+    },
+    {
+        "name": "agent_assign_readonly",
+        "description": "Shortcut for a read-only Exploriererin assignment. Does not return the prompt or response output.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["agent", "task"],
+            "properties": {
+                "agent": {"type": "string", "enum": ["a", "b"]},
+                "task": {"type": "string"},
+                "skill": {"type": "string"},
+                "scope": {"type": "array", "items": {"type": "string"}, "default": []},
+                "context": {"type": "array", "items": {"type": "string"}, "default": []},
+                "forbidden": {"type": "array", "items": {"type": "string"}, "default": []},
+                "name": {"type": "string"},
+                "enter": {"type": "boolean", "default": True},
+                "allow_missing_skill": {"type": "boolean", "default": False},
+                "allow_subagents": {"type": "boolean", "default": False},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_assign_write",
+        "description": "Shortcut for an Arbeitsbiene write assignment with required explicit write paths. Does not return the prompt or response output.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["agent", "task", "write_paths"],
+            "properties": {
+                "agent": {"type": "string", "enum": ["a", "b"]},
+                "task": {"type": "string"},
+                "skill": {"type": "string"},
+                "scope": {"type": "array", "items": {"type": "string"}, "default": []},
+                "write_paths": {"type": "array", "items": {"type": "string"}},
+                "context": {"type": "array", "items": {"type": "string"}, "default": []},
+                "forbidden": {"type": "array", "items": {"type": "string"}, "default": []},
+                "name": {"type": "string"},
+                "enter": {"type": "boolean", "default": True},
+                "allow_missing_skill": {"type": "boolean", "default": False},
+                "allow_subagents": {"type": "boolean", "default": False},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_assignments",
+        "description": "Return data-sparse assignment audit records. Does not return prompt text or Agentin responses.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string", "enum": ["a", "b", "all"], "default": "all"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_ASSIGNMENT_RECORDS, "default": 20},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_last_assignment_status",
+        "description": "Return the most recent assignment metadata for one Agentin. Does not return prompt text or Agentin responses.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["agent"],
+            "properties": {"agent": {"type": "string", "enum": ["a", "b"]}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_report_request",
+        "description": "Ask one running Agentin for a concise report. The Agentin response is not returned automatically.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["agent"],
+            "properties": {
+                "agent": {"type": "string", "enum": ["a", "b"]},
+                "assignment_id": {"type": "string"},
+                "enter": {"type": "boolean", "default": True},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "worktree_create_for_agent",
+        "description": "Create an isolated git worktree for one Agentin. Does not return command output.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["agent"],
+            "properties": {
+                "agent": {"type": "string", "enum": ["a", "b"]},
+                "path": {"type": "string"},
+                "base_ref": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "worktree_status",
+        "description": "Return capped git status and worktree metadata.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "integration_status",
+        "description": "Return repo integration metadata: git status, diff stat, and recent assignment records.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "commit_ready_check",
+        "description": "Run fixed readiness checks: git diff --check, compileall, and optionally unittest.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"run_tests": {"type": "boolean", "default": True}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "master_plugin_status",
+        "description": "Return plugin packaging and MCP registration status for codex-master.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "agent_doctor",
@@ -1140,6 +1715,19 @@ def main_cli(argv: list[str]) -> int:
     p_skills.add_argument("--include-names", action="store_true")
     p_skills.add_argument("--limit", type=int, default=80)
 
+    p_skill_match = sub.add_parser("skill-match")
+    p_skill_match.add_argument("agent", choices=["a", "b", "all"], nargs="?", default="all")
+    p_skill_match.add_argument("skill")
+    p_skill_match.add_argument("--limit", type=int, default=8)
+
+    p_capabilities = sub.add_parser("capabilities")
+    p_capabilities.add_argument("agent", choices=["a", "b", "all"], nargs="?", default="all")
+
+    p_scope_check = sub.add_parser("scope-check")
+    p_scope_check.add_argument("--scope", action="append", default=[])
+    p_scope_check.add_argument("--write-path", dest="write_paths", action="append", default=[])
+    p_scope_check.add_argument("--cwd")
+
     p_assign = sub.add_parser("assign")
     p_assign.add_argument("agent", choices=["a", "b"])
     p_assign.add_argument("--role", choices=["exploriererin", "arbeitsbiene"], required=True)
@@ -1153,6 +1741,58 @@ def main_cli(argv: list[str]) -> int:
     p_assign.add_argument("--no-enter", action="store_true")
     p_assign.add_argument("--allow-missing-skill", action="store_true")
     p_assign.add_argument("--allow-subagents", action="store_true")
+
+    p_assign_readonly = sub.add_parser("assign-readonly")
+    p_assign_readonly.add_argument("agent", choices=["a", "b"])
+    p_assign_readonly.add_argument("--task", required=True)
+    p_assign_readonly.add_argument("--skill")
+    p_assign_readonly.add_argument("--scope", action="append", default=[])
+    p_assign_readonly.add_argument("--context", action="append", default=[])
+    p_assign_readonly.add_argument("--forbid", dest="forbidden", action="append", default=[])
+    p_assign_readonly.add_argument("--name")
+    p_assign_readonly.add_argument("--no-enter", action="store_true")
+    p_assign_readonly.add_argument("--allow-missing-skill", action="store_true")
+    p_assign_readonly.add_argument("--allow-subagents", action="store_true")
+
+    p_assign_write = sub.add_parser("assign-write")
+    p_assign_write.add_argument("agent", choices=["a", "b"])
+    p_assign_write.add_argument("--task", required=True)
+    p_assign_write.add_argument("--skill")
+    p_assign_write.add_argument("--scope", action="append", default=[])
+    p_assign_write.add_argument("--write-path", dest="write_paths", action="append", default=[])
+    p_assign_write.add_argument("--context", action="append", default=[])
+    p_assign_write.add_argument("--forbid", dest="forbidden", action="append", default=[])
+    p_assign_write.add_argument("--name")
+    p_assign_write.add_argument("--no-enter", action="store_true")
+    p_assign_write.add_argument("--allow-missing-skill", action="store_true")
+    p_assign_write.add_argument("--allow-subagents", action="store_true")
+
+    p_assignments = sub.add_parser("assignments")
+    p_assignments.add_argument("agent", choices=["a", "b", "all"], nargs="?", default="all")
+    p_assignments.add_argument("--limit", type=int, default=20)
+
+    p_last_assignment = sub.add_parser("last-assignment")
+    p_last_assignment.add_argument("agent", choices=["a", "b"])
+
+    p_report = sub.add_parser("report-request")
+    p_report.add_argument("agent", choices=["a", "b"])
+    p_report.add_argument("--assignment-id")
+    p_report.add_argument("--no-enter", action="store_true")
+
+    p_worktree_create = sub.add_parser("worktree-create")
+    p_worktree_create.add_argument("agent", choices=["a", "b"])
+    p_worktree_create.add_argument("--path")
+    p_worktree_create.add_argument("--base-ref")
+
+    p_worktree_status = sub.add_parser("worktree-status")
+    p_worktree_status.add_argument("--path")
+
+    sub.add_parser("integration-status")
+
+    p_commit_ready = sub.add_parser("commit-ready-check")
+    p_commit_ready.add_argument("--no-tests", action="store_true")
+
+    sub.add_parser("plugin-status")
 
     p_install = sub.add_parser("install")
     p_install.add_argument("--no-register", action="store_true")
@@ -1193,6 +1833,17 @@ def main_cli(argv: list[str]) -> int:
                     {"agent": args.agent, "include_names": args.include_names, "limit": args.limit},
                 )
             )
+        if args.command == "skill-match":
+            return print_json(call_tool("agent_skill_match", {"agent": args.agent, "skill": args.skill, "limit": args.limit}))
+        if args.command == "capabilities":
+            return print_json(call_tool("agent_capabilities", {"agent": args.agent}))
+        if args.command == "scope-check":
+            return print_json(
+                call_tool(
+                    "agent_scope_check",
+                    {"scope": args.scope, "write_paths": args.write_paths, "cwd": args.cwd},
+                )
+            )
         if args.command == "assign":
             return print_json(
                 call_tool(
@@ -1213,6 +1864,69 @@ def main_cli(argv: list[str]) -> int:
                     },
                 )
             )
+        if args.command == "assign-readonly":
+            return print_json(
+                call_tool(
+                    "agent_assign_readonly",
+                    {
+                        "agent": args.agent,
+                        "task": args.task,
+                        "skill": args.skill,
+                        "scope": args.scope,
+                        "context": args.context,
+                        "forbidden": args.forbidden,
+                        "name": args.name,
+                        "enter": not args.no_enter,
+                        "allow_missing_skill": args.allow_missing_skill,
+                        "allow_subagents": args.allow_subagents,
+                    },
+                )
+            )
+        if args.command == "assign-write":
+            return print_json(
+                call_tool(
+                    "agent_assign_write",
+                    {
+                        "agent": args.agent,
+                        "task": args.task,
+                        "skill": args.skill,
+                        "scope": args.scope,
+                        "write_paths": args.write_paths,
+                        "context": args.context,
+                        "forbidden": args.forbidden,
+                        "name": args.name,
+                        "enter": not args.no_enter,
+                        "allow_missing_skill": args.allow_missing_skill,
+                        "allow_subagents": args.allow_subagents,
+                    },
+                )
+            )
+        if args.command == "assignments":
+            return print_json(call_tool("agent_assignments", {"agent": args.agent, "limit": args.limit}))
+        if args.command == "last-assignment":
+            return print_json(call_tool("agent_last_assignment_status", {"agent": args.agent}))
+        if args.command == "report-request":
+            return print_json(
+                call_tool(
+                    "agent_report_request",
+                    {"agent": args.agent, "assignment_id": args.assignment_id, "enter": not args.no_enter},
+                )
+            )
+        if args.command == "worktree-create":
+            return print_json(
+                call_tool(
+                    "worktree_create_for_agent",
+                    {"agent": args.agent, "path": args.path, "base_ref": args.base_ref},
+                )
+            )
+        if args.command == "worktree-status":
+            return print_json(call_tool("worktree_status", {"path": args.path}))
+        if args.command == "integration-status":
+            return print_json(call_tool("integration_status", {}))
+        if args.command == "commit-ready-check":
+            return print_json(call_tool("commit_ready_check", {"run_tests": not args.no_tests}))
+        if args.command == "plugin-status":
+            return print_json(call_tool("master_plugin_status", {}))
         if args.command == "install":
             return print_json(
                 install(

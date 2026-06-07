@@ -1,0 +1,39 @@
+{
+  "name": "codex-master",
+  "version": "0.1.5+codex.20260607094056",
+  "description": "Local Codex Masterjet plugin for controlling isolated Agentinnen A/B through a data-sparse tmux MCP server.",
+  "author": {
+    "name": "teladi"
+  },
+  "homepage": "https://github.com/teladi/codex-master",
+  "repository": "https://github.com/teladi/codex-master",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "mcp",
+    "tmux",
+    "agents",
+    "fleet",
+    "skills"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Codex Master",
+    "shortDescription": "Control isolated Codex Agentinnen with a local Masterjet MCP.",
+    "longDescription": "Adds the codex-master-mcp local MCP server plus fleet-management skills for starting, assigning, auditing, and safely inspecting two isolated Codex Agentinnen through tmux. The tool surface is data-sparse by default and keeps prompt text, Agentin responses, and raw terminal logs out of normal MCP responses.",
+    "developerName": "teladi",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use Codex Master to start Agentin A and Agentin B",
+      "Assign a read-only Exploriererin task with codex-master-mcp",
+      "Check codex-master plugin and MCP status"
+    ],
+    "brandColor": "#1F7A64"
+  }
+}

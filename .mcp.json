@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "codex-master-mcp": {
+      "cwd": ".",
+      "command": "python3",
+      "args": [
+        "-c",
+        "import sys; sys.path.insert(0, 'src'); from codex_master.server import main; raise SystemExit(main())"
+      ],
+      "note": "Local data-sparse Codex Masterjet MCP server. Controls Agentin A/B through tmux and does not return raw terminal output by default."
+    }
+  }
+}

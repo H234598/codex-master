@@ -39,6 +39,15 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("agent_start", names)
         self.assertIn("agent_safe_tail", names)
         self.assertIn("agent_assign", names)
+        self.assertIn("agent_assignments", names)
+        self.assertIn("agent_skill_match", names)
+        self.assertIn("agent_capabilities", names)
+        self.assertIn("agent_scope_check", names)
+        self.assertIn("agent_assign_readonly", names)
+        self.assertIn("agent_assign_write", names)
+        self.assertIn("worktree_status", names)
+        self.assertIn("commit_ready_check", names)
+        self.assertIn("master_plugin_status", names)
 
     def test_initialize_rejects_unsupported_protocol(self) -> None:
         response = handle_rpc(
@@ -194,6 +203,12 @@ class ServerHelpersTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "pipe-pane failed"):
                     start_agent("a", cwd=tmpdir)
 
+            new_session_calls = [call for call in mock_run_tmux.call_args_list if call.args[0][0] == "new-session"]
+            self.assertEqual(len(new_session_calls), 1)
+            start_command = new_session_calls[0].args[0][-1]
+            self.assertIn("--model gpt-5.4-mini", start_command)
+            self.assertIn('model="gpt-5.4-mini"', start_command)
+            self.assertIn('model_reasoning_effort="medium"', start_command)
             kill_calls = [call for call in mock_run_tmux.call_args_list if call.args[0][0] == "kill-session"]
             self.assertEqual(len(kill_calls), 1)
             self.assertFalse(any(Path(tmpdir).glob("*.log")))
@@ -261,16 +276,76 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(payload["names_truncated"])
         self.assertNotIn("SECRET_SKILL_CONTENT_SHOULD_NOT_LEAK", payload_text)
 
+    def test_skill_match_and_capabilities_are_data_sparse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            skill = home / ".tmp" / "plugins" / "plugins" / "github" / "skills" / "gh-fix-ci" / "SKILL.md"
+            skill.parent.mkdir(parents=True, exist_ok=True)
+            skill.write_text("SECRET_SKILL_CONTENT_SHOULD_NOT_LEAK\n", encoding="utf-8")
+
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"b": {"label": "B", "runner": home / "codex", "home": home, "session": "session-b"}},
+                clear=False,
+            ):
+                match = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 24,
+                        "method": "tools/call",
+                        "params": {"name": "agent_skill_match", "arguments": {"agent": "b", "skill": "github:gh-fix-ci"}},
+                    }
+                )
+                capabilities = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 25,
+                        "method": "tools/call",
+                        "params": {"name": "agent_capabilities", "arguments": {"agent": "b"}},
+                    }
+                )
+
+        self.assertFalse(match["result"]["isError"])
+        match_payload = json.loads(match["result"]["content"][0]["text"])["results"][0]
+        match_text = json.dumps(match_payload, sort_keys=True)
+        self.assertTrue(match_payload["available"])
+        self.assertEqual(match_payload["skill_file_contents"], "not_returned")
+        self.assertNotIn("SECRET_SKILL_CONTENT_SHOULD_NOT_LEAK", match_text)
+
+        self.assertFalse(capabilities["result"]["isError"])
+        capability_payload = json.loads(capabilities["result"]["content"][0]["text"])["results"][0]
+        self.assertEqual(capability_payload["models"]["default"], "gpt-5.4-mini")
+        self.assertEqual(capability_payload["models"]["write"], "gpt-5.3-codex-spark")
+        self.assertEqual(capability_payload["master_mcp_tools"], "not_configured_for_agent")
+
+    def test_scope_check_blocks_writes_outside_scope(self) -> None:
+        response = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 26,
+                "method": "tools/call",
+                "params": {
+                    "name": "agent_scope_check",
+                    "arguments": {"scope": ["src/codex_master"], "write_paths": ["tests/test_server.py"]},
+                },
+            }
+        )
+        self.assertFalse(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertFalse(payload["allowed"])
+        self.assertEqual(payload["violations"], ["tests/test_server.py"])
+
     @patch("codex_master.server.send_agent")
     def test_agent_assign_sends_structured_prompt_without_returning_prompt(self, mock_send_agent) -> None:
         mock_send_agent.return_value = {"agent": "a", "status": "sent", "response_output": "not_returned"}
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
+            assignment_log = home / "assignments.jsonl"
             skill = home / ".tmp" / "plugins" / "plugins" / "codex-security" / "skills" / "security-scan" / "SKILL.md"
             skill.parent.mkdir(parents=True, exist_ok=True)
             skill.write_text("Skill body must not be returned\n", encoding="utf-8")
 
-            with patch.dict(
+            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log), patch.dict(
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
@@ -293,12 +368,22 @@ class ServerHelpersTest(unittest.TestCase):
                         },
                     }
                 )
+                ledger_response = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 23,
+                        "method": "tools/call",
+                        "params": {"name": "agent_assignments", "arguments": {"agent": "a", "limit": 1}},
+                    }
+                )
 
         self.assertIsNotNone(response)
         self.assertFalse(response["result"]["isError"])
         payload = json.loads(response["result"]["content"][0]["text"])
+        assignment_id = payload["assignment_id"]
         self.assertEqual(payload["status"], "assigned")
         self.assertEqual(payload["role"], "exploriererin")
+        self.assertEqual(payload["model"], "gpt-5.4-mini")
         self.assertEqual(payload["write_policy"], "read_only")
         self.assertFalse(payload["subagents_allowed"])
         self.assertEqual(payload["skill"]["requested"], "codex-security:security-scan")
@@ -314,20 +399,39 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(sent_agent, "a")
         self.assertTrue(sent_enter)
         self.assertIn("[EXPLORER_BEE_TASK]", sent_prompt)
+        self.assertIn("Modell: gpt-5.4-mini", sent_prompt)
         self.assertIn("Skill: codex-security:security-scan", sent_prompt)
         self.assertIn("Darf schreiben: nein", sent_prompt)
         self.assertIn("Darf eigene Subagentinnen starten: nein", sent_prompt)
+
+        self.assertIsNotNone(ledger_response)
+        self.assertFalse(ledger_response["result"]["isError"])
+        ledger = json.loads(ledger_response["result"]["content"][0]["text"])
+        self.assertEqual(ledger["record_count"], 1)
+        record = ledger["records"][0]
+        self.assertEqual(record["assignment_id"], assignment_id)
+        self.assertEqual(record["agent"], "a")
+        self.assertEqual(record["role"], "exploriererin")
+        self.assertEqual(record["model"], "gpt-5.4-mini")
+        self.assertEqual(record["scope"], ["src/codex_master/server.py"])
+        self.assertEqual(record["write_policy"], "read_only")
+        self.assertFalse(record["allow_subagents"])
+        ledger_text = json.dumps(ledger, sort_keys=True)
+        self.assertNotIn("[EXPLORER_BEE_TASK]", ledger_text)
+        self.assertNotIn("Pruefe nur lesend.", ledger_text)
+        self.assertNotIn("Skill body must not be returned", ledger_text)
 
     @patch("codex_master.server.send_agent")
     def test_agent_assign_allows_nested_subagents_only_when_explicit(self, mock_send_agent) -> None:
         mock_send_agent.return_value = {"agent": "b", "status": "sent", "response_output": "not_returned"}
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
+            assignment_log = home / "assignments.jsonl"
             skill = home / ".tmp" / "plugins" / "plugins" / "github" / "skills" / "gh-fix-ci" / "SKILL.md"
             skill.parent.mkdir(parents=True, exist_ok=True)
             skill.write_text("body\n", encoding="utf-8")
 
-            with patch.dict(
+            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log), patch.dict(
                 "codex_master.server.AGENTS",
                 {"b": {"label": "B", "runner": home / "codex", "home": home, "session": "session-b"}},
                 clear=False,
@@ -356,9 +460,11 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(response["result"]["isError"])
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertTrue(payload["subagents_allowed"])
+        self.assertEqual(payload["model"], "gpt-5.3-codex-spark")
         self.assertEqual(payload["write_policy"], "explicit_paths_only")
         sent_prompt = mock_send_agent.call_args.args[1]
         self.assertIn("[WORK_BEE_TASK]", sent_prompt)
+        self.assertIn("Modell: gpt-5.3-codex-spark", sent_prompt)
         self.assertIn("Darf eigene Subagentinnen starten: ja, nur innerhalb Scope und Schreibpfaden", sent_prompt)
 
     def test_agent_assign_enforces_role_write_and_skill_boundaries(self) -> None:
@@ -412,6 +518,23 @@ class ServerHelpersTest(unittest.TestCase):
                         },
                     }
                 )
+                outside_scope = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 27,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "agent_assign_write",
+                            "arguments": {
+                                "agent": "a",
+                                "task": "fix",
+                                "scope": ["src"],
+                                "write_paths": ["tests/test_server.py"],
+                                "allow_missing_skill": True,
+                            },
+                        },
+                    }
+                )
 
         self.assertTrue(readonly["result"]["isError"])
         self.assertIn("must not include write paths", readonly["result"]["content"][0]["text"])
@@ -419,6 +542,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("require at least one explicit write path", worker["result"]["content"][0]["text"])
         self.assertTrue(missing_skill["result"]["isError"])
         self.assertIn("skill not found", missing_skill["result"]["content"][0]["text"])
+        self.assertTrue(outside_scope["result"]["isError"])
+        self.assertIn("write paths must stay inside scope", outside_scope["result"]["content"][0]["text"])
 
 
 class CliLifecycleTest(unittest.TestCase):
