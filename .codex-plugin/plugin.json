@@ -1,6 +1,6 @@
 {
   "name": "codex-master",
-  "version": "0.8.0+codex.20260607213208",
+  "version": "0.8.1+codex.20260607213705",
   "description": "Local Codex Masterjet plugin for controlling a sleeping Agentinnen pool through a data-sparse tmux MCP server.",
   "author": {
     "name": "teladi"

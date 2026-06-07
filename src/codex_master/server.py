@@ -4989,6 +4989,11 @@ def master_namespace_status() -> dict[str, Any]:
         "master_release_status": "master_release_status" in tool_names,
         "master_watchdog_status": "master_watchdog_status" in tool_names,
         "master_timeout_policy": "master_timeout_policy" in tool_names,
+        "agent_pool_validate": "agent_pool_validate" in tool_names,
+        "agent_pool_install": "agent_pool_install" in tool_names,
+        "agent_pool_status": "agent_pool_status" in tool_names,
+        "agent_pool_copy_auth": "agent_pool_copy_auth" in tool_names,
+        "agent_pool_destroy_pool": "agent_pool_destroy_pool" in tool_names,
         "raw_output": "not_returned",
     }
     server_ready = bool(registration.get("ok")) and bool(startup_self_test.get("ok")) and bool(
@@ -5014,6 +5019,11 @@ def master_namespace_status() -> dict[str, Any]:
             "master_release_status": local_tool_contract["master_release_status"],
             "master_watchdog_status": local_tool_contract["master_watchdog_status"],
             "master_timeout_policy": local_tool_contract["master_timeout_policy"],
+            "agent_pool_validate": local_tool_contract["agent_pool_validate"],
+            "agent_pool_install": local_tool_contract["agent_pool_install"],
+            "agent_pool_status": local_tool_contract["agent_pool_status"],
+            "agent_pool_copy_auth": local_tool_contract["agent_pool_copy_auth"],
+            "agent_pool_destroy_pool": local_tool_contract["agent_pool_destroy_pool"],
         },
         "local_tool_contract": local_tool_contract,
         "mcp_registration": registration,

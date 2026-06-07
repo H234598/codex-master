@@ -1294,6 +1294,11 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["expected_tools"]["master_namespace_status"])
         self.assertTrue(result["expected_tools"]["master_release_status"])
         self.assertTrue(result["expected_tools"]["master_timeout_policy"])
+        self.assertTrue(result["expected_tools"]["agent_pool_validate"])
+        self.assertTrue(result["expected_tools"]["agent_pool_install"])
+        self.assertTrue(result["expected_tools"]["agent_pool_status"])
+        self.assertTrue(result["expected_tools"]["agent_pool_copy_auth"])
+        self.assertTrue(result["expected_tools"]["agent_pool_destroy_pool"])
         self.assertFalse(result["tool_search"]["authoritative_for_local_stdio_mcp_tools"])
         self.assertTrue(result["client_refresh"]["existing_sessions_may_need_restart"])
         self.assertTrue(result["mcp_server_ready"])
@@ -1490,7 +1495,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.8.0+codex.test",
+            "version": "0.8.1+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1517,7 +1522,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.8.0")
+        self.assertEqual(result["expected_tag"], "v0.8.1")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
