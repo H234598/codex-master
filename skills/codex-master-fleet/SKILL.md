@@ -69,6 +69,7 @@ Prefer structured tools over raw `send`:
 cd /home/teladi/codex-master
 ./bin/codex-master-mcp doctor
 ./bin/codex-master-mcp status
+./bin/codex-master-mcp wait a --timeout-seconds 30 --poll-interval-seconds 2
 ./bin/codex-master-mcp start both --cwd /home/teladi/codex-master
 ./bin/codex-master-mcp capabilities all
 ./bin/codex-master-mcp skills all
@@ -87,12 +88,14 @@ cd /home/teladi/codex-master
 
 Data minimization:
 
-- `status`, `start`, `send`, `assign-*`, `doctor`, `skills`, `capabilities`,
-  and `plugin-status` do not return Agentin terminal output.
+- `status`, `wait`, `start`, `send`, `assign-*`, `doctor`, `skills`,
+  `capabilities`, and `plugin-status` do not return Agentin terminal output.
 - `status` may classify bounded pane/log text into metadata-only response and
   limit states, but it must not return the classified text. Daily, weekly,
   token, quota, and rate limits must keep default Agentinnen-model limits
   separate from Spark write-model limits.
+- `wait` may poll status for bounded time and return activity/stop/limit
+  metadata, but it must not return Agentin output.
 - `capabilities` returns a bounded first plugin page plus counts/truncation
   flags, not a complete broad plugin inventory.
 - `skills` returns bounded plugin/name pages plus total counts, offsets, limits,

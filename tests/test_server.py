@@ -20,9 +20,13 @@ from codex_master.server import (
     MAX_SEND_TEXT,
     MAX_SKILL_NAMES,
     MAX_TASK_TEXT,
+    MAX_WAIT_POLL_SECONDS,
+    MAX_WAIT_SECONDS,
     RAW_LOG_TRUNCATION_MARKER,
     COMMAND_TIMEOUT_RETURN_CODE,
     DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    DEFAULT_WAIT_POLL_SECONDS,
+    DEFAULT_WAIT_SECONDS,
     DEFAULT_TMUX_TIMEOUT_SECONDS,
     allowed_raw_log_path,
     append_bounded_raw_log,
@@ -53,6 +57,7 @@ from codex_master.server import (
     trim_chars,
     trim_lines,
     uninstall,
+    wait_agent,
     WRITE_AGENT_MODEL,
     write_bounded_raw_log,
     write_meta,
@@ -149,6 +154,7 @@ class ServerHelpersTest(unittest.TestCase):
         names = {tool["name"] for tool in response["result"]["tools"]}
         self.assertIn("agent_start", names)
         self.assertIn("agent_safe_tail", names)
+        self.assertIn("agent_wait", names)
         self.assertIn("agent_assign", names)
         self.assertIn("agent_assignments", names)
         self.assertIn("agent_skill_match", names)
@@ -161,9 +167,14 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("master_plugin_status", names)
         by_name = {tool["name"]: tool for tool in response["result"]["tools"]}
         assign_props = by_name["agent_assign"]["inputSchema"]["properties"]
+        wait_props = by_name["agent_wait"]["inputSchema"]["properties"]
         skill_props = by_name["agent_skills"]["inputSchema"]["properties"]
         self.assertEqual(assign_props["task"]["maxLength"], MAX_TASK_TEXT)
         self.assertEqual(assign_props["context"]["maxItems"], MAX_ASSIGNMENT_LIST_ITEMS)
+        self.assertEqual(wait_props["timeout_seconds"]["default"], DEFAULT_WAIT_SECONDS)
+        self.assertEqual(wait_props["timeout_seconds"]["maximum"], MAX_WAIT_SECONDS)
+        self.assertEqual(wait_props["poll_interval_seconds"]["default"], DEFAULT_WAIT_POLL_SECONDS)
+        self.assertEqual(wait_props["poll_interval_seconds"]["maximum"], MAX_WAIT_POLL_SECONDS)
         self.assertEqual(by_name["agent_send"]["inputSchema"]["properties"]["text"]["maxLength"], MAX_SEND_TEXT)
         self.assertEqual(skill_props["limit"]["maximum"], MAX_SKILL_NAMES)
         self.assertEqual(skill_props["names_offset"]["minimum"], 0)
@@ -393,6 +404,23 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(bad_array["result"]["isError"])
         bad_array_payload = json.loads(bad_array["result"]["content"][0]["text"])
         self.assertEqual(bad_array_payload["error"], "scope must be an array")
+
+    def test_agent_wait_tool_validates_bounds(self) -> None:
+        response = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 41,
+                "method": "tools/call",
+                "params": {
+                    "name": "agent_wait",
+                    "arguments": {"agent": "a", "timeout_seconds": MAX_WAIT_SECONDS + 1},
+                },
+            }
+        )
+
+        self.assertTrue(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["error"], f"timeout_seconds must be <= {MAX_WAIT_SECONDS}")
 
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.pane_tail")
@@ -665,6 +693,57 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(payload["raw_log_bytes"], 4)
         self.assertTrue(payload["raw_log_path_valid"])
         self.assertNotIn(str(log_path), json.dumps(payload, sort_keys=True))
+
+    @patch("codex_master.server.time.sleep")
+    @patch("codex_master.server.status_agent")
+    def test_wait_agent_reports_activity_without_output(self, mock_status_agent, mock_sleep) -> None:
+        mock_status_agent.side_effect = [
+            {
+                "agent": "a",
+                "running": True,
+                "raw_log_bytes": 10,
+                "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
+                "response_state": {"state": "idle"},
+                "limit_state": {"limited": False},
+            },
+            {
+                "agent": "a",
+                "running": True,
+                "raw_log_bytes": 11,
+                "raw_log_updated_at_utc": "2026-06-07T10:00:01+00:00",
+                "response_state": {"state": "active"},
+                "limit_state": {"limited": False},
+            },
+        ]
+
+        result = wait_agent("a", timeout_seconds=10, poll_interval_seconds=1)
+
+        self.assertEqual(result["status"], "activity_observed")
+        self.assertEqual(result["current"]["raw_log_bytes"], 11)
+        self.assertEqual(result["raw_output"], "not_returned")
+        self.assertEqual(result["response_output"], "not_returned")
+        self.assertNotIn("output", json.dumps(result["current"], sort_keys=True))
+        mock_sleep.assert_called_once()
+
+    @patch("codex_master.server.time.sleep")
+    @patch("codex_master.server.status_agent")
+    def test_wait_agent_returns_blocked_by_limit_immediately(self, mock_status_agent, mock_sleep) -> None:
+        mock_status_agent.return_value = {
+            "agent": "a",
+            "running": True,
+            "raw_log_bytes": 10,
+            "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
+            "response_state": {"state": "blocked_by_limit"},
+            "limit_state": {"limited": True, "window": "daily"},
+        }
+
+        result = wait_agent("a", timeout_seconds=10, poll_interval_seconds=1)
+
+        self.assertEqual(result["status"], "blocked_by_limit")
+        self.assertEqual(result["poll_count"], 0)
+        self.assertEqual(result["raw_output"], "not_returned")
+        self.assertEqual(result["response_output"], "not_returned")
+        mock_sleep.assert_not_called()
 
     def test_append_bounded_raw_log_caps_file_size(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -60,6 +60,10 @@ MAX_RAW_LOG_FILES = 20
 RAW_LOG_CHUNK_BYTES = 64 * 1024
 MAX_LIMIT_STATUS_BYTES = 16 * 1024
 IDLE_RESPONSE_SECONDS = 300
+DEFAULT_WAIT_SECONDS = 30
+MAX_WAIT_SECONDS = 120
+DEFAULT_WAIT_POLL_SECONDS = 2
+MAX_WAIT_POLL_SECONDS = 10
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
 MCP_SERVER_NAME = "codex-master-mcp"
 DEFAULT_INSTALL_PATH = Path("~/.local/bin/codex-master-mcp").expanduser()
@@ -1043,6 +1047,57 @@ def agent_response_state(running: bool, limit_state: dict[str, Any], raw_log_inf
         "idle_threshold_seconds": IDLE_RESPONSE_SECONDS,
         "response_output": "not_returned",
         "raw_output": "not_returned",
+    }
+
+
+def activity_signature(status: dict[str, Any]) -> tuple[Any, Any, Any]:
+    return (
+        status.get("raw_log_bytes"),
+        status.get("raw_log_updated_at_utc"),
+        (status.get("response_state") or {}).get("state"),
+    )
+
+
+def wait_terminal_status(status: dict[str, Any], initial: dict[str, Any]) -> str | None:
+    if (status.get("limit_state") or {}).get("limited"):
+        return "blocked_by_limit"
+    if not status.get("running"):
+        return "not_running"
+    if activity_signature(status) != activity_signature(initial):
+        return "activity_observed"
+    return None
+
+
+def wait_agent(agent: str, timeout_seconds: int = DEFAULT_WAIT_SECONDS, poll_interval_seconds: int = DEFAULT_WAIT_POLL_SECONDS) -> dict[str, Any]:
+    if agent not in {"a", "b"}:
+        raise AgentError("agent must be a or b")
+    timeout_seconds = max(0, min(int(timeout_seconds), MAX_WAIT_SECONDS))
+    poll_interval_seconds = max(1, min(int(poll_interval_seconds), MAX_WAIT_POLL_SECONDS))
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    initial = status_agent(agent)
+    current = initial
+    polls = 0
+    status = wait_terminal_status(current, initial)
+    while status is None and time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        time.sleep(min(float(poll_interval_seconds), remaining))
+        polls += 1
+        current = status_agent(agent)
+        status = wait_terminal_status(current, initial)
+    if status is None:
+        status = "timeout"
+    return {
+        "agent": agent,
+        "status": status,
+        "timeout_seconds": timeout_seconds,
+        "poll_interval_seconds": poll_interval_seconds,
+        "poll_count": polls,
+        "elapsed_seconds": max(0, int(time.monotonic() - started)),
+        "initial": initial,
+        "current": current,
+        "raw_output": "not_returned",
+        "response_output": "not_returned",
     }
 
 
@@ -2139,6 +2194,15 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "agent_status":
         selected = agent_ids(str(args.get("agent", "all")))
         return multi_agent_result(selected, status_agent)
+    if name == "agent_wait":
+        selected = agent_ids(str(args.get("agent", "")))
+        if len(selected) != 1:
+            raise AgentError("agent_wait requires exactly one agent: a or b")
+        return wait_agent(
+            selected[0],
+            int_arg(args, "timeout_seconds", DEFAULT_WAIT_SECONDS),
+            int_arg(args, "poll_interval_seconds", DEFAULT_WAIT_POLL_SECONDS),
+        )
     if name == "agent_skills":
         selected = agent_ids(str(args.get("agent", "all")))
         include_names = bool_arg(args, "include_names", False)
@@ -2347,6 +2411,30 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {"agent": {"type": "string", "enum": ["a", "b", "all"], "default": "all"}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_wait",
+        "description": "Wait briefly for one Agentin to show activity, stop, or hit a classified limit. Returns metadata and status only; does not return raw output.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["agent"],
+            "properties": {
+                "agent": {"type": "string", "enum": ["a", "b"]},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_WAIT_SECONDS,
+                    "default": DEFAULT_WAIT_SECONDS,
+                },
+                "poll_interval_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_WAIT_POLL_SECONDS,
+                    "default": DEFAULT_WAIT_POLL_SECONDS,
+                },
+            },
             "additionalProperties": False,
         },
     },
@@ -2805,6 +2893,11 @@ def main_cli(argv: list[str]) -> int:
     p_status = sub.add_parser("status")
     p_status.add_argument("agent", choices=["a", "b", "all"], nargs="?", default="all")
 
+    p_wait = sub.add_parser("wait")
+    p_wait.add_argument("agent", choices=["a", "b"])
+    p_wait.add_argument("--timeout-seconds", type=int, default=DEFAULT_WAIT_SECONDS)
+    p_wait.add_argument("--poll-interval-seconds", type=int, default=DEFAULT_WAIT_POLL_SECONDS)
+
     p_send = sub.add_parser("send")
     p_send.add_argument("agent", choices=["a", "b"])
     p_send.add_argument("text")
@@ -2934,6 +3027,17 @@ def main_cli(argv: list[str]) -> int:
             return print_json(call_tool("agent_start", {"agent": args.agent, "cwd": args.cwd, "prompt": args.prompt}))
         if args.command == "status":
             return print_json(call_tool("agent_status", {"agent": args.agent}))
+        if args.command == "wait":
+            return print_json(
+                call_tool(
+                    "agent_wait",
+                    {
+                        "agent": args.agent,
+                        "timeout_seconds": args.timeout_seconds,
+                        "poll_interval_seconds": args.poll_interval_seconds,
+                    },
+                )
+            )
         if args.command == "send":
             return print_json(call_tool("agent_send", {"agent": args.agent, "text": args.text, "enter": not args.no_enter}))
         if args.command == "interrupt":
