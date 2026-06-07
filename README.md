@@ -257,11 +257,12 @@ python3 -m codex_master.server stop both
   `systemd/user/codex-master-watchdog.service` and
   `systemd/user/codex-master-watchdog.timer`
 - the user service runs with conservative hardening directives:
-  `NoNewPrivileges`, `PrivateTmp`, `LockPersonality`,
-  `MemoryDenyWriteExecute`, `RestrictRealtime`, `RestrictSUIDSGID`, native
-  syscall architecture, and `UMask=0077`; it intentionally keeps normal user
-  home access because the watchdog needs Codex config, tmux IPC, and managed
-  state files
+  empty `CapabilityBoundingSet`, private keyring/tmp/devices, kernel and clock
+  protections, read-only system hierarchy, explicit write access only to the
+  managed state and user runtime directories, no IP sockets, no namespaces,
+  `NoNewPrivileges`, `MemoryDenyWriteExecute`, native syscall architecture,
+  and `UMask=0077`; it intentionally keeps normal user home read access because
+  the watchdog needs Codex config, tmux IPC, and managed state files
 
 `skills`
 - scans each Agentin home for `SKILL.md` files in `skills/`, `plugins/cache/`,

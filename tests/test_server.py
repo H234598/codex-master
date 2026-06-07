@@ -1229,7 +1229,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.4.2+codex.test",
+            "version": "0.4.3+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1256,7 +1256,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.4.2")
+        self.assertEqual(result["expected_tag"], "v0.4.3")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -3928,10 +3928,24 @@ class CliLifecycleTest(unittest.TestCase):
         service = Path(__file__).resolve().parents[1] / "systemd" / "user" / "codex-master-watchdog.service"
         text = service.read_text(encoding="utf-8")
 
+        self.assertIn("CapabilityBoundingSet=", text)
+        self.assertIn("KeyringMode=private", text)
         self.assertIn("NoNewPrivileges=yes", text)
         self.assertIn("PrivateTmp=yes", text)
+        self.assertIn("PrivateDevices=yes", text)
+        self.assertIn("ProtectClock=yes", text)
+        self.assertIn("ProtectControlGroups=yes", text)
+        self.assertIn("ProtectHostname=yes", text)
+        self.assertIn("ProtectKernelLogs=yes", text)
+        self.assertIn("ProtectKernelModules=yes", text)
+        self.assertIn("ProtectKernelTunables=yes", text)
+        self.assertIn("ProtectSystem=strict", text)
+        self.assertIn("ReadWritePaths=%h/.local/state/codex-master-mcp %t", text)
+        self.assertIn("IPAddressDeny=any", text)
         self.assertIn("LockPersonality=yes", text)
         self.assertIn("MemoryDenyWriteExecute=yes", text)
+        self.assertIn("RestrictAddressFamilies=AF_UNIX", text)
+        self.assertIn("RestrictNamespaces=yes", text)
         self.assertIn("RestrictRealtime=yes", text)
         self.assertIn("RestrictSUIDSGID=yes", text)
         self.assertIn("SystemCallArchitectures=native", text)
