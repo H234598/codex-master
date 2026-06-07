@@ -1814,6 +1814,34 @@ def agent_home_process_summary(agent: str, proc_root: Path = Path("/proc")) -> d
     }
 
 
+def agent_identity_guard(running: bool, process_summary: dict[str, Any]) -> dict[str, Any]:
+    process_count = int(process_summary.get("process_count") or 0)
+    external_process_count = int(process_summary.get("external_process_count") or 0)
+    managed_process_count = int(process_summary.get("managed_process_count") or 0)
+    if external_process_count > 0:
+        state = "blocked_external_home_user"
+        ok = False
+    elif not running and managed_process_count > 0:
+        state = "blocked_orphaned_managed_home_process"
+        ok = False
+    elif running:
+        state = "managed_session_running"
+        ok = True
+    else:
+        state = "clear"
+        ok = True
+    return {
+        "ok": ok,
+        "state": state,
+        "single_identity_required": True,
+        "tmux_session_running": running,
+        "home_process_count": process_count,
+        "home_managed_process_count": managed_process_count,
+        "home_external_process_count": external_process_count,
+        "raw_output": "not_returned",
+    }
+
+
 def codex_related_process_summary(proc_root: Path = Path("/proc")) -> dict[str, Any]:
     home_kind_counts = {
         "main_default_home": 0,
@@ -1940,10 +1968,17 @@ def start_agent(
         }
 
     process_summary = agent_home_process_summary(agent)
+    identity_guard = agent_identity_guard(False, process_summary)
     if process_summary["external_process_count"]:
         raise AgentError(
             f"agent {agent} CODEX_HOME is already used by {process_summary['external_process_count']} external process(es); "
             "stop them or use a separate CODEX_HOME before starting through codex-master-mcp"
+        )
+    if not identity_guard["ok"]:
+        raise AgentError(
+            f"agent {agent} CODEX_HOME is already used by {process_summary['managed_process_count']} "
+            "managed process(es) without the managed tmux session; stop the orphaned process(es) before starting "
+            "through codex-master-mcp"
         )
 
     cwd = bounded_text(cwd, field="cwd", max_chars=MAX_PATH_TEXT) if cwd is not None else None
@@ -2013,6 +2048,7 @@ def start_agent(
 
 def start_agent_with_lease(agent: str, cwd: Any = None, prompt: Any = None) -> dict[str, Any]:
     if tmux_alive(AGENTS[agent]["session"]):
+        ensure_agent_lease_available(agent)
         return start_agent(agent, cwd, prompt)
     claim = claim_agent(agent)
     lease = claim["lease"]
@@ -2377,6 +2413,7 @@ def status_agent(agent: str) -> dict[str, Any]:
     raw_log_path = allowed_raw_log_path(raw_log)
     process_summary = agent_home_process_summary(agent)
     running = tmux_alive(session)
+    identity_guard = agent_identity_guard(running, process_summary)
     raw_log_info = raw_log_metadata(raw_log_path)
     latest_assignment = latest_assignment_summary(agent)
     pane_text = pane_tail(agent, MAX_TAIL_LINES) if running else ""
@@ -2418,8 +2455,10 @@ def status_agent(agent: str) -> dict[str, Any]:
         "raw_log_policy": "local_only_bounded_not_returned_by_default",
         "raw_log_path_valid": (raw_log_path is not None) if raw_log else True,
         "home_process_count": process_summary["process_count"],
+        "home_managed_process_count": process_summary["managed_process_count"],
         "home_external_process_count": process_summary["external_process_count"],
         "home_external_processes_truncated": process_summary["external_processes_truncated"],
+        "identity_guard": identity_guard,
         "raw_output": "not_returned",
     }
 
@@ -4908,6 +4947,7 @@ def doctor() -> dict[str, Any]:
     for agent, cfg in AGENTS.items():
         process_summary = agent_home_process_summary(agent)
         running = tmux_alive(cfg["session"])
+        identity_guard = agent_identity_guard(running, process_summary)
         checks.extend(
             [
                 {
@@ -4940,6 +4980,10 @@ def doctor() -> dict[str, Any]:
                     "external_processes": process_summary["external_processes"],
                     "external_processes_truncated": process_summary["external_processes_truncated"],
                     "raw_output": "not_returned",
+                },
+                {
+                    "name": f"agent_{agent}_single_identity_guard",
+                    **identity_guard,
                 },
             ]
         )

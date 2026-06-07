@@ -45,6 +45,7 @@ from codex_master.server import (
     allowed_raw_log_path,
     append_bounded_raw_log,
     agent_lifecycle_lock,
+    agent_identity_guard,
     agent_home_process_summary,
     check_mcp_registration,
     call_tool,
@@ -1441,7 +1442,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.6.3+codex.test",
+            "version": "0.6.4+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1468,7 +1469,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.6.3")
+        self.assertEqual(result["expected_tag"], "v0.6.4")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -2076,6 +2077,9 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(payload["response_state"]["state"], "blocked_by_limit")
         self.assertEqual(payload["home"], "not_returned")
         self.assertEqual(payload["home_kind"], "managed_agent_home")
+        self.assertEqual(payload["home_managed_process_count"], 0)
+        self.assertTrue(payload["identity_guard"]["ok"])
+        self.assertEqual(payload["identity_guard"]["state"], "clear")
         self.assertEqual(payload["runner"], "not_returned")
         self.assertEqual(payload["cwd_state"], "not_set")
         payload_text = json.dumps(payload, sort_keys=True)
@@ -2138,6 +2142,9 @@ class ServerHelpersTest(unittest.TestCase):
         payload_text = json.dumps(payload, sort_keys=True)
         self.assertEqual(payload["home"], "not_returned")
         self.assertEqual(payload["runner"], "not_returned")
+        self.assertEqual(payload["home_managed_process_count"], 1)
+        self.assertTrue(payload["identity_guard"]["ok"])
+        self.assertEqual(payload["identity_guard"]["state"], "managed_session_running")
         self.assertNotIn(str(log_path), payload_text)
         self.assertNotIn(str(tmp_path), payload_text)
 
@@ -2830,6 +2837,22 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(summary["external_processes"][0]["raw_output"], "not_returned")
         self.assertNotIn(str(home), json.dumps(summary, sort_keys=True))
 
+    def test_agent_identity_guard_blocks_orphaned_managed_home_process(self) -> None:
+        summary = {
+            "process_count": 1,
+            "managed_process_count": 1,
+            "external_process_count": 0,
+            "raw_output": "not_returned",
+        }
+
+        result = agent_identity_guard(False, summary)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["state"], "blocked_orphaned_managed_home_process")
+        self.assertTrue(result["single_identity_required"])
+        self.assertEqual(result["home_managed_process_count"], 1)
+        self.assertEqual(result["raw_output"], "not_returned")
+
     def test_agent_lifecycle_lock_refuses_symlink_lock_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -3073,6 +3096,30 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["lease"]["holder"], "this_server")
         self.assertFalse(mock_start_agent.call_args.kwargs["release_lease_on_failure"])
 
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("codex_master.server.start_agent")
+    def test_start_agent_with_lease_blocks_running_foreign_lease(self, mock_start_agent, _mock_tmux_alive) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch(
+                "codex_master.server.LEASE_DIR", state / "leases"
+            ):
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                    claim_agent("b", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
+                    with self.assertRaises(AgentBusyError) as caught:
+                        start_agent_with_lease("b", "/tmp/work", "hi")
+
+        self.assertEqual(caught.exception.payload["error_code"], "agent_lease_held_by_other_client")
+        self.assertEqual(caught.exception.payload["lease"]["holder"], "other_server")
+        self.assertEqual(caught.exception.payload["raw_output"], "not_returned")
+        mock_start_agent.assert_not_called()
+
     def test_agent_claim_wait_rejects_invalid_direct_interval_values(self) -> None:
         with self.assertRaisesRegex(AgentError, "wait_seconds must be an integer or forever"):
             claim_agent_with_wait("a", wait_seconds="nope")
@@ -3238,6 +3285,38 @@ class ServerHelpersTest(unittest.TestCase):
                 clear=False,
             ):
                 with self.assertRaisesRegex(RuntimeError, "CODEX_HOME is already used"):
+                    start_agent("a", cwd=tmpdir)
+
+        mock_summary.assert_called_once_with("a")
+        mock_run_tmux.assert_not_called()
+
+    @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("codex_master.server.run_tmux")
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 1,
+            "external_process_count": 0,
+            "managed_process_count": 1,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
+    def test_start_agent_blocks_orphaned_managed_codex_home_user(
+        self, mock_summary, mock_run_tmux, _mock_tmux_alive, _mock_ensure_state
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = Path(tmpdir) / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
+                clear=False,
+            ):
+                with self.assertRaisesRegex(AgentError, "managed process\\(es\\) without the managed tmux session"):
                     start_agent("a", cwd=tmpdir)
 
         mock_summary.assert_called_once_with("a")
@@ -5126,6 +5205,8 @@ class CliLifecycleTest(unittest.TestCase):
             mock_wrapper_path.return_value = wrapper
             mock_agent_home_process_summary.side_effect = lambda agent: {
                 "home": agent,
+                "process_count": 0,
+                "managed_process_count": 0,
                 "external_process_count": 0,
                 "external_processes": [],
                 "external_processes_truncated": False,
