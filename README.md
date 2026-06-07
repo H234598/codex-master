@@ -139,6 +139,7 @@ python3 -m codex_master.server stop both
 `doctor`
 - checks availability of required tooling (`codex`, `tmux`) and MCP state directory
 - reports a structured `checks` object
+- verifies the installed MCP command with a data-sparse `initialize` probe
 - reports whether the active Codex MCP registration has
   `startup_timeout_sec >= 120`
 - reports whether the active `CODEX_HOME` looks like the main default home, a

@@ -164,8 +164,10 @@ Data minimization:
   crashing. Install must persist `startup_timeout_sec = 120` for the active MCP
   registration and refuse Master MCP registration from a managed Agentinnen
   `CODEX_HOME`. Registering install paths must pass a data-sparse MCP startup
-  self-test before registration. `doctor` must warn, without returning changed
-  file names, when the installed MCP points at a dirty repo worktree.
+  self-test before registration. `doctor` must run the same data-sparse startup
+  self-test, tolerate unavailable commands without raw error output, and warn
+  without returning changed file names when the installed MCP points at a dirty
+  repo worktree.
 - Use `tail` only for an explicit capped, ANSI-stripped, redacted excerpt.
 - Do not read raw tmux logs directly unless the user explicitly requests it and
   the privacy impact is acceptable.

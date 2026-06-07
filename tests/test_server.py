@@ -46,6 +46,7 @@ from codex_master.server import (
     install,
     installed_source_worktree_state,
     mcp_command_startup_self_test,
+    mcp_probe_response_ok,
     mcp_registration_command_matches,
     main_cli,
     prune_raw_logs,
@@ -2534,7 +2535,10 @@ class CliLifecycleTest(unittest.TestCase):
         mock_run.return_value = subprocess.CompletedProcess(
             ["codex-master-mcp"],
             0,
-            'Content-Length: 77\r\n\r\n{"jsonrpc":"2.0","id":1,"serverInfo":{"name":"codex-master-mcp"}} SECRET',
+            (
+                'Content-Length: 118\r\n\r\n{"jsonrpc":"2.0","id":1,'
+                '"result":{"serverInfo":{"name":"codex-master-mcp"}}} SECRET'
+            ),
             "",
         )
 
@@ -2544,6 +2548,26 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertNotIn("SECRET", json.dumps(result, sort_keys=True))
         self.assertEqual(mock_run.call_args.kwargs["timeout"], DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS)
+
+    @patch("codex_master.server.subprocess.run")
+    def test_mcp_command_startup_self_test_handles_missing_command(self, mock_run) -> None:
+        mock_run.side_effect = FileNotFoundError("SECRET_PATH_SHOULD_NOT_RETURN")
+
+        result = mcp_command_startup_self_test(Path("/tmp/missing-codex-master-mcp"))
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["raw_output"], "not_returned")
+        self.assertNotIn("SECRET_PATH_SHOULD_NOT_RETURN", json.dumps(result, sort_keys=True))
+
+    def test_mcp_probe_response_requires_json_rpc_server_info(self) -> None:
+        self.assertTrue(
+            mcp_probe_response_ok(
+                'Content-Length: 118\r\n\r\n{"jsonrpc":"2.0","id":1,'
+                '"result":{"serverInfo":{"name":"codex-master-mcp"}}}'
+            )
+        )
+        self.assertFalse(mcp_probe_response_ok('codex-master-mcp finished with "id":1 but no JSON-RPC response'))
 
     @patch("codex_master.server.run_command")
     def test_installed_source_worktree_state_warns_without_paths(self, mock_run) -> None:

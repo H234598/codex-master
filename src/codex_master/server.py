@@ -414,6 +414,26 @@ def mcp_initialize_probe_payload() -> str:
     ) + "\n"
 
 
+def mcp_probe_response_ok(output: str) -> bool:
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(output):
+        if char != "{":
+            continue
+        try:
+            payload, _end = decoder.raw_decode(output[index:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or payload.get("id") != 1:
+            continue
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            continue
+        server_info = result.get("serverInfo")
+        if isinstance(server_info, dict) and server_info.get("name") == MCP_SERVER_NAME:
+            return True
+    return False
+
+
 def mcp_command_startup_self_test(
     command_path: Path,
     *,
@@ -430,6 +450,13 @@ def mcp_command_startup_self_test(
             check=False,
             timeout=timeout,
         )
+    except OSError:
+        return {
+            "ok": False,
+            "status": "unavailable",
+            "timeout_seconds": timeout,
+            "raw_output": "not_returned",
+        }
     except subprocess.TimeoutExpired:
         return {
             "ok": False,
@@ -439,7 +466,7 @@ def mcp_command_startup_self_test(
         }
 
     output = cp.stdout + cp.stderr
-    ok = cp.returncode == 0 and MCP_SERVER_NAME in output and '"id":1' in output
+    ok = cp.returncode == 0 and mcp_probe_response_ok(output)
     return {
         "ok": ok,
         "status": "ok" if ok else "failed",
@@ -2246,6 +2273,7 @@ def doctor() -> dict[str, Any]:
             "target": installed_target,
         },
         installed_source_worktree_state(resolved_install_path, wrapper),
+        {"name": "mcp_startup_self_test", **mcp_command_startup_self_test(install_path)},
     ]
     for agent, cfg in AGENTS.items():
         process_summary = agent_home_process_summary(agent)
