@@ -256,6 +256,42 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(log_names, ["log-2.log", "log-3.log"])
         self.assertTrue(all(size <= 80 for size in log_sizes))
 
+    def test_prune_raw_logs_unlinks_symlinks_without_touching_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw"
+            raw_dir.mkdir()
+            target = Path(tmpdir) / "outside.log"
+            target.write_bytes(b"x" * 200)
+            target.chmod(0o644)
+            link = raw_dir / "linked.log"
+            link.symlink_to(target)
+            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
+                "codex_master.server.LEGACY_STATE_ROOT", Path(tmpdir) / "legacy"
+            ), patch("codex_master.server.META_DIR", Path(tmpdir) / "meta"), patch(
+                "codex_master.server.LEGACY_META_DIR", Path(tmpdir) / "legacy" / "meta"
+            ):
+                result = prune_raw_logs(max_files=2, max_bytes=80)
+                target_size = target.stat().st_size
+                target_mode = stat.S_IMODE(target.stat().st_mode)
+                link_exists = link.exists() or link.is_symlink()
+
+        self.assertEqual(result["deleted_symlink_count"], 1)
+        self.assertEqual(target_size, 200)
+        self.assertEqual(target_mode, 0o644)
+        self.assertFalse(link_exists)
+
+    def test_append_bounded_raw_log_rejects_symlink_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "target.log"
+            target.write_bytes(b"target")
+            link = Path(tmpdir) / "linked.log"
+            link.symlink_to(target)
+            with self.assertRaisesRegex(RuntimeError, "without following symlinks"):
+                append_bounded_raw_log(link, b"payload", max_bytes=128)
+            target_content = target.read_bytes()
+
+        self.assertEqual(target_content, b"target")
+
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.write_meta")
     @patch("codex_master.server.pane_pid", return_value=123)

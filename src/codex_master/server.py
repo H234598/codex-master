@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import shlex
+import stat as stat_module
 import subprocess
 import sys
 import time
@@ -249,6 +250,29 @@ def replace_private_bytes(path: Path, data: bytes) -> None:
             pass
 
 
+def open_private_regular_update(path: Path) -> Any:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise AgentError(f"could not open private state file without following symlinks: {path}") from exc
+    try:
+        current_stat = os.fstat(fd)
+        if not stat_module.S_ISREG(current_stat.st_mode):
+            raise AgentError(f"private state path is not a regular file: {path}")
+        try:
+            os.fchmod(fd, 0o600)
+        except PermissionError:
+            pass
+        return os.fdopen(fd, "r+b")
+    except Exception:
+        os.close(fd)
+        raise
+
+
 def managed_raw_dirs() -> tuple[Path, ...]:
     legacy_raw = LEGACY_STATE_ROOT / "raw"
     dirs = [RAW_DIR]
@@ -287,14 +311,18 @@ def protected_raw_log_paths() -> set[Path]:
 def bound_raw_log_file(path: Path, max_bytes: int = MAX_RAW_LOG_BYTES) -> bool:
     max_bytes = max(1, int(max_bytes))
     try:
-        size = path.stat().st_size
+        current_stat = path.lstat()
     except OSError:
         return False
-    if size <= max_bytes:
+    if not stat_module.S_ISREG(current_stat.st_mode):
         return False
     marker = RAW_LOG_TRUNCATION_MARKER[: max(0, max_bytes - 1)]
-    tail_limit = max(0, max_bytes - len(marker))
-    with path.open("rb") as fh:
+    with open_private_regular_update(path) as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        if size <= max_bytes:
+            return False
+        tail_limit = max(0, max_bytes - len(marker))
         fh.seek(max(0, size - tail_limit), os.SEEK_SET)
         tail = fh.read(tail_limit)
     replace_private_bytes(path, marker + tail)
@@ -305,13 +333,7 @@ def append_bounded_raw_log(path: Path, chunk: bytes, max_bytes: int = MAX_RAW_LO
     max_bytes = max(1, int(max_bytes))
     if not chunk:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.touch(mode=0o600, exist_ok=True)
-    try:
-        path.chmod(0o600)
-    except PermissionError:
-        pass
-    with path.open("r+b") as fh:
+    with open_private_regular_update(path) as fh:
         fh.seek(0, os.SEEK_END)
         size = fh.tell()
         if size + len(chunk) <= max_bytes:
@@ -350,26 +372,39 @@ def prune_raw_logs(max_files: int = MAX_RAW_LOG_FILES, max_bytes: int = MAX_RAW_
     max_bytes = max(1, int(max_bytes))
     protected = protected_raw_log_paths()
     deleted = 0
+    deleted_symlink = 0
     truncated = 0
     retained = 0
     for raw_dir in managed_raw_dirs():
         if not raw_dir.exists():
             continue
-        logs = sorted(
-            (path for path in raw_dir.glob("*.log") if path.is_file()),
-            key=lambda path: (path.stat().st_mtime, path.name),
-            reverse=True,
-        )
+        logs: list[tuple[Path, os.stat_result]] = []
+        for path in raw_dir.glob("*.log"):
+            try:
+                current_stat = path.lstat()
+            except OSError:
+                continue
+            if stat_module.S_ISLNK(current_stat.st_mode):
+                try:
+                    path.unlink()
+                    deleted += 1
+                    deleted_symlink += 1
+                except FileNotFoundError:
+                    pass
+                continue
+            if stat_module.S_ISREG(current_stat.st_mode):
+                logs.append((path, current_stat))
+        logs = sorted(logs, key=lambda item: (item[1].st_mtime, item[0].name), reverse=True)
         keep: set[Path] = set(protected)
-        for path in logs[:max_files]:
+        for path, _current_stat in logs[:max_files]:
             keep.add(path.resolve(strict=False))
-        for path in logs:
+        for path, current_stat in logs:
             resolved = path.resolve(strict=False)
             try:
                 path.chmod(0o600)
             except PermissionError:
                 pass
-            if resolved not in protected and path.stat().st_size > max_bytes:
+            if resolved not in protected and current_stat.st_size > max_bytes:
                 truncated += 1 if bound_raw_log_file(path, max_bytes) else 0
             if resolved in keep:
                 retained += 1
@@ -384,6 +419,7 @@ def prune_raw_logs(max_files: int = MAX_RAW_LOG_FILES, max_bytes: int = MAX_RAW_
         "max_bytes_per_file": max_bytes,
         "retained_count": retained,
         "deleted_count": deleted,
+        "deleted_symlink_count": deleted_symlink,
         "truncated_count": truncated,
         "raw_output": "not_returned",
     }
@@ -397,13 +433,14 @@ def raw_log_retention_status() -> dict[str, Any]:
         if not raw_dir.exists():
             continue
         for path in raw_dir.glob("*.log"):
-            if not path.is_file():
-                continue
-            file_count += 1
             try:
-                size = path.stat().st_size
+                current_stat = path.lstat()
             except OSError:
                 continue
+            if not stat_module.S_ISREG(current_stat.st_mode):
+                continue
+            file_count += 1
+            size = current_stat.st_size
             total_bytes += size
             oversized_count += int(size > MAX_RAW_LOG_BYTES)
     return {

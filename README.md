@@ -156,8 +156,9 @@ fields at 1,000 characters, and assignment lists at 50 items.
 Raw logs are local debug artifacts, not normal API data. The tmux pipe writes
 through a bounded local writer, `doctor` reports the configured raw-log policy,
 and `tail --source log` refuses metadata paths outside the managed raw-log state.
-Use `tail` only when an explicit, capped, ANSI-stripped, redacted excerpt is
-needed.
+Managed raw logs must be regular files; symlinks are not followed and are pruned
+from raw-log directories. Use `tail` only when an explicit, capped,
+ANSI-stripped, redacted excerpt is needed.
 
 Model policy: Agentin A and Agentin B run on `gpt-5.4-mini` by default. Read-only
 Exploriererin assignments keep that model. Arbeitsbiene write assignments are
