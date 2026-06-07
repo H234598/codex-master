@@ -40,6 +40,7 @@ META_DIR = STATE_ROOT / "meta"
 LOCK_DIR = STATE_ROOT / "locks"
 LEASE_DIR = STATE_ROOT / "leases"
 ASSIGNMENT_LOG = STATE_ROOT / "assignments.jsonl"
+SELECTOR_POLICY_FILE = STATE_ROOT / "selector-policy.json"
 LEGACY_META_DIR = LEGACY_STATE_ROOT / "meta"
 DEFAULT_AGENT_MODEL = "gpt-5.4-mini"
 DEFAULT_AGENT_MODEL_EFFORT = "medium"
@@ -102,6 +103,7 @@ MAX_CODEX_CONFIG_BYTES = 1024 * 1024
 MAX_PLUGIN_MANIFEST_BYTES = 64 * 1024
 MAX_PLUGIN_CACHE_VERSIONS = 20
 MAX_PLUGIN_CACHE_RETAINED_VERSIONS = 5
+MAX_SELECTOR_POLICY_BYTES = 4096
 MAX_PAGED_OFFSET = 10_000_000
 PLUGIN_CACHE_ALLOWED_FILES = (".app.json", ".mcp.json", "README.md", "codex-agent-pool.json", "pyproject.toml")
 PLUGIN_CACHE_ALLOWED_DIRS = (".codex-plugin", "bin", "docs", "examples", "schemas", "scripts", "skills", "src", "systemd")
@@ -128,6 +130,8 @@ MAX_POOL_SHARED_ASSETS = 40
 MAX_POOL_RUNTIME_DIRS = 40
 AGENT_SERIES = ("a", "b", "c")
 AGENTS_PER_SERIES = 100
+DEFAULT_ORDINAL_AGENT_SERIES = ("a", "b")
+AGENT_SELECTOR_SERIES_ENV = "CODEX_MASTER_AGENT_SELECTOR_SERIES"
 AGENT_IDS = tuple(f"{series}{index}" for series in AGENT_SERIES for index in range(1, AGENTS_PER_SERIES + 1))
 PRIMARY_AGENT_IDS = ("a1", "b1")
 LEGACY_AGENT_ALIASES = {"a": "a1", "b": "b1"}
@@ -137,6 +141,7 @@ SERIES_AGENT_IDS = {
 }
 AGENT_SELECTOR_DESCRIPTION = (
     "Agentin selector: a1..a100, b1..b100, c1..c100; legacy aliases a/b; "
+    "numeric ordinal selectors 1=a1, 2=b1, 3=a2 by default; "
     "group selectors both, all, a-series, b-series, c-series."
 )
 DEFAULT_AGENTIN_BASE_NAMES = (
@@ -240,6 +245,7 @@ PLUGIN_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]{0,199}$")
 RELEASE_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+(?:[A-Za-z0-9.+_-]*)?$")
 BRACKETED_PASTE_BEGIN = "\x1b[200~"
 BRACKETED_PASTE_END = "\x1b[201~"
+CODEX_TUI_SUBMIT_KEY = "S-Enter"
 PATH_NOT_RETURNED = "not_returned"
 
 
@@ -663,11 +669,111 @@ def assert_install_context_allows_master_registration() -> None:
         raise AgentError("refusing to register Master MCP inside a managed Agentin home")
 
 
+def normalize_agent_selector_text(agent: str) -> str:
+    return str(agent).strip().lower()
+
+
+def selector_policy_path() -> Path:
+    return SELECTOR_POLICY_FILE
+
+
+def parse_selector_series_value(value: Any, *, field: str = "series") -> tuple[str, ...]:
+    if isinstance(value, str):
+        items = [item.strip().lower() for item in value.split(",")]
+    elif isinstance(value, list):
+        items = [str(item).strip().lower() for item in value if isinstance(item, str)]
+    else:
+        raise AgentError(f"{field} must be a comma-separated string or array of series prefixes")
+    series = tuple(item for item in items if item)
+    if not series:
+        raise AgentError(f"{field} must contain at least one Agentinnen series")
+    invalid = [item for item in series if item not in AGENT_SERIES]
+    if invalid:
+        raise AgentError(f"{field} contains unknown Agentinnen series: {', '.join(invalid)}")
+    if len(set(series)) != len(series):
+        raise AgentError(f"{field} must not contain duplicate Agentinnen series")
+    return series
+
+
+def selector_policy_series() -> tuple[str, ...]:
+    env_value = os.environ.get(AGENT_SELECTOR_SERIES_ENV)
+    if env_value:
+        return parse_selector_series_value(env_value, field=AGENT_SELECTOR_SERIES_ENV)
+    path = selector_policy_path()
+    try:
+        current_stat = path.lstat()
+    except FileNotFoundError:
+        return DEFAULT_ORDINAL_AGENT_SERIES
+    except OSError:
+        return DEFAULT_ORDINAL_AGENT_SERIES
+    if not stat_module.S_ISREG(current_stat.st_mode) or current_stat.st_size > MAX_SELECTOR_POLICY_BYTES:
+        return DEFAULT_ORDINAL_AGENT_SERIES
+    try:
+        text = read_private_regular_text(path, MAX_SELECTOR_POLICY_BYTES, "could not read selector policy")
+        payload = json.loads(text)
+    except (AgentError, json.JSONDecodeError):
+        return DEFAULT_ORDINAL_AGENT_SERIES
+    if not isinstance(payload, dict) or "series" not in payload:
+        return DEFAULT_ORDINAL_AGENT_SERIES
+    try:
+        return parse_selector_series_value(payload["series"], field="selector policy series")
+    except AgentError:
+        return DEFAULT_ORDINAL_AGENT_SERIES
+
+
+def selector_policy_status() -> dict[str, Any]:
+    series = selector_policy_series()
+    return {
+        "series": list(series),
+        "default_series": list(DEFAULT_ORDINAL_AGENT_SERIES),
+        "env_override": AGENT_SELECTOR_SERIES_ENV,
+        "env_override_active": bool(os.environ.get(AGENT_SELECTOR_SERIES_ENV)),
+        "policy_file": PATH_NOT_RETURNED,
+        "ordinal_mapping": ordinal_mapping_preview(series),
+        "raw_output": "not_returned",
+    }
+
+
+def set_selector_policy(series: Any) -> dict[str, Any]:
+    selected_series = parse_selector_series_value(series, field="series")
+    ensure_state()
+    payload = {"series": list(selected_series), "updated_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat()}
+    replace_private_text(selector_policy_path(), json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return selector_policy_status()
+
+
+def ordinal_mapping_preview(series: tuple[str, ...] | None = None, *, limit: int = 8) -> list[dict[str, Any]]:
+    selected_series = series or selector_policy_series()
+    preview = []
+    for ordinal in range(1, max(1, limit) + 1):
+        preview.append({"selector": str(ordinal), "agent": ordinal_agent_id(str(ordinal), selected_series)})
+    return preview
+
+
+def ordinal_agent_id(selector: str, series: tuple[str, ...] | None = None) -> str:
+    value = normalize_agent_selector_text(selector)
+    if not value.isdecimal():
+        raise AgentError("ordinal selector must be a positive integer")
+    ordinal = int(value)
+    if ordinal < 1:
+        raise AgentError("ordinal selector must be >= 1")
+    selected_series = series or selector_policy_series()
+    series_index = (ordinal - 1) % len(selected_series)
+    agent_index = ((ordinal - 1) // len(selected_series)) + 1
+    agent = f"{selected_series[series_index]}{agent_index}"
+    if agent not in AGENTS:
+        raise AgentError(f"ordinal selector {selector!r} resolves outside the installed Agentinnen pool")
+    return agent
+
+
 def canonical_agent_id(agent: str) -> str:
-    if agent in AGENTS:
-        return agent
-    if agent in LEGACY_AGENT_ALIASES:
-        return LEGACY_AGENT_ALIASES[agent]
+    normalized = normalize_agent_selector_text(agent)
+    if normalized.isdecimal():
+        return ordinal_agent_id(normalized)
+    if normalized in AGENTS:
+        return normalized
+    if normalized in LEGACY_AGENT_ALIASES:
+        return LEGACY_AGENT_ALIASES[normalized]
     raise AgentError(
         f"unknown agent: {agent!r}; expected a concrete id like a1, b1, c1 or a selector like both/all/a-series"
     )
@@ -680,13 +786,14 @@ def agent_record_aliases(agent: str) -> set[str]:
 
 
 def agent_ids(agent: str) -> list[str]:
-    if agent == "all":
+    normalized = normalize_agent_selector_text(agent)
+    if normalized == "all":
         return list(AGENTS)
-    if agent == "both":
+    if normalized == "both":
         return [canonical_agent_id("a"), canonical_agent_id("b")]
-    if agent in SERIES_AGENT_IDS:
-        return [item for item in SERIES_AGENT_IDS[agent] if item in AGENTS]
-    return [canonical_agent_id(agent)]
+    if normalized in SERIES_AGENT_IDS:
+        return [item for item in SERIES_AGENT_IDS[normalized] if item in AGENTS]
+    return [canonical_agent_id(normalized)]
 
 
 def single_agent_id(agent: str, tool_name: str) -> str:
@@ -1656,6 +1763,65 @@ def is_regular_executable_no_symlink(path: Path) -> bool:
     return os.access(path, os.X_OK)
 
 
+def agent_auth_status(agent: str) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
+    auth_file = AGENTS[agent]["home"] / "auth.json"
+    try:
+        auth_stat = auth_file.lstat()
+    except FileNotFoundError:
+        state = "missing"
+        authenticated = False
+    except OSError:
+        state = "unreadable"
+        authenticated = False
+    else:
+        if stat_module.S_ISLNK(auth_stat.st_mode):
+            state = "symlink_rejected"
+            authenticated = False
+        elif not stat_module.S_ISREG(auth_stat.st_mode):
+            state = "not_regular"
+            authenticated = False
+        elif auth_stat.st_size > MAX_CODEX_CONFIG_BYTES:
+            state = "too_large"
+            authenticated = False
+        else:
+            state = "present_regular"
+            authenticated = True
+    return {
+        "authenticated": authenticated,
+        "auth_state": state,
+        "auth_file": PATH_NOT_RETURNED,
+        "raw_output": "not_returned",
+    }
+
+
+def require_authenticated_agent_for_mutation(
+    agent: str,
+    *,
+    operation: str,
+    allow_unauthenticated: bool = False,
+) -> dict[str, Any]:
+    auth = agent_auth_status(agent)
+    if allow_unauthenticated:
+        return {
+            **auth,
+            "required": False,
+            "override": True,
+            "operation": operation,
+        }
+    if not auth["authenticated"]:
+        raise AgentError(
+            f"{operation} requires authenticated Agentin {canonical_agent_id(agent)}; "
+            f"auth_state={auth['auth_state']}; pass allow_unauthenticated=true only for login/bootstrap"
+        )
+    return {
+        **auth,
+        "required": True,
+        "override": False,
+        "operation": operation,
+    }
+
+
 def managed_raw_dirs() -> tuple[Path, ...]:
     legacy_raw = LEGACY_STATE_ROOT / "raw"
     dirs = [RAW_DIR]
@@ -2216,11 +2382,24 @@ def start_agent(
     }
 
 
-def start_agent_with_lease(agent: str, cwd: Any = None, prompt: Any = None) -> dict[str, Any]:
+def start_agent_with_lease(
+    agent: str,
+    cwd: Any = None,
+    prompt: Any = None,
+    *,
+    allow_unauthenticated: bool = False,
+) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
+    auth_gate = require_authenticated_agent_for_mutation(
+        agent,
+        operation="agent_start",
+        allow_unauthenticated=allow_unauthenticated,
+    )
     if tmux_alive(AGENTS[agent]["session"]):
         ensure_agent_lease_available(agent)
-        return start_agent(agent, cwd, prompt)
+        result = start_agent(agent, cwd, prompt)
+        result["auth_gate"] = auth_gate
+        return result
     claim = claim_agent(agent)
     lease = claim["lease"]
     release_on_completion = claim["status"] in {"claimed", "claimed_expired"}
@@ -2239,6 +2418,7 @@ def start_agent_with_lease(agent: str, cwd: Any = None, prompt: Any = None) -> d
     if release_on_completion and agent_lease_status(agent).get("held_by_this_server"):
         release = release_agent(agent, force=True)
         result["lease"] = release["lease"]
+    result["auth_gate"] = auth_gate
     return result
 
 
@@ -2590,6 +2770,7 @@ def status_agent(agent: str) -> dict[str, Any]:
     identity_guard = agent_identity_guard(running, process_summary)
     raw_log_info = raw_log_metadata(raw_log_path)
     latest_assignment = latest_assignment_summary(agent)
+    auth = agent_auth_status(agent)
     pane_text = pane_tail(agent, MAX_TAIL_LINES) if running else ""
     tui_context = classify_tui_context(pane_text, running)
     limit_state = agent_limit_state(
@@ -2633,6 +2814,7 @@ def status_agent(agent: str) -> dict[str, Any]:
         "home_external_process_count": process_summary["external_process_count"],
         "home_external_processes_truncated": process_summary["external_processes_truncated"],
         "identity_guard": identity_guard,
+        "auth": auth,
         "raw_output": "not_returned",
     }
 
@@ -3314,9 +3496,15 @@ def assign_agent(
     enter: bool = True,
     allow_missing_skill: bool = False,
     allow_subagents: bool = False,
+    allow_unauthenticated: bool = False,
     lease: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
+    auth_gate = require_authenticated_agent_for_mutation(
+        agent,
+        operation="agent_assign",
+        allow_unauthenticated=allow_unauthenticated,
+    )
     role = role.strip().lower()
     if role not in {"exploriererin", "arbeitsbiene"}:
         raise AgentError("role must be 'exploriererin' or 'arbeitsbiene'")
@@ -3411,6 +3599,7 @@ def assign_agent(
         "write_policy": "read_only" if role == "exploriererin" else "explicit_paths_only",
         "write_path_count": len(write_paths),
         "subagents_allowed": allow_subagents,
+        "auth_gate": auth_gate,
         "lease": lease,
         "prompt_chars": len(prompt),
         "prompt_output": "not_returned",
@@ -4960,6 +5149,7 @@ def master_timeout_policy() -> dict[str, Any]:
         "stopped_lease_recovery": stopped_lease_recovery,
         "agent_wait": agent_wait,
         "fleet_watchdog": watchdog,
+        "agent_selector_policy": selector_policy_status(),
         "server_instance_identity": server_instance_identity_status(),
         "client_config": {
             "ok": bool(client_config.get("ok")),
@@ -4994,6 +5184,8 @@ def master_namespace_status() -> dict[str, Any]:
         "agent_pool_status": "agent_pool_status" in tool_names,
         "agent_pool_copy_auth": "agent_pool_copy_auth" in tool_names,
         "agent_pool_destroy_pool": "agent_pool_destroy_pool" in tool_names,
+        "agent_selector_policy": "agent_selector_policy" in tool_names,
+        "agent_selector_preview": "agent_selector_preview" in tool_names,
         "raw_output": "not_returned",
     }
     server_ready = bool(registration.get("ok")) and bool(startup_self_test.get("ok")) and bool(
@@ -5024,6 +5216,8 @@ def master_namespace_status() -> dict[str, Any]:
             "agent_pool_status": local_tool_contract["agent_pool_status"],
             "agent_pool_copy_auth": local_tool_contract["agent_pool_copy_auth"],
             "agent_pool_destroy_pool": local_tool_contract["agent_pool_destroy_pool"],
+            "agent_selector_policy": local_tool_contract["agent_selector_policy"],
+            "agent_selector_preview": local_tool_contract["agent_selector_preview"],
         },
         "local_tool_contract": local_tool_contract,
         "mcp_registration": registration,
@@ -5330,15 +5524,16 @@ def send_agent(agent: str, text: str, enter: bool = True) -> dict[str, Any]:
     if cp.returncode != 0:
         raise AgentError(f"tmux paste-buffer failed for agent {agent}: {command_error_text(cp.stderr)}")
     if enter:
-        cp = run_tmux(["send-keys", "-t", session, "Enter"], check=False)
+        cp = run_tmux(["send-keys", "-t", session, CODEX_TUI_SUBMIT_KEY], check=False)
         if cp.returncode != 0:
-            raise AgentError(f"tmux send Enter failed for agent {agent}: {command_error_text(cp.stderr)}")
+            raise AgentError(f"tmux send submit key failed for agent {agent}: {command_error_text(cp.stderr)}")
     return {
         "agent": agent,
         "status": "sent",
         "chars": len(text),
         "paste_mode": paste_mode,
         "submitted": enter,
+        "submit_key": CODEX_TUI_SUBMIT_KEY if enter else None,
         "response_output": "not_returned",
     }
 
@@ -5503,12 +5698,38 @@ def call_agent_lifecycle(agent: str, fn: Any) -> dict[str, Any]:
         return fn()
 
 
+def call_authenticated_agent_mutation(
+    agent: str,
+    *,
+    operation: str,
+    allow_unauthenticated: bool,
+    fn: Any,
+) -> dict[str, Any]:
+    auth_gate = require_authenticated_agent_for_mutation(
+        agent,
+        operation=operation,
+        allow_unauthenticated=allow_unauthenticated,
+    )
+    result = fn()
+    result["auth_gate"] = auth_gate
+    return result
+
+
 def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "agent_start":
         selected = agent_ids(str(args.get("agent", "both")))
+        allow_unauthenticated = bool_arg(args, "allow_unauthenticated", False)
         return multi_agent_result(
             selected,
-            lambda agent: call_agent_lifecycle(agent, lambda: start_agent_with_lease(agent, args.get("cwd"), args.get("prompt"))),
+            lambda agent: call_agent_lifecycle(
+                agent,
+                lambda: start_agent_with_lease(
+                    agent,
+                    args.get("cwd"),
+                    args.get("prompt"),
+                    allow_unauthenticated=allow_unauthenticated,
+                ),
+            ),
         )
     if name == "agent_stop":
         selected = agent_ids(str(args.get("agent", "both")))
@@ -5580,6 +5801,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 enter=bool_arg(args, "enter", True),
                 allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
                 allow_subagents=bool_arg(args, "allow_subagents", False),
+                allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
             ),
         )
     if name == "agent_assign_readonly":
@@ -5598,6 +5820,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 enter=bool_arg(args, "enter", True),
                 allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
                 allow_subagents=bool_arg(args, "allow_subagents", False),
+                allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
             ),
         )
     if name == "agent_assign_write":
@@ -5617,6 +5840,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 enter=bool_arg(args, "enter", True),
                 allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
                 allow_subagents=bool_arg(args, "allow_subagents", False),
+                allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
             ),
         )
     if name == "agent_assignments":
@@ -5628,13 +5852,18 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         selected_agent = single_agent_id(str(args.get("agent", "")), "agent_report_request")
         return call_agent_lifecycle(
             selected_agent,
-            lambda: run_with_agent_lease(
+            lambda: call_authenticated_agent_mutation(
                 selected_agent,
-                lambda lease: request_agent_report(
+                operation="agent_report_request",
+                allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
+                fn=lambda: run_with_agent_lease(
                     selected_agent,
-                    args.get("assignment_id"),
-                    bool_arg(args, "enter", True),
-                    lease=lease,
+                    lambda lease: request_agent_report(
+                        selected_agent,
+                        args.get("assignment_id"),
+                        bool_arg(args, "enter", True),
+                        lease=lease,
+                    ),
                 ),
             ),
         )
@@ -5663,6 +5892,20 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return master_watchdog_status()
     if name == "master_timeout_policy":
         return master_timeout_policy()
+    if name == "agent_selector_policy":
+        series = args.get("series")
+        if series is None:
+            return selector_policy_status()
+        return set_selector_policy(series)
+    if name == "agent_selector_preview":
+        series = args.get("series")
+        selected_series = selector_policy_series() if series is None else parse_selector_series_value(series)
+        limit = normalize_int_field(args.get("limit", 8), field="limit", minimum=1, maximum=30)
+        return {
+            "series": list(selected_series),
+            "ordinal_mapping": ordinal_mapping_preview(selected_series, limit=limit),
+            "raw_output": "not_returned",
+        }
     if name == "agent_pool_validate":
         return agent_pool_validate(
             args.get("spec") if isinstance(args.get("spec"), str) else None,
@@ -5717,12 +5960,17 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             raise AgentError("agent_send requires non-empty text")
         return call_agent_lifecycle(
             selected_agent,
-            lambda: run_with_agent_lease(
+            lambda: call_authenticated_agent_mutation(
                 selected_agent,
-                lambda lease: {
-                    **send_agent(selected_agent, text, bool_arg(args, "enter", True)),
-                    "lease": lease,
-                },
+                operation="agent_send",
+                allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
+                fn=lambda: run_with_agent_lease(
+                    selected_agent,
+                    lambda lease: {
+                        **send_agent(selected_agent, text, bool_arg(args, "enter", True)),
+                        "lease": lease,
+                    },
+                ),
             ),
         )
     if name == "agent_interrupt":
@@ -5733,16 +5981,22 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         )
     if name == "agent_claim":
         selected_agent = single_agent_id(str(args.get("agent", "")), "agent_claim")
+        allow_unauthenticated = bool_arg(args, "allow_unauthenticated", False)
         wait_forever = bool_arg(args, "wait_forever", "wait_seconds" not in args and DEFAULT_CLAIM_WAIT_FOREVER)
         wait_seconds: int | str | None = None if wait_forever else int_arg(args, "wait_seconds", 0)
-        return claim_agent_with_wait(
+        return call_authenticated_agent_mutation(
             selected_agent,
-            int_arg(args, "ttl_seconds", DEFAULT_AGENT_LEASE_SECONDS),
-            bool_arg(args, "force", False),
-            wait_seconds,
-            int_arg(args, "poll_interval_seconds", DEFAULT_WAIT_POLL_SECONDS),
-            bool_arg(args, "recover_stopped", True),
-            int_arg(args, "stopped_grace_seconds", DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS),
+            operation="agent_claim",
+            allow_unauthenticated=allow_unauthenticated,
+            fn=lambda: claim_agent_with_wait(
+                selected_agent,
+                int_arg(args, "ttl_seconds", DEFAULT_AGENT_LEASE_SECONDS),
+                bool_arg(args, "force", False),
+                wait_seconds,
+                int_arg(args, "poll_interval_seconds", DEFAULT_WAIT_POLL_SECONDS),
+                bool_arg(args, "recover_stopped", True),
+                int_arg(args, "stopped_grace_seconds", DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS),
+            ),
         )
     if name == "agent_release":
         selected_agent = single_agent_id(str(args.get("agent", "")), "agent_release")
@@ -5781,9 +6035,17 @@ def text_schema(max_chars: int, **extra: Any) -> dict[str, Any]:
     return schema
 
 
+def allow_unauthenticated_schema() -> dict[str, Any]:
+    return {
+        "type": "boolean",
+        "default": False,
+        "description": "Bootstrap/login override only. Default false requires a regular per-Agentin auth.json.",
+    }
+
+
 def agent_selector_schema(*, default: str | None = None, single: bool = False) -> dict[str, Any]:
     description = (
-        "Concrete Agentin id or legacy alias: a1..a100, b1..b100, c1..c100, a, b."
+        "Concrete Agentin id, legacy alias, or ordinal selector: a1..a100, b1..b100, c1..c100, a, b, 1, 2, 3."
         if single
         else AGENT_SELECTOR_DESCRIPTION
     )
@@ -6438,6 +6700,7 @@ TOOLS: list[dict[str, Any]] = [
                 "agent": agent_selector_schema(default="both"),
                 "cwd": text_schema(MAX_PATH_TEXT, description="Working directory. Defaults to the MCP server cwd."),
                 "prompt": text_schema(MAX_SEND_TEXT, description="Optional initial prompt passed to Codex."),
+                "allow_unauthenticated": allow_unauthenticated_schema(),
             },
             "additionalProperties": False,
         },
@@ -6499,6 +6762,7 @@ TOOLS: list[dict[str, Any]] = [
                     "default": DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
                 },
                 "force": {"type": "boolean", "default": False},
+                "allow_unauthenticated": allow_unauthenticated_schema(),
             },
             "additionalProperties": False,
         },
@@ -6583,6 +6847,7 @@ TOOLS: list[dict[str, Any]] = [
                 "agent": agent_selector_schema(single=True),
                 "text": text_schema(MAX_SEND_TEXT),
                 "enter": {"type": "boolean", "default": True},
+                "allow_unauthenticated": allow_unauthenticated_schema(),
             },
             "additionalProperties": False,
         },
@@ -6703,6 +6968,7 @@ TOOLS: list[dict[str, Any]] = [
                 "enter": {"type": "boolean", "default": True},
                 "allow_missing_skill": {"type": "boolean", "default": False},
                 "allow_subagents": {"type": "boolean", "default": False},
+                "allow_unauthenticated": allow_unauthenticated_schema(),
             },
             "additionalProperties": False,
         },
@@ -6724,6 +6990,7 @@ TOOLS: list[dict[str, Any]] = [
                 "enter": {"type": "boolean", "default": True},
                 "allow_missing_skill": {"type": "boolean", "default": False},
                 "allow_subagents": {"type": "boolean", "default": False},
+                "allow_unauthenticated": allow_unauthenticated_schema(),
             },
             "additionalProperties": False,
         },
@@ -6746,6 +7013,7 @@ TOOLS: list[dict[str, Any]] = [
                 "enter": {"type": "boolean", "default": True},
                 "allow_missing_skill": {"type": "boolean", "default": False},
                 "allow_subagents": {"type": "boolean", "default": False},
+                "allow_unauthenticated": allow_unauthenticated_schema(),
             },
             "additionalProperties": False,
         },
@@ -6782,6 +7050,36 @@ TOOLS: list[dict[str, Any]] = [
                 "agent": agent_selector_schema(single=True),
                 "assignment_id": text_schema(MAX_ASSIGNMENT_ID),
                 "enter": {"type": "boolean", "default": True},
+                "allow_unauthenticated": allow_unauthenticated_schema(),
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_selector_policy",
+        "description": "Show or set ordinal Agentin selector policy. Default series is a,b so 1=a1, 2=b1, 3=a2. Pass series like 'a,b,c' to include C.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "series": text_schema(
+                    32,
+                    description="Optional comma-separated case-insensitive series prefixes, for example a,b or a,b,c.",
+                ),
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_selector_preview",
+        "description": "Preview ordinal Agentin selector mapping for the current or supplied selector policy. Does not mutate state.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "series": text_schema(
+                    32,
+                    description="Optional comma-separated case-insensitive series prefixes, for example a,b or a,b,c.",
+                ),
+                "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 8},
             },
             "additionalProperties": False,
         },
@@ -7145,9 +7443,17 @@ def main_cli(argv: list[str]) -> int:
     p_start.add_argument("agent", nargs="?", default="both", help=AGENT_SELECTOR_DESCRIPTION)
     p_start.add_argument("--cwd")
     p_start.add_argument("--prompt")
+    p_start.add_argument("--allow-unauthenticated", action="store_true")
 
     p_status = sub.add_parser("status")
     p_status.add_argument("agent", nargs="?", default="all", help=AGENT_SELECTOR_DESCRIPTION)
+
+    p_selector_policy = sub.add_parser("selector-policy")
+    p_selector_policy.add_argument("--series")
+
+    p_selector_preview = sub.add_parser("selector-preview")
+    p_selector_preview.add_argument("--series")
+    p_selector_preview.add_argument("--limit", type=int, default=8)
 
     p_wait = sub.add_parser("wait")
     p_wait.add_argument("agent", help="Concrete Agentin id or legacy alias: a1..a100, b1..b100, c1..c100, a, b.")
@@ -7169,6 +7475,7 @@ def main_cli(argv: list[str]) -> int:
     p_send.add_argument("agent")
     p_send.add_argument("text")
     p_send.add_argument("--no-enter", action="store_true")
+    p_send.add_argument("--allow-unauthenticated", action="store_true")
 
     p_interrupt = sub.add_parser("interrupt")
     p_interrupt.add_argument("agent")
@@ -7194,6 +7501,7 @@ def main_cli(argv: list[str]) -> int:
     p_claim.add_argument("--no-recover-stopped", dest="recover_stopped", action="store_false")
     p_claim.add_argument("--stopped-grace-seconds", type=int, default=DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS)
     p_claim.add_argument("--force", action="store_true")
+    p_claim.add_argument("--allow-unauthenticated", action="store_true")
 
     p_release = sub.add_parser("release")
     p_release.add_argument("agent")
@@ -7239,6 +7547,7 @@ def main_cli(argv: list[str]) -> int:
     p_assign.add_argument("--no-enter", action="store_true")
     p_assign.add_argument("--allow-missing-skill", action="store_true")
     p_assign.add_argument("--allow-subagents", action="store_true")
+    p_assign.add_argument("--allow-unauthenticated", action="store_true")
 
     p_assign_readonly = sub.add_parser("assign-readonly")
     p_assign_readonly.add_argument("agent")
@@ -7251,6 +7560,7 @@ def main_cli(argv: list[str]) -> int:
     p_assign_readonly.add_argument("--no-enter", action="store_true")
     p_assign_readonly.add_argument("--allow-missing-skill", action="store_true")
     p_assign_readonly.add_argument("--allow-subagents", action="store_true")
+    p_assign_readonly.add_argument("--allow-unauthenticated", action="store_true")
 
     p_assign_write = sub.add_parser("assign-write")
     p_assign_write.add_argument("agent")
@@ -7264,6 +7574,7 @@ def main_cli(argv: list[str]) -> int:
     p_assign_write.add_argument("--no-enter", action="store_true")
     p_assign_write.add_argument("--allow-missing-skill", action="store_true")
     p_assign_write.add_argument("--allow-subagents", action="store_true")
+    p_assign_write.add_argument("--allow-unauthenticated", action="store_true")
 
     p_assignments = sub.add_parser("assignments")
     p_assignments.add_argument("agent", nargs="?", default="all", help=AGENT_SELECTOR_DESCRIPTION)
@@ -7276,6 +7587,7 @@ def main_cli(argv: list[str]) -> int:
     p_report.add_argument("agent")
     p_report.add_argument("--assignment-id")
     p_report.add_argument("--no-enter", action="store_true")
+    p_report.add_argument("--allow-unauthenticated", action="store_true")
 
     p_worktree_create = sub.add_parser("worktree-create")
     p_worktree_create.add_argument("agent")
@@ -7354,9 +7666,28 @@ def main_cli(argv: list[str]) -> int:
         if args.command == "raw-log-writer":
             return write_bounded_raw_log(Path(args.path), args.max_bytes)
         if args.command == "start":
-            return print_json(call_validated_tool("agent_start", {"agent": args.agent, "cwd": args.cwd, "prompt": args.prompt}))
+            return print_json(
+                call_validated_tool(
+                    "agent_start",
+                    {
+                        "agent": args.agent,
+                        "cwd": args.cwd,
+                        "prompt": args.prompt,
+                        "allow_unauthenticated": True if args.allow_unauthenticated else None,
+                    },
+                )
+            )
         if args.command == "status":
             return print_json(call_validated_tool("agent_status", {"agent": args.agent}))
+        if args.command == "selector-policy":
+            return print_json(call_validated_tool("agent_selector_policy", {"series": args.series}))
+        if args.command == "selector-preview":
+            return print_json(
+                call_validated_tool(
+                    "agent_selector_preview",
+                    {"series": args.series, "limit": args.limit},
+                )
+            )
         if args.command == "wait":
             return print_json(
                 call_validated_tool(
@@ -7386,7 +7717,17 @@ def main_cli(argv: list[str]) -> int:
                 return 0
             return print_json(payload)
         if args.command == "send":
-            return print_json(call_validated_tool("agent_send", {"agent": args.agent, "text": args.text, "enter": not args.no_enter}))
+            return print_json(
+                call_validated_tool(
+                    "agent_send",
+                    {
+                        "agent": args.agent,
+                        "text": args.text,
+                        "enter": not args.no_enter,
+                        "allow_unauthenticated": True if args.allow_unauthenticated else None,
+                    },
+                )
+            )
         if args.command == "interrupt":
             return print_json(call_validated_tool("agent_interrupt", {"agent": args.agent, "force": args.force}))
         if args.command == "stop":
@@ -7412,6 +7753,7 @@ def main_cli(argv: list[str]) -> int:
                         "recover_stopped": args.recover_stopped,
                         "stopped_grace_seconds": args.stopped_grace_seconds,
                         "force": args.force,
+                        "allow_unauthenticated": True if args.allow_unauthenticated else None,
                     },
                 )
             )
@@ -7466,6 +7808,7 @@ def main_cli(argv: list[str]) -> int:
                         "enter": not args.no_enter,
                         "allow_missing_skill": args.allow_missing_skill,
                         "allow_subagents": args.allow_subagents,
+                        "allow_unauthenticated": True if args.allow_unauthenticated else None,
                     },
                 )
             )
@@ -7484,6 +7827,7 @@ def main_cli(argv: list[str]) -> int:
                         "enter": not args.no_enter,
                         "allow_missing_skill": args.allow_missing_skill,
                         "allow_subagents": args.allow_subagents,
+                        "allow_unauthenticated": True if args.allow_unauthenticated else None,
                     },
                 )
             )
@@ -7503,6 +7847,7 @@ def main_cli(argv: list[str]) -> int:
                         "enter": not args.no_enter,
                         "allow_missing_skill": args.allow_missing_skill,
                         "allow_subagents": args.allow_subagents,
+                        "allow_unauthenticated": True if args.allow_unauthenticated else None,
                     },
                 )
             )
@@ -7514,7 +7859,12 @@ def main_cli(argv: list[str]) -> int:
             return print_json(
                 call_validated_tool(
                     "agent_report_request",
-                    {"agent": args.agent, "assignment_id": args.assignment_id, "enter": not args.no_enter},
+                    {
+                        "agent": args.agent,
+                        "assignment_id": args.assignment_id,
+                        "enter": not args.no_enter,
+                        "allow_unauthenticated": True if args.allow_unauthenticated else None,
+                    },
                 )
             )
         if args.command == "worktree-create":

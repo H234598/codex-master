@@ -33,6 +33,7 @@ from codex_master.server import (
     RAW_LOG_TRUNCATION_MARKER,
     BRACKETED_PASTE_BEGIN,
     BRACKETED_PASTE_END,
+    CODEX_TUI_SUBMIT_KEY,
     COMMAND_TIMEOUT_RETURN_CODE,
     DEFAULT_COMMAND_TIMEOUT_SECONDS,
     DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS,
@@ -56,12 +57,14 @@ from codex_master.server import (
     classify_tui_context,
     codex_related_process_summary,
     DEFAULT_AGENT_MODEL,
+    DEFAULT_ORDINAL_AGENT_SERIES,
     doctor,
     ensure_state,
     handle_rpc,
     install,
     installed_source_worktree_state,
     agent_lease_status,
+    agent_auth_status,
     interrupt_agent,
     mcp_command_startup_self_test,
     mcp_probe_response_ok,
@@ -88,6 +91,8 @@ from codex_master.server import (
     run_tmux,
     send_agent,
     server_instance_identity_status,
+    selector_policy_series,
+    selector_policy_status,
     start_agent,
     start_agent_with_lease,
     strip_ansi,
@@ -386,6 +391,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("agent_scope_check", names)
         self.assertIn("agent_assign_readonly", names)
         self.assertIn("agent_assign_write", names)
+        self.assertIn("agent_selector_policy", names)
+        self.assertIn("agent_selector_preview", names)
         self.assertIn("worktree_status", names)
         self.assertIn("commit_ready_check", names)
         self.assertIn("master_app_bridge_status", names)
@@ -397,9 +404,14 @@ class ServerHelpersTest(unittest.TestCase):
         by_name = {tool["name"]: tool for tool in response["result"]["tools"]}
         assign_props = by_name["agent_assign"]["inputSchema"]["properties"]
         claim_props = by_name["agent_claim"]["inputSchema"]["properties"]
+        start_props = by_name["agent_start"]["inputSchema"]["properties"]
+        send_props = by_name["agent_send"]["inputSchema"]["properties"]
+        report_props = by_name["agent_report_request"]["inputSchema"]["properties"]
         wait_props = by_name["agent_wait"]["inputSchema"]["properties"]
         watchdog_props = by_name["fleet_watchdog"]["inputSchema"]["properties"]
         assign_write_props = by_name["agent_assign_write"]["inputSchema"]["properties"]
+        assign_readonly_props = by_name["agent_assign_readonly"]["inputSchema"]["properties"]
+        selector_policy_props = by_name["agent_selector_policy"]["inputSchema"]["properties"]
         skill_props = by_name["agent_skills"]["inputSchema"]["properties"]
         self.assertEqual(assign_props["task"]["maxLength"], MAX_TASK_TEXT)
         self.assertEqual(assign_props["context"]["maxItems"], MAX_ASSIGNMENT_LIST_ITEMS)
@@ -419,6 +431,14 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(claim_props["recover_stopped"]["default"])
         self.assertEqual(claim_props["stopped_grace_seconds"]["default"], DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS)
         self.assertEqual(claim_props["stopped_grace_seconds"]["maximum"], MAX_STOPPED_LEASE_RECOVERY_GRACE_SECONDS)
+        self.assertFalse(start_props["allow_unauthenticated"]["default"])
+        self.assertFalse(send_props["allow_unauthenticated"]["default"])
+        self.assertFalse(claim_props["allow_unauthenticated"]["default"])
+        self.assertFalse(assign_props["allow_unauthenticated"]["default"])
+        self.assertFalse(assign_readonly_props["allow_unauthenticated"]["default"])
+        self.assertFalse(assign_write_props["allow_unauthenticated"]["default"])
+        self.assertFalse(report_props["allow_unauthenticated"]["default"])
+        self.assertEqual(selector_policy_props["series"]["maxLength"], 32)
         self.assertEqual(DEFAULT_WATCHDOG_IDLE_SECONDS, 60)
         self.assertEqual(DEFAULT_WATCHDOG_POLL_SECONDS, 15)
         self.assertEqual(DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS, 15)
@@ -427,12 +447,12 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(watchdog_props["poll_interval_seconds"]["maximum"], MAX_WAIT_POLL_SECONDS)
         self.assertEqual(watchdog_props["report_grace_seconds"]["default"], DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS)
         self.assertEqual(assign_write_props["write_paths"]["minItems"], 1)
-        self.assertEqual(by_name["agent_send"]["inputSchema"]["properties"]["text"]["maxLength"], MAX_SEND_TEXT)
+        self.assertEqual(send_props["text"]["maxLength"], MAX_SEND_TEXT)
         self.assertEqual(skill_props["limit"]["maximum"], MAX_SKILL_NAMES)
-        self.assertEqual(by_name["agent_start"]["inputSchema"]["properties"]["agent"]["default"], "both")
+        self.assertEqual(start_props["agent"]["default"], "both")
         self.assertEqual(by_name["agent_status"]["inputSchema"]["properties"]["agent"]["default"], "all")
-        self.assertEqual(by_name["agent_start"]["inputSchema"]["properties"]["agent"]["maxLength"], 32)
-        self.assertNotIn("enum", by_name["agent_start"]["inputSchema"]["properties"]["agent"])
+        self.assertEqual(start_props["agent"]["maxLength"], 32)
+        self.assertNotIn("enum", start_props["agent"])
         self.assertEqual(skill_props["names_offset"]["minimum"], 0)
         self.assertEqual(skill_props["plugins_offset"]["minimum"], 0)
         self.assertEqual(skill_props["plugins_limit"]["default"], MAX_CAPABILITY_PLUGINS)
@@ -440,12 +460,71 @@ class ServerHelpersTest(unittest.TestCase):
 
     def test_agent_selectors_scale_to_series_pool_with_legacy_aliases(self) -> None:
         self.assertEqual(agent_ids("a"), ["a1"])
+        self.assertEqual(agent_ids("A"), ["a1"])
+        self.assertEqual(agent_ids("A1"), ["a1"])
         self.assertEqual(agent_ids("b"), ["b1"])
         self.assertEqual(agent_ids("both"), ["a1", "b1"])
         self.assertEqual(agent_ids("a-series")[0], "a1")
+        self.assertEqual(agent_ids("A-Series")[0], "a1")
         self.assertEqual(agent_ids("a-series")[-1], "a100")
         self.assertEqual(len(agent_ids("a-series")), 100)
         self.assertEqual(len(agent_ids("all")), 300)
+        self.assertEqual(agent_ids("1"), ["a1"])
+        self.assertEqual(agent_ids("2"), ["b1"])
+        self.assertEqual(agent_ids("3"), ["a2"])
+        self.assertEqual(agent_ids("4"), ["b2"])
+        self.assertEqual(agent_ids("200"), ["b100"])
+
+    def test_agent_selector_policy_can_switch_ordinal_rotation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            with patch.dict("os.environ", {}, clear=True), patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
+                "codex_master.server.SELECTOR_POLICY_FILE", state / "selector-policy.json"
+            ):
+                default_status = selector_policy_status()
+                preview = call_tool("agent_selector_preview", {"series": "A,B,C", "limit": 6})
+                changed = call_tool("agent_selector_policy", {"series": "A,B,C"})
+                persisted_status = call_tool("agent_selector_policy", {})
+                selected = [agent_ids(str(index))[0] for index in range(1, 7)]
+
+        self.assertEqual(default_status["series"], list(DEFAULT_ORDINAL_AGENT_SERIES))
+        self.assertEqual([item["agent"] for item in preview["ordinal_mapping"]], ["a1", "b1", "c1", "a2", "b2", "c2"])
+        self.assertEqual(changed["series"], ["a", "b", "c"])
+        self.assertEqual(persisted_status["series"], ["a", "b", "c"])
+        self.assertEqual(selected, ["a1", "b1", "c1", "a2", "b2", "c2"])
+        self.assertNotIn(tmpdir, json.dumps(changed, sort_keys=True))
+
+    def test_agent_auth_status_is_data_sparse_and_rejects_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": Path(tmpdir) / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                missing = agent_auth_status("A")
+                (home / "auth.json").write_text('{"token":"secret"}\n', encoding="utf-8")
+                present = agent_auth_status("a")
+                (home / "auth.json").unlink()
+                outside = Path(tmpdir) / "outside-auth.json"
+                outside.write_text("secret\n", encoding="utf-8")
+                (home / "auth.json").symlink_to(outside)
+                linked = agent_auth_status("a")
+
+        self.assertFalse(missing["authenticated"])
+        self.assertEqual(missing["auth_state"], "missing")
+        self.assertTrue(present["authenticated"])
+        self.assertEqual(present["auth_state"], "present_regular")
+        self.assertFalse(linked["authenticated"])
+        self.assertEqual(linked["auth_state"], "symlink_rejected")
+        payload = json.dumps({"missing": missing, "present": present, "linked": linked}, sort_keys=True)
+        self.assertNotIn(tmpdir, payload)
+        self.assertNotIn("secret", payload)
 
     def test_master_watchdog_status_reports_hardened_systemd_state_without_paths(self) -> None:
         source_root = Path(__file__).resolve().parents[1]
@@ -1495,7 +1574,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.8.2+codex.test",
+            "version": "0.8.3+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1522,7 +1601,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.8.2")
+        self.assertEqual(result["expected_tag"], "v0.8.3")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -2967,7 +3046,10 @@ class ServerHelpersTest(unittest.TestCase):
                             "jsonrpc": "2.0",
                             "id": 49,
                             "method": "tools/call",
-                            "params": {"name": "agent_send", "arguments": {"agent": "b", "text": "hi"}},
+                            "params": {
+                                "name": "agent_send",
+                                "arguments": {"agent": "b", "text": "hi", "allow_unauthenticated": True},
+                            },
                         }
                     )
 
@@ -3129,7 +3211,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.LEASE_DIR", state / "leases"
             ):
                 with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
-                    result = start_agent_with_lease("a", "/tmp/work", "hi")
+                    result = start_agent_with_lease("a", "/tmp/work", "hi", allow_unauthenticated=True)
                 with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
                     next_claim = claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
 
@@ -3163,7 +3245,7 @@ class ServerHelpersTest(unittest.TestCase):
             ):
                 with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
                     claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
-                    result = start_agent_with_lease("a", "/tmp/work", "hi")
+                    result = start_agent_with_lease("a", "/tmp/work", "hi", allow_unauthenticated=True)
                 with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
                     with self.assertRaisesRegex(AgentError, "leased by another MCP client"):
                         claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
@@ -3189,7 +3271,7 @@ class ServerHelpersTest(unittest.TestCase):
                     claim_agent("b", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
                 with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
                     with self.assertRaises(AgentBusyError) as caught:
-                        start_agent_with_lease("b", "/tmp/work", "hi")
+                        start_agent_with_lease("b", "/tmp/work", "hi", allow_unauthenticated=True)
 
         self.assertEqual(caught.exception.payload["error_code"], "agent_lease_held_by_other_client")
         self.assertEqual(caught.exception.payload["lease"]["holder"], "other_server")
@@ -3311,8 +3393,19 @@ class ServerHelpersTest(unittest.TestCase):
 
     @patch("codex_master.server.start_agent", return_value={"agent": "a", "status": "started"})
     @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch(
+        "codex_master.server.agent_auth_status",
+        return_value={
+            "authenticated": True,
+            "auth_state": "present_regular",
+            "auth_file": "not_returned",
+            "raw_output": "not_returned",
+        },
+    )
     @patch("codex_master.server.agent_lifecycle_lock")
-    def test_call_tool_agent_start_acquires_lifecycle_lock(self, mock_lock, _mock_alive, mock_start_agent) -> None:
+    def test_call_tool_agent_start_acquires_lifecycle_lock(
+        self, mock_lock, _mock_auth, _mock_alive, mock_start_agent
+    ) -> None:
         events = []
 
         class FakeLock:
@@ -3330,9 +3423,47 @@ class ServerHelpersTest(unittest.TestCase):
 
         result = call_tool("agent_start", {"agent": "a", "cwd": "/tmp/work", "prompt": "hi"})
 
-        self.assertEqual(result["results"], [{"agent": "a", "status": "started"}])
+        self.assertEqual(result["results"][0]["agent"], "a")
+        self.assertEqual(result["results"][0]["status"], "started")
+        self.assertEqual(result["results"][0]["auth_gate"]["auth_state"], "present_regular")
         self.assertEqual(events, [("lock", "a1"), ("unlock", "a1")])
         mock_start_agent.assert_called_once_with("a1", "/tmp/work", "hi")
+
+    @patch("codex_master.server.claim_agent_with_wait")
+    def test_mutating_tools_require_auth_by_default_and_allow_bootstrap_override(self, mock_claim_with_wait) -> None:
+        mock_claim_with_wait.return_value = {
+            "agent": "c2",
+            "status": "claimed",
+            "raw_output": "not_returned",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            home = Path(tmpdir) / "c2"
+            home.mkdir()
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch.dict(
+                "codex_master.server.AGENTS",
+                {"c2": {"label": "C2", "runner": home / "codex", "home": home, "session": "session-c2"}},
+                clear=False,
+            ):
+                start_result = call_tool("agent_start", {"agent": "c2"})
+                with self.assertRaisesRegex(AgentError, "agent_claim requires authenticated Agentin c2"):
+                    call_tool("agent_claim", {"agent": "c2", "wait_forever": False})
+                with self.assertRaisesRegex(AgentError, "agent_send requires authenticated Agentin c2"):
+                    call_tool("agent_send", {"agent": "c2", "text": "hi"})
+                claim_result = call_tool(
+                    "agent_claim",
+                    {"agent": "c2", "wait_forever": False, "allow_unauthenticated": True},
+                )
+
+        self.assertIn("requires authenticated Agentin c2", start_result["results"][0]["error"])
+        self.assertEqual(claim_result["status"], "claimed")
+        self.assertFalse(claim_result["auth_gate"]["required"])
+        self.assertTrue(claim_result["auth_gate"]["override"])
+        mock_claim_with_wait.assert_called_once()
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.tmux_alive", return_value=False)
@@ -4202,6 +4333,7 @@ class ServerHelpersTest(unittest.TestCase):
         mock_send_agent.return_value = {"agent": "a", "status": "sent", "response_output": "not_returned"}
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
             state = home / "state"
             assignment_log = home / "assignments.jsonl"
             skill = home / ".tmp" / "plugins" / "plugins" / "codex-security" / "skills" / "security-scan" / "SKILL.md"
@@ -4297,6 +4429,7 @@ class ServerHelpersTest(unittest.TestCase):
         mock_send_agent.return_value = {"agent": "a", "status": "sent", "response_output": "not_returned"}
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
             state = home / "state"
             assignment_log = home / "assignments.jsonl"
             with patch("codex_master.server.STATE_ROOT", state), patch(
@@ -4361,6 +4494,7 @@ class ServerHelpersTest(unittest.TestCase):
         mock_send_agent.return_value = {"agent": "b", "status": "sent", "response_output": "not_returned"}
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
             state = home / "state"
             assignment_log = home / "assignments.jsonl"
             skill = home / ".tmp" / "plugins" / "plugins" / "github" / "skills" / "gh-fix-ci" / "SKILL.md"
@@ -4412,6 +4546,7 @@ class ServerHelpersTest(unittest.TestCase):
     def test_agent_assign_enforces_role_write_and_skill_boundaries(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
             with patch.dict(
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
@@ -4548,11 +4683,12 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["status"], "sent")
         self.assertEqual(result["chars"], len("line 1\nline 2"))
         self.assertEqual(result["paste_mode"], "bracketed_paste")
+        self.assertEqual(result["submit_key"], CODEX_TUI_SUBMIT_KEY)
         self.assertEqual(result["response_output"], "not_returned")
         load_call = next(call for call in calls if call["args"][0] == "load-buffer")
         self.assertEqual(load_call["input_text"], f"{BRACKETED_PASTE_BEGIN}line 1\nline 2{BRACKETED_PASTE_END}")
         self.assertTrue(any(call["args"][0] == "paste-buffer" for call in calls))
-        self.assertTrue(any(call["args"][-1] == "Enter" for call in calls))
+        self.assertTrue(any(call["args"][-1] == CODEX_TUI_SUBMIT_KEY for call in calls))
 
     def test_send_agent_keeps_single_line_plain_paste(self) -> None:
         calls = []
@@ -4568,9 +4704,10 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(result["paste_mode"], "plain_paste")
         self.assertFalse(result["submitted"])
+        self.assertIsNone(result["submit_key"])
         load_call = next(call for call in calls if call["args"][0] == "load-buffer")
         self.assertEqual(load_call["input_text"], "single line")
-        self.assertFalse(any(call["args"][-1] == "Enter" for call in calls))
+        self.assertFalse(any(call["args"][-1] == CODEX_TUI_SUBMIT_KEY for call in calls))
 
 
 class CliLifecycleTest(unittest.TestCase):

@@ -9,6 +9,18 @@ Local MCP wrapper for controlling a sleeping/scalable Codex Agentinnen pool:
 Legacy selectors `a` and `b` map to `a1` and `b1`; `both` maps to `a1,b1`.
 Series selectors `a-series`, `b-series`, `c-series`, and `all` are available
 for status, skills, capabilities, lease status, start/stop, and watchdog calls.
+Selectors are case-insensitive, so `A1`, `a1`, `A-Series`, and `a-series`
+resolve identically. Numeric single-Agentin selectors use the current selector
+policy. The default policy is alternating A/B: `1=a1`, `2=b1`, `3=a2`,
+`4=b2`, and so on. Change it with:
+
+```sh
+./bin/codex-master-mcp selector-policy --series a,b,c
+./bin/codex-master-mcp selector-preview --series a,b,c --limit 6
+```
+
+The policy is stored in private MCP state and can also be overridden for a
+process with `CODEX_MASTER_AGENT_SELECTOR_SERIES=a,b,c`.
 The original authenticated homes are preserved as `a1` and `b1`. Additional
 homes are intentionally slim and sleeping by default; they have their own
 `CODEX_HOME`, wrapper, config, tmux session name, lease, and metadata, while
@@ -38,6 +50,9 @@ errors use generic markers rather than local file paths. Safe-tail log reads
 ignore non-regular raw-log targets. Tmux control errors are redacted and bounded
 before they are returned or raised. MCP tool responses do not return raw output
 by default and expose raw-log presence without returning local raw-log paths.
+Text is pasted into the Codex TUI through tmux and submitted with `S-Enter`.
+Plain `Enter` can leave multi-line or wrapped prompts sitting in the composer
+instead of starting the model response in current Codex CLI builds.
 Existing metadata under the old `codex-agent-mcp` state directory is still read
 as a migration fallback. External `tmux`, `git`, and `codex mcp` subprocesses
 are timeout-bounded so MCP calls fail closed instead of hanging indefinitely.
@@ -71,6 +86,13 @@ never returned in public responses.
 successful start, so short-lived local CLI commands do not block the next
 operator command. Use `agent_claim` explicitly when a connected Codex-CLI
 instance should keep an Agentin reserved after startup.
+Working mutations require a regular per-Agentin `auth.json` by default:
+`agent_start`, `agent_claim`, `agent_send`, `agent_assign`,
+`agent_assign_readonly`, `agent_assign_write`, and `agent_report_request` fail
+closed when auth is missing, symlinked, not a regular file, unreadable, or too
+large. Status/skills/capabilities/lease/pool/stop/release remain available for
+diagnosis and cleanup. Use `--allow-unauthenticated` only for explicit
+login/bootstrap flows.
 `agent_status` classifies bounded pane/log text without returning it, so callers
 can distinguish likely daily, weekly, token, quota, or rate limits from ordinary
 "no response yet" states. The classification keeps default Agentinnen-model
@@ -135,6 +157,10 @@ in the user journal.
 - `agent_assignments`: data-sparse assignment audit log
 - `agent_last_assignment_status`: latest assignment metadata for one Agentin
 - `agent_report_request`: ask one Agentin for a concise report
+- `agent_selector_policy`: show or set the ordinal selector policy, for example
+  `a,b` or `a,b,c`
+- `agent_selector_preview`: preview numeric selector mapping without mutating
+  state
 - `worktree_create_for_agent`: create an isolated git worktree for one Agentin
 - `worktree_status`: capped git status and worktree metadata
 - `integration_status`: repo status, diff stat, and recent assignment metadata
@@ -188,6 +214,9 @@ python3 -m codex_master.server uninstall       # remove mcp registration and loc
 
 python3 -m codex_master.server start both --cwd /home/teladi/codex-master
 python3 -m codex_master.server status
+python3 -m codex_master.server selector-policy
+python3 -m codex_master.server selector-policy --series a,b,c
+python3 -m codex_master.server selector-preview --limit 6
 python3 -m codex_master.server lease-status all
 python3 -m codex_master.server claim b --forever --poll-interval-seconds 30
 python3 -m codex_master.server claim b --no-wait
