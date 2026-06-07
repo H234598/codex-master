@@ -484,6 +484,57 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["expected_tools"]["master_namespace_status"])
         self.assertFalse(result["tool_search"]["authoritative_for_local_stdio_mcp_tools"])
         self.assertTrue(result["client_refresh"]["existing_sessions_may_need_restart"])
+        self.assertTrue(result["mcp_server_ready"])
+        self.assertTrue(result["plugin_cache_ready"])
+        self.assertTrue(result["namespace_ready"])
+        self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
+
+    @patch("codex_master.server.codex_related_process_summary")
+    @patch("codex_master.server.master_app_bridge_status")
+    @patch("codex_master.server.plugin_cache_status")
+    @patch("codex_master.server.mcp_command_tools_list_self_test")
+    @patch("codex_master.server.mcp_command_startup_self_test")
+    @patch("codex_master.server.check_mcp_registration")
+    def test_master_namespace_status_fails_when_plugin_cache_is_stale(
+        self,
+        mock_registration,
+        mock_startup,
+        mock_tools,
+        mock_cache,
+        mock_app_bridge,
+        mock_processes,
+    ) -> None:
+        mock_registration.return_value = {"ok": True, "registered": True, "raw_output": "not_returned"}
+        mock_startup.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
+        mock_tools.return_value = {
+            "ok": True,
+            "status": "ok",
+            "tool_count": 25,
+            "required_tool": "master_app_bridge_status",
+            "required_tool_available": True,
+            "raw_output": "not_returned",
+        }
+        mock_cache.return_value = {
+            "ok": False,
+            "repo_version_installed": False,
+            "reason": "repo_plugin_version_not_installed",
+            "raw_output": "not_returned",
+        }
+        mock_app_bridge.return_value = {"ok": True, "connector_id": "connector_test", "raw_output": "not_returned"}
+        mock_processes.return_value = {
+            "codex_client_process_count": 2,
+            "mcp_server_process_count": 1,
+            "home_kind_counts": {},
+            "raw_output": "not_returned",
+        }
+
+        result = master_namespace_status()
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["mcp_server_ready"])
+        self.assertFalse(result["plugin_cache_ready"])
+        self.assertFalse(result["namespace_ready"])
+        self.assertEqual(result["plugin_cache"]["reason"], "repo_plugin_version_not_installed")
         self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.subprocess.run")

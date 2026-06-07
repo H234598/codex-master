@@ -2756,10 +2756,15 @@ def master_namespace_status() -> dict[str, Any]:
     server_ready = bool(registration.get("ok")) and bool(startup_self_test.get("ok")) and bool(
         tools_list_self_test.get("ok")
     )
+    plugin_cache_ready = bool(cache_status.get("ok"))
+    namespace_ready = server_ready and plugin_cache_ready
     return {
-        "ok": server_ready,
+        "ok": namespace_ready,
         "server_name": MCP_SERVER_NAME,
         "expected_mcp_server": MCP_SERVER_NAME,
+        "mcp_server_ready": server_ready,
+        "plugin_cache_ready": plugin_cache_ready,
+        "namespace_ready": namespace_ready,
         "expected_tools": {
             "master_app_bridge_status": local_tool_contract["master_app_bridge_status"],
             "master_plugin_status": local_tool_contract["master_plugin_status"],

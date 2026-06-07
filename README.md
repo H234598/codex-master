@@ -102,6 +102,9 @@ when an assignment explicitly allows it.
 `plugin-status` and `namespace-status` also report whether the repo plugin
 manifest version is installed in the local plugin cache, without returning cache
 paths.
+For `namespace-status`, top-level `ok` means both the MCP server and the local
+plugin cache are ready; `mcp_server_ready` remains separate for isolating server
+startup from stale client/plugin state.
 
 ## Local CLI
 
