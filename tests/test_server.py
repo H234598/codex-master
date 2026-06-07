@@ -49,6 +49,8 @@ from codex_master.server import (
     handle_rpc,
     install,
     installed_source_worktree_state,
+    agent_lease_status,
+    interrupt_agent,
     mcp_command_startup_self_test,
     mcp_probe_response_ok,
     mcp_registration_command_matches,
@@ -1933,6 +1935,31 @@ class ServerHelpersTest(unittest.TestCase):
             wait_agent("a", poll_interval_seconds=False)
         with self.assertRaisesRegex(AgentError, f"poll_interval_seconds must be <= {MAX_WAIT_POLL_SECONDS}"):
             wait_agent("a", poll_interval_seconds=MAX_WAIT_POLL_SECONDS + 1)
+
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("codex_master.server.run_tmux")
+    def test_interrupt_releases_fresh_lease_when_tmux_fails(self, mock_run_tmux, _mock_alive) -> None:
+        mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux", "send-keys"], 1, "", "interrupt failed")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch(
+                "codex_master.server.LEASE_DIR", state / "leases"
+            ), patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
+                clear=False,
+            ):
+                with self.assertRaisesRegex(AgentError, "tmux interrupt failed"):
+                    interrupt_agent("a")
+                lease = agent_lease_status("a")
+
+        self.assertEqual(lease["state"], "unclaimed")
+        self.assertEqual(lease["holder"], "none")
 
     @patch("codex_master.server.start_agent", return_value={"agent": "a", "status": "started"})
     @patch("codex_master.server.tmux_alive", return_value=True)

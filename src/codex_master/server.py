@@ -3558,10 +3558,17 @@ def interrupt_agent(agent: str, force: bool = False) -> dict[str, Any]:
     session = cfg["session"]
     if not tmux_alive(session):
         raise AgentError(f"agent {agent} is not running")
-    lease = claim_agent(agent, force=force)["lease"]
-    cp = run_tmux(["send-keys", "-t", session, "C-c"], check=False)
-    if cp.returncode != 0:
-        raise AgentError(f"tmux interrupt failed for agent {agent}: {command_error_text(cp.stderr)}")
+    claim = claim_agent(agent, force=force)
+    release_on_failure = claim["status"] in {"claimed", "claimed_expired", "forced"}
+    lease = claim["lease"]
+    try:
+        cp = run_tmux(["send-keys", "-t", session, "C-c"], check=False)
+        if cp.returncode != 0:
+            raise AgentError(f"tmux interrupt failed for agent {agent}: {command_error_text(cp.stderr)}")
+    except Exception:
+        if release_on_failure:
+            release_agent(agent, force=True)
+        raise
     return {"agent": agent, "status": "interrupt_sent", "lease": lease, "response_output": "not_returned"}
 
 
