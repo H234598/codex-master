@@ -95,11 +95,13 @@ python3 -m codex_master.server stop both
 `install`
 - creates `~/.local/bin/codex-master-mcp` as symlink to `bin/codex-master-mcp`
 - registers the command via `codex mcp add codex-master-mcp -- <link>`
+- requires the install-path parent chain to be real directories, not symlinks
 - returns JSON and no agent output
 
 `uninstall`
 - unregisters from `codex mcp remove codex-master-mcp`
 - removes `~/.local/bin/codex-master-mcp`
+- requires the install-path parent chain to be real directories when removing
 - returns JSON and no raw secret material
 
 `doctor`

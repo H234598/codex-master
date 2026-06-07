@@ -1893,6 +1893,62 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(payload.get("symlink"), "removed")
         self.assertEqual(payload.get("mcp"), "skipped")
 
+    @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_refuses_symlink_parent_without_writing_redirected_path(self, mock_wrapper_path, _mock_registration) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            real_bin = tmp_path / "real-bin"
+            link_bin = tmp_path / "link-bin"
+            redirected = real_bin / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            real_bin.mkdir()
+            link_bin.symlink_to(real_bin, target_is_directory=True)
+            mock_wrapper_path.return_value = wrapper
+
+            with self.assertRaisesRegex(AgentError, "install parent directories must be real directories") as raised:
+                install_path = link_bin / "codex-master-mcp"
+                from codex_master.server import install
+
+                install(register=False, install_path=install_path)
+
+            redirected_exists = redirected.exists() or redirected.is_symlink()
+
+        self.assertFalse(redirected_exists)
+        self.assertNotIn(str(link_bin), str(raised.exception))
+        self.assertNotIn(str(real_bin), str(raised.exception))
+
+    @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_uninstall_refuses_symlink_parent_without_removing_redirected_link(
+        self, mock_wrapper_path, _mock_registration
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            real_bin = tmp_path / "real-bin"
+            link_bin = tmp_path / "link-bin"
+            redirected = real_bin / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            real_bin.mkdir()
+            redirected.symlink_to(wrapper)
+            link_bin.symlink_to(real_bin, target_is_directory=True)
+            mock_wrapper_path.return_value = wrapper
+
+            with self.assertRaisesRegex(AgentError, "install parent directories must be real directories") as raised:
+                from codex_master.server import uninstall
+
+                uninstall(unregister=False, remove_symlink=True, install_path=link_bin / "codex-master-mcp")
+
+            redirected_is_symlink = redirected.is_symlink()
+
+        self.assertTrue(redirected_is_symlink)
+        self.assertNotIn(str(link_bin), str(raised.exception))
+        self.assertNotIn(str(real_bin), str(raised.exception))
+
     @patch("codex_master.server.tmux_alive", return_value=False)
     @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
     @patch("codex_master.server.shutil.which")

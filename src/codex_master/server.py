@@ -1533,6 +1533,13 @@ def worktree_status(path: Any = None) -> dict[str, Any]:
     }
 
 
+def normalize_install_path(path: Path) -> Path:
+    normalized = path.expanduser()
+    if not normalized.is_absolute():
+        normalized = Path.cwd() / normalized
+    return normalized.absolute()
+
+
 def integration_status() -> dict[str, Any]:
     return {
         "repo": str(repo_root()),
@@ -1666,8 +1673,8 @@ def install(register: bool = True, force: bool = False, install_path: Path = DEF
     if not os.access(wrapper, os.X_OK):
         raise AgentError(f"repo wrapper is not executable: {wrapper}")
 
-    install_path = install_path.expanduser()
-    install_path.parent.mkdir(parents=True, exist_ok=True)
+    install_path = normalize_install_path(install_path)
+    ensure_directory_chain_no_symlink(install_path.parent, "install parent directories must be real directories")
     if install_path.exists() or install_path.is_symlink():
         if install_path.is_symlink() and install_path.resolve() == wrapper:
             symlink_status = "already_installed"
@@ -1711,7 +1718,7 @@ def install(register: bool = True, force: bool = False, install_path: Path = DEF
 
 
 def uninstall(unregister: bool = True, remove_symlink: bool = False, install_path: Path = DEFAULT_INSTALL_PATH) -> dict[str, Any]:
-    install_path = install_path.expanduser()
+    install_path = normalize_install_path(install_path)
     mcp_status = "skipped"
     if unregister:
         current = check_mcp_registration(install_path)
@@ -1726,6 +1733,7 @@ def uninstall(unregister: bool = True, remove_symlink: bool = False, install_pat
 
     symlink_status = "skipped"
     if remove_symlink:
+        ensure_directory_chain_no_symlink(install_path.parent, "install parent directories must be real directories")
         wrapper = repo_wrapper_path()
         if install_path.is_symlink() and install_path.resolve() == wrapper:
             install_path.unlink()

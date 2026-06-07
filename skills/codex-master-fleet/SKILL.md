@@ -129,6 +129,8 @@ Data minimization:
   enums, and declared bounds before dispatch.
 - Worktree creation must reject existing targets, including broken symlinks,
   and require every target parent directory to be a real directory.
+- Install and uninstall symlink operations must require the install-path parent
+  chain to be real directories.
 - Use `tail` only for an explicit capped, ANSI-stripped, redacted excerpt.
 - Do not read raw tmux logs directly unless the user explicitly requests it and
   the privacy impact is acceptable.
