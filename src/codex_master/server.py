@@ -1777,6 +1777,14 @@ def is_regular_executable_no_symlink(path: Path) -> bool:
     return os.access(path, os.X_OK)
 
 
+def is_regular_file_no_symlink(path: Path) -> bool:
+    try:
+        mode = path.lstat().st_mode
+    except OSError:
+        return False
+    return stat_module.S_ISREG(mode)
+
+
 def agent_auth_status(agent: str) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     auth_file = AGENTS[agent]["home"] / "auth.json"
@@ -6561,6 +6569,13 @@ def pool_read_private_bytes(path: Path, max_bytes: int, error_text: str) -> byte
     return data
 
 
+def pool_private_text_matches(path: Path, expected: str, max_bytes: int) -> bool:
+    try:
+        return read_private_regular_text(path, max_bytes, "pool private file could not be read") == expected
+    except AgentError:
+        return False
+
+
 def pool_marker_payload(normalized: dict[str, Any]) -> dict[str, Any]:
     digest = hashlib.sha256(json.dumps(normalized["raw"], sort_keys=True).encode("utf-8")).hexdigest()
     return {
@@ -6620,9 +6635,9 @@ def agent_pool_status(
             existing += 1
         if is_regular_executable_no_symlink(home / "codex"):
             wrappers += 1
-        if (home / "config.toml").is_file() and not (home / "config.toml").is_symlink():
+        if is_regular_file_no_symlink(home / "config.toml"):
             configs += 1
-        if (home / "auth.json").is_file() and not (home / "auth.json").is_symlink():
+        if is_regular_file_no_symlink(home / "auth.json"):
             auth += 1
         for asset in normalized["shared_assets"]:
             if (home / asset).is_symlink():
@@ -6679,19 +6694,20 @@ def agent_pool_install(
 
         wrapper = pool_wrapper_text(agent, home, normalized["codex_bin"])
         wrapper_path = home / "codex"
-        if not wrapper_path.exists() or wrapper_path.read_text(encoding="utf-8", errors="replace") != wrapper:
+        if not pool_private_text_matches(wrapper_path, wrapper, MAX_CODEX_CONFIG_BYTES):
             pool_write_private_file(wrapper_path, wrapper, 0o700)
             updated_wrappers += 1
 
         config_path = home / "config.toml"
-        if not config_path.exists():
+        if not is_regular_file_no_symlink(config_path):
             pool_write_private_file(config_path, pool_minimal_config(home), 0o600)
             created_configs += 1
 
         for runtime_dir in normalized["runtime_dirs"]:
             runtime_path = home / runtime_dir
-            if not runtime_path.exists():
-                ensure_private_dir(runtime_path)
+            runtime_existed = is_real_directory_no_symlink(runtime_path)
+            ensure_private_dir(runtime_path)
+            if not runtime_existed:
                 created_runtime_dirs += 1
 
         template = normalized["templates"][agent]

@@ -274,6 +274,9 @@ The repo contains a generic, machine-readable `codex-agent-pool.json` plus
 unauthenticated.
 Pool spec reads accept only regular UTF-8 JSON files, reject symlinked or
 oversized spec files, and keep spec paths out of public error responses.
+Pool install also keeps generated `codex` wrappers and `config.toml` files as
+per-Agentin regular files, replacing symlinked entries without touching their
+targets, and validates runtime directories as real directories.
 
 The spec is only the map. The actual auth material is still the per-home
 `auth.json`, for example `~/.codex-agents/a1/auth.json`. Normal install never

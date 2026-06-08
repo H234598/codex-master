@@ -1595,7 +1595,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.4+codex.test",
+            "version": "0.9.5+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1622,7 +1622,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.4")
+        self.assertEqual(result["expected_tag"], "v0.9.5")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -6015,6 +6015,64 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertTrue(destroyed["ok"])
             self.assertEqual(destroyed["removed_agent_entries"], 4)
             self.assertFalse(pool.exists())
+
+    def test_agent_pool_install_replaces_wrapper_and_config_symlinks_without_touching_targets(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec(tmp, pool)
+            home = pool / "a1"
+            home.mkdir(parents=True)
+            (home / "skills").mkdir()
+            (home / "plugins").mkdir()
+            wrapper_target = tmp / "outside-wrapper-target"
+            config_target = tmp / "outside-config-target"
+            wrapper_target.write_text("external wrapper secret\n", encoding="utf-8")
+            config_target.write_text("external config secret\n", encoding="utf-8")
+            (home / "codex").symlink_to(wrapper_target)
+            (home / "config.toml").symlink_to(config_target)
+
+            result = server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+
+            self.assertTrue(result["ok"])
+            self.assertFalse((home / "codex").is_symlink())
+            self.assertTrue((home / "codex").is_file())
+            self.assertTrue(os.access(home / "codex", os.X_OK))
+            self.assertFalse((home / "config.toml").is_symlink())
+            self.assertTrue((home / "config.toml").is_file())
+            self.assertEqual(wrapper_target.read_text(encoding="utf-8"), "external wrapper secret\n")
+            self.assertEqual(config_target.read_text(encoding="utf-8"), "external config secret\n")
+
+    def test_agent_pool_install_rejects_runtime_dir_symlink_without_path_leak(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents-secret"
+            spec_path = self._write_spec(tmp, pool)
+            home = pool / "a1"
+            home.mkdir(parents=True)
+            target = tmp / "outside-runtime-target"
+            target.mkdir()
+            (home / "logs").symlink_to(target)
+
+            response = handle_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 66,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "agent_pool_install",
+                        "arguments": {"spec": str(spec_path), "target_dir": str(pool)},
+                    },
+                }
+            )
+
+            self.assertTrue(response["result"]["isError"])
+            payload_text = response["result"]["content"][0]["text"]
+            self.assertIn("private state directory must not be a symlink", payload_text)
+            self.assertNotIn(str(tmp), payload_text)
+            self.assertNotIn("outside-runtime-target", payload_text)
 
     def test_agent_pool_tools_are_registered_and_cli_invokes_pool_namespace(self) -> None:
         from codex_master import server as server_module
