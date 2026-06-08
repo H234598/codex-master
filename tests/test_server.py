@@ -1643,7 +1643,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.19+codex.test",
+            "version": "0.9.20+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1670,7 +1670,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.19")
+        self.assertEqual(result["expected_tag"], "v0.9.20")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -2063,6 +2063,10 @@ class ServerHelpersTest(unittest.TestCase):
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertEqual(payload["lines_limit"], 80)
         self.assertEqual(payload["chars_limit"], 8192)
+        self.assertTrue(payload["output_truncated"])
+        self.assertTrue(payload["output_truncated_by_lines"])
+        self.assertFalse(payload["output_truncated_by_chars"])
+        self.assertEqual(payload["output_chars"], len(payload["output"]))
         self.assertIn("... truncated to last 80 lines ...", payload["output"])
         self.assertNotIn("line-001", payload["output"])
         self.assertNotIn("OPENAI_API_KEY=sk-testtoken1234567890", payload["output"])
@@ -2094,6 +2098,10 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(response["result"]["isError"])
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertEqual(payload["chars_limit"], 8192)
+        self.assertTrue(payload["output_truncated"])
+        self.assertFalse(payload["output_truncated_by_lines"])
+        self.assertTrue(payload["output_truncated_by_chars"])
+        self.assertEqual(payload["output_chars"], len(payload["output"]))
         self.assertTrue(payload["output"].startswith("... truncated to last characters ..."))
         self.assertNotIn("sk-verylongtoken01234567890", payload["output"])
 
@@ -2178,6 +2186,10 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(response["result"]["isError"])
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertEqual(payload["source"], "log")
+        self.assertTrue(payload["output_truncated"])
+        self.assertTrue(payload["output_truncated_by_lines"])
+        self.assertFalse(payload["output_truncated_by_chars"])
+        self.assertEqual(payload["output_chars"], len(payload["output"]))
         self.assertNotIn("first", payload["output"])
         self.assertNotIn("sk-logtoken1234567890", payload["output"])
         self.assertIn("OPENAI_API_KEY=<redacted>", payload["output"])
@@ -2235,6 +2247,10 @@ class ServerHelpersTest(unittest.TestCase):
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertEqual(payload["source"], "log")
         self.assertEqual(payload["output"], "")
+        self.assertFalse(payload["output_truncated"])
+        self.assertFalse(payload["output_truncated_by_lines"])
+        self.assertFalse(payload["output_truncated_by_chars"])
+        self.assertEqual(payload["output_chars"], 0)
         self.assertEqual(payload["raw_log"], "not_returned")
         self.assertNotIn(str(fifo_path), json.dumps(payload, sort_keys=True))
 

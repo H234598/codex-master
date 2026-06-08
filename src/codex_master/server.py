@@ -5821,17 +5821,23 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
         raw = read_log_tail(raw_log_path, chars * 4) if raw_log_path else ""
     cleaned = strip_ansi(raw)
     redacted, was_redacted = redact(cleaned)
-    cleaned = trim_lines(redacted, lines)
-    cleaned = trim_chars(cleaned, chars)
+    output_truncated_by_lines = len(redacted.splitlines()) > lines
+    line_trimmed = trim_lines(redacted, lines)
+    output_truncated_by_chars = len(line_trimmed) > chars
+    output = trim_chars(line_trimmed, chars)
     return {
         "agent": agent,
         "source": source,
         "lines_limit": lines,
         "chars_limit": chars,
         "redaction_applied": was_redacted,
+        "output_chars": len(output),
+        "output_truncated": output_truncated_by_lines or output_truncated_by_chars,
+        "output_truncated_by_lines": output_truncated_by_lines,
+        "output_truncated_by_chars": output_truncated_by_chars,
         "raw_log": "not_returned" if meta.get("raw_log") else None,
         "lease": lease,
-        "output": cleaned,
+        "output": output,
     }
 
 
@@ -7109,7 +7115,7 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Explicitly request a small, ANSI-stripped, redacted output excerpt from one Agentin. "
             "Refuses active leases held by other clients before reading pane or log output. "
-            "Raw logs remain local."
+            "Raw logs remain local. Returns metadata booleans when line or character limits truncated the excerpt."
         ),
         "inputSchema": {
             "type": "object",
