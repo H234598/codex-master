@@ -6683,6 +6683,11 @@ def pool_guard_root(pool_root: Path) -> None:
         raise AgentError("refusing unsafe pool root")
 
 
+def pool_require_real_root(root: Path) -> None:
+    if not is_real_directory_no_symlink(root):
+        raise AgentError("pool root must be a real directory")
+
+
 def pool_shell_double_content(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
 
@@ -6828,6 +6833,32 @@ def agent_pool_status(
     normalized = pool_normalize_spec(spec, target_dir=target_dir, codex_bin=codex_bin)
     root = normalized["pool_root"]
     ids = normalized["ids"]
+    root_state = pool_public_path_state(root)
+    if root_state != "directory":
+        return {
+            "ok": False,
+            "pool_root": PATH_NOT_RETURNED,
+            "pool_root_state": root_state,
+            "marker_state": "missing" if root_state == "missing" else "not_checked",
+            "marker_present": False,
+            "expected_agent_count": len(ids),
+            "existing_agent_count": 0,
+            "missing_agent_count": len(ids),
+            "wrapper_executable_count": 0,
+            "config_count": 0,
+            "auth_count": 0,
+            "shared_asset_symlink_count": 0,
+            "shared_asset_expected_link_count": 0,
+            "shared_asset_valid_link_count": 0,
+            "shared_asset_missing_link_count": 0,
+            "shared_asset_invalid_link_count": 0,
+            "shared_asset_template_source_count": 0,
+            "shared_asset_template_source_missing_count": 0,
+            "series_count": len(normalized["series_ids"]),
+            "series": "not_returned",
+            "series_state": "set" if normalized["series_ids"] else "not_set",
+            "raw_output": "not_returned",
+        }
     existing = 0
     wrappers = 0
     configs = 0
@@ -6908,7 +6939,7 @@ def agent_pool_status(
             and template_sources_missing == 0
         ),
         "pool_root": PATH_NOT_RETURNED,
-        "pool_root_state": pool_public_path_state(root),
+        "pool_root_state": root_state,
         "marker_state": pool_public_path_state(marker),
         "marker_present": marker_present,
         "expected_agent_count": len(ids),
@@ -7043,6 +7074,7 @@ def agent_pool_copy_auth(
     normalized = pool_normalize_spec(spec, target_dir=target_dir, codex_bin=codex_bin)
     root = normalized["pool_root"]
     pool_guard_root(root)
+    pool_require_real_root(root)
     if from_agent not in normalized["ids"]:
         raise AgentError("from_agent is not part of the pool")
     target_ids = [agent for agent in pool_selector_ids(normalized, to) if agent != from_agent]
@@ -7106,6 +7138,9 @@ def agent_pool_destroy_pool(
     pool_guard_root(root)
     if not yes:
         raise AgentError("destroy_pool requires yes=true")
+    root_state = pool_public_path_state(root)
+    if root_state != "directory" and not (root_state == "missing" and force):
+        raise AgentError("pool root must be a real directory")
     marker = root / POOL_MARKER_FILE
     if not pool_regular_marker_present(marker) and not force:
         raise AgentError("destroy_pool requires an installed pool marker or force=true")

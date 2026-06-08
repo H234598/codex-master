@@ -1794,7 +1794,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.38")
+        self.assertEqual(result["expected_tag"], "v0.9.39")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -6935,6 +6935,37 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn(custom_prefix, payload)
             self.assertNotIn(str(pool), payload)
 
+    def test_agent_pool_status_does_not_follow_symlinked_pool_root(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            external = tmp / "outside-secret-root"
+            pool = tmp / "agents-secret-link"
+            external.mkdir()
+            pool.symlink_to(external, target_is_directory=True)
+            (external / "a1").mkdir()
+            (external / "a1" / "codex").write_text("#!/bin/sh\n", encoding="utf-8")
+            (external / "a1" / "codex").chmod(0o700)
+            (external / "a1" / "config.toml").write_text("secret-config\n", encoding="utf-8")
+            (external / "a1" / "auth.json").write_text('{"token":"secret"}\n', encoding="utf-8")
+            (external / server_module.POOL_MARKER_FILE).write_text("{}\n", encoding="utf-8")
+            spec_path = self._write_spec(tmp, pool)
+
+            status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+
+            self.assertFalse(status["ok"])
+            self.assertEqual(status["pool_root_state"], "symlink")
+            self.assertEqual(status["marker_state"], "not_checked")
+            self.assertFalse(status["marker_present"])
+            self.assertEqual(status["existing_agent_count"], 0)
+            self.assertEqual(status["wrapper_executable_count"], 0)
+            self.assertEqual(status["config_count"], 0)
+            self.assertEqual(status["auth_count"], 0)
+            payload = json.dumps(status, sort_keys=True)
+            self.assertNotIn(str(tmp), payload)
+            self.assertNotIn("outside-secret-root", payload)
+
     def test_agent_pool_status_requires_regular_marker_and_configs_for_ok(self) -> None:
         from codex_master import server as server_module
 
@@ -7180,6 +7211,34 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn(str(tmp), str(ctx.exception))
             self.assertNotIn("external-secret", str(ctx.exception))
 
+    def test_agent_pool_copy_auth_rejects_symlinked_pool_root_without_copying(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            external = tmp / "outside-secret-root"
+            pool = tmp / "agents-secret-link"
+            external.mkdir()
+            pool.symlink_to(external, target_is_directory=True)
+            (external / "a1").mkdir()
+            (external / "a1" / "auth.json").write_text('{"token":"external-secret"}\n', encoding="utf-8")
+            (external / "a2").mkdir()
+            spec_path = self._write_spec(tmp, pool)
+
+            with self.assertRaisesRegex(AgentError, "pool root must be a real directory") as ctx:
+                server_module.agent_pool_copy_auth(
+                    str(spec_path),
+                    target_dir=str(pool),
+                    codex_bin="/bin/echo",
+                    from_agent="a1",
+                    to="a-series",
+                    yes=True,
+                )
+
+            self.assertFalse((external / "a2" / "auth.json").exists())
+            self.assertNotIn(str(tmp), str(ctx.exception))
+            self.assertNotIn("external-secret", str(ctx.exception))
+
     def test_agent_pool_rejects_codex_bin_control_chars_without_path_leak(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -7395,6 +7454,34 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn(str(tmp), payload_text)
             self.assertNotIn("outside-marker", payload_text)
             self.assertTrue(marker.is_symlink())
+
+    def test_agent_pool_destroy_rejects_symlinked_pool_root_without_removing_external_entries(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            external = tmp / "outside-secret-root"
+            pool = tmp / "agents-secret-link"
+            external.mkdir()
+            pool.symlink_to(external, target_is_directory=True)
+            (external / "a1").mkdir()
+            (external / "a1" / "sentinel").write_text("keep\n", encoding="utf-8")
+            marker = external / server_module.POOL_MARKER_FILE
+            marker.write_text("{}\n", encoding="utf-8")
+            spec_path = self._write_spec(tmp, pool)
+
+            with self.assertRaisesRegex(AgentError, "pool root must be a real directory") as ctx:
+                server_module.agent_pool_destroy_pool(
+                    str(spec_path),
+                    target_dir=str(pool),
+                    codex_bin="/bin/echo",
+                    yes=True,
+                )
+
+            self.assertTrue((external / "a1" / "sentinel").is_file())
+            self.assertTrue(marker.is_file())
+            self.assertNotIn(str(tmp), str(ctx.exception))
+            self.assertNotIn("outside-secret-root", str(ctx.exception))
 
     def test_agent_pool_destroy_refuses_unsafe_rmtree_without_removing_pool(self) -> None:
         from codex_master import server as server_module

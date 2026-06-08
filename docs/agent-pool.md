@@ -124,7 +124,8 @@ requires all expected homes, regular wrappers, regular configs, a regular
 installed pool marker, no missing or invalid shared-asset links, and no missing
 template sources that are required by other Agentinnen. It returns
 `pool_root: not_returned`, not local paths, and does not echo concrete series
-names.
+names. If the configured pool root is a symlink, `pool status` reports that
+root state and does not count through the link target.
 
 `pool copy_auth` copies one source `auth.json` to many installed Agentinnen.
 Without `--yes` it is a dry-run and only reports copy counts.
@@ -136,6 +137,7 @@ Without `--yes` it is a dry-run and only reports copy counts.
 
 `pool destroy_pool` removes only the Agentin entries described by the spec. It
 requires `--yes` and a regular installed pool marker unless `--force` is passed.
+If the pool root exists, it must be a real directory and not a symlink.
 Directory removal fails closed if the Python runtime cannot provide
 symlink-attack-resistant `rmtree` semantics.
 
@@ -156,6 +158,7 @@ inspection, stop, release, and watchdog cleanup remain usable. Use
 
 `copy_auth`:
 
+- requires the pool root to be a real directory, not a symlink
 - reads only `<pool-root>/<from-agent>/auth.json`
 - requires the source Agentin to be part of the pool spec
 - requires the source Agentin home to be a real directory, not a symlink
