@@ -1599,7 +1599,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.15+codex.test",
+            "version": "0.9.16+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1626,7 +1626,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.15")
+        self.assertEqual(result["expected_tag"], "v0.9.16")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -4968,7 +4968,7 @@ class ServerHelpersTest(unittest.TestCase):
                                 "agent": "a",
                                 "task": "fix",
                                 "scope": ["src"],
-                                "write_paths": ["tests/test_server.py"],
+                                "write_paths": ["tests/SECRET_SCOPE_PATH_SHOULD_NOT_RETURN.py"],
                                 "allow_missing_skill": True,
                             },
                         },
@@ -5010,7 +5010,9 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("skill not found", missing_skill_text)
         self.assertNotIn("SECRET_SKILL_NAME_SHOULD_NOT_RETURN", missing_skill_text)
         self.assertTrue(outside_scope["result"]["isError"])
-        self.assertIn("write paths must stay inside scope", outside_scope["result"]["content"][0]["text"])
+        outside_scope_text = outside_scope["result"]["content"][0]["text"]
+        self.assertIn("write paths must stay inside scope", outside_scope_text)
+        self.assertNotIn("SECRET_SCOPE_PATH_SHOULD_NOT_RETURN", outside_scope_text)
         self.assertTrue(long_task["result"]["isError"])
         self.assertIn("task must not exceed", long_task["result"]["content"][0]["text"])
         self.assertTrue(too_many_context_items["result"]["isError"])

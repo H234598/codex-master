@@ -3576,7 +3576,7 @@ def assign_agent(
         raise AgentError("arbeitsbiene assignments require at least one explicit write path")
     scope_result = scope_check(scope, write_paths)
     if role == "arbeitsbiene" and not scope_result["allowed"]:
-        raise AgentError(f"write paths must stay inside scope: {', '.join(scope_result['violations'])}")
+        raise AgentError("write paths must stay inside scope")
 
     matches: list[dict[str, str]] = []
     if skill:
