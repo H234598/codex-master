@@ -5832,6 +5832,7 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
         "chars_limit": chars,
         "redaction_applied": was_redacted,
         "output_chars": len(output),
+        "output_lines": len(output.splitlines()),
         "output_truncated": output_truncated_by_lines or output_truncated_by_chars,
         "output_truncated_by_lines": output_truncated_by_lines,
         "output_truncated_by_chars": output_truncated_by_chars,
@@ -7115,7 +7116,7 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Explicitly request a small, ANSI-stripped, redacted output excerpt from one Agentin. "
             "Refuses active leases held by other clients before reading pane or log output. "
-            "Raw logs remain local. Returns metadata booleans when line or character limits truncated the excerpt."
+            "Raw logs remain local. Returns output size metadata and booleans when line or character limits truncated the excerpt."
         ),
         "inputSchema": {
             "type": "object",
