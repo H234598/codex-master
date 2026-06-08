@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import stat
 import subprocess
 import tempfile
@@ -141,6 +142,17 @@ class FakeStdin:
 
 
 class ServerHelpersTest(unittest.TestCase):
+    def test_github_ci_pins_external_actions_to_full_shas(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        external_uses = re.findall(r"^\s*uses:\s*([^@\s]+)@([0-9A-Za-z._-]+)", workflow, flags=re.MULTILINE)
+
+        self.assertGreaterEqual(len(external_uses), 2)
+        for action, ref in external_uses:
+            if action.startswith("./") or action.startswith(".github/"):
+                continue
+            self.assertRegex(ref, r"^[0-9a-f]{40}$", f"{action} must be pinned to a full commit SHA")
+
     def test_github_ci_keeps_commit_ready_whitespace_gate(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
@@ -1794,7 +1806,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.39")
+        self.assertEqual(result["expected_tag"], "v0.9.40")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
