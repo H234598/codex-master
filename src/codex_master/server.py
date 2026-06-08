@@ -6777,7 +6777,9 @@ def agent_pool_status(
         "shared_asset_invalid_link_count": shared_invalid,
         "shared_asset_template_source_count": template_sources,
         "shared_asset_template_source_missing_count": template_sources_missing,
-        "series": {name: len(pool_selector_ids(normalized, name)) for name in sorted(normalized["series_ids"])},
+        "series_count": len(normalized["series_ids"]),
+        "series": "not_returned",
+        "series_state": "set" if normalized["series_ids"] else "not_set",
         "raw_output": "not_returned",
     }
 

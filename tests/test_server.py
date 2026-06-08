@@ -1643,7 +1643,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.27+codex.test",
+            "version": "0.9.28+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1670,7 +1670,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.27")
+        self.assertEqual(result["expected_tag"], "v0.9.28")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -3623,7 +3623,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("SECRET_INTERRUPT_OUTPUT_SHOULD_NOT_RETURN", error_text)
         self.assertNotIn(tmpdir, error_text)
 
-    @patch("codex_master.server.start_agent", return_value={"agent": "a", "status": "started"})
+    @patch("codex_master.server.start_agent", return_value={"agent": "a1", "status": "started"})
+    @patch("codex_master.server.ensure_agent_lease_available", return_value=None)
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch(
         "codex_master.server.agent_auth_status",
@@ -3636,7 +3637,7 @@ class ServerHelpersTest(unittest.TestCase):
     )
     @patch("codex_master.server.agent_lifecycle_lock")
     def test_call_tool_agent_start_acquires_lifecycle_lock(
-        self, mock_lock, _mock_auth, _mock_alive, mock_start_agent
+        self, mock_lock, _mock_auth, _mock_alive, mock_ensure_lease, mock_start_agent
     ) -> None:
         events = []
 
@@ -3655,10 +3656,11 @@ class ServerHelpersTest(unittest.TestCase):
 
         result = call_tool("agent_start", {"agent": "a", "cwd": "/tmp/work", "prompt": "hi"})
 
-        self.assertEqual(result["results"][0]["agent"], "a")
+        self.assertEqual(result["results"][0]["agent"], "a1")
         self.assertEqual(result["results"][0]["status"], "started")
         self.assertEqual(result["results"][0]["auth_gate"]["auth_state"], "present_regular")
         self.assertEqual(events, [("lock", "a1"), ("unlock", "a1")])
+        mock_ensure_lease.assert_called_once_with("a1")
         mock_start_agent.assert_called_once_with("a1", "/tmp/work", "hi")
 
     @patch("codex_master.server.claim_agent_with_wait")
@@ -6476,6 +6478,9 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(status["shared_asset_valid_link_count"], 2)
             self.assertEqual(status["shared_asset_missing_link_count"], 0)
             self.assertEqual(status["shared_asset_invalid_link_count"], 0)
+            self.assertEqual(status["series_count"], 3)
+            self.assertEqual(status["series"], "not_returned")
+            self.assertEqual(status["series_state"], "set")
             self.assertEqual(status["auth_count"], 2)
             status_text = json.dumps(status, sort_keys=True)
             self.assertNotIn(str(pool), status_text)
@@ -6611,6 +6616,42 @@ class AgentPoolManagementTest(unittest.TestCase):
             payload = json.dumps(result, sort_keys=True)
             self.assertNotIn(custom_prefix, payload)
             self.assertNotIn(secret_alias, payload)
+            self.assertNotIn(str(pool), payload)
+
+    def test_agent_pool_status_does_not_echo_custom_series_names(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents-secret"
+            custom_prefix = "secretstatus"
+            spec = {
+                "schema_version": 1,
+                "pool_root": str(pool),
+                "codex_bin": "/bin/codex",
+                "series": [
+                    {
+                        "prefix": custom_prefix,
+                        "count": 2,
+                        "template": f"{custom_prefix}1",
+                        "authenticated": [f"{custom_prefix}1"],
+                    }
+                ],
+                "shared_assets": [],
+            }
+            spec_path = self._write_spec_payload(tmp, spec)
+
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+
+            self.assertTrue(status["ok"])
+            self.assertEqual(status["expected_agent_count"], 2)
+            self.assertEqual(status["series_count"], 1)
+            self.assertEqual(status["series"], "not_returned")
+            self.assertEqual(status["series_state"], "set")
+
+            payload = json.dumps(status, sort_keys=True)
+            self.assertNotIn(custom_prefix, payload)
             self.assertNotIn(str(pool), payload)
 
     def test_agent_pool_status_requires_regular_marker_and_configs_for_ok(self) -> None:

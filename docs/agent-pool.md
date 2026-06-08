@@ -114,13 +114,14 @@ limit instead of guessing. Public tool responses and assignment audit records
 still omit prompt text and Agentin output.
 
 `pool status` counts installed homes, wrappers, configs, auth files, the
-installed pool marker, and shared asset symlinks. It also reports data-sparse
-shared-asset integrity counters for expected, valid, missing, and invalid
-non-template links plus required template sources. Its top-level `ok` requires
-all expected homes, regular wrappers, regular configs, a regular installed pool
-marker, no missing or invalid shared-asset links, and no missing template
-sources that are required by other Agentinnen. It returns
-`pool_root: not_returned`, not local paths.
+installed pool marker, series count, and shared asset symlinks. It also reports
+data-sparse shared-asset integrity counters for expected, valid, missing, and
+invalid non-template links plus required template sources. Its top-level `ok`
+requires all expected homes, regular wrappers, regular configs, a regular
+installed pool marker, no missing or invalid shared-asset links, and no missing
+template sources that are required by other Agentinnen. It returns
+`pool_root: not_returned`, not local paths, and does not echo concrete series
+names.
 
 `pool copy_auth` copies one source `auth.json` to many installed Agentinnen.
 Without `--yes` it is a dry-run and only reports copy counts.

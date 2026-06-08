@@ -282,7 +282,8 @@ targets, validates runtime directories as real directories, and writes a
 regular installed-pool marker. Pool status reports `ok` only when the marker,
 all expected homes, wrappers, configs, and required shared-asset links are
 present and valid. Shared-asset diagnostics are counts only; local link targets
-and pool paths are not returned.
+and pool paths are not returned. Pool status also returns series counts without
+echoing concrete series names.
 
 The spec is only the map. The actual auth material is still the per-home
 `auth.json`, for example `~/.codex-agents/a1/auth.json`. Normal install never
