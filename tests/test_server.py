@@ -99,6 +99,7 @@ from codex_master.server import (
     selector_policy_status,
     start_agent,
     start_agent_with_lease,
+    stop_agent,
     strip_ansi,
     skill_match_agent,
     sync_plugin_cache_from_repo,
@@ -1595,7 +1596,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.11+codex.test",
+            "version": "0.9.12+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1622,7 +1623,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.11")
+        self.assertEqual(result["expected_tag"], "v0.9.12")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -3521,9 +3522,14 @@ class ServerHelpersTest(unittest.TestCase):
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.run_tmux")
     def test_interrupt_releases_fresh_lease_when_tmux_fails(self, mock_run_tmux, _mock_alive) -> None:
-        mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux", "send-keys"], 1, "", "interrupt failed")
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            mock_run_tmux.return_value = subprocess.CompletedProcess(
+                ["tmux", "send-keys"],
+                1,
+                "",
+                f"SECRET_INTERRUPT_OUTPUT_SHOULD_NOT_RETURN {tmpdir}",
+            )
             state = root / "state"
             with patch("codex_master.server.STATE_ROOT", state), patch(
                 "codex_master.server.RAW_DIR", state / "raw"
@@ -3536,12 +3542,15 @@ class ServerHelpersTest(unittest.TestCase):
                 {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
                 clear=False,
             ):
-                with self.assertRaisesRegex(AgentError, "tmux interrupt failed"):
+                with self.assertRaisesRegex(AgentError, "tmux interrupt failed") as raised:
                     interrupt_agent("a")
                 lease = agent_lease_status("a")
 
         self.assertEqual(lease["state"], "unclaimed")
         self.assertEqual(lease["holder"], "none")
+        error_text = str(raised.exception)
+        self.assertNotIn("SECRET_INTERRUPT_OUTPUT_SHOULD_NOT_RETURN", error_text)
+        self.assertNotIn(tmpdir, error_text)
 
     @patch("codex_master.server.start_agent", return_value={"agent": "a", "status": "started"})
     @patch("codex_master.server.tmux_alive", return_value=True)
@@ -3852,6 +3861,29 @@ class ServerHelpersTest(unittest.TestCase):
             error_text = str(raised.exception)
             self.assertNotIn("SECRET_PIPE_OUTPUT_SHOULD_NOT_RETURN", error_text)
             self.assertNotIn(str(tmpdir), error_text)
+
+    @patch("codex_master.server.ensure_agent_lease_available")
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("codex_master.server.run_tmux")
+    def test_stop_agent_tmux_failure_is_data_sparse(self, mock_run_tmux, _mock_alive, _mock_lease) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mock_run_tmux.return_value = subprocess.CompletedProcess(
+                ["tmux", "kill-session"],
+                1,
+                "",
+                f"SECRET_STOP_OUTPUT_SHOULD_NOT_RETURN {tmpdir}",
+            )
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": Path(tmpdir) / "codex", "home": Path(tmpdir), "session": "test_session"}},
+                clear=False,
+            ):
+                with self.assertRaisesRegex(AgentError, "tmux stop failed") as raised:
+                    stop_agent("a")
+
+            error_text = str(raised.exception)
+            self.assertNotIn("SECRET_STOP_OUTPUT_SHOULD_NOT_RETURN", error_text)
+            self.assertNotIn(tmpdir, error_text)
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.write_meta")
@@ -5112,6 +5144,43 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(raised.exception.payload["retryable"])
         self.assertEqual(raised.exception.payload["raw_output"], "not_returned")
         self.assertFalse(any(call["args"][0] == "load-buffer" for call in calls))
+
+    def test_send_agent_tmux_failures_are_data_sparse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cases = [
+                ("load-buffer", "tmux load-buffer failed"),
+                ("paste-buffer", "tmux paste-buffer failed"),
+                ("submit-key", "tmux send submit key failed"),
+            ]
+            for failing_step, expected_error in cases:
+                with self.subTest(failing_step=failing_step):
+                    calls = []
+
+                    def fake_run_tmux(args, *, input_text=None, check=True, timeout=10):
+                        calls.append({"args": args, "input_text": input_text, "check": check, "timeout": timeout})
+                        should_fail = args[0] == failing_step or (
+                            failing_step == "submit-key"
+                            and args[0] == "send-keys"
+                            and args[-1] == CODEX_TUI_SUBMIT_KEY
+                        )
+                        if should_fail:
+                            return subprocess.CompletedProcess(
+                                ["tmux", *args],
+                                1,
+                                "",
+                                f"SECRET_SEND_OUTPUT_SHOULD_NOT_RETURN {tmpdir}",
+                            )
+                        return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
+
+                    with patch("codex_master.server.tmux_alive", return_value=True), patch(
+                        "codex_master.server.pane_tail", return_value="› Ready"
+                    ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux):
+                        with self.assertRaisesRegex(AgentError, expected_error) as raised:
+                            send_agent("a", "line 1\nline 2", enter=True)
+
+                    error_text = str(raised.exception)
+                    self.assertNotIn("SECRET_SEND_OUTPUT_SHOULD_NOT_RETURN", error_text)
+                    self.assertNotIn(tmpdir, error_text)
 
 
 class CliLifecycleTest(unittest.TestCase):

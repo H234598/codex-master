@@ -2454,7 +2454,7 @@ def stop_agent(agent: str, force: bool = False) -> dict[str, Any]:
     if was_running:
         cp = run_tmux(["kill-session", "-t", session], check=False)
         if cp.returncode != 0:
-            raise AgentError(f"tmux stop failed for agent {agent}: {command_error_text(cp.stderr)}")
+            raise AgentError(f"tmux stop failed for agent {agent}")
         release = release_agent(agent, force=True)
     else:
         release = {"status": "skipped", "lease": agent_lease_status(agent), "raw_output": "not_returned"}
@@ -5663,14 +5663,14 @@ def send_agent(
     buffer_name = f"codex-master-mcp-{agent}-{int(time.time() * 1000)}"
     cp = run_tmux(["load-buffer", "-b", buffer_name, "-"], input_text=payload, check=False)
     if cp.returncode != 0:
-        raise AgentError(f"tmux load-buffer failed for agent {agent}: {command_error_text(cp.stderr)}")
+        raise AgentError(f"tmux load-buffer failed for agent {agent}")
     cp = run_tmux(["paste-buffer", "-d", "-b", buffer_name, "-t", session], check=False)
     if cp.returncode != 0:
-        raise AgentError(f"tmux paste-buffer failed for agent {agent}: {command_error_text(cp.stderr)}")
+        raise AgentError(f"tmux paste-buffer failed for agent {agent}")
     if enter:
         cp = run_tmux(["send-keys", "-t", session, CODEX_TUI_SUBMIT_KEY], check=False)
         if cp.returncode != 0:
-            raise AgentError(f"tmux send submit key failed for agent {agent}: {command_error_text(cp.stderr)}")
+            raise AgentError(f"tmux send submit key failed for agent {agent}")
     return {
         "agent": agent,
         "status": "sent",
@@ -5695,7 +5695,7 @@ def interrupt_agent(agent: str, force: bool = False) -> dict[str, Any]:
     try:
         cp = run_tmux(["send-keys", "-t", session, "C-c"], check=False)
         if cp.returncode != 0:
-            raise AgentError(f"tmux interrupt failed for agent {agent}: {command_error_text(cp.stderr)}")
+            raise AgentError(f"tmux interrupt failed for agent {agent}")
     except Exception:
         if release_on_failure:
             release_agent(agent, force=True)
