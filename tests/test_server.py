@@ -1595,7 +1595,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.8+codex.test",
+            "version": "0.9.9+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1622,7 +1622,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.8")
+        self.assertEqual(result["expected_tag"], "v0.9.9")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -5385,6 +5385,68 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertNotIn(str(tmp_path), str(raised.exception))
         self.assertNotIn("secret-repo", str(raised.exception))
 
+    @patch("codex_master.server.run_command")
+    @patch("codex_master.server.check_mcp_registration")
+    @patch("codex_master.server.mcp_command_startup_self_test")
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_mcp_add_failure_is_data_sparse(
+        self, mock_wrapper_path, mock_self_test, mock_registration, mock_run
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "secret-repo" / "bin" / "codex-master-mcp"
+            wrapper.parent.mkdir(parents=True)
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            mock_wrapper_path.return_value = wrapper
+            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
+            mock_registration.return_value = {"registered": False, "ok": False, "startup_timeout_ok": True}
+            mock_run.return_value = subprocess.CompletedProcess(
+                ["codex", "mcp", "add"],
+                1,
+                "",
+                f"SECRET_OUTPUT_SHOULD_NOT_RETURN {tmp_path}\n",
+            )
+
+            with self.assertRaisesRegex(AgentError, "codex mcp add failed") as raised:
+                install(register=True, install_path=install_link, sync_plugin_cache=False)
+
+        error_text = str(raised.exception)
+        self.assertNotIn(str(tmp_path), error_text)
+        self.assertNotIn("SECRET_OUTPUT_SHOULD_NOT_RETURN", error_text)
+
+    @patch("codex_master.server.run_command")
+    @patch("codex_master.server.check_mcp_registration")
+    @patch("codex_master.server.mcp_command_startup_self_test")
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_mcp_remove_failure_is_data_sparse(
+        self, mock_wrapper_path, mock_self_test, mock_registration, mock_run
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "secret-repo" / "bin" / "codex-master-mcp"
+            wrapper.parent.mkdir(parents=True)
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            mock_wrapper_path.return_value = wrapper
+            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
+            mock_registration.return_value = {"registered": True, "ok": False, "startup_timeout_ok": True}
+            mock_run.return_value = subprocess.CompletedProcess(
+                ["codex", "mcp", "remove"],
+                1,
+                "",
+                f"SECRET_OUTPUT_SHOULD_NOT_RETURN {tmp_path}\n",
+            )
+
+            with self.assertRaisesRegex(AgentError, "codex mcp remove failed") as raised:
+                install(register=True, force=True, install_path=install_link, sync_plugin_cache=False)
+
+        error_text = str(raised.exception)
+        self.assertNotIn(str(tmp_path), error_text)
+        self.assertNotIn("SECRET_OUTPUT_SHOULD_NOT_RETURN", error_text)
+
     @patch("codex_master.server.mcp_command_startup_self_test")
     @patch("codex_master.server.repo_wrapper_path")
     def test_install_refuses_failed_startup_self_test_before_writing_link(
@@ -5626,6 +5688,27 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(payload.get("ok"), True)
         self.assertEqual(payload.get("symlink"), "removed")
         self.assertEqual(payload.get("mcp"), "skipped")
+
+    @patch("codex_master.server.run_command")
+    @patch("codex_master.server.check_mcp_registration")
+    def test_uninstall_mcp_remove_failure_is_data_sparse(self, mock_registration, mock_run) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            mock_registration.return_value = {"registered": True, "ok": False}
+            mock_run.return_value = subprocess.CompletedProcess(
+                ["codex", "mcp", "remove"],
+                1,
+                "",
+                f"SECRET_OUTPUT_SHOULD_NOT_RETURN {tmp_path}\n",
+            )
+
+            with self.assertRaisesRegex(AgentError, "codex mcp remove failed") as raised:
+                uninstall(unregister=True, remove_symlink=False, install_path=install_link)
+
+        error_text = str(raised.exception)
+        self.assertNotIn(str(tmp_path), error_text)
+        self.assertNotIn("SECRET_OUTPUT_SHOULD_NOT_RETURN", error_text)
 
     @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
     @patch("codex_master.server.repo_wrapper_path")

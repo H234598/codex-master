@@ -5527,14 +5527,12 @@ def install(
             if current.get("registered") and force:
                 remove = run_command(["codex", "mcp", "remove", MCP_SERVER_NAME])
                 if remove.returncode != 0:
-                    output, redacted = command_excerpt(remove.stdout + remove.stderr)
-                    raise AgentError(f"codex mcp remove failed: {output if not redacted else '<redacted>'}")
+                    raise AgentError("codex mcp remove failed")
             elif current.get("registered"):
                 raise AgentError("MCP server is registered with a different command; rerun install with --force")
             add = run_command(["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(install_path)])
             if add.returncode != 0:
-                output, redacted = command_excerpt(add.stdout + add.stderr)
-                raise AgentError(f"codex mcp add failed: {output if not redacted else '<redacted>'}")
+                raise AgentError("codex mcp add failed")
             registration = {"requested": True, "status": "registered"}
         if not current.get("startup_timeout_ok"):
             startup_timeout_config = ensure_mcp_startup_timeout_configured()
@@ -5578,8 +5576,7 @@ def uninstall(unregister: bool = True, remove_symlink: bool = False, install_pat
         if current.get("registered"):
             remove = run_command(["codex", "mcp", "remove", MCP_SERVER_NAME])
             if remove.returncode != 0:
-                output, redacted = command_excerpt(remove.stdout + remove.stderr)
-                raise AgentError(f"codex mcp remove failed: {output if not redacted else '<redacted>'}")
+                raise AgentError("codex mcp remove failed")
             mcp_status = "removed"
         else:
             mcp_status = "not_registered"
