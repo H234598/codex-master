@@ -141,6 +141,18 @@ class FakeStdin:
 
 
 class ServerHelpersTest(unittest.TestCase):
+    def test_github_ci_keeps_commit_ready_whitespace_gate(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+        self.assertIn("fetch-depth: 0", workflow)
+        self.assertIn("name: Check committed whitespace", workflow)
+        self.assertIn("BASE_SHA:", workflow)
+        self.assertIn("BEFORE_SHA:", workflow)
+        self.assertIn("HEAD_SHA:", workflow)
+        self.assertIn("git diff-tree --check --root", workflow)
+        self.assertIn("git diff --check", workflow)
+
     def test_redacts_common_secret_shapes(self) -> None:
         text = "OPENAI_API_KEY=sk-testtoken1234567890 and jwt eyJabcabcabcabc.abcabcabcabc.sigsignaturesig"
         redacted, changed = redact(text)
@@ -1755,7 +1767,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.30")
+        self.assertEqual(result["expected_tag"], "v0.9.31")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
