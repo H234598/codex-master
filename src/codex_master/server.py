@@ -5792,6 +5792,7 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
     chars = normalize_int_field(chars, field="chars", minimum=1, maximum=MAX_TAIL_CHARS)
     if source not in ("pane", "log"):
         raise AgentError("source must be 'pane' or 'log'")
+    lease = ensure_agent_lease_available(agent)
     meta = read_meta(agent)
     if source == "pane":
         raw = pane_tail(agent, lines)
@@ -5812,6 +5813,7 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
         "chars_limit": chars,
         "redaction_applied": was_redacted,
         "raw_log": "not_returned" if meta.get("raw_log") else None,
+        "lease": lease,
         "output": cleaned,
     }
 
@@ -7043,7 +7045,11 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "agent_safe_tail",
-        "description": "Explicitly request a small, ANSI-stripped, redacted output excerpt from one Agentin. Raw logs remain local.",
+        "description": (
+            "Explicitly request a small, ANSI-stripped, redacted output excerpt from one Agentin. "
+            "Refuses active leases held by other clients before reading pane or log output. "
+            "Raw logs remain local."
+        ),
         "inputSchema": {
             "type": "object",
             "required": ["agent"],

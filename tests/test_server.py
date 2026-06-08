@@ -428,6 +428,9 @@ class ServerHelpersTest(unittest.TestCase):
         assign_live_data_props = by_name["agent_assign_live_data"]["inputSchema"]["properties"]
         selector_policy_props = by_name["agent_selector_policy"]["inputSchema"]["properties"]
         skill_props = by_name["agent_skills"]["inputSchema"]["properties"]
+        tail_description = by_name["agent_safe_tail"]["description"]
+        self.assertIn("held by other clients", tail_description)
+        self.assertIn("before reading pane or log output", tail_description)
         self.assertEqual(assign_props["task"]["maxLength"], MAX_TASK_TEXT)
         self.assertEqual(assign_props["context"]["maxItems"], MAX_ASSIGNMENT_LIST_ITEMS)
         self.assertEqual(DEFAULT_WAIT_SECONDS, 120)
@@ -1592,7 +1595,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.2+codex.test",
+            "version": "0.9.3+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1619,7 +1622,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.2")
+        self.assertEqual(result["expected_tag"], "v0.9.3")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -1984,8 +1987,12 @@ class ServerHelpersTest(unittest.TestCase):
 
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.pane_tail")
+    @patch("codex_master.server.ensure_agent_lease_available")
     @patch("codex_master.server.ensure_state")
-    def test_safe_tail_tools_call_limits_and_redacts(self, _mock_ensure_state, mock_pane_tail, _mock_tmux_alive) -> None:
+    def test_safe_tail_tools_call_limits_and_redacts(
+        self, _mock_ensure_state, mock_lease, mock_pane_tail, _mock_tmux_alive
+    ) -> None:
+        mock_lease.return_value = {"state": "unclaimed", "holder": "none", "raw_output": "not_returned"}
         raw = "\n".join([f"line-{i:03d}" for i in range(1, 101)])
         raw += "\n\x1b[31mOPENAI_API_KEY=sk-testtoken1234567890\x1b[0m"
         mock_pane_tail.return_value = raw
@@ -2010,11 +2017,16 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("OPENAI_API_KEY=<redacted>", payload["output"])
         self.assertFalse("\x1b[" in payload["output"])
         self.assertTrue(payload["redaction_applied"])
+        self.assertEqual(payload["lease"]["state"], "unclaimed")
 
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.pane_tail")
+    @patch("codex_master.server.ensure_agent_lease_available")
     @patch("codex_master.server.ensure_state")
-    def test_safe_tail_tools_call_applies_char_limit(self, _mock_ensure_state, mock_pane_tail, _mock_tmux_alive) -> None:
+    def test_safe_tail_tools_call_applies_char_limit(
+        self, _mock_ensure_state, mock_lease, mock_pane_tail, _mock_tmux_alive
+    ) -> None:
+        mock_lease.return_value = {"state": "unclaimed", "holder": "none", "raw_output": "not_returned"}
         raw = "x" * 8190 + "\x1b[31mOPENAI_API_KEY=sk-verylongtoken01234567890\x1b[0m"
         mock_pane_tail.return_value = raw
 
@@ -2048,8 +2060,47 @@ class ServerHelpersTest(unittest.TestCase):
         with self.assertRaisesRegex(AgentError, f"chars must be <= {MAX_TAIL_CHARS}"):
             safe_tail("a", lines=1, chars=MAX_TAIL_CHARS + 1)
 
+    @patch("codex_master.server.pane_tail")
+    def test_safe_tail_blocks_foreign_lease_before_reading_output(self, mock_pane_tail) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"):
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                    claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
+                    with patch("codex_master.server.ensure_state"), patch(
+                        "codex_master.server.read_meta"
+                    ) as mock_read_meta:
+                        response = handle_rpc(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": 47,
+                                "method": "tools/call",
+                                "params": {
+                                    "name": "agent_safe_tail",
+                                    "arguments": {"agent": "a", "source": "pane", "lines": 2, "chars": 4000},
+                                },
+                            }
+                        )
+
+        self.assertTrue(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["error_code"], "agent_lease_held_by_other_client")
+        self.assertTrue(payload["retryable"])
+        self.assertEqual(payload["lease"]["holder"], "other_server")
+        self.assertEqual(payload["raw_output"], "not_returned")
+        self.assertNotIn("owner-one", json.dumps(payload, sort_keys=True))
+        mock_pane_tail.assert_not_called()
+        mock_read_meta.assert_not_called()
+
+    @patch("codex_master.server.ensure_agent_lease_available")
     @patch("codex_master.server.ensure_state")
-    def test_safe_tail_log_source_reads_caps_and_redacts(self, _mock_ensure_state) -> None:
+    def test_safe_tail_log_source_reads_caps_and_redacts(self, _mock_ensure_state, mock_lease) -> None:
+        mock_lease.return_value = {"state": "unclaimed", "holder": "none", "raw_output": "not_returned"}
         with tempfile.TemporaryDirectory() as tmpdir:
             log_path = Path(tmpdir) / "agent.log"
             log_path.write_text(
@@ -2082,8 +2133,10 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(payload["raw_log"], "not_returned")
         self.assertNotIn(str(log_path), json.dumps(payload, sort_keys=True))
 
+    @patch("codex_master.server.ensure_agent_lease_available")
     @patch("codex_master.server.ensure_state")
-    def test_safe_tail_log_source_rejects_unmanaged_meta_path(self, _mock_ensure_state) -> None:
+    def test_safe_tail_log_source_rejects_unmanaged_meta_path(self, _mock_ensure_state, mock_lease) -> None:
+        mock_lease.return_value = {"state": "unclaimed", "holder": "none", "raw_output": "not_returned"}
         with patch("codex_master.server.read_meta", return_value={"raw_log": "/etc/passwd"}):
             response = handle_rpc(
                 {
@@ -2102,8 +2155,10 @@ class ServerHelpersTest(unittest.TestCase):
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertIn("outside managed raw log state", payload["error"])
 
+    @patch("codex_master.server.ensure_agent_lease_available")
     @patch("codex_master.server.ensure_state")
-    def test_safe_tail_log_source_ignores_non_regular_log_file(self, _mock_ensure_state) -> None:
+    def test_safe_tail_log_source_ignores_non_regular_log_file(self, _mock_ensure_state, mock_lease) -> None:
+        mock_lease.return_value = {"state": "unclaimed", "holder": "none", "raw_output": "not_returned"}
         with tempfile.TemporaryDirectory() as tmpdir:
             raw_dir = Path(tmpdir)
             fifo_path = raw_dir / "agent.log"

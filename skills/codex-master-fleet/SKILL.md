@@ -48,8 +48,9 @@ not show it; test the user's model IDs instead of assuming they are unavailable.
 - The main instance is the Teamleiterin. It may inspect and integrate, but
   should mainly coordinate, test, commit, push, and release.
 - Default eigene-Bienen fleet size is 2-3 Bienen. Maximum is 6, only for
-  independent tasks. In addition, use 1-2 fremde Bienen through MCP/plugin
-  control surfaces when useful and safe.
+  independent tasks. In addition, fremde Bienen may be spawned directly through
+  MCP/plugin control surfaces; use 1-2 by default when delegation helps, with
+  leases, auth checks, and write scopes as the safety boundary.
 - Exploriererinnen read, analyze, and report concise context packages only.
 - Arbeitsbienen may write only in assigned files or isolated workspaces.
 - Before assigning writes, inspect `git status --short` and avoid overlapping
@@ -332,7 +333,9 @@ Data minimization:
   not local repo paths or raw `git`/`gh` command output. It should make stale
   GitHub releases and local tags without GitHub releases visible without
   forcing a release.
-- Use `tail` only for an explicit capped, ANSI-stripped, redacted excerpt.
+- Use `tail` only for an explicit capped, ANSI-stripped, redacted excerpt. It
+  must refuse active leases held by another MCP client before reading pane or
+  log output.
 - Do not read raw tmux logs directly unless the user explicitly requests it and
   the privacy impact is acceptable.
 

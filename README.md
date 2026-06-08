@@ -154,7 +154,8 @@ in the user journal.
 - `agent_send`: send text to one running Agentin
 - `agent_interrupt`: send Ctrl-C to one running Agentin
 - `agent_stop`: stop selected Agentinnen
-- `agent_safe_tail`: explicit capped, ANSI-stripped, redacted excerpt; log
+- `agent_safe_tail`: explicit capped, ANSI-stripped, redacted excerpt; refuses
+  active leases held by other clients before reading pane or log output; log
   source reads only regular raw-log files
 - `agent_skills`: data-sparse skill inventory without file contents
 - `agent_skill_match`: check whether one or all Agentinnen have a named skill
@@ -592,7 +593,9 @@ the path, and checks that `codex-master-mcp` has a `startup_timeout_sec` of at
 least 120 seconds in the active Codex MCP configuration.
 
 Use `tail` only when an explicit, capped excerpt is needed. Normal status and
-send operations do not return Agentin output.
+send operations do not return Agentin output. `tail` refuses to read pane or log
+output while the selected Agentin has an active lease held by another MCP
+client; claim the Agentin first or wait for the lease to expire.
 
 ## Plugin
 
