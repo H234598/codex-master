@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 import os
+from typing import Any
 from unittest.mock import Mock, patch
 
 from codex_master.server import (
@@ -1642,7 +1643,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.18+codex.test",
+            "version": "0.9.19+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1669,7 +1670,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.18")
+        self.assertEqual(result["expected_tag"], "v0.9.19")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -6280,6 +6281,110 @@ class AgentPoolManagementTest(unittest.TestCase):
         spec_path = root / "pool.json"
         spec_path.write_text(json.dumps(spec), encoding="utf-8")
         return spec_path
+
+    def _write_spec_payload(self, root: Path, payload: dict[str, Any]) -> Path:
+        spec_path = root / "pool.json"
+        spec_path.write_text(json.dumps(payload), encoding="utf-8")
+        return spec_path
+
+    def _pool_validate_error_text(self, spec_path: Path, pool: Path, message_id: int) -> str:
+        response = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": message_id,
+                "method": "tools/call",
+                "params": {
+                    "name": "agent_pool_validate",
+                    "arguments": {"spec": str(spec_path), "target_dir": str(pool), "codex_bin": "/bin/codex"},
+                },
+            }
+        )
+        self.assertTrue(response["result"]["isError"])
+        return response["result"]["content"][0]["text"]
+
+    def test_agent_pool_spec_validation_errors_do_not_echo_request_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents-secret"
+
+            schema_spec = self._write_spec_payload(
+                tmp,
+                {
+                    "schema_version": "SECRET_SCHEMA_VERSION",
+                    "pool_root": str(pool),
+                    "codex_bin": "/bin/codex",
+                    "series": [{"prefix": "a", "count": 1, "template": "a1", "authenticated": []}],
+                },
+            )
+            schema_error = self._pool_validate_error_text(schema_spec, pool, 66)
+            self.assertIn("unsupported pool schema_version", schema_error)
+            self.assertNotIn("SECRET_SCHEMA_VERSION", schema_error)
+            self.assertNotIn(str(pool), schema_error)
+
+            duplicate_prefix = "secretprefix"
+            duplicate_spec = self._write_spec_payload(
+                tmp,
+                {
+                    "schema_version": 1,
+                    "pool_root": str(pool),
+                    "codex_bin": "/bin/codex",
+                    "series": [
+                        {
+                            "prefix": duplicate_prefix,
+                            "count": 1,
+                            "template": f"{duplicate_prefix}1",
+                            "authenticated": [],
+                        },
+                        {
+                            "prefix": duplicate_prefix,
+                            "count": 1,
+                            "template": f"{duplicate_prefix}1",
+                            "authenticated": [],
+                        },
+                    ],
+                },
+            )
+            duplicate_error = self._pool_validate_error_text(duplicate_spec, pool, 67)
+            self.assertIn("series prefix is duplicated", duplicate_error)
+            self.assertNotIn(duplicate_prefix, duplicate_error)
+            self.assertNotIn(str(pool), duplicate_error)
+
+            auth_spec = self._write_spec_payload(
+                tmp,
+                {
+                    "schema_version": 1,
+                    "pool_root": str(pool),
+                    "codex_bin": "/bin/codex",
+                    "series": [
+                        {
+                            "prefix": "a",
+                            "count": 1,
+                            "template": "a1",
+                            "authenticated": ["SECRET_AUTH_AGENT"],
+                        }
+                    ],
+                },
+            )
+            auth_error = self._pool_validate_error_text(auth_spec, pool, 68)
+            self.assertIn("authenticated contains unknown Agentin ids", auth_error)
+            self.assertNotIn("SECRET_AUTH_AGENT", auth_error)
+            self.assertNotIn(str(pool), auth_error)
+
+            alias_spec = self._write_spec_payload(
+                tmp,
+                {
+                    "schema_version": 1,
+                    "pool_root": str(pool),
+                    "codex_bin": "/bin/codex",
+                    "series": [{"prefix": "a", "count": 1, "template": "a1", "authenticated": []}],
+                    "aliases": {"SECRET_ALIAS": "SECRET_TARGET"},
+                },
+            )
+            alias_error = self._pool_validate_error_text(alias_spec, pool, 69)
+            self.assertIn("alias points to an unknown target", alias_error)
+            self.assertNotIn("SECRET_ALIAS", alias_error)
+            self.assertNotIn("SECRET_TARGET", alias_error)
+            self.assertNotIn(str(pool), alias_error)
 
     def test_agent_pool_install_status_copy_auth_and_destroy_are_data_sparse(self) -> None:
         from codex_master import server as server_module

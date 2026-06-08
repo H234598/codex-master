@@ -6395,7 +6395,7 @@ def pool_normalize_spec(
     raw, source = pool_load_raw_spec(spec_path)
     schema_version = raw.get("schema_version", POOL_SCHEMA_VERSION)
     if schema_version != POOL_SCHEMA_VERSION:
-        raise AgentError(f"unsupported pool schema_version: {schema_version!r}")
+        raise AgentError("unsupported pool schema_version")
 
     raw_pool_root = target_dir if target_dir is not None else raw.get("pool_root", "${HOME}/.codex-agents")
     if not isinstance(raw_pool_root, str) or not raw_pool_root:
@@ -6425,7 +6425,7 @@ def pool_normalize_spec(
         if not isinstance(prefix, str) or not POOL_PREFIX_RE.fullmatch(prefix):
             raise AgentError(f"series[{index}].prefix is invalid")
         if prefix in prefixes:
-            raise AgentError(f"series prefix is duplicated: {prefix}")
+            raise AgentError("series prefix is duplicated")
         prefixes.add(prefix)
         count = normalize_int_field(item.get("count"), field=f"series[{index}].count", minimum=1, maximum=MAX_POOL_AGENTS)
         current_ids = [f"{prefix}{number}" for number in range(1, count + 1)]
@@ -6459,14 +6459,14 @@ def pool_normalize_spec(
             raise AgentError("alias names must be short strings")
         if isinstance(target, str):
             if target not in valid_targets:
-                raise AgentError(f"alias {alias!r} points to an unknown target")
+                raise AgentError("alias points to an unknown target")
             aliases[alias] = target
         elif isinstance(target, list) and target and all(isinstance(agent, str) for agent in target):
             if any(agent not in valid_targets for agent in target):
-                raise AgentError(f"alias {alias!r} points to an unknown target")
+                raise AgentError("alias points to an unknown target")
             aliases[alias] = target[:]
         else:
-            raise AgentError(f"alias {alias!r} must point to an Agentin id, series selector, or non-empty list")
+            raise AgentError("alias must point to an Agentin id, series selector, or non-empty list")
 
     shared_assets = raw.get("shared_assets", [])
     if not isinstance(shared_assets, list) or len(shared_assets) > MAX_POOL_SHARED_ASSETS:
