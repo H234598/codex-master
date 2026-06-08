@@ -20,6 +20,7 @@ from codex_master.server import (
     MAX_ASSIGNMENT_RECORDS,
     MAX_CAPABILITY_PLUGINS,
     MAX_ERROR_CHARS,
+    MAX_GIT_REF_TEXT,
     MAX_LIVE_DATA_TOPIC,
     MAX_META_BYTES,
     MAX_RPC_MESSAGE_BYTES,
@@ -428,12 +429,14 @@ class ServerHelpersTest(unittest.TestCase):
         assign_readonly_props = by_name["agent_assign_readonly"]["inputSchema"]["properties"]
         assign_live_data_props = by_name["agent_assign_live_data"]["inputSchema"]["properties"]
         selector_policy_props = by_name["agent_selector_policy"]["inputSchema"]["properties"]
+        worktree_create_props = by_name["worktree_create_for_agent"]["inputSchema"]["properties"]
         skill_props = by_name["agent_skills"]["inputSchema"]["properties"]
         tail_description = by_name["agent_safe_tail"]["description"]
         self.assertIn("held by other clients", tail_description)
         self.assertIn("before reading pane or log output", tail_description)
         self.assertEqual(assign_props["task"]["maxLength"], MAX_TASK_TEXT)
         self.assertEqual(assign_props["context"]["maxItems"], MAX_ASSIGNMENT_LIST_ITEMS)
+        self.assertEqual(worktree_create_props["base_ref"]["maxLength"], MAX_GIT_REF_TEXT)
         self.assertEqual(DEFAULT_WAIT_SECONDS, 120)
         self.assertEqual(MAX_WAIT_SECONDS, 600)
         self.assertEqual(DEFAULT_WAIT_POLL_SECONDS, 30)
@@ -1596,7 +1599,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.13+codex.test",
+            "version": "0.9.14+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1623,7 +1626,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.13")
+        self.assertEqual(result["expected_tag"], "v0.9.14")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -4145,6 +4148,35 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(mock_run_command.call_args.args[0], ["git", "worktree", "add", str(expected_target)])
         self.assertEqual(mock_run_command.call_args.kwargs["cwd"], repo)
         self.assertNotIn(str(repo), json.dumps(result, sort_keys=True))
+
+    @patch("codex_master.server.run_command")
+    def test_worktree_create_base_ref_is_bounded_and_not_returned(self, mock_run_command) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            relative = ".codex-master-worktrees/agent-a"
+            expected_target = repo / relative
+            mock_run_command.return_value = subprocess.CompletedProcess(["git"], 0, "", "")
+
+            with patch("codex_master.server.repo_root", return_value=repo):
+                result = worktree_create_for_agent("a", path=relative, base_ref="origin/main")
+
+        self.assertEqual(result["base_ref"], "not_returned")
+        self.assertEqual(result["base_ref_state"], "set")
+        self.assertEqual(mock_run_command.call_args.args[0], ["git", "worktree", "add", str(expected_target), "origin/main"])
+        self.assertNotIn("origin/main", json.dumps(result, sort_keys=True))
+
+    @patch("codex_master.server.run_command")
+    def test_worktree_create_rejects_unsafe_base_ref_without_git_call(self, mock_run_command) -> None:
+        for base_ref in ("--detach", "main with space", "main\nSECRET_BASE_REF_SHOULD_NOT_RETURN"):
+            with self.subTest(base_ref=base_ref):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    repo = Path(tmpdir)
+                    with patch("codex_master.server.repo_root", return_value=repo):
+                        with self.assertRaisesRegex(AgentError, "base_ref contains unsupported characters") as raised:
+                            worktree_create_for_agent("a", path=".codex-master-worktrees/agent-a", base_ref=base_ref)
+
+                self.assertNotIn("SECRET_BASE_REF_SHOULD_NOT_RETURN", str(raised.exception))
+        mock_run_command.assert_not_called()
 
     @patch("codex_master.server.run_command")
     def test_worktree_create_git_failure_is_data_sparse(self, mock_run_command) -> None:

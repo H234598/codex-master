@@ -97,6 +97,7 @@ MAX_ASSIGNMENT_LIST_ITEMS = 50
 MAX_AGENTIN_NAME = 80
 MAX_SKILL_REF = 300
 MAX_PATH_TEXT = 1000
+MAX_GIT_REF_TEXT = 200
 MAX_ASSIGNMENT_ID = 200
 MAX_LIVE_DATA_TOPIC = 400
 MAX_RPC_MESSAGE_BYTES = 1024 * 1024
@@ -128,6 +129,7 @@ POOL_DEFAULT_CODEX_BIN = "${CODEX_AGENT_BIN:-/usr/local/bin/codex}"
 POOL_AUTH_POLICIES = ("preserve_existing_only", "copy_explicit_only")
 POOL_PREFIX_RE = re.compile(r"^[a-z][a-z0-9_-]{0,15}$")
 POOL_SAFE_RELATIVE_RE = re.compile(r"^[A-Za-z0-9._-][A-Za-z0-9._/-]{0,199}$")
+GIT_BASE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@{}~^+-]{0,199}$")
 MAX_POOL_AGENTS = 1000
 MAX_POOL_SERIES = 26
 MAX_POOL_SHARED_ASSETS = 40
@@ -3841,10 +3843,21 @@ def repo_relative_public_path(path: Path, repo: Path) -> str | None:
     return text or "."
 
 
+def normalize_git_base_ref(value: Any) -> str | None:
+    if value is None:
+        return None
+    ref = bounded_text(value, field="base_ref", max_chars=MAX_GIT_REF_TEXT)
+    if not ref:
+        return None
+    if not GIT_BASE_REF_RE.fullmatch(ref):
+        raise AgentError("base_ref contains unsupported characters")
+    return ref
+
+
 def worktree_create_for_agent(agent: str, path: Any = None, base_ref: Any = None) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     path = bounded_text(path, field="path", max_chars=MAX_PATH_TEXT) if path is not None else None
-    base_ref = bounded_text(base_ref, field="base_ref", max_chars=MAX_PATH_TEXT) if base_ref is not None else None
+    base_ref = normalize_git_base_ref(base_ref)
     repo = repo_root().resolve(strict=False)
     target = Path(path).expanduser() if path else repo / ".codex-master-worktrees" / f"agent-{agent}-{now_id()}"
     if not target.is_absolute():
@@ -3871,7 +3884,8 @@ def worktree_create_for_agent(agent: str, path: Any = None, base_ref: Any = None
         "path": public_path or PATH_NOT_RETURNED,
         "path_state": "set" if public_path else "not_returned",
         "path_kind": "repo_relative" if public_path else "not_returned",
-        "base_ref": base_ref,
+        "base_ref": PATH_NOT_RETURNED if base_ref else None,
+        "base_ref_state": "set" if base_ref else "not_set",
         "status": "created",
         "raw_output": "not_returned",
     }
@@ -7338,7 +7352,7 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "agent": agent_selector_schema(single=True),
                 "path": text_schema(MAX_PATH_TEXT),
-                "base_ref": text_schema(MAX_PATH_TEXT),
+                "base_ref": text_schema(MAX_GIT_REF_TEXT),
             },
             "additionalProperties": False,
         },
