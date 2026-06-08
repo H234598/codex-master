@@ -1596,7 +1596,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.12+codex.test",
+            "version": "0.9.13+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1623,7 +1623,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.12")
+        self.assertEqual(result["expected_tag"], "v0.9.13")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -4145,6 +4145,26 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(mock_run_command.call_args.args[0], ["git", "worktree", "add", str(expected_target)])
         self.assertEqual(mock_run_command.call_args.kwargs["cwd"], repo)
         self.assertNotIn(str(repo), json.dumps(result, sort_keys=True))
+
+    @patch("codex_master.server.run_command")
+    def test_worktree_create_git_failure_is_data_sparse(self, mock_run_command) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            relative = ".codex-master-worktrees/agent-a"
+            mock_run_command.return_value = subprocess.CompletedProcess(
+                ["git"],
+                128,
+                "",
+                f"SECRET_WORKTREE_OUTPUT_SHOULD_NOT_RETURN {tmpdir}",
+            )
+
+            with patch("codex_master.server.repo_root", return_value=repo):
+                with self.assertRaisesRegex(AgentError, "git worktree add failed") as raised:
+                    worktree_create_for_agent("a", path=relative)
+
+        error_text = str(raised.exception)
+        self.assertNotIn("SECRET_WORKTREE_OUTPUT_SHOULD_NOT_RETURN", error_text)
+        self.assertNotIn(tmpdir, error_text)
 
     @patch("codex_master.server.run_command")
     def test_worktree_create_refuses_relative_escape_without_git_call(self, mock_run_command) -> None:

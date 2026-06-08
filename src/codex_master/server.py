@@ -3864,8 +3864,7 @@ def worktree_create_for_agent(agent: str, path: Any = None, base_ref: Any = None
         args.append(base_ref)
     cp = run_command(["git", *args], cwd=repo)
     if cp.returncode != 0:
-        output, redacted = command_excerpt(cp.stdout + cp.stderr)
-        raise AgentError(f"git worktree add failed: {output if not redacted else '<redacted>'}")
+        raise AgentError("git worktree add failed")
     public_path = repo_relative_public_path(target, repo)
     return {
         "agent": agent,
