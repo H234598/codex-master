@@ -87,8 +87,10 @@ Shortcut wrapper:
 
 `pool validate` reads the spec, expands supported environment defaults such as
 `${HOME}` and `${CODEX_AGENT_BIN:-/usr/local/bin/codex}`, and returns only
-counts and state markers. The resolved `codex_bin` must be non-empty, bounded,
-and free of control characters before it is written into generated wrappers.
+counts and state markers. It does not echo concrete series, alias, or
+authenticated Agentin names. The resolved `codex_bin` must be non-empty,
+bounded, and free of control characters before it is written into generated
+wrappers.
 
 `pool install` is idempotent. It creates missing Agentin homes, regular
 executable wrappers, minimal configs, runtime directories, and an installed pool

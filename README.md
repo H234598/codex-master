@@ -274,6 +274,8 @@ The repo contains a generic, machine-readable `codex-agent-pool.json` plus
 unauthenticated.
 Pool spec reads accept only regular UTF-8 JSON files, reject symlinked or
 oversized spec files, and keep spec paths out of public error responses.
+Pool validation returns only counts and state markers for series, aliases, and
+authenticated Agentinnen; concrete names are not echoed.
 Pool install also keeps generated `codex` wrappers and `config.toml` files as
 per-Agentin regular files, replacing symlinked entries without touching their
 targets, validates runtime directories as real directories, and writes a
