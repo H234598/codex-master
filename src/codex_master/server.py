@@ -3557,7 +3557,7 @@ def assign_agent(
     agent = canonical_agent_id(agent)
     auth_gate = require_authenticated_agent_for_mutation(
         agent,
-        operation="agent_assign",
+        operation=operation,
         allow_unauthenticated=allow_unauthenticated,
     )
     role = role.strip().lower()
@@ -5696,6 +5696,7 @@ def send_agent(
         "paste_mode": paste_mode,
         "submitted": enter,
         "submit_key": CODEX_TUI_SUBMIT_KEY if enter else None,
+        "raw_output": "not_returned",
         "input_ready": readiness,
         "response_output": "not_returned",
     }
@@ -5718,7 +5719,13 @@ def interrupt_agent(agent: str, force: bool = False) -> dict[str, Any]:
         if release_on_failure:
             release_agent(agent, force=True)
         raise
-    return {"agent": agent, "status": "interrupt_sent", "lease": lease, "response_output": "not_returned"}
+    return {
+        "agent": agent,
+        "status": "interrupt_sent",
+        "lease": lease,
+        "raw_output": "not_returned",
+        "response_output": "not_returned",
+    }
 
 
 def strip_ansi(text: str) -> str:

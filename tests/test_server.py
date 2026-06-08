@@ -1782,7 +1782,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.34")
+        self.assertEqual(result["expected_tag"], "v0.9.35")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -3813,6 +3813,13 @@ class ServerHelpersTest(unittest.TestCase):
                     call_tool("agent_send", {"agent": "c2", "text": "hi"})
                 with self.assertRaisesRegex(AgentError, "agent_interrupt requires authenticated Agentin c2"):
                     call_tool("agent_interrupt", {"agent": "c2"})
+                with self.assertRaisesRegex(AgentError, "agent_assign_readonly requires authenticated Agentin c2"):
+                    call_tool("agent_assign_readonly", {"agent": "c2", "scope": ["src"], "task": "hi"})
+                with self.assertRaisesRegex(AgentError, "agent_assign_write requires authenticated Agentin c2"):
+                    call_tool(
+                        "agent_assign_write",
+                        {"agent": "c2", "scope": ["src"], "write_paths": ["src/file.py"], "task": "hi"},
+                    )
                 claim_result = call_tool(
                     "agent_claim",
                     {"agent": "c2", "wait_forever": False, "allow_unauthenticated": True},
@@ -5597,6 +5604,55 @@ class CliLifecycleTest(unittest.TestCase):
             "agent_interrupt",
             {"agent": "c2", "force": True, "allow_unauthenticated": True},
         )
+
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("codex_master.server.wait_agent_input_ready")
+    @patch("codex_master.server.run_tmux")
+    def test_send_agent_success_response_is_data_sparse(self, mock_run_tmux, mock_ready, _mock_alive) -> None:
+        mock_ready.return_value = {
+            "ready": True,
+            "poll_count": 1,
+            "timeout_seconds": 0,
+            "evidence": "not_returned",
+            "raw_output": "not_returned",
+        }
+        mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "SECRET_OUTPUT", "SECRET_ERROR")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
+                clear=False,
+            ):
+                result = send_agent("a", "hello", True)
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(result["raw_output"], "not_returned")
+        self.assertEqual(result["response_output"], "not_returned")
+        self.assertNotIn("SECRET_OUTPUT", json.dumps(result, sort_keys=True))
+
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("codex_master.server.run_tmux")
+    def test_interrupt_agent_success_response_is_data_sparse(self, mock_run_tmux, _mock_alive) -> None:
+        mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "SECRET_OUTPUT", "SECRET_ERROR")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
+                clear=False,
+            ):
+                result = interrupt_agent("a")
+
+        self.assertEqual(result["status"], "interrupt_sent")
+        self.assertEqual(result["raw_output"], "not_returned")
+        self.assertEqual(result["response_output"], "not_returned")
+        self.assertNotIn("SECRET_OUTPUT", json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.print_json")
     @patch("codex_master.server.call_tool", return_value={"status": "claimed", "raw_output": "not_returned"})
