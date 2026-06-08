@@ -91,7 +91,9 @@ counts and state markers. It does not echo concrete series, alias, or
 authenticated Agentin names. The resolved `codex_bin` must be non-empty,
 bounded, free of control characters, and usable before it is written into
 generated wrappers: path-like values must resolve to an executable file, while
-plain command names must resolve on `PATH`.
+plain command names must resolve on `PATH`. Generated wrappers execute the
+selected binary with `exec --`, so an unusual but valid command name is treated
+as command data rather than as an `exec` option.
 
 `pool install` is idempotent. It creates missing Agentin homes, regular
 executable wrappers, minimal configs, runtime directories, and an installed pool
@@ -156,6 +158,7 @@ inspection, stop, release, and watchdog cleanup remain usable. Use
 
 - reads only `<pool-root>/<from-agent>/auth.json`
 - requires the source Agentin to be part of the pool spec
+- requires the source Agentin home to be a real directory, not a symlink
 - resolves the target selector through the same spec
 - skips the source Agentin if the target selector includes it
 - skips missing target homes

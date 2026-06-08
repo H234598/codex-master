@@ -1794,7 +1794,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.37")
+        self.assertEqual(result["expected_tag"], "v0.9.38")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -7152,6 +7152,34 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertFalse((pool / "a2" / "auth.json").is_symlink())
             self.assertEqual((pool / "a2" / "auth.json").read_text(encoding="utf-8"), '{"token":"secret"}\n')
 
+    def test_agent_pool_copy_auth_rejects_symlinked_source_home_without_copying(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents-secret"
+            external = tmp / "outside-secret-source"
+            external.mkdir()
+            (external / "auth.json").write_text('{"token":"external-secret"}\n', encoding="utf-8")
+            pool.mkdir()
+            (pool / "a1").symlink_to(external)
+            (pool / "a2").mkdir()
+            spec_path = self._write_spec(tmp, pool)
+
+            with self.assertRaisesRegex(AgentError, "source Agentin home is missing or invalid") as ctx:
+                server_module.agent_pool_copy_auth(
+                    str(spec_path),
+                    target_dir=str(pool),
+                    codex_bin="/bin/echo",
+                    from_agent="a1",
+                    to="a-series",
+                    yes=True,
+                )
+
+            self.assertFalse((pool / "a2" / "auth.json").exists())
+            self.assertNotIn(str(tmp), str(ctx.exception))
+            self.assertNotIn("external-secret", str(ctx.exception))
+
     def test_agent_pool_rejects_codex_bin_control_chars_without_path_leak(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -7271,6 +7299,40 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn("FAKE_OK:", completed.stdout)
             self.assertNotIn("BAD", completed.stdout + completed.stderr)
+
+    def test_agent_pool_wrapper_treats_command_name_as_data_not_exec_option(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            fake_codex = bin_dir / "-codex"
+            fake_codex.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'printf "DASH_OK:%s\\n" "${CODEX_HOME}"\n',
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o700)
+            spec_path = self._write_spec(tmp, pool)
+            test_path = os.pathsep.join([str(bin_dir), os.environ.get("PATH", "")])
+
+            with patch.dict("os.environ", {"PATH": test_path}):
+                result = server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="-codex")
+                completed = subprocess.run(
+                    [str(pool / "a1" / "codex")],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    env={"PATH": test_path},
+                )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("DASH_OK:", completed.stdout)
 
     def test_agent_pool_install_rejects_runtime_dir_symlink_without_path_leak(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

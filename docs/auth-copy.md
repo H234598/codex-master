@@ -72,6 +72,7 @@ If the selector includes the source Agentin, the source is skipped. For example,
 The copy path is deliberately conservative:
 
 - `auth.json` must be a regular file, not a symlink
+- the source Agentin home must be a real directory, not a symlink
 - oversized source files are rejected
 - target homes must be real directories, not symlinks
 - existing target auth files are skipped unless `--overwrite` is set

@@ -6701,7 +6701,7 @@ def pool_wrapper_text(agent: str, home: Path, codex_bin: str) -> str:
             "fi",
             "export CODEX_AGENT_BIN",
             "unset CODEX_ACCESS_TOKEN OPENAI_API_KEY",
-            'exec "${CODEX_AGENT_BIN}" "$@"',
+            'exec -- "${CODEX_AGENT_BIN}" "$@"',
             "",
         ]
     )
@@ -7049,7 +7049,10 @@ def agent_pool_copy_auth(
     if not target_ids:
         raise AgentError("copy_auth target selector resolves to no target Agentinnen")
 
-    source = root / from_agent / "auth.json"
+    source_home = root / from_agent
+    if not is_real_directory_no_symlink(source_home):
+        raise AgentError("source Agentin home is missing or invalid")
+    source = source_home / "auth.json"
     auth_bytes = pool_read_private_bytes(source, MAX_CODEX_CONFIG_BYTES, "source auth is missing or invalid")
     copyable = 0
     copied = 0
