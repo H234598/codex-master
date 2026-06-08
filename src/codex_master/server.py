@@ -6699,11 +6699,13 @@ def agent_pool_status(
 
     missing = len(ids) - existing
     marker = root / POOL_MARKER_FILE
+    marker_present = pool_regular_marker_present(marker)
     return {
-        "ok": missing == 0 and wrappers == len(ids),
+        "ok": missing == 0 and wrappers == len(ids) and configs == len(ids) and marker_present,
         "pool_root": PATH_NOT_RETURNED,
         "pool_root_state": pool_public_path_state(root),
         "marker_state": pool_public_path_state(marker),
+        "marker_present": marker_present,
         "expected_agent_count": len(ids),
         "existing_agent_count": existing,
         "missing_agent_count": missing,

@@ -1643,7 +1643,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.24+codex.test",
+            "version": "0.9.25+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1670,7 +1670,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.24")
+        self.assertEqual(result["expected_tag"], "v0.9.25")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -6462,7 +6462,10 @@ class AgentPoolManagementTest(unittest.TestCase):
 
             status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
             self.assertTrue(status["ok"])
+            self.assertTrue(status["marker_present"])
+            self.assertEqual(status["marker_state"], "file")
             self.assertEqual(status["existing_agent_count"], 4)
+            self.assertEqual(status["config_count"], 4)
             self.assertEqual(status["auth_count"], 2)
             status_text = json.dumps(status, sort_keys=True)
             self.assertNotIn(str(pool), status_text)
@@ -6556,6 +6559,47 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(result["target_count"], 1)
             self.assertNotIn(custom_prefix, payload)
             self.assertNotIn(str(pool), payload)
+
+    def test_agent_pool_status_requires_regular_marker_and_configs_for_ok(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents-secret"
+            spec_path = self._write_spec(tmp, pool)
+            (pool / "a1" / "skills").mkdir(parents=True)
+            (pool / "a1" / "plugins").mkdir()
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            marker = pool / server_module.POOL_MARKER_FILE
+
+            marker.unlink()
+            missing_marker = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            self.assertFalse(missing_marker["ok"])
+            self.assertFalse(missing_marker["marker_present"])
+            self.assertEqual(missing_marker["marker_state"], "missing")
+
+            marker_target = tmp / "outside-marker"
+            marker_target.write_text("marker\n", encoding="utf-8")
+            marker.symlink_to(marker_target)
+            linked_marker = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            self.assertFalse(linked_marker["ok"])
+            self.assertFalse(linked_marker["marker_present"])
+            self.assertEqual(linked_marker["marker_state"], "symlink")
+
+            marker.unlink()
+            marker.write_text("{}\n", encoding="utf-8")
+            (pool / "a2" / "config.toml").unlink()
+            missing_config = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            self.assertFalse(missing_config["ok"])
+            self.assertTrue(missing_config["marker_present"])
+            self.assertEqual(missing_config["config_count"], 3)
+
+            payload = json.dumps(
+                {"missing_marker": missing_marker, "linked_marker": linked_marker, "missing_config": missing_config},
+                sort_keys=True,
+            )
+            self.assertNotIn(str(tmp), payload)
+            self.assertNotIn("outside-marker", payload)
 
     def test_auth_copy_docs_match_data_sparse_output_contract(self) -> None:
         root = Path(__file__).resolve().parents[1]

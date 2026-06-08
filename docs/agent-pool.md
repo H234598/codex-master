@@ -111,8 +111,10 @@ that tells the Agentin to use current search sources or report a tooling/access
 limit instead of guessing. Public tool responses and assignment audit records
 still omit prompt text and Agentin output.
 
-`pool status` counts installed homes, wrappers, configs, auth files, and shared
-asset symlinks. It returns `pool_root: not_returned`, not local paths.
+`pool status` counts installed homes, wrappers, configs, auth files, the
+installed pool marker, and shared asset symlinks. Its top-level `ok` requires
+all expected homes, regular wrappers, regular configs, and a regular installed
+pool marker. It returns `pool_root: not_returned`, not local paths.
 
 `pool copy_auth` copies one source `auth.json` to many installed Agentinnen.
 Without `--yes` it is a dry-run and only reports copy counts.
