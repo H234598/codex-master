@@ -6700,8 +6700,63 @@ def agent_pool_status(
     missing = len(ids) - existing
     marker = root / POOL_MARKER_FILE
     marker_present = pool_regular_marker_present(marker)
+    shared_expected = 0
+    shared_valid = 0
+    shared_invalid = 0
+    shared_missing = 0
+    template_sources = 0
+    template_sources_missing = 0
+    templates_with_consumers = {normalized["templates"][agent] for agent in ids if normalized["templates"][agent] != agent}
+    for agent in ids:
+        template = normalized["templates"][agent]
+        home = root / agent
+        for asset in normalized["shared_assets"]:
+            target = home / asset
+            if template == agent:
+                if path_present_no_follow(target):
+                    template_sources += 1
+                elif agent in templates_with_consumers:
+                    template_sources_missing += 1
+                continue
+            shared_expected += 1
+            try:
+                mode = target.lstat().st_mode
+            except FileNotFoundError:
+                shared_missing += 1
+                continue
+            except OSError:
+                shared_invalid += 1
+                continue
+            if not stat_module.S_ISLNK(mode):
+                shared_invalid += 1
+                continue
+            try:
+                link_target = os.readlink(target)
+            except OSError:
+                shared_invalid += 1
+                continue
+            expected_source = root / template / asset
+            if os.path.isabs(link_target) or not path_present_no_follow(expected_source):
+                shared_invalid += 1
+                continue
+            actual_path = os.path.normpath(os.path.abspath(target.parent / link_target))
+            expected_path = os.path.normpath(os.path.abspath(expected_source))
+            actual_resolved = (target.parent / link_target).resolve(strict=False)
+            expected_resolved = expected_source.resolve(strict=False)
+            if actual_path == expected_path or actual_resolved == expected_resolved:
+                shared_valid += 1
+            else:
+                shared_invalid += 1
     return {
-        "ok": missing == 0 and wrappers == len(ids) and configs == len(ids) and marker_present,
+        "ok": (
+            missing == 0
+            and wrappers == len(ids)
+            and configs == len(ids)
+            and marker_present
+            and shared_missing == 0
+            and shared_invalid == 0
+            and template_sources_missing == 0
+        ),
         "pool_root": PATH_NOT_RETURNED,
         "pool_root_state": pool_public_path_state(root),
         "marker_state": pool_public_path_state(marker),
@@ -6713,6 +6768,12 @@ def agent_pool_status(
         "config_count": configs,
         "auth_count": auth,
         "shared_asset_symlink_count": shared_symlinks,
+        "shared_asset_expected_link_count": shared_expected,
+        "shared_asset_valid_link_count": shared_valid,
+        "shared_asset_missing_link_count": shared_missing,
+        "shared_asset_invalid_link_count": shared_invalid,
+        "shared_asset_template_source_count": template_sources,
+        "shared_asset_template_source_missing_count": template_sources_missing,
         "series": {name: len(pool_selector_ids(normalized, name)) for name in sorted(normalized["series_ids"])},
         "raw_output": "not_returned",
     }

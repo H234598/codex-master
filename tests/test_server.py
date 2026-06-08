@@ -1643,7 +1643,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.25+codex.test",
+            "version": "0.9.26+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1670,7 +1670,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.25")
+        self.assertEqual(result["expected_tag"], "v0.9.26")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -6466,6 +6466,10 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(status["marker_state"], "file")
             self.assertEqual(status["existing_agent_count"], 4)
             self.assertEqual(status["config_count"], 4)
+            self.assertEqual(status["shared_asset_expected_link_count"], 2)
+            self.assertEqual(status["shared_asset_valid_link_count"], 2)
+            self.assertEqual(status["shared_asset_missing_link_count"], 0)
+            self.assertEqual(status["shared_asset_invalid_link_count"], 0)
             self.assertEqual(status["auth_count"], 2)
             status_text = json.dumps(status, sort_keys=True)
             self.assertNotIn(str(pool), status_text)
@@ -6600,6 +6604,84 @@ class AgentPoolManagementTest(unittest.TestCase):
             )
             self.assertNotIn(str(tmp), payload)
             self.assertNotIn("outside-marker", payload)
+
+    def test_agent_pool_status_detects_invalid_shared_asset_links_without_path_leak(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents-secret"
+            spec_path = self._write_spec(tmp, pool)
+            (pool / "a1" / "skills").mkdir(parents=True)
+            (pool / "a1" / "plugins").mkdir()
+            (pool / "a2").mkdir()
+            (pool / "a2" / "skills").symlink_to("missing-secret-skills")
+
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            invalid_status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            self.assertFalse(invalid_status["ok"])
+            self.assertEqual(invalid_status["shared_asset_expected_link_count"], 2)
+            self.assertEqual(invalid_status["shared_asset_valid_link_count"], 1)
+            self.assertEqual(invalid_status["shared_asset_missing_link_count"], 0)
+            self.assertEqual(invalid_status["shared_asset_invalid_link_count"], 1)
+            self.assertEqual(invalid_status["shared_asset_template_source_missing_count"], 0)
+
+            payload = json.dumps(invalid_status, sort_keys=True)
+            self.assertNotIn(str(tmp), payload)
+            self.assertNotIn("missing-secret-skills", payload)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents-secret"
+            spec_path = self._write_spec(tmp, pool)
+            (pool / "a1" / "skills").mkdir(parents=True)
+            (pool / "a1" / "plugins").mkdir()
+            (pool / "a2").mkdir()
+            outside = tmp / "outside-skills"
+            outside.mkdir()
+            (pool / "a2" / "skills").symlink_to(outside)
+
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            absolute_status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            self.assertFalse(absolute_status["ok"])
+            self.assertEqual(absolute_status["shared_asset_invalid_link_count"], 1)
+            self.assertEqual(absolute_status["shared_asset_valid_link_count"], 1)
+
+            payload = json.dumps(absolute_status, sort_keys=True)
+            self.assertNotIn(str(tmp), payload)
+            self.assertNotIn("outside-skills", payload)
+
+    def test_agent_pool_status_accepts_links_to_resolved_template_source(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents-secret"
+            spec = {
+                "schema_version": 1,
+                "pool_root": str(pool),
+                "codex_bin": "/bin/codex",
+                "series": [
+                    {"prefix": "a", "count": 1, "template": "a1", "authenticated": []},
+                    {"prefix": "c", "count": 2, "template": "c1", "authenticated": []},
+                ],
+                "shared_assets": ["skills"],
+            }
+            spec_path = self._write_spec_payload(tmp, spec)
+            (pool / "a1" / "skills").mkdir(parents=True)
+            (pool / "c1").mkdir(parents=True)
+            (pool / "c1" / "skills").symlink_to("../a1/skills")
+            (pool / "c2").mkdir()
+            (pool / "c2" / "skills").symlink_to("../a1/skills")
+
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+
+            self.assertTrue(status["ok"])
+            self.assertEqual(status["shared_asset_expected_link_count"], 1)
+            self.assertEqual(status["shared_asset_valid_link_count"], 1)
+            self.assertEqual(status["shared_asset_invalid_link_count"], 0)
+            self.assertEqual(status["shared_asset_template_source_missing_count"], 0)
 
     def test_auth_copy_docs_match_data_sparse_output_contract(self) -> None:
         root = Path(__file__).resolve().parents[1]
