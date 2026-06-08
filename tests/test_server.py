@@ -1595,7 +1595,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.10+codex.test",
+            "version": "0.9.11+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1622,7 +1622,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.10")
+        self.assertEqual(result["expected_tag"], "v0.9.11")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -3821,7 +3821,12 @@ class ServerHelpersTest(unittest.TestCase):
                 if args and args[0] == "new-session":
                     return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
                 if args and args[0] == "pipe-pane":
-                    return subprocess.CompletedProcess(["tmux", *args], 1, "", "pipe failed")
+                    return subprocess.CompletedProcess(
+                        ["tmux", *args],
+                        1,
+                        "",
+                        f"SECRET_PIPE_OUTPUT_SHOULD_NOT_RETURN {tmpdir}",
+                    )
                 if args and args[0] == "kill-session":
                     return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
                 return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
@@ -3832,7 +3837,7 @@ class ServerHelpersTest(unittest.TestCase):
                 {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
             ), patch("codex_master.server.RAW_DIR", Path(tmpdir)), patch("codex_master.server.META_DIR", Path(tmpdir)):
-                with self.assertRaisesRegex(RuntimeError, "pipe-pane failed"):
+                with self.assertRaisesRegex(RuntimeError, "pipe-pane failed") as raised:
                     start_agent("a", cwd=tmpdir)
 
             new_session_calls = [call for call in mock_run_tmux.call_args_list if call.args[0][0] == "new-session"]
@@ -3844,6 +3849,9 @@ class ServerHelpersTest(unittest.TestCase):
             kill_calls = [call for call in mock_run_tmux.call_args_list if call.args[0][0] == "kill-session"]
             self.assertEqual(len(kill_calls), 1)
             self.assertFalse(any(Path(tmpdir).glob("*.log")))
+            error_text = str(raised.exception)
+            self.assertNotIn("SECRET_PIPE_OUTPUT_SHOULD_NOT_RETURN", error_text)
+            self.assertNotIn(str(tmpdir), error_text)
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.write_meta")
@@ -3962,7 +3970,7 @@ class ServerHelpersTest(unittest.TestCase):
     @patch("codex_master.server.write_meta")
     @patch("codex_master.server.tmux_alive", return_value=False)
     @patch("codex_master.server.run_tmux")
-    def test_start_agent_redacts_tmux_start_error(
+    def test_start_agent_omits_tmux_start_stderr(
         self, mock_run_tmux, _mock_alive, _mock_write_meta, _mock_ensure_state
     ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3970,7 +3978,10 @@ class ServerHelpersTest(unittest.TestCase):
             runner.write_text("#!/bin/sh\n", encoding="utf-8")
             runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
             mock_run_tmux.return_value = subprocess.CompletedProcess(
-                ["tmux", "new-session"], 1, "", "OPENAI_API_KEY=sk-testtoken1234567890"
+                ["tmux", "new-session"],
+                1,
+                "",
+                f"OPENAI_API_KEY=sk-testtoken1234567890 SECRET_START_OUTPUT_SHOULD_NOT_RETURN {tmpdir}",
             )
 
             with patch.dict(
@@ -3993,7 +4004,9 @@ class ServerHelpersTest(unittest.TestCase):
 
         error_text = str(raised.exception)
         self.assertNotIn("sk-testtoken1234567890", error_text)
-        self.assertIn("OPENAI_API_KEY=<redacted>", error_text)
+        self.assertNotIn("OPENAI_API_KEY", error_text)
+        self.assertNotIn("SECRET_START_OUTPUT_SHOULD_NOT_RETURN", error_text)
+        self.assertNotIn(str(tmpdir), error_text)
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.tmux_alive", return_value=False)

@@ -2359,7 +2359,7 @@ def start_agent(
         cleanup_failed_start(session, raw_log, kill_session=False)
         if release_lease_on_failure and lease and lease.get("held_by_this_server"):
             release_agent(agent, force=True)
-        raise AgentError(f"tmux start failed for agent {agent}: {command_error_text(cp.stderr)}")
+        raise AgentError(f"tmux start failed for agent {agent}")
 
     pipe_command = raw_log_writer_command(raw_log)
     pipe = run_tmux(["pipe-pane", "-o", "-t", session, pipe_command], check=False)
@@ -2367,7 +2367,7 @@ def start_agent(
         cleanup_failed_start(session, raw_log, kill_session=True)
         if release_lease_on_failure and lease and lease.get("held_by_this_server"):
             release_agent(agent, force=True)
-        raise AgentError(f"tmux pipe-pane failed for agent {agent}: {command_error_text(pipe.stderr)}")
+        raise AgentError(f"tmux pipe-pane failed for agent {agent}")
 
     data = {
         "agent": agent,
