@@ -6309,6 +6309,32 @@ def pool_public_path_state(path: Path) -> str:
     return "other"
 
 
+def pool_regular_marker_present(path: Path) -> bool:
+    try:
+        mode = path.lstat().st_mode
+    except OSError:
+        return False
+    return stat_module.S_ISREG(mode)
+
+
+def remove_agent_pool_entry(path: Path) -> str:
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "skipped"
+    if stat_module.S_ISLNK(mode) or stat_module.S_ISREG(mode):
+        path.unlink()
+        return "removed"
+    if stat_module.S_ISDIR(mode):
+        if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+            raise AgentError("safe pool removal is unavailable")
+        shutil.rmtree(path)
+        return "removed"
+    return "skipped"
+
+
 def pool_safe_relative_path(value: Any, *, field: str) -> Path:
     if not isinstance(value, str) or not value:
         raise AgentError(f"{field} must be a non-empty relative path")
@@ -6730,7 +6756,7 @@ def agent_pool_install(
         for asset in normalized["shared_assets"]:
             source = template_home / asset
             target = home / asset
-            if target.exists() or target.is_symlink():
+            if path_present_no_follow(target):
                 skipped_existing_assets += 1
                 continue
             if not source.exists():
@@ -6806,7 +6832,7 @@ def agent_pool_copy_auth(
             skipped_missing_home += 1
             continue
         target = home / "auth.json"
-        if target.exists() and not overwrite:
+        if path_present_no_follow(target) and not overwrite:
             skipped_existing += 1
             continue
         copyable += 1
@@ -6846,7 +6872,7 @@ def agent_pool_destroy_pool(
     if not yes:
         raise AgentError("destroy_pool requires yes=true")
     marker = root / POOL_MARKER_FILE
-    if not marker.exists() and not force:
+    if not pool_regular_marker_present(marker) and not force:
         raise AgentError("destroy_pool requires an installed pool marker or force=true")
 
     removed = 0
@@ -6854,24 +6880,15 @@ def agent_pool_destroy_pool(
     skipped = 0
     for agent in normalized["ids"]:
         target = root / agent
-        try:
-            mode = target.lstat().st_mode
-        except FileNotFoundError:
+        removal_state = remove_agent_pool_entry(target)
+        if removal_state == "missing":
             missing += 1
-            continue
-        except OSError:
-            skipped += 1
-            continue
-        if stat_module.S_ISLNK(mode) or stat_module.S_ISREG(mode):
-            target.unlink()
-            removed += 1
-        elif stat_module.S_ISDIR(mode):
-            shutil.rmtree(target)
+        elif removal_state == "removed":
             removed += 1
         else:
             skipped += 1
 
-    if marker.exists() and not marker.is_symlink():
+    if pool_regular_marker_present(marker):
         marker.unlink()
     root_removed = False
     if remove_root:

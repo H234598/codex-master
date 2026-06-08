@@ -123,7 +123,9 @@ Without `--yes` it is a dry-run and only reports copy counts.
 ```
 
 `pool destroy_pool` removes only the Agentin entries described by the spec. It
-requires `--yes` and the installed pool marker unless `--force` is passed.
+requires `--yes` and a regular installed pool marker unless `--force` is passed.
+Directory removal fails closed if the Python runtime cannot provide
+symlink-attack-resistant `rmtree` semantics.
 
 ## Auth Rules
 

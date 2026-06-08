@@ -1595,7 +1595,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.6+codex.test",
+            "version": "0.9.7+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1622,7 +1622,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.6")
+        self.assertEqual(result["expected_tag"], "v0.9.7")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -6045,6 +6045,62 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(wrapper_target.read_text(encoding="utf-8"), "external wrapper secret\n")
             self.assertEqual(config_target.read_text(encoding="utf-8"), "external config secret\n")
 
+    def test_agent_pool_install_skips_broken_shared_asset_symlink_without_replacing_it(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec(tmp, pool)
+            (pool / "a1" / "skills").mkdir(parents=True)
+            (pool / "a1" / "plugins").mkdir()
+            (pool / "a2").mkdir()
+            (pool / "a2" / "skills").symlink_to("missing-skills")
+
+            result = server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["skipped_existing_shared_assets"], 1)
+            self.assertTrue((pool / "a2" / "skills").is_symlink())
+            self.assertFalse((pool / "a2" / "skills").exists())
+            self.assertTrue((pool / "a2" / "plugins").is_symlink())
+
+    def test_agent_pool_copy_auth_treats_broken_target_symlink_as_existing(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec(tmp, pool)
+            (pool / "a1").mkdir(parents=True)
+            (pool / "a2").mkdir()
+            (pool / "a1" / "auth.json").write_text('{"token":"secret"}\n', encoding="utf-8")
+            (pool / "a2" / "auth.json").symlink_to("missing-auth.json")
+
+            skipped = server_module.agent_pool_copy_auth(
+                str(spec_path),
+                target_dir=str(pool),
+                codex_bin="/bin/codex",
+                from_agent="a1",
+                to="a-series",
+                yes=True,
+            )
+            replaced = server_module.agent_pool_copy_auth(
+                str(spec_path),
+                target_dir=str(pool),
+                codex_bin="/bin/codex",
+                from_agent="a1",
+                to="a-series",
+                yes=True,
+                overwrite=True,
+            )
+
+            self.assertEqual(skipped["skipped_existing_count"], 1)
+            self.assertEqual(skipped["copied_count"], 0)
+            self.assertEqual(replaced["copied_count"], 1)
+            self.assertFalse((pool / "a2" / "auth.json").is_symlink())
+            self.assertEqual((pool / "a2" / "auth.json").read_text(encoding="utf-8"), '{"token":"secret"}\n')
+
     def test_agent_pool_rejects_codex_bin_control_chars_without_path_leak(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -6130,6 +6186,60 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertIn("private state directory must not be a symlink", payload_text)
             self.assertNotIn(str(tmp), payload_text)
             self.assertNotIn("outside-runtime-target", payload_text)
+
+    def test_agent_pool_destroy_requires_regular_marker_without_path_leak(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents-secret"
+            spec_path = self._write_spec(tmp, pool)
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            marker = pool / server_module.POOL_MARKER_FILE
+            marker.unlink()
+            marker_target = tmp / "outside-marker"
+            marker_target.write_text("marker\n", encoding="utf-8")
+            marker.symlink_to(marker_target)
+
+            response = handle_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 68,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "agent_pool_destroy_pool",
+                        "arguments": {"spec": str(spec_path), "target_dir": str(pool), "yes": True},
+                    },
+                }
+            )
+
+            self.assertTrue(response["result"]["isError"])
+            payload_text = response["result"]["content"][0]["text"]
+            self.assertIn("destroy_pool requires an installed pool marker or force=true", payload_text)
+            self.assertNotIn(str(tmp), payload_text)
+            self.assertNotIn("outside-marker", payload_text)
+            self.assertTrue(marker.is_symlink())
+
+    def test_agent_pool_destroy_refuses_unsafe_rmtree_without_removing_pool(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec(tmp, pool)
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+
+            with patch.object(server_module.shutil.rmtree, "avoids_symlink_attacks", False, create=True):
+                with self.assertRaises(AgentError) as ctx:
+                    server_module.agent_pool_destroy_pool(
+                        str(spec_path),
+                        target_dir=str(pool),
+                        codex_bin="/bin/codex",
+                        yes=True,
+                    )
+
+            self.assertIn("safe pool removal is unavailable", str(ctx.exception))
+            self.assertTrue((pool / "a1").is_dir())
 
     def test_agent_pool_tools_are_registered_and_cli_invokes_pool_namespace(self) -> None:
         from codex_master import server as server_module
