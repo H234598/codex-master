@@ -1595,7 +1595,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.9+codex.test",
+            "version": "0.9.10+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1622,7 +1622,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.9")
+        self.assertEqual(result["expected_tag"], "v0.9.10")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -3701,6 +3701,43 @@ class ServerHelpersTest(unittest.TestCase):
                 runner_is_symlink = runner.is_symlink()
 
         self.assertTrue(runner_is_symlink)
+        mock_run_tmux.assert_not_called()
+
+    @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("codex_master.server.run_tmux")
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 0,
+            "external_process_count": 0,
+            "managed_process_count": 0,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
+    def test_start_agent_missing_cwd_error_is_path_sparse(
+        self, _mock_summary, mock_run_tmux, _mock_tmux_alive, _mock_ensure_state
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            runner = tmp_path / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            secret_cwd = tmp_path / "secret-cwd-do-not-return"
+
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": tmp_path, "session": "test_session"}},
+                clear=False,
+            ):
+                with self.assertRaisesRegex(AgentError, "cwd is not a directory") as raised:
+                    start_agent("a", cwd=str(secret_cwd))
+
+        error_text = str(raised.exception)
+        self.assertNotIn(str(tmp_path), error_text)
+        self.assertNotIn("secret-cwd-do-not-return", error_text)
         mock_run_tmux.assert_not_called()
 
     @patch("codex_master.server.ensure_state")

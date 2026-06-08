@@ -2343,7 +2343,7 @@ def start_agent(
     prompt = bounded_text(prompt, field="prompt", max_chars=MAX_SEND_TEXT, strip=False) if prompt is not None else None
     start_cwd = Path(cwd or os.getcwd()).expanduser().resolve()
     if not start_cwd.exists() or not start_cwd.is_dir():
-        raise AgentError(f"cwd is not a directory: {start_cwd}")
+        raise AgentError("cwd is not a directory")
 
     run_id = f"{now_id()}-{agent}"
     raw_log = RAW_DIR / f"{run_id}.log"
