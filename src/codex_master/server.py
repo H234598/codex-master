@@ -6259,7 +6259,12 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         selected_agent = single_agent_id(str(args.get("agent", "")), "agent_interrupt")
         return call_agent_lifecycle(
             selected_agent,
-            lambda: interrupt_agent(selected_agent, bool_arg(args, "force", False)),
+            lambda: call_authenticated_agent_mutation(
+                selected_agent,
+                operation="agent_interrupt",
+                allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
+                fn=lambda: interrupt_agent(selected_agent, bool_arg(args, "force", False)),
+            ),
         )
     if name == "agent_claim":
         selected_agent = single_agent_id(str(args.get("agent", "")), "agent_claim")
@@ -7282,6 +7287,7 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "agent": agent_selector_schema(single=True),
                 "force": {"type": "boolean", "default": False},
+                "allow_unauthenticated": allow_unauthenticated_schema(),
             },
             "additionalProperties": False,
         },
@@ -7939,6 +7945,7 @@ def main_cli(argv: list[str]) -> int:
     p_interrupt = sub.add_parser("interrupt")
     p_interrupt.add_argument("agent")
     p_interrupt.add_argument("--force", action="store_true")
+    p_interrupt.add_argument("--allow-unauthenticated", action="store_true")
 
     p_stop = sub.add_parser("stop")
     p_stop.add_argument("agent", nargs="?", default="both", help=AGENT_SELECTOR_DESCRIPTION)
@@ -8217,7 +8224,16 @@ def main_cli(argv: list[str]) -> int:
                 )
             )
         if args.command == "interrupt":
-            return print_json(call_validated_tool("agent_interrupt", {"agent": args.agent, "force": args.force}))
+            return print_json(
+                call_validated_tool(
+                    "agent_interrupt",
+                    {
+                        "agent": args.agent,
+                        "force": args.force,
+                        "allow_unauthenticated": True if args.allow_unauthenticated else None,
+                    },
+                )
+            )
         if args.command == "stop":
             return print_json(
                 call_validated_tool(

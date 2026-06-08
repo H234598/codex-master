@@ -454,6 +454,7 @@ class ServerHelpersTest(unittest.TestCase):
         status_props = by_name["agent_status"]["inputSchema"]["properties"]
         lease_status_props = by_name["agent_lease_status"]["inputSchema"]["properties"]
         send_props = by_name["agent_send"]["inputSchema"]["properties"]
+        interrupt_props = by_name["agent_interrupt"]["inputSchema"]["properties"]
         report_props = by_name["agent_report_request"]["inputSchema"]["properties"]
         wait_props = by_name["agent_wait"]["inputSchema"]["properties"]
         watchdog_props = by_name["fleet_watchdog"]["inputSchema"]["properties"]
@@ -492,6 +493,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn(str(MAX_MUTATING_AGENTS_WITHOUT_CONFIRM), start_props["allow_broad_selector"]["description"])
         self.assertFalse(stop_props["allow_broad_selector"]["default"])
         self.assertFalse(send_props["allow_unauthenticated"]["default"])
+        self.assertFalse(interrupt_props["allow_unauthenticated"]["default"])
         self.assertFalse(claim_props["allow_unauthenticated"]["default"])
         self.assertFalse(assign_props["allow_unauthenticated"]["default"])
         self.assertFalse(assign_readonly_props["allow_unauthenticated"]["default"])
@@ -1780,7 +1782,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.33")
+        self.assertEqual(result["expected_tag"], "v0.9.34")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -3809,6 +3811,8 @@ class ServerHelpersTest(unittest.TestCase):
                     call_tool("agent_claim", {"agent": "c2", "wait_forever": False})
                 with self.assertRaisesRegex(AgentError, "agent_send requires authenticated Agentin c2"):
                     call_tool("agent_send", {"agent": "c2", "text": "hi"})
+                with self.assertRaisesRegex(AgentError, "agent_interrupt requires authenticated Agentin c2"):
+                    call_tool("agent_interrupt", {"agent": "c2"})
                 claim_result = call_tool(
                     "agent_claim",
                     {"agent": "c2", "wait_forever": False, "allow_unauthenticated": True},
@@ -5579,6 +5583,19 @@ class CliLifecycleTest(unittest.TestCase):
                 "allow_missing_skill": False,
                 "allow_subagents": False,
             },
+        )
+
+    @patch("codex_master.server.print_json")
+    @patch("codex_master.server.call_tool", return_value={"status": "interrupt_sent", "raw_output": "not_returned"})
+    def test_cli_interrupt_can_allow_unauthenticated(self, mock_call_tool, mock_print_json) -> None:
+        mock_print_json.return_value = 0
+
+        result = main_cli(["interrupt", "c2", "--force", "--allow-unauthenticated"])
+
+        self.assertEqual(result, 0)
+        mock_call_tool.assert_called_once_with(
+            "agent_interrupt",
+            {"agent": "c2", "force": True, "allow_unauthenticated": True},
         )
 
     @patch("codex_master.server.print_json")

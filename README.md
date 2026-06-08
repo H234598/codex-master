@@ -100,7 +100,7 @@ Mutating Start/Stop selectors that resolve to more than 6 Agentinnen fail
 closed unless `allow_broad_selector=true` is passed. This prevents accidental
 `all`/series operations from starting or stopping large parts of the pool.
 Working mutations require a regular per-Agentin `auth.json` by default:
-`agent_start`, `agent_claim`, `agent_send`, `agent_assign`,
+`agent_start`, `agent_claim`, `agent_send`, `agent_interrupt`, `agent_assign`,
 `agent_assign_readonly`, `agent_assign_live_data`, `agent_assign_write`, and
 `agent_report_request` fail closed when auth is missing, symlinked, not a
 regular file, unreadable, or too large. Status/skills/capabilities/lease/pool/

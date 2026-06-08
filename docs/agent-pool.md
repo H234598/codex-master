@@ -146,10 +146,10 @@ MCP working mutations require each selected Agentin to have a regular local
 `auth.json` by default. This protects Teamleiterinnen from accidentally
 starting or assigning unauthenticated sleeping homes such as `c2`. The guarded
 tools are `agent_start`, `agent_claim`, `agent_send`, `agent_assign`,
-`agent_assign_readonly`, `agent_assign_live_data`, `agent_assign_write`, and
-`agent_report_request`. Read-only diagnostics, pool inspection, stop, release,
-and watchdog cleanup remain usable. Use `--allow-unauthenticated` only for
-explicit login/bootstrap flows.
+`agent_interrupt`, `agent_assign_readonly`, `agent_assign_live_data`,
+`agent_assign_write`, and `agent_report_request`. Read-only diagnostics, pool
+inspection, stop, release, and watchdog cleanup remain usable. Use
+`--allow-unauthenticated` only for explicit login/bootstrap flows.
 
 `copy_auth`:
 
