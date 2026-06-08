@@ -142,6 +142,9 @@ Data minimization:
   `skill-match`, and `capabilities` are paged with `--agents-limit` and
   `--agents-offset`; the default page size is 30 Agentinnen and the maximum is
   100.
+- Broad mutating `start`/`stop` selectors that resolve to more than 6
+  Agentinnen require `--allow-broad-selector`; use this only after checking
+  leases and scope.
 - For weather, news, prices, schedules, and other current-data tasks, prefer
   `assign-live-data` over raw `send`. It is a read-only assignment that tells
   the Agentin to use current search sources or report a tooling/access limit

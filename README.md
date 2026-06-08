@@ -96,6 +96,9 @@ never returned in public responses.
 successful start, so short-lived local CLI commands do not block the next
 operator command. Use `agent_claim` explicitly when a connected Codex-CLI
 instance should keep an Agentin reserved after startup.
+Mutating Start/Stop selectors that resolve to more than 6 Agentinnen fail
+closed unless `allow_broad_selector=true` is passed. This prevents accidental
+`all`/series operations from starting or stopping large parts of the pool.
 Working mutations require a regular per-Agentin `auth.json` by default:
 `agent_start`, `agent_claim`, `agent_send`, `agent_assign`,
 `agent_assign_readonly`, `agent_assign_live_data`, `agent_assign_write`, and
@@ -138,8 +141,8 @@ in the user journal.
 
 ## Tools
 
-- `agent_start`: start selected Agentinnen (`a1`, `b1`, `c1`, series selectors,
-  `both`, or `all`)
+- `agent_start`: start selected Agentinnen; `all`/series selectors require
+  `allow_broad_selector=true` when they resolve to more than 6 Agentinnen
 - `agent_status`: structured status, response state, and limit classification
   without raw output
 - `agent_lease_status`: data-sparse lease state for selected Agentinnen
@@ -157,7 +160,8 @@ in the user journal.
   then optionally interrupt, stop, or release without raw output
 - `agent_send`: send text to one running Agentin
 - `agent_interrupt`: send Ctrl-C to one running Agentin
-- `agent_stop`: stop selected Agentinnen
+- `agent_stop`: stop selected Agentinnen; `all`/series selectors require
+  `allow_broad_selector=true` when they resolve to more than 6 Agentinnen
 - `agent_safe_tail`: explicit capped, ANSI-stripped, redacted excerpt; refuses
   active leases held by other clients before reading pane or log output; log
   source reads only regular raw-log files

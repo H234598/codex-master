@@ -88,6 +88,7 @@ MAX_SKILL_NAMES = 200
 MAX_CAPABILITY_PLUGINS = 20
 DEFAULT_MULTI_AGENT_RESULT_LIMIT = 30
 MAX_MULTI_AGENT_RESULT_LIMIT = 100
+MAX_MUTATING_AGENTS_WITHOUT_CONFIRM = 6
 MAX_ASSIGNMENT_RECORDS = 100
 MAX_ASSIGNMENT_LOG_RECORDS = 500
 MAX_ASSIGNMENT_LOG_BYTES = 1024 * 1024
@@ -5901,6 +5902,34 @@ def paged_multi_agent_result(selected: list[str], args: dict[str, Any], fn: Any)
     )
 
 
+def require_broad_mutation_confirmation(
+    selected: list[str],
+    *,
+    operation: str,
+    allow_broad_selector: bool,
+) -> dict[str, Any]:
+    if len(selected) <= MAX_MUTATING_AGENTS_WITHOUT_CONFIRM:
+        return {
+            "required": False,
+            "allowed": True,
+            "selected_count": len(selected),
+            "limit": MAX_MUTATING_AGENTS_WITHOUT_CONFIRM,
+            "raw_output": "not_returned",
+        }
+    if not allow_broad_selector:
+        raise AgentError(
+            f"{operation} broad selector resolves to more than {MAX_MUTATING_AGENTS_WITHOUT_CONFIRM} "
+            "Agentinnen; pass allow_broad_selector=true after checking leases and scope"
+        )
+    return {
+        "required": True,
+        "allowed": True,
+        "selected_count": len(selected),
+        "limit": MAX_MUTATING_AGENTS_WITHOUT_CONFIRM,
+        "raw_output": "not_returned",
+    }
+
+
 def call_agent_lifecycle(agent: str, fn: Any) -> dict[str, Any]:
     with agent_lifecycle_lock(agent):
         return fn()
@@ -5927,7 +5956,12 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "agent_start":
         selected = agent_ids(str(args.get("agent", "both")))
         allow_unauthenticated = bool_arg(args, "allow_unauthenticated", False)
-        return multi_agent_result(
+        broad_selection = require_broad_mutation_confirmation(
+            selected,
+            operation="agent_start",
+            allow_broad_selector=bool_arg(args, "allow_broad_selector", False),
+        )
+        result = multi_agent_result(
             selected,
             lambda agent: call_agent_lifecycle(
                 agent,
@@ -5939,12 +5973,21 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 ),
             ),
         )
+        result["broad_selection"] = broad_selection
+        return result
     if name == "agent_stop":
         selected = agent_ids(str(args.get("agent", "both")))
-        return multi_agent_result(
+        broad_selection = require_broad_mutation_confirmation(
+            selected,
+            operation="agent_stop",
+            allow_broad_selector=bool_arg(args, "allow_broad_selector", False),
+        )
+        result = multi_agent_result(
             selected,
             lambda agent: call_agent_lifecycle(agent, lambda: stop_agent(agent, bool_arg(args, "force", False))),
         )
+        result["broad_selection"] = broad_selection
+        return result
     if name == "agent_status":
         selected = agent_ids(str(args.get("agent", "all")))
         return paged_multi_agent_result(selected, args, status_agent)
@@ -6275,6 +6318,17 @@ def allow_unauthenticated_schema() -> dict[str, Any]:
         "type": "boolean",
         "default": False,
         "description": "Bootstrap/login override only. Default false requires a regular per-Agentin auth.json.",
+    }
+
+
+def allow_broad_selector_schema() -> dict[str, Any]:
+    return {
+        "type": "boolean",
+        "default": False,
+        "description": (
+            f"Required when a mutating selector resolves to more than {MAX_MUTATING_AGENTS_WITHOUT_CONFIRM} "
+            "Agentinnen."
+        ),
     }
 
 
@@ -7063,6 +7117,7 @@ TOOLS: list[dict[str, Any]] = [
                 "cwd": text_schema(MAX_PATH_TEXT, description="Working directory. Defaults to the MCP server cwd."),
                 "prompt": text_schema(MAX_SEND_TEXT, description="Optional initial prompt passed to Codex."),
                 "allow_unauthenticated": allow_unauthenticated_schema(),
+                "allow_broad_selector": allow_broad_selector_schema(),
             },
             "additionalProperties": False,
         },
@@ -7235,6 +7290,7 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "agent": agent_selector_schema(default="both"),
                 "force": {"type": "boolean", "default": False},
+                "allow_broad_selector": allow_broad_selector_schema(),
             },
             "additionalProperties": False,
         },
@@ -7840,6 +7896,7 @@ def main_cli(argv: list[str]) -> int:
     p_start.add_argument("--cwd")
     p_start.add_argument("--prompt")
     p_start.add_argument("--allow-unauthenticated", action="store_true")
+    p_start.add_argument("--allow-broad-selector", action="store_true")
 
     p_status = sub.add_parser("status")
     p_status.add_argument("agent", nargs="?", default="all", help=AGENT_SELECTOR_DESCRIPTION)
@@ -7882,6 +7939,7 @@ def main_cli(argv: list[str]) -> int:
     p_stop = sub.add_parser("stop")
     p_stop.add_argument("agent", nargs="?", default="both", help=AGENT_SELECTOR_DESCRIPTION)
     p_stop.add_argument("--force", action="store_true")
+    p_stop.add_argument("--allow-broad-selector", action="store_true")
 
     p_lease_status = sub.add_parser("lease-status")
     p_lease_status.add_argument("agent", nargs="?", default="all", help=AGENT_SELECTOR_DESCRIPTION)
@@ -8094,6 +8152,7 @@ def main_cli(argv: list[str]) -> int:
                         "cwd": args.cwd,
                         "prompt": args.prompt,
                         "allow_unauthenticated": True if args.allow_unauthenticated else None,
+                        "allow_broad_selector": True if args.allow_broad_selector else None,
                     },
                 )
             )
@@ -8156,7 +8215,16 @@ def main_cli(argv: list[str]) -> int:
         if args.command == "interrupt":
             return print_json(call_validated_tool("agent_interrupt", {"agent": args.agent, "force": args.force}))
         if args.command == "stop":
-            return print_json(call_validated_tool("agent_stop", {"agent": args.agent, "force": args.force}))
+            return print_json(
+                call_validated_tool(
+                    "agent_stop",
+                    {
+                        "agent": args.agent,
+                        "force": args.force,
+                        "allow_broad_selector": True if args.allow_broad_selector else None,
+                    },
+                )
+            )
         if args.command == "lease-status":
             return print_json(
                 call_validated_tool(

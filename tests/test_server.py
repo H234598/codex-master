@@ -26,6 +26,7 @@ from codex_master.server import (
     MAX_LIVE_DATA_TOPIC,
     MAX_META_BYTES,
     MAX_MULTI_AGENT_RESULT_LIMIT,
+    MAX_MUTATING_AGENTS_WITHOUT_CONFIRM,
     MAX_RPC_MESSAGE_BYTES,
     MAX_RAW_LOG_BYTES,
     MAX_SEND_TEXT,
@@ -424,6 +425,7 @@ class ServerHelpersTest(unittest.TestCase):
         assign_props = by_name["agent_assign"]["inputSchema"]["properties"]
         claim_props = by_name["agent_claim"]["inputSchema"]["properties"]
         start_props = by_name["agent_start"]["inputSchema"]["properties"]
+        stop_props = by_name["agent_stop"]["inputSchema"]["properties"]
         status_props = by_name["agent_status"]["inputSchema"]["properties"]
         lease_status_props = by_name["agent_lease_status"]["inputSchema"]["properties"]
         send_props = by_name["agent_send"]["inputSchema"]["properties"]
@@ -461,6 +463,9 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(claim_props["stopped_grace_seconds"]["default"], DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS)
         self.assertEqual(claim_props["stopped_grace_seconds"]["maximum"], MAX_STOPPED_LEASE_RECOVERY_GRACE_SECONDS)
         self.assertFalse(start_props["allow_unauthenticated"]["default"])
+        self.assertFalse(start_props["allow_broad_selector"]["default"])
+        self.assertIn(str(MAX_MUTATING_AGENTS_WITHOUT_CONFIRM), start_props["allow_broad_selector"]["description"])
+        self.assertFalse(stop_props["allow_broad_selector"]["default"])
         self.assertFalse(send_props["allow_unauthenticated"]["default"])
         self.assertFalse(claim_props["allow_unauthenticated"]["default"])
         self.assertFalse(assign_props["allow_unauthenticated"]["default"])
@@ -540,6 +545,45 @@ class ServerHelpersTest(unittest.TestCase):
         mock_status_agent.assert_any_call("a2")
         mock_status_agent.assert_any_call("a3")
         self.assertEqual(mock_status_agent.call_count, 2)
+
+    @patch("codex_master.server.call_agent_lifecycle")
+    def test_mutating_broad_selectors_require_explicit_confirmation(self, mock_lifecycle) -> None:
+        with self.assertRaisesRegex(AgentError, "allow_broad_selector=true") as raised_start:
+            call_tool("agent_start", {"agent": "a-series"})
+        with self.assertRaisesRegex(AgentError, "allow_broad_selector=true") as raised_stop:
+            call_tool("agent_stop", {"agent": "all"})
+
+        self.assertEqual(mock_lifecycle.call_count, 0)
+        self.assertNotIn("a-series", str(raised_start.exception))
+        self.assertNotIn("a1", str(raised_stop.exception))
+        self.assertNotIn("b1", str(raised_stop.exception))
+
+    @patch("codex_master.server.call_agent_lifecycle")
+    def test_mutating_broad_selectors_can_be_explicitly_confirmed(self, mock_lifecycle) -> None:
+        mock_lifecycle.side_effect = lambda agent, fn: {
+            "agent": agent,
+            "status": "started",
+            "raw_output": "not_returned",
+        }
+        agents = {
+            f"a{index}": {
+                "label": f"A{index}",
+                "runner": Path("/tmp/codex"),
+                "home": Path("/tmp/home"),
+                "session": f"session-a{index}",
+            }
+            for index in range(1, MAX_MUTATING_AGENTS_WITHOUT_CONFIRM + 2)
+        }
+
+        with patch.dict("codex_master.server.AGENTS", agents, clear=True):
+            result = call_tool("agent_start", {"agent": "all", "allow_broad_selector": True})
+
+        self.assertEqual(len(result["results"]), MAX_MUTATING_AGENTS_WITHOUT_CONFIRM + 1)
+        self.assertTrue(result["broad_selection"]["required"])
+        self.assertTrue(result["broad_selection"]["allowed"])
+        self.assertEqual(result["broad_selection"]["selected_count"], MAX_MUTATING_AGENTS_WITHOUT_CONFIRM + 1)
+        self.assertEqual(result["broad_selection"]["raw_output"], "not_returned")
+        self.assertEqual(mock_lifecycle.call_count, MAX_MUTATING_AGENTS_WITHOUT_CONFIRM + 1)
 
     def test_agent_selector_policy_can_switch_ordinal_rotation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1684,7 +1728,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.29+codex.test",
+            "version": "0.9.30+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1711,7 +1755,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.29")
+        self.assertEqual(result["expected_tag"], "v0.9.30")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -5413,6 +5457,19 @@ class CliLifecycleTest(unittest.TestCase):
         mock_call_tool.assert_called_once_with(
             "agent_status",
             {"agent": "all", "agents_offset": 30, "agents_limit": 10},
+        )
+
+    @patch("codex_master.server.print_json")
+    @patch("codex_master.server.call_tool", return_value={"results": [], "raw_output": "not_returned"})
+    def test_cli_start_can_confirm_broad_selector(self, mock_call_tool, mock_print_json) -> None:
+        mock_print_json.return_value = 0
+
+        result = main_cli(["start", "all", "--allow-broad-selector"])
+
+        self.assertEqual(result, 0)
+        mock_call_tool.assert_called_once_with(
+            "agent_start",
+            {"agent": "all", "allow_broad_selector": True},
         )
 
     @patch("codex_master.server.print_json")
