@@ -1595,7 +1595,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.7+codex.test",
+            "version": "0.9.8+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1622,7 +1622,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.7")
+        self.assertEqual(result["expected_tag"], "v0.9.8")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -5353,6 +5353,37 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertNotIn(str(Path(__file__).resolve().parents[1] / "bin" / "codex-master-mcp"), payload_text)
         self.assertNotIn(str(Path(tmp_home)), payload_text)
         mock_run.assert_any_call(["codex", "mcp", "add", "codex-master-mcp", "--", str(install_link)])
+
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_missing_repo_wrapper_error_is_path_sparse(self, mock_wrapper_path) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "secret-repo" / "bin" / "codex-master-mcp"
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            mock_wrapper_path.return_value = wrapper
+
+            with self.assertRaisesRegex(AgentError, "repo wrapper missing") as raised:
+                install(register=False, install_path=install_link, sync_plugin_cache=False)
+
+        self.assertNotIn(str(tmp_path), str(raised.exception))
+        self.assertNotIn("secret-repo", str(raised.exception))
+
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_non_executable_repo_wrapper_error_is_path_sparse(self, mock_wrapper_path) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "secret-repo" / "bin" / "codex-master-mcp"
+            wrapper.parent.mkdir(parents=True)
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(0o600)
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            mock_wrapper_path.return_value = wrapper
+
+            with self.assertRaisesRegex(AgentError, "repo wrapper is not executable") as raised:
+                install(register=False, install_path=install_link, sync_plugin_cache=False)
+
+        self.assertNotIn(str(tmp_path), str(raised.exception))
+        self.assertNotIn("secret-repo", str(raised.exception))
 
     @patch("codex_master.server.mcp_command_startup_self_test")
     @patch("codex_master.server.repo_wrapper_path")

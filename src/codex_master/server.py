@@ -5490,9 +5490,9 @@ def install(
         assert_install_context_allows_master_registration()
     wrapper = repo_wrapper_path()
     if not wrapper.exists():
-        raise AgentError(f"repo wrapper missing: {wrapper}")
+        raise AgentError("repo wrapper missing")
     if not os.access(wrapper, os.X_OK):
-        raise AgentError(f"repo wrapper is not executable: {wrapper}")
+        raise AgentError("repo wrapper is not executable")
     startup_self_test: dict[str, Any] = {"requested": register, "status": "skipped", "raw_output": "not_returned"}
     if register:
         wrapper_self_test = mcp_command_startup_self_test(wrapper)
