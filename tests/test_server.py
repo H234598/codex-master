@@ -1780,7 +1780,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.32")
+        self.assertEqual(result["expected_tag"], "v0.9.33")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -4078,6 +4078,55 @@ class ServerHelpersTest(unittest.TestCase):
             error_text = str(raised.exception)
             self.assertNotIn("SECRET_STOP_OUTPUT_SHOULD_NOT_RETURN", error_text)
             self.assertNotIn(tmpdir, error_text)
+
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    def test_stop_agent_releases_own_lease_when_already_not_running(self, _mock_alive) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch(
+                "codex_master.server.LEASE_DIR", state / "leases"
+            ), patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
+                clear=False,
+            ):
+                claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
+
+                result = stop_agent("a")
+
+        self.assertEqual(result["status"], "not_running")
+        self.assertEqual(result["lease"]["state"], "unclaimed")
+        self.assertEqual(result["lease"]["holder"], "none")
+
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    def test_stop_agent_keeps_foreign_lease_when_already_not_running(self, _mock_alive) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch(
+                "codex_master.server.LEASE_DIR", state / "leases"
+            ), patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
+                clear=False,
+            ):
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                    claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
+                    result = stop_agent("a")
+
+        self.assertEqual(result["status"], "not_running")
+        self.assertEqual(result["lease"]["state"], "held")
+        self.assertEqual(result["lease"]["holder"], "other_server")
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.write_meta")

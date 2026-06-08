@@ -2460,7 +2460,11 @@ def stop_agent(agent: str, force: bool = False) -> dict[str, Any]:
             raise AgentError(f"tmux stop failed for agent {agent}")
         release = release_agent(agent, force=True)
     else:
-        release = {"status": "skipped", "lease": agent_lease_status(agent), "raw_output": "not_returned"}
+        current_lease = agent_lease_status(agent)
+        if current_lease["held_by_this_server"] or current_lease["state"] == "expired":
+            release = release_agent(agent, force=True)
+        else:
+            release = {"status": "skipped", "lease": current_lease, "raw_output": "not_returned"}
     return {
         "agent": agent,
         "status": "stopped" if was_running else "not_running",
