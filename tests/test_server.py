@@ -1806,7 +1806,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.40")
+        self.assertEqual(result["expected_tag"], "v0.9.41")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -3979,7 +3979,19 @@ class ServerHelpersTest(unittest.TestCase):
         mock_run_tmux.assert_not_called()
 
     @patch("codex_master.server.ensure_state")
-    @patch("codex_master.server.read_meta", return_value={"raw_log": "/tmp/private-agent.log"})
+    @patch(
+        "codex_master.server.read_meta",
+        return_value={
+            "agent": "a",
+            "backend": "tmux",
+            "home": "/tmp/private-agent-home",
+            "runner": "/tmp/private-agent-home/codex",
+            "cwd": "/tmp/private-agent-cwd",
+            "args": ["--secret-looking-path", "/tmp/private-agent-home"],
+            "raw_log": "/tmp/private-agent.log",
+            "model": "gpt-5.4-mini",
+        },
+    )
     @patch("codex_master.server.pane_pid", return_value=321)
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch(
@@ -4009,8 +4021,15 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "already_running")
         self.assertEqual(result["home_external_process_count"], 0)
+        self.assertEqual(result["meta"]["home"], "not_returned")
+        self.assertEqual(result["meta"]["runner"], "not_returned")
+        self.assertEqual(result["meta"]["cwd"], "not_returned")
         self.assertEqual(result["meta"]["raw_log"], "not_returned")
-        self.assertNotIn("/tmp/private-agent.log", json.dumps(result, sort_keys=True))
+        self.assertEqual(result["meta"]["args"], "not_returned")
+        self.assertEqual(result["meta"]["home_state"], "set")
+        self.assertEqual(result["meta"]["runner_state"], "set")
+        self.assertEqual(result["meta"]["cwd_state"], "set")
+        self.assertNotIn("/tmp/private-agent", json.dumps(result, sort_keys=True))
         self.assertEqual(result["raw_output"], "not_returned")
 
     @patch("codex_master.server.ensure_state")

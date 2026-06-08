@@ -1192,9 +1192,29 @@ def read_meta(agent: str) -> dict[str, Any]:
 
 
 def public_agent_meta(meta: dict[str, Any]) -> dict[str, Any]:
-    public = dict(meta)
-    if "raw_log" in public:
-        public["raw_log"] = "not_returned"
+    public: dict[str, Any] = {}
+    for key in (
+        "agent",
+        "backend",
+        "label",
+        "session",
+        "model",
+        "model_reasoning_effort",
+        "started_at_utc",
+        "run_id",
+        "raw_log_policy",
+        "raw_log_max_bytes",
+        "meta_source",
+    ):
+        if key in meta:
+            public[key] = meta[key]
+    for path_key in ("home", "runner", "cwd", "raw_log"):
+        if path_key in meta:
+            public[path_key] = PATH_NOT_RETURNED
+            public[f"{path_key}_state"] = "set" if meta.get(path_key) else "not_set"
+    if "args" in meta:
+        public["args"] = "not_returned"
+        public["args_state"] = "set" if meta.get("args") else "not_set"
     return public
 
 
