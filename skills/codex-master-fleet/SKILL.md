@@ -103,17 +103,17 @@ Prefer structured tools over raw `send`:
 cd /home/teladi/codex-master
 ./bin/codex-master-mcp doctor
 ./bin/codex-master-mcp status
-./bin/codex-master-mcp lease-status all
+./bin/codex-master-mcp lease-status all --agents-limit 30
 ./bin/codex-master-mcp claim b1 --forever --poll-interval-seconds 30
 ./bin/codex-master-mcp claim b1 --no-wait
 ./bin/codex-master-mcp claim b1 --no-recover-stopped
 ./bin/codex-master-mcp wait a1 --timeout-seconds 120 --poll-interval-seconds 30
 ./bin/codex-master-mcp watchdog all --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 15 --action stop --manage-unclaimed --quiet
 ./bin/codex-master-mcp start both --cwd /home/teladi/codex-master
-./bin/codex-master-mcp capabilities all
-./bin/codex-master-mcp skills all
+./bin/codex-master-mcp capabilities all --agents-limit 30
+./bin/codex-master-mcp skills all --agents-limit 30
 ./bin/codex-master-mcp skills a1 --include-names --limit 20 --names-offset 20 --plugins-offset 20 --plugins-limit 20
-./bin/codex-master-mcp skill-match all codex-security:security-scan
+./bin/codex-master-mcp skill-match all codex-security:security-scan --agents-limit 30
 ./bin/codex-master-mcp scope-check --scope src --write-path src/codex_master/server.py
 ./bin/codex-master-mcp assign-readonly a1 --skill codex-security:security-scan --scope src/codex_master/server.py --task "Pruefe nur lesend und berichte knapp."
 ./bin/codex-master-mcp assign-live-data a1 --task "Wie ist das Wetter gerade in Berlin?" --live-data-topic "Wetter Berlin heute"
@@ -138,6 +138,10 @@ Data minimization:
   `skills`, `capabilities`, `app-bridge-status`, `plugin-status`,
   `namespace-status`, `release-status`, `watchdog-status`, and
   `timeout-policy` do not return Agentin terminal output.
+- Broad read-only selectors on `status`, `lease-status`, `skills`,
+  `skill-match`, and `capabilities` are paged with `--agents-limit` and
+  `--agents-offset`; the default page size is 30 Agentinnen and the maximum is
+  100.
 - For weather, news, prices, schedules, and other current-data tasks, prefer
   `assign-live-data` over raw `send`. It is a read-only assignment that tells
   the Agentin to use current search sources or report a tooling/access limit

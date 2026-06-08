@@ -86,6 +86,8 @@ MCP_SERVER_NAME = "codex-master-mcp"
 DEFAULT_INSTALL_PATH = Path("~/.local/bin/codex-master-mcp").expanduser()
 MAX_SKILL_NAMES = 200
 MAX_CAPABILITY_PLUGINS = 20
+DEFAULT_MULTI_AGENT_RESULT_LIMIT = 30
+MAX_MULTI_AGENT_RESULT_LIMIT = 100
 MAX_ASSIGNMENT_RECORDS = 100
 MAX_ASSIGNMENT_LOG_RECORDS = 500
 MAX_ASSIGNMENT_LOG_BYTES = 1024 * 1024
@@ -5848,14 +5850,55 @@ def negotiate_protocol_version(requested: str | None) -> str:
     raise AgentError("Unsupported protocol version")
 
 
-def multi_agent_result(selected: list[str], fn: Any) -> dict[str, Any]:
+def multi_agent_result(
+    selected: list[str],
+    fn: Any,
+    *,
+    agents_offset: int | None = None,
+    agents_limit: int | None = None,
+) -> dict[str, Any]:
+    paged = agents_offset is not None or agents_limit is not None
+    offset = 0 if agents_offset is None else normalize_int_field(
+        agents_offset,
+        field="agents_offset",
+        minimum=0,
+        maximum=MAX_PAGED_OFFSET,
+    )
+    limit = len(selected) if agents_limit is None else normalize_int_field(
+        agents_limit,
+        field="agents_limit",
+        minimum=0,
+        maximum=MAX_MULTI_AGENT_RESULT_LIMIT,
+    )
+    page = selected[offset : offset + limit] if paged else selected
     results = []
-    for agent in selected:
+    for agent in page:
         try:
             results.append(fn(agent))
         except Exception as exc:
             results.append({"agent": agent, "error": safe_error_text(exc)})
-    return {"results": results}
+    payload: dict[str, Any] = {"results": results}
+    if paged:
+        payload.update(
+            {
+                "result_count": len(results),
+                "total_count": len(selected),
+                "agents_offset": offset,
+                "agents_limit": limit,
+                "truncated": offset + limit < len(selected),
+                "raw_output": "not_returned",
+            }
+        )
+    return payload
+
+
+def paged_multi_agent_result(selected: list[str], args: dict[str, Any], fn: Any) -> dict[str, Any]:
+    return multi_agent_result(
+        selected,
+        fn,
+        agents_offset=int_arg(args, "agents_offset", 0),
+        agents_limit=int_arg(args, "agents_limit", DEFAULT_MULTI_AGENT_RESULT_LIMIT),
+    )
 
 
 def call_agent_lifecycle(agent: str, fn: Any) -> dict[str, Any]:
@@ -5904,7 +5947,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         )
     if name == "agent_status":
         selected = agent_ids(str(args.get("agent", "all")))
-        return multi_agent_result(selected, status_agent)
+        return paged_multi_agent_result(selected, args, status_agent)
     if name == "agent_wait":
         selected_agent = single_agent_id(str(args.get("agent", "")), "agent_wait")
         return wait_agent(
@@ -5930,19 +5973,21 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         names_offset = int_arg(args, "names_offset", 0)
         plugins_offset = int_arg(args, "plugins_offset", 0)
         plugins_limit = int_arg(args, "plugins_limit", MAX_CAPABILITY_PLUGINS)
-        return multi_agent_result(
+        return paged_multi_agent_result(
             selected,
+            args,
             lambda agent: skills_agent(agent, include_names, limit, names_offset, plugins_offset, plugins_limit),
         )
     if name == "agent_skill_match":
         selected = agent_ids(str(args.get("agent", "all")))
-        return multi_agent_result(
+        return paged_multi_agent_result(
             selected,
+            args,
             lambda agent: skill_match_agent(agent, args.get("skill"), int_arg(args, "limit", 8)),
         )
     if name == "agent_capabilities":
         selected = agent_ids(str(args.get("agent", "all")))
-        return multi_agent_result(selected, capabilities_agent)
+        return paged_multi_agent_result(selected, args, capabilities_agent)
     if name == "agent_scope_check":
         return scope_check(
             as_string_list(args.get("scope"), field="scope"),
@@ -6193,7 +6238,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return call_agent_lifecycle(selected_agent, lambda: release_agent(selected_agent, bool_arg(args, "force", False)))
     if name == "agent_lease_status":
         selected = agent_ids(str(args.get("agent", "all")))
-        return multi_agent_result(selected, agent_lease_status)
+        return paged_multi_agent_result(selected, args, agent_lease_status)
     if name == "agent_safe_tail":
         selected_agent = single_agent_id(str(args.get("agent", "")), "agent_safe_tail")
         return safe_tail(
@@ -6243,6 +6288,19 @@ def agent_selector_schema(*, default: str | None = None, single: bool = False) -
     if default is not None:
         schema["default"] = default
     return schema
+
+
+def agents_paging_schema() -> dict[str, Any]:
+    return {
+        "agents_offset": {"type": "integer", "minimum": 0, "default": 0},
+        "agents_limit": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": MAX_MULTI_AGENT_RESULT_LIMIT,
+            "default": DEFAULT_MULTI_AGENT_RESULT_LIMIT,
+            "description": "Maximum Agentinnen records returned for broad selectors like all or a-series.",
+        },
+    }
 
 
 def text_array_schema(
@@ -7014,7 +7072,7 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Return structured status for selected Codex Agentinnen, including data-sparse response and limit classification. Does not return raw output.",
         "inputSchema": {
             "type": "object",
-            "properties": {"agent": agent_selector_schema(default="all")},
+            "properties": {"agent": agent_selector_schema(default="all"), **agents_paging_schema()},
             "additionalProperties": False,
         },
     },
@@ -7023,7 +7081,7 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Return data-sparse per-Agentin lease state for multi-client collision avoidance.",
         "inputSchema": {
             "type": "object",
-            "properties": {"agent": agent_selector_schema(default="all")},
+            "properties": {"agent": agent_selector_schema(default="all"), **agents_paging_schema()},
             "additionalProperties": False,
         },
     },
@@ -7207,6 +7265,7 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "agent": agent_selector_schema(default="all"),
+                **agents_paging_schema(),
                 "include_names": {"type": "boolean", "default": False},
                 "limit": {"type": "integer", "minimum": 0, "maximum": MAX_SKILL_NAMES, "default": 80},
                 "names_offset": {"type": "integer", "minimum": 0, "default": 0},
@@ -7229,6 +7288,7 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["skill"],
             "properties": {
                 "agent": agent_selector_schema(default="all"),
+                **agents_paging_schema(),
                 "skill": text_schema(MAX_SKILL_REF),
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_SKILL_NAMES, "default": 8},
             },
@@ -7240,7 +7300,7 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Return data-sparse capability summaries for one or all Agentinnen.",
         "inputSchema": {
             "type": "object",
-            "properties": {"agent": agent_selector_schema(default="all")},
+            "properties": {"agent": agent_selector_schema(default="all"), **agents_paging_schema()},
             "additionalProperties": False,
         },
     },
@@ -7783,6 +7843,8 @@ def main_cli(argv: list[str]) -> int:
 
     p_status = sub.add_parser("status")
     p_status.add_argument("agent", nargs="?", default="all", help=AGENT_SELECTOR_DESCRIPTION)
+    p_status.add_argument("--agents-offset", type=int, default=0)
+    p_status.add_argument("--agents-limit", type=int, default=DEFAULT_MULTI_AGENT_RESULT_LIMIT)
 
     p_selector_policy = sub.add_parser("selector-policy")
     p_selector_policy.add_argument("--series")
@@ -7823,6 +7885,8 @@ def main_cli(argv: list[str]) -> int:
 
     p_lease_status = sub.add_parser("lease-status")
     p_lease_status.add_argument("agent", nargs="?", default="all", help=AGENT_SELECTOR_DESCRIPTION)
+    p_lease_status.add_argument("--agents-offset", type=int, default=0)
+    p_lease_status.add_argument("--agents-limit", type=int, default=DEFAULT_MULTI_AGENT_RESULT_LIMIT)
 
     p_claim = sub.add_parser("claim")
     p_claim.add_argument("agent")
@@ -7856,14 +7920,20 @@ def main_cli(argv: list[str]) -> int:
     p_skills.add_argument("--names-offset", type=int, default=0)
     p_skills.add_argument("--plugins-offset", type=int, default=0)
     p_skills.add_argument("--plugins-limit", type=int, default=MAX_CAPABILITY_PLUGINS)
+    p_skills.add_argument("--agents-offset", type=int, default=0)
+    p_skills.add_argument("--agents-limit", type=int, default=DEFAULT_MULTI_AGENT_RESULT_LIMIT)
 
     p_skill_match = sub.add_parser("skill-match")
     p_skill_match.add_argument("agent", nargs="?", default="all", help=AGENT_SELECTOR_DESCRIPTION)
     p_skill_match.add_argument("skill")
     p_skill_match.add_argument("--limit", type=int, default=8)
+    p_skill_match.add_argument("--agents-offset", type=int, default=0)
+    p_skill_match.add_argument("--agents-limit", type=int, default=DEFAULT_MULTI_AGENT_RESULT_LIMIT)
 
     p_capabilities = sub.add_parser("capabilities")
     p_capabilities.add_argument("agent", nargs="?", default="all", help=AGENT_SELECTOR_DESCRIPTION)
+    p_capabilities.add_argument("--agents-offset", type=int, default=0)
+    p_capabilities.add_argument("--agents-limit", type=int, default=DEFAULT_MULTI_AGENT_RESULT_LIMIT)
 
     p_scope_check = sub.add_parser("scope-check")
     p_scope_check.add_argument("--scope", action="append", default=[])
@@ -8028,7 +8098,12 @@ def main_cli(argv: list[str]) -> int:
                 )
             )
         if args.command == "status":
-            return print_json(call_validated_tool("agent_status", {"agent": args.agent}))
+            return print_json(
+                call_validated_tool(
+                    "agent_status",
+                    {"agent": args.agent, "agents_offset": args.agents_offset, "agents_limit": args.agents_limit},
+                )
+            )
         if args.command == "selector-policy":
             return print_json(call_validated_tool("agent_selector_policy", {"series": args.series}))
         if args.command == "selector-preview":
@@ -8083,7 +8158,12 @@ def main_cli(argv: list[str]) -> int:
         if args.command == "stop":
             return print_json(call_validated_tool("agent_stop", {"agent": args.agent, "force": args.force}))
         if args.command == "lease-status":
-            return print_json(call_validated_tool("agent_lease_status", {"agent": args.agent}))
+            return print_json(
+                call_validated_tool(
+                    "agent_lease_status",
+                    {"agent": args.agent, "agents_offset": args.agents_offset, "agents_limit": args.agents_limit},
+                )
+            )
         if args.command == "claim":
             wait_forever = args.wait_forever
             wait_seconds = args.wait_seconds
@@ -8127,13 +8207,31 @@ def main_cli(argv: list[str]) -> int:
                         "names_offset": args.names_offset,
                         "plugins_offset": args.plugins_offset,
                         "plugins_limit": args.plugins_limit,
+                        "agents_offset": args.agents_offset,
+                        "agents_limit": args.agents_limit,
                     },
                 )
             )
         if args.command == "skill-match":
-            return print_json(call_validated_tool("agent_skill_match", {"agent": args.agent, "skill": args.skill, "limit": args.limit}))
+            return print_json(
+                call_validated_tool(
+                    "agent_skill_match",
+                    {
+                        "agent": args.agent,
+                        "skill": args.skill,
+                        "limit": args.limit,
+                        "agents_offset": args.agents_offset,
+                        "agents_limit": args.agents_limit,
+                    },
+                )
+            )
         if args.command == "capabilities":
-            return print_json(call_validated_tool("agent_capabilities", {"agent": args.agent}))
+            return print_json(
+                call_validated_tool(
+                    "agent_capabilities",
+                    {"agent": args.agent, "agents_offset": args.agents_offset, "agents_limit": args.agents_limit},
+                )
+            )
         if args.command == "scope-check":
             return print_json(
                 call_validated_tool(

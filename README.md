@@ -143,6 +143,10 @@ in the user journal.
 - `agent_status`: structured status, response state, and limit classification
   without raw output
 - `agent_lease_status`: data-sparse lease state for selected Agentinnen
+- Broad read-only selectors on `agent_status`, `agent_lease_status`,
+  `agent_skills`, `agent_skill_match`, and `agent_capabilities` are paged with
+  `agents_limit`/`agents_offset`; the default page size is 30 Agentinnen and
+  responses include `total_count` plus `truncated` metadata.
 - `agent_claim`: claim or renew one Agentin, retrying forever by default when
   she is busy; explicit claims may recover stopped orphan leases after grace
 - `agent_release`: release this MCP client's Agentin claim; force only after
@@ -230,16 +234,16 @@ python3 -m codex_master.server status
 python3 -m codex_master.server selector-policy
 python3 -m codex_master.server selector-policy --series a,b,c
 python3 -m codex_master.server selector-preview --limit 6
-python3 -m codex_master.server lease-status all
+python3 -m codex_master.server lease-status all --agents-limit 30
 python3 -m codex_master.server claim b --forever --poll-interval-seconds 30
 python3 -m codex_master.server claim b --no-wait
 python3 -m codex_master.server claim b --no-recover-stopped
 python3 -m codex_master.server wait a --timeout-seconds 120 --poll-interval-seconds 30
 python3 -m codex_master.server watchdog all --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 15 --action stop --manage-unclaimed --quiet
-python3 -m codex_master.server capabilities all
-python3 -m codex_master.server skills all
+python3 -m codex_master.server capabilities all --agents-limit 30
+python3 -m codex_master.server skills all --agents-limit 30
 python3 -m codex_master.server skills a --include-names --limit 20 --names-offset 20 --plugins-offset 20 --plugins-limit 20
-python3 -m codex_master.server skill-match all codex-security:security-scan
+python3 -m codex_master.server skill-match all codex-security:security-scan --agents-limit 30
 python3 -m codex_master.server scope-check --scope src/codex_master --write-path src/codex_master/server.py
 python3 -m codex_master.server assign-readonly a --skill codex-security:security-scan --scope src/codex_master/server.py --task "Pruefe nur lesend und berichte knapp."
 python3 -m codex_master.server assign-live-data a --task "Wie ist das Wetter gerade in Berlin?" --live-data-topic "Wetter Berlin heute"
@@ -482,7 +486,7 @@ that a Codex Agentin uses when the task names the skill or clearly matches its
 domain.
 
 ```sh
-python3 -m codex_master.server skills all
+python3 -m codex_master.server skills all --agents-limit 30
 python3 -m codex_master.server send a "Nutze codex-security:security-scan. Pruefe src/codex_master/server.py nur lesend und berichte knapp."
 python3 -m codex_master.server send b "Nutze github:gh-fix-ci. Pruefe die CI-Konfiguration nur lesend und berichte knapp."
 python3 -m codex_master.server tail a --source pane --lines 20 --chars 2000

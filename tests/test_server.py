@@ -15,6 +15,7 @@ from codex_master.server import (
     AgentInputNotReadyError,
     DEFAULT_CLAIM_WAIT_FOREVER,
     DEFAULT_AGENT_LEASE_SECONDS,
+    DEFAULT_MULTI_AGENT_RESULT_LIMIT,
     DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
     MAX_ASSIGNMENT_LIST_ITEMS,
     MAX_ASSIGNMENT_LOG_BYTES,
@@ -24,6 +25,7 @@ from codex_master.server import (
     MAX_GIT_REF_TEXT,
     MAX_LIVE_DATA_TOPIC,
     MAX_META_BYTES,
+    MAX_MULTI_AGENT_RESULT_LIMIT,
     MAX_RPC_MESSAGE_BYTES,
     MAX_RAW_LOG_BYTES,
     MAX_SEND_TEXT,
@@ -422,6 +424,8 @@ class ServerHelpersTest(unittest.TestCase):
         assign_props = by_name["agent_assign"]["inputSchema"]["properties"]
         claim_props = by_name["agent_claim"]["inputSchema"]["properties"]
         start_props = by_name["agent_start"]["inputSchema"]["properties"]
+        status_props = by_name["agent_status"]["inputSchema"]["properties"]
+        lease_status_props = by_name["agent_lease_status"]["inputSchema"]["properties"]
         send_props = by_name["agent_send"]["inputSchema"]["properties"]
         report_props = by_name["agent_report_request"]["inputSchema"]["properties"]
         wait_props = by_name["agent_wait"]["inputSchema"]["properties"]
@@ -432,6 +436,8 @@ class ServerHelpersTest(unittest.TestCase):
         selector_policy_props = by_name["agent_selector_policy"]["inputSchema"]["properties"]
         worktree_create_props = by_name["worktree_create_for_agent"]["inputSchema"]["properties"]
         skill_props = by_name["agent_skills"]["inputSchema"]["properties"]
+        skill_match_props = by_name["agent_skill_match"]["inputSchema"]["properties"]
+        capability_props = by_name["agent_capabilities"]["inputSchema"]["properties"]
         tail_description = by_name["agent_safe_tail"]["description"]
         self.assertIn("held by other clients", tail_description)
         self.assertIn("before reading pane or log output", tail_description)
@@ -475,7 +481,11 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(send_props["text"]["maxLength"], MAX_SEND_TEXT)
         self.assertEqual(skill_props["limit"]["maximum"], MAX_SKILL_NAMES)
         self.assertEqual(start_props["agent"]["default"], "both")
-        self.assertEqual(by_name["agent_status"]["inputSchema"]["properties"]["agent"]["default"], "all")
+        self.assertEqual(status_props["agent"]["default"], "all")
+        for props in (status_props, lease_status_props, skill_props, skill_match_props, capability_props):
+            self.assertEqual(props["agents_offset"]["default"], 0)
+            self.assertEqual(props["agents_limit"]["default"], DEFAULT_MULTI_AGENT_RESULT_LIMIT)
+            self.assertEqual(props["agents_limit"]["maximum"], MAX_MULTI_AGENT_RESULT_LIMIT)
         self.assertEqual(start_props["agent"]["maxLength"], 32)
         self.assertNotIn("enum", start_props["agent"])
         self.assertEqual(skill_props["names_offset"]["minimum"], 0)
@@ -499,6 +509,37 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(agent_ids("3"), ["a2"])
         self.assertEqual(agent_ids("4"), ["b2"])
         self.assertEqual(agent_ids("200"), ["b100"])
+
+    @patch("codex_master.server.status_agent")
+    def test_multi_agent_status_results_are_paged_for_broad_selectors(self, mock_status_agent) -> None:
+        mock_status_agent.side_effect = lambda agent: {
+            "agent": agent,
+            "running": False,
+            "raw_output": "not_returned",
+        }
+        agents = {
+            f"a{index}": {
+                "label": f"A{index}",
+                "runner": Path("/tmp/codex"),
+                "home": Path("/tmp/home"),
+                "session": f"session-a{index}",
+            }
+            for index in range(1, 6)
+        }
+
+        with patch.dict("codex_master.server.AGENTS", agents, clear=True):
+            result = call_tool("agent_status", {"agent": "all", "agents_offset": 1, "agents_limit": 2})
+
+        self.assertEqual([item["agent"] for item in result["results"]], ["a2", "a3"])
+        self.assertEqual(result["result_count"], 2)
+        self.assertEqual(result["total_count"], 5)
+        self.assertEqual(result["agents_offset"], 1)
+        self.assertEqual(result["agents_limit"], 2)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["raw_output"], "not_returned")
+        mock_status_agent.assert_any_call("a2")
+        mock_status_agent.assert_any_call("a3")
+        self.assertEqual(mock_status_agent.call_count, 2)
 
     def test_agent_selector_policy_can_switch_ordinal_rotation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1643,7 +1684,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.28+codex.test",
+            "version": "0.9.29+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1670,7 +1711,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.28")
+        self.assertEqual(result["expected_tag"], "v0.9.29")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -1984,6 +2025,14 @@ class ServerHelpersTest(unittest.TestCase):
                 "params": {"name": "agent_skills", "arguments": {"limit": MAX_SKILL_NAMES + 1}},
             }
         )
+        over_agents_limit = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 41,
+                "method": "tools/call",
+                "params": {"name": "agent_status", "arguments": {"agents_limit": MAX_MULTI_AGENT_RESULT_LIMIT + 1}},
+            }
+        )
         bad_array = handle_rpc(
             {
                 "jsonrpc": "2.0",
@@ -2013,6 +2062,9 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(over_limit["result"]["isError"])
         over_limit_payload = json.loads(over_limit["result"]["content"][0]["text"])
         self.assertEqual(over_limit_payload["error"], f"limit must be <= {MAX_SKILL_NAMES}")
+        self.assertTrue(over_agents_limit["result"]["isError"])
+        over_agents_limit_payload = json.loads(over_agents_limit["result"]["content"][0]["text"])
+        self.assertEqual(over_agents_limit_payload["error"], f"agents_limit must be <= {MAX_MULTI_AGENT_RESULT_LIMIT}")
         self.assertTrue(bad_array["result"]["isError"])
         bad_array_payload = json.loads(bad_array["result"]["content"][0]["text"])
         self.assertEqual(bad_array_payload["error"], "scope must be an array")
@@ -5349,6 +5401,19 @@ class CliLifecycleTest(unittest.TestCase):
 
         self.assertEqual(result, 0)
         mock_call_tool.assert_called_once_with("agent_start", {"agent": "a"})
+
+    @patch("codex_master.server.print_json")
+    @patch("codex_master.server.call_tool", return_value={"results": [], "raw_output": "not_returned"})
+    def test_cli_status_passes_agent_result_paging(self, mock_call_tool, mock_print_json) -> None:
+        mock_print_json.return_value = 0
+
+        result = main_cli(["status", "all", "--agents-offset", "30", "--agents-limit", "10"])
+
+        self.assertEqual(result, 0)
+        mock_call_tool.assert_called_once_with(
+            "agent_status",
+            {"agent": "all", "agents_offset": 30, "agents_limit": 10},
+        )
 
     @patch("codex_master.server.print_json")
     @patch("codex_master.server.call_tool", return_value={"status": "assigned", "raw_output": "not_returned"})
