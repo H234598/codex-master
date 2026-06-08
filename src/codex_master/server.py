@@ -6195,7 +6195,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             int_arg(args, "chars", 4000),
             str(args.get("source", "pane")),
         )
-    raise AgentError(f"unknown tool: {name}")
+    raise AgentError("unknown tool")
 
 
 def bool_arg(args: dict[str, Any], name: str, default: bool) -> bool:
@@ -7501,7 +7501,7 @@ def validate_tool_call(name: Any, args: Any) -> tuple[str, dict[str, Any]]:
     if not isinstance(name, str) or not name.strip():
         raise AgentError("tools/call requires a known tool name")
     if name not in TOOL_SCHEMAS:
-        raise AgentError(f"unknown tool: {name}")
+        raise AgentError("unknown tool")
     if args is None:
         args = {}
     if not isinstance(args, dict):
@@ -7512,8 +7512,7 @@ def validate_tool_call(name: Any, args: Any) -> tuple[str, dict[str, Any]]:
     if schema.get("additionalProperties") is False:
         extra = sorted(set(args) - set(properties))
         if extra:
-            safe_extra = ", ".join(redact_list([str(item) for item in extra], max_items=10))
-            raise AgentError(f"unknown argument(s) for {name}: {safe_extra}")
+            raise AgentError(f"unknown argument(s) for {name}")
 
     missing = [field for field in schema.get("required", []) if field not in args or args[field] is None]
     if missing:
@@ -7624,7 +7623,7 @@ def handle_rpc(msg: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if message_id is None:
         return None
-    return rpc_error(message_id, -32601, f"method not found: {method}")
+    return rpc_error(message_id, -32601, "method not found")
 
 
 def parse_content_length(line: bytes, max_bytes: int = MAX_RPC_MESSAGE_BYTES) -> int:

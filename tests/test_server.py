@@ -1642,7 +1642,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.17+codex.test",
+            "version": "0.9.18+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1669,7 +1669,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.17")
+        self.assertEqual(result["expected_tag"], "v0.9.18")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -1824,7 +1824,7 @@ class ServerHelpersTest(unittest.TestCase):
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertIn("error", payload)
 
-    def test_mcp_error_text_is_redacted_and_bounded(self) -> None:
+    def test_mcp_error_text_is_data_sparse_and_bounded(self) -> None:
         secret_tool = "unknown-" + ("x" * 1800) + "-OPENAI_API_KEY=sk-testtoken1234567890"
         response = handle_rpc(
             {
@@ -1840,12 +1840,15 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertTrue(response["result"]["isError"])
         payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["error"], "unknown tool")
         self.assertNotIn("sk-testtoken1234567890", payload["error"])
-        self.assertIn("OPENAI_API_KEY=<redacted>", payload["error"])
+        self.assertNotIn("OPENAI_API_KEY", payload["error"])
+        self.assertNotIn("unknown-", payload["error"])
         self.assertLessEqual(len(payload["error"]), MAX_ERROR_CHARS + 40)
         self.assertEqual(method_response["error"]["code"], -32601)
+        self.assertEqual(method_response["error"]["message"], "method not found")
         self.assertNotIn("sk-testtoken1234567890", method_response["error"]["message"])
-        self.assertIn("OPENAI_API_KEY=<redacted>", method_response["error"]["message"])
+        self.assertNotIn("OPENAI_API_KEY", method_response["error"]["message"])
 
     def test_mcp_tool_call_rejects_stringified_booleans_and_integers(self) -> None:
         boolean_response = handle_rpc(
@@ -1949,7 +1952,8 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertTrue(unknown_response["result"]["isError"])
         unknown_payload = json.loads(unknown_response["result"]["content"][0]["text"])
-        self.assertEqual(unknown_payload["error"], "unknown argument(s) for agent_status: surprise")
+        self.assertEqual(unknown_payload["error"], "unknown argument(s) for agent_status")
+        self.assertNotIn("surprise", unknown_payload["error"])
         self.assertTrue(missing_response["result"]["isError"])
         missing_payload = json.loads(missing_response["result"]["content"][0]["text"])
         self.assertEqual(missing_payload["error"], "missing required argument(s) for agent_send: text")
