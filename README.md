@@ -293,7 +293,8 @@ Use `--codex-bin` when the Codex CLI binary is not `/usr/local/bin/codex`.
 Normal install never copies auth material. For bulk auth propagation, run
 `pool copy_auth` first without `--yes` to inspect counts, then repeat with
 `--yes` when intentional. `copy_auth` copies only `auth.json`, skips the source
-Agentin when she is part of the target selector, and never returns auth content.
+Agentin when she is part of the target selector, and never returns auth content,
+the source Agentin id, or the requested target selector.
 
 Do not use symlinks or hardlinks for `auth.json` in the normal pool model.
 Auth files are small; copies keep each Agentin isolated. Symlinks cross the

@@ -28,8 +28,10 @@ That first command is a dry-run. It returns counts only:
 ```json
 {
   "dry_run": true,
-  "source_agent": "a1",
-  "target_selector": "a-series",
+  "source_agent": "not_returned",
+  "source_agent_state": "set",
+  "target_selector": "not_returned",
+  "target_selector_state": "set",
   "target_count": 99,
   "copyable_count": 99,
   "copied_count": 0,
@@ -75,6 +77,8 @@ The copy path is deliberately conservative:
 - existing target auth files are skipped unless `--overwrite` is set
 - target files are written as private files
 - command responses never include auth content
+- command responses never echo the source Agentin id
+- command responses never echo the requested target selector
 - command responses never include local pool paths
 
 This preserves the main data-minimization rule: callers can see what is possible

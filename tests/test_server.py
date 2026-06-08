@@ -1643,7 +1643,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.23+codex.test",
+            "version": "0.9.24+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1670,7 +1670,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.23")
+        self.assertEqual(result["expected_tag"], "v0.9.24")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -6556,6 +6556,19 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(result["target_count"], 1)
             self.assertNotIn(custom_prefix, payload)
             self.assertNotIn(str(pool), payload)
+
+    def test_auth_copy_docs_match_data_sparse_output_contract(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        text = (root / "docs" / "auth-copy.md").read_text(encoding="utf-8")
+
+        self.assertIn('"source_agent": "not_returned"', text)
+        self.assertIn('"source_agent_state": "set"', text)
+        self.assertIn('"target_selector": "not_returned"', text)
+        self.assertIn('"target_selector_state": "set"', text)
+        self.assertIn("never echo the source Agentin id", text)
+        self.assertIn("never echo the requested target selector", text)
+        self.assertNotIn('"source_agent": "a1"', text)
+        self.assertNotIn('"target_selector": "a-series"', text)
 
     def test_agent_pool_install_replaces_wrapper_and_config_symlinks_without_touching_targets(self) -> None:
         from codex_master import server as server_module

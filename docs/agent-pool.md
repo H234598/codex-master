@@ -152,6 +152,7 @@ explicit login/bootstrap flows.
 - skips existing target `auth.json` unless `--overwrite` is set
 - writes target auth files as private regular files
 - never returns auth file content
+- never echoes the source Agentin id or requested target selector
 - never returns the pool root path
 
 Do not symlink or hardlink `auth.json` as the normal mode. Auth files are small,
