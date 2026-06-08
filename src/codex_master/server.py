@@ -6858,7 +6858,8 @@ def agent_pool_copy_auth(
     return {
         "ok": True,
         "dry_run": not yes,
-        "source_agent": from_agent,
+        "source_agent": "not_returned",
+        "source_agent_state": "set",
         "target_selector": "not_returned",
         "target_selector_state": "set",
         "target_count": len(target_ids),
@@ -7463,7 +7464,7 @@ TOOLS: list[dict[str, Any]] = [
         "name": "agent_pool_copy_auth",
         "description": (
             "Copy one source Agentin auth.json to many installed Agentinnen. "
-            "Dry-run unless yes=true; never returns auth content or the requested target selector."
+            "Dry-run unless yes=true; never returns auth content, source Agentin id, or requested target selector."
         ),
         "inputSchema": {
             "type": "object",

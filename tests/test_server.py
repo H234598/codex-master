@@ -1643,7 +1643,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.22+codex.test",
+            "version": "0.9.23+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1670,7 +1670,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.22")
+        self.assertEqual(result["expected_tag"], "v0.9.23")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -6439,6 +6439,8 @@ class AgentPoolManagementTest(unittest.TestCase):
                 to="a-series",
             )
             self.assertTrue(dry_run["dry_run"])
+            self.assertEqual(dry_run["source_agent"], "not_returned")
+            self.assertEqual(dry_run["source_agent_state"], "set")
             self.assertEqual(dry_run["target_selector"], "not_returned")
             self.assertEqual(dry_run["target_selector_state"], "set")
             self.assertEqual(dry_run["copyable_count"], 1)
@@ -6511,6 +6513,48 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(result["target_selector_state"], "set")
             self.assertEqual(result["target_count"], 1)
             self.assertNotIn("SECRET_COPY_TARGET", payload)
+            self.assertNotIn(str(pool), payload)
+
+    def test_agent_pool_copy_auth_does_not_echo_custom_source_agent(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents-secret"
+            custom_prefix = "secretcopy"
+            spec = {
+                "schema_version": 1,
+                "pool_root": str(pool),
+                "codex_bin": "/bin/codex",
+                "series": [
+                    {
+                        "prefix": custom_prefix,
+                        "count": 2,
+                        "template": f"{custom_prefix}1",
+                        "authenticated": [f"{custom_prefix}1"],
+                    }
+                ],
+            }
+            spec_path = self._write_spec_payload(tmp, spec)
+            (pool / f"{custom_prefix}1").mkdir(parents=True)
+            (pool / f"{custom_prefix}2").mkdir()
+            (pool / f"{custom_prefix}1" / "auth.json").write_text('{"token":"secret"}\n', encoding="utf-8")
+
+            result = server_module.agent_pool_copy_auth(
+                str(spec_path),
+                target_dir=str(pool),
+                codex_bin="/bin/codex",
+                from_agent=f"{custom_prefix}1",
+                to=f"{custom_prefix}-series",
+            )
+
+            payload = json.dumps(result, sort_keys=True)
+            self.assertEqual(result["source_agent"], "not_returned")
+            self.assertEqual(result["source_agent_state"], "set")
+            self.assertEqual(result["target_selector"], "not_returned")
+            self.assertEqual(result["target_selector_state"], "set")
+            self.assertEqual(result["target_count"], 1)
+            self.assertNotIn(custom_prefix, payload)
             self.assertNotIn(str(pool), payload)
 
     def test_agent_pool_install_replaces_wrapper_and_config_symlinks_without_touching_targets(self) -> None:
