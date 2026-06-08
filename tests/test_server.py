@@ -153,6 +153,19 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("git diff-tree --check --root", workflow)
         self.assertIn("git diff --check", workflow)
 
+    def test_readme_checks_document_local_and_ci_gates(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("git diff --check", readme)
+        self.assertIn("PYTHONPATH=src python3 -m compileall -q src tests", readme)
+        self.assertIn("PYTHONPATH=src python3 -m unittest discover -s tests -v", readme)
+        self.assertIn("./bin/codex-master-mcp tools", readme)
+        self.assertIn("./bin/codex-master-mcp commit-ready-check", readme)
+        self.assertIn("plugin/App/MCP manifest validation", readme)
+        self.assertIn("committed-whitespace", readme)
+        self.assertIn("CLI wrapper smoke", readme)
+
     def test_redacts_common_secret_shapes(self) -> None:
         text = "OPENAI_API_KEY=sk-testtoken1234567890 and jwt eyJabcabcabcabc.abcabcabcabc.sigsignaturesig"
         redacted, changed = redact(text)
@@ -1767,7 +1780,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.31")
+        self.assertEqual(result["expected_tag"], "v0.9.32")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")

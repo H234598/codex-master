@@ -639,8 +639,16 @@ and install it as a plugin.
 ## Checks
 
 ```sh
+git diff --check
 PYTHONPATH=src python3 -m compileall -q src tests
 PYTHONPATH=src python3 -m unittest discover -s tests -v
+./bin/codex-master-mcp tools
 ```
 
-The same checks run in GitHub Actions via `.github/workflows/ci.yml`.
+`./bin/codex-master-mcp commit-ready-check` runs the local release gate for
+`git diff --check`, `compileall`, and the unit tests.
+
+GitHub Actions uses `.github/workflows/ci.yml` to run the same source and unit
+test gates, plus plugin/App/MCP manifest validation, committed-whitespace
+checks for the pushed or pull-request commit range, and a CLI wrapper smoke
+check.
