@@ -165,6 +165,18 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("plugin/App/MCP manifest validation", readme)
         self.assertIn("committed-whitespace", readme)
         self.assertIn("CLI wrapper smoke", readme)
+        self.assertIn("agent-pool installer smoke", readme)
+
+    def test_github_ci_smokes_agent_pool_installer(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+        self.assertIn("name: Check agent pool installer", workflow)
+        self.assertIn("./bin/codex-master-mcp pool validate", workflow)
+        self.assertIn("./scripts/install-agent-pool", workflow)
+        self.assertIn("./bin/codex-master-mcp pool status", workflow)
+        self.assertIn("./bin/codex-master-mcp pool destroy_pool", workflow)
+        self.assertIn("--remove-root", workflow)
 
     def test_redacts_common_secret_shapes(self) -> None:
         text = "OPENAI_API_KEY=sk-testtoken1234567890 and jwt eyJabcabcabcabc.abcabcabcabc.sigsignaturesig"
@@ -1782,7 +1794,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.35")
+        self.assertEqual(result["expected_tag"], "v0.9.36")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")

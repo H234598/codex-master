@@ -650,5 +650,6 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 GitHub Actions uses `.github/workflows/ci.yml` to run the same source and unit
 test gates, plus plugin/App/MCP manifest validation, committed-whitespace
-checks for the pushed or pull-request commit range, and a CLI wrapper smoke
-check.
+checks for the pushed or pull-request commit range, a CLI wrapper smoke check,
+and a temporary agent-pool installer smoke for `validate`, `install`, `status`,
+and `destroy_pool`.

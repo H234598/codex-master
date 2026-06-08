@@ -82,3 +82,39 @@ jobs:
 
       - name: Check CLI wrapper
         run: ./bin/codex-master-mcp tools
+
+      - name: Check agent pool installer
+        run: |
+          set -eu
+          spec="${RUNNER_TEMP}/codex-agent-pool-ci.json"
+          target="${RUNNER_TEMP}/codex-agents-ci"
+          cat > "${spec}" <<'JSON'
+          {
+            "schema_version": 1,
+            "pool_root": "${HOME}/.codex-agents-ci",
+            "codex_bin": "/bin/echo",
+            "series": [
+              {
+                "prefix": "ci",
+                "count": 1,
+                "template": "ci1",
+                "authenticated": []
+              }
+            ],
+            "aliases": {
+              "ci": "ci1"
+            },
+            "shared_assets": [],
+            "runtime_dirs": [
+              "sessions"
+            ],
+            "auth": {
+              "policy": "preserve_existing_only",
+              "copy": []
+            }
+          }
+          JSON
+          ./bin/codex-master-mcp pool validate --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo
+          ./scripts/install-agent-pool --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo
+          ./bin/codex-master-mcp pool status --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo
+          ./bin/codex-master-mcp pool destroy_pool --spec "${spec}" --target-dir "${target}" --codex-bin /bin/echo --yes --force --remove-root
