@@ -1595,7 +1595,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.3+codex.test",
+            "version": "0.9.4+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1622,7 +1622,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.3")
+        self.assertEqual(result["expected_tag"], "v0.9.4")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -6040,6 +6040,53 @@ class AgentPoolManagementTest(unittest.TestCase):
         self.assertEqual(len(captured_payloads), 1)
         self.assertTrue(captured_payloads[0]["ok"])
         self.assertEqual(captured_payloads[0]["pool_root"], "not_returned")
+
+    def test_agent_pool_spec_reader_rejects_symlink_and_oversized_without_path_leak(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents-secret"
+            real_spec = self._write_spec(tmp, pool)
+            link = tmp / "pool-link.json"
+            link.symlink_to(real_spec.name)
+            response = handle_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 64,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "agent_pool_validate",
+                        "arguments": {"spec": str(link), "target_dir": str(pool)},
+                    },
+                }
+            )
+
+            self.assertTrue(response["result"]["isError"])
+            payload_text = response["result"]["content"][0]["text"]
+            self.assertIn("pool spec must be a readable regular file within the size limit", payload_text)
+            self.assertNotIn(str(tmp), payload_text)
+            self.assertNotIn("agents-secret", payload_text)
+
+            oversized = tmp / "oversized-pool.json"
+            oversized.write_text("x" * (server_module.MAX_POOL_SPEC_BYTES + 1), encoding="utf-8")
+            response = handle_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 65,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "agent_pool_validate",
+                        "arguments": {"spec": str(oversized), "target_dir": str(pool)},
+                    },
+                }
+            )
+
+            self.assertTrue(response["result"]["isError"])
+            payload_text = response["result"]["content"][0]["text"]
+            self.assertIn("pool spec must be a readable regular file within the size limit", payload_text)
+            self.assertNotIn(str(tmp), payload_text)
+            self.assertNotIn("agents-secret", payload_text)
 
 if __name__ == "__main__":
     unittest.main()

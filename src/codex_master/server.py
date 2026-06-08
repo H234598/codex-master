@@ -104,6 +104,7 @@ MAX_ERROR_CHARS = 1200
 MAX_META_BYTES = 64 * 1024
 MAX_CODEX_CONFIG_BYTES = 1024 * 1024
 MAX_PLUGIN_MANIFEST_BYTES = 64 * 1024
+MAX_POOL_SPEC_BYTES = 256 * 1024
 MAX_PLUGIN_CACHE_VERSIONS = 20
 MAX_PLUGIN_CACHE_RETAINED_VERSIONS = 5
 MAX_SELECTOR_POLICY_BYTES = 4096
@@ -6306,7 +6307,7 @@ def pool_safe_relative_path(value: Any, *, field: str) -> Path:
 def pool_load_raw_spec(spec_path: str | None = None) -> tuple[dict[str, Any], str]:
     if spec_path is None:
         default_path = repo_root() / POOL_SPEC_FILE
-        if not default_path.exists():
+        if not path_present_no_follow(default_path):
             return default_agent_pool_spec(), "built_in_default"
         spec_path = str(default_path)
 
@@ -6314,10 +6315,16 @@ def pool_load_raw_spec(spec_path: str | None = None) -> tuple[dict[str, Any], st
     if not path.is_absolute():
         path = Path.cwd() / path
     try:
-        text = path.read_text(encoding="utf-8")
+        if not path_present_no_follow(path):
+            raise AgentError("pool spec not found")
+        text = read_private_regular_text(
+            path,
+            MAX_POOL_SPEC_BYTES,
+            "pool spec must be a readable regular file within the size limit",
+        )
         payload = json.loads(text)
-    except FileNotFoundError as exc:
-        raise AgentError("pool spec not found") from exc
+    except AgentError:
+        raise
     except json.JSONDecodeError as exc:
         raise AgentError("pool spec is not valid JSON") from exc
     except OSError as exc:

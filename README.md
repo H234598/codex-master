@@ -272,6 +272,8 @@ The repo contains a generic, machine-readable `codex-agent-pool.json` plus
 300-Agentinnen pool: `a1..a100`, `b1..b100`, and `c1..c100`, with `a1` and
 `b1` marked as the authenticated source homes and the C series intentionally
 unauthenticated.
+Pool spec reads accept only regular UTF-8 JSON files, reject symlinked or
+oversized spec files, and keep spec paths out of public error responses.
 
 The spec is only the map. The actual auth material is still the per-home
 `auth.json`, for example `~/.codex-agents/a1/auth.json`. Normal install never
