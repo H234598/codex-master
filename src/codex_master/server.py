@@ -705,7 +705,7 @@ def parse_selector_series_value(value: Any, *, field: str = "series") -> tuple[s
         raise AgentError(f"{field} must contain at least one Agentinnen series")
     invalid = [item for item in series if item not in AGENT_SERIES]
     if invalid:
-        raise AgentError(f"{field} contains unknown Agentinnen series: {', '.join(invalid)}")
+        raise AgentError(f"{field} contains unknown Agentinnen series")
     if len(set(series)) != len(series):
         raise AgentError(f"{field} must not contain duplicate Agentinnen series")
     return series
@@ -778,7 +778,7 @@ def ordinal_agent_id(selector: str, series: tuple[str, ...] | None = None) -> st
     agent_index = ((ordinal - 1) // len(selected_series)) + 1
     agent = f"{selected_series[series_index]}{agent_index}"
     if agent not in AGENTS:
-        raise AgentError(f"ordinal selector {selector!r} resolves outside the installed Agentinnen pool")
+        raise AgentError("ordinal selector resolves outside the installed Agentinnen pool")
     return agent
 
 
@@ -790,9 +790,7 @@ def canonical_agent_id(agent: str) -> str:
         return normalized
     if normalized in LEGACY_AGENT_ALIASES:
         return LEGACY_AGENT_ALIASES[normalized]
-    raise AgentError(
-        f"unknown agent: {agent!r}; expected a concrete id like a1, b1, c1 or a selector like both/all/a-series"
-    )
+    raise AgentError("unknown agent; expected a concrete id like a1, b1, c1 or a selector like both/all/a-series")
 
 
 def agent_record_aliases(agent: str) -> set[str]:

@@ -522,6 +522,49 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(selected, ["a1", "b1", "c1", "a2", "b2", "c2"])
         self.assertNotIn(tmpdir, json.dumps(changed, sort_keys=True))
 
+    def test_agent_selector_errors_do_not_echo_request_values(self) -> None:
+        unknown_agent = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 71,
+                "method": "tools/call",
+                "params": {"name": "agent_status", "arguments": {"agent": "SECRETAGENT"}},
+            }
+        )
+        invalid_series = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 72,
+                "method": "tools/call",
+                "params": {"name": "agent_selector_preview", "arguments": {"series": "a,SECRET_SERIES"}},
+            }
+        )
+        ordinal_outside_pool = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 73,
+                "method": "tools/call",
+                "params": {"name": "agent_status", "arguments": {"agent": "999999"}},
+            }
+        )
+
+        self.assertTrue(unknown_agent["result"]["isError"])
+        unknown_agent_text = unknown_agent["result"]["content"][0]["text"]
+        self.assertIn("unknown agent", unknown_agent_text)
+        self.assertNotIn("SECRETAGENT", unknown_agent_text)
+        self.assertNotIn("secretagent", unknown_agent_text)
+
+        self.assertTrue(invalid_series["result"]["isError"])
+        invalid_series_text = invalid_series["result"]["content"][0]["text"]
+        self.assertIn("unknown Agentinnen series", invalid_series_text)
+        self.assertNotIn("SECRET_SERIES", invalid_series_text)
+        self.assertNotIn("secret_series", invalid_series_text)
+
+        self.assertTrue(ordinal_outside_pool["result"]["isError"])
+        ordinal_text = ordinal_outside_pool["result"]["content"][0]["text"]
+        self.assertIn("outside the installed Agentinnen pool", ordinal_text)
+        self.assertNotIn("999999", ordinal_text)
+
     def test_agent_auth_status_is_data_sparse_and_rejects_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir) / "home"
@@ -1599,7 +1642,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.16+codex.test",
+            "version": "0.9.17+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1626,7 +1669,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.16")
+        self.assertEqual(result["expected_tag"], "v0.9.17")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
