@@ -6276,6 +6276,16 @@ def pool_expand_text(value: str) -> str:
     return os.path.expandvars(text)
 
 
+def pool_validate_codex_bin(value: str) -> str:
+    if not value:
+        raise AgentError("codex_bin must resolve to a non-empty string")
+    if len(value) > MAX_PATH_TEXT:
+        raise AgentError(f"codex_bin exceeds {MAX_PATH_TEXT} characters")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise AgentError("codex_bin contains unsupported characters")
+    return value
+
+
 def pool_normalized_path(value: str) -> Path:
     path = Path(pool_expand_text(value)).expanduser()
     if not path.is_absolute():
@@ -6361,7 +6371,7 @@ def pool_normalize_spec(
     raw_codex_bin = codex_bin if codex_bin is not None else raw.get("codex_bin", POOL_DEFAULT_CODEX_BIN)
     if not isinstance(raw_codex_bin, str) or not raw_codex_bin:
         raise AgentError("codex_bin must be a non-empty string")
-    codex_bin_value = pool_expand_text(raw_codex_bin)
+    codex_bin_value = pool_validate_codex_bin(pool_expand_text(raw_codex_bin))
 
     raw_series = raw.get("series")
     if not isinstance(raw_series, list) or not raw_series:
@@ -6491,14 +6501,17 @@ def pool_shell_double_content(value: str) -> str:
 
 def pool_wrapper_text(agent: str, home: Path, codex_bin: str) -> str:
     home_text = pool_shell_double_content(str(home))
-    codex_bin_text = pool_shell_double_content(codex_bin)
+    codex_bin_word = shlex.quote(codex_bin)
     return "\n".join(
         [
             "#!/usr/bin/env bash",
             "set -euo pipefail",
             "",
             f'export CODEX_HOME="{home_text}"',
-            f': "${{CODEX_AGENT_BIN:={codex_bin_text}}}"',
+            'if [[ -z "${CODEX_AGENT_BIN:-}" ]]; then',
+            f"  CODEX_AGENT_BIN={codex_bin_word}",
+            "fi",
+            "export CODEX_AGENT_BIN",
             "unset CODEX_ACCESS_TOKEN OPENAI_API_KEY",
             'exec "${CODEX_AGENT_BIN}" "$@"',
             "",

@@ -1595,7 +1595,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.5+codex.test",
+            "version": "0.9.6+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1622,7 +1622,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.5")
+        self.assertEqual(result["expected_tag"], "v0.9.6")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -6044,6 +6044,63 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertTrue((home / "config.toml").is_file())
             self.assertEqual(wrapper_target.read_text(encoding="utf-8"), "external wrapper secret\n")
             self.assertEqual(config_target.read_text(encoding="utf-8"), "external config secret\n")
+
+    def test_agent_pool_rejects_codex_bin_control_chars_without_path_leak(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents-secret"
+            spec_path = self._write_spec(tmp, pool)
+            response = handle_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 67,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "agent_pool_validate",
+                        "arguments": {
+                            "spec": str(spec_path),
+                            "target_dir": str(pool),
+                            "codex_bin": "/bin/codex\nmalicious",
+                        },
+                    },
+                }
+            )
+
+            self.assertTrue(response["result"]["isError"])
+            payload_text = response["result"]["content"][0]["text"]
+            self.assertIn("codex_bin contains unsupported characters", payload_text)
+            self.assertNotIn(str(tmp), payload_text)
+            self.assertNotIn("agents-secret", payload_text)
+
+    def test_agent_pool_wrapper_quotes_codex_bin_special_chars_as_data(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec(tmp, pool)
+            fake_codex = tmp / 'codex }"; echo BAD #'
+            fake_codex.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'printf "FAKE_OK:%s\\n" "${CODEX_HOME}"\n',
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o700)
+
+            result = server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin=str(fake_codex))
+            self.assertTrue(result["ok"])
+            completed = subprocess.run(
+                [str(pool / "a1" / "codex")],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("FAKE_OK:", completed.stdout)
+            self.assertNotIn("BAD", completed.stdout + completed.stderr)
 
     def test_agent_pool_install_rejects_runtime_dir_symlink_without_path_leak(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
