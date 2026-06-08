@@ -6429,6 +6429,23 @@ def pool_validate_codex_bin(value: str) -> str:
     return value
 
 
+def pool_codex_bin_state(value: str) -> str:
+    if "/" in value:
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        try:
+            mode = path.stat().st_mode
+        except OSError as exc:
+            raise AgentError("codex_bin path must resolve to an executable file") from exc
+        if not stat_module.S_ISREG(mode) or not os.access(path, os.X_OK):
+            raise AgentError("codex_bin path must resolve to an executable file")
+        return "executable_path"
+    if shutil.which(value) is None:
+        raise AgentError("codex_bin command must resolve to an executable on PATH")
+    return "executable_command"
+
+
 def pool_normalized_path(value: str) -> Path:
     path = Path(pool_expand_text(value)).expanduser()
     if not path.is_absolute():
@@ -6541,6 +6558,7 @@ def pool_normalize_spec(
     if not isinstance(raw_codex_bin, str) or not raw_codex_bin:
         raise AgentError("codex_bin must be a non-empty string")
     codex_bin_value = pool_validate_codex_bin(pool_expand_text(raw_codex_bin))
+    codex_bin_state = pool_codex_bin_state(codex_bin_value)
 
     raw_series = raw.get("series")
     if not isinstance(raw_series, list) or not raw_series:
@@ -6626,6 +6644,7 @@ def pool_normalize_spec(
         "schema_version": schema_version,
         "pool_root": pool_root,
         "codex_bin": codex_bin_value,
+        "codex_bin_state": codex_bin_state,
         "ids": ids,
         "series_ids": series_ids,
         "templates": templates,
@@ -6766,7 +6785,7 @@ def pool_marker_payload(normalized: dict[str, Any]) -> dict[str, Any]:
         "agent_count": len(normalized["ids"]),
         "series_count": len(normalized["series_ids"]),
         "spec_sha256": digest,
-        "codex_bin_state": "configured",
+        "codex_bin_state": normalized["codex_bin_state"],
         "pool_root": PATH_NOT_RETURNED,
     }
 
@@ -6783,7 +6802,7 @@ def agent_pool_validate(
         "spec_source": normalized["source"],
         "pool_root": PATH_NOT_RETURNED,
         "pool_root_state": pool_public_path_state(normalized["pool_root"]),
-        "codex_bin_state": "configured",
+        "codex_bin_state": normalized["codex_bin_state"],
         "expected_agent_count": len(normalized["ids"]),
         "series_count": len(normalized["series_ids"]),
         "series": "not_returned",

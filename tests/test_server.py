@@ -1794,7 +1794,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.36")
+        self.assertEqual(result["expected_tag"], "v0.9.37")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -6570,7 +6570,7 @@ class AgentPoolManagementTest(unittest.TestCase):
         spec = {
             "schema_version": 1,
             "pool_root": str(pool),
-            "codex_bin": "/opt/codex/bin/codex",
+            "codex_bin": "/bin/echo",
             "series": [
                 {"prefix": "a", "count": 2, "template": "a1", "authenticated": ["a1"]},
                 {"prefix": "b", "count": 1, "template": "b1", "authenticated": ["b1"]},
@@ -6598,7 +6598,7 @@ class AgentPoolManagementTest(unittest.TestCase):
                 "method": "tools/call",
                 "params": {
                     "name": "agent_pool_validate",
-                    "arguments": {"spec": str(spec_path), "target_dir": str(pool), "codex_bin": "/bin/codex"},
+                    "arguments": {"spec": str(spec_path), "target_dir": str(pool), "codex_bin": "/bin/echo"},
                 },
             }
         )
@@ -6615,7 +6615,7 @@ class AgentPoolManagementTest(unittest.TestCase):
                 {
                     "schema_version": "SECRET_SCHEMA_VERSION",
                     "pool_root": str(pool),
-                    "codex_bin": "/bin/codex",
+                    "codex_bin": "/bin/echo",
                     "series": [{"prefix": "a", "count": 1, "template": "a1", "authenticated": []}],
                 },
             )
@@ -6630,7 +6630,7 @@ class AgentPoolManagementTest(unittest.TestCase):
                 {
                     "schema_version": 1,
                     "pool_root": str(pool),
-                    "codex_bin": "/bin/codex",
+                    "codex_bin": "/bin/echo",
                     "series": [
                         {
                             "prefix": duplicate_prefix,
@@ -6657,7 +6657,7 @@ class AgentPoolManagementTest(unittest.TestCase):
                 {
                     "schema_version": 1,
                     "pool_root": str(pool),
-                    "codex_bin": "/bin/codex",
+                    "codex_bin": "/bin/echo",
                     "series": [
                         {
                             "prefix": "a",
@@ -6678,7 +6678,7 @@ class AgentPoolManagementTest(unittest.TestCase):
                 {
                     "schema_version": 1,
                     "pool_root": str(pool),
-                    "codex_bin": "/bin/codex",
+                    "codex_bin": "/bin/echo",
                     "series": [{"prefix": "a", "count": 1, "template": "a1", "authenticated": []}],
                     "aliases": {"SECRET_ALIAS": "SECRET_TARGET"},
                 },
@@ -6699,7 +6699,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             (pool / "a1" / "skills").mkdir(parents=True)
             (pool / "a1" / "plugins").mkdir()
 
-            validation = server_module.agent_pool_validate(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            validation = server_module.agent_pool_validate(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
             self.assertTrue(validation["ok"])
             self.assertEqual(validation["expected_agent_count"], 4)
             self.assertEqual(validation["pool_root"], "not_returned")
@@ -6710,7 +6710,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(validation["authenticated_agents"], "not_returned")
             self.assertEqual(validation["authenticated_agents_state"], "set")
 
-            install_result = server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            install_result = server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
             self.assertTrue(install_result["ok"])
             self.assertEqual(install_result["installed_agent_count"], 4)
             self.assertTrue((pool / "a1" / "codex").is_file())
@@ -6723,7 +6723,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             dry_run = server_module.agent_pool_copy_auth(
                 str(spec_path),
                 target_dir=str(pool),
-                codex_bin="/bin/codex",
+                codex_bin="/bin/echo",
                 from_agent="a1",
                 to="a-series",
             )
@@ -6739,7 +6739,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             copied = server_module.agent_pool_copy_auth(
                 str(spec_path),
                 target_dir=str(pool),
-                codex_bin="/bin/codex",
+                codex_bin="/bin/echo",
                 from_agent="a1",
                 to="a-series",
                 yes=True,
@@ -6749,7 +6749,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual((pool / "a2" / "auth.json").read_text(encoding="utf-8"), '{"token":"secret"}\n')
             self.assertNotIn("a-series", json.dumps(copied, sort_keys=True))
 
-            status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
             self.assertTrue(status["ok"])
             self.assertTrue(status["marker_present"])
             self.assertEqual(status["marker_state"], "file")
@@ -6768,12 +6768,12 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertIn("not_returned", status_text)
 
             with self.assertRaises(AgentError):
-                server_module.agent_pool_destroy_pool(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+                server_module.agent_pool_destroy_pool(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
 
             destroyed = server_module.agent_pool_destroy_pool(
                 str(spec_path),
                 target_dir=str(pool),
-                codex_bin="/bin/codex",
+                codex_bin="/bin/echo",
                 yes=True,
                 remove_root=True,
             )
@@ -6790,7 +6790,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             spec = {
                 "schema_version": 1,
                 "pool_root": str(pool),
-                "codex_bin": "/bin/codex",
+                "codex_bin": "/bin/echo",
                 "series": [{"prefix": "a", "count": 2, "template": "a1", "authenticated": ["a1"]}],
                 "aliases": {"SECRET_COPY_TARGET": "a2"},
             }
@@ -6802,7 +6802,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             result = server_module.agent_pool_copy_auth(
                 str(spec_path),
                 target_dir=str(pool),
-                codex_bin="/bin/codex",
+                codex_bin="/bin/echo",
                 from_agent="a1",
                 to="SECRET_COPY_TARGET",
             )
@@ -6824,7 +6824,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             spec = {
                 "schema_version": 1,
                 "pool_root": str(pool),
-                "codex_bin": "/bin/codex",
+                "codex_bin": "/bin/echo",
                 "series": [
                     {
                         "prefix": custom_prefix,
@@ -6842,7 +6842,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             result = server_module.agent_pool_copy_auth(
                 str(spec_path),
                 target_dir=str(pool),
-                codex_bin="/bin/codex",
+                codex_bin="/bin/echo",
                 from_agent=f"{custom_prefix}1",
                 to=f"{custom_prefix}-series",
             )
@@ -6867,7 +6867,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             spec = {
                 "schema_version": 1,
                 "pool_root": str(pool),
-                "codex_bin": "/bin/codex",
+                "codex_bin": "/bin/echo",
                 "series": [
                     {
                         "prefix": custom_prefix,
@@ -6880,7 +6880,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             }
             spec_path = self._write_spec_payload(tmp, spec)
 
-            result = server_module.agent_pool_validate(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            result = server_module.agent_pool_validate(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
 
             self.assertTrue(result["ok"])
             self.assertEqual(result["expected_agent_count"], 2)
@@ -6909,7 +6909,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             spec = {
                 "schema_version": 1,
                 "pool_root": str(pool),
-                "codex_bin": "/bin/codex",
+                "codex_bin": "/bin/echo",
                 "series": [
                     {
                         "prefix": custom_prefix,
@@ -6922,8 +6922,8 @@ class AgentPoolManagementTest(unittest.TestCase):
             }
             spec_path = self._write_spec_payload(tmp, spec)
 
-            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
-            status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+            status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
 
             self.assertTrue(status["ok"])
             self.assertEqual(status["expected_agent_count"], 2)
@@ -6944,11 +6944,11 @@ class AgentPoolManagementTest(unittest.TestCase):
             spec_path = self._write_spec(tmp, pool)
             (pool / "a1" / "skills").mkdir(parents=True)
             (pool / "a1" / "plugins").mkdir()
-            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
             marker = pool / server_module.POOL_MARKER_FILE
 
             marker.unlink()
-            missing_marker = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            missing_marker = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
             self.assertFalse(missing_marker["ok"])
             self.assertFalse(missing_marker["marker_present"])
             self.assertEqual(missing_marker["marker_state"], "missing")
@@ -6956,7 +6956,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             marker_target = tmp / "outside-marker"
             marker_target.write_text("marker\n", encoding="utf-8")
             marker.symlink_to(marker_target)
-            linked_marker = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            linked_marker = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
             self.assertFalse(linked_marker["ok"])
             self.assertFalse(linked_marker["marker_present"])
             self.assertEqual(linked_marker["marker_state"], "symlink")
@@ -6964,7 +6964,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             marker.unlink()
             marker.write_text("{}\n", encoding="utf-8")
             (pool / "a2" / "config.toml").unlink()
-            missing_config = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            missing_config = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
             self.assertFalse(missing_config["ok"])
             self.assertTrue(missing_config["marker_present"])
             self.assertEqual(missing_config["config_count"], 3)
@@ -6988,8 +6988,8 @@ class AgentPoolManagementTest(unittest.TestCase):
             (pool / "a2").mkdir()
             (pool / "a2" / "skills").symlink_to("missing-secret-skills")
 
-            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
-            invalid_status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+            invalid_status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
             self.assertFalse(invalid_status["ok"])
             self.assertEqual(invalid_status["shared_asset_expected_link_count"], 2)
             self.assertEqual(invalid_status["shared_asset_valid_link_count"], 1)
@@ -7012,8 +7012,8 @@ class AgentPoolManagementTest(unittest.TestCase):
             outside.mkdir()
             (pool / "a2" / "skills").symlink_to(outside)
 
-            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
-            absolute_status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+            absolute_status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
             self.assertFalse(absolute_status["ok"])
             self.assertEqual(absolute_status["shared_asset_invalid_link_count"], 1)
             self.assertEqual(absolute_status["shared_asset_valid_link_count"], 1)
@@ -7031,7 +7031,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             spec = {
                 "schema_version": 1,
                 "pool_root": str(pool),
-                "codex_bin": "/bin/codex",
+                "codex_bin": "/bin/echo",
                 "series": [
                     {"prefix": "a", "count": 1, "template": "a1", "authenticated": []},
                     {"prefix": "c", "count": 2, "template": "c1", "authenticated": []},
@@ -7045,8 +7045,8 @@ class AgentPoolManagementTest(unittest.TestCase):
             (pool / "c2").mkdir()
             (pool / "c2" / "skills").symlink_to("../a1/skills")
 
-            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
-            status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+            status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
 
             self.assertTrue(status["ok"])
             self.assertEqual(status["shared_asset_expected_link_count"], 1)
@@ -7085,7 +7085,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             (home / "codex").symlink_to(wrapper_target)
             (home / "config.toml").symlink_to(config_target)
 
-            result = server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            result = server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
 
             self.assertTrue(result["ok"])
             self.assertFalse((home / "codex").is_symlink())
@@ -7108,7 +7108,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             (pool / "a2").mkdir()
             (pool / "a2" / "skills").symlink_to("missing-skills")
 
-            result = server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            result = server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
 
             self.assertTrue(result["ok"])
             self.assertEqual(result["skipped_existing_shared_assets"], 1)
@@ -7131,7 +7131,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             skipped = server_module.agent_pool_copy_auth(
                 str(spec_path),
                 target_dir=str(pool),
-                codex_bin="/bin/codex",
+                codex_bin="/bin/echo",
                 from_agent="a1",
                 to="a-series",
                 yes=True,
@@ -7139,7 +7139,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             replaced = server_module.agent_pool_copy_auth(
                 str(spec_path),
                 target_dir=str(pool),
-                codex_bin="/bin/codex",
+                codex_bin="/bin/echo",
                 from_agent="a1",
                 to="a-series",
                 yes=True,
@@ -7167,7 +7167,7 @@ class AgentPoolManagementTest(unittest.TestCase):
                         "arguments": {
                             "spec": str(spec_path),
                             "target_dir": str(pool),
-                            "codex_bin": "/bin/codex\nmalicious",
+                            "codex_bin": "/bin/echo\nmalicious",
                         },
                     },
                 }
@@ -7178,6 +7178,69 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertIn("codex_bin contains unsupported characters", payload_text)
             self.assertNotIn(str(tmp), payload_text)
             self.assertNotIn("agents-secret", payload_text)
+
+    def test_agent_pool_rejects_unusable_codex_bin_without_path_leak(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents-secret"
+            spec_path = self._write_spec(tmp, pool)
+            missing = tmp / "missing-codex-secret"
+            not_executable = tmp / "codex-not-executable-secret"
+            not_executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+            missing_response = handle_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 70,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "agent_pool_validate",
+                        "arguments": {
+                            "spec": str(spec_path),
+                            "target_dir": str(pool),
+                            "codex_bin": str(missing),
+                        },
+                    },
+                }
+            )
+            not_executable_response = handle_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 71,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "agent_pool_validate",
+                        "arguments": {
+                            "spec": str(spec_path),
+                            "target_dir": str(pool),
+                            "codex_bin": str(not_executable),
+                        },
+                    },
+                }
+            )
+            with patch.dict("os.environ", {"PATH": ""}):
+                command_response = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 72,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "agent_pool_validate",
+                            "arguments": {"spec": str(spec_path), "target_dir": str(pool), "codex_bin": "codex-secret"},
+                        },
+                    }
+                )
+
+            for response, expected in (
+                (missing_response, "codex_bin path must resolve to an executable file"),
+                (not_executable_response, "codex_bin path must resolve to an executable file"),
+                (command_response, "codex_bin command must resolve to an executable on PATH"),
+            ):
+                self.assertTrue(response["result"]["isError"])
+                payload_text = response["result"]["content"][0]["text"]
+                self.assertIn(expected, payload_text)
+                self.assertNotIn(str(tmp), payload_text)
+                self.assertNotIn("secret", payload_text.lower())
 
     def test_agent_pool_wrapper_quotes_codex_bin_special_chars_as_data(self) -> None:
         from codex_master import server as server_module
@@ -7245,7 +7308,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             tmp = Path(tmpdir)
             pool = tmp / "agents-secret"
             spec_path = self._write_spec(tmp, pool)
-            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
             marker = pool / server_module.POOL_MARKER_FILE
             marker.unlink()
             marker_target = tmp / "outside-marker"
@@ -7278,14 +7341,14 @@ class AgentPoolManagementTest(unittest.TestCase):
             tmp = Path(tmpdir)
             pool = tmp / "agents"
             spec_path = self._write_spec(tmp, pool)
-            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/codex")
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
 
             with patch.object(server_module.shutil.rmtree, "avoids_symlink_attacks", False, create=True):
                 with self.assertRaises(AgentError) as ctx:
                     server_module.agent_pool_destroy_pool(
                         str(spec_path),
                         target_dir=str(pool),
-                        codex_bin="/bin/codex",
+                        codex_bin="/bin/echo",
                         yes=True,
                     )
 
