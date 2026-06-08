@@ -1599,7 +1599,7 @@ class ServerHelpersTest(unittest.TestCase):
     ) -> None:
         mock_plugin_manifest.return_value = {
             "ok": True,
-            "version": "0.9.14+codex.test",
+            "version": "0.9.15+codex.test",
             "raw_output": "not_returned",
         }
 
@@ -1626,7 +1626,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.14")
+        self.assertEqual(result["expected_tag"], "v0.9.15")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -4952,7 +4952,7 @@ class ServerHelpersTest(unittest.TestCase):
                                 "agent": "a",
                                 "role": "exploriererin",
                                 "task": "nur lesen",
-                                "skill": "missing-plugin:missing-skill",
+                                "skill": "missing-plugin:SECRET_SKILL_NAME_SHOULD_NOT_RETURN",
                             },
                         },
                     }
@@ -5006,7 +5006,9 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(worker["result"]["isError"])
         self.assertIn("require at least one explicit write path", worker["result"]["content"][0]["text"])
         self.assertTrue(missing_skill["result"]["isError"])
-        self.assertIn("skill not found", missing_skill["result"]["content"][0]["text"])
+        missing_skill_text = missing_skill["result"]["content"][0]["text"]
+        self.assertIn("skill not found", missing_skill_text)
+        self.assertNotIn("SECRET_SKILL_NAME_SHOULD_NOT_RETURN", missing_skill_text)
         self.assertTrue(outside_scope["result"]["isError"])
         self.assertIn("write paths must stay inside scope", outside_scope["result"]["content"][0]["text"])
         self.assertTrue(long_task["result"]["isError"])

@@ -3582,7 +3582,7 @@ def assign_agent(
     if skill:
         matches = skill_matches(agent, skill)
         if not matches and not allow_missing_skill:
-            raise AgentError(f"skill not found for agent {agent}: {skill}")
+            raise AgentError(f"skill not found for agent {agent}")
 
     model = assignment_model(role)
     prompt = assignment_prompt(
