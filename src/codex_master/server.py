@@ -6295,7 +6295,7 @@ def check_mcp_registration(command_path: Path = DEFAULT_INSTALL_PATH) -> dict[st
         "startup_timeout_sec": startup_timeout_sec,
         "startup_timeout_ok": startup_timeout_ok,
         "startup_timeout_recommended_sec": RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
-        "ok": registered and command_matches,
+        "ok": registered and command_matches and startup_timeout_ok,
         "redaction_applied": redacted,
         "output_excerpt": output if not registered or not command_matches else "",
     }
@@ -6446,7 +6446,7 @@ def install(
             raise AgentError("install path failed MCP startup self-test")
         current = check_mcp_registration(install_path)
         startup_timeout_config = None
-        if current.get("ok"):
+        if current.get("ok") or (current.get("registered") and current.get("command_matches")):
             registration = {"requested": True, "status": "already_registered"}
         else:
             if current.get("registered") and force:

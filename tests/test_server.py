@@ -532,6 +532,29 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("command: /<redacted>", result["output_excerpt"])
         self.assertNotIn("/tmp/bin/codex-master-mcp-old", result["output_excerpt"])
 
+    @patch("codex_master.server.run_command")
+    @patch("codex_master.server.shutil.which", return_value="/usr/bin/codex")
+    def test_check_mcp_registration_rejects_short_startup_timeout(self, _mock_which, mock_run) -> None:
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["codex", "mcp", "get", "codex-master-mcp"],
+            0,
+            "\n".join(
+                [
+                    "codex-master-mcp",
+                    "  command: /tmp/bin/codex-master-mcp",
+                    "  startup_timeout_sec: 30",
+                ]
+            ),
+            "",
+        )
+
+        result = check_mcp_registration(Path("/tmp/bin/codex-master-mcp"))
+
+        self.assertTrue(result["registered"])
+        self.assertTrue(result["command_matches"])
+        self.assertFalse(result["startup_timeout_ok"])
+        self.assertFalse(result["ok"])
+
     def test_mcp_tools_list(self) -> None:
         response = handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         self.assertIsNotNone(response)
@@ -7157,6 +7180,36 @@ class CliLifecycleTest(unittest.TestCase):
 
         self.assertEqual(mock_self_test.call_args_list[0].args[0], wrapper)
         self.assertEqual(mock_self_test.call_args_list[1].args[0], install_link)
+
+    @patch("codex_master.server.run_command")
+    @patch("codex_master.server.ensure_mcp_startup_timeout_configured")
+    @patch("codex_master.server.check_mcp_registration")
+    @patch("codex_master.server.mcp_command_startup_self_test")
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_keeps_matching_registration_when_timeout_is_stale(
+        self, mock_wrapper_path, mock_self_test, mock_registration, mock_timeout, mock_run
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            mock_wrapper_path.return_value = wrapper
+            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
+            mock_registration.return_value = {
+                "registered": True,
+                "command_matches": True,
+                "ok": False,
+                "startup_timeout_ok": False,
+            }
+            mock_timeout.return_value = {"status": "updated", "raw_output": "not_returned"}
+
+            result = install(register=True, install_path=install_link, sync_plugin_cache=False)
+
+        self.assertEqual(result["mcp"]["status"], "already_registered")
+        self.assertEqual(result["mcp"]["startup_timeout"]["status"], "updated")
+        mock_run.assert_not_called()
 
     @patch("codex_master.server.subprocess.run")
     def test_mcp_command_startup_self_test_is_data_sparse(self, mock_run) -> None:
