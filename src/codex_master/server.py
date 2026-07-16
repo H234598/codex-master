@@ -3112,16 +3112,20 @@ def model_from_status_text(text: str) -> str | None:
 
 
 def first_limit_evidence(text: str) -> str:
-    lowered = text.lower()
-    for pattern in LIMIT_TEXT_PATTERNS:
-        match = re.search(pattern, lowered)
-        if match:
-            line_start = text.rfind("\n", 0, match.start()) + 1
-            next_line = text.find("\n", match.end())
-            line_end = len(text) if next_line == -1 else next_line
-            start = max(line_start, match.start() - 160)
-            end = min(line_end, match.end() + 160)
-            return text[start:end]
+    offset = 0
+    for raw_line in text.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
+        lowered = line.lower()
+        if any(re.search(pattern, lowered) for pattern in LIMIT_CLEAR_TEXT_PATTERNS):
+            offset += len(raw_line)
+            continue
+        for pattern in LIMIT_TEXT_PATTERNS:
+            match = re.search(pattern, lowered)
+            if match:
+                start = max(offset, offset + match.start() - 160)
+                end = min(offset + len(line), offset + match.end() + 160)
+                return text[start:end]
+        offset += len(raw_line)
     return ""
 
 
@@ -3168,18 +3172,20 @@ def classify_limit_text(text: str, meta: dict[str, Any] | None = None, latest_as
         and not any(re.search(pattern, line) for pattern in LIMIT_CLEAR_TEXT_PATTERNS)
         for line in limit_lines
     )
+    limit_evidence = first_limit_evidence(cleaned) if has_limit else ""
+    classification_text = limit_evidence.lower() if limit_evidence else lowered
     window = "unknown"
-    if re.search(r"\b(?:daily|per day|today|24h|24 hours)\b", lowered):
+    if re.search(r"\b(?:daily|per day|today|24h|24 hours)\b", classification_text):
         window = "daily"
-    elif re.search(r"\b(?:weekly|per week|this week|7d|7 days)\b", lowered):
+    elif re.search(r"\b(?:weekly|per week|this week|7d|7 days)\b", classification_text):
         window = "weekly"
 
     limit_kind = "unknown"
-    if re.search(r"\b(?:token|context length|context window)\b", lowered):
+    if re.search(r"\b(?:token|context length|context window)\b", classification_text):
         limit_kind = "token"
-    elif re.search(r"\brate[- ]limit|too many requests\b", lowered):
+    elif re.search(r"\brate[- ]limit|too many requests\b", classification_text):
         limit_kind = "rate"
-    elif re.search(r"\bquota\b", lowered):
+    elif re.search(r"\bquota\b", classification_text):
         limit_kind = "quota"
     elif has_limit:
         limit_kind = "usage"

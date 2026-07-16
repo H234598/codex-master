@@ -2841,6 +2841,16 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(mixed_status["limited"])
         self.assertEqual(mixed_status["kind"], "rate")
 
+        mixed_window = classify_limit_text("Weekly limit reached.\nDaily quota normal.")
+        self.assertEqual(mixed_window["window"], "weekly")
+        self.assertEqual(mixed_window["kind"], "usage")
+
+        negated_first = classify_limit_text("No rate limit reached.\nWeekly limit reached for Codex Spark.")
+        self.assertTrue(negated_first["limited"])
+        self.assertEqual(negated_first["window"], "weekly")
+        self.assertEqual(negated_first["model"], WRITE_AGENT_MODEL)
+        self.assertEqual(negated_first["model_source"], "limit_evidence_text")
+
         rate_limited = classify_limit_text("Request was rate-limited. Retry later.")
         self.assertTrue(rate_limited["limited"])
         self.assertEqual(rate_limited["kind"], "rate")
