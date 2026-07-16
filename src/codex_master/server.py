@@ -3214,16 +3214,11 @@ def codex_usage_snapshot_accounts(
     meta_account = routing.get("account") if isinstance(routing, dict) else None
     assignment_created = parse_utc_timestamp(record.get("created_at_utc")) if isinstance(record, dict) else None
     session_started = parse_utc_timestamp(meta.get("started_at_utc"))
-    selected_account = None
-    if (
-        assignment_account is not None
-        and session_started is not None
-        and assignment_created is not None
-        and assignment_created < session_started
-    ):
-        selected_account = meta_account
-    else:
-        selected_account = assignment_account if assignment_account is not None else meta_account
+    assignment_is_current = assignment_account is not None and (
+        session_started is None
+        or (assignment_created is not None and assignment_created >= session_started)
+    )
+    selected_account = assignment_account if assignment_is_current else meta_account
     add_account(selected_account if selected_account is not None else agent)
     return accounts
 
