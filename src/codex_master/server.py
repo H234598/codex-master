@@ -3217,13 +3217,17 @@ def codex_usage_snapshot_accounts(
     ):
         raise AgentError("codex-usage snapshot account is invalid")
     assignment_created = parse_utc_timestamp(record.get("created_at_utc")) if isinstance(record, dict) else None
+    session_timestamp_present = "started_at_utc" in meta
     session_started = parse_utc_timestamp(meta.get("started_at_utc"))
     current_time = time.time()
     assignment_is_current = (
         assignment_account is not None
         and assignment_created is not None
         and assignment_created <= current_time
-        and (session_started is None or assignment_created >= session_started)
+        and (
+            not session_timestamp_present
+            or (session_started is not None and assignment_created >= session_started)
+        )
     )
     selected_account = assignment_account if assignment_is_current else meta_account
     add_account(selected_account if selected_account is not None else agent)

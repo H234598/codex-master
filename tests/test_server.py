@@ -3998,6 +3998,37 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(status["account"], "a1")
         read.assert_called_once_with("a1")
 
+    def test_codex_usage_watchdog_ignores_assignment_with_invalid_session_timestamp(self) -> None:
+        blocked_old = {
+            "account": "BW_Alt",
+            "status": "blocked",
+            "blocked_until": "2099-06-08T06:50:00+00:00",
+            "blocked_reason": "old account limit",
+        }
+
+        def read_snapshot(account: str) -> dict[str, Any]:
+            return blocked_old if account == "BW_Alt" else {}
+
+        with patch(
+            "codex_master.server.read_meta",
+            return_value={"started_at_utc": "not-a-timestamp"},
+        ), patch(
+            "codex_master.server.list_assignments",
+            return_value={
+                "records": [
+                    {
+                        "created_at_utc": "2026-07-16T09:00:00+00:00",
+                        "routing": {"account": "BW_Alt"},
+                    }
+                ]
+            },
+        ), patch("codex_master.server.read_codex_usage_snapshot", side_effect=read_snapshot) as read:
+            status = codex_usage_watchdog_status("a1")
+
+        self.assertEqual(status["state"], "missing")
+        self.assertEqual(status["account"], "a1")
+        read.assert_called_once_with("a1")
+
     def test_codex_usage_watchdog_ignores_future_assignment(self) -> None:
         blocked_future = {
             "account": "BW_Future",
