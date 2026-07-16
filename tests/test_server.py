@@ -3442,6 +3442,40 @@ class ServerHelpersTest(unittest.TestCase):
         mock_report.assert_called_once()
         mock_interrupt.assert_not_called()
 
+    def test_fleet_watchdog_does_not_reuse_release_flag_after_session_restart(self) -> None:
+        meta_store: dict[str, object] = {
+            "watchdog": {
+                "phase": "report_requested",
+                "requested_at_utc": "1970-01-01T00:13:00+00:00",
+                "assignment_id": "assign-1",
+                "planned_action": "interrupt",
+                "started_at_utc": "2026-06-07T09:00:00+00:00",
+                "release_lease_after_action": True,
+            }
+        }
+        status = {
+            "agent": "a",
+            "running": True,
+            "lease": {"state": "held", "held_by_this_server": True, "raw_output": "not_returned"},
+            "response_state": {"state": "running_recent_output"},
+            "raw_log_idle_seconds": 90,
+            "raw_log_bytes": 100,
+            "raw_log_updated_at_utc": "1970-01-01T00:15:00+00:00",
+            "started_at_utc": "2026-06-07T09:30:00+00:00",
+            "last_assignment": {"assignment_id": "assign-1", "created_at_utc": "2026-06-07T09:58:00+00:00"},
+        }
+        report = {"status": "report_requested", "submitted": True, "assignment_id": "assign-1", "send": {"status": "sent"}}
+
+        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "codex_master.server.status_agent", return_value=status
+        ), patch("codex_master.server.read_meta", return_value=meta_store), patch(
+            "codex_master.server.write_meta", side_effect=lambda _agent, data: meta_store.update(data)
+        ), patch("codex_master.server.request_agent_report", return_value=report):
+            result = fleet_watchdog("a")
+
+        self.assertEqual(result["results"][0]["watchdog_state"], "report_requested")
+        self.assertFalse(meta_store["watchdog"]["release_lease_after_action"])
+
     def test_fleet_watchdog_claims_unclaimed_agent_before_report(self) -> None:
         meta_store: dict[str, object] = {}
         status = {

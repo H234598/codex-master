@@ -3932,7 +3932,19 @@ def watchdog_agent(
 
     meta = read_meta(agent)
     marker = watchdog_marker(meta)
-    release_watchdog_lease = bool(marker.get("release_lease_after_action"))
+    marker_started_at = parse_utc_timestamp(marker.get("started_at_utc"))
+    current_started_at = parse_utc_timestamp(status.get("started_at_utc"))
+    session_identity_present = marker.get("started_at_utc") is not None or status.get("started_at_utc") is not None
+    session_identity_matches = (
+        not session_identity_present
+        or (marker_started_at is not None and current_started_at is not None and marker_started_at == current_started_at)
+    )
+    marker_lease_matches = (
+        marker.get("phase") == "report_requested"
+        and marker.get("assignment_id") == assignment_id
+        and session_identity_matches
+    )
+    release_watchdog_lease = bool(marker.get("release_lease_after_action")) and marker_lease_matches
     marker_is_current = watchdog_marker_matches(
         marker,
         action=action,
