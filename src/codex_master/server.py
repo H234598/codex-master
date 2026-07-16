@@ -3212,16 +3212,18 @@ def codex_usage_snapshot_accounts(
     routing = meta.get("routing")
     assignment_account = assignment_routing.get("account") if isinstance(assignment_routing, dict) else None
     meta_account = routing.get("account") if isinstance(routing, dict) else None
+    if assignment_account is not None and (
+        not isinstance(assignment_account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(assignment_account)
+    ):
+        raise AgentError("codex-usage snapshot account is invalid")
     assignment_created = parse_utc_timestamp(record.get("created_at_utc")) if isinstance(record, dict) else None
     session_started = parse_utc_timestamp(meta.get("started_at_utc"))
     current_time = time.time()
-    assignment_is_current = assignment_account is not None and (
-        session_started is None
-        or (
-            assignment_created is not None
-            and assignment_created >= session_started
-            and assignment_created <= current_time
-        )
+    assignment_is_current = (
+        assignment_account is not None
+        and assignment_created is not None
+        and assignment_created <= current_time
+        and (session_started is None or assignment_created >= session_started)
     )
     selected_account = assignment_account if assignment_is_current else meta_account
     add_account(selected_account if selected_account is not None else agent)
