@@ -3623,6 +3623,45 @@ class ServerHelpersTest(unittest.TestCase):
         mock_release.assert_called_once_with("a1", force=True)
         mock_write_meta.assert_called_once_with("a1", {})
 
+    def test_fleet_watchdog_cleans_marker_when_agent_stops_during_report_grace(self) -> None:
+        status = {
+            "agent": "a",
+            "running": False,
+            "lease": {"state": "held", "held_by_this_server": True, "raw_output": "not_returned"},
+            "response_state": {"state": "not_running"},
+            "raw_log_idle_seconds": 240,
+            "raw_log_bytes": 100,
+            "raw_log_updated_at_utc": "1970-01-01T00:12:00+00:00",
+            "last_assignment": {"assignment_id": "assign-1", "created_at_utc": "2026-06-07T09:58:00+00:00"},
+        }
+        marker = {
+            "watchdog": {
+                "phase": "report_requested",
+                "requested_at_utc": "1970-01-01T00:13:00+00:00",
+                "assignment_id": "assign-1",
+                "planned_action": "interrupt",
+                "release_lease_after_action": True,
+            }
+        }
+        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "codex_master.server.status_agent", return_value=status
+        ), patch("codex_master.server.read_meta", return_value=marker), patch(
+            "codex_master.server.write_meta"
+        ) as mock_write_meta, patch(
+            "codex_master.server.agent_lease_status",
+            return_value={"held_by_this_server": True},
+        ) as mock_lease, patch(
+            "codex_master.server.release_agent",
+            return_value={"lease": {"state": "unclaimed", "held_by_this_server": False}},
+        ) as mock_release:
+            result = fleet_watchdog("a")
+
+        payload = result["results"][0]
+        self.assertEqual(payload["watchdog_state"], "skipped_not_running")
+        mock_lease.assert_called_once_with("a1")
+        mock_release.assert_called_once_with("a1", force=True)
+        mock_write_meta.assert_called_once_with("a1", {})
+
     def test_fleet_watchdog_skips_other_client_lease(self) -> None:
         status = {
             "agent": "a",

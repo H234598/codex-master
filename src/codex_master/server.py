@@ -3882,6 +3882,16 @@ def watchdog_agent(
         "response_output": "not_returned",
     }
     if not status.get("running"):
+        if not dry_run:
+            marker = watchdog_marker(read_meta(agent))
+            if marker:
+                if marker.get("release_lease_after_action") and agent_lease_status(agent).get("held_by_this_server"):
+                    released = release_agent(agent, force=True)
+                    released_lease = released.get("lease") if isinstance(released, dict) else None
+                    if isinstance(released_lease, dict):
+                        base["lease_state"] = released_lease.get("state")
+                        base["held_by_this_server"] = bool(released_lease.get("held_by_this_server"))
+                update_watchdog_marker(agent, None)
         return {**base, "watchdog_state": "skipped_not_running", "action_taken": "none"}
     if lease_state == "held" and not held_by_this_server:
         return {**base, "watchdog_state": "skipped_not_leased_by_this_server", "action_taken": "none"}
