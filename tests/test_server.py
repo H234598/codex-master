@@ -4147,6 +4147,28 @@ class ServerHelpersTest(unittest.TestCase):
                 with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
                     codex_usage_watchdog_status("a")
 
+    def test_codex_usage_watchdog_rejects_symlinked_snapshot_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "a1.json").write_text(
+                json.dumps(
+                    {
+                        "account": "a1",
+                        "status": "blocked",
+                        "blocked_until": "2099-06-08T06:50:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "snapshots").symlink_to(outside, target_is_directory=True)
+            with patch.dict("os.environ", {"CODEX_USAGE_STATE_ROOT": tmpdir}, clear=False), patch(
+                "codex_master.server.read_meta", return_value={}
+            ), patch("codex_master.server.list_assignments", return_value={"records": []}):
+                with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
+                    codex_usage_watchdog_status("a")
+
     def test_usage_watchdog_dry_run_reports_marker_changes_without_mutating(self) -> None:
         blocked_status = {
             "agent": "a1",

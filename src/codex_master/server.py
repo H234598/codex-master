@@ -1272,6 +1272,19 @@ def read_json_file(path: Path) -> dict[str, Any]:
 
 def read_codex_usage_snapshot(account: str) -> dict[str, Any]:
     path = codex_usage_snapshot_path(account)
+    snapshot_dir = path.parent
+    try:
+        snapshot_dir_stat = snapshot_dir.lstat()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise AgentError("could_not_read_codex_usage_snapshot") from exc
+    if (
+        stat_module.S_ISLNK(snapshot_dir_stat.st_mode)
+        or not stat_module.S_ISDIR(snapshot_dir_stat.st_mode)
+        or not directory_chain_is_real_no_symlink(snapshot_dir)
+    ):
+        raise AgentError("could_not_read_codex_usage_snapshot")
     try:
         current_stat = path.lstat()
     except FileNotFoundError:
