@@ -758,7 +758,9 @@ def parse_selector_series_value(value: Any, *, field: str = "series") -> tuple[s
     if isinstance(value, str):
         items = [item.strip().lower() for item in value.split(",")]
     elif isinstance(value, list):
-        items = [str(item).strip().lower() for item in value if isinstance(item, str)]
+        if any(not isinstance(item, str) for item in value):
+            raise AgentError(f"{field} must contain only string series prefixes")
+        items = [item.strip().lower() for item in value]
     else:
         raise AgentError(f"{field} must be a comma-separated string or array of series prefixes")
     series = tuple(item for item in items if item)
@@ -1211,9 +1213,10 @@ def read_json_file(path: Path) -> dict[str, Any]:
     if len(raw) > MAX_META_BYTES:
         return error
     try:
-        return json.loads(raw.decode("utf-8"))
+        payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return error
+    return payload if isinstance(payload, dict) else error
 
 
 def read_codex_usage_snapshot(agent: str) -> dict[str, Any]:
@@ -1495,12 +1498,9 @@ def normalize_claim_wait_seconds(value: Any) -> int | None:
         return None
     if isinstance(value, str) and value.strip().lower() in {"forever", "infinite", "unbounded", "unlimited"}:
         return None
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise AgentError("wait_seconds must be an integer or forever")
-    try:
-        number = int(value)
-    except (TypeError, ValueError) as exc:
-        raise AgentError("wait_seconds must be an integer or forever") from exc
+    number = value
     if number < 0:
         raise AgentError("wait_seconds must be >= 0")
     return number
@@ -4375,17 +4375,78 @@ def redact_list(items: list[str], max_items: int = 50) -> list[str]:
 
 
 def sanitize_assignment_record(record: dict[str, Any]) -> dict[str, Any]:
-    sanitized = dict(record)
+    sanitized = {
+        key: record[key]
+        for key in (
+            "assignment_id",
+            "created_at_utc",
+            "agent",
+            "role",
+            "name",
+            "model",
+            "model_reasoning_effort",
+            "model_switch",
+            "routing",
+            "group_id",
+            "job_id",
+            "skill",
+            "scope",
+            "write_paths",
+            "context_count",
+            "forbidden_count",
+            "write_policy",
+            "allow_subagents",
+            "requires_search",
+            "live_data",
+            "lease",
+            "submitted",
+            "prompt_chars",
+            "prompt_output",
+            "response_output",
+        )
+        if key in record
+    }
     for key in ("scope", "write_paths"):
         values = sanitized.get(key)
         if isinstance(values, list):
-            sanitized[key] = redact_list([str(item) for item in values], max_items=MAX_ASSIGNMENT_LIST_ITEMS)
-    skill = sanitized.get("skill")
-    if isinstance(skill, dict):
-        sanitized["skill"] = {
-            key: redact(str(value))[0] if isinstance(value, str) else value
-            for key, value in skill.items()
-        }
+            sanitized[key] = redact_list(
+                [item for item in values if isinstance(item, str)], max_items=MAX_ASSIGNMENT_LIST_ITEMS
+            )
+    for key, allowed_keys in {
+        "model_switch": ("status", "previous_model", "model", "raw_output"),
+        "routing": (
+            "schema_version",
+            "account",
+            "backend_account_id",
+            "role",
+            "decision",
+            "model",
+            "reason",
+            "usage_state",
+            "paid_overage_allowed",
+            "policy_source",
+            "raw_output",
+        ),
+        "skill": ("requested", "available", "match_count"),
+        "live_data": ("required", "topic_state", "raw_output"),
+        "lease": ("state", "holder", "held_by_this_server", "expires_at_utc", "raw_output"),
+    }.items():
+        value = sanitized.get(key)
+        if not isinstance(value, dict):
+            sanitized.pop(key, None)
+            continue
+        safe_value = {}
+        for nested_key in allowed_keys:
+            if nested_key not in value:
+                continue
+            nested_value = value[nested_key]
+            if nested_key == "raw_output":
+                safe_value[nested_key] = "not_returned"
+            elif isinstance(nested_value, str):
+                safe_value[nested_key] = redact(nested_value)[0]
+            elif nested_value is None or isinstance(nested_value, (bool, int)):
+                safe_value[nested_key] = nested_value
+        sanitized[key] = safe_value
     sanitized["prompt_output"] = "not_returned"
     sanitized["response_output"] = "not_returned"
     return sanitized
@@ -4421,7 +4482,8 @@ def prune_assignment_log(max_records: int | None = None) -> None:
             parsed = json.loads(line)
         except json.JSONDecodeError:
             continue
-        valid_records.append(json.dumps(parsed, sort_keys=True))
+        if isinstance(parsed, dict):
+            valid_records.append(json.dumps(parsed, sort_keys=True))
 
     kept = valid_records[-max_records:]
     text = "\n".join(kept) + ("\n" if kept else "")
@@ -4445,6 +4507,8 @@ def list_assignments(agent: str = "all", limit: int = 20) -> dict[str, Any]:
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
                 continue
             if record.get("agent") in selected_records:
                 records.append(sanitize_assignment_record(record))
@@ -6396,9 +6460,13 @@ def interrupt_agent(agent: str, force: bool = False) -> dict[str, Any]:
     session = cfg["session"]
     if not tmux_alive(session):
         raise AgentError(f"agent {agent} is not running")
-    claim = claim_agent(agent, force=force)
-    release_on_failure = claim["status"] in {"claimed", "claimed_expired", "forced"}
-    lease = claim["lease"]
+    if force:
+        lease = ensure_agent_lease_available(agent, force=True)
+        release_on_failure = False
+    else:
+        claim = claim_agent(agent)
+        release_on_failure = claim["status"] in {"claimed", "claimed_expired"}
+        lease = claim["lease"]
     try:
         cp = run_tmux(["send-keys", "-t", session, "C-c"], check=False)
         if cp.returncode != 0:
@@ -7012,11 +7080,14 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return paged_multi_agent_result(selected, args, agent_lease_status)
     if name == "agent_safe_tail":
         selected_agent = single_agent_id(str(args.get("agent", "")), "agent_safe_tail")
-        return safe_tail(
+        return call_agent_lifecycle(
             selected_agent,
-            int_arg(args, "lines", 40),
-            int_arg(args, "chars", 4000),
-            str(args.get("source", "pane")),
+            lambda: safe_tail(
+                selected_agent,
+                int_arg(args, "lines", 40),
+                int_arg(args, "chars", 4000),
+                str(args.get("source", "pane")),
+            ),
         )
     raise AgentError("unknown tool")
 
@@ -8605,10 +8676,17 @@ def rpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
 
 
 def handle_rpc(msg: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(msg, dict):
+        raise AgentError("RPC message must be an object")
     method = msg.get("method")
     message_id = msg.get("id")
     if method == "initialize":
-        requested = (msg.get("params") or {}).get("protocolVersion")
+        params = msg.get("params", {})
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return rpc_error(message_id, -32602, "initialize params must be an object")
+        requested = params.get("protocolVersion")
         try:
             protocol_version = negotiate_protocol_version(requested)
         except AgentError:
@@ -8633,7 +8711,9 @@ def handle_rpc(msg: dict[str, Any]) -> dict[str, Any] | None:
         return rpc_result(message_id, {"prompts": []})
     if method == "tools/call":
         try:
-            params = msg.get("params") or {}
+            params = msg.get("params", {})
+            if params is None:
+                params = {}
             if not isinstance(params, dict):
                 raise AgentError("tools/call params must be an object")
             name, args = validate_tool_call(params.get("name"), params.get("arguments", {}))

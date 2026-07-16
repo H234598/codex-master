@@ -87,7 +87,9 @@ from codex_master.server import (
     main_cli,
     master_timeout_policy,
     master_watchdog_status,
+    parse_selector_series_value,
     list_assignments,
+    prune_assignment_log,
     prune_raw_logs,
     raw_log_retention_status,
     read_message,
@@ -703,6 +705,10 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(persisted_status["series"], ["a", "b", "c"])
         self.assertEqual(selected, ["a1", "b1", "c1", "a2", "b2", "c2"])
         self.assertNotIn(tmpdir, json.dumps(changed, sort_keys=True))
+
+    def test_selector_policy_rejects_non_string_series_entries(self) -> None:
+        with self.assertRaisesRegex(AgentError, "series must contain only string series prefixes"):
+            parse_selector_series_value(["a", 7])
 
     def test_agent_selector_errors_do_not_echo_request_values(self) -> None:
         unknown_agent = handle_rpc(
@@ -1957,6 +1963,13 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(response["error"]["code"], -32602)
         self.assertEqual(response["error"]["message"], "Unsupported protocol version")
 
+    def test_initialize_rejects_non_object_params(self) -> None:
+        for index, value in enumerate(([], False, 0, "", ["unexpected"]), start=1):
+            response = handle_rpc({"jsonrpc": "2.0", "id": 100 + index, "method": "initialize", "params": value})
+
+            self.assertEqual(response["error"]["code"], -32602)
+            self.assertEqual(response["error"]["message"], "initialize params must be an object")
+
     def test_initialize_accepts_supported_protocol(self) -> None:
         response = handle_rpc(
             {"jsonrpc": "2.0", "id": 16, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}}
@@ -2099,6 +2112,10 @@ class ServerHelpersTest(unittest.TestCase):
 
     def test_mcp_tool_call_validates_params_and_argument_shape(self) -> None:
         params_response = handle_rpc({"jsonrpc": "2.0", "id": 33, "method": "tools/call", "params": "not-an-object"})
+        falsy_params_responses = [
+            handle_rpc({"jsonrpc": "2.0", "id": 330 + index, "method": "tools/call", "params": value})
+            for index, value in enumerate(([], False, 0, ""), start=1)
+        ]
         arguments_response = handle_rpc(
             {
                 "jsonrpc": "2.0",
@@ -2111,9 +2128,18 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(params_response["result"]["isError"])
         params_payload = json.loads(params_response["result"]["content"][0]["text"])
         self.assertEqual(params_payload["error"], "tools/call params must be an object")
+        for response in falsy_params_responses:
+            self.assertTrue(response["result"]["isError"])
+            payload = json.loads(response["result"]["content"][0]["text"])
+            self.assertEqual(payload["error"], "tools/call params must be an object")
         self.assertTrue(arguments_response["result"]["isError"])
         arguments_payload = json.loads(arguments_response["result"]["content"][0]["text"])
         self.assertEqual(arguments_payload["error"], "tools/call arguments must be an object")
+
+    def test_handle_rpc_rejects_non_object_messages(self) -> None:
+        for message in ([], False, 0, ""):
+            with self.assertRaisesRegex(AgentError, "RPC message must be an object"):
+                handle_rpc(message)
 
     def test_mcp_tool_call_enforces_schema_properties_and_required_fields(self) -> None:
         unknown_response = handle_rpc(
@@ -2382,6 +2408,23 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("owner-one", json.dumps(payload, sort_keys=True))
         mock_pane_tail.assert_not_called()
         mock_read_meta.assert_not_called()
+
+    @patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn())
+    @patch("codex_master.server.safe_tail", return_value={"agent": "a1", "raw_output": "not_returned"})
+    def test_safe_tail_tool_serializes_agent_lifecycle(self, mock_safe_tail, mock_lifecycle) -> None:
+        response = handle_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 48,
+                "method": "tools/call",
+                "params": {"name": "agent_safe_tail", "arguments": {"agent": "a"}},
+            }
+        )
+
+        self.assertFalse(response["result"]["isError"])
+        mock_lifecycle.assert_called_once()
+        self.assertEqual(mock_lifecycle.call_args.args[0], "a1")
+        mock_safe_tail.assert_called_once_with("a1", 40, 4000, "pane")
 
     @patch("codex_master.server.ensure_agent_lease_available")
     @patch("codex_master.server.ensure_state")
@@ -3321,12 +3364,15 @@ class ServerHelpersTest(unittest.TestCase):
             symlink_meta.symlink_to(target)
             oversized_meta = meta_dir / "b.json"
             oversized_meta.write_text('{"payload": "' + ("x" * MAX_META_BYTES) + '"}\n', encoding="utf-8")
+            non_object_meta = meta_dir / "a1.json"
 
             with patch("codex_master.server.META_DIR", meta_dir), patch(
                 "codex_master.server.LEGACY_META_DIR", legacy_meta_dir
             ):
                 symlink_result = read_meta("a")
                 oversized_result = read_meta("b")
+                non_object_meta.write_text('["not", "metadata"]\n', encoding="utf-8")
+                non_object_result = read_meta("a")
                 symlink_still_exists = symlink_meta.is_symlink()
 
         self.assertIn("meta_error", symlink_result)
@@ -3338,6 +3384,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(oversized_result["meta_error"], "could_not_read")
         self.assertNotIn(str(meta_dir), json.dumps(oversized_result, sort_keys=True))
         self.assertNotIn("payload", oversized_result)
+        self.assertEqual(non_object_result, {"meta_error": "could_not_read"})
 
     def test_read_meta_uses_generic_legacy_source_marker(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3766,6 +3813,33 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(caught.exception.payload["error_code"], "agent_lease_held_by_other_client")
         self.assertEqual(current["holder"], "other_server")
 
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("codex_master.server.run_tmux")
+    def test_interrupt_force_does_not_replace_foreign_lease(self, mock_run_tmux, _mock_alive) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux", "send-keys"], 0, "", "")
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}},
+                clear=False,
+            ):
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                    claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
+                    result = interrupt_agent("a", force=True)
+                    current = agent_lease_status("a")
+
+        self.assertEqual(result["status"], "interrupt_sent")
+        self.assertEqual(result["lease"]["holder"], "other_server")
+        self.assertEqual(current["holder"], "other_server")
+        mock_run_tmux.assert_called_once_with(["send-keys", "-t", "session-a", "C-c"], check=False)
+
     def test_agent_claim_does_not_recover_foreign_lease_inside_stopped_grace(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -3917,6 +3991,10 @@ class ServerHelpersTest(unittest.TestCase):
     def test_agent_claim_wait_rejects_invalid_direct_interval_values(self) -> None:
         with self.assertRaisesRegex(AgentError, "wait_seconds must be an integer or forever"):
             claim_agent_with_wait("a", wait_seconds="nope")
+        with self.assertRaisesRegex(AgentError, "wait_seconds must be an integer or forever"):
+            claim_agent_with_wait("a", wait_seconds="10")
+        with self.assertRaisesRegex(AgentError, "wait_seconds must be an integer or forever"):
+            claim_agent_with_wait("a", wait_seconds=1.5)
         with self.assertRaisesRegex(AgentError, "poll_interval_seconds must be an integer"):
             claim_agent_with_wait("a", poll_interval_seconds=True)
         with self.assertRaisesRegex(AgentError, f"poll_interval_seconds must be <= {MAX_WAIT_POLL_SECONDS}"):
@@ -5229,7 +5307,12 @@ class ServerHelpersTest(unittest.TestCase):
                         "agent": "a",
                         "scope": ["/home/teladi/private/repo"],
                         "write_paths": ["/home/teladi/private/repo/file.py"],
-                        "skill": {"requested": "/home/teladi/secret-skill"},
+                        "skill": {
+                            "requested": "/home/teladi/secret-skill",
+                            "secret": "ASSIGNMENT_NESTED_SECRET_SHOULD_NOT_LEAK",
+                        },
+                        "secret": "ASSIGNMENT_SECRET_SHOULD_NOT_LEAK",
+                        "raw_prompt": "ASSIGNMENT_PROMPT_SHOULD_NOT_LEAK",
                     }
                 )
                 + "\n",
@@ -5257,6 +5340,9 @@ class ServerHelpersTest(unittest.TestCase):
         payload_text = json.dumps(payload, sort_keys=True)
         self.assertNotIn("/home/teladi/private", payload_text)
         self.assertNotIn("/home/teladi/secret-skill", payload_text)
+        self.assertNotIn("ASSIGNMENT_NESTED_SECRET_SHOULD_NOT_LEAK", payload_text)
+        self.assertNotIn("ASSIGNMENT_SECRET_SHOULD_NOT_LEAK", payload_text)
+        self.assertNotIn("ASSIGNMENT_PROMPT_SHOULD_NOT_LEAK", payload_text)
 
     @patch("codex_master.server.ensure_state")
     def test_list_assignments_rejects_invalid_limits(self, _mock_ensure_state) -> None:
@@ -5269,6 +5355,23 @@ class ServerHelpersTest(unittest.TestCase):
                     list_assignments("a", limit=0)
                 with self.assertRaisesRegex(AgentError, f"limit must be <= {MAX_ASSIGNMENT_RECORDS}"):
                     list_assignments("a", limit=MAX_ASSIGNMENT_RECORDS + 1)
+
+    @patch("codex_master.server.ensure_state")
+    def test_assignment_log_drops_non_object_json_records(self, _mock_ensure_state) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assignment_log = Path(tmpdir) / "assignments.jsonl"
+            assignment_log.write_text(
+                '["not", "a record"]\n{"agent": "a1", "assignment_id": "ok"}\nnull\n',
+                encoding="utf-8",
+            )
+            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+                prune_assignment_log()
+                listed = list_assignments("a", limit=10)
+            remaining = [json.loads(line) for line in assignment_log.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(remaining, [{"agent": "a1", "assignment_id": "ok"}])
+        self.assertEqual(listed["record_count"], 1)
+        self.assertEqual(listed["records"][0]["assignment_id"], "ok")
 
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.send_agent")
