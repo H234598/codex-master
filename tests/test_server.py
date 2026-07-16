@@ -3326,6 +3326,45 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(marker_store[0]["blocked_until_utc"], "2099-06-08T06:50:00+02:00")
         mock_stop.assert_called_once_with("a1", force=False)
 
+    def test_usage_watchdog_claims_unclaimed_agent_before_stop(self) -> None:
+        blocked_status = {
+            "agent": "a1",
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": "2099-06-08T06:50:00+02:00",
+            "reason": "usage limit reached",
+            "source": "snapshot",
+            "raw_output": "not_returned",
+        }
+        with patch.dict(
+            "codex_master.server.AGENTS",
+            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
+            clear=True,
+        ), patch("codex_master.server.ensure_state"), patch(
+            "codex_master.server.tmux_alive", return_value=True
+        ), patch(
+            "codex_master.server.agent_lease_status",
+            return_value={"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
+        ), patch("codex_master.server.codex_usage_watchdog_status", return_value=blocked_status), patch(
+            "codex_master.server.update_codex_usage_watchdog_marker"
+        ), patch(
+            "codex_master.server.claim_agent",
+            return_value={
+                "status": "claimed",
+                "lease": {"state": "held", "held_by_this_server": True, "raw_output": "not_returned"},
+            },
+        ) as mock_claim, patch(
+            "codex_master.server.stop_agent",
+            return_value={"agent": "a1", "status": "stopped", "lease": {"state": "unclaimed"}, "raw_output": "not_returned"},
+        ) as mock_stop:
+            result = usage_watchdog_agent("a1", dry_run=False)
+
+        self.assertEqual(result["usage_watchdog_state"], "stopped")
+        self.assertEqual(result["lease_state"], "held")
+        self.assertTrue(result["held_by_this_server"])
+        mock_claim.assert_called_once_with("a1")
+        mock_stop.assert_called_once_with("a1", force=False)
+
     def test_cli_usage_watchdog_routes_to_tool(self) -> None:
         captured: dict[str, Any] = {}
 

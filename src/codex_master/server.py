@@ -3705,8 +3705,20 @@ def usage_watchdog_agent(agent: str, *, dry_run: bool) -> dict[str, Any]:
             return {**base, "usage_watchdog_state": "skipped_not_leased_by_this_server", "action_taken": "none"}
         if dry_run:
             return {**base, "usage_watchdog_state": "would_stop", "action_taken": "none"}
-        update_codex_usage_watchdog_marker(agent, marker)
-        result = stop_agent(agent, force=False)
+        claimed_for_watchdog = False
+        if not lease.get("held_by_this_server") and lease.get("state") in {"unclaimed", "expired"}:
+            claim = claim_agent(agent)
+            lease = claim["lease"]
+            claimed_for_watchdog = claim["status"] in {"claimed", "claimed_expired"}
+            base["lease_state"] = lease.get("state")
+            base["held_by_this_server"] = bool(lease.get("held_by_this_server"))
+        try:
+            update_codex_usage_watchdog_marker(agent, marker)
+            result = stop_agent(agent, force=False)
+        except Exception:
+            if claimed_for_watchdog and agent_lease_status(agent).get("held_by_this_server"):
+                release_agent(agent, force=True)
+            raise
         return {
             **base,
             "usage_watchdog_state": "stopped",
