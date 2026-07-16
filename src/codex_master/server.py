@@ -3758,7 +3758,7 @@ def codex_usage_watchdog_status(
 
     if marker:
         marker_agent = marker.get("agent")
-        if marker_agent not in agent_record_aliases(agent):
+        if not isinstance(marker_agent, str) or marker_agent not in agent_record_aliases(agent):
             raise AgentError("could_not_read_codex_usage_watchdog_marker")
         marker_account = marker.get("account")
         if marker_account is not None and (
