@@ -4316,6 +4316,16 @@ class ServerHelpersTest(unittest.TestCase):
 
         read_snapshot.assert_not_called()
 
+    def test_codex_usage_watchdog_rejects_unbound_assignment_route(self) -> None:
+        with patch("codex_master.server.read_meta", return_value={}), patch(
+            "codex_master.server.list_assignments",
+            return_value={"records": [{"routing": {"decision": "spark"}}]},
+        ), patch("codex_master.server.read_codex_usage_snapshot") as read_snapshot:
+            with self.assertRaisesRegex(AgentError, "codex-usage assignment routing metadata is invalid"):
+                codex_usage_watchdog_status("a1")
+
+        read_snapshot.assert_not_called()
+
     @patch("codex_master.server.ensure_state")
     def test_codex_usage_watchdog_rejects_non_mapping_assignment_route_in_log(self, _mock_ensure_state) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4323,6 +4333,25 @@ class ServerHelpersTest(unittest.TestCase):
             assignment_log = root / "assignments.jsonl"
             assignment_log.write_text(
                 json.dumps({"agent": "a1", "routing": []}) + "\n",
+                encoding="utf-8",
+            )
+            with patch("codex_master.server.STATE_ROOT", root / "state"), patch(
+                "codex_master.server.LOCK_DIR", root / "locks"
+            ), patch("codex_master.server.ASSIGNMENT_LOG", assignment_log), patch(
+                "codex_master.server.read_meta", return_value={}
+            ), patch("codex_master.server.read_codex_usage_snapshot") as read_snapshot:
+                with self.assertRaisesRegex(AgentError, "codex-usage assignment routing metadata is invalid"):
+                    codex_usage_watchdog_status("a1")
+
+        read_snapshot.assert_not_called()
+
+    @patch("codex_master.server.ensure_state")
+    def test_codex_usage_watchdog_rejects_unbound_assignment_route_in_log(self, _mock_ensure_state) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            assignment_log = root / "assignments.jsonl"
+            assignment_log.write_text(
+                json.dumps({"agent": "a1", "routing": {"decision": "spark"}}) + "\n",
                 encoding="utf-8",
             )
             with patch("codex_master.server.STATE_ROOT", root / "state"), patch(

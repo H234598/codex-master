@@ -3213,6 +3213,10 @@ def codex_usage_snapshot_accounts(
     assignment_routing = record.get("routing") if isinstance(record, dict) else None
     if "routing" in record and not isinstance(assignment_routing, dict):
         raise AgentError("codex-usage assignment routing metadata is invalid")
+    if "routing" in record and (
+        "account" not in assignment_routing or assignment_routing.get("account") is None
+    ):
+        raise AgentError("codex-usage assignment routing metadata is invalid")
     routing = meta.get("routing")
     if "routing" in meta and not isinstance(routing, dict):
         raise AgentError("codex-usage routing metadata is invalid")
@@ -5287,8 +5291,10 @@ def list_assignments(agent: str = "all", limit: int = 20, *, strict_routing: boo
             continue
         record_agent = record.get("agent")
         if isinstance(record_agent, str) and record_agent in selected_records:
-            if strict_routing and "routing" in record and not isinstance(record["routing"], dict):
-                raise AgentError("codex-usage assignment routing metadata is invalid")
+            if strict_routing and "routing" in record:
+                routing = record["routing"]
+                if not isinstance(routing, dict) or "account" not in routing or routing.get("account") is None:
+                    raise AgentError("codex-usage assignment routing metadata is invalid")
             records.append(sanitize_assignment_record(record))
     return {
         "agent": agent,
