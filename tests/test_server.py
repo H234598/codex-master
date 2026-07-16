@@ -3413,6 +3413,16 @@ class ServerHelpersTest(unittest.TestCase):
                 session_started_at="2026-06-07T09:00:00+00:00",
             )
         )
+        future_time = {**marker, "requested_at_utc": "2099-01-01T00:00:00+00:00"}
+        self.assertFalse(
+            watchdog_marker_matches(
+                future_time,
+                action="interrupt",
+                assignment_id="old-assignment",
+                session_started_at="2026-06-07T09:00:00+00:00",
+                now=1780826400.0,
+            )
+        )
 
     def test_fleet_watchdog_requests_report_before_interrupt(self) -> None:
         meta_store: dict[str, object] = {}

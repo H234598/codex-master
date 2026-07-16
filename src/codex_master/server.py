@@ -4028,7 +4028,12 @@ def watchdog_marker_lease_matches(
 
 
 def watchdog_marker_matches(
-    marker: dict[str, Any], *, action: str, assignment_id: Any, session_started_at: Any = None
+    marker: dict[str, Any],
+    *,
+    action: str,
+    assignment_id: Any,
+    session_started_at: Any = None,
+    now: float | None = None,
 ) -> bool:
     if marker.get("planned_action") != action:
         return False
@@ -4038,7 +4043,9 @@ def watchdog_marker_matches(
         session_started_at=session_started_at,
     ):
         return False
-    return parse_utc_timestamp(marker.get("requested_at_utc")) is not None
+    requested_at = parse_utc_timestamp(marker.get("requested_at_utc"))
+    current = time.time() if now is None else now
+    return requested_at is not None and requested_at <= current
 
 
 def watchdog_output_changed_since_marker(status: dict[str, Any], marker: dict[str, Any]) -> bool:
@@ -4184,6 +4191,7 @@ def watchdog_agent(
         action=action,
         assignment_id=assignment_id,
         session_started_at=status.get("started_at_utc"),
+        now=now,
     )
     output_changed = marker_is_current and watchdog_output_changed_since_marker(status, marker)
     if marker_is_current and output_changed:
