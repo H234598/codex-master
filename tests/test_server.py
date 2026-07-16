@@ -1444,6 +1444,20 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["required_tool_available"])
         self.assertNotIn("agent_status", json.dumps(result, sort_keys=True))
 
+    def test_mcp_tools_list_probe_result_counts_content_length_in_utf8_bytes(self) -> None:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"tools": [{"name": "café"}]},
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        output = f"Content-Length: {len(encoded.encode('utf-8'))}\r\n\r\n{encoded}"
+
+        result = mcp_tools_list_probe_result(output, "café")
+
+        self.assertTrue(result["response_found"])
+        self.assertTrue(result["required_tool_available"])
+
     def test_mcp_tools_list_probe_result_rejects_embedded_json(self) -> None:
         output = (
             'Content-Length: 123\r\n\r\n{"jsonrpc":"2.0","id":2,'

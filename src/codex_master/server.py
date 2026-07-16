@@ -1017,18 +1017,23 @@ def iter_mcp_json_messages(text: str) -> list[dict[str, Any]]:
             except AgentError:
                 return []
             body_start = header_end + sep_len
-            body = remaining[body_start : body_start + body_length]
-            if len(body) != body_length:
+            encoded_remaining = remaining[body_start:].encode("utf-8")
+            body_bytes = encoded_remaining[:body_length]
+            if len(body_bytes) != body_length:
                 return []
             try:
+                body = body_bytes.decode("utf-8")
                 payload = json.loads(body)
-            except json.JSONDecodeError:
+            except (UnicodeDecodeError, json.JSONDecodeError):
                 return []
             if isinstance(payload, dict):
                 payloads.append(payload)
             else:
                 return []
-            remaining = remaining[body_start + body_length :]
+            try:
+                remaining = encoded_remaining[body_length:].decode("utf-8")
+            except UnicodeDecodeError:
+                return []
             continue
 
         next_line, sep, rest = remaining.partition("\n")
