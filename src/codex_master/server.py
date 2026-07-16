@@ -1943,8 +1943,25 @@ def agent_auth_status(agent: str) -> dict[str, Any]:
             state = "too_large"
             authenticated = False
         else:
-            state = "present_regular"
-            authenticated = True
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = -1
+            try:
+                fd = os.open(auth_file, flags)
+                opened_stat = os.fstat(fd)
+                if not stat_module.S_ISREG(opened_stat.st_mode) or opened_stat.st_size > MAX_CODEX_CONFIG_BYTES:
+                    raise OSError("auth file changed unexpectedly")
+                os.read(fd, 1)
+            except OSError:
+                state = "unreadable"
+                authenticated = False
+            else:
+                state = "present_regular"
+                authenticated = True
+            finally:
+                if fd >= 0:
+                    os.close(fd)
     return {
         "authenticated": authenticated,
         "auth_state": state,

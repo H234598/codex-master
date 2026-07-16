@@ -785,6 +785,10 @@ class ServerHelpersTest(unittest.TestCase):
                 outside.write_text("secret\n", encoding="utf-8")
                 (home / "auth.json").symlink_to(outside)
                 linked = agent_auth_status("a")
+                (home / "auth.json").unlink()
+                (home / "auth.json").write_text("{}\n", encoding="utf-8")
+                with patch("codex_master.server.os.open", side_effect=PermissionError):
+                    unreadable = agent_auth_status("a")
 
         self.assertFalse(missing["authenticated"])
         self.assertEqual(missing["auth_state"], "missing")
@@ -792,6 +796,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(present["auth_state"], "present_regular")
         self.assertFalse(linked["authenticated"])
         self.assertEqual(linked["auth_state"], "symlink_rejected")
+        self.assertFalse(unreadable["authenticated"])
+        self.assertEqual(unreadable["auth_state"], "unreadable")
         payload = json.dumps({"missing": missing, "present": present, "linked": linked}, sort_keys=True)
         self.assertNotIn(tmpdir, payload)
         self.assertNotIn("secret", payload)
