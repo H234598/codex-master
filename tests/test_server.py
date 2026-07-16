@@ -3365,13 +3365,36 @@ class ServerHelpersTest(unittest.TestCase):
             "planned_action": "interrupt",
             "assignment_id": "old-assignment",
             "requested_at_utc": "2026-06-07T10:00:00+00:00",
+            "started_at_utc": "2026-06-07T09:00:00+00:00",
         }
 
-        self.assertTrue(watchdog_marker_matches(marker, action="interrupt", assignment_id="old-assignment"))
+        self.assertTrue(
+            watchdog_marker_matches(
+                marker,
+                action="interrupt",
+                assignment_id="old-assignment",
+                session_started_at="2026-06-07T09:00:00+00:00",
+            )
+        )
+        self.assertFalse(
+            watchdog_marker_matches(
+                marker,
+                action="interrupt",
+                assignment_id="old-assignment",
+                session_started_at="2026-06-07T09:30:00+00:00",
+            )
+        )
         self.assertFalse(watchdog_marker_matches(marker, action="interrupt", assignment_id=None))
         self.assertFalse(watchdog_marker_matches(marker, action="interrupt", assignment_id="new-assignment"))
         invalid_time = {**marker, "requested_at_utc": "not-a-timestamp"}
-        self.assertFalse(watchdog_marker_matches(invalid_time, action="interrupt", assignment_id="old-assignment"))
+        self.assertFalse(
+            watchdog_marker_matches(
+                invalid_time,
+                action="interrupt",
+                assignment_id="old-assignment",
+                session_started_at="2026-06-07T09:00:00+00:00",
+            )
+        )
 
     def test_fleet_watchdog_requests_report_before_interrupt(self) -> None:
         meta_store: dict[str, object] = {}
@@ -3391,6 +3414,7 @@ class ServerHelpersTest(unittest.TestCase):
             "raw_log_idle_seconds": 90,
             "raw_log_bytes": 100,
             "raw_log_updated_at_utc": "1970-01-01T00:15:00+00:00",
+            "started_at_utc": "2026-06-07T09:00:00+00:00",
             "last_assignment": {"assignment_id": "assign-1", "created_at_utc": "2026-06-07T09:58:00+00:00"},
         }
         report = {
@@ -3414,6 +3438,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(payload["report_request"]["send_status"], "sent")
         self.assertEqual(meta_store["watchdog"]["phase"], "report_requested")
         self.assertEqual(meta_store["watchdog"]["planned_action"], "interrupt")
+        self.assertEqual(meta_store["watchdog"]["started_at_utc"], "2026-06-07T09:00:00+00:00")
         mock_report.assert_called_once()
         mock_interrupt.assert_not_called()
 

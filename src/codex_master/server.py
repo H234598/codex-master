@@ -3791,7 +3791,9 @@ def watchdog_effective_idle(status: dict[str, Any], *, now: float | None = None)
     }
 
 
-def watchdog_marker_matches(marker: dict[str, Any], *, action: str, assignment_id: Any) -> bool:
+def watchdog_marker_matches(
+    marker: dict[str, Any], *, action: str, assignment_id: Any, session_started_at: Any = None
+) -> bool:
     if marker.get("phase") != "report_requested":
         return False
     if marker.get("planned_action") != action:
@@ -3799,6 +3801,11 @@ def watchdog_marker_matches(marker: dict[str, Any], *, action: str, assignment_i
     marker_assignment = marker.get("assignment_id")
     if marker_assignment != assignment_id:
         return False
+    if marker.get("started_at_utc") is not None or session_started_at is not None:
+        marker_started_at = parse_utc_timestamp(marker.get("started_at_utc"))
+        current_started_at = parse_utc_timestamp(session_started_at)
+        if marker_started_at is None or current_started_at is None or marker_started_at != current_started_at:
+            return False
     return parse_utc_timestamp(marker.get("requested_at_utc")) is not None
 
 
@@ -3926,7 +3933,12 @@ def watchdog_agent(
     meta = read_meta(agent)
     marker = watchdog_marker(meta)
     release_watchdog_lease = bool(marker.get("release_lease_after_action"))
-    marker_is_current = watchdog_marker_matches(marker, action=action, assignment_id=assignment_id)
+    marker_is_current = watchdog_marker_matches(
+        marker,
+        action=action,
+        assignment_id=assignment_id,
+        session_started_at=status.get("started_at_utc"),
+    )
     output_changed = marker_is_current and watchdog_output_changed_since_marker(status, marker)
     if marker_is_current and output_changed:
         if not dry_run:
@@ -3954,6 +3966,7 @@ def watchdog_agent(
                     "requested_at_utc": requested_at_utc,
                     "assignment_id": assignment_id,
                     "planned_action": action,
+                    "started_at_utc": status.get("started_at_utc"),
                     "raw_log_bytes": status.get("raw_log_bytes"),
                     "raw_log_updated_at_utc": status.get("raw_log_updated_at_utc"),
                     "idle_seconds": effective_idle,
