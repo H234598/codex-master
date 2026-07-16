@@ -3998,6 +3998,37 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(status["account"], "a1")
         read.assert_called_once_with("a1")
 
+    def test_codex_usage_watchdog_ignores_future_assignment(self) -> None:
+        blocked_future = {
+            "account": "BW_Future",
+            "status": "blocked",
+            "blocked_until": "2099-06-08T06:50:00+00:00",
+            "blocked_reason": "future account limit",
+        }
+
+        def read_snapshot(account: str) -> dict[str, Any]:
+            return blocked_future if account == "BW_Future" else {}
+
+        with patch(
+            "codex_master.server.read_meta",
+            return_value={"started_at_utc": "2026-07-16T10:00:00+00:00"},
+        ), patch(
+            "codex_master.server.list_assignments",
+            return_value={
+                "records": [
+                    {
+                        "created_at_utc": "2099-01-01T00:00:00+00:00",
+                        "routing": {"account": "BW_Future"},
+                    }
+                ]
+            },
+        ), patch("codex_master.server.read_codex_usage_snapshot", side_effect=read_snapshot) as read:
+            status = codex_usage_watchdog_status("a1")
+
+        self.assertEqual(status["state"], "missing")
+        self.assertEqual(status["account"], "a1")
+        read.assert_called_once_with("a1")
+
     def test_codex_usage_watchdog_does_not_fallback_to_old_account_snapshot(self) -> None:
         with patch(
             "codex_master.server.read_meta",
