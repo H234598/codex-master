@@ -3727,6 +3727,15 @@ def codex_usage_watchdog_status(
         )
     )
     current_account = accounts[0] if accounts else None
+    routing = meta.get("routing")
+    routing_account = routing.get("account") if isinstance(routing, dict) else None
+    account_mapping = (
+        "override"
+        if snapshot_account is not None
+        else "routing"
+        if routing_account == current_account
+        else "fallback"
+    )
     now = time.time()
 
     if marker:
@@ -3759,6 +3768,7 @@ def codex_usage_watchdog_status(
             raise AgentError("could_not_read_codex_usage_snapshot")
         state = _codex_usage_watchdog_state_from_snapshot(snapshot, now=now)
         state["account"] = snapshot_account
+        state["account_mapping"] = account_mapping
         if state["state"] == "blocked":
             return state
         if marker:
@@ -3779,6 +3789,7 @@ def codex_usage_watchdog_status(
     return {
         "agent": agent,
         "account": current_account,
+        "account_mapping": account_mapping,
         "state": "missing",
         "blocked": False,
         "blocked_until_utc": None,
@@ -3801,9 +3812,14 @@ def codex_usage_status_with_routing(
     persist_account: bool = True,
     include_assignment_history: bool = True,
 ) -> dict[str, Any]:
-    needs_routing_check = status.get("usage_status") in {"login_required", "partial", "error"}
+    needs_routing_check = not status.get("blocked") and (
+        status.get("usage_status") in {"login_required", "partial", "error"}
+        or status.get("account_mapping") == "fallback"
+    )
     needs_routing_check = needs_routing_check or (
-        status.get("state") == "missing" and status.get("account") == canonical_agent_id(agent)
+        not status.get("blocked")
+        and status.get("state") == "missing"
+        and status.get("account") == canonical_agent_id(agent)
     )
     if needs_routing_check:
         auth = agent_auth_status(agent)
