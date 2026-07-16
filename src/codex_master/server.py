@@ -3518,7 +3518,9 @@ def ensure_agent_not_blocked_by_codex_usage(agent: str) -> dict[str, Any]:
 def _codex_usage_watchdog_state_from_marker(marker: dict[str, Any], *, now: float) -> dict[str, Any]:
     agent = str(marker.get("agent") or "")
     blocked_until_ts = parse_utc_timestamp(marker.get("blocked_until_utc"))
-    if blocked_until_ts is not None and blocked_until_ts > now:
+    if blocked_until_ts is None:
+        raise AgentError("could_not_read_codex_usage_watchdog_marker")
+    if blocked_until_ts > now:
         return {
             "agent": agent or "unknown",
             "state": "blocked",
@@ -3532,11 +3534,7 @@ def _codex_usage_watchdog_state_from_marker(marker: dict[str, Any], *, now: floa
         "agent": agent or "unknown",
         "state": "released",
         "blocked": False,
-        "blocked_until_utc": (
-            _dt.datetime.fromtimestamp(blocked_until_ts, _dt.timezone.utc).isoformat()
-            if blocked_until_ts is not None
-            else None
-        ),
+        "blocked_until_utc": _dt.datetime.fromtimestamp(blocked_until_ts, _dt.timezone.utc).isoformat(),
         "reason": marker.get("reason"),
         "source": "marker",
         "raw_output": "not_returned",
