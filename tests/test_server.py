@@ -4926,10 +4926,33 @@ class ServerHelpersTest(unittest.TestCase):
     )
     @patch("codex_master.server.call_agent_lifecycle")
     def test_claim_wait_refuses_codex_usage_block_before_lease(self, mock_lifecycle, _mock_usage) -> None:
+        mock_lifecycle.side_effect = lambda _agent, fn: fn()
+
         with self.assertRaisesRegex(AgentError, "blocked by codex-usage watchdog"):
             claim_agent_with_wait("a", wait_seconds=0)
 
-        mock_lifecycle.assert_not_called()
+        mock_lifecycle.assert_called_once()
+
+    def test_claim_wait_rechecks_codex_usage_block_inside_lifecycle_lock(self) -> None:
+        blocked_after_lock = False
+
+        def fake_lifecycle(_agent: str, fn: Any) -> dict[str, Any]:
+            nonlocal blocked_after_lock
+            blocked_after_lock = True
+            return fn()
+
+        def fake_usage_check(_agent: str) -> dict[str, Any]:
+            if blocked_after_lock:
+                raise AgentError("agent a is blocked by codex-usage watchdog")
+            return {"blocked": False}
+
+        with patch("codex_master.server.call_agent_lifecycle", side_effect=fake_lifecycle), patch(
+            "codex_master.server.ensure_agent_not_blocked_by_codex_usage", side_effect=fake_usage_check
+        ), patch("codex_master.server.claim_agent") as mock_claim:
+            with self.assertRaisesRegex(AgentError, "blocked by codex-usage watchdog"):
+                claim_agent_with_wait("a", wait_seconds=0)
+
+        mock_claim.assert_not_called()
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.tmux_alive", return_value=False)

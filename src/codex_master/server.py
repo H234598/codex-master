@@ -1931,19 +1931,20 @@ def claim_agent_with_wait(
     wait_forever = wait_seconds is None
     deadline = None if wait_forever else started + wait_seconds
     polls = 0
-    while True:
+
+    def claim_once() -> dict[str, Any]:
         ensure_agent_not_blocked_by_codex_usage(agent)
+        return claim_agent(
+            agent,
+            ttl_seconds=ttl_seconds,
+            force=force,
+            recover_stopped=recover_stopped,
+            stopped_grace_seconds=stopped_grace_seconds,
+        )
+
+    while True:
         try:
-            result = call_agent_lifecycle(
-                agent,
-                lambda: claim_agent(
-                    agent,
-                    ttl_seconds=ttl_seconds,
-                    force=force,
-                    recover_stopped=recover_stopped,
-                    stopped_grace_seconds=stopped_grace_seconds,
-                ),
-            )
+            result = call_agent_lifecycle(agent, claim_once)
             result["waited_seconds"] = max(0, int(time.monotonic() - started))
             result["poll_count"] = polls
             result["wait_forever"] = wait_forever
