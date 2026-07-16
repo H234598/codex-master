@@ -6476,7 +6476,15 @@ def master_watchdog_status(root: Path | None = None, systemd_user_dir: Path | No
         "NextElapseUSecRealtime",
         "LastTriggerUSec",
     )
-    service_properties = ("LoadState", "ActiveState", "SubState", "Result", "ExecMainCode", "ExecMainStatus")
+    service_properties = (
+        "LoadState",
+        "ActiveState",
+        "SubState",
+        "Result",
+        "ExecMainCode",
+        "ExecMainStatus",
+        "ExecMainStartTimestamp",
+    )
     timer = systemctl_user_show(WATCHDOG_TIMER_NAME, timer_properties)
     service = systemctl_user_show(WATCHDOG_SERVICE_NAME, service_properties)
     unit_files = watchdog_unit_file_status(root=root, systemd_user_dir=systemd_user_dir)
@@ -6492,6 +6500,7 @@ def master_watchdog_status(root: Path | None = None, systemd_user_dir: Path | No
     service_ok = (
         bool(service.get("ok"))
         and service_props.get("LoadState") == "loaded"
+        and bool(service_props.get("ExecMainStartTimestamp"))
         and service_props.get("Result") in {"", "success"}
         and service_props.get("ExecMainStatus") in {"", "0"}
     )
