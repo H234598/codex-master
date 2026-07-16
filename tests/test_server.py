@@ -3899,6 +3899,37 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(status["blocked"])
         read_snapshot.assert_called_once_with("BW_Privat")
 
+    def test_codex_usage_watchdog_prefers_current_session_route_over_old_assignment(self) -> None:
+        blocked = {
+            "account": "BW_Neu",
+            "status": "blocked",
+            "blocked_until": "2099-06-08T06:50:00+00:00",
+            "blocked_reason": "usage limit reached",
+        }
+        with patch(
+            "codex_master.server.read_meta",
+            return_value={
+                "started_at_utc": "2026-07-16T10:00:00+00:00",
+                "routing": {"account": "BW_Neu"},
+            },
+        ), patch(
+            "codex_master.server.list_assignments",
+            return_value={
+                "records": [
+                    {
+                        "created_at_utc": "2026-07-16T09:00:00+00:00",
+                        "routing": {"account": "BW_Alt"},
+                    }
+                ]
+            },
+        ), patch(
+            "codex_master.server.read_codex_usage_snapshot", return_value=blocked
+        ) as read_snapshot:
+            status = codex_usage_watchdog_status("a1")
+
+        self.assertTrue(status["blocked"])
+        read_snapshot.assert_called_once_with("BW_Neu")
+
     def test_remember_agent_routing_persists_main_usage_account(self) -> None:
         routing = {
             "account": "BW_Privat",

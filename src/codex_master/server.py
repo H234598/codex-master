@@ -3187,10 +3187,23 @@ def codex_usage_snapshot_accounts(agent: str, meta: dict[str, Any]) -> list[str]
         records = []
     record = records[-1] if records and isinstance(records[-1], dict) else {}
     assignment_routing = record.get("routing") if isinstance(record, dict) else None
-    add_account(assignment_routing.get("account") if isinstance(assignment_routing, dict) else None)
-
     routing = meta.get("routing")
-    add_account(routing.get("account") if isinstance(routing, dict) else None)
+    assignment_account = assignment_routing.get("account") if isinstance(assignment_routing, dict) else None
+    meta_account = routing.get("account") if isinstance(routing, dict) else None
+    assignment_created = parse_utc_timestamp(record.get("created_at_utc")) if isinstance(record, dict) else None
+    session_started = parse_utc_timestamp(meta.get("started_at_utc"))
+    if (
+        meta_account is not None
+        and assignment_account is not None
+        and session_started is not None
+        and assignment_created is not None
+        and assignment_created < session_started
+    ):
+        add_account(meta_account)
+        add_account(assignment_account)
+    else:
+        add_account(assignment_account)
+        add_account(meta_account)
     add_account(agent)
     return accounts
 
