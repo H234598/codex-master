@@ -1271,14 +1271,16 @@ def read_codex_usage_snapshot(agent: str) -> dict[str, Any]:
     path = codex_usage_snapshot_path(agent)
     try:
         current_stat = path.lstat()
-    except OSError:
+    except FileNotFoundError:
         return {}
+    except OSError as exc:
+        raise AgentError("could_not_read_codex_usage_snapshot") from exc
     if (
         not stat_module.S_ISREG(current_stat.st_mode)
         or getattr(current_stat, "st_nlink", 1) > 1
         or current_stat.st_size > MAX_CODEX_USAGE_SNAPSHOT_BYTES
     ):
-        return {}
+        raise AgentError("could_not_read_codex_usage_snapshot")
 
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -1292,23 +1294,25 @@ def read_codex_usage_snapshot(agent: str) -> dict[str, Any]:
             or getattr(opened_stat, "st_nlink", 1) > 1
             or opened_stat.st_size > MAX_CODEX_USAGE_SNAPSHOT_BYTES
         ):
-            return {}
+            raise AgentError("could_not_read_codex_usage_snapshot")
         with os.fdopen(fd, "rb") as fh:
             fd = -1
             raw = fh.read(MAX_CODEX_USAGE_SNAPSHOT_BYTES + 1)
-    except OSError:
-        return {}
+    except OSError as exc:
+        raise AgentError("could_not_read_codex_usage_snapshot") from exc
     finally:
         if fd >= 0:
             os.close(fd)
 
     if len(raw) > MAX_CODEX_USAGE_SNAPSHOT_BYTES:
-        return {}
+        raise AgentError("could_not_read_codex_usage_snapshot")
     try:
         payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AgentError("could_not_read_codex_usage_snapshot") from exc
+    if not isinstance(payload, dict):
+        raise AgentError("could_not_read_codex_usage_snapshot")
+    return payload
 
 
 def path_present_no_follow(path: Path) -> bool:

@@ -3807,6 +3807,17 @@ class ServerHelpersTest(unittest.TestCase):
             with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
                 codex_usage_watchdog_status("a")
 
+    def test_codex_usage_watchdog_status_fails_closed_on_invalid_snapshot_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            snapshot_dir = Path(tmpdir) / "snapshots"
+            snapshot_dir.mkdir()
+            (snapshot_dir / "a1.json").write_text("{not-json", encoding="utf-8")
+            with patch.dict("os.environ", {"CODEX_USAGE_STATE_ROOT": tmpdir}, clear=False), patch(
+                "codex_master.server.read_meta", return_value={}
+            ):
+                with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
+                    codex_usage_watchdog_status("a")
+
     def test_usage_watchdog_dry_run_reports_marker_changes_without_mutating(self) -> None:
         blocked_status = {
             "agent": "a1",
