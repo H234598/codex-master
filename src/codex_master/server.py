@@ -3225,6 +3225,13 @@ def codex_usage_snapshot_accounts(
     routing = meta.get("routing")
     if "routing" in meta and not isinstance(routing, dict):
         raise AgentError("codex-usage routing metadata is invalid")
+    if "routing" in meta and isinstance(routing, dict) and "decision" in routing and (
+        "account" not in routing
+        or routing.get("account") is None
+        or not isinstance(routing["decision"], str)
+        or routing["decision"] not in CODEX_USAGE_DECISIONS
+    ):
+        raise AgentError("codex-usage routing metadata is invalid")
     assignment_account = assignment_routing.get("account") if isinstance(assignment_routing, dict) else None
     meta_account = routing.get("account") if isinstance(routing, dict) else None
     if meta_account is not None and (
