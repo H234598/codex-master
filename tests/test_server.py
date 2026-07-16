@@ -367,6 +367,12 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(underscored_previous, 120)
         self.assertEqual(underscored_updated.count("startup_timeout_sec"), 1)
 
+        existing_quoted = existing_low.replace("startup_timeout_sec = 30", '"startup_timeout_sec" = 30')
+        quoted_updated, quoted_changed, quoted_previous = updated_mcp_startup_timeout_config(existing_quoted)
+        self.assertTrue(quoted_changed)
+        self.assertEqual(quoted_previous, 30)
+        self.assertEqual(quoted_updated.count("startup_timeout_sec"), 1)
+
         existing_exponent = existing_low.replace("startup_timeout_sec = 30", "startup_timeout_sec = 1.2e2")
         exponent_updated, exponent_changed, exponent_previous = updated_mcp_startup_timeout_config(existing_exponent)
         self.assertFalse(exponent_changed)

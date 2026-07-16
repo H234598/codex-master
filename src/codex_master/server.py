@@ -606,7 +606,7 @@ def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | floa
             break
 
     timeout_line_re = re.compile(
-        r"^(\s*startup_timeout_sec\s*=\s*)([+-]?(?:\d(?:_?\d)*)(?:\.(?:\d(?:_?\d)*))?(?:[eE][+-]?\d(?:_?\d)*)?)(\s*(?:#.*)?)$"
+        r"^(\s*(?:startup_timeout_sec|\"startup_timeout_sec\")\s*=\s*)([+-]?(?:\d(?:_?\d)*)(?:\.(?:\d(?:_?\d)*))?(?:[eE][+-]?\d(?:_?\d)*)?)(\s*(?:#.*)?)$"
     )
     for index in range(section_start + 1, section_end):
         match = timeout_line_re.match(lines[index])
