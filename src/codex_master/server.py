@@ -2998,6 +2998,7 @@ def start_agent_with_lease(
     claim = claim_agent(agent)
     lease = claim["lease"]
     release_on_completion = claim["status"] in {"claimed", "claimed_expired"}
+    result: dict[str, Any] | None = None
     if tmux_alive(AGENTS[agent]["session"]):
         try:
             result = start_agent(
@@ -3019,9 +3020,16 @@ def start_agent_with_lease(
                     raise AgentError(
                         "routed model differs from active session; controlled restart requires "
                         "an inactive Agentin"
-                    )
+                )
             remember_agent_routing(agent, routing)
         except Exception:
+            if isinstance(result, dict) and result.get("status") == "started":
+                raw_log = read_meta(agent).get("raw_log")
+                raw_log_path = allowed_raw_log_path(raw_log)
+                if raw_log_path is not None:
+                    cleanup_failed_start(AGENTS[agent]["session"], raw_log_path, kill_session=True)
+                else:
+                    run_tmux(["kill-session", "-t", AGENTS[agent]["session"]], check=False)
             if release_on_completion and agent_lease_status(agent).get("held_by_this_server"):
                 release_agent(agent, force=True)
             raise
@@ -3048,12 +3056,13 @@ def start_agent_with_lease(
     try:
         remember_agent_routing(agent, routing)
     except Exception:
-        raw_log = read_meta(agent).get("raw_log")
-        raw_log_path = allowed_raw_log_path(raw_log)
-        if raw_log_path is not None:
-            cleanup_failed_start(AGENTS[agent]["session"], raw_log_path, kill_session=True)
-        else:
-            run_tmux(["kill-session", "-t", AGENTS[agent]["session"]], check=False)
+        if isinstance(result, dict) and result.get("status") == "started":
+            raw_log = read_meta(agent).get("raw_log")
+            raw_log_path = allowed_raw_log_path(raw_log)
+            if raw_log_path is not None:
+                cleanup_failed_start(AGENTS[agent]["session"], raw_log_path, kill_session=True)
+            else:
+                run_tmux(["kill-session", "-t", AGENTS[agent]["session"]], check=False)
         if release_on_completion and agent_lease_status(agent).get("held_by_this_server"):
             release_agent(agent, force=True)
         raise

@@ -4879,7 +4879,7 @@ class ServerHelpersTest(unittest.TestCase):
     @patch("codex_master.server.remember_agent_routing", side_effect=AgentError("routing failed"))
     @patch("codex_master.server.start_agent", return_value={"agent": "a", "status": "started"})
     @patch("codex_master.server.claim_agent")
-    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("codex_master.server.tmux_alive", return_value=True)
     def test_start_agent_with_lease_cleans_up_after_routing_metadata_failure(
         self,
         _mock_alive,
@@ -4903,6 +4903,33 @@ class ServerHelpersTest(unittest.TestCase):
         mock_cleanup.assert_called_once_with(
             AGENTS["a1"]["session"], Path("/tmp/managed-a.log"), kill_session=True
         )
+        mock_release.assert_called_once_with("a1", force=True)
+
+    @patch("codex_master.server.release_agent")
+    @patch("codex_master.server.cleanup_failed_start")
+    @patch("codex_master.server.remember_agent_routing", side_effect=AgentError("routing failed"))
+    @patch("codex_master.server.start_agent", return_value={"agent": "a", "status": "already_running"})
+    @patch("codex_master.server.claim_agent")
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    def test_start_agent_with_lease_does_not_clean_up_raced_existing_session(
+        self,
+        _mock_alive,
+        mock_claim,
+        _mock_start,
+        _mock_remember,
+        mock_cleanup,
+        mock_release,
+    ) -> None:
+        mock_claim.return_value = {
+            "status": "claimed",
+            "lease": {"held_by_this_server": True},
+        }
+
+        with patch("codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}):
+            with self.assertRaisesRegex(AgentError, "routing failed"):
+                start_agent_with_lease("a", allow_unauthenticated=True)
+
+        mock_cleanup.assert_not_called()
         mock_release.assert_called_once_with("a1", force=True)
 
     def test_agent_claim_wait_rejects_invalid_direct_interval_values(self) -> None:
