@@ -3093,6 +3093,7 @@ LIMIT_TEXT_PATTERNS = (
 LIMIT_CLEAR_TEXT_PATTERNS = (
     r"\blimit\b.{0,40}\b(?:not|isn't|is not|hasn't|has not)\b",
     r"\b(?:not|isn't|is not|hasn't|has not)\b.{0,40}\b(?:limit|quota|tokens?)\b",
+    r"\b(?:not|isn't|is not|hasn't|has not)\b.{0,40}\brate limited\b",
     r"\b(?:not|isn't|is not|hasn't|has not)\b.{0,40}\b(?:full|exceeded|reached|blocked|overflow)\b",
 )
 
