@@ -8009,6 +8009,9 @@ def agent_pool_install(
     overwrite_auth: bool = False,
 ) -> dict[str, Any]:
     normalized = pool_normalize_spec(spec, target_dir=target_dir, codex_bin=codex_bin)
+    if copy_auth_from or copy_auth_to:
+        if not copy_auth_from or not copy_auth_to:
+            raise AgentError("copy_auth_from and copy_auth_to must be provided together")
     root = normalized["pool_root"]
     pool_guard_root(root)
     ensure_private_dir(root)
@@ -8069,8 +8072,6 @@ def agent_pool_install(
 
     auth_result: dict[str, Any] | None = None
     if copy_auth_from or copy_auth_to:
-        if not copy_auth_from or not copy_auth_to:
-            raise AgentError("copy_auth_from and copy_auth_to must be provided together")
         auth_result = agent_pool_copy_auth(
             spec,
             target_dir,

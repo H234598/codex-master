@@ -8171,6 +8171,24 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(destroyed["removed_agent_entries"], 4)
             self.assertFalse(pool.exists())
 
+    def test_agent_pool_install_rejects_partial_auth_copy_before_mutation(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec(tmp, pool)
+
+            with self.assertRaisesRegex(AgentError, "copy_auth_from and copy_auth_to must be provided together"):
+                server_module.agent_pool_install(
+                    str(spec_path),
+                    target_dir=str(pool),
+                    codex_bin="/bin/echo",
+                    copy_auth_from="a1",
+                )
+
+            self.assertFalse(pool.exists())
+
     def test_agent_pool_copy_auth_does_not_echo_custom_target_selector(self) -> None:
         from codex_master import server as server_module
 
