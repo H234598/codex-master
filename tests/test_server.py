@@ -4612,6 +4612,16 @@ class ServerHelpersTest(unittest.TestCase):
             with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
                 codex_usage_watchdog_status("a")
 
+    def test_codex_usage_watchdog_status_rejects_snapshot_expiry_without_status(self) -> None:
+        with patch("codex_master.server.read_meta", return_value={}), patch(
+            "codex_master.server.list_assignments", return_value={"records": []}
+        ), patch(
+            "codex_master.server.read_codex_usage_snapshot",
+            return_value={"account": "a1", "blocked_until": "2099-06-08T06:50:00+00:00"},
+        ):
+            with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
+                codex_usage_watchdog_status("a")
+
     def test_codex_usage_watchdog_status_rejects_unknown_snapshot_status(self) -> None:
         with patch("codex_master.server.read_meta", return_value={}), patch(
             "codex_master.server.read_codex_usage_snapshot",
