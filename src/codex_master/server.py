@@ -3751,10 +3751,14 @@ def safe_codex_usage_reason(value: Any) -> str | None:
 
 def ensure_agent_not_blocked_by_codex_usage(agent: str) -> dict[str, Any]:
     status = codex_usage_watchdog_status(agent)
-    if status.get("state") == "missing" and status.get("account") == canonical_agent_id(agent):
+    needs_routing_check = status.get("usage_status") in {"login_required", "partial", "error"}
+    needs_routing_check = needs_routing_check or (
+        status.get("state") == "missing" and status.get("account") == canonical_agent_id(agent)
+    )
+    if needs_routing_check:
         auth = agent_auth_status(agent)
         if auth.get("authenticated"):
-            routing = codex_usage_routing_decision(agent, role="teamleiterin")
+            routing = codex_usage_routing_decision(agent, role="arbeitsbiene")
             remember_agent_usage_account(agent, routing.get("account"))
             if routing.get("decision") == "blocked":
                 reason = routing.get("reason") or "codex usage limit reached"
@@ -3811,6 +3815,7 @@ def _codex_usage_watchdog_state_from_snapshot(snapshot: dict[str, Any], *, now: 
         return {
             "agent": agent or "unknown",
             "account": agent or None,
+            "usage_status": status,
             "state": "blocked",
             "blocked": True,
             "blocked_until_utc": _dt.datetime.fromtimestamp(blocked_until_ts, _dt.timezone.utc).isoformat(),
@@ -3821,6 +3826,7 @@ def _codex_usage_watchdog_state_from_snapshot(snapshot: dict[str, Any], *, now: 
     return {
         "agent": agent or "unknown",
         "account": agent or None,
+        "usage_status": status,
         "state": "released" if status == "blocked" else "clear",
         "blocked": False,
         "blocked_until_utc": (
