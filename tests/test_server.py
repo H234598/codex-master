@@ -3778,6 +3778,41 @@ class ServerHelpersTest(unittest.TestCase):
         mock_release.assert_not_called()
         mock_update.assert_called_once_with("a1", None)
 
+    def test_fleet_watchdog_does_not_release_new_lease_when_stopped(self) -> None:
+        status = {
+            "agent": "a",
+            "running": False,
+            "lease": {"state": "held", "held_by_this_server": True, "raw_output": "not_returned"},
+            "response_state": {"state": "not_running"},
+            "raw_log_idle_seconds": 10,
+            "raw_log_bytes": 200,
+            "raw_log_updated_at_utc": "2026-07-17T10:16:00+00:00",
+            "started_at_utc": "2026-07-17T09:30:00+00:00",
+            "last_assignment": {"assignment_id": "assign-new", "created_at_utc": "2026-07-17T09:58:00+00:00"},
+        }
+        marker = {
+            "watchdog": {
+                "phase": "report_requested",
+                "assignment_id": "assign-old",
+                "started_at_utc": "2026-07-17T09:00:00+00:00",
+                "release_lease_after_action": True,
+            }
+        }
+        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "codex_master.server.status_agent", return_value=status
+        ), patch("codex_master.server.read_meta", return_value=marker), patch(
+            "codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}
+        ) as mock_lease, patch("codex_master.server.release_agent") as mock_release, patch(
+            "codex_master.server.update_watchdog_marker"
+        ) as mock_update:
+            result = fleet_watchdog("a")
+
+        payload = result["results"][0]
+        self.assertEqual(payload["watchdog_state"], "skipped_not_running")
+        mock_lease.assert_not_called()
+        mock_release.assert_not_called()
+        mock_update.assert_called_once_with("a1", None)
+
     def test_fleet_watchdog_action_none_releases_stale_watchdog_lease(self) -> None:
         status = {
             "agent": "a",

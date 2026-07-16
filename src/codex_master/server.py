@@ -4161,8 +4161,17 @@ def watchdog_agent(
     if not status.get("running"):
         if not dry_run:
             marker = watchdog_marker(read_meta(agent))
+            marker_lease_matches = watchdog_marker_lease_matches(
+                marker,
+                assignment_id=assignment_id,
+                session_started_at=status.get("started_at_utc"),
+            )
             if marker:
-                if marker.get("release_lease_after_action") and agent_lease_status(agent).get("held_by_this_server"):
+                if (
+                    marker.get("release_lease_after_action")
+                    and marker_lease_matches
+                    and agent_lease_status(agent).get("held_by_this_server")
+                ):
                     released = release_agent(agent, force=True)
                     released_lease = released.get("lease") if isinstance(released, dict) else None
                     if isinstance(released_lease, dict):
