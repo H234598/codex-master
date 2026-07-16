@@ -71,6 +71,7 @@ from codex_master.server import (
     codex_usage_routing_decision,
     codex_usage_spark_health_update,
     DEFAULT_AGENT_MODEL,
+    DEFAULT_AGENT_MODEL_EFFORT,
     DEFAULT_ORDINAL_AGENT_SERIES,
     doctor,
     ensure_state,
@@ -125,6 +126,7 @@ from codex_master.server import (
     uninstall,
     wait_agent,
     WRITE_AGENT_MODEL,
+    WRITE_AGENT_MODEL_EFFORT,
     write_bounded_raw_log,
     write_meta,
     worktree_create_for_agent,
@@ -6313,6 +6315,38 @@ class ServerHelpersTest(unittest.TestCase):
                         lease=lease,
                     )
                 tmux.assert_not_called()
+
+    def test_model_switch_restarts_when_reasoning_effort_differs(self) -> None:
+        lease = {"state": "held", "holder": "test", "held_by_this_server": True}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            agent = {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}
+            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
+                "codex_master.server.tmux_alive", return_value=True
+            ), patch(
+                "codex_master.server.read_meta",
+                return_value={
+                    "model": DEFAULT_AGENT_MODEL,
+                    "model_reasoning_effort": WRITE_AGENT_MODEL_EFFORT,
+                    "cwd": str(home),
+                },
+            ), patch(
+                "codex_master.server.status_agent",
+                return_value={"response_state": {"state": "running_idle"}},
+            ), patch(
+                "codex_master.server.run_tmux",
+                return_value=subprocess.CompletedProcess(["tmux"], 0, "", ""),
+            ), patch("codex_master.server.start_agent", return_value={"status": "started"}) as start:
+                result = ensure_assignment_session_model(
+                    "a",
+                    model=DEFAULT_AGENT_MODEL,
+                    reasoning_effort=DEFAULT_AGENT_MODEL_EFFORT,
+                    lease=lease,
+                )
+
+        self.assertEqual(result["status"], "restarted")
+        self.assertEqual(start.call_args.kwargs["model"], DEFAULT_AGENT_MODEL)
+        self.assertEqual(start.call_args.kwargs["model_reasoning_effort"], DEFAULT_AGENT_MODEL_EFFORT)
 
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.send_agent")

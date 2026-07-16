@@ -4355,7 +4355,10 @@ def ensure_assignment_session_model(
         raise AgentError(f"agent {agent} is not running")
     meta = read_meta(agent)
     current_model = meta.get("model") or DEFAULT_AGENT_MODEL
-    if current_model == model:
+    current_reasoning_effort = meta.get("model_reasoning_effort") or (
+        WRITE_AGENT_MODEL_EFFORT if current_model == WRITE_AGENT_MODEL else DEFAULT_AGENT_MODEL_EFFORT
+    )
+    if current_model == model and current_reasoning_effort == reasoning_effort:
         return {
             "status": "unchanged",
             "previous_model": current_model,
