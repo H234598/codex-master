@@ -4332,6 +4332,33 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertIsNone(route)
 
+    def test_agent_spark_routing_rejects_old_matching_assignment(self) -> None:
+        with patch(
+            "codex_master.server.read_meta",
+            return_value={
+                "model": WRITE_AGENT_MODEL,
+                "started_at_utc": "2026-07-16T10:00:00+00:00",
+                "routing": {"account": "BW_Neu"},
+            },
+        ), patch(
+            "codex_master.server.list_assignments",
+            return_value={
+                "records": [
+                    {
+                        "created_at_utc": "2026-07-16T09:00:00+00:00",
+                        "routing": {
+                            "account": "BW_Neu",
+                            "decision": "spark",
+                            "backend_account_id": "backend-old",
+                        },
+                    }
+                ]
+            },
+        ):
+            route = agent_spark_routing("a1")
+
+        self.assertIsNone(route)
+
     def test_agent_spark_routing_does_not_use_assignment_for_empty_metadata(self) -> None:
         with patch(
             "codex_master.server.read_meta",
