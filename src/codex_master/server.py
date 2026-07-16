@@ -8971,6 +8971,18 @@ def serve_mcp() -> int:
             response = handle_rpc(msg)
             if response is not None:
                 write_message(response)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            try:
+                write_message(rpc_error(None, -32700, "Parse error"))
+            except Exception:
+                return 1
+        except AgentError as exc:
+            try:
+                code = -32600 if str(exc) == "RPC message must be an object" else -32000
+                message = "Invalid Request" if code == -32600 else safe_error_text(exc)
+                write_message(rpc_error(None, code, message))
+            except Exception:
+                return 1
         except Exception as exc:
             try:
                 write_message(rpc_error(None, -32000, safe_error_text(exc)))

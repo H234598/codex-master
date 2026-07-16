@@ -99,6 +99,7 @@ from codex_master.server import (
     read_meta,
     safe_tail,
     same_path_text,
+    serve_mcp,
     skills_agent,
     record_assignment,
     redact,
@@ -2073,6 +2074,22 @@ class ServerHelpersTest(unittest.TestCase):
 
         with patch("sys.stdin", FakeStdin(data)):
             self.assertEqual(read_message(), message)
+
+    def test_serve_mcp_maps_parse_and_invalid_request_errors(self) -> None:
+        with patch("codex_master.server.ensure_state"), patch(
+            "codex_master.server.read_message",
+            side_effect=[json.JSONDecodeError("bad", "", 0), None],
+        ), patch("codex_master.server.write_message") as mock_write:
+            self.assertEqual(serve_mcp(), 0)
+
+        self.assertEqual(mock_write.call_args_list[0].args[0]["error"]["code"], -32700)
+        with patch("codex_master.server.ensure_state"), patch(
+            "codex_master.server.read_message",
+            side_effect=[AgentError("RPC message must be an object"), None],
+        ), patch("codex_master.server.write_message") as mock_write:
+            self.assertEqual(serve_mcp(), 0)
+
+        self.assertEqual(mock_write.call_args_list[0].args[0]["error"], {"code": -32600, "message": "Invalid Request"})
 
     def test_mcp_tool_call_error_is_structured(self) -> None:
         response = handle_rpc(
