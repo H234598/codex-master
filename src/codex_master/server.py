@@ -3245,6 +3245,8 @@ def agent_spark_routing(agent: str) -> dict[str, Any] | None:
     meta = read_meta(agent)
     if meta.get("model") != WRITE_AGENT_MODEL:
         return None
+    if "routing" in meta and not isinstance(meta.get("routing"), dict):
+        return None
     route = meta.get("routing")
     account_only_route = (
         isinstance(route, dict)
