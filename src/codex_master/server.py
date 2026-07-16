@@ -3590,7 +3590,14 @@ def watchdog_agent(
         return {**base, "watchdog_state": "skipped_insufficient_idle_evidence", "action_taken": "none"}
     if effective_idle < idle_seconds and response_state != "blocked_by_limit":
         meta = read_meta(agent)
-        if watchdog_marker(meta) and not dry_run and lease_allowed:
+        marker = watchdog_marker(meta)
+        if marker and not dry_run and lease_allowed:
+            if marker.get("release_lease_after_action") and agent_lease_status(agent).get("held_by_this_server"):
+                released = release_agent(agent, force=True)
+                released_lease = released.get("lease") if isinstance(released, dict) else None
+                if isinstance(released_lease, dict):
+                    base["lease_state"] = released_lease.get("state")
+                    base["held_by_this_server"] = bool(released_lease.get("held_by_this_server"))
             update_watchdog_marker(agent, None)
         return {**base, "watchdog_state": "active", "action_taken": "none"}
 
