@@ -1995,13 +1995,15 @@ def agent_auth_status(agent: str) -> dict[str, Any]:
                 opened_stat = os.fstat(fd)
                 if not stat_module.S_ISREG(opened_stat.st_mode) or opened_stat.st_size > MAX_CODEX_CONFIG_BYTES:
                     raise OSError("auth file changed unexpectedly")
-                os.read(fd, 1)
+                if not os.read(fd, 1):
+                    state = "empty"
+                    authenticated = False
+                else:
+                    state = "present_regular"
+                    authenticated = True
             except OSError:
                 state = "unreadable"
                 authenticated = False
-            else:
-                state = "present_regular"
-                authenticated = True
             finally:
                 if fd >= 0:
                     os.close(fd)

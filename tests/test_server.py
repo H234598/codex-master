@@ -900,6 +900,8 @@ class ServerHelpersTest(unittest.TestCase):
                 linked = agent_auth_status("a")
                 (home / "auth.json").unlink()
                 (home / "auth.json").write_text("{}\n", encoding="utf-8")
+                (home / "auth.json").write_bytes(b"")
+                empty_file = agent_auth_status("a")
                 with patch("codex_master.server.os.open", side_effect=PermissionError):
                     unreadable = agent_auth_status("a")
 
@@ -907,6 +909,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(missing["auth_state"], "missing")
         self.assertTrue(present["authenticated"])
         self.assertEqual(present["auth_state"], "present_regular")
+        self.assertFalse(empty_file["authenticated"])
+        self.assertEqual(empty_file["auth_state"], "empty")
         self.assertFalse(linked["authenticated"])
         self.assertEqual(linked["auth_state"], "symlink_rejected")
         self.assertFalse(unreadable["authenticated"])
