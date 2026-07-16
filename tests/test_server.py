@@ -78,6 +78,7 @@ from codex_master.server import (
     installed_source_worktree_state,
     agent_lease_status,
     agent_auth_status,
+    assign_agent,
     interrupt_agent,
     mcp_command_startup_self_test,
     mcp_probe_response_ok,
@@ -136,6 +137,8 @@ from codex_master.server import (
     master_release_status,
     plugin_cache_status,
     plugin_manifest_version,
+    watchdog_effective_idle,
+    watchdog_marker_matches,
 )
 
 
@@ -2227,6 +2230,37 @@ class ServerHelpersTest(unittest.TestCase):
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertEqual(payload["error"], f"timeout_seconds must be <= {MAX_WAIT_SECONDS}")
 
+    @patch("codex_master.server.record_assignment", side_effect=AgentError("record failed"))
+    @patch("codex_master.server.remember_agent_routing")
+    @patch("codex_master.server.send_agent", return_value={"status": "sent", "raw_output": "not_returned"})
+    def test_agent_assign_releases_fresh_lease_when_recording_fails(
+        self, _mock_send, _mock_routing, _mock_record
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}},
+                clear=False,
+            ), patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                with self.assertRaisesRegex(AgentError, "record failed"):
+                    assign_agent(
+                        "a",
+                        role="exploriererin",
+                        task="inspect",
+                        scope=["src"],
+                        allow_unauthenticated=True,
+                    )
+
+                lease = agent_lease_status("a")
+
+        self.assertEqual(lease["state"], "unclaimed")
+
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.pane_tail")
     @patch("codex_master.server.ensure_agent_lease_available")
@@ -2791,6 +2825,28 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["response_output"], "not_returned")
         mock_sleep.assert_called_once()
 
+    @patch("codex_master.server.update_agent_spark_health")
+    @patch("codex_master.server.status_agent")
+    def test_wait_agent_ignores_preexisting_output_after_assignment(self, mock_status_agent, mock_health) -> None:
+        mock_status_agent.return_value = {
+            "agent": "a",
+            "running": True,
+            "raw_log_bytes": 20,
+            "raw_log_updated_at_utc": "2026-06-07T10:01:00+00:00",
+            "last_assignment": {
+                "assignment_id": "assign-1",
+                "created_at_utc": "2026-06-07T10:00:30+00:00",
+            },
+            "response_state": {"state": "running_tui_starter_context"},
+            "limit_state": {"limited": False},
+            "tui_context": {"state": "starter_placeholder", "evidence": "not_returned"},
+        }
+
+        result = wait_agent("a", timeout_seconds=0, poll_interval_seconds=1)
+
+        self.assertEqual(result["status"], "timeout")
+        mock_health.assert_called_once_with("a1", state="failed", reason="spark_turn_timeout")
+
     @patch("codex_master.server.time.sleep")
     @patch("codex_master.server.status_agent")
     def test_wait_agent_times_out_in_assigned_tui_starter_context_without_activity(
@@ -2817,6 +2873,46 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertEqual(result["response_output"], "not_returned")
         mock_sleep.assert_not_called()
+
+    @patch("codex_master.server.update_agent_spark_health")
+    @patch("codex_master.server.status_agent")
+    def test_wait_agent_prefers_not_running_over_stale_limit(self, mock_status_agent, mock_health) -> None:
+        mock_status_agent.return_value = {
+            "agent": "a",
+            "running": False,
+            "limit_state": {"limited": True},
+        }
+
+        result = wait_agent("a", timeout_seconds=0, poll_interval_seconds=1)
+
+        self.assertEqual(result["status"], "not_running")
+        self.assertEqual(result["poll_count"], 0)
+        mock_health.assert_not_called()
+
+    def test_watchdog_effective_idle_prefers_new_assignment_over_stale_raw_log(self) -> None:
+        result = watchdog_effective_idle(
+            {
+                "raw_log_idle_seconds": 600,
+                "raw_log_updated_at_utc": "2026-06-07T09:50:00+00:00",
+                "last_assignment": {"created_at_utc": "2026-06-07T09:59:50+00:00"},
+            },
+            now=1780826400.0,
+        )
+
+        self.assertEqual(result["effective_idle_seconds"], 10)
+        self.assertEqual(result["activity_source"], "last_assignment_age")
+
+    def test_watchdog_marker_requires_same_assignment_identity(self) -> None:
+        marker = {
+            "phase": "report_requested",
+            "planned_action": "interrupt",
+            "assignment_id": "old-assignment",
+            "requested_at_utc": "2026-06-07T10:00:00+00:00",
+        }
+
+        self.assertTrue(watchdog_marker_matches(marker, action="interrupt", assignment_id="old-assignment"))
+        self.assertFalse(watchdog_marker_matches(marker, action="interrupt", assignment_id=None))
+        self.assertFalse(watchdog_marker_matches(marker, action="interrupt", assignment_id="new-assignment"))
 
     def test_fleet_watchdog_requests_report_before_interrupt(self) -> None:
         meta_store: dict[str, object] = {}
@@ -2959,6 +3055,30 @@ class ServerHelpersTest(unittest.TestCase):
             "codex_master.server.interrupt_agent"
         ) as mock_interrupt:
             result = fleet_watchdog("a")
+
+        payload = result["results"][0]
+        self.assertEqual(payload["watchdog_state"], "skipped_not_leased_by_this_server")
+        self.assertEqual(payload["action_taken"], "none")
+        mock_report.assert_not_called()
+        mock_interrupt.assert_not_called()
+
+    def test_fleet_watchdog_skips_other_client_lease_without_lease_requirement(self) -> None:
+        status = {
+            "agent": "a",
+            "running": True,
+            "lease": {"state": "held", "held_by_this_server": False, "raw_output": "not_returned"},
+            "response_state": {"state": "running_recent_output"},
+            "raw_log_idle_seconds": 90,
+            "raw_log_bytes": 100,
+            "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
+            "last_assignment": {"assignment_id": "assign-1", "created_at_utc": "2026-06-07T09:58:00+00:00"},
+        }
+        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "codex_master.server.status_agent", return_value=status
+        ), patch("codex_master.server.request_agent_report") as mock_report, patch(
+            "codex_master.server.interrupt_agent"
+        ) as mock_interrupt:
+            result = fleet_watchdog("a", require_lease=False)
 
         payload = result["results"][0]
         self.assertEqual(payload["watchdog_state"], "skipped_not_leased_by_this_server")
@@ -3616,6 +3736,36 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(payload["lease"]["holder"], "other_server")
         self.assertNotIn("owner-one", json.dumps(payload, sort_keys=True))
 
+    def test_agent_claim_force_does_not_override_running_foreign_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            running_status = {
+                "running": True,
+                "raw_log_idle_seconds": DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS + 1,
+                "home_process_count": 0,
+                "home_external_process_count": 0,
+                "raw_output": "not_returned",
+                "response_output": "not_returned",
+            }
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"):
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                    first = claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"), patch(
+                    "codex_master.server.status_agent", return_value=running_status
+                ):
+                    with self.assertRaises(AgentBusyError) as caught:
+                        claim_agent("a", force=True)
+                    current = agent_lease_status("a")
+
+        self.assertEqual(first["status"], "claimed")
+        self.assertEqual(caught.exception.payload["error_code"], "agent_lease_held_by_other_client")
+        self.assertEqual(current["holder"], "other_server")
+
     def test_agent_claim_does_not_recover_foreign_lease_inside_stopped_grace(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -3976,6 +4126,42 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(claim_result["auth_gate"]["override"])
         mock_claim_with_wait.assert_called_once()
 
+    @patch(
+        "codex_master.server.codex_usage_watchdog_status",
+        return_value={
+            "agent": "a",
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": "2099-06-08T06:50:00+00:00",
+            "reason": "usage limit reached",
+            "source": "marker",
+        },
+    )
+    @patch("codex_master.server.tmux_alive")
+    def test_start_refuses_codex_usage_block_before_tmux(self, mock_alive, _mock_usage) -> None:
+        with self.assertRaisesRegex(AgentError, "blocked by codex-usage watchdog"):
+            start_agent_with_lease("a", allow_unauthenticated=True)
+
+        mock_alive.assert_not_called()
+
+    @patch(
+        "codex_master.server.codex_usage_watchdog_status",
+        return_value={
+            "agent": "a",
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": "2099-06-08T06:50:00+00:00",
+            "reason": "usage limit reached",
+            "source": "marker",
+        },
+    )
+    @patch("codex_master.server.call_agent_lifecycle")
+    def test_claim_wait_refuses_codex_usage_block_before_lease(self, mock_lifecycle, _mock_usage) -> None:
+        with self.assertRaisesRegex(AgentError, "blocked by codex-usage watchdog"):
+            claim_agent_with_wait("a", wait_seconds=0)
+
+        mock_lifecycle.assert_not_called()
+
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.tmux_alive", return_value=False)
     @patch("codex_master.server.run_tmux")
@@ -4231,6 +4417,37 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertNotIn("SECRET_PIPE_OUTPUT_SHOULD_NOT_RETURN", error_text)
             self.assertNotIn(str(tmpdir), error_text)
 
+    @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.write_meta", side_effect=AgentError("meta failed"))
+    @patch("codex_master.server.tmux_alive", side_effect=[False, True])
+    @patch("codex_master.server.run_tmux")
+    def test_start_agent_cleans_up_session_when_meta_write_fails(
+        self, mock_run_tmux, _mock_alive, _mock_write_meta, _mock_ensure_state
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            runner = root / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+
+            def fake_run_tmux(args, **_kwargs):
+                return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
+
+            mock_run_tmux.side_effect = fake_run_tmux
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": root, "session": "test_session"}},
+                clear=False,
+            ), patch("codex_master.server.RAW_DIR", root), patch("codex_master.server.META_DIR", root):
+                with self.assertRaisesRegex(AgentError, "meta failed"):
+                    start_agent("a", cwd=tmpdir)
+
+            kill_calls = [call for call in mock_run_tmux.call_args_list if call.args[0][0] == "kill-session"]
+            leftover_logs = list(root.glob("*.log"))
+
+        self.assertEqual(len(kill_calls), 1)
+        self.assertEqual(leftover_logs, [])
+
     @patch("codex_master.server.ensure_agent_lease_available")
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.run_tmux")
@@ -4302,6 +4519,31 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["status"], "not_running")
         self.assertEqual(result["lease"]["state"], "held")
         self.assertEqual(result["lease"]["holder"], "other_server")
+
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    def test_stop_agent_force_releases_foreign_lease_when_already_not_running(self, _mock_alive) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch(
+                "codex_master.server.LEASE_DIR", state / "leases"
+            ), patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
+                clear=False,
+            ):
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-one"):
+                    claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
+                with patch("codex_master.server.SERVER_INSTANCE_ID", "owner-two"):
+                    result = stop_agent("a", force=True)
+
+        self.assertEqual(result["status"], "not_running")
+        self.assertEqual(result["lease"]["state"], "unclaimed")
+        self.assertEqual(result["lease"]["holder"], "none")
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.write_meta")

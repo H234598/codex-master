@@ -1755,7 +1755,7 @@ def claim_agent(
     current = read_agent_lease_record(agent)
     current_public = public_agent_lease(agent, current)
     stopped_recovery = None
-    if current_public["state"] == "held" and not current_public["held_by_this_server"] and not force:
+    if current_public["state"] == "held" and not current_public["held_by_this_server"]:
         if recover_stopped:
             stopped_recovery = stopped_foreign_lease_recovery_status(
                 agent,
@@ -1768,8 +1768,6 @@ def claim_agent(
         status = "renewed"
     elif current_public["state"] == "held" and stopped_recovery and stopped_recovery["recoverable"]:
         status = "claimed_stopped_orphan"
-    elif current_public["state"] == "held" and force:
-        status = "forced"
     elif current_public["state"] == "expired":
         status = "claimed_expired"
     else:
@@ -1847,6 +1845,7 @@ def claim_agent_with_wait(
     deadline = None if wait_forever else started + wait_seconds
     polls = 0
     while True:
+        ensure_agent_not_blocked_by_codex_usage(agent)
         try:
             result = call_agent_lifecycle(
                 agent,
@@ -2666,7 +2665,13 @@ def start_agent(
         "raw_log_policy": "local_only_bounded_not_returned_by_default",
         "raw_log_max_bytes": MAX_RAW_LOG_BYTES,
     }
-    write_meta(agent, data)
+    try:
+        write_meta(agent, data)
+    except Exception:
+        cleanup_failed_start(session, raw_log, kill_session=True)
+        if release_lease_on_failure and lease and lease.get("held_by_this_server"):
+            release_agent(agent, force=True)
+        raise
     return {
         "agent": agent,
         "status": "started",
@@ -2697,6 +2702,7 @@ def start_agent_with_lease(
         operation="agent_start",
         allow_unauthenticated=allow_unauthenticated,
     )
+    ensure_agent_not_blocked_by_codex_usage(agent)
     routing = None if allow_unauthenticated else codex_usage_routing_decision(
         agent,
         role="arbeitsbiene",
@@ -2762,7 +2768,7 @@ def stop_agent(agent: str, force: bool = False) -> dict[str, Any]:
         release = release_agent(agent, force=True)
     else:
         current_lease = agent_lease_status(agent)
-        if current_lease["held_by_this_server"] or current_lease["state"] == "expired":
+        if force or current_lease["held_by_this_server"] or current_lease["state"] == "expired":
             release = release_agent(agent, force=True)
         else:
             release = {"status": "skipped", "lease": current_lease, "raw_output": "not_returned"}
@@ -3101,14 +3107,19 @@ def activity_signature(status: dict[str, Any]) -> tuple[Any, Any, Any]:
 
 
 def wait_terminal_status(status: dict[str, Any], initial: dict[str, Any]) -> str | None:
-    if (status.get("limit_state") or {}).get("limited"):
-        return "blocked_by_limit"
     if not status.get("running"):
         return "not_running"
+    if (status.get("limit_state") or {}).get("limited"):
+        return "blocked_by_limit"
     latest_assignment = status.get("last_assignment") if isinstance(status.get("last_assignment"), dict) else {}
+    initial_assignment = initial.get("last_assignment") if isinstance(initial.get("last_assignment"), dict) else {}
+    assignment_changed = (
+        latest_assignment.get("assignment_id") != initial_assignment.get("assignment_id")
+        or latest_assignment.get("created_at_utc") != initial_assignment.get("created_at_utc")
+    )
     assignment_created = parse_utc_timestamp(latest_assignment.get("created_at_utc"))
     raw_log_updated = parse_utc_timestamp(status.get("raw_log_updated_at_utc"))
-    if assignment_created is not None and raw_log_updated is not None and raw_log_updated > assignment_created:
+    if assignment_changed and assignment_created is not None and raw_log_updated is not None and raw_log_updated > assignment_created:
         return "activity_observed"
     if activity_signature(status) != activity_signature(initial):
         return "activity_observed"
@@ -3378,16 +3389,24 @@ def _codex_usage_watchdog_state_from_snapshot(snapshot: dict[str, Any], *, now: 
 
 
 def watchdog_effective_idle(status: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
+    current = time.time() if now is None else now
     raw_idle = status.get("raw_log_idle_seconds")
-    if isinstance(raw_idle, int) and not isinstance(raw_idle, bool):
+    latest_assignment = status.get("last_assignment") if isinstance(status.get("last_assignment"), dict) else {}
+    assignment_value = latest_assignment.get("created_at_utc")
+    assignment_created = parse_utc_timestamp(assignment_value)
+    assignment_age = age_seconds_from_utc(assignment_value, now=current)
+    assignment_is_current = assignment_created is not None and assignment_created <= current
+    if (
+        isinstance(raw_idle, int)
+        and not isinstance(raw_idle, bool)
+        and (assignment_age is None or not assignment_is_current or max(0, raw_idle) <= assignment_age)
+    ):
         return {
             "effective_idle_seconds": max(0, raw_idle),
             "activity_source": "raw_log",
             "activity_at_utc": status.get("raw_log_updated_at_utc"),
             "raw_output": "not_returned",
         }
-    latest_assignment = status.get("last_assignment") if isinstance(status.get("last_assignment"), dict) else {}
-    assignment_age = age_seconds_from_utc(latest_assignment.get("created_at_utc"), now=now)
     if assignment_age is not None:
         return {
             "effective_idle_seconds": assignment_age,
@@ -3417,7 +3436,7 @@ def watchdog_marker_matches(marker: dict[str, Any], *, action: str, assignment_i
     if marker.get("planned_action") != action:
         return False
     marker_assignment = marker.get("assignment_id")
-    if marker_assignment and assignment_id and marker_assignment != assignment_id:
+    if marker_assignment != assignment_id:
         return False
     return bool(marker.get("requested_at_utc"))
 
@@ -3513,6 +3532,8 @@ def watchdog_agent(
     }
     if not status.get("running"):
         return {**base, "watchdog_state": "skipped_not_running", "action_taken": "none"}
+    if lease_state == "held" and not held_by_this_server:
+        return {**base, "watchdog_state": "skipped_not_leased_by_this_server", "action_taken": "none"}
     if require_lease and not lease_allowed:
         return {**base, "watchdog_state": "skipped_not_leased_by_this_server", "action_taken": "none"}
     effective_idle = idle["effective_idle_seconds"]
@@ -4266,49 +4287,53 @@ def assign_agent(
             release_agent(agent, force=True)
         raise
     assignment_id = f"{now_id()}-{agent}"
-    record_assignment(
-        {
-            "assignment_id": assignment_id,
-            "created_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-            "agent": agent,
-            "role": role,
-            "name": name or default_agentin_name(agent),
-            "model": model,
-            "model_reasoning_effort": reasoning_effort,
-            "model_switch": model_switch,
-            "routing": routing,
-            "group_id": group_id,
-            "job_id": job_id,
-            "skill": {
-                "requested": skill,
-                "available": bool(matches) if skill else None,
-                "match_count": len(matches),
-            },
-            "scope": redact_list(scope),
-            "write_paths": redact_list(write_paths),
-            "context_count": len(context),
-            "forbidden_count": len(forbidden),
-            "write_policy": "read_only" if role == "exploriererin" else "explicit_paths_only",
-            "allow_subagents": allow_subagents,
-            "requires_search": requires_search,
-            "live_data": {
-                "required": requires_search,
-                "topic_state": "set" if live_data_topic else "task",
-                "raw_output": "not_returned",
-            },
-            "lease": {
-                "state": lease.get("state"),
-                "holder": lease.get("holder"),
-                "held_by_this_server": lease.get("held_by_this_server"),
-                "expires_at_utc": lease.get("expires_at_utc"),
-                "raw_output": "not_returned",
-            },
-            "submitted": enter,
-            "prompt_chars": len(prompt),
-            "prompt_output": "not_returned",
-            "response_output": "not_returned",
-        }
-    )
+    assignment_record = {
+        "assignment_id": assignment_id,
+        "created_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "agent": agent,
+        "role": role,
+        "name": name or default_agentin_name(agent),
+        "model": model,
+        "model_reasoning_effort": reasoning_effort,
+        "model_switch": model_switch,
+        "routing": routing,
+        "group_id": group_id,
+        "job_id": job_id,
+        "skill": {
+            "requested": skill,
+            "available": bool(matches) if skill else None,
+            "match_count": len(matches),
+        },
+        "scope": redact_list(scope),
+        "write_paths": redact_list(write_paths),
+        "context_count": len(context),
+        "forbidden_count": len(forbidden),
+        "write_policy": "read_only" if role == "exploriererin" else "explicit_paths_only",
+        "allow_subagents": allow_subagents,
+        "requires_search": requires_search,
+        "live_data": {
+            "required": requires_search,
+            "topic_state": "set" if live_data_topic else "task",
+            "raw_output": "not_returned",
+        },
+        "lease": {
+            "state": lease.get("state"),
+            "holder": lease.get("holder"),
+            "held_by_this_server": lease.get("held_by_this_server"),
+            "expires_at_utc": lease.get("expires_at_utc"),
+            "raw_output": "not_returned",
+        },
+        "submitted": enter,
+        "prompt_chars": len(prompt),
+        "prompt_output": "not_returned",
+        "response_output": "not_returned",
+    }
+    try:
+        record_assignment(assignment_record)
+    except Exception:
+        if release_on_failure:
+            release_agent(agent, force=True)
+        raise
     return {
         "assignment_id": assignment_id,
         "agent": agent,
