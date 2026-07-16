@@ -1462,6 +1462,24 @@ def agent_lifecycle_lock(agent: str) -> Any:
                 pass
 
 
+@contextlib.contextmanager
+def assignment_log_lock() -> Any:
+    ensure_private_dir(STATE_ROOT)
+    ensure_private_dir(LOCK_DIR)
+    lock_path = LOCK_DIR / "assignments.lock"
+    with open_private_regular_update(lock_path) as fh:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            yield
+        except OSError as exc:
+            raise AgentError("could not acquire assignment log lock") from exc
+        finally:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+
+
 def agent_lease_path(agent: str) -> Path:
     agent = canonical_agent_id(agent)
     return LEASE_DIR / f"{agent}.json"
@@ -4539,11 +4557,17 @@ def sanitize_assignment_record(record: dict[str, Any]) -> dict[str, Any]:
 
 def record_assignment(record: dict[str, Any]) -> None:
     ensure_state()
-    write_private_text(ASSIGNMENT_LOG, json.dumps(record, sort_keys=True) + "\n")
-    prune_assignment_log()
+    with assignment_log_lock():
+        write_private_text(ASSIGNMENT_LOG, json.dumps(record, sort_keys=True) + "\n")
+        _prune_assignment_log()
 
 
 def prune_assignment_log(max_records: int | None = None) -> None:
+    with assignment_log_lock():
+        _prune_assignment_log(max_records)
+
+
+def _prune_assignment_log(max_records: int | None = None) -> None:
     default_max_records = MAX_ASSIGNMENT_LOG_RECORDS
     max_records = normalize_int_field(
         max_records if max_records is not None else default_max_records,
@@ -4583,20 +4607,25 @@ def list_assignments(agent: str = "all", limit: int = 20) -> dict[str, Any]:
         selected_records.update(agent_record_aliases(selected_agent))
     limit = normalize_int_field(limit, field="limit", minimum=1, maximum=MAX_ASSIGNMENT_RECORDS)
     records: list[dict[str, Any]] = []
-    if ASSIGNMENT_LOG.exists():
-        for line in read_private_regular_text(
-            ASSIGNMENT_LOG, MAX_ASSIGNMENT_LOG_BYTES, "could_not_read_assignment_log"
-        ).splitlines():
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(record, dict):
-                continue
-            if record.get("agent") in selected_records:
-                records.append(sanitize_assignment_record(record))
+    with assignment_log_lock():
+        lines = (
+            read_private_regular_text(
+                ASSIGNMENT_LOG, MAX_ASSIGNMENT_LOG_BYTES, "could_not_read_assignment_log"
+            ).splitlines()
+            if ASSIGNMENT_LOG.exists()
+            else []
+        )
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        if record.get("agent") in selected_records:
+            records.append(sanitize_assignment_record(record))
     return {
         "agent": agent,
         "selected_count": len(selected),
