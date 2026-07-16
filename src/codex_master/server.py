@@ -3256,6 +3256,9 @@ def agent_spark_routing(agent: str) -> dict[str, Any] | None:
         route = assignment_route
     if not isinstance(route, dict) or route.get("decision") != "spark":
         return None
+    route_account = route.get("account")
+    if not isinstance(route_account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(route_account):
+        return None
     backend_account_id = route.get("backend_account_id")
     if not isinstance(backend_account_id, str) or not backend_account_id:
         return None

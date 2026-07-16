@@ -4262,6 +4262,18 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIsNone(route)
         list_assignments_mock.assert_not_called()
 
+    def test_agent_spark_routing_rejects_unbound_metadata_route(self) -> None:
+        with patch(
+            "codex_master.server.read_meta",
+            return_value={
+                "model": WRITE_AGENT_MODEL,
+                "routing": {"decision": "spark", "backend_account_id": "backend-unbound"},
+            },
+        ):
+            route = agent_spark_routing("a1")
+
+        self.assertIsNone(route)
+
     def test_agent_spark_routing_rejects_unbound_assignment_account(self) -> None:
         with patch(
             "codex_master.server.read_meta",
