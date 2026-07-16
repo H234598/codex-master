@@ -7886,6 +7886,20 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn("SECRET_TARGET", alias_error)
             self.assertNotIn(str(pool), alias_error)
 
+            shadowing_alias = self._write_spec_payload(
+                tmp,
+                {
+                    "schema_version": 1,
+                    "pool_root": str(pool),
+                    "codex_bin": "/bin/echo",
+                    "series": [{"prefix": "a", "count": 1, "template": "a1", "authenticated": []}],
+                    "aliases": {"a1": "a1"},
+                },
+            )
+            shadowing_error = self._pool_validate_error_text(shadowing_alias, pool, 70)
+            self.assertIn("alias conflicts with a pool selector", shadowing_error)
+            self.assertNotIn(str(pool), shadowing_error)
+
     def test_agent_pool_install_status_copy_auth_and_destroy_are_data_sparse(self) -> None:
         from codex_master import server as server_module
 

@@ -7557,9 +7557,12 @@ def pool_normalize_spec(
         raise AgentError("aliases must be an object")
     aliases: dict[str, str | list[str]] = {}
     valid_targets = set(ids) | set(series_ids)
+    reserved_aliases = valid_targets | {"all"}
     for alias, target in raw_aliases.items():
         if not isinstance(alias, str) or not alias or len(alias) > 64:
             raise AgentError("alias names must be short strings")
+        if alias in reserved_aliases:
+            raise AgentError("alias conflicts with a pool selector")
         if isinstance(target, str):
             if target not in valid_targets:
                 raise AgentError("alias points to an unknown target")
