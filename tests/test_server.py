@@ -4165,6 +4165,25 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(link_is_symlink)
 
     @patch("codex_master.server.ensure_state")
+    def test_record_assignment_prunes_by_bytes_before_append(self, _mock_ensure_state) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            assignment_log = root / "assignments.jsonl"
+            with patch("codex_master.server.STATE_ROOT", root / "state"), patch(
+                "codex_master.server.LOCK_DIR", root / "locks"
+            ), patch("codex_master.server.ASSIGNMENT_LOG", assignment_log), patch(
+                "codex_master.server.MAX_ASSIGNMENT_LOG_BYTES", 150
+            ), patch("codex_master.server.MAX_ASSIGNMENT_LOG_RECORDS", 10):
+                record_assignment({"assignment_id": "1", "agent": "a", "payload": "x" * 60})
+                record_assignment({"assignment_id": "2", "agent": "a", "payload": "y" * 60})
+
+            records = [json.loads(line) for line in assignment_log.read_text(encoding="utf-8").splitlines()]
+            log_size = assignment_log.stat().st_size
+
+        self.assertEqual(records, [{"assignment_id": "2", "agent": "a", "payload": "y" * 60}])
+        self.assertLessEqual(log_size, 150)
+
+    @patch("codex_master.server.ensure_state")
     def test_list_assignments_refuses_symlink_log_without_leaking_path(self, _mock_ensure_state) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir) / "external.jsonl"

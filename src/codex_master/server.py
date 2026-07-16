@@ -1377,12 +1377,6 @@ def write_meta(agent: str, data: dict[str, Any]) -> None:
     replace_private_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
-def write_private_text(path: Path, text: str) -> None:
-    with open_private_regular_update(path) as fh:
-        fh.seek(0, os.SEEK_END)
-        fh.write(text.encode("utf-8"))
-
-
 def replace_private_text(path: Path, text: str) -> None:
     replace_private_bytes(path, text.encode("utf-8"))
 
@@ -4728,8 +4722,7 @@ def sanitize_assignment_record(record: dict[str, Any]) -> dict[str, Any]:
 def record_assignment(record: dict[str, Any]) -> None:
     ensure_state()
     with assignment_log_lock():
-        write_private_text(ASSIGNMENT_LOG, json.dumps(record, sort_keys=True) + "\n")
-        _prune_assignment_log()
+        _prune_assignment_log(pending_record=record)
 
 
 def prune_assignment_log(max_records: int | None = None) -> None:
@@ -4737,7 +4730,11 @@ def prune_assignment_log(max_records: int | None = None) -> None:
         _prune_assignment_log(max_records)
 
 
-def _prune_assignment_log(max_records: int | None = None) -> None:
+def _prune_assignment_log(
+    max_records: int | None = None,
+    *,
+    pending_record: dict[str, Any] | None = None,
+) -> None:
     default_max_records = MAX_ASSIGNMENT_LOG_RECORDS
     max_records = normalize_int_field(
         max_records if max_records is not None else default_max_records,
@@ -4745,13 +4742,26 @@ def _prune_assignment_log(max_records: int | None = None) -> None:
         minimum=1,
         maximum=default_max_records,
     )
-    if not ASSIGNMENT_LOG.exists():
+    assignment_log_present = path_present_no_follow(ASSIGNMENT_LOG)
+    if not assignment_log_present and pending_record is None:
         return
-    lines = read_private_regular_text(
-        ASSIGNMENT_LOG,
-        MAX_ASSIGNMENT_LOG_BYTES,
-        "could_not_read_assignment_log",
-    ).splitlines()
+    if assignment_log_present:
+        try:
+            current_stat = ASSIGNMENT_LOG.lstat()
+        except OSError as exc:
+            raise AgentError("could_not_read_assignment_log") from exc
+        if not stat_module.S_ISREG(current_stat.st_mode) or getattr(current_stat, "st_nlink", 1) > 1:
+            with open_private_regular_update(ASSIGNMENT_LOG):
+                pass
+    lines = (
+        read_private_regular_text(
+            ASSIGNMENT_LOG,
+            MAX_ASSIGNMENT_LOG_BYTES,
+            "could_not_read_assignment_log",
+        ).splitlines()
+        if assignment_log_present
+        else []
+    )
 
     valid_records: list[str] = []
     for line in lines:
@@ -4764,7 +4774,16 @@ def _prune_assignment_log(max_records: int | None = None) -> None:
         if isinstance(parsed, dict):
             valid_records.append(json.dumps(parsed, sort_keys=True))
 
+    if pending_record is not None:
+        valid_records.append(json.dumps(pending_record, sort_keys=True))
     kept = valid_records[-max_records:]
+    while kept:
+        text = "\n".join(kept) + "\n"
+        if len(text.encode("utf-8")) <= MAX_ASSIGNMENT_LOG_BYTES:
+            break
+        if len(kept) == 1:
+            raise AgentError("assignment record exceeds log size limit")
+        kept.pop(0)
     text = "\n".join(kept) + ("\n" if kept else "")
     replace_private_text(ASSIGNMENT_LOG, text)
 
