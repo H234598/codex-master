@@ -8040,6 +8040,15 @@ def agent_pool_install(
     if copy_auth_from or copy_auth_to:
         if not copy_auth_from or not copy_auth_to:
             raise AgentError("copy_auth_from and copy_auth_to must be provided together")
+        agent_pool_copy_auth(
+            spec,
+            target_dir,
+            codex_bin,
+            from_agent=copy_auth_from,
+            to=copy_auth_to,
+            yes=False,
+            overwrite=overwrite_auth,
+        )
     root = normalized["pool_root"]
     pool_guard_root(root)
     ensure_private_dir(root)
