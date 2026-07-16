@@ -3081,7 +3081,9 @@ def limit_model_pool(model: Any) -> str:
 
 LIMIT_TEXT_PATTERNS = (
     r"\brate limited\b",
+    r"\brate-limited\b",
     r"\brate limits?\b.{0,80}\b(?:reached|exceeded|hit|error|retry|again)\b",
+    r"\brate-limits?\b.{0,80}\b(?:reached|exceeded|hit|error|retry|again)\b",
     r"\busage limit\b.{0,80}\b(?:reached|exceeded|hit|blocked|retry|again)\b",
     r"\blimit (?:reached|exceeded|hit)\b",
     r"\bquota (?:exceeded|reached)\b",
@@ -3093,7 +3095,7 @@ LIMIT_TEXT_PATTERNS = (
 LIMIT_CLEAR_TEXT_PATTERNS = (
     r"\blimit\b.{0,40}\b(?:not|isn't|is not|hasn't|has not)\b",
     r"\b(?:not|isn't|is not|hasn't|has not|no|without)\b.{0,40}\b(?:limit|quota|tokens?)\b",
-    r"\b(?:not|isn't|is not|hasn't|has not|no|without)\b.{0,40}\brate limited\b",
+    r"\b(?:not|isn't|is not|hasn't|has not|no|without)\b.{0,40}\brate[- ]limited\b",
     r"\b(?:not|isn't|is not|hasn't|has not|no|without)\b.{0,40}\b(?:full|exceeded|reached|blocked|overflow|too long|too many requests)\b",
 )
 
@@ -3170,7 +3172,7 @@ def classify_limit_text(text: str, meta: dict[str, Any] | None = None, latest_as
     limit_kind = "unknown"
     if re.search(r"\b(?:token|context length|context window)\b", lowered):
         limit_kind = "token"
-    elif re.search(r"\brate limit|too many requests\b", lowered):
+    elif re.search(r"\brate[- ]limit|too many requests\b", lowered):
         limit_kind = "rate"
     elif re.search(r"\bquota\b", lowered):
         limit_kind = "quota"

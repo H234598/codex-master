@@ -2813,6 +2813,7 @@ class ServerHelpersTest(unittest.TestCase):
             "Usage limit not reached",
             "Context window is not full",
             "Codex is not rate limited right now.",
+            "Codex is not rate-limited right now.",
             "Not too many requests are pending.",
             "No rate limit reached.",
             "Context window is not too long.",
@@ -2825,6 +2826,14 @@ class ServerHelpersTest(unittest.TestCase):
         failed = classify_limit_text("Token limit exceeded. Try again later.")
         self.assertTrue(failed["limited"])
         self.assertEqual(failed["kind"], "token")
+
+        rate_limited = classify_limit_text("Request was rate-limited. Retry later.")
+        self.assertTrue(rate_limited["limited"])
+        self.assertEqual(rate_limited["kind"], "rate")
+
+        hyphenated_rate_limit = classify_limit_text("Rate-limit reached; retry later.")
+        self.assertTrue(hyphenated_rate_limit["limited"])
+        self.assertEqual(hyphenated_rate_limit["kind"], "rate")
 
     def test_classify_tui_context_detects_starter_placeholder_without_output(self) -> None:
         result = classify_tui_context("Find and fix a bug in @filename\nSECRET_SHOULD_NOT_RETURN", running=True)
