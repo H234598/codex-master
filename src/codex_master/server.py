@@ -3989,7 +3989,7 @@ def watchdog_effective_idle(status: dict[str, Any], *, now: float | None = None)
             "activity_at_utc": status.get("raw_log_updated_at_utc"),
             "raw_output": "not_returned",
         }
-    if assignment_age is not None:
+    if assignment_age is not None and assignment_is_current:
         return {
             "effective_idle_seconds": assignment_age,
             "activity_source": "last_assignment_age",
