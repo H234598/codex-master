@@ -3629,6 +3629,14 @@ class ServerHelpersTest(unittest.TestCase):
             with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_watchdog_marker"):
                 codex_usage_watchdog_status("a")
 
+    def test_codex_usage_watchdog_status_fails_closed_on_blocked_snapshot_without_expiry(self) -> None:
+        with patch("codex_master.server.read_meta", return_value={}), patch(
+            "codex_master.server.read_codex_usage_snapshot",
+            return_value={"account": "a1", "status": "blocked", "blocked_reason": "usage limit reached"},
+        ):
+            with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
+                codex_usage_watchdog_status("a")
+
     def test_usage_watchdog_dry_run_reports_marker_changes_without_mutating(self) -> None:
         blocked_status = {
             "agent": "a1",
