@@ -8205,31 +8205,47 @@ def agent_pool_status(
 
 
 @contextlib.contextmanager
-def pool_install_root(root: Path) -> Any:
-    try:
-        parent_stat = root.parent.lstat()
-    except FileNotFoundError:
-        parent_stat = None
-    except OSError as exc:
-        raise AgentError("pool root changed during install") from exc
-    try:
-        root_stat = root.lstat()
-    except FileNotFoundError:
-        root_stat = None
-    except OSError as exc:
-        raise AgentError("pool root changed during install") from exc
+def pool_root_operation(
+    root: Path,
+    *,
+    ensure: bool,
+    error_text: str,
+    expected_parent_stat: os.stat_result | None = None,
+    expected_root_stat: os.stat_result | None = None,
+) -> Any:
+    if expected_parent_stat is None:
+        try:
+            parent_stat = root.parent.lstat()
+        except FileNotFoundError:
+            parent_stat = None
+        except OSError as exc:
+            raise AgentError(error_text) from exc
+    else:
+        parent_stat = expected_parent_stat
+    if expected_root_stat is None:
+        try:
+            root_stat = root.lstat()
+        except FileNotFoundError:
+            root_stat = None
+        except OSError as exc:
+            raise AgentError(error_text) from exc
+    else:
+        root_stat = expected_root_stat
 
-    ensure_private_dir(root)
+    if ensure:
+        ensure_private_dir(root)
+    elif parent_stat is None or root_stat is None:
+        raise AgentError(error_text)
     if parent_stat is None:
         try:
             parent_stat = root.parent.lstat()
         except OSError as exc:
-            raise AgentError("pool root changed during install") from exc
+            raise AgentError(error_text) from exc
     if root_stat is None:
         try:
             root_stat = root.lstat()
         except OSError as exc:
-            raise AgentError("pool root changed during install") from exc
+            raise AgentError(error_text) from exc
 
     parent_fd = -1
     root_fd = -1
@@ -8237,20 +8253,20 @@ def pool_install_root(root: Path) -> Any:
         parent_fd = open_directory_no_follow_matching(
             root.parent,
             parent_stat,
-            error_text="pool root changed during install",
-            changed_text="pool root changed during install",
+            error_text=error_text,
+            changed_text=error_text,
         )
         root_fd = open_directory_no_follow_matching(
             root.name,
             root_stat,
-            error_text="pool root changed during install",
-            changed_text="pool root changed during install",
+            error_text=error_text,
+            changed_text=error_text,
             dir_fd=parent_fd,
         )
         try:
             operation_root = Path(f"/proc/self/fd/{root_fd}").resolve(strict=True)
         except (OSError, RuntimeError) as exc:
-            raise AgentError("pool root changed during install") from exc
+            raise AgentError(error_text) from exc
         yield operation_root
     finally:
         if root_fd >= 0:
@@ -8284,7 +8300,7 @@ def agent_pool_install(
         )
     root = normalized["pool_root"]
     pool_guard_root(root)
-    with pool_install_root(root) as root:
+    with pool_root_operation(root, ensure=True, error_text="pool root changed during install") as root:
         created = 0
         updated_wrappers = 0
         created_configs = 0
@@ -8384,54 +8400,66 @@ def agent_pool_copy_auth(
     normalized = pool_normalize_spec(spec, target_dir=target_dir, codex_bin=codex_bin)
     root = normalized["pool_root"]
     pool_guard_root(root)
+    try:
+        expected_parent_stat = root.parent.lstat()
+        expected_root_stat = root.lstat()
+    except OSError as exc:
+        raise AgentError("pool root must be a real directory") from exc
     pool_require_real_root(root)
-    if from_agent not in normalized["ids"]:
-        raise AgentError("from_agent is not part of the pool")
-    target_ids = [agent for agent in pool_selector_ids(normalized, to) if agent != from_agent]
-    if not target_ids:
-        raise AgentError("copy_auth target selector resolves to no target Agentinnen")
+    with pool_root_operation(
+        root,
+        ensure=False,
+        error_text="pool root changed during auth copy",
+        expected_parent_stat=expected_parent_stat,
+        expected_root_stat=expected_root_stat,
+    ) as root:
+        if from_agent not in normalized["ids"]:
+            raise AgentError("from_agent is not part of the pool")
+        target_ids = [agent for agent in pool_selector_ids(normalized, to) if agent != from_agent]
+        if not target_ids:
+            raise AgentError("copy_auth target selector resolves to no target Agentinnen")
 
-    source_home = root / from_agent
-    if not is_real_directory_no_symlink(source_home):
-        raise AgentError("source Agentin home is missing or invalid")
-    source = source_home / "auth.json"
-    auth_bytes = pool_read_private_bytes(source, MAX_CODEX_CONFIG_BYTES, "source auth is missing or invalid")
-    copyable = 0
-    copied = 0
-    skipped_existing = 0
-    skipped_missing_home = 0
+        source_home = root / from_agent
+        if not is_real_directory_no_symlink(source_home):
+            raise AgentError("source Agentin home is missing or invalid")
+        source = source_home / "auth.json"
+        auth_bytes = pool_read_private_bytes(source, MAX_CODEX_CONFIG_BYTES, "source auth is missing or invalid")
+        copyable = 0
+        copied = 0
+        skipped_existing = 0
+        skipped_missing_home = 0
 
-    for agent in target_ids:
-        home = root / agent
-        if not is_real_directory_no_symlink(home):
-            skipped_missing_home += 1
-            continue
-        target = home / "auth.json"
-        if path_present_no_follow(target) and not overwrite:
-            skipped_existing += 1
-            continue
-        copyable += 1
-        if yes:
-            pool_write_private_bytes(target, auth_bytes, 0o600)
-            copied += 1
+        for agent in target_ids:
+            home = root / agent
+            if not is_real_directory_no_symlink(home):
+                skipped_missing_home += 1
+                continue
+            target = home / "auth.json"
+            if path_present_no_follow(target) and not overwrite:
+                skipped_existing += 1
+                continue
+            copyable += 1
+            if yes:
+                pool_write_private_bytes(target, auth_bytes, 0o600)
+                copied += 1
 
-    return {
-        "ok": True,
-        "dry_run": not yes,
-        "source_agent": "not_returned",
-        "source_agent_state": "set",
-        "target_selector": "not_returned",
-        "target_selector_state": "set",
-        "target_count": len(target_ids),
-        "copyable_count": copyable,
-        "copied_count": copied,
-        "skipped_existing_count": skipped_existing,
-        "skipped_missing_home_count": skipped_missing_home,
-        "overwrite": overwrite,
-        "auth_content": "not_returned",
-        "pool_root": PATH_NOT_RETURNED,
-        "raw_output": "not_returned",
-    }
+        return {
+            "ok": True,
+            "dry_run": not yes,
+            "source_agent": "not_returned",
+            "source_agent_state": "set",
+            "target_selector": "not_returned",
+            "target_selector_state": "set",
+            "target_count": len(target_ids),
+            "copyable_count": copyable,
+            "copied_count": copied,
+            "skipped_existing_count": skipped_existing,
+            "skipped_missing_home_count": skipped_missing_home,
+            "overwrite": overwrite,
+            "auth_content": "not_returned",
+            "pool_root": PATH_NOT_RETURNED,
+            "raw_output": "not_returned",
+        }
 
 
 def agent_pool_destroy_pool(

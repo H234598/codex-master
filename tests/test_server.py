@@ -9077,6 +9077,46 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn(str(tmp), str(ctx.exception))
             self.assertNotIn("external-secret", str(ctx.exception))
 
+    def test_agent_pool_copy_auth_rejects_pool_root_swap_before_copy(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            backup = tmp / "agents-backup"
+            replacement = tmp / "replacement"
+            pool.mkdir()
+            replacement.mkdir()
+            spec_path = self._write_spec(tmp, pool)
+            for root in (pool, replacement):
+                (root / "a1").mkdir()
+                (root / "a1" / "auth.json").write_text('{"token":"secret"}\n', encoding="utf-8")
+                (root / "a2").mkdir()
+            real_require = server_module.pool_require_real_root
+            swapped = False
+
+            def swap_after_check(root: Path) -> None:
+                nonlocal swapped
+                real_require(root)
+                if root == pool and not swapped:
+                    swapped = True
+                    pool.rename(backup)
+                    replacement.rename(pool)
+
+            with patch.object(server_module, "pool_require_real_root", side_effect=swap_after_check):
+                with self.assertRaisesRegex(AgentError, "pool root changed during auth copy"):
+                    server_module.agent_pool_copy_auth(
+                        str(spec_path),
+                        target_dir=str(pool),
+                        codex_bin="/bin/echo",
+                        from_agent="a1",
+                        to="a-series",
+                        yes=True,
+                    )
+
+            self.assertTrue(swapped)
+            self.assertFalse((pool / "a2" / "auth.json").exists())
+
     def test_agent_pool_rejects_codex_bin_control_chars_without_path_leak(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
