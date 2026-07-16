@@ -3974,6 +3974,8 @@ def _codex_usage_watchdog_state_from_snapshot(snapshot: dict[str, Any], *, now: 
         raise AgentError("could_not_read_codex_usage_snapshot")
     if status not in {"", "ok", "login_required", "partial", "error", "blocked"}:
         raise AgentError("could_not_read_codex_usage_snapshot")
+    if "blocked_until" in snapshot and snapshot["blocked_until"] is not None and blocked_until_ts is None:
+        raise AgentError("could_not_read_codex_usage_snapshot")
     if not status_present and blocked_until_ts is not None:
         raise AgentError("could_not_read_codex_usage_snapshot")
     if status == "blocked" and blocked_until_ts is None:
