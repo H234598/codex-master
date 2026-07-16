@@ -3898,6 +3898,50 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(target_mode, 0o644)
         self.assertFalse(link_exists)
 
+    def test_prune_raw_logs_rejects_raw_root_swap_before_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            raw_dir = tmp_path / "raw"
+            backup_raw = tmp_path / "raw-backup"
+            redirected_raw = tmp_path / "redirected-raw"
+            raw_dir.mkdir()
+            redirected_raw.mkdir()
+            for index in range(2):
+                log_path = redirected_raw / f"outside-{index}.log"
+                log_path.write_bytes(b"x" * 200)
+                os.utime(log_path, (1000 + index, 1000 + index))
+            swapped = False
+
+            def real_is_real(path: Path) -> bool:
+                try:
+                    return stat.S_ISDIR(path.lstat().st_mode)
+                except OSError:
+                    return False
+
+            def swap_after_check(path: Path) -> bool:
+                nonlocal swapped
+                if path == raw_dir and not swapped:
+                    swapped = True
+                    raw_dir.rename(backup_raw)
+                    raw_dir.symlink_to(redirected_raw, target_is_directory=True)
+                    return True
+                return real_is_real(path)
+
+            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
+                "codex_master.server.LEGACY_STATE_ROOT", tmp_path / "legacy"
+            ), patch("codex_master.server.META_DIR", tmp_path / "meta"), patch(
+                "codex_master.server.LEGACY_META_DIR", tmp_path / "legacy" / "meta"
+            ), patch("codex_master.server.is_real_directory_no_symlink", side_effect=swap_after_check):
+                prune_raw_logs(max_files=1, max_bytes=80)
+            redirected_sizes = sorted(path.stat().st_size for path in redirected_raw.glob("*.log"))
+            redirected_names = sorted(path.name for path in redirected_raw.glob("*.log"))
+            redirected_modes = sorted(stat.S_IMODE(path.stat().st_mode) for path in redirected_raw.glob("*.log"))
+
+        self.assertTrue(swapped)
+        self.assertEqual(redirected_names, ["outside-0.log", "outside-1.log"])
+        self.assertEqual(redirected_sizes, [200, 200])
+        self.assertEqual(redirected_modes, [0o644, 0o644])
+
     def test_legacy_raw_symlink_is_not_traversed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             raw_dir = Path(tmpdir) / "raw"

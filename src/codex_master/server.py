@@ -2300,6 +2300,84 @@ def bound_raw_log_file(path: Path, max_bytes: int = MAX_RAW_LOG_BYTES) -> bool:
     return True
 
 
+def harden_raw_log_at_dir_fd(directory_fd: int, name: str, expected_stat: os.stat_result) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(name, flags, dir_fd=directory_fd)
+        current = os.fstat(fd)
+        if (
+            not stat_module.S_ISREG(current.st_mode)
+            or getattr(current, "st_nlink", 1) > 1
+            or not source_identity_matches(current, expected_stat)
+        ):
+            return
+        try:
+            os.fchmod(fd, 0o600)
+        except PermissionError:
+            pass
+    except OSError:
+        return
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def replace_private_bytes_at_dir_fd(directory_fd: int, name: str, data: bytes) -> None:
+    tmp_name = f".{name}.{now_id()}.{uuid.uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    tmp_created = False
+    try:
+        fd = os.open(tmp_name, flags, 0o600, dir_fd=directory_fd)
+        tmp_created = True
+        with os.fdopen(fd, "wb") as fh:
+            fd = -1
+            fh.write(data)
+        os.replace(tmp_name, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        tmp_created = False
+    except OSError as exc:
+        raise AgentError("could not bound raw log") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if tmp_created:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name, dir_fd=directory_fd)
+
+
+def bound_raw_log_at_dir_fd(directory_fd: int, name: str, max_bytes: int = MAX_RAW_LOG_BYTES) -> bool:
+    max_bytes = max(1, int(max_bytes))
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(name, flags, dir_fd=directory_fd)
+        current = os.fstat(fd)
+        if not stat_module.S_ISREG(current.st_mode) or getattr(current, "st_nlink", 1) > 1:
+            return False
+        if current.st_size <= max_bytes:
+            return False
+        marker = RAW_LOG_TRUNCATION_MARKER[: max(0, max_bytes - 1)]
+        tail_limit = max(0, max_bytes - len(marker))
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            fh.seek(max(0, current.st_size - tail_limit), os.SEEK_SET)
+            tail = fh.read(tail_limit)
+    except OSError as exc:
+        raise AgentError("could not bound raw log") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    replace_private_bytes_at_dir_fd(directory_fd, name, marker + tail)
+    return True
+
+
 def append_bounded_raw_log(path: Path, chunk: bytes, max_bytes: int = MAX_RAW_LOG_BYTES) -> None:
     max_bytes = max(1, int(max_bytes))
     if not chunk:
@@ -2363,49 +2441,72 @@ def prune_raw_logs(max_files: int = MAX_RAW_LOG_FILES, max_bytes: int = MAX_RAW_
     for raw_dir in managed_raw_dirs():
         if not is_real_directory_no_symlink(raw_dir):
             continue
-        logs: list[tuple[Path, os.stat_result]] = []
-        for path in raw_dir.glob("*.log"):
+        try:
+            raw_stat = raw_dir.lstat()
+        except OSError:
+            continue
+        if stat_module.S_ISLNK(raw_stat.st_mode) or not stat_module.S_ISDIR(raw_stat.st_mode):
+            continue
+        raw_fd = -1
+        try:
             try:
-                current_stat = path.lstat()
+                raw_fd = open_directory_no_follow_matching(
+                    raw_dir,
+                    raw_stat,
+                    error_text="raw log directory unreadable",
+                    changed_text="raw log directory changed",
+                )
+            except AgentError:
+                continue
+            raw_fd_path = Path(f"/proc/self/fd/{raw_fd}")
+            logs: list[tuple[str, os.stat_result]] = []
+            try:
+                entry_names = sorted(name for name in os.listdir(raw_fd) if name.endswith(".log"))
             except OSError:
                 continue
-            if stat_module.S_ISLNK(current_stat.st_mode):
+            for name in entry_names:
                 try:
-                    path.unlink()
+                    current_stat = os.stat(name, dir_fd=raw_fd, follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat_module.S_ISLNK(current_stat.st_mode):
+                    try:
+                        os.unlink(name, dir_fd=raw_fd)
+                        deleted += 1
+                        deleted_symlink += 1
+                    except FileNotFoundError:
+                        pass
+                    continue
+                if stat_module.S_ISREG(current_stat.st_mode) and getattr(current_stat, "st_nlink", 1) > 1:
+                    try:
+                        os.unlink(name, dir_fd=raw_fd)
+                        deleted += 1
+                    except FileNotFoundError:
+                        pass
+                    continue
+                if stat_module.S_ISREG(current_stat.st_mode):
+                    logs.append((name, current_stat))
+            logs = sorted(logs, key=lambda item: (item[1].st_mtime, item[0]), reverse=True)
+            keep: set[Path] = set(protected)
+            for name, _current_stat in logs[:max_files]:
+                keep.add((raw_fd_path / name).resolve(strict=False))
+            for name, current_stat in logs:
+                path = raw_fd_path / name
+                resolved = path.resolve(strict=False)
+                harden_raw_log_at_dir_fd(raw_fd, name, current_stat)
+                if resolved not in protected and current_stat.st_size > max_bytes:
+                    truncated += 1 if bound_raw_log_at_dir_fd(raw_fd, name, max_bytes) else 0
+                if resolved in keep:
+                    retained += 1
+                    continue
+                try:
+                    os.unlink(name, dir_fd=raw_fd)
                     deleted += 1
-                    deleted_symlink += 1
                 except FileNotFoundError:
                     pass
-                continue
-            if stat_module.S_ISREG(current_stat.st_mode) and getattr(current_stat, "st_nlink", 1) > 1:
-                try:
-                    path.unlink()
-                    deleted += 1
-                except FileNotFoundError:
-                    pass
-                continue
-            if stat_module.S_ISREG(current_stat.st_mode):
-                logs.append((path, current_stat))
-        logs = sorted(logs, key=lambda item: (item[1].st_mtime, item[0].name), reverse=True)
-        keep: set[Path] = set(protected)
-        for path, _current_stat in logs[:max_files]:
-            keep.add(path.resolve(strict=False))
-        for path, current_stat in logs:
-            resolved = path.resolve(strict=False)
-            try:
-                path.chmod(0o600)
-            except PermissionError:
-                pass
-            if resolved not in protected and current_stat.st_size > max_bytes:
-                truncated += 1 if bound_raw_log_file(path, max_bytes) else 0
-            if resolved in keep:
-                retained += 1
-                continue
-            try:
-                path.unlink()
-                deleted += 1
-            except FileNotFoundError:
-                pass
+        finally:
+            if raw_fd >= 0:
+                os.close(raw_fd)
     return {
         "max_files_per_dir": max_files,
         "max_bytes_per_file": max_bytes,
