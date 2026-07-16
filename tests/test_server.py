@@ -9290,6 +9290,19 @@ class CliLifecycleTest(unittest.TestCase):
         mock_print_json.assert_not_called()
 
     @patch("codex_master.server.print_json")
+    @patch(
+        "codex_master.server.call_tool",
+        return_value={"status": "ok", "results": [{"agent": "a1", "error": "agent failed"}]},
+    )
+    def test_cli_watchdog_quiet_preserves_agent_errors(self, mock_call_tool, mock_print_json) -> None:
+        payload = mock_call_tool.return_value
+
+        result = main_cli(["watchdog", "all", "--manage-unclaimed", "--quiet"])
+
+        self.assertEqual(result, 1)
+        mock_print_json.assert_called_once_with(payload)
+
+    @patch("codex_master.server.print_json")
     @patch("codex_master.server.call_tool", return_value={"ok": True, "raw_output": "not_returned"})
     def test_cli_watchdog_status_routes_to_master_tool(self, mock_call_tool, mock_print_json) -> None:
         mock_print_json.return_value = 0

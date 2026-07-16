@@ -10391,7 +10391,18 @@ def main_cli(argv: list[str]) -> int:
                 },
             )
             if args.quiet:
-                return 0
+                results = payload.get("results") if isinstance(payload, dict) else None
+                has_agent_errors = isinstance(payload, dict) and (
+                    "error" in payload
+                    or (
+                        isinstance(results, list)
+                        and any(isinstance(item, dict) and "error" in item for item in results)
+                    )
+                )
+                if not has_agent_errors:
+                    return 0
+                print_json(payload)
+                return 1
             return print_json(payload)
         if args.command == "send":
             return print_json(
