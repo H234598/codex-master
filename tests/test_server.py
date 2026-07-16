@@ -3068,6 +3068,44 @@ class ServerHelpersTest(unittest.TestCase):
         mock_report.assert_called_once()
         mock_interrupt.assert_not_called()
 
+    def test_fleet_watchdog_claims_unclaimed_agent_before_report(self) -> None:
+        meta_store: dict[str, object] = {}
+        status = {
+            "agent": "a",
+            "running": True,
+            "lease": {"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
+            "response_state": {"state": "running_recent_output"},
+            "raw_log_idle_seconds": 90,
+            "raw_log_bytes": 100,
+            "raw_log_updated_at_utc": "1970-01-01T00:15:00+00:00",
+            "last_assignment": {"assignment_id": "assign-1", "created_at_utc": "2026-06-07T09:58:00+00:00"},
+        }
+        lease = {"state": "held", "holder": "this_server", "held_by_this_server": True}
+        report = {
+            "status": "report_requested",
+            "submitted": True,
+            "assignment_id": "assign-1",
+            "send": {"status": "sent"},
+        }
+        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "codex_master.server.status_agent", return_value=status
+        ), patch("codex_master.server.read_meta", return_value=meta_store), patch(
+            "codex_master.server.write_meta", side_effect=lambda _agent, data: meta_store.update(data)
+        ), patch(
+            "codex_master.server.claim_agent", return_value={"status": "claimed", "lease": lease}
+        ) as mock_claim, patch(
+            "codex_master.server.request_agent_report", return_value=report
+        ) as mock_report:
+            result = fleet_watchdog("a", manage_unclaimed=True)
+
+        payload = result["results"][0]
+        self.assertEqual(payload["watchdog_state"], "report_requested")
+        self.assertEqual(payload["lease_state"], "held")
+        self.assertTrue(payload["held_by_this_server"])
+        mock_claim.assert_called_once_with("a1")
+        self.assertEqual(mock_report.call_args.kwargs["lease"], lease)
+        self.assertTrue(meta_store["watchdog"]["release_lease_after_action"])
+
     def test_fleet_watchdog_waits_during_report_grace(self) -> None:
         status = {
             "agent": "a",
@@ -3147,6 +3185,41 @@ class ServerHelpersTest(unittest.TestCase):
         mock_report.assert_not_called()
         mock_interrupt.assert_called_once_with("a1", force=False)
         mock_write_meta.assert_called_once_with("a1", {})
+
+    def test_fleet_watchdog_releases_lease_acquired_for_unclaimed_report(self) -> None:
+        status = {
+            "agent": "a",
+            "running": True,
+            "lease": {"state": "held", "held_by_this_server": True, "raw_output": "not_returned"},
+            "response_state": {"state": "running_recent_output"},
+            "raw_log_idle_seconds": 240,
+            "raw_log_bytes": 100,
+            "raw_log_updated_at_utc": "1970-01-01T00:12:00+00:00",
+            "last_assignment": {"assignment_id": "assign-1", "created_at_utc": "2026-06-07T09:58:00+00:00"},
+        }
+        marker = {
+            "watchdog": {
+                "phase": "report_requested",
+                "requested_at_utc": "1970-01-01T00:13:00+00:00",
+                "assignment_id": "assign-1",
+                "planned_action": "interrupt",
+                "raw_log_bytes": 100,
+                "raw_log_updated_at_utc": "1970-01-01T00:12:00+00:00",
+                "release_lease_after_action": True,
+                "report_grace_seconds": DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS,
+            }
+        }
+        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "codex_master.server.time.time", return_value=1000.0
+        ), patch("codex_master.server.status_agent", return_value=status), patch(
+            "codex_master.server.read_meta", return_value=marker
+        ), patch("codex_master.server.write_meta"), patch(
+            "codex_master.server.watchdog_action", return_value={"status": "interrupt_sent"}
+        ) as mock_action:
+            result = fleet_watchdog("a")
+
+        self.assertEqual(result["results"][0]["watchdog_state"], "action_sent")
+        mock_action.assert_called_once_with("a1", "interrupt", release_after_interrupt=True)
 
     def test_fleet_watchdog_skips_other_client_lease(self) -> None:
         status = {

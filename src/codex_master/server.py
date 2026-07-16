@@ -3587,6 +3587,7 @@ def watchdog_agent(
 
     meta = read_meta(agent)
     marker = watchdog_marker(meta)
+    release_watchdog_lease = bool(marker.get("release_lease_after_action"))
     marker_is_current = watchdog_marker_matches(marker, action=action, assignment_id=assignment_id)
     output_changed = marker_is_current and watchdog_output_changed_since_marker(status, marker)
     if marker_is_current and output_changed:
@@ -3597,22 +3598,36 @@ def watchdog_agent(
     if action != "none" and not marker_is_current:
         if dry_run:
             return {**base, "watchdog_state": "would_request_report", "action_taken": "none"}
-        report = request_agent_report(agent, assignment_id=assignment_id, lease=lease)
-        requested_at_utc = _dt.datetime.now(_dt.timezone.utc).isoformat()
-        update_watchdog_marker(
-            agent,
-            {
-                "phase": "report_requested",
-                "requested_at_utc": requested_at_utc,
-                "assignment_id": assignment_id,
-                "planned_action": action,
-                "raw_log_bytes": status.get("raw_log_bytes"),
-                "raw_log_updated_at_utc": status.get("raw_log_updated_at_utc"),
-                "idle_seconds": effective_idle,
-                "idle_threshold_seconds": idle_seconds,
-                "report_grace_seconds": report_grace_seconds,
-            },
-        )
+        report_lease_claimed = False
+        if not held_by_this_server and lease_state in {"unclaimed", "expired"}:
+            claim = claim_agent(agent)
+            lease = claim["lease"]
+            report_lease_claimed = claim["status"] in {"claimed", "claimed_expired"}
+            release_watchdog_lease = manage_unclaimed and report_lease_claimed
+            base["lease_state"] = lease.get("state")
+            base["held_by_this_server"] = bool(lease.get("held_by_this_server"))
+        try:
+            report = request_agent_report(agent, assignment_id=assignment_id, lease=lease)
+            requested_at_utc = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            update_watchdog_marker(
+                agent,
+                {
+                    "phase": "report_requested",
+                    "requested_at_utc": requested_at_utc,
+                    "assignment_id": assignment_id,
+                    "planned_action": action,
+                    "raw_log_bytes": status.get("raw_log_bytes"),
+                    "raw_log_updated_at_utc": status.get("raw_log_updated_at_utc"),
+                    "idle_seconds": effective_idle,
+                    "idle_threshold_seconds": idle_seconds,
+                    "report_grace_seconds": report_grace_seconds,
+                    "release_lease_after_action": release_watchdog_lease,
+                },
+            )
+        except Exception:
+            if report_lease_claimed and agent_lease_status(agent).get("held_by_this_server"):
+                release_agent(agent, force=True)
+            raise
         return {
             **base,
             "watchdog_state": "report_requested",
@@ -3641,7 +3656,9 @@ def watchdog_agent(
         state="failed",
         reason="spark_turn_watchdog_timeout",
     ) if action != "none" else {"state": "not_checked", "updated": False, "raw_output": "not_returned"}
-    release_after_interrupt = manage_unclaimed and unclaimed_or_expired and action == "interrupt"
+    release_after_interrupt = action == "interrupt" and (
+        (manage_unclaimed and unclaimed_or_expired) or release_watchdog_lease
+    )
     result = watchdog_action(agent, action, release_after_interrupt=release_after_interrupt)
     update_watchdog_marker(agent, None)
     return {
