@@ -71,6 +71,7 @@ from codex_master.server import (
     codex_usage_watchdog_status,
     codex_usage_routing_decision,
     codex_usage_spark_health_update,
+    validate_codex_usage_routing_decision,
     DEFAULT_AGENT_MODEL,
     DEFAULT_AGENT_MODEL_EFFORT,
     DEFAULT_ORDINAL_AGENT_SERIES,
@@ -7790,6 +7791,14 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("release", command)
         self.assertEqual(decision["decision"], "spark")
         self.assertEqual(decision["backend_account_id"], "backend-nufker")
+
+    def test_codex_usage_routing_rejects_unhashable_decision(self) -> None:
+        with self.assertRaisesRegex(AgentError, "codex-usage routing decision is invalid"):
+            validate_codex_usage_routing_decision(
+                {"schema_version": 1, "role": "arbeitsbiene", "decision": []},
+                agent="a1",
+                role="arbeitsbiene",
+            )
 
     def test_spark_health_update_is_bounded_and_uses_config(self) -> None:
         completed = subprocess.CompletedProcess(

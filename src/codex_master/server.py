@@ -2208,7 +2208,7 @@ def validate_codex_usage_routing_decision(
         raise AgentError("codex-usage routing schema is unsupported")
     decision = payload.get("decision")
     model = payload.get("model")
-    if decision not in CODEX_USAGE_DECISIONS or payload.get("role") != role:
+    if not isinstance(decision, str) or decision not in CODEX_USAGE_DECISIONS or payload.get("role") != role:
         raise AgentError("codex-usage routing decision is invalid")
     if not isinstance(payload.get("account"), str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(payload["account"]):
         raise AgentError("codex-usage routing account is invalid")
