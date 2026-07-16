@@ -3996,12 +3996,13 @@ def watchdog_effective_idle(status: dict[str, Any], *, now: float | None = None)
             "activity_at_utc": latest_assignment.get("created_at_utc"),
             "raw_output": "not_returned",
         }
-    started_age = age_seconds_from_utc(status.get("started_at_utc"), now=now)
-    if started_age is not None:
+    started_at = status.get("started_at_utc")
+    started_timestamp = parse_utc_timestamp(started_at)
+    if started_timestamp is not None and started_timestamp <= current:
         return {
-            "effective_idle_seconds": started_age,
+            "effective_idle_seconds": max(0, int(current - started_timestamp)),
             "activity_source": "session_start_age",
-            "activity_at_utc": status.get("started_at_utc"),
+            "activity_at_utc": started_at,
             "raw_output": "not_returned",
         }
     return {

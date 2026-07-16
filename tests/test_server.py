@@ -3377,6 +3377,15 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["effective_idle_seconds"], 3600)
         self.assertEqual(result["activity_source"], "session_start_age")
 
+    def test_watchdog_effective_idle_ignores_future_session_start(self) -> None:
+        result = watchdog_effective_idle(
+            {"started_at_utc": "2099-01-01T00:00:00+00:00"},
+            now=1780826400.0,
+        )
+
+        self.assertIsNone(result["effective_idle_seconds"])
+        self.assertEqual(result["activity_source"], "insufficient_idle_evidence")
+
     def test_watchdog_marker_requires_same_assignment_identity(self) -> None:
         marker = {
             "phase": "report_requested",
