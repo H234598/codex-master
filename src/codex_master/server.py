@@ -2557,11 +2557,13 @@ def raw_log_writer_command(raw_log: Path) -> str:
     return shlex.join(argv)
 
 
-def read_proc_environ(pid_dir: Path) -> dict[str, str]:
+def read_proc_environ(pid_dir: Path) -> dict[str, str] | None:
     try:
         raw = (pid_dir / "environ").read_bytes()
-    except OSError:
+    except FileNotFoundError:
         return {}
+    except OSError:
+        return None
     env: dict[str, str] = {}
     for item in raw.split(b"\0"):
         if not item or b"=" not in item:
@@ -2581,7 +2583,7 @@ def read_proc_status(pid_dir: Path) -> dict[str, str]:
         if ":" not in line:
             continue
         key, value = line.split(":", 1)
-        if key in {"Name", "State", "PPid", "Tgid"}:
+        if key in {"Name", "State", "PPid", "Tgid", "Uid"}:
             result[key] = value.strip()
     return result
 
@@ -2631,10 +2633,28 @@ def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[di
     for pid_dir in pid_dirs:
         if not pid_dir.name.isdigit():
             continue
+        status = read_proc_status(pid_dir)
+        uid_parts = status.get("Uid", "").split()
+        if uid_parts and uid_parts[0].isdigit() and int(uid_parts[0]) != os.getuid():
+            continue
         env = read_proc_environ(pid_dir)
+        if env is None:
+            name = (status.get("Name") or "").lower()
+            argv = read_proc_cmdline(pid_dir)
+            argv_names = {Path(item).name.lower() for item in argv if item}
+            joined = "\0".join(argv).lower()
+            codex_like = (
+                name == "codex"
+                or "codex" in argv_names
+                or "@openai/codex" in joined
+                or "node_modules/@openai/codex" in joined
+            )
+            if codex_like:
+                return None
+            # ponytail: opaque non-Codex processes skipped; privileged proc access needed to detect arbitrary same-home users.
+            continue
         if not same_path_text(env.get("CODEX_HOME", ""), home):
             continue
-        status = read_proc_status(pid_dir)
         managed = env.get("CODEX_AGENT_MCP") == "1" or env.get("CODEX_MASTER_MCP") == "1"
         ppid_parts = status.get("PPid", "0").split()
         ppid = int(ppid_parts[0]) if ppid_parts and ppid_parts[0].isdigit() else None

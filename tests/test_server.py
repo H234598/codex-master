@@ -4394,6 +4394,27 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIsNone(summary["managed_process_count"])
         self.assertEqual(summary["raw_output"], "not_returned")
 
+    @patch("codex_master.server.read_proc_environ", return_value=None)
+    def test_agent_home_process_summary_fails_closed_on_unreadable_process_environment(
+        self, _mock_read_proc_environ
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proc_root = Path(tmpdir) / "proc"
+            process = proc_root / "100"
+            process.mkdir(parents=True)
+            process.joinpath("status").write_text("Name:\tcodex\n", encoding="utf-8")
+            process.joinpath("cmdline").write_bytes(b"/usr/bin/codex\0")
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": Path(tmpdir) / "codex", "home": Path(tmpdir) / "home", "session": "a"}},
+                clear=False,
+            ):
+                summary = agent_home_process_summary("a", proc_root)
+
+        self.assertIsNone(summary["process_count"])
+        self.assertIsNone(summary["external_process_count"])
+        self.assertIsNone(summary["managed_process_count"])
+
     def test_agent_identity_guard_blocks_unavailable_process_scan(self) -> None:
         result = agent_identity_guard(
             False,
