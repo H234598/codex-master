@@ -8878,6 +8878,32 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn(str(tmp), payload)
             self.assertNotIn("outside-secret-root", payload)
 
+    def test_agent_pool_status_rejects_pool_root_swap_before_scan(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            external = tmp / "outside-secret-root"
+            pool.mkdir()
+            external.mkdir()
+            (external / "a1").mkdir()
+            spec_path = self._write_spec(tmp, pool)
+            original_state = server_module.pool_public_path_state
+            swapped = [False]
+
+            def race_root_state(path: Path) -> str:
+                if path == pool and not swapped[0]:
+                    pool.rename(tmp / "agents-original")
+                    pool.symlink_to(external, target_is_directory=True)
+                    swapped[0] = True
+                    return "directory"
+                return original_state(path)
+
+            with patch("codex_master.server.pool_public_path_state", side_effect=race_root_state):
+                with self.assertRaisesRegex(AgentError, "pool root changed during status"):
+                    server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+
     def test_agent_pool_status_requires_regular_marker_and_configs_for_ok(self) -> None:
         from codex_master import server as server_module
 

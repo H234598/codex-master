@@ -8183,7 +8183,14 @@ def agent_pool_status(
 ) -> dict[str, Any]:
     normalized = pool_normalize_spec(spec, target_dir=target_dir, codex_bin=codex_bin)
     root = normalized["pool_root"]
-    ids = normalized["ids"]
+    try:
+        expected_parent_stat = root.parent.lstat()
+    except OSError:
+        expected_parent_stat = None
+    try:
+        expected_root_stat = root.lstat()
+    except OSError:
+        expected_root_stat = None
     root_state = pool_public_path_state(root)
     if root_state != "directory":
         return {
@@ -8192,9 +8199,9 @@ def agent_pool_status(
             "pool_root_state": root_state,
             "marker_state": "missing" if root_state == "missing" else "not_checked",
             "marker_present": False,
-            "expected_agent_count": len(ids),
+            "expected_agent_count": len(normalized["ids"]),
             "existing_agent_count": 0,
-            "missing_agent_count": len(ids),
+            "missing_agent_count": len(normalized["ids"]),
             "wrapper_executable_count": 0,
             "config_count": 0,
             "auth_count": 0,
@@ -8210,6 +8217,18 @@ def agent_pool_status(
             "series_state": "set" if normalized["series_ids"] else "not_set",
             "raw_output": "not_returned",
         }
+    with pool_root_operation(
+        root,
+        ensure=False,
+        error_text="pool root changed during status",
+        expected_parent_stat=expected_parent_stat,
+        expected_root_stat=expected_root_stat,
+    ) as operation_root:
+        return _agent_pool_status_at_root(normalized, operation_root, root_state)
+
+
+def _agent_pool_status_at_root(normalized: dict[str, Any], root: Path, root_state: str) -> dict[str, Any]:
+    ids = normalized["ids"]
     existing = 0
     wrappers = 0
     configs = 0
