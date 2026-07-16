@@ -4039,6 +4039,8 @@ def usage_watchdog_agent(agent: str, *, dry_run: bool) -> dict[str, Any]:
                 "usage_watchdog_state": "would_mark" if dry_run else "blocked_marked",
                 "action_taken": "none",
             }
+        if lease.get("state") == "unreadable":
+            return {**base, "usage_watchdog_state": "skipped_lease_unreadable", "action_taken": "none"}
         if not lease.get("held_by_this_server") and lease.get("state") == "held":
             return {**base, "usage_watchdog_state": "skipped_not_leased_by_this_server", "action_taken": "none"}
         if dry_run:

@@ -3872,6 +3872,35 @@ class ServerHelpersTest(unittest.TestCase):
         mock_claim.assert_called_once_with("a1")
         mock_stop.assert_called_once_with("a1", force=False)
 
+    def test_usage_watchdog_skips_running_agent_when_lease_is_unreadable(self) -> None:
+        blocked_status = {
+            "agent": "a1",
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": "2099-06-08T06:50:00+02:00",
+            "reason": "usage limit reached",
+            "source": "snapshot",
+            "raw_output": "not_returned",
+        }
+        with patch.dict(
+            "codex_master.server.AGENTS",
+            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
+            clear=True,
+        ), patch("codex_master.server.ensure_state"), patch(
+            "codex_master.server.tmux_alive", return_value=True
+        ), patch(
+            "codex_master.server.agent_lease_status",
+            return_value={"state": "unreadable", "held_by_this_server": False, "raw_output": "not_returned"},
+        ), patch("codex_master.server.codex_usage_watchdog_status", return_value=blocked_status), patch(
+            "codex_master.server.update_codex_usage_watchdog_marker"
+        ) as mock_update, patch("codex_master.server.stop_agent") as mock_stop:
+            result = usage_watchdog_agent("a1", dry_run=False)
+
+        self.assertEqual(result["usage_watchdog_state"], "skipped_lease_unreadable")
+        self.assertEqual(result["action_taken"], "none")
+        mock_update.assert_not_called()
+        mock_stop.assert_not_called()
+
     def test_cli_usage_watchdog_routes_to_tool(self) -> None:
         captured: dict[str, Any] = {}
 
