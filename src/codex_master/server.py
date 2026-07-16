@@ -3696,7 +3696,7 @@ def watchdog_agent(
             claim = claim_agent(agent)
             lease = claim["lease"]
             report_lease_claimed = claim["status"] in {"claimed", "claimed_expired"}
-            release_watchdog_lease = manage_unclaimed and report_lease_claimed
+            release_watchdog_lease = report_lease_claimed
             base["lease_state"] = lease.get("state")
             base["held_by_this_server"] = bool(lease.get("held_by_this_server"))
         try:
