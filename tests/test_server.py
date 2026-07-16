@@ -2031,6 +2031,13 @@ class ServerHelpersTest(unittest.TestCase):
             with self.assertRaisesRegex(AgentError, "incomplete RPC message body"):
                 read_message()
 
+    def test_read_message_skips_blank_lines_before_json_message(self) -> None:
+        message = {"jsonrpc": "2.0", "id": 1, "method": "resources/list"}
+        data = b"\n  \n" + json.dumps(message).encode("utf-8") + b"\n"
+
+        with patch("sys.stdin", FakeStdin(data)):
+            self.assertEqual(read_message(), message)
+
     def test_mcp_tool_call_error_is_structured(self) -> None:
         response = handle_rpc(
             {

@@ -8801,11 +8801,14 @@ def parse_content_length(line: bytes, max_bytes: int = MAX_RPC_MESSAGE_BYTES) ->
 
 
 def read_message() -> dict[str, Any] | None:
-    first = sys.stdin.buffer.readline(MAX_RPC_MESSAGE_BYTES + 1)
-    if len(first) > MAX_RPC_MESSAGE_BYTES:
-        raise AgentError(f"RPC message line exceeds {MAX_RPC_MESSAGE_BYTES} bytes")
-    if not first:
-        return None
+    while True:
+        first = sys.stdin.buffer.readline(MAX_RPC_MESSAGE_BYTES + 1)
+        if len(first) > MAX_RPC_MESSAGE_BYTES:
+            raise AgentError(f"RPC message line exceeds {MAX_RPC_MESSAGE_BYTES} bytes")
+        if not first:
+            return None
+        if first.strip():
+            break
     if first.startswith(b"Content-Length:"):
         length = parse_content_length(first)
         while True:
