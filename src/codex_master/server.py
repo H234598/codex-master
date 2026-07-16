@@ -3791,21 +3791,32 @@ def watchdog_effective_idle(status: dict[str, Any], *, now: float | None = None)
     }
 
 
+def watchdog_marker_lease_matches(
+    marker: dict[str, Any], *, assignment_id: Any, session_started_at: Any
+) -> bool:
+    if marker.get("phase") != "report_requested" or marker.get("assignment_id") != assignment_id:
+        return False
+    marker_started_at = parse_utc_timestamp(marker.get("started_at_utc"))
+    current_started_at = parse_utc_timestamp(session_started_at)
+    session_identity_present = marker.get("started_at_utc") is not None or session_started_at is not None
+    return not session_identity_present or (
+        marker_started_at is not None
+        and current_started_at is not None
+        and marker_started_at == current_started_at
+    )
+
+
 def watchdog_marker_matches(
     marker: dict[str, Any], *, action: str, assignment_id: Any, session_started_at: Any = None
 ) -> bool:
-    if marker.get("phase") != "report_requested":
-        return False
     if marker.get("planned_action") != action:
         return False
-    marker_assignment = marker.get("assignment_id")
-    if marker_assignment != assignment_id:
+    if not watchdog_marker_lease_matches(
+        marker,
+        assignment_id=assignment_id,
+        session_started_at=session_started_at,
+    ):
         return False
-    if marker.get("started_at_utc") is not None or session_started_at is not None:
-        marker_started_at = parse_utc_timestamp(marker.get("started_at_utc"))
-        current_started_at = parse_utc_timestamp(session_started_at)
-        if marker_started_at is None or current_started_at is None or marker_started_at != current_started_at:
-            return False
     return parse_utc_timestamp(marker.get("requested_at_utc")) is not None
 
 
@@ -3921,7 +3932,16 @@ def watchdog_agent(
         meta = read_meta(agent)
         marker = watchdog_marker(meta)
         if marker and not dry_run and lease_allowed:
-            if marker.get("release_lease_after_action") and agent_lease_status(agent).get("held_by_this_server"):
+            marker_lease_matches = watchdog_marker_lease_matches(
+                marker,
+                assignment_id=assignment_id,
+                session_started_at=status.get("started_at_utc"),
+            )
+            if (
+                marker.get("release_lease_after_action")
+                and marker_lease_matches
+                and agent_lease_status(agent).get("held_by_this_server")
+            ):
                 released = release_agent(agent, force=True)
                 released_lease = released.get("lease") if isinstance(released, dict) else None
                 if isinstance(released_lease, dict):
@@ -3932,17 +3952,10 @@ def watchdog_agent(
 
     meta = read_meta(agent)
     marker = watchdog_marker(meta)
-    marker_started_at = parse_utc_timestamp(marker.get("started_at_utc"))
-    current_started_at = parse_utc_timestamp(status.get("started_at_utc"))
-    session_identity_present = marker.get("started_at_utc") is not None or status.get("started_at_utc") is not None
-    session_identity_matches = (
-        not session_identity_present
-        or (marker_started_at is not None and current_started_at is not None and marker_started_at == current_started_at)
-    )
-    marker_lease_matches = (
-        marker.get("phase") == "report_requested"
-        and marker.get("assignment_id") == assignment_id
-        and session_identity_matches
+    marker_lease_matches = watchdog_marker_lease_matches(
+        marker,
+        assignment_id=assignment_id,
+        session_started_at=status.get("started_at_utc"),
     )
     release_watchdog_lease = bool(marker.get("release_lease_after_action")) and marker_lease_matches
     marker_is_current = watchdog_marker_matches(
