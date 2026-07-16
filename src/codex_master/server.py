@@ -7283,6 +7283,8 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         selected_agent = single_agent_id(str(args.get("agent", "")), "agent_claim")
         allow_unauthenticated = bool_arg(args, "allow_unauthenticated", False)
         wait_forever = bool_arg(args, "wait_forever", "wait_seconds" not in args and DEFAULT_CLAIM_WAIT_FOREVER)
+        if wait_forever and "wait_seconds" in args:
+            raise AgentError("wait_forever and wait_seconds are mutually exclusive")
         wait_seconds: int | str | None = None if wait_forever else int_arg(args, "wait_seconds", 0)
         return call_authenticated_agent_mutation(
             selected_agent,

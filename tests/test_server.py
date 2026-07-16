@@ -7102,6 +7102,10 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(raised.exception.code, 2)
         mock_call_tool.assert_not_called()
 
+    def test_mcp_claim_rejects_conflicting_wait_modes(self) -> None:
+        with self.assertRaisesRegex(AgentError, "wait_forever and wait_seconds are mutually exclusive"):
+            call_tool("agent_claim", {"agent": "a", "wait_forever": True, "wait_seconds": 30})
+
     @patch("codex_master.server.call_tool")
     @patch("builtins.print")
     def test_cli_tool_validation_rejects_out_of_bounds_arguments(self, mock_print, mock_call_tool) -> None:
