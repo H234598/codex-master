@@ -4563,6 +4563,30 @@ class ServerHelpersTest(unittest.TestCase):
 
         mock_remember_routing.assert_not_called()
 
+    @patch("codex_master.server.remember_agent_routing")
+    @patch("codex_master.server.start_agent")
+    @patch("codex_master.server.claim_agent")
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    def test_start_agent_with_lease_rejects_running_reasoning_effort_mismatch(
+        self, _mock_alive, mock_claim, mock_start_agent, mock_remember_routing
+    ) -> None:
+        mock_claim.return_value = {"status": "renewed", "lease": {"held_by_this_server": True}}
+        mock_start_agent.return_value = {
+            "agent": "a",
+            "status": "already_running",
+            "meta": {
+                "model": DEFAULT_AGENT_MODEL,
+                "model_reasoning_effort": WRITE_AGENT_MODEL_EFFORT,
+            },
+            "raw_output": "not_returned",
+        }
+
+        with patch("codex_master.server.agent_auth_status", return_value={"authenticated": True}):
+            with self.assertRaisesRegex(AgentError, "routed model differs from active session"):
+                start_agent_with_lease("a", allow_unauthenticated=True)
+
+        mock_remember_routing.assert_not_called()
+
     def test_start_agent_with_lease_claims_transient_lease_for_running_session(self) -> None:
         lease = {"state": "held", "holder": "this_server", "held_by_this_server": True}
         with patch("codex_master.server.tmux_alive", return_value=True), patch(

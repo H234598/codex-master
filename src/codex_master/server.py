@@ -2871,8 +2871,12 @@ def start_agent_with_lease(
                 model_reasoning_effort=selected_effort,
             )
             if result.get("status") == "already_running":
-                active_model = (result.get("meta") or {}).get("model") or DEFAULT_AGENT_MODEL
-                if active_model != selected_model:
+                active_meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+                active_model = active_meta.get("model") or DEFAULT_AGENT_MODEL
+                active_effort = active_meta.get("model_reasoning_effort") or (
+                    WRITE_AGENT_MODEL_EFFORT if active_model == WRITE_AGENT_MODEL else DEFAULT_AGENT_MODEL_EFFORT
+                )
+                if active_model != selected_model or active_effort != selected_effort:
                     raise AgentError(
                         "routed model differs from active session; controlled restart requires "
                         "an inactive Agentin"
