@@ -4183,18 +4183,20 @@ class ServerHelpersTest(unittest.TestCase):
             "codex_master.server.AGENTS",
             {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
             clear=True,
-        ), patch("codex_master.server.ensure_state"), patch(
+        ), patch("codex_master.server.ensure_state") as ensure_state, patch(
             "codex_master.server.tmux_alive", return_value=False
         ), patch(
             "codex_master.server.agent_lease_status",
             return_value={"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
-        ), patch("codex_master.server.codex_usage_watchdog_status", return_value=blocked_status), patch(
+        ) as lease_status, patch("codex_master.server.codex_usage_watchdog_status", return_value=blocked_status), patch(
             "codex_master.server.update_codex_usage_watchdog_marker"
         ) as update_marker:
             result = usage_watchdog_agent("a1", dry_run=True)
 
         self.assertEqual(result["usage_watchdog_state"], "would_mark")
         self.assertEqual(result["action_taken"], "none")
+        ensure_state.assert_not_called()
+        lease_status.assert_called_once_with("a1", initialize_state=False)
         update_marker.assert_not_called()
 
     def test_usage_watchdog_resolves_unmapped_account_before_marking(self) -> None:

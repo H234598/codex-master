@@ -1781,9 +1781,10 @@ def stopped_foreign_lease_recovery_status(
     }
 
 
-def agent_lease_status(agent: str) -> dict[str, Any]:
+def agent_lease_status(agent: str, *, initialize_state: bool = True) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
-    ensure_state()
+    if initialize_state:
+        ensure_state()
     try:
         return public_agent_lease(agent, read_agent_lease_record(agent))
     except AgentError:
@@ -3183,7 +3184,12 @@ def latest_assignment_summary(agent: str) -> dict[str, Any] | None:
     }
 
 
-def codex_usage_snapshot_accounts(agent: str, meta: dict[str, Any]) -> list[str]:
+def codex_usage_snapshot_accounts(
+    agent: str,
+    meta: dict[str, Any],
+    *,
+    include_assignment_history: bool = True,
+) -> list[str]:
     accounts: list[str] = []
 
     def add_account(value: Any) -> None:
@@ -3194,9 +3200,12 @@ def codex_usage_snapshot_accounts(agent: str, meta: dict[str, Any]) -> list[str]
         if value not in accounts:
             accounts.append(value)
 
-    try:
-        records = list_assignments(agent, 1).get("records", [])
-    except AgentError:
+    if include_assignment_history:
+        try:
+            records = list_assignments(agent, 1).get("records", [])
+        except AgentError:
+            records = []
+    else:
         records = []
     record = records[-1] if records and isinstance(records[-1], dict) else {}
     assignment_routing = record.get("routing") if isinstance(record, dict) else None
@@ -3693,7 +3702,12 @@ def update_codex_usage_watchdog_marker(agent: str, marker: dict[str, Any] | None
     write_meta(agent, meta)
 
 
-def codex_usage_watchdog_status(agent: str, *, snapshot_account: str | None = None) -> dict[str, Any]:
+def codex_usage_watchdog_status(
+    agent: str,
+    *,
+    snapshot_account: str | None = None,
+    include_assignment_history: bool = True,
+) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     meta = read_meta(agent)
     if meta.get("meta_error"):
@@ -3703,7 +3717,15 @@ def codex_usage_watchdog_status(agent: str, *, snapshot_account: str | None = No
         not isinstance(snapshot_account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(snapshot_account)
     ):
         raise AgentError("codex-usage snapshot account is invalid")
-    accounts = [snapshot_account] if snapshot_account is not None else codex_usage_snapshot_accounts(agent, meta)
+    accounts = (
+        [snapshot_account]
+        if snapshot_account is not None
+        else codex_usage_snapshot_accounts(
+            agent,
+            meta,
+            include_assignment_history=include_assignment_history,
+        )
+    )
     current_account = accounts[0] if accounts else None
     now = time.time()
 
@@ -3770,7 +3792,11 @@ def safe_codex_usage_reason(value: Any) -> str | None:
 
 
 def codex_usage_status_with_routing(
-    agent: str, status: dict[str, Any], *, persist_account: bool = True
+    agent: str,
+    status: dict[str, Any],
+    *,
+    persist_account: bool = True,
+    include_assignment_history: bool = True,
 ) -> dict[str, Any]:
     needs_routing_check = status.get("usage_status") in {"login_required", "partial", "error"}
     needs_routing_check = needs_routing_check or (
@@ -3782,11 +3808,15 @@ def codex_usage_status_with_routing(
             routing = codex_usage_routing_decision(agent, role="arbeitsbiene")
             if persist_account:
                 remember_agent_usage_account(agent, routing.get("account"))
-                status = codex_usage_watchdog_status(agent)
+                status = codex_usage_watchdog_status(
+                    agent,
+                    include_assignment_history=include_assignment_history,
+                )
             else:
                 status = codex_usage_watchdog_status(
                     agent,
                     snapshot_account=routing.get("account"),
+                    include_assignment_history=include_assignment_history,
                 )
             if routing.get("decision") == "blocked" and not status.get("blocked"):
                 reason = routing.get("reason") or "codex usage limit reached"
@@ -4177,15 +4207,17 @@ def watchdog_agent(
 
 def usage_watchdog_agent(agent: str, *, dry_run: bool) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
-    ensure_state()
+    if not dry_run:
+        ensure_state()
     cfg = AGENTS[agent]
     session = cfg["session"]
     running = tmux_alive(session)
-    lease = agent_lease_status(agent)
+    lease = agent_lease_status(agent, initialize_state=not dry_run)
     usage_watchdog = codex_usage_status_with_routing(
         agent,
-        codex_usage_watchdog_status(agent),
+        codex_usage_watchdog_status(agent, include_assignment_history=not dry_run),
         persist_account=not dry_run,
+        include_assignment_history=not dry_run,
     )
     base = {
         "agent": agent,
