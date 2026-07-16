@@ -3075,14 +3075,20 @@ def limit_model_pool(model: Any) -> str:
 
 
 LIMIT_TEXT_PATTERNS = (
-    r"\brate limit(?:ed|s)?\b",
-    r"\busage limit\b",
+    r"\brate limited\b",
+    r"\brate limits?\b.{0,80}\b(?:reached|exceeded|hit|error|retry|again)\b",
+    r"\busage limit\b.{0,80}\b(?:reached|exceeded|hit|blocked|retry|again)\b",
     r"\blimit (?:reached|exceeded|hit)\b",
     r"\bquota (?:exceeded|reached)\b",
     r"\btoo many requests\b",
     r"\bout of tokens\b",
-    r"\btoken (?:limit|budget|quota)\b",
-    r"\bcontext (?:length|window).{0,80}\b(?:exceeded|full|limit)\b",
+    r"\btoken (?:limit|budget|quota)\b.{0,80}\b(?:exceeded|reached|hit|full|blocked|retry|again)\b",
+    r"\bcontext (?:length|window).{0,80}\b(?:exceeded|full|too long|overflow)\b",
+)
+LIMIT_CLEAR_TEXT_PATTERNS = (
+    r"\blimit\b.{0,40}\b(?:not|isn't|is not|hasn't|has not)\b",
+    r"\b(?:not|isn't|is not|hasn't|has not)\b.{0,40}\b(?:limit|quota|tokens?)\b",
+    r"\b(?:not|isn't|is not|hasn't|has not)\b.{0,40}\b(?:full|exceeded|reached|blocked|overflow)\b",
 )
 
 
@@ -3146,9 +3152,8 @@ def classify_limit_text(text: str, meta: dict[str, Any] | None = None, latest_as
     meta = meta or {}
     cleaned = strip_ansi(text)
     lowered = cleaned.lower()
-    has_limit = any(
-        re.search(pattern, lowered)
-        for pattern in LIMIT_TEXT_PATTERNS
+    has_limit = any(re.search(pattern, lowered) for pattern in LIMIT_TEXT_PATTERNS) and not any(
+        re.search(pattern, lowered) for pattern in LIMIT_CLEAR_TEXT_PATTERNS
     )
     window = "unknown"
     if re.search(r"\b(?:daily|per day|today|24h|24 hours)\b", lowered):
@@ -3166,7 +3171,7 @@ def classify_limit_text(text: str, meta: dict[str, Any] | None = None, latest_as
     elif has_limit:
         limit_kind = "usage"
 
-    detected = has_limit or (window != "unknown" and "limit" in lowered)
+    detected = has_limit
     model, model_source = infer_limit_model_info(cleaned, meta, latest_assignment, detected=detected)
     session_model = meta.get("model") if isinstance(meta.get("model"), str) else "unknown"
     assignment_model = latest_assignment.get("model") if latest_assignment else None

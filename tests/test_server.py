@@ -2804,6 +2804,24 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(limit["assignment_model_pool"], "spark_write_model")
         self.assertEqual(limit["evidence"], "not_returned")
 
+    def test_classify_limit_text_ignores_capacity_without_limit_failure(self) -> None:
+        for text in (
+            "Rate limit: 100 requests/minute",
+            "Usage limit: 5 hours remaining",
+            "Token limit: 128k",
+            "Context window limit: 128k",
+            "Usage limit not reached",
+            "Context window is not full",
+        ):
+            with self.subTest(text=text):
+                result = classify_limit_text(text)
+                self.assertFalse(result["limited"])
+                self.assertEqual(result["window"], "none")
+
+        failed = classify_limit_text("Token limit exceeded. Try again later.")
+        self.assertTrue(failed["limited"])
+        self.assertEqual(failed["kind"], "token")
+
     def test_classify_tui_context_detects_starter_placeholder_without_output(self) -> None:
         result = classify_tui_context("Find and fix a bug in @filename\nSECRET_SHOULD_NOT_RETURN", running=True)
 
