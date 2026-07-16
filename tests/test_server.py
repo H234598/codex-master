@@ -3638,6 +3638,23 @@ class ServerHelpersTest(unittest.TestCase):
                 self.assertTrue(status["blocked"])
                 self.assertEqual(status["source"], "snapshot")
 
+    def test_codex_usage_watchdog_reason_is_bounded_and_redacted(self) -> None:
+        secret_reason = "/home/teladi/private-token sk-usage-secret1234567890 " + ("x" * 500)
+        with patch("codex_master.server.read_meta", return_value={}), patch(
+            "codex_master.server.read_codex_usage_snapshot",
+            return_value={
+                "account": "a1",
+                "status": "blocked",
+                "blocked_until": "2099-06-08T06:50:00+00:00",
+                "blocked_reason": secret_reason,
+            },
+        ):
+            status = codex_usage_watchdog_status("a1")
+
+        self.assertNotIn("private-token", status["reason"])
+        self.assertNotIn("sk-usage-secret1234567890", status["reason"])
+        self.assertLessEqual(len(status["reason"]), 300)
+
     def test_codex_usage_watchdog_status_fails_closed_on_unreadable_metadata(self) -> None:
         with patch("codex_master.server.read_meta", return_value={"meta_error": "could_not_read"}):
             with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_watchdog_metadata"):

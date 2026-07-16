@@ -3534,6 +3534,12 @@ def codex_usage_watchdog_status(agent: str) -> dict[str, Any]:
     }
 
 
+def safe_codex_usage_reason(value: Any) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return safe_error_text(value, max_chars=300)
+
+
 def ensure_agent_not_blocked_by_codex_usage(agent: str) -> dict[str, Any]:
     status = codex_usage_watchdog_status(agent)
     if status.get("blocked"):
@@ -3546,6 +3552,7 @@ def ensure_agent_not_blocked_by_codex_usage(agent: str) -> dict[str, Any]:
 
 def _codex_usage_watchdog_state_from_marker(marker: dict[str, Any], *, now: float) -> dict[str, Any]:
     agent = str(marker.get("agent") or "")
+    reason = safe_codex_usage_reason(marker.get("reason"))
     blocked_until_ts = parse_utc_timestamp(marker.get("blocked_until_utc"))
     if blocked_until_ts is None:
         raise AgentError("could_not_read_codex_usage_watchdog_marker")
@@ -3555,7 +3562,7 @@ def _codex_usage_watchdog_state_from_marker(marker: dict[str, Any], *, now: floa
             "state": "blocked",
             "blocked": True,
             "blocked_until_utc": _dt.datetime.fromtimestamp(blocked_until_ts, _dt.timezone.utc).isoformat(),
-            "reason": marker.get("reason"),
+            "reason": reason,
             "source": "marker",
             "raw_output": "not_returned",
         }
@@ -3564,7 +3571,7 @@ def _codex_usage_watchdog_state_from_marker(marker: dict[str, Any], *, now: floa
         "state": "released",
         "blocked": False,
         "blocked_until_utc": _dt.datetime.fromtimestamp(blocked_until_ts, _dt.timezone.utc).isoformat(),
-        "reason": marker.get("reason"),
+        "reason": reason,
         "source": "marker",
         "raw_output": "not_returned",
     }
@@ -3573,7 +3580,7 @@ def _codex_usage_watchdog_state_from_marker(marker: dict[str, Any], *, now: floa
 def _codex_usage_watchdog_state_from_snapshot(snapshot: dict[str, Any], *, now: float) -> dict[str, Any]:
     agent = str(snapshot.get("account") or snapshot.get("agent") or "")
     blocked_until_ts = parse_utc_timestamp(snapshot.get("blocked_until"))
-    blocked_reason = snapshot.get("blocked_reason")
+    blocked_reason = safe_codex_usage_reason(snapshot.get("blocked_reason"))
     status = str(snapshot.get("status") or "")
     if status == "blocked" and blocked_until_ts is None:
         raise AgentError("could_not_read_codex_usage_snapshot")
