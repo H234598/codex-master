@@ -9508,10 +9508,14 @@ def read_message() -> dict[str, Any] | None:
             break
     if first.startswith(b"Content-Length:"):
         length = parse_content_length(first)
+        header_bytes = len(first)
         while True:
             line = sys.stdin.buffer.readline(MAX_RPC_MESSAGE_BYTES + 1)
             if len(line) > MAX_RPC_MESSAGE_BYTES:
                 raise AgentError(f"RPC header line exceeds {MAX_RPC_MESSAGE_BYTES} bytes")
+            header_bytes += len(line)
+            if header_bytes > MAX_RPC_MESSAGE_BYTES:
+                raise AgentError(f"RPC header block exceeds {MAX_RPC_MESSAGE_BYTES} bytes")
             if line in (b"\r\n", b"\n", b""):
                 break
         body = sys.stdin.buffer.read(length)

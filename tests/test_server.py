@@ -2247,6 +2247,13 @@ class ServerHelpersTest(unittest.TestCase):
             with self.assertRaisesRegex(AgentError, "Content-Length exceeds"):
                 read_message()
 
+    def test_read_message_rejects_oversized_content_length_header_block(self) -> None:
+        header_line = b"X: " + (b"x" * (64 * 1024 - 5)) + b"\r\n"
+        data = b"Content-Length: 2\r\n" + (header_line * 17) + b"\r\n{}"
+        with patch("sys.stdin", FakeStdin(data)):
+            with self.assertRaisesRegex(AgentError, "RPC header block exceeds"):
+                read_message()
+
     def test_read_message_rejects_oversized_json_line(self) -> None:
         data = b"{" + (b"x" * MAX_RPC_MESSAGE_BYTES)
         with patch("sys.stdin", FakeStdin(data)):
