@@ -4091,7 +4091,9 @@ def watchdog_marker_matches(
     return requested_at is not None and requested_at <= current
 
 
-def watchdog_output_changed_since_marker(status: dict[str, Any], marker: dict[str, Any]) -> bool:
+def watchdog_output_changed_since_marker(
+    status: dict[str, Any], marker: dict[str, Any], *, now: float | None = None
+) -> bool:
     marker_bytes = marker.get("raw_log_bytes")
     current_bytes = status.get("raw_log_bytes")
     if (
@@ -4104,7 +4106,13 @@ def watchdog_output_changed_since_marker(status: dict[str, Any], marker: dict[st
         return True
     requested_at = parse_utc_timestamp(marker.get("requested_at_utc"))
     activity_at = parse_utc_timestamp(status.get("raw_log_updated_at_utc"))
-    return bool(requested_at is not None and activity_at is not None and activity_at > requested_at)
+    current = time.time() if now is None else now
+    return bool(
+        requested_at is not None
+        and activity_at is not None
+        and activity_at <= current
+        and activity_at > requested_at
+    )
 
 
 def public_watchdog_report_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -4245,7 +4253,7 @@ def watchdog_agent(
         session_started_at=status.get("started_at_utc"),
         now=now,
     )
-    output_changed = marker_is_current and watchdog_output_changed_since_marker(status, marker)
+    output_changed = marker_is_current and watchdog_output_changed_since_marker(status, marker, now=now)
     if marker_is_current and output_changed:
         if not dry_run:
             update_watchdog_marker(agent, None)

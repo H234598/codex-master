@@ -157,6 +157,7 @@ from codex_master.server import (
     prune_plugin_cache_versions,
     watchdog_effective_idle,
     watchdog_marker_matches,
+    watchdog_output_changed_since_marker,
 )
 
 
@@ -3398,6 +3399,21 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertIsNone(result["effective_idle_seconds"])
         self.assertEqual(result["activity_source"], "insufficient_idle_evidence")
+
+    def test_watchdog_output_change_ignores_future_raw_log_timestamp(self) -> None:
+        self.assertFalse(
+            watchdog_output_changed_since_marker(
+                {
+                    "raw_log_bytes": 100,
+                    "raw_log_updated_at_utc": "2099-01-01T00:00:00+00:00",
+                },
+                {
+                    "raw_log_bytes": 100,
+                    "requested_at_utc": "2026-06-07T10:00:00+00:00",
+                },
+                now=1780826400.0,
+            )
+        )
 
     def test_watchdog_marker_requires_same_assignment_identity(self) -> None:
         marker = {
