@@ -1613,6 +1613,17 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["tool_count"], 0)
         self.assertFalse(result["required_tool_available"])
 
+    @patch("codex_master.server.subprocess.run", side_effect=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid"))
+    def test_mcp_self_tests_fail_closed_on_invalid_command_output(self, _mock_run) -> None:
+        startup = mcp_command_startup_self_test(Path("/tmp/codex-master-mcp"))
+        tools = mcp_command_tools_list_self_test(Path("/tmp/codex-master-mcp"))
+
+        self.assertFalse(startup["ok"])
+        self.assertEqual(startup["status"], "failed")
+        self.assertFalse(tools["ok"])
+        self.assertEqual(tools["status"], "failed")
+        self.assertFalse(tools["required_tool_available"])
+
     def test_codex_related_process_summary_is_aggregate_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

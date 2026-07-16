@@ -1137,6 +1137,13 @@ def mcp_command_startup_self_test(
             "timeout_seconds": timeout,
             "raw_output": "not_returned",
         }
+    except UnicodeDecodeError:
+        return {
+            "ok": False,
+            "status": "failed",
+            "timeout_seconds": timeout,
+            "raw_output": "not_returned",
+        }
 
     output = cp.stdout
     ok = cp.returncode == 0 and mcp_probe_response_ok(output)
@@ -1179,6 +1186,15 @@ def mcp_command_tools_list_self_test(
         return {
             "ok": False,
             "status": "timeout",
+            "timeout_seconds": timeout,
+            "required_tool": required_tool,
+            "required_tool_available": False,
+            "raw_output": "not_returned",
+        }
+    except UnicodeDecodeError:
+        return {
+            "ok": False,
+            "status": "failed",
             "timeout_seconds": timeout,
             "required_tool": required_tool,
             "required_tool_available": False,
