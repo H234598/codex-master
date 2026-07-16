@@ -3768,7 +3768,7 @@ def codex_usage_watchdog_status(
             snapshot_account = account
             break
     if snapshot:
-        snapshot_identity = snapshot.get("account") or snapshot.get("agent")
+        snapshot_identity = snapshot["account"] if "account" in snapshot else snapshot.get("agent")
         if snapshot_identity != snapshot_account:
             raise AgentError("could_not_read_codex_usage_snapshot")
         state = _codex_usage_watchdog_state_from_snapshot(snapshot, now=now)
@@ -3889,7 +3889,8 @@ def _codex_usage_watchdog_state_from_marker(marker: dict[str, Any], *, now: floa
 
 
 def _codex_usage_watchdog_state_from_snapshot(snapshot: dict[str, Any], *, now: float) -> dict[str, Any]:
-    agent = str(snapshot.get("account") or snapshot.get("agent") or "")
+    identity = snapshot["account"] if "account" in snapshot else snapshot.get("agent")
+    agent = str(identity or "")
     blocked_until_ts = parse_utc_timestamp(snapshot.get("blocked_until"))
     blocked_reason = safe_codex_usage_reason(snapshot.get("blocked_reason"))
     status = str(snapshot.get("status") or "")
