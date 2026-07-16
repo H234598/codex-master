@@ -3201,10 +3201,7 @@ def codex_usage_snapshot_accounts(
             accounts.append(value)
 
     if include_assignment_history:
-        try:
-            records = list_assignments(agent, 1).get("records", [])
-        except AgentError:
-            records = []
+        records = list_assignments(agent, 1).get("records", [])
     else:
         records = []
     record = records[-1] if records and isinstance(records[-1], dict) else {}

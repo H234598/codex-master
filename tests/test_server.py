@@ -4692,6 +4692,16 @@ class ServerHelpersTest(unittest.TestCase):
             with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_watchdog_metadata"):
                 codex_usage_watchdog_status("a")
 
+    def test_codex_usage_watchdog_status_fails_closed_on_unreadable_assignment_log(self) -> None:
+        with patch("codex_master.server.read_meta", return_value={}), patch(
+            "codex_master.server.list_assignments",
+            side_effect=AgentError("could_not_read_assignment_log"),
+        ), patch("codex_master.server.read_codex_usage_snapshot") as read_snapshot:
+            with self.assertRaisesRegex(AgentError, "could_not_read_assignment_log"):
+                codex_usage_watchdog_status("a")
+
+        read_snapshot.assert_not_called()
+
     def test_codex_usage_watchdog_status_fails_closed_on_invalid_marker_type(self) -> None:
         with patch(
             "codex_master.server.read_meta",
