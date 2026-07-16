@@ -4168,7 +4168,7 @@ def watchdog_agent(
             )
             if marker:
                 if (
-                    marker.get("release_lease_after_action")
+                    marker.get("release_lease_after_action") is True
                     and marker_lease_matches
                     and agent_lease_status(agent).get("held_by_this_server")
                 ):
@@ -4196,7 +4196,7 @@ def watchdog_agent(
                 session_started_at=status.get("started_at_utc"),
             )
             if (
-                marker.get("release_lease_after_action")
+                marker.get("release_lease_after_action") is True
                 and marker_lease_matches
                 and agent_lease_status(agent).get("held_by_this_server")
             ):
@@ -4215,7 +4215,7 @@ def watchdog_agent(
         assignment_id=assignment_id,
         session_started_at=status.get("started_at_utc"),
     )
-    release_watchdog_lease = bool(marker.get("release_lease_after_action")) and marker_lease_matches
+    release_watchdog_lease = marker.get("release_lease_after_action") is True and marker_lease_matches
     marker_is_current = watchdog_marker_matches(
         marker,
         action=action,
