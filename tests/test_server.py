@@ -42,6 +42,7 @@ from codex_master.server import (
     BRACKETED_PASTE_END,
     CODEX_TUI_SUBMIT_KEY,
     COMMAND_TIMEOUT_RETURN_CODE,
+    COMMAND_UNAVAILABLE_RETURN_CODE,
     DEFAULT_COMMAND_TIMEOUT_SECONDS,
     DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS,
     DEFAULT_SEND_READY_TIMEOUT_SECONDS,
@@ -1962,6 +1963,13 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("timed out", result.stderr)
         self.assertEqual(mock_run.call_args.kwargs["timeout"], DEFAULT_COMMAND_TIMEOUT_SECONDS)
 
+    @patch("codex_master.server.subprocess.run", side_effect=FileNotFoundError("git missing"))
+    def test_run_command_returns_unavailable_result(self, _mock_run) -> None:
+        result = run_command(["git", "status"])
+
+        self.assertEqual(result.returncode, COMMAND_UNAVAILABLE_RETURN_CODE)
+        self.assertIn("git missing", result.stderr)
+
     @patch("codex_master.server.subprocess.run")
     def test_run_tmux_returns_bounded_timeout_result(self, mock_run) -> None:
         mock_run.side_effect = subprocess.TimeoutExpired(
@@ -1974,6 +1982,13 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result.stdout, "partial")
         self.assertIn("timed out", result.stderr)
         self.assertEqual(mock_run.call_args.kwargs["timeout"], DEFAULT_TMUX_TIMEOUT_SECONDS)
+
+    @patch("codex_master.server.subprocess.run", side_effect=FileNotFoundError("tmux missing"))
+    def test_run_tmux_returns_unavailable_result(self, _mock_run) -> None:
+        result = run_tmux(["has-session"], check=False)
+
+        self.assertEqual(result.returncode, COMMAND_UNAVAILABLE_RETURN_CODE)
+        self.assertIn("tmux missing", result.stderr)
 
     def test_initialize_rejects_unsupported_protocol(self) -> None:
         response = handle_rpc(

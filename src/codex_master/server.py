@@ -141,6 +141,7 @@ PLUGIN_CACHE_OPTIONAL_DIRS = ("docs", "examples", "schemas", "scripts")
 PLUGIN_CACHE_EXCLUDED_NAMES = (".git", ".pytest_cache", ".mypy_cache", ".ruff_cache", "__pycache__")
 PLUGIN_CACHE_EXCLUDED_SUFFIXES = (".pyc", ".pyo", ".swp", ".swo", ".tmp", ".bak", ".orig", ".rej", "~")
 COMMAND_TIMEOUT_RETURN_CODE = 124
+COMMAND_UNAVAILABLE_RETURN_CODE = 127
 DEFAULT_TMUX_TIMEOUT_SECONDS = 10
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
 DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS = 10
@@ -921,6 +922,11 @@ def run_tmux(
         if check:
             raise subprocess.CalledProcessError(cp.returncode, cp.args, output=cp.stdout, stderr=cp.stderr) from exc
         return cp
+    except OSError as exc:
+        cp = subprocess.CompletedProcess(command, COMMAND_UNAVAILABLE_RETURN_CODE, "", str(exc))
+        if check:
+            raise subprocess.CalledProcessError(cp.returncode, cp.args, output=cp.stdout, stderr=cp.stderr) from exc
+        return cp
 
 
 def run_command(
@@ -944,6 +950,11 @@ def run_command(
         )
     except subprocess.TimeoutExpired as exc:
         cp = timeout_completed_process(args, exc, "command")
+        if check:
+            raise subprocess.CalledProcessError(cp.returncode, cp.args, output=cp.stdout, stderr=cp.stderr) from exc
+        return cp
+    except OSError as exc:
+        cp = subprocess.CompletedProcess(args, COMMAND_UNAVAILABLE_RETURN_CODE, "", str(exc))
         if check:
             raise subprocess.CalledProcessError(cp.returncode, cp.args, output=cp.stdout, stderr=cp.stderr) from exc
         return cp
