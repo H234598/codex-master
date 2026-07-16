@@ -588,7 +588,7 @@ def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | floa
     section_end = len(lines)
 
     for index, line in enumerate(lines):
-        if line.strip() == MCP_SERVER_TABLE_HEADER:
+        if line.split("#", 1)[0].strip() == MCP_SERVER_TABLE_HEADER:
             section_start = index
             break
 

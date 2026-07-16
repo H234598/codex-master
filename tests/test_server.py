@@ -385,6 +385,14 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIsNone(inserted_previous)
         self.assertIn('command = "/tmp/codex-master-mcp"\nstartup_timeout_sec = 120', inserted)
 
+        commented_header = existing_low.replace(
+            "[mcp_servers.codex-master-mcp]", "[mcp_servers.codex-master-mcp] # keep this section"
+        )
+        commented_updated, commented_changed, _commented_previous = updated_mcp_startup_timeout_config(commented_header)
+        self.assertTrue(commented_changed)
+        self.assertEqual(commented_updated.count("[mcp_servers.codex-master-mcp]"), 1)
+        self.assertIn("startup_timeout_sec = 120", commented_updated)
+
     def test_ensure_mcp_startup_timeout_configured_is_path_sparse_and_no_follow(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = Path(tmpdir) / ".codex" / "config.toml"
