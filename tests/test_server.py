@@ -1028,6 +1028,28 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(result["checks"]["service_last_run_success"])
         self.assertFalse(result["ok"])
 
+    def test_master_watchdog_status_rejects_incomplete_service_result(self) -> None:
+        timer = {
+            "ok": True,
+            "properties": {"LoadState": "loaded", "ActiveState": "active", "SubState": "waiting"},
+        }
+        service = {
+            "ok": True,
+            "properties": {
+                "LoadState": "loaded",
+                "Result": "",
+                "ExecMainStatus": "",
+                "ExecMainStartTimestamp": "Sun 2026-06-07 18:45:00 CEST",
+            },
+        }
+        with patch("codex_master.server.systemctl_user_show", side_effect=[timer, service]), patch(
+            "codex_master.server.watchdog_unit_file_status", return_value={"ok": True}
+        ), patch("codex_master.server.watchdog_security_status", return_value={"ok": True}):
+            result = master_watchdog_status()
+
+        self.assertFalse(result["checks"]["service_last_run_success"])
+        self.assertFalse(result["ok"])
+
     def test_master_watchdog_status_detects_missing_hardening_directive(self) -> None:
         source_root = Path(__file__).resolve().parents[1]
         service_text = (source_root / "systemd" / "user" / "codex-master-watchdog.service").read_text(encoding="utf-8")

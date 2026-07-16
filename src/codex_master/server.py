@@ -6511,8 +6511,8 @@ def master_watchdog_status(root: Path | None = None, systemd_user_dir: Path | No
         bool(service.get("ok"))
         and service_props.get("LoadState") == "loaded"
         and bool(service_props.get("ExecMainStartTimestamp"))
-        and service_props.get("Result") in {"", "success"}
-        and service_props.get("ExecMainStatus") in {"", "0"}
+        and service_props.get("Result") == "success"
+        and service_props.get("ExecMainStatus") == "0"
     )
     checks = {
         "timer_active": timer_ok,
