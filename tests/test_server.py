@@ -2813,6 +2813,9 @@ class ServerHelpersTest(unittest.TestCase):
             "Usage limit not reached",
             "Context window is not full",
             "Codex is not rate limited right now.",
+            "Not too many requests are pending.",
+            "No rate limit reached.",
+            "Context window is not too long.",
         ):
             with self.subTest(text=text):
                 result = classify_limit_text(text)
