@@ -7370,7 +7370,13 @@ def tui_accepts_input(text: str) -> bool:
 
 def wait_agent_input_ready(agent: str, timeout_seconds: float = DEFAULT_SEND_READY_TIMEOUT_SECONDS) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
-    timeout_seconds = max(0.0, float(timeout_seconds))
+    try:
+        timeout_seconds = float(timeout_seconds)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise AgentError("timeout_seconds must be a finite number") from exc
+    if not math.isfinite(timeout_seconds):
+        raise AgentError("timeout_seconds must be a finite number")
+    timeout_seconds = max(0.0, timeout_seconds)
     deadline = time.monotonic() + timeout_seconds
     polls = 0
     while True:

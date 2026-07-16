@@ -133,6 +133,7 @@ from codex_master.server import (
     tui_accepts_input,
     uninstall,
     wait_agent,
+    wait_agent_input_ready,
     wait_terminal_status,
     WRITE_AGENT_MODEL,
     WRITE_AGENT_MODEL_EFFORT,
@@ -6523,6 +6524,11 @@ class ServerHelpersTest(unittest.TestCase):
             wait_agent("a", poll_interval_seconds=False)
         with self.assertRaisesRegex(AgentError, f"poll_interval_seconds must be <= {MAX_WAIT_POLL_SECONDS}"):
             wait_agent("a", poll_interval_seconds=MAX_WAIT_POLL_SECONDS + 1)
+
+    def test_wait_agent_input_ready_rejects_non_finite_timeout(self) -> None:
+        for timeout in (float("nan"), float("inf"), float("-inf")):
+            with self.assertRaisesRegex(AgentError, "timeout_seconds must be a finite number"):
+                wait_agent_input_ready("a", timeout)
 
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.run_tmux")
