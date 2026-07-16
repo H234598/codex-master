@@ -101,6 +101,7 @@ from codex_master.server import (
     read_message,
     read_meta,
     remember_agent_routing,
+    remember_agent_usage_account,
     safe_tail,
     same_path_text,
     serve_mcp,
@@ -4022,12 +4023,36 @@ class ServerHelpersTest(unittest.TestCase):
             return_value={"authenticated": True},
         ), patch(
             "codex_master.server.codex_usage_routing_decision", return_value=routing
-        ) as route, patch("codex_master.server.remember_agent_routing") as remember:
+        ) as route, patch("codex_master.server.remember_agent_usage_account") as remember:
             status = ensure_agent_not_blocked_by_codex_usage("a1")
 
         self.assertEqual(status, clear)
         route.assert_called_once_with("a1", role="teamleiterin")
-        remember.assert_called_once_with("a1", routing)
+        remember.assert_called_once_with("a1", "BW_Privat")
+
+    def test_remember_agent_usage_account_preserves_existing_route(self) -> None:
+        meta = {
+            "routing": {
+                "account": "BW_Alt",
+                "backend_account_id": "backend-old",
+                "decision": "spark",
+                "model": WRITE_AGENT_MODEL,
+            }
+        }
+        with patch("codex_master.server.read_meta", return_value=meta), patch(
+            "codex_master.server.write_meta"
+        ) as write:
+            remember_agent_usage_account("a1", "BW_Neu")
+
+        self.assertEqual(
+            write.call_args.args[1]["routing"],
+            {
+                "account": "BW_Neu",
+                "backend_account_id": "backend-old",
+                "decision": "spark",
+                "model": WRITE_AGENT_MODEL,
+            },
+        )
 
     def test_codex_usage_watchdog_reason_is_bounded_and_redacted(self) -> None:
         secret_reason = "/home/teladi/private-token sk-usage-secret1234567890 " + ("x" * 500)

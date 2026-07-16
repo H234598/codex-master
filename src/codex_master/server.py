@@ -3249,6 +3249,18 @@ def remember_agent_routing(agent: str, routing: dict[str, Any] | None) -> None:
     write_meta(agent, meta)
 
 
+def remember_agent_usage_account(agent: str, account: Any) -> None:
+    if not isinstance(account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(account):
+        return
+    meta = read_meta(agent)
+    routing = meta.get("routing")
+    if not isinstance(routing, dict):
+        routing = {}
+    routing["account"] = account
+    meta["routing"] = routing
+    write_meta(agent, meta)
+
+
 def update_agent_spark_health(agent: str, *, state: str, reason: str) -> dict[str, Any]:
     route = agent_spark_routing(agent)
     if route is None:
@@ -3743,7 +3755,7 @@ def ensure_agent_not_blocked_by_codex_usage(agent: str) -> dict[str, Any]:
         auth = agent_auth_status(agent)
         if auth.get("authenticated"):
             routing = codex_usage_routing_decision(agent, role="teamleiterin")
-            remember_agent_routing(agent, routing)
+            remember_agent_usage_account(agent, routing.get("account"))
             if routing.get("decision") == "blocked":
                 reason = routing.get("reason") or "codex usage limit reached"
                 raise AgentError(f"agent {canonical_agent_id(agent)} is blocked by codex-usage routing: {reason}")
