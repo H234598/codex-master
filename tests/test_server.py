@@ -6241,6 +6241,33 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(payload["cwd"], "not_returned")
         self.assertEqual(payload["cwd_state"], "set")
 
+    def test_scope_check_rejects_non_directory_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cwd = Path(tmpdir) / "not-a-directory"
+            cwd.write_text("file", encoding="utf-8")
+            response = handle_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 27,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "agent_scope_check",
+                        "arguments": {
+                            "scope": ["."],
+                            "write_paths": ["child/file.py"],
+                            "cwd": str(cwd),
+                        },
+                    },
+                }
+            )
+
+        self.assertFalse(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertFalse(payload["allowed"])
+        self.assertEqual(payload["violations"], ["child/file.py"])
+        self.assertEqual(payload["cwd"], "not_returned")
+        self.assertEqual(payload["cwd_state"], "invalid")
+
     @patch("codex_master.server.ensure_state")
     def test_assignments_redact_historical_absolute_paths(self, _mock_ensure_state) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

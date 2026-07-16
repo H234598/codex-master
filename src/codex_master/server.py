@@ -4399,10 +4399,11 @@ def path_is_within(path: Path, scope: Path) -> bool:
 def scope_check(scope: list[str], write_paths: list[str], cwd: Any = None) -> dict[str, Any]:
     cwd = bounded_text(cwd, field="cwd", max_chars=MAX_PATH_TEXT) if cwd is not None else None
     base = Path(cwd or os.getcwd()).expanduser().resolve(strict=False)
-    scope_paths = [path for item in scope if (path := normalize_scope_path(item, base)) is not None]
+    cwd_valid = base.is_dir()
+    scope_paths = [path for item in scope if (path := normalize_scope_path(item, base)) is not None] if cwd_valid else []
     violations: list[str] = []
 
-    if write_paths and not scope_paths:
+    if write_paths and (not cwd_valid or not scope_paths):
         violations = redact_list(write_paths)
     else:
         for original in write_paths:
@@ -4412,7 +4413,7 @@ def scope_check(scope: list[str], write_paths: list[str], cwd: Any = None) -> di
 
     return {
         "cwd": PATH_NOT_RETURNED,
-        "cwd_state": "set",
+        "cwd_state": "set" if cwd_valid else "invalid",
         "allowed": not violations,
         "scope": redact_list(scope),
         "write_paths": redact_list(write_paths),
