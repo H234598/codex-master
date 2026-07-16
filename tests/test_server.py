@@ -2172,6 +2172,18 @@ class ServerHelpersTest(unittest.TestCase):
             with self.assertRaisesRegex(AgentError, "RPC message must be an object"):
                 handle_rpc(message)
 
+    def test_handle_rpc_rejects_invalid_json_rpc_request_shape(self) -> None:
+        wrong_version = handle_rpc({"jsonrpc": "1.0", "id": 41, "method": "tools/list"})
+        missing_method = handle_rpc({"jsonrpc": "2.0", "id": 42})
+        invalid_id = handle_rpc({"jsonrpc": "2.0", "id": [], "method": "tools/list"})
+
+        self.assertEqual(wrong_version["error"], {"code": -32600, "message": "Invalid Request"})
+        self.assertEqual(wrong_version["id"], 41)
+        self.assertEqual(missing_method["error"]["code"], -32600)
+        self.assertEqual(missing_method["id"], 42)
+        self.assertEqual(invalid_id["error"]["code"], -32600)
+        self.assertIsNone(invalid_id["id"])
+
     def test_mcp_tool_call_enforces_schema_properties_and_required_fields(self) -> None:
         unknown_response = handle_rpc(
             {

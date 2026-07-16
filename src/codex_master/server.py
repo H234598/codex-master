@@ -8728,8 +8728,17 @@ def rpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
 def handle_rpc(msg: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(msg, dict):
         raise AgentError("RPC message must be an object")
-    method = msg.get("method")
     message_id = msg.get("id")
+    valid_id = message_id is None or (
+        isinstance(message_id, (str, int, float)) and not isinstance(message_id, bool)
+    )
+    if "id" in msg and not valid_id:
+        return rpc_error(None, -32600, "Invalid Request")
+    if msg.get("jsonrpc") != "2.0":
+        return rpc_error(message_id if "id" in msg else None, -32600, "Invalid Request")
+    method = msg.get("method")
+    if not isinstance(method, str):
+        return rpc_error(message_id if "id" in msg else None, -32600, "Invalid Request")
 
     def reply(payload: dict[str, Any]) -> dict[str, Any] | None:
         return payload if "id" in msg else None
