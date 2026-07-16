@@ -96,6 +96,7 @@ from codex_master.server import (
     prune_assignment_log,
     prune_raw_logs,
     raw_log_retention_status,
+    raw_log_metadata,
     read_message,
     read_meta,
     safe_tail,
@@ -2137,6 +2138,13 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, COMMAND_UNAVAILABLE_RETURN_CODE)
         self.assertIn("tmux missing", result.stderr)
+
+    def test_raw_log_metadata_fails_closed_on_unrepresentable_mtime(self) -> None:
+        fake_stat = Mock(st_mode=stat.S_IFREG, st_size=12, st_mtime=float("inf"))
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(Path, "lstat", return_value=fake_stat):
+            result = raw_log_metadata(Path(tmpdir) / "agent.log")
+
+        self.assertEqual(result, {"bytes": 12, "updated_at_utc": None, "idle_seconds": None})
 
     def test_initialize_rejects_unsupported_protocol(self) -> None:
         response = handle_rpc(
