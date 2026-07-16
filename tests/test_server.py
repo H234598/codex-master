@@ -144,6 +144,7 @@ from codex_master.server import (
     mcp_tools_list_probe_result,
     master_namespace_status,
     master_release_status,
+    open_directory_no_follow_matching,
     plugin_cache_status,
     plugin_manifest_version,
     prune_plugin_cache_versions,
@@ -5792,6 +5793,72 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn(str(real_parent), str(raised.exception))
         self.assertFalse(redirected_target.exists())
 
+    @patch("codex_master.server.subprocess.run")
+    def test_worktree_create_pins_parent_before_git_call(self, mock_subprocess_run) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            repo = tmp_path / "repo"
+            checked_parent = repo / "checked-parent"
+            outside = tmp_path / "outside"
+            repo.mkdir()
+            checked_parent.mkdir()
+            outside.mkdir()
+            target = checked_parent / "agent-a"
+            observed: list[Path] = []
+            raced = [False]
+
+            def race_before_git(args, **kwargs):
+                if args[:3] == ["git", "show-ref", "--verify"] and not raced[0]:
+                    checked_parent.rmdir()
+                    checked_parent.symlink_to(outside, target_is_directory=True)
+                    raced[0] = True
+                    return subprocess.CompletedProcess(args, 1, "", "")
+                if args[:3] == ["git", "worktree", "add"]:
+                    observed.append(Path(kwargs["cwd"]).resolve())
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            mock_subprocess_run.side_effect = race_before_git
+
+            with patch("codex_master.server.repo_root", return_value=repo):
+                result = worktree_create_for_agent("a", path=str(target))
+
+        self.assertEqual(result["status"], "created")
+        self.assertEqual(len(observed), 1)
+        self.assertNotEqual(observed[0].parent, outside)
+        self.assertEqual(mock_subprocess_run.call_args.args[0], ["git", "worktree", "add", "-b", "agent-a", "."])
+
+    @patch("codex_master.server.run_command")
+    def test_worktree_create_refuses_target_swap_before_git_call(self, mock_run_command) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            repo = tmp_path / "repo"
+            parent = repo / "parent"
+            outside = tmp_path / "outside"
+            repo.mkdir()
+            parent.mkdir()
+            outside.mkdir()
+            target = parent / "agent-a"
+
+            original_open = open_directory_no_follow_matching
+
+            def race_target_open(path, *args, **kwargs):
+                if kwargs.get("dir_fd") is not None and path == target.name:
+                    target.rmdir()
+                    target.symlink_to(outside, target_is_directory=True)
+                return original_open(path, *args, **kwargs)
+
+            with patch("codex_master.server.open_directory_no_follow_matching", side_effect=race_target_open):
+                with patch("codex_master.server.repo_root", return_value=repo):
+                    with self.assertRaisesRegex(AgentError, "worktree path must be a real directory"):
+                        worktree_create_for_agent("a", path=str(target))
+
+            target_is_symlink = target.is_symlink()
+            outside_empty = list(outside.iterdir()) == []
+
+        mock_run_command.assert_not_called()
+        self.assertTrue(target_is_symlink)
+        self.assertTrue(outside_empty)
+
     @patch("codex_master.server.run_command")
     def test_worktree_create_refuses_broken_target_symlink_without_git_call(self, mock_run_command) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5814,8 +5881,10 @@ class ServerHelpersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
             relative = ".codex-master-worktrees/agent-a"
-            expected_target = repo / relative
-            mock_run_command.return_value = subprocess.CompletedProcess(["git"], 0, "", "")
+            mock_run_command.side_effect = [
+                subprocess.CompletedProcess(["git"], 1, "", ""),
+                subprocess.CompletedProcess(["git"], 0, "", ""),
+            ]
 
             with patch("codex_master.server.repo_root", return_value=repo):
                 result = worktree_create_for_agent("a", path=relative)
@@ -5824,8 +5893,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["path_state"], "set")
         self.assertEqual(result["path_kind"], "repo_relative")
         self.assertEqual(result["status"], "created")
-        self.assertEqual(mock_run_command.call_args.args[0], ["git", "worktree", "add", str(expected_target)])
-        self.assertEqual(mock_run_command.call_args.kwargs["cwd"], repo)
+        self.assertEqual(mock_run_command.call_args_list[-1].args[0], ["git", "worktree", "add", "-b", "agent-a", "."])
+        self.assertRegex(str(mock_run_command.call_args_list[-1].kwargs["cwd"]), r"^/proc/self/fd/\d+$")
         self.assertNotIn(str(repo), json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.run_command")
@@ -5833,7 +5902,6 @@ class ServerHelpersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
             relative = ".codex-master-worktrees/agent-a"
-            expected_target = repo / relative
             mock_run_command.return_value = subprocess.CompletedProcess(["git"], 0, "", "")
 
             with patch("codex_master.server.repo_root", return_value=repo):
@@ -5841,7 +5909,8 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(result["base_ref"], "not_returned")
         self.assertEqual(result["base_ref_state"], "set")
-        self.assertEqual(mock_run_command.call_args.args[0], ["git", "worktree", "add", str(expected_target), "origin/main"])
+        self.assertEqual(mock_run_command.call_args.args[0], ["git", "worktree", "add", ".", "origin/main"])
+        self.assertRegex(str(mock_run_command.call_args.kwargs["cwd"]), r"^/proc/self/fd/\d+$")
         self.assertNotIn("origin/main", json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.run_command")
@@ -5911,6 +5980,34 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn(str(link_dir), str(raised.exception))
         self.assertNotIn(str(real_dir), str(raised.exception))
 
+    @patch("codex_master.server.subprocess.run")
+    def test_worktree_status_pins_target_before_git_call(self, mock_subprocess_run) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            repo = tmp_path / "repo"
+            target = repo / "worktree"
+            outside = tmp_path / "outside"
+            repo.mkdir()
+            target.mkdir()
+            outside.mkdir()
+            observed: list[Path] = []
+
+            def race_before_git(args, **kwargs):
+                if args == ["git", "status", "--short"]:
+                    target.rmdir()
+                    target.symlink_to(outside, target_is_directory=True)
+                    observed.append(Path(kwargs["cwd"]).resolve())
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            mock_subprocess_run.side_effect = race_before_git
+
+            with patch("codex_master.server.repo_root", return_value=repo):
+                result = worktree_status(str(target))
+
+        self.assertEqual(result["path_state"], "set")
+        self.assertEqual(len(observed), 1)
+        self.assertNotEqual(observed[0], outside)
+
     @patch("codex_master.server.run_command")
     def test_worktree_status_refuses_non_directory_without_git_call(self, mock_run_command) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5943,7 +6040,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["path"], "not_returned")
         self.assertEqual(result["path_state"], "set")
         self.assertEqual(mock_run_command.call_args_list[0].args[0], ["git", "status", "--short"])
-        self.assertEqual(mock_run_command.call_args_list[0].kwargs["cwd"], target)
+        self.assertRegex(str(mock_run_command.call_args_list[0].kwargs["cwd"]), r"^/proc/self/fd/\d+$")
         result_text = json.dumps(result, sort_keys=True)
         self.assertNotIn(str(repo), result_text)
         self.assertNotIn(str(target), result_text)

@@ -5033,17 +5033,78 @@ def worktree_create_for_agent(agent: str, path: Any = None, base_ref: Any = None
         raise AgentError("worktree path must stay inside repo")
     if path_present_no_follow(target):
         raise AgentError("worktree path already exists")
+    try:
+        parent_stat = target.parent.lstat()
+    except FileNotFoundError:
+        parent_stat = None
+    except OSError as exc:
+        raise AgentError("worktree parent directories must be real directories") from exc
     ensure_directory_chain_no_symlink(target.parent, "worktree parent directories must be real directories")
-    target = target.resolve(strict=False)
-    if not path_is_within(target, repo):
+    resolved_target = target.resolve(strict=False)
+    if not path_is_within(resolved_target, repo):
         raise AgentError("worktree path must stay inside repo")
-    args = ["worktree", "add", str(target)]
-    if base_ref:
-        args.append(base_ref)
-    cp = run_command(["git", *args], cwd=repo)
-    if cp.returncode != 0:
-        raise AgentError("git worktree add failed")
-    public_path = repo_relative_public_path(target, repo)
+    if parent_stat is None:
+        try:
+            parent_stat = target.parent.lstat()
+        except OSError as exc:
+            raise AgentError("worktree parent directories must be real directories") from exc
+    parent_fd = open_directory_chain_no_follow_matching(
+        target.parent,
+        parent_stat,
+        error_text="worktree parent directories must be real directories",
+        changed_text="worktree parent directories changed unexpectedly",
+    )
+    target_fd = -1
+    target_stat: os.stat_result | None = None
+    created_target = False
+    cp: subprocess.CompletedProcess[str] | None = None
+    try:
+        try:
+            os.mkdir(target.name, 0o755, dir_fd=parent_fd)
+        except FileExistsError as exc:
+            raise AgentError("worktree path already exists") from exc
+        except OSError as exc:
+            raise AgentError("worktree path could not be created") from exc
+        created_target = True
+        try:
+            target_stat = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise AgentError("worktree path must be a real directory") from exc
+        target_fd = open_directory_no_follow_matching(
+            target.name,
+            target_stat,
+            error_text="worktree path must be a real directory",
+            changed_text="worktree path changed unexpectedly",
+            dir_fd=parent_fd,
+        )
+        operation_cwd = Path(f"/proc/self/fd/{target_fd}")
+        if base_ref:
+            args = ["worktree", "add", ".", base_ref]
+        else:
+            branch_check = run_command(
+                ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{target.name}"],
+                cwd=operation_cwd,
+            )
+            args = (
+                ["worktree", "add", ".", target.name]
+                if branch_check.returncode == 0
+                else ["worktree", "add", "-b", target.name, "."]
+            )
+        cp = run_command(["git", *args], cwd=operation_cwd)
+        if cp.returncode != 0:
+            raise AgentError("git worktree add failed")
+    finally:
+        if created_target and target_stat is not None and (cp is None or cp.returncode != 0):
+            try:
+                current_target = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+                if source_identity_matches(current_target, target_stat):
+                    os.rmdir(target.name, dir_fd=parent_fd)
+            except OSError:
+                pass
+        if target_fd >= 0:
+            os.close(target_fd)
+        os.close(parent_fd)
+    public_path = repo_relative_public_path(resolved_target, repo)
     return {
         "agent": agent,
         "path": public_path or PATH_NOT_RETURNED,
@@ -5068,16 +5129,28 @@ def worktree_status(path: Any = None) -> dict[str, Any]:
         raise AgentError("worktree status path must stay inside repo")
     if not directory_chain_is_real_no_symlink(target.parent):
         raise AgentError("worktree status parent directories must be real directories")
-    if not is_real_directory_no_symlink(target):
+    try:
+        target_stat = target.lstat()
+    except OSError as exc:
+        raise AgentError("worktree status path must be a real directory") from exc
+    if stat_module.S_ISLNK(target_stat.st_mode) or not stat_module.S_ISDIR(target_stat.st_mode):
         raise AgentError("worktree status path must be a real directory")
-    target = target.resolve(strict=False)
-    return {
-        "path": PATH_NOT_RETURNED,
-        "path_state": "set",
-        "status": git_excerpt(["status", "--short"], cwd=target),
-        "worktrees": git_excerpt(["worktree", "list", "--porcelain"], cwd=repo),
-        "raw_output": "not_returned",
-    }
+    target_fd = open_directory_chain_no_follow_matching(
+        target,
+        target_stat,
+        error_text="worktree status path must be a real directory",
+        changed_text="worktree status path changed unexpectedly",
+    )
+    try:
+        return {
+            "path": PATH_NOT_RETURNED,
+            "path_state": "set",
+            "status": git_excerpt(["status", "--short"], cwd=Path(f"/proc/self/fd/{target_fd}")),
+            "worktrees": git_excerpt(["worktree", "list", "--porcelain"], cwd=repo),
+            "raw_output": "not_returned",
+        }
+    finally:
+        os.close(target_fd)
 
 
 def normalize_install_path(path: Path) -> Path:
@@ -5543,6 +5616,42 @@ def open_directory_no_follow_matching(
     except Exception:
         os.close(fd)
         raise
+
+
+def open_directory_chain_no_follow_matching(
+    path: Path,
+    expected_stat: os.stat_result,
+    *,
+    error_text: str,
+    changed_text: str,
+) -> int:
+    if not path.is_absolute():
+        raise AgentError(error_text)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(path.anchor, flags)
+        for part in path.parts[1:]:
+            child_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child_fd
+        opened_stat = os.fstat(fd)
+        if not stat_module.S_ISDIR(opened_stat.st_mode) or not source_identity_matches(opened_stat, expected_stat):
+            raise AgentError(changed_text)
+        result = fd
+        fd = -1
+        return result
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError(error_text) from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def read_json_object_from_dir_fd(dir_fd: int, name: str, label: str) -> dict[str, Any]:
