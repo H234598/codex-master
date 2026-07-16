@@ -2223,7 +2223,7 @@ def allowed_raw_log_path(raw_log: Any) -> Path | None:
     except OSError:
         return None
     else:
-        if stat_module.S_ISLNK(current_stat.st_mode):
+        if stat_module.S_ISLNK(current_stat.st_mode) or getattr(current_stat, "st_nlink", 1) > 1:
             return None
     try:
         candidate = raw_path.resolve(strict=False)
@@ -2257,10 +2257,12 @@ def bound_raw_log_file(path: Path, max_bytes: int = MAX_RAW_LOG_BYTES) -> bool:
         current_stat = path.lstat()
     except OSError:
         return False
-    if not stat_module.S_ISREG(current_stat.st_mode):
+    if not stat_module.S_ISREG(current_stat.st_mode) or getattr(current_stat, "st_nlink", 1) > 1:
         return False
     marker = RAW_LOG_TRUNCATION_MARKER[: max(0, max_bytes - 1)]
     with open_private_regular_update(path) as fh:
+        if getattr(os.fstat(fh.fileno()), "st_nlink", 1) > 1:
+            return False
         fh.seek(0, os.SEEK_END)
         size = fh.tell()
         if size <= max_bytes:
@@ -2277,6 +2279,8 @@ def append_bounded_raw_log(path: Path, chunk: bytes, max_bytes: int = MAX_RAW_LO
     if not chunk:
         return
     with open_private_regular_update(path) as fh:
+        if getattr(os.fstat(fh.fileno()), "st_nlink", 1) > 1:
+            raise RuntimeError("raw log path must not be a hardlink")
         fh.seek(0, os.SEEK_END)
         size = fh.tell()
         if size + len(chunk) <= max_bytes:
@@ -2344,6 +2348,13 @@ def prune_raw_logs(max_files: int = MAX_RAW_LOG_FILES, max_bytes: int = MAX_RAW_
                     path.unlink()
                     deleted += 1
                     deleted_symlink += 1
+                except FileNotFoundError:
+                    pass
+                continue
+            if stat_module.S_ISREG(current_stat.st_mode) and getattr(current_stat, "st_nlink", 1) > 1:
+                try:
+                    path.unlink()
+                    deleted += 1
                 except FileNotFoundError:
                     pass
                 continue
@@ -6727,7 +6738,7 @@ def read_log_tail(path: Path, approx_bytes: int) -> str:
     try:
         fd = os.open(path, flags)
         opened_stat = os.fstat(fd)
-        if not stat_module.S_ISREG(opened_stat.st_mode):
+        if not stat_module.S_ISREG(opened_stat.st_mode) or getattr(opened_stat, "st_nlink", 1) > 1:
             return ""
         with os.fdopen(fd, "rb") as fh:
             fd = -1

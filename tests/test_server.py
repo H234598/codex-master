@@ -3783,6 +3783,31 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(target_content, b"target")
 
+    def test_raw_log_hardlinks_are_rejected_and_pruned_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            raw_dir = tmp / "raw"
+            raw_dir.mkdir()
+            target = tmp / "outside.log"
+            target.write_bytes(b"target")
+            link = raw_dir / "linked.log"
+            os.link(target, link)
+
+            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
+                "codex_master.server.LEGACY_STATE_ROOT", tmp / "legacy"
+            ):
+                allowed = allowed_raw_log_path(str(link))
+                with self.assertRaisesRegex(RuntimeError, "hardlink"):
+                    append_bounded_raw_log(link, b"payload", max_bytes=128)
+                result = prune_raw_logs(max_files=2, max_bytes=80)
+                target_content = target.read_bytes()
+                link_exists = link.exists()
+
+        self.assertIsNone(allowed)
+        self.assertEqual(target_content, b"target")
+        self.assertFalse(link_exists)
+        self.assertEqual(result["deleted_count"], 1)
+
     def test_write_bounded_raw_log_requires_real_state_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_root = Path(tmpdir) / "state"
