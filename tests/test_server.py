@@ -2837,6 +2837,10 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(failed["limited"])
         self.assertEqual(failed["kind"], "token")
 
+        mixed_status = classify_limit_text("Rate limit reached. Retry later.\nNo rate limit applies to cached work.")
+        self.assertTrue(mixed_status["limited"])
+        self.assertEqual(mixed_status["kind"], "rate")
+
         rate_limited = classify_limit_text("Request was rate-limited. Retry later.")
         self.assertTrue(rate_limited["limited"])
         self.assertEqual(rate_limited["kind"], "rate")

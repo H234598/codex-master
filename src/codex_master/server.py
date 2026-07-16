@@ -3162,8 +3162,11 @@ def classify_limit_text(text: str, meta: dict[str, Any] | None = None, latest_as
     meta = meta or {}
     cleaned = strip_ansi(text)
     lowered = cleaned.lower()
-    has_limit = any(re.search(pattern, lowered) for pattern in LIMIT_TEXT_PATTERNS) and not any(
-        re.search(pattern, lowered) for pattern in LIMIT_CLEAR_TEXT_PATTERNS
+    limit_lines = lowered.splitlines() or [lowered]
+    has_limit = any(
+        any(re.search(pattern, line) for pattern in LIMIT_TEXT_PATTERNS)
+        and not any(re.search(pattern, line) for pattern in LIMIT_CLEAR_TEXT_PATTERNS)
+        for line in limit_lines
     )
     window = "unknown"
     if re.search(r"\b(?:daily|per day|today|24h|24 hours)\b", lowered):
