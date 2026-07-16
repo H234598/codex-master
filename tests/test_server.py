@@ -99,6 +99,7 @@ from codex_master.server import (
     raw_log_metadata,
     read_message,
     read_meta,
+    remember_agent_routing,
     safe_tail,
     same_path_text,
     serve_mcp,
@@ -3879,6 +3880,46 @@ class ServerHelpersTest(unittest.TestCase):
                 self.assertEqual(status["state"], "blocked")
                 self.assertTrue(status["blocked"])
                 self.assertEqual(status["source"], "snapshot")
+
+    def test_codex_usage_watchdog_status_reads_snapshot_for_routing_account(self) -> None:
+        blocked = {
+            "account": "BW_Privat",
+            "status": "blocked",
+            "blocked_until": "2099-06-08T06:50:00+00:00",
+            "blocked_reason": "usage limit reached",
+        }
+        with patch(
+            "codex_master.server.read_meta",
+            return_value={"routing": {"account": "BW_Privat"}},
+        ), patch("codex_master.server.list_assignments", return_value={"records": []}), patch(
+            "codex_master.server.read_codex_usage_snapshot", return_value=blocked
+        ) as read_snapshot:
+            status = codex_usage_watchdog_status("a1")
+
+        self.assertTrue(status["blocked"])
+        read_snapshot.assert_called_once_with("BW_Privat")
+
+    def test_remember_agent_routing_persists_main_usage_account(self) -> None:
+        routing = {
+            "account": "BW_Privat",
+            "backend_account_id": "backend-private",
+            "decision": "main",
+            "model": DEFAULT_AGENT_MODEL,
+        }
+        with patch("codex_master.server.read_meta", return_value={}), patch(
+            "codex_master.server.write_meta"
+        ) as write:
+            remember_agent_routing("a1", routing)
+
+        self.assertEqual(
+            write.call_args.args[1]["routing"],
+            {
+                "account": "BW_Privat",
+                "backend_account_id": "backend-private",
+                "decision": "main",
+                "model": DEFAULT_AGENT_MODEL,
+            },
+        )
 
     def test_codex_usage_watchdog_reason_is_bounded_and_redacted(self) -> None:
         secret_reason = "/home/teladi/private-token sk-usage-secret1234567890 " + ("x" * 500)

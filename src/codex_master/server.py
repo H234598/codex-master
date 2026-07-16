@@ -157,6 +157,7 @@ POOL_PREFIX_RE = re.compile(r"^[a-z][a-z0-9_-]{0,15}$")
 POOL_SAFE_RELATIVE_RE = re.compile(r"^[A-Za-z0-9._-][A-Za-z0-9._/-]{0,199}$")
 GIT_BASE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@{}~^+-]{0,199}$")
 ROUTING_CONTEXT_ID_RE = re.compile(r"^[A-Za-z0-9_.:@+-]{1,128}$")
+CODEX_USAGE_ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 MAX_POOL_AGENTS = 1000
 MAX_POOL_SERIES = 26
 MAX_POOL_SHARED_ASSETS = 40
@@ -323,8 +324,10 @@ def codex_usage_state_root() -> Path:
     return root / "codex-usage"
 
 
-def codex_usage_snapshot_path(agent: str) -> Path:
-    return codex_usage_state_root() / "snapshots" / f"{canonical_agent_id(agent)}.json"
+def codex_usage_snapshot_path(account: str) -> Path:
+    if not isinstance(account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(account):
+        raise AgentError("codex-usage snapshot account is invalid")
+    return codex_usage_state_root() / "snapshots" / f"{account}.json"
 
 
 def codex_usage_executable() -> str:
@@ -1267,8 +1270,8 @@ def read_json_file(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else error
 
 
-def read_codex_usage_snapshot(agent: str) -> dict[str, Any]:
-    path = codex_usage_snapshot_path(agent)
+def read_codex_usage_snapshot(account: str) -> dict[str, Any]:
+    path = codex_usage_snapshot_path(account)
     try:
         current_stat = path.lstat()
     except FileNotFoundError:
@@ -2193,8 +2196,8 @@ def validate_codex_usage_routing_decision(
     model = payload.get("model")
     if decision not in CODEX_USAGE_DECISIONS or payload.get("role") != role:
         raise AgentError("codex-usage routing decision is invalid")
-    if not isinstance(payload.get("account"), str) or not payload["account"]:
-        raise AgentError("codex-usage routing account is missing")
+    if not isinstance(payload.get("account"), str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(payload["account"]):
+        raise AgentError("codex-usage routing account is invalid")
     if not isinstance(payload.get("backend_account_id"), str) or not payload["backend_account_id"]:
         raise AgentError("codex-usage routing backend account id is missing")
     expected_model = {
@@ -3167,6 +3170,31 @@ def latest_assignment_summary(agent: str) -> dict[str, Any] | None:
     }
 
 
+def codex_usage_snapshot_accounts(agent: str, meta: dict[str, Any]) -> list[str]:
+    accounts: list[str] = []
+
+    def add_account(value: Any) -> None:
+        if value is None:
+            return
+        if not isinstance(value, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(value):
+            raise AgentError("codex-usage snapshot account is invalid")
+        if value not in accounts:
+            accounts.append(value)
+
+    try:
+        records = list_assignments(agent, 1).get("records", [])
+    except AgentError:
+        records = []
+    record = records[-1] if records and isinstance(records[-1], dict) else {}
+    assignment_routing = record.get("routing") if isinstance(record, dict) else None
+    add_account(assignment_routing.get("account") if isinstance(assignment_routing, dict) else None)
+
+    routing = meta.get("routing")
+    add_account(routing.get("account") if isinstance(routing, dict) else None)
+    add_account(agent)
+    return accounts
+
+
 def agent_spark_routing(agent: str) -> dict[str, Any] | None:
     agent = canonical_agent_id(agent)
     meta = read_meta(agent)
@@ -3195,17 +3223,17 @@ def agent_spark_routing(agent: str) -> dict[str, Any] | None:
 def remember_agent_routing(agent: str, routing: dict[str, Any] | None) -> None:
     if not isinstance(routing, dict):
         return
+    account = routing.get("account")
     backend_account_id = routing.get("backend_account_id")
     decision = routing.get("decision")
     model = routing.get("model")
-    if not isinstance(backend_account_id, str) or decision != "spark" or model != WRITE_AGENT_MODEL:
+    if not isinstance(account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(account):
         return
     meta = read_meta(agent)
-    meta["routing"] = {
-        "backend_account_id": backend_account_id,
-        "decision": decision,
-        "model": model,
-    }
+    remembered = {"account": account, "decision": decision, "model": model}
+    if isinstance(backend_account_id, str) and backend_account_id:
+        remembered["backend_account_id"] = backend_account_id
+    meta["routing"] = remembered
     write_meta(agent, meta)
 
 
@@ -3641,7 +3669,11 @@ def codex_usage_watchdog_status(agent: str) -> dict[str, Any]:
         if state["state"] == "blocked":
             return state
 
-    snapshot = read_codex_usage_snapshot(agent)
+    snapshot = {}
+    for account in codex_usage_snapshot_accounts(agent, meta):
+        snapshot = read_codex_usage_snapshot(account)
+        if snapshot:
+            break
     if snapshot:
         state = _codex_usage_watchdog_state_from_snapshot(snapshot, now=now)
         if state["state"] == "blocked":
