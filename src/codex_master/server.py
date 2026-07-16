@@ -3589,14 +3589,9 @@ def agent_response_state(
     }
 
 
-def activity_signature(status: dict[str, Any]) -> tuple[Any, Any]:
-    return (
-        status.get("raw_log_bytes"),
-        status.get("raw_log_updated_at_utc"),
-    )
-
-
-def wait_terminal_status(status: dict[str, Any], initial: dict[str, Any]) -> str | None:
+def wait_terminal_status(
+    status: dict[str, Any], initial: dict[str, Any], *, now: float | None = None
+) -> str | None:
     if not status.get("running"):
         return "not_running"
     if (status.get("limit_state") or {}).get("limited"):
@@ -3609,9 +3604,23 @@ def wait_terminal_status(status: dict[str, Any], initial: dict[str, Any]) -> str
     )
     assignment_created = parse_utc_timestamp(latest_assignment.get("created_at_utc"))
     raw_log_updated = parse_utc_timestamp(status.get("raw_log_updated_at_utc"))
-    if assignment_changed and assignment_created is not None and raw_log_updated is not None and raw_log_updated > assignment_created:
+    current = time.time() if now is None else now
+    if (
+        assignment_changed
+        and assignment_created is not None
+        and raw_log_updated is not None
+        and raw_log_updated <= current
+        and raw_log_updated > assignment_created
+    ):
         return "activity_observed"
-    if activity_signature(status) != activity_signature(initial):
+    if status.get("raw_log_bytes") != initial.get("raw_log_bytes"):
+        return "activity_observed"
+    initial_raw_log_updated = parse_utc_timestamp(initial.get("raw_log_updated_at_utc"))
+    if (
+        raw_log_updated is not None
+        and raw_log_updated <= current
+        and raw_log_updated != initial_raw_log_updated
+    ):
         return "activity_observed"
     initial_response_state = (initial.get("response_state") or {}).get("state")
     current_response_state = (status.get("response_state") or {}).get("state")

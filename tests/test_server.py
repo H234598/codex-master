@@ -132,6 +132,7 @@ from codex_master.server import (
     tui_accepts_input,
     uninstall,
     wait_agent,
+    wait_terminal_status,
     WRITE_AGENT_MODEL,
     WRITE_AGENT_MODEL_EFFORT,
     write_bounded_raw_log,
@@ -3338,6 +3339,36 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertEqual(result["response_output"], "not_returned")
         mock_sleep.assert_not_called()
+
+    def test_wait_terminal_status_ignores_future_log_after_assignment(self) -> None:
+        initial = {
+            "running": True,
+            "raw_log_bytes": 10,
+            "raw_log_updated_at_utc": "2099-01-01T00:00:00+00:00",
+            "last_assignment": {
+                "assignment_id": "old-assignment",
+                "created_at_utc": "2026-06-07T09:59:00+00:00",
+            },
+        }
+        current = {
+            **initial,
+            "last_assignment": {
+                "assignment_id": "new-assignment",
+                "created_at_utc": "2026-06-07T10:01:00+00:00",
+            },
+        }
+
+        self.assertIsNone(wait_terminal_status(current, initial, now=1780826400.0))
+
+    def test_wait_terminal_status_ignores_future_log_timestamp_change(self) -> None:
+        initial = {
+            "running": True,
+            "raw_log_bytes": 10,
+            "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
+        }
+        current = {**initial, "raw_log_updated_at_utc": "2099-01-01T00:00:00+00:00"}
+
+        self.assertIsNone(wait_terminal_status(current, initial, now=1780826400.0))
 
     @patch("codex_master.server.update_agent_spark_health")
     @patch("codex_master.server.status_agent")
