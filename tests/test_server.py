@@ -2212,6 +2212,7 @@ class ServerHelpersTest(unittest.TestCase):
         wrong_version = handle_rpc({"jsonrpc": "1.0", "id": 41, "method": "tools/list"})
         missing_method = handle_rpc({"jsonrpc": "2.0", "id": 42})
         invalid_id = handle_rpc({"jsonrpc": "2.0", "id": [], "method": "tools/list"})
+        non_finite_id = handle_rpc({"jsonrpc": "2.0", "id": float("inf"), "method": "tools/list"})
 
         self.assertEqual(wrong_version["error"], {"code": -32600, "message": "Invalid Request"})
         self.assertEqual(wrong_version["id"], 41)
@@ -2219,6 +2220,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(missing_method["id"], 42)
         self.assertEqual(invalid_id["error"]["code"], -32600)
         self.assertIsNone(invalid_id["id"])
+        self.assertEqual(non_finite_id["error"]["code"], -32600)
+        self.assertIsNone(non_finite_id["id"])
 
     def test_mcp_tool_call_enforces_schema_properties_and_required_fields(self) -> None:
         unknown_response = handle_rpc(

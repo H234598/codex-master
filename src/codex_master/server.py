@@ -8843,7 +8843,12 @@ def handle_rpc(msg: dict[str, Any]) -> dict[str, Any] | None:
         raise AgentError("RPC message must be an object")
     message_id = msg.get("id")
     valid_id = message_id is None or (
-        isinstance(message_id, (str, int, float)) and not isinstance(message_id, bool)
+        isinstance(message_id, str)
+        or (
+            isinstance(message_id, (int, float))
+            and not isinstance(message_id, bool)
+            and (not isinstance(message_id, float) or math.isfinite(message_id))
+        )
     )
     if "id" in msg and not valid_id:
         return rpc_error(None, -32600, "Invalid Request")
