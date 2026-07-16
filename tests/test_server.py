@@ -22,6 +22,7 @@ from codex_master.server import (
     MAX_ASSIGNMENT_LOG_BYTES,
     MAX_ASSIGNMENT_RECORDS,
     MAX_CAPABILITY_PLUGINS,
+    MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID,
     MAX_ERROR_CHARS,
     MAX_GIT_REF_TEXT,
     MAX_LIVE_DATA_TOPIC,
@@ -7891,6 +7892,22 @@ class ServerHelpersTest(unittest.TestCase):
         with self.assertRaisesRegex(AgentError, "codex-usage routing decision is invalid"):
             validate_codex_usage_routing_decision(
                 {"schema_version": 1, "role": "arbeitsbiene", "decision": []},
+                agent="a1",
+                role="arbeitsbiene",
+            )
+
+    def test_codex_usage_routing_rejects_oversized_backend_account_id(self) -> None:
+        with self.assertRaisesRegex(AgentError, "codex-usage routing backend account id exceeds"):
+            validate_codex_usage_routing_decision(
+                {
+                    "schema_version": 1,
+                    "account": "BW_Nufker",
+                    "backend_account_id": "x" * (MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID + 1),
+                    "role": "arbeitsbiene",
+                    "decision": "spark",
+                    "model": WRITE_AGENT_MODEL,
+                    "paid_overage_allowed": False,
+                },
                 agent="a1",
                 role="arbeitsbiene",
             )

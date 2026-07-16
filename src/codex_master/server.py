@@ -128,6 +128,7 @@ MAX_ERROR_CHARS = 1200
 MAX_META_BYTES = 64 * 1024
 MAX_CODEX_USAGE_SNAPSHOT_BYTES = 64 * 1024
 MAX_CODEX_USAGE_DECISION_BYTES = 64 * 1024
+MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID = 512
 MAX_CODEX_CONFIG_BYTES = 1024 * 1024
 MAX_PLUGIN_MANIFEST_BYTES = 64 * 1024
 MAX_POOL_SPEC_BYTES = 256 * 1024
@@ -2150,7 +2151,7 @@ def codex_usage_spark_health_update(
     backend_account_id = bounded_text(
         backend_account_id,
         field="backend_account_id",
-        max_chars=512,
+        max_chars=MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID,
         required=True,
     ) or ""
     if not isinstance(state, str) or state not in CODEX_USAGE_SPARK_HEALTH_STATES:
@@ -2212,8 +2213,12 @@ def validate_codex_usage_routing_decision(
         raise AgentError("codex-usage routing decision is invalid")
     if not isinstance(payload.get("account"), str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(payload["account"]):
         raise AgentError("codex-usage routing account is invalid")
-    if not isinstance(payload.get("backend_account_id"), str) or not payload["backend_account_id"]:
-        raise AgentError("codex-usage routing backend account id is missing")
+    backend_account_id = bounded_text(
+        payload.get("backend_account_id"),
+        field="codex-usage routing backend account id",
+        max_chars=MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID,
+        required=True,
+    ) or ""
     expected_model = {
         "spark": WRITE_AGENT_MODEL,
         "main": DEFAULT_AGENT_MODEL,
@@ -2230,7 +2235,7 @@ def validate_codex_usage_routing_decision(
     return {
         "schema_version": 1,
         "account": payload["account"],
-        "backend_account_id": payload["backend_account_id"],
+        "backend_account_id": backend_account_id,
         "role": role,
         "decision": decision,
         "model": model,
@@ -3281,7 +3286,11 @@ def agent_spark_routing(agent: str) -> dict[str, Any] | None:
     if not isinstance(route_account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(route_account):
         return None
     backend_account_id = route.get("backend_account_id")
-    if not isinstance(backend_account_id, str) or not backend_account_id:
+    if (
+        not isinstance(backend_account_id, str)
+        or not backend_account_id.strip()
+        or len(backend_account_id) > MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID
+    ):
         return None
     return {
         "backend_account_id": backend_account_id,
@@ -3301,7 +3310,11 @@ def remember_agent_routing(agent: str, routing: dict[str, Any] | None) -> None:
         return
     meta = read_meta(agent)
     remembered = {"account": account, "decision": decision, "model": model}
-    if isinstance(backend_account_id, str) and backend_account_id:
+    if (
+        isinstance(backend_account_id, str)
+        and backend_account_id.strip()
+        and len(backend_account_id) <= MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID
+    ):
         remembered["backend_account_id"] = backend_account_id
     meta["routing"] = remembered
     write_meta(agent, meta)
