@@ -3730,6 +3730,9 @@ def codex_usage_watchdog_status(
     now = time.time()
 
     if marker:
+        marker_agent = marker.get("agent")
+        if marker_agent not in agent_record_aliases(agent):
+            raise AgentError("could_not_read_codex_usage_watchdog_marker")
         marker_account = marker.get("account")
         if marker_account is not None and (
             not isinstance(marker_account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(marker_account)

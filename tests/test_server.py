@@ -3991,6 +3991,21 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(status["blocked"])
         read_snapshot.assert_called_once_with("BW_Neu")
 
+    def test_codex_usage_watchdog_rejects_marker_for_wrong_agent(self) -> None:
+        with patch(
+            "codex_master.server.read_meta",
+            return_value={
+                "routing": {"account": "BW_Neu"},
+                "codex_usage_watchdog": {
+                    "agent": "b1",
+                    "account": "BW_Neu",
+                    "blocked_until_utc": "2099-06-08T06:50:00+00:00",
+                },
+            },
+        ), patch("codex_master.server.list_assignments", return_value={"records": []}):
+            with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_watchdog_marker"):
+                codex_usage_watchdog_status("a1")
+
     def test_remember_agent_routing_persists_main_usage_account(self) -> None:
         routing = {
             "account": "BW_Privat",
