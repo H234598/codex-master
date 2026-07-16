@@ -3060,6 +3060,21 @@ def start_agent_with_lease(
         if selected_model == WRITE_AGENT_MODEL
         else DEFAULT_AGENT_MODEL_EFFORT
     )
+
+    def validate_existing_session(result: dict[str, Any]) -> None:
+        if result.get("status") != "already_running":
+            return
+        active_meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+        active_model = active_meta.get("model") or DEFAULT_AGENT_MODEL
+        active_effort = active_meta.get("model_reasoning_effort") or (
+            WRITE_AGENT_MODEL_EFFORT if active_model == WRITE_AGENT_MODEL else DEFAULT_AGENT_MODEL_EFFORT
+        )
+        if active_model != selected_model or active_effort != selected_effort:
+            raise AgentError(
+                "routed model differs from active session; controlled restart requires "
+                "an inactive Agentin"
+            )
+
     claim = claim_agent(agent)
     lease = claim["lease"]
     release_on_completion = claim["status"] in {"claimed", "claimed_expired"}
@@ -3075,17 +3090,7 @@ def start_agent_with_lease(
                 model=selected_model,
                 model_reasoning_effort=selected_effort,
             )
-            if result.get("status") == "already_running":
-                active_meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
-                active_model = active_meta.get("model") or DEFAULT_AGENT_MODEL
-                active_effort = active_meta.get("model_reasoning_effort") or (
-                    WRITE_AGENT_MODEL_EFFORT if active_model == WRITE_AGENT_MODEL else DEFAULT_AGENT_MODEL_EFFORT
-                )
-                if active_model != selected_model or active_effort != selected_effort:
-                    raise AgentError(
-                        "routed model differs from active session; controlled restart requires "
-                        "an inactive Agentin"
-                )
+            validate_existing_session(result)
             remember_agent_routing(agent, routing)
         except Exception:
             if isinstance(result, dict) and result.get("status") == "started":
@@ -3119,6 +3124,7 @@ def start_agent_with_lease(
             release_agent(agent, force=True)
         raise
     try:
+        validate_existing_session(result)
         remember_agent_routing(agent, routing)
     except Exception:
         if isinstance(result, dict) and result.get("status") == "started":
