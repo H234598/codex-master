@@ -5252,6 +5252,30 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("SECRET_INTERRUPT_OUTPUT_SHOULD_NOT_RETURN", error_text)
         self.assertNotIn(tmpdir, error_text)
 
+    @patch("codex_master.server.agent_home_process_summary", return_value={"process_count": 0})
+    @patch("codex_master.server.tmux_alive", side_effect=[True, False])
+    @patch("codex_master.server.run_tmux")
+    def test_interrupt_treats_session_vanishing_before_send_as_not_running(
+        self, mock_run_tmux, _mock_alive, _mock_processes
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux", "send-keys"], 1, "", "")
+            state = root / "state"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
+                clear=False,
+            ):
+                result = interrupt_agent("a")
+
+        self.assertEqual(result["status"], "not_running")
+        self.assertEqual(result["lease"]["state"], "unclaimed")
+
     @patch("codex_master.server.start_agent", return_value={"agent": "a1", "status": "started"})
     @patch(
         "codex_master.server.claim_agent",

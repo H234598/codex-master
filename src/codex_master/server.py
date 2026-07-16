@@ -7094,7 +7094,21 @@ def interrupt_agent(agent: str, force: bool = False) -> dict[str, Any]:
     try:
         cp = run_tmux(["send-keys", "-t", session, "C-c"], check=False)
         if cp.returncode != 0:
-            raise AgentError(f"tmux interrupt failed for agent {agent}")
+            if cp.returncode in {COMMAND_TIMEOUT_RETURN_CODE, COMMAND_UNAVAILABLE_RETURN_CODE} or tmux_alive(session):
+                raise AgentError(f"tmux interrupt failed for agent {agent}")
+            process_count = agent_home_process_summary(agent).get("process_count")
+            if not isinstance(process_count, int) or isinstance(process_count, bool) or process_count != 0:
+                raise AgentError(f"tmux interrupt failed for agent {agent}")
+            if release_on_failure:
+                release = release_agent(agent, force=True)
+                lease = release["lease"]
+            return {
+                "agent": agent,
+                "status": "not_running",
+                "lease": lease,
+                "raw_output": "not_returned",
+                "response_output": "not_returned",
+            }
     except Exception:
         if release_on_failure:
             release_agent(agent, force=True)
