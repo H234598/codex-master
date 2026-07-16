@@ -3957,6 +3957,27 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(status["state"], "missing")
         read_snapshot.assert_called_once_with("BW_Neu")
 
+    def test_codex_usage_watchdog_ignores_marker_for_previous_account(self) -> None:
+        with patch(
+            "codex_master.server.read_meta",
+            return_value={
+                "routing": {"account": "BW_Neu"},
+                "codex_usage_watchdog": {
+                    "agent": "a1",
+                    "account": "BW_Alt",
+                    "blocked_until_utc": "2099-06-08T06:50:00+00:00",
+                    "reason": "old account limit",
+                },
+            },
+        ), patch("codex_master.server.list_assignments", return_value={"records": []}), patch(
+            "codex_master.server.read_codex_usage_snapshot", return_value={}
+        ) as read_snapshot:
+            status = codex_usage_watchdog_status("a1")
+
+        self.assertEqual(status["state"], "missing")
+        self.assertFalse(status["blocked"])
+        read_snapshot.assert_called_once_with("BW_Neu")
+
     def test_remember_agent_routing_persists_main_usage_account(self) -> None:
         routing = {
             "account": "BW_Privat",

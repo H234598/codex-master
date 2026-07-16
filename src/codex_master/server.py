@@ -3674,20 +3674,34 @@ def codex_usage_watchdog_status(agent: str) -> dict[str, Any]:
     if meta.get("meta_error"):
         raise AgentError("could_not_read_codex_usage_watchdog_metadata")
     marker = codex_usage_watchdog_marker(meta)
+    accounts = codex_usage_snapshot_accounts(agent, meta)
+    current_account = accounts[0] if accounts else None
     now = time.time()
 
     if marker:
-        state = _codex_usage_watchdog_state_from_marker(marker, now=now)
-        if state["state"] == "blocked":
-            return state
+        marker_account = marker.get("account")
+        if marker_account is not None and (
+            not isinstance(marker_account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(marker_account)
+        ):
+            raise AgentError("could_not_read_codex_usage_watchdog_marker")
+        marker_is_current = marker_account is None or marker_account == current_account
+        if marker_is_current:
+            state = _codex_usage_watchdog_state_from_marker(marker, now=now)
+            if state["state"] == "blocked":
+                return state
+        else:
+            marker = {}
 
     snapshot = {}
-    for account in codex_usage_snapshot_accounts(agent, meta):
+    snapshot_account = None
+    for account in accounts:
         snapshot = read_codex_usage_snapshot(account)
         if snapshot:
+            snapshot_account = account
             break
     if snapshot:
         state = _codex_usage_watchdog_state_from_snapshot(snapshot, now=now)
+        state["account"] = snapshot_account
         if state["state"] == "blocked":
             return state
         if marker:
@@ -3734,6 +3748,7 @@ def ensure_agent_not_blocked_by_codex_usage(agent: str) -> dict[str, Any]:
 
 def _codex_usage_watchdog_state_from_marker(marker: dict[str, Any], *, now: float) -> dict[str, Any]:
     agent = str(marker.get("agent") or "")
+    account = marker.get("account")
     reason = safe_codex_usage_reason(marker.get("reason"))
     blocked_until_ts = parse_utc_timestamp(marker.get("blocked_until_utc"))
     if blocked_until_ts is None:
@@ -3741,6 +3756,7 @@ def _codex_usage_watchdog_state_from_marker(marker: dict[str, Any], *, now: floa
     if blocked_until_ts > now:
         return {
             "agent": agent or "unknown",
+            "account": account,
             "state": "blocked",
             "blocked": True,
             "blocked_until_utc": _dt.datetime.fromtimestamp(blocked_until_ts, _dt.timezone.utc).isoformat(),
@@ -3750,6 +3766,7 @@ def _codex_usage_watchdog_state_from_marker(marker: dict[str, Any], *, now: floa
         }
     return {
         "agent": agent or "unknown",
+        "account": account,
         "state": "released",
         "blocked": False,
         "blocked_until_utc": _dt.datetime.fromtimestamp(blocked_until_ts, _dt.timezone.utc).isoformat(),
@@ -3771,6 +3788,7 @@ def _codex_usage_watchdog_state_from_snapshot(snapshot: dict[str, Any], *, now: 
     if status == "blocked" and blocked_until_ts is not None and blocked_until_ts > now:
         return {
             "agent": agent or "unknown",
+            "account": agent or None,
             "state": "blocked",
             "blocked": True,
             "blocked_until_utc": _dt.datetime.fromtimestamp(blocked_until_ts, _dt.timezone.utc).isoformat(),
@@ -3780,6 +3798,7 @@ def _codex_usage_watchdog_state_from_snapshot(snapshot: dict[str, Any], *, now: 
         }
     return {
         "agent": agent or "unknown",
+        "account": agent or None,
         "state": "released" if status == "blocked" else "clear",
         "blocked": False,
         "blocked_until_utc": (
@@ -4123,6 +4142,8 @@ def usage_watchdog_agent(agent: str, *, dry_run: bool) -> dict[str, Any]:
             "reason": usage_watchdog.get("reason"),
             "source": usage_watchdog.get("source"),
         }
+        if isinstance(usage_watchdog.get("account"), str):
+            marker["account"] = usage_watchdog["account"]
         if not running:
             if not dry_run:
                 update_codex_usage_watchdog_marker(agent, marker)
