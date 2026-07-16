@@ -8741,6 +8741,28 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertIn("safe pool removal is unavailable", str(ctx.exception))
             self.assertTrue((pool / "a1").is_dir())
 
+    def test_agent_pool_destroy_reports_root_removal_failure(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec(tmp, pool)
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+            (pool / "unexpected-entry").write_text("keep\n", encoding="utf-8")
+
+            result = server_module.agent_pool_destroy_pool(
+                str(spec_path),
+                target_dir=str(pool),
+                codex_bin="/bin/echo",
+                yes=True,
+                remove_root=True,
+            )
+            self.assertFalse(result["ok"])
+            self.assertFalse(result["root_removed"])
+            self.assertFalse((pool / "a1").exists())
+            self.assertTrue((pool / "unexpected-entry").is_file())
+
     def test_agent_pool_tools_are_registered_and_cli_invokes_pool_namespace(self) -> None:
         from codex_master import server as server_module
 

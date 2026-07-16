@@ -8122,7 +8122,7 @@ def agent_pool_destroy_pool(
             root_removed = False
 
     return {
-        "ok": skipped == 0,
+        "ok": skipped == 0 and (not remove_root or root_removed),
         "pool_root": PATH_NOT_RETURNED,
         "removed_agent_entries": removed,
         "missing_agent_entries": missing,
