@@ -3995,6 +3995,18 @@ class ServerHelpersTest(unittest.TestCase):
             with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
                 codex_usage_watchdog_status("a1")
 
+    def test_codex_usage_watchdog_rejects_empty_assignment_account(self) -> None:
+        with patch(
+            "codex_master.server.read_meta", return_value={"routing": {"account": "BW_Neu"}}
+        ), patch(
+            "codex_master.server.list_assignments",
+            return_value={"records": [{"routing": {"account": ""}}]},
+        ), patch("codex_master.server.read_codex_usage_snapshot") as read_snapshot:
+            with self.assertRaisesRegex(AgentError, "codex-usage snapshot account is invalid"):
+                codex_usage_watchdog_status("a1")
+
+        read_snapshot.assert_not_called()
+
     def test_codex_usage_watchdog_ignores_marker_for_previous_account(self) -> None:
         with patch(
             "codex_master.server.read_meta",

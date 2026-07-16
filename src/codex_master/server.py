@@ -3224,7 +3224,7 @@ def codex_usage_snapshot_accounts(
     ):
         selected_account = meta_account
     else:
-        selected_account = assignment_account or meta_account
+        selected_account = assignment_account if assignment_account is not None else meta_account
     add_account(selected_account if selected_account is not None else agent)
     return accounts
 
