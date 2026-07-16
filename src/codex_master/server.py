@@ -3206,11 +3206,13 @@ def codex_usage_snapshot_accounts(
             accounts.append(value)
 
     if include_assignment_history:
-        records = list_assignments(agent, 1).get("records", [])
+        records = list_assignments(agent, 1, strict_routing=True).get("records", [])
     else:
         records = []
     record = records[-1] if records and isinstance(records[-1], dict) else {}
     assignment_routing = record.get("routing") if isinstance(record, dict) else None
+    if "routing" in record and not isinstance(assignment_routing, dict):
+        raise AgentError("codex-usage assignment routing metadata is invalid")
     routing = meta.get("routing")
     if "routing" in meta and not isinstance(routing, dict):
         raise AgentError("codex-usage routing metadata is invalid")
@@ -5258,7 +5260,7 @@ def _prune_assignment_log(
     replace_private_text(ASSIGNMENT_LOG, text)
 
 
-def list_assignments(agent: str = "all", limit: int = 20) -> dict[str, Any]:
+def list_assignments(agent: str = "all", limit: int = 20, *, strict_routing: bool = False) -> dict[str, Any]:
     ensure_state()
     selected = agent_ids(agent)
     selected_records = set(selected)
@@ -5285,6 +5287,8 @@ def list_assignments(agent: str = "all", limit: int = 20) -> dict[str, Any]:
             continue
         record_agent = record.get("agent")
         if isinstance(record_agent, str) and record_agent in selected_records:
+            if strict_routing and "routing" in record and not isinstance(record["routing"], dict):
+                raise AgentError("codex-usage assignment routing metadata is invalid")
             records.append(sanitize_assignment_record(record))
     return {
         "agent": agent,
