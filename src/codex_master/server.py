@@ -2153,7 +2153,7 @@ def codex_usage_spark_health_update(
         max_chars=512,
         required=True,
     ) or ""
-    if state not in CODEX_USAGE_SPARK_HEALTH_STATES:
+    if not isinstance(state, str) or state not in CODEX_USAGE_SPARK_HEALTH_STATES:
         raise AgentError("spark health state is invalid")
     reason = bounded_text(reason, field="spark health reason", max_chars=120, required=True) or ""
     command = [codex_usage_executable()]

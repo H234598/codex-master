@@ -7820,6 +7820,10 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("backend-nufker", command)
         self.assertEqual(result["state"], "failed")
 
+    def test_spark_health_update_rejects_unhashable_state(self) -> None:
+        with self.assertRaisesRegex(AgentError, "spark health state is invalid"):
+            codex_usage_spark_health_update("backend-nufker", state=[], reason="spark_turn_timeout")
+
     @patch("codex_master.server.update_agent_spark_health")
     @patch("codex_master.server.time.sleep")
     @patch("codex_master.server.status_agent")
