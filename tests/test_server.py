@@ -4521,6 +4521,29 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertIsNone(route)
 
+    def test_agent_spark_routing_rejects_future_assignment_without_metadata_route(self) -> None:
+        with patch(
+            "codex_master.server.read_meta",
+            return_value={"model": WRITE_AGENT_MODEL},
+        ), patch(
+            "codex_master.server.list_assignments",
+            return_value={
+                "records": [
+                    {
+                        "created_at_utc": "2099-01-01T00:00:00+00:00",
+                        "routing": {
+                            "account": "BW_Future",
+                            "decision": "spark",
+                            "backend_account_id": "backend-future",
+                        },
+                    }
+                ]
+            },
+        ):
+            route = agent_spark_routing("a1")
+
+        self.assertIsNone(route)
+
     def test_agent_spark_routing_does_not_use_assignment_for_empty_metadata(self) -> None:
         with patch(
             "codex_master.server.read_meta",
