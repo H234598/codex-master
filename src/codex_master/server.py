@@ -3747,9 +3747,14 @@ def codex_usage_watchdog_status(
             not isinstance(marker_account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(marker_account)
         ):
             raise AgentError("could_not_read_codex_usage_watchdog_marker")
-        marker_is_current = marker_account is None or marker_account == current_account
+        if parse_utc_timestamp(marker.get("blocked_until_utc")) is None:
+            raise AgentError("could_not_read_codex_usage_watchdog_marker")
+        marker_is_current = marker_account == current_account or (
+            marker_account is None and current_account == agent
+        )
         if marker_is_current:
             state = _codex_usage_watchdog_state_from_marker(marker, now=now)
+            state["account_mapping"] = account_mapping
             if state["state"] == "blocked":
                 return state
         else:

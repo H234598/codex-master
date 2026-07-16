@@ -3991,6 +3991,34 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(status["blocked"])
         read_snapshot.assert_called_once_with("BW_Neu")
 
+    def test_codex_usage_watchdog_rechecks_legacy_marker_after_account_routing(self) -> None:
+        meta = {
+            "codex_usage_watchdog": {
+                "agent": "a1",
+                "blocked_until_utc": "2099-06-08T06:50:00+00:00",
+                "reason": "old account limit",
+            }
+        }
+        routing = {"account": "BW_Neu", "decision": "main"}
+
+        def remember(_agent: str, account: str) -> None:
+            meta["routing"] = {"account": account}
+
+        with patch("codex_master.server.read_meta", return_value=meta), patch(
+            "codex_master.server.list_assignments", return_value={"records": []}
+        ), patch("codex_master.server.read_codex_usage_snapshot", return_value={}) as read_snapshot, patch(
+            "codex_master.server.agent_auth_status", return_value={"authenticated": True}
+        ), patch("codex_master.server.codex_usage_routing_decision", return_value=routing) as route, patch(
+            "codex_master.server.remember_agent_usage_account", side_effect=remember
+        ):
+            status = ensure_agent_not_blocked_by_codex_usage("a1")
+
+        self.assertEqual(status["state"], "missing")
+        self.assertEqual(status["account"], "BW_Neu")
+        self.assertFalse(status["blocked"])
+        route.assert_called_once_with("a1", role="arbeitsbiene")
+        read_snapshot.assert_called_once_with("BW_Neu")
+
     def test_codex_usage_watchdog_rejects_marker_for_wrong_agent(self) -> None:
         with patch(
             "codex_master.server.read_meta",
