@@ -9324,6 +9324,46 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn(str(tmp), str(ctx.exception))
             self.assertNotIn("outside-secret-root", str(ctx.exception))
 
+    def test_agent_pool_destroy_rejects_pool_root_swap_before_removal(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            backup = tmp / "agents-backup"
+            external = tmp / "outside-root"
+            external.mkdir()
+            spec_path = self._write_spec(tmp, pool)
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+            (external / "a1").mkdir()
+            (external / "a1" / "sentinel").write_text("keep\n", encoding="utf-8")
+            external_marker = external / server_module.POOL_MARKER_FILE
+            external_marker.write_text("{}\n", encoding="utf-8")
+            real_state = server_module.pool_public_path_state
+            swapped = False
+
+            def swap_after_status(path: Path) -> str:
+                nonlocal swapped
+                if path == pool and not swapped:
+                    swapped = True
+                    pool.rename(backup)
+                    pool.symlink_to(external, target_is_directory=True)
+                    return "directory"
+                return real_state(path)
+
+            with patch.object(server_module, "pool_public_path_state", side_effect=swap_after_status):
+                with self.assertRaisesRegex(AgentError, "pool root must be a real directory"):
+                    server_module.agent_pool_destroy_pool(
+                        str(spec_path),
+                        target_dir=str(pool),
+                        codex_bin="/bin/echo",
+                        yes=True,
+                    )
+
+            self.assertTrue(swapped)
+            self.assertTrue((external / "a1" / "sentinel").is_file())
+            self.assertTrue(external_marker.is_file())
+
     def test_agent_pool_destroy_refuses_unsafe_rmtree_without_removing_pool(self) -> None:
         from codex_master import server as server_module
 

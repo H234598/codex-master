@@ -8390,35 +8390,85 @@ def agent_pool_destroy_pool(
     pool_guard_root(root)
     if not yes:
         raise AgentError("destroy_pool requires yes=true")
+    try:
+        root_stat_before = root.lstat()
+    except FileNotFoundError:
+        root_stat_before = None
+    except OSError as exc:
+        raise AgentError("pool root must be a real directory") from exc
     root_state = pool_public_path_state(root)
     if root_state != "directory" and not (root_state == "missing" and force):
         raise AgentError("pool root must be a real directory")
-    marker = root / POOL_MARKER_FILE
-    if not pool_regular_marker_present(marker) and not force:
-        raise AgentError("destroy_pool requires an installed pool marker or force=true")
 
     removed = 0
     missing = 0
     skipped = 0
-    for agent in normalized["ids"]:
-        target = root / agent
-        removal_state = remove_agent_pool_entry(target)
-        if removal_state == "missing":
-            missing += 1
-        elif removal_state == "removed":
-            removed += 1
-        else:
-            skipped += 1
-
-    if pool_regular_marker_present(marker):
-        marker.unlink()
     root_removed = False
-    if remove_root:
-        try:
-            root.rmdir()
-            root_removed = True
-        except OSError:
-            root_removed = False
+    parent_fd = -1
+    root_fd = -1
+    try:
+        operation_root = root
+        if root_state == "directory":
+            if root_stat_before is None or not stat_module.S_ISDIR(root_stat_before.st_mode):
+                raise AgentError("pool root must be a real directory")
+            try:
+                parent_stat = root.parent.lstat()
+            except OSError as exc:
+                raise AgentError("pool root must be a real directory") from exc
+            parent_fd = open_directory_no_follow_matching(
+                root.parent,
+                parent_stat,
+                error_text="pool root must be a real directory",
+                changed_text="pool root must be a real directory",
+            )
+            root_fd = open_directory_no_follow_matching(
+                root.name,
+                root_stat_before,
+                error_text="pool root must be a real directory",
+                changed_text="pool root must be a real directory",
+                dir_fd=parent_fd,
+            )
+            operation_root = Path(f"/proc/self/fd/{root_fd}")
+        elif root_stat_before is not None:
+            raise AgentError("pool root must be a real directory")
+
+        marker = operation_root / POOL_MARKER_FILE
+        if not pool_regular_marker_present(marker) and not force:
+            raise AgentError("destroy_pool requires an installed pool marker or force=true")
+        for agent in normalized["ids"]:
+            target = operation_root / agent
+            removal_state = remove_agent_pool_entry(target)
+            if removal_state == "missing":
+                missing += 1
+            elif removal_state == "removed":
+                removed += 1
+            else:
+                skipped += 1
+
+        if pool_regular_marker_present(marker):
+            marker.unlink()
+        if remove_root:
+            if root_fd >= 0:
+                try:
+                    current_root = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+                    if stat_module.S_ISDIR(current_root.st_mode) and source_identity_matches(
+                        current_root, root_stat_before
+                    ):
+                        os.rmdir(root.name, dir_fd=parent_fd)
+                        root_removed = True
+                except OSError:
+                    root_removed = False
+            else:
+                try:
+                    root.rmdir()
+                    root_removed = True
+                except OSError:
+                    root_removed = False
+    finally:
+        if root_fd >= 0:
+            os.close(root_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
     return {
         "ok": skipped == 0 and (not remove_root or root_removed),
