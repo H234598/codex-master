@@ -58,6 +58,25 @@ BASE_ARGS = [
     "danger-full-access",
     "--search",
 ]
+
+
+def agent_base_args(model: str, reasoning_effort: str) -> list[str]:
+    if model not in {DEFAULT_AGENT_MODEL, WRITE_AGENT_MODEL}:
+        raise AgentError("unsupported routed agent model")
+    if reasoning_effort not in {DEFAULT_AGENT_MODEL_EFFORT, WRITE_AGENT_MODEL_EFFORT}:
+        raise AgentError("unsupported routed reasoning effort")
+    return [
+        "--model",
+        model,
+        "-c",
+        f'model="{model}"',
+        "-c",
+        f'model_reasoning_effort="{reasoning_effort}"',
+        "--yolo",
+        "-s",
+        "danger-full-access",
+        "--search",
+    ]
 MAX_TAIL_LINES = 80
 MAX_TAIL_CHARS = 8192
 MAX_RAW_LOG_BYTES = 5 * 1024 * 1024
@@ -106,6 +125,8 @@ MAX_LIVE_DATA_TOPIC = 400
 MAX_RPC_MESSAGE_BYTES = 1024 * 1024
 MAX_ERROR_CHARS = 1200
 MAX_META_BYTES = 64 * 1024
+MAX_CODEX_USAGE_SNAPSHOT_BYTES = 64 * 1024
+MAX_CODEX_USAGE_DECISION_BYTES = 64 * 1024
 MAX_CODEX_CONFIG_BYTES = 1024 * 1024
 MAX_PLUGIN_MANIFEST_BYTES = 64 * 1024
 MAX_POOL_SPEC_BYTES = 256 * 1024
@@ -133,6 +154,7 @@ POOL_AUTH_POLICIES = ("preserve_existing_only", "copy_explicit_only")
 POOL_PREFIX_RE = re.compile(r"^[a-z][a-z0-9_-]{0,15}$")
 POOL_SAFE_RELATIVE_RE = re.compile(r"^[A-Za-z0-9._-][A-Za-z0-9._/-]{0,199}$")
 GIT_BASE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@{}~^+-]{0,199}$")
+ROUTING_CONTEXT_ID_RE = re.compile(r"^[A-Za-z0-9_.:@+-]{1,128}$")
 MAX_POOL_AGENTS = 1000
 MAX_POOL_SERIES = 26
 MAX_POOL_SHARED_ASSETS = 40
@@ -176,6 +198,10 @@ DEFAULT_AGENTIN_BASE_NAMES = (
     "Tara",
 )
 DEFAULT_AGENTIN_NAMES = {"a1": "Mila", "b1": "Nora"}
+CODEX_USAGE_BLOCK_METADATA_KEY = "codex_usage_watchdog"
+CODEX_USAGE_DECISION_TIMEOUT_SECONDS = 8
+CODEX_USAGE_SPARK_HEALTH_STATES = {"healthy", "failed"}
+CODEX_USAGE_DECISIONS = {"spark", "main", "credits", "blocked", "unchanged"}
 WATCHDOG_SERVICE_NAME = "codex-master-watchdog.service"
 WATCHDOG_TIMER_NAME = "codex-master-watchdog.timer"
 MAX_SYSTEMD_UNIT_BYTES = 64 * 1024
@@ -284,6 +310,34 @@ def env_text_value(primary: str, fallback: str | None, default: str) -> str:
     if value is None and fallback:
         value = os.environ.get(fallback)
     return value if value is not None else default
+
+
+def codex_usage_state_root() -> Path:
+    override = os.environ.get("CODEX_USAGE_STATE_ROOT")
+    if override:
+        return Path(override).expanduser()
+    data_home = os.environ.get("XDG_DATA_HOME")
+    root = Path(data_home).expanduser() if data_home else Path.home() / ".local" / "share"
+    return root / "codex-usage"
+
+
+def codex_usage_snapshot_path(agent: str) -> Path:
+    return codex_usage_state_root() / "snapshots" / f"{canonical_agent_id(agent)}.json"
+
+
+def codex_usage_executable() -> str:
+    configured = os.environ.get("CODEX_USAGE_BIN", "codex-usage").strip()
+    if not configured or "\x00" in configured:
+        raise AgentError("CODEX_USAGE_BIN is invalid")
+    if "/" in configured:
+        path = Path(configured).expanduser()
+        if not is_regular_executable_no_symlink(path):
+            raise AgentError("codex-usage executable is unavailable")
+        return str(path)
+    resolved = shutil.which(configured)
+    if not resolved:
+        raise AgentError("codex-usage executable is unavailable")
+    return resolved
 
 
 def default_agentin_name(agent: str) -> str:
@@ -525,9 +579,9 @@ def codex_config_path() -> Path:
     return root / "config.toml"
 
 
-def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | None]:
+def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | float | None]:
     lines = text.splitlines()
-    previous: int | None = None
+    previous: int | float | None = None
     section_start: int | None = None
     section_end = len(lines)
 
@@ -549,12 +603,13 @@ def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | None
             section_end = index
             break
 
-    timeout_line_re = re.compile(r"^(\s*startup_timeout_sec\s*=\s*)(\d+)(\s*(?:#.*)?)$")
+    timeout_line_re = re.compile(r"^(\s*startup_timeout_sec\s*=\s*)(\d+(?:\.\d+)?)(\s*(?:#.*)?)$")
     for index in range(section_start + 1, section_end):
         match = timeout_line_re.match(lines[index])
         if not match:
             continue
-        previous = int(match.group(2))
+        numeric = float(match.group(2))
+        previous = int(numeric) if numeric.is_integer() else numeric
         if previous >= RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS:
             return text if text.endswith("\n") else text + "\n", False, previous
         lines[index] = f"{match.group(1)}{RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS}{match.group(3)}"
@@ -656,7 +711,10 @@ def codex_client_mcp_config_status(
     command_configured = isinstance(command, str) and bool(command.strip())
     startup_timeout = server_config.get("startup_timeout_sec")
     startup_timeout_sec = (
-        startup_timeout if isinstance(startup_timeout, int) and not isinstance(startup_timeout, bool) else None
+        startup_timeout
+        if isinstance(startup_timeout, (int, float))
+        and not isinstance(startup_timeout, bool)
+        else None
     )
     startup_timeout_ok = (
         startup_timeout_sec is not None and startup_timeout_sec >= RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS
@@ -1156,6 +1214,42 @@ def read_json_file(path: Path) -> dict[str, Any]:
         return json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return error
+
+
+def read_codex_usage_snapshot(agent: str) -> dict[str, Any]:
+    path = codex_usage_snapshot_path(agent)
+    try:
+        current_stat = path.lstat()
+    except OSError:
+        return {}
+    if not stat_module.S_ISREG(current_stat.st_mode) or current_stat.st_size > MAX_CODEX_USAGE_SNAPSHOT_BYTES:
+        return {}
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(path, flags)
+        opened_stat = os.fstat(fd)
+        if not stat_module.S_ISREG(opened_stat.st_mode) or opened_stat.st_size > MAX_CODEX_USAGE_SNAPSHOT_BYTES:
+            return {}
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            raw = fh.read(MAX_CODEX_USAGE_SNAPSHOT_BYTES + 1)
+    except OSError:
+        return {}
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+    if len(raw) > MAX_CODEX_USAGE_SNAPSHOT_BYTES:
+        return {}
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def path_present_no_follow(path: Path) -> bool:
@@ -1867,6 +1961,163 @@ def require_authenticated_agent_for_mutation(
     }
 
 
+def codex_usage_routing_decision(
+    agent: str,
+    *,
+    role: str,
+    group_id: str | None = None,
+    job_id: str | None = None,
+) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
+    group_id = normalize_routing_context_id(group_id, field="group_id")
+    job_id = normalize_routing_context_id(job_id, field="job_id")
+    auth_path = AGENTS[agent]["home"] / "auth.json"
+    if not is_regular_file_no_symlink(auth_path):
+        raise AgentError("codex-usage routing requires regular per-Agentin auth.json")
+    command = [codex_usage_executable()]
+    config_path = os.environ.get("CODEX_USAGE_CONFIG", "").strip()
+    if config_path:
+        if "\x00" in config_path:
+            raise AgentError("CODEX_USAGE_CONFIG is invalid")
+        command.extend(["--config", str(Path(config_path).expanduser())])
+    command.extend(
+        [
+            "policy",
+            "evaluate",
+            "--auth-json",
+            str(auth_path),
+            "--role",
+            role,
+            "--agent",
+            agent,
+            "--format",
+            "json",
+        ]
+    )
+    if group_id:
+        command.extend(["--group", group_id])
+    if job_id:
+        command.extend(["--job", job_id])
+    cp = run_command(command, timeout=CODEX_USAGE_DECISION_TIMEOUT_SECONDS)
+    combined_size = len(cp.stdout.encode("utf-8")) + len(cp.stderr.encode("utf-8"))
+    if combined_size > MAX_CODEX_USAGE_DECISION_BYTES:
+        raise AgentError("codex-usage routing output exceeded size limit")
+    if cp.returncode != 0:
+        detail, _changed = redact(trim_chars(cp.stderr.strip(), 300))
+        suffix = f": {detail}" if detail else ""
+        raise AgentError(f"codex-usage routing failed with exit {cp.returncode}{suffix}")
+    try:
+        payload = json.loads(cp.stdout)
+    except json.JSONDecodeError as exc:
+        raise AgentError("codex-usage routing returned invalid JSON") from exc
+    return validate_codex_usage_routing_decision(payload, agent=agent, role=role)
+
+
+def codex_usage_spark_health_update(
+    backend_account_id: str,
+    *,
+    state: str,
+    reason: str,
+) -> dict[str, Any]:
+    backend_account_id = bounded_text(
+        backend_account_id,
+        field="backend_account_id",
+        max_chars=512,
+        required=True,
+    ) or ""
+    if state not in CODEX_USAGE_SPARK_HEALTH_STATES:
+        raise AgentError("spark health state is invalid")
+    reason = bounded_text(reason, field="spark health reason", max_chars=120, required=True) or ""
+    command = [codex_usage_executable()]
+    config_path = os.environ.get("CODEX_USAGE_CONFIG", "").strip()
+    if config_path:
+        if "\x00" in config_path:
+            raise AgentError("CODEX_USAGE_CONFIG is invalid")
+        command.extend(["--config", str(Path(config_path).expanduser())])
+    command.extend(
+        [
+            "spark-health",
+            "--backend-account-id",
+            backend_account_id,
+            "--state",
+            state,
+            "--reason",
+            reason,
+        ]
+    )
+    cp = run_command(command, timeout=CODEX_USAGE_DECISION_TIMEOUT_SECONDS)
+    combined_size = len(cp.stdout.encode("utf-8")) + len(cp.stderr.encode("utf-8"))
+    if combined_size > MAX_CODEX_USAGE_DECISION_BYTES:
+        raise AgentError("codex-usage spark health output exceeded size limit")
+    if cp.returncode != 0:
+        detail, _changed = redact(trim_chars(cp.stderr.strip(), 300))
+        suffix = f": {detail}" if detail else ""
+        raise AgentError(f"codex-usage spark health update failed with exit {cp.returncode}{suffix}")
+    return {
+        "state": state,
+        "reason": reason,
+        "updated": True,
+        "raw_output": "not_returned",
+    }
+
+
+def normalize_routing_context_id(value: Any, *, field: str) -> str | None:
+    if value is None:
+        return None
+    text = bounded_text(value, field=field, max_chars=128, required=True) or ""
+    if not ROUTING_CONTEXT_ID_RE.fullmatch(text):
+        raise AgentError(f"{field} contains unsupported characters")
+    return text
+
+
+def validate_codex_usage_routing_decision(
+    payload: Any,
+    *,
+    agent: str,
+    role: str,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise AgentError("codex-usage routing schema is unsupported")
+    decision = payload.get("decision")
+    model = payload.get("model")
+    if decision not in CODEX_USAGE_DECISIONS or payload.get("role") != role:
+        raise AgentError("codex-usage routing decision is invalid")
+    if not isinstance(payload.get("account"), str) or not payload["account"]:
+        raise AgentError("codex-usage routing account is missing")
+    if not isinstance(payload.get("backend_account_id"), str) or not payload["backend_account_id"]:
+        raise AgentError("codex-usage routing backend account id is missing")
+    expected_model = {
+        "spark": WRITE_AGENT_MODEL,
+        "main": DEFAULT_AGENT_MODEL,
+        "credits": DEFAULT_AGENT_MODEL,
+        "blocked": None,
+        "unchanged": None,
+    }[decision]
+    if model != expected_model:
+        raise AgentError("codex-usage routing model does not match decision")
+    if decision == "credits" and payload.get("paid_overage_allowed") is not True:
+        raise AgentError("codex-usage credits decision lacks explicit paid policy")
+    if not isinstance(payload.get("paid_overage_allowed"), bool):
+        raise AgentError("codex-usage paid policy is invalid")
+    return {
+        "schema_version": 1,
+        "account": payload["account"],
+        "backend_account_id": payload["backend_account_id"],
+        "role": role,
+        "decision": decision,
+        "model": model,
+        "reason": bounded_text(payload.get("reason"), field="routing reason", max_chars=120),
+        "usage_state": bounded_text(
+            payload.get("usage_state"), field="routing usage_state", max_chars=32
+        ),
+        "paid_overage_allowed": payload["paid_overage_allowed"],
+        "policy_source": bounded_text(
+            payload.get("policy_source"), field="routing policy_source", max_chars=160
+        ),
+        "raw_output": "not_returned",
+    }
+
+
 def managed_raw_dirs() -> tuple[Path, ...]:
     legacy_raw = LEGACY_STATE_ROOT / "raw"
     dirs = [RAW_DIR]
@@ -2321,6 +2572,8 @@ def start_agent(
     prompt: str | None = None,
     lease: dict[str, Any] | None = None,
     release_lease_on_failure: bool = False,
+    model: str = DEFAULT_AGENT_MODEL,
+    model_reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     ensure_state()
@@ -2367,12 +2620,16 @@ def start_agent(
     start_cwd = Path(cwd or os.getcwd()).expanduser().resolve()
     if not start_cwd.exists() or not start_cwd.is_dir():
         raise AgentError("cwd is not a directory")
+    reasoning_effort = model_reasoning_effort or (
+        WRITE_AGENT_MODEL_EFFORT if model == WRITE_AGENT_MODEL else DEFAULT_AGENT_MODEL_EFFORT
+    )
+    routed_args = agent_base_args(model, reasoning_effort)
 
     run_id = f"{now_id()}-{agent}"
     raw_log = RAW_DIR / f"{run_id}.log"
     write_private_new_bytes(raw_log, b"")
 
-    argv = [str(runner), *BASE_ARGS]
+    argv = [str(runner), *routed_args]
     if prompt:
         argv.append(prompt)
 
@@ -2400,9 +2657,9 @@ def start_agent(
         "home": str(cfg["home"]),
         "runner": str(runner),
         "cwd": str(start_cwd),
-        "args": BASE_ARGS,
-        "model": DEFAULT_AGENT_MODEL,
-        "model_reasoning_effort": DEFAULT_AGENT_MODEL_EFFORT,
+        "args": routed_args,
+        "model": model,
+        "model_reasoning_effort": reasoning_effort,
         "started_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "run_id": run_id,
         "raw_log": str(raw_log),
@@ -2419,8 +2676,8 @@ def start_agent(
         "cwd": PATH_NOT_RETURNED,
         "cwd_state": "set",
         "lease": lease or agent_lease_status(agent),
-        "model": DEFAULT_AGENT_MODEL,
-        "model_reasoning_effort": DEFAULT_AGENT_MODEL_EFFORT,
+        "model": model,
+        "model_reasoning_effort": reasoning_effort,
         "raw_log": "not_returned",
         "raw_log_max_bytes": MAX_RAW_LOG_BYTES,
         "raw_output": "not_returned",
@@ -2440,10 +2697,30 @@ def start_agent_with_lease(
         operation="agent_start",
         allow_unauthenticated=allow_unauthenticated,
     )
+    routing = None if allow_unauthenticated else codex_usage_routing_decision(
+        agent,
+        role="arbeitsbiene",
+    )
+    selected_model = routing["model"] if routing else DEFAULT_AGENT_MODEL
+    if selected_model is None:
+        raise AgentError("codex-usage blocked Agentin start before model launch")
+    selected_effort = (
+        WRITE_AGENT_MODEL_EFFORT
+        if selected_model == WRITE_AGENT_MODEL
+        else DEFAULT_AGENT_MODEL_EFFORT
+    )
     if tmux_alive(AGENTS[agent]["session"]):
         ensure_agent_lease_available(agent)
-        result = start_agent(agent, cwd, prompt)
+        result = start_agent(
+            agent,
+            cwd,
+            prompt,
+            model=selected_model,
+            model_reasoning_effort=selected_effort,
+        )
+        remember_agent_routing(agent, routing)
         result["auth_gate"] = auth_gate
+        result["routing"] = routing
         return result
     claim = claim_agent(agent)
     lease = claim["lease"]
@@ -2455,7 +2732,10 @@ def start_agent_with_lease(
             prompt,
             lease=lease,
             release_lease_on_failure=release_on_completion,
+            model=selected_model,
+            model_reasoning_effort=selected_effort,
         )
+        remember_agent_routing(agent, routing)
     except Exception:
         if release_on_completion and agent_lease_status(agent).get("held_by_this_server"):
             release_agent(agent, force=True)
@@ -2464,6 +2744,7 @@ def start_agent_with_lease(
         release = release_agent(agent, force=True)
         result["lease"] = release["lease"]
     result["auth_gate"] = auth_gate
+    result["routing"] = routing
     return result
 
 
@@ -2547,6 +2828,67 @@ def latest_assignment_summary(agent: str) -> dict[str, Any] | None:
         "model": record.get("model"),
         "raw_output": "not_returned",
     }
+
+
+def agent_spark_routing(agent: str) -> dict[str, Any] | None:
+    agent = canonical_agent_id(agent)
+    meta = read_meta(agent)
+    if meta.get("model") != WRITE_AGENT_MODEL:
+        return None
+    route = meta.get("routing")
+    if not isinstance(route, dict):
+        try:
+            records = list_assignments(agent, 1).get("records", [])
+        except AgentError:
+            records = []
+        record = records[-1] if records and isinstance(records[-1], dict) else {}
+        route = record.get("routing") if isinstance(record, dict) else None
+    if not isinstance(route, dict) or route.get("decision") != "spark":
+        return None
+    backend_account_id = route.get("backend_account_id")
+    if not isinstance(backend_account_id, str) or not backend_account_id:
+        return None
+    return {
+        "backend_account_id": backend_account_id,
+        "model": WRITE_AGENT_MODEL,
+        "decision": "spark",
+    }
+
+
+def remember_agent_routing(agent: str, routing: dict[str, Any] | None) -> None:
+    if not isinstance(routing, dict):
+        return
+    backend_account_id = routing.get("backend_account_id")
+    decision = routing.get("decision")
+    model = routing.get("model")
+    if not isinstance(backend_account_id, str) or decision != "spark" or model != WRITE_AGENT_MODEL:
+        return
+    meta = read_meta(agent)
+    meta["routing"] = {
+        "backend_account_id": backend_account_id,
+        "decision": decision,
+        "model": model,
+    }
+    write_meta(agent, meta)
+
+
+def update_agent_spark_health(agent: str, *, state: str, reason: str) -> dict[str, Any]:
+    route = agent_spark_routing(agent)
+    if route is None:
+        return {"state": "not_applicable", "updated": False, "raw_output": "not_returned"}
+    try:
+        result = codex_usage_spark_health_update(
+            route["backend_account_id"],
+            state=state,
+            reason=reason,
+        )
+    except AgentError:
+        return {
+            "state": "update_failed",
+            "updated": False,
+            "raw_output": "not_returned",
+        }
+    return {**result, "account_state": "spark_routed", "raw_output": "not_returned"}
 
 
 def limit_model_pool(model: Any) -> str:
@@ -2800,6 +3142,20 @@ def wait_agent(agent: str, timeout_seconds: int = DEFAULT_WAIT_SECONDS, poll_int
         status = wait_terminal_status(current, initial)
     if status is None:
         status = "timeout"
+    if status == "activity_observed":
+        spark_health = update_agent_spark_health(
+            agent,
+            state="healthy",
+            reason="spark_turn_activity_observed",
+        )
+    elif status in {"timeout", "blocked_by_limit"}:
+        spark_health = update_agent_spark_health(
+            agent,
+            state="failed",
+            reason=f"spark_turn_{status}",
+        )
+    else:
+        spark_health = {"state": "not_checked", "updated": False, "raw_output": "not_returned"}
     return {
         "agent": agent,
         "status": status,
@@ -2809,6 +3165,7 @@ def wait_agent(agent: str, timeout_seconds: int = DEFAULT_WAIT_SECONDS, poll_int
         "elapsed_seconds": max(0, int(time.monotonic() - started)),
         "initial": initial,
         "current": current,
+        "spark_health": spark_health,
         "raw_output": "not_returned",
         "response_output": "not_returned",
     }
@@ -2838,6 +3195,7 @@ def status_agent(agent: str) -> dict[str, Any]:
         latest_assignment=latest_assignment,
         pane_text=pane_text,
     )
+    usage_watchdog = codex_usage_watchdog_status(agent)
     return {
         "agent": agent,
         "label": cfg["label"],
@@ -2858,6 +3216,7 @@ def status_agent(agent: str) -> dict[str, Any]:
         "last_assignment": latest_assignment,
         "tui_context": tui_context,
         "limit_state": limit_state,
+        "usage_watchdog": usage_watchdog,
         "response_state": agent_response_state(running, limit_state, raw_log_info, tui_context),
         "raw_log": "not_returned" if raw_log else None,
         "raw_log_bytes": raw_log_info["bytes"],
@@ -2890,6 +3249,132 @@ def update_watchdog_marker(agent: str, marker: dict[str, Any] | None) -> None:
     else:
         meta["watchdog"] = marker
     write_meta(agent, meta)
+
+
+def codex_usage_watchdog_marker(meta: dict[str, Any]) -> dict[str, Any]:
+    value = meta.get(CODEX_USAGE_BLOCK_METADATA_KEY)
+    return value if isinstance(value, dict) else {}
+
+
+def update_codex_usage_watchdog_marker(agent: str, marker: dict[str, Any] | None) -> None:
+    meta = read_meta(agent)
+    if meta.get("meta_error"):
+        raise AgentError("could_not_update_codex_usage_watchdog_metadata")
+    if marker is None:
+        meta.pop(CODEX_USAGE_BLOCK_METADATA_KEY, None)
+    else:
+        meta[CODEX_USAGE_BLOCK_METADATA_KEY] = marker
+    write_meta(agent, meta)
+
+
+def codex_usage_watchdog_status(agent: str) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
+    meta = read_meta(agent)
+    marker = codex_usage_watchdog_marker(meta)
+    now = time.time()
+
+    if marker:
+        state = _codex_usage_watchdog_state_from_marker(marker, now=now)
+        if state["state"] == "blocked":
+            return state
+
+    snapshot = read_codex_usage_snapshot(agent)
+    if snapshot:
+        state = _codex_usage_watchdog_state_from_snapshot(snapshot, now=now)
+        if state["state"] == "blocked":
+            return state
+        if marker:
+            return {
+                **state,
+                "marker_state": state["state"],
+                "state": "released",
+                "source": "snapshot",
+            }
+        return state
+
+    if marker:
+        return {
+            **_codex_usage_watchdog_state_from_marker(marker, now=now),
+            "source": "marker",
+        }
+
+    return {
+        "agent": agent,
+        "state": "missing",
+        "blocked": False,
+        "blocked_until_utc": None,
+        "reason": None,
+        "source": "snapshot",
+        "raw_output": "not_returned",
+    }
+
+
+def ensure_agent_not_blocked_by_codex_usage(agent: str) -> dict[str, Any]:
+    status = codex_usage_watchdog_status(agent)
+    if status.get("blocked"):
+        blocked_until = status.get("blocked_until_utc")
+        reason = status.get("reason") or "codex usage limit reached"
+        detail = f"; blocked_until_utc={blocked_until}" if blocked_until else ""
+        raise AgentError(f"agent {canonical_agent_id(agent)} is blocked by codex-usage watchdog: {reason}{detail}")
+    return status
+
+
+def _codex_usage_watchdog_state_from_marker(marker: dict[str, Any], *, now: float) -> dict[str, Any]:
+    agent = str(marker.get("agent") or "")
+    blocked_until_ts = parse_utc_timestamp(marker.get("blocked_until_utc"))
+    if blocked_until_ts is not None and blocked_until_ts > now:
+        return {
+            "agent": agent or "unknown",
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": _dt.datetime.fromtimestamp(blocked_until_ts, _dt.timezone.utc).isoformat(),
+            "reason": marker.get("reason"),
+            "source": "marker",
+            "raw_output": "not_returned",
+        }
+    return {
+        "agent": agent or "unknown",
+        "state": "released",
+        "blocked": False,
+        "blocked_until_utc": (
+            _dt.datetime.fromtimestamp(blocked_until_ts, _dt.timezone.utc).isoformat()
+            if blocked_until_ts is not None
+            else None
+        ),
+        "reason": marker.get("reason"),
+        "source": "marker",
+        "raw_output": "not_returned",
+    }
+
+
+def _codex_usage_watchdog_state_from_snapshot(snapshot: dict[str, Any], *, now: float) -> dict[str, Any]:
+    agent = str(snapshot.get("account") or snapshot.get("agent") or "")
+    blocked_until_ts = parse_utc_timestamp(snapshot.get("blocked_until"))
+    blocked_reason = snapshot.get("blocked_reason")
+    status = str(snapshot.get("status") or "")
+    if status == "blocked" and blocked_until_ts is not None and blocked_until_ts > now:
+        return {
+            "agent": agent or "unknown",
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": _dt.datetime.fromtimestamp(blocked_until_ts, _dt.timezone.utc).isoformat(),
+            "reason": blocked_reason,
+            "source": "snapshot",
+            "raw_output": "not_returned",
+        }
+    return {
+        "agent": agent or "unknown",
+        "state": "released" if status == "blocked" else "clear",
+        "blocked": False,
+        "blocked_until_utc": (
+            _dt.datetime.fromtimestamp(blocked_until_ts, _dt.timezone.utc).isoformat()
+            if blocked_until_ts is not None
+            else None
+        ),
+        "reason": blocked_reason,
+        "source": "snapshot",
+        "raw_output": "not_returned",
+    }
 
 
 def watchdog_effective_idle(status: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
@@ -3090,6 +3575,11 @@ def watchdog_agent(
 
     if dry_run:
         return {**base, "watchdog_state": f"would_{action}", "action_taken": "none"}
+    spark_health = update_agent_spark_health(
+        agent,
+        state="failed",
+        reason="spark_turn_watchdog_timeout",
+    ) if action != "none" else {"state": "not_checked", "updated": False, "raw_output": "not_returned"}
     release_after_interrupt = manage_unclaimed and unclaimed_or_expired and action == "interrupt"
     result = watchdog_action(agent, action, release_after_interrupt=release_after_interrupt)
     update_watchdog_marker(agent, None)
@@ -3097,7 +3587,79 @@ def watchdog_agent(
         **base,
         "watchdog_state": "action_sent" if action != "none" else "no_action",
         "action_taken": action,
+        "spark_health": spark_health,
         "action_result": public_watchdog_action_result(result),
+    }
+
+
+def usage_watchdog_agent(agent: str, *, dry_run: bool) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
+    ensure_state()
+    cfg = AGENTS[agent]
+    session = cfg["session"]
+    running = tmux_alive(session)
+    lease = agent_lease_status(agent)
+    usage_watchdog = codex_usage_watchdog_status(agent)
+    base = {
+        "agent": agent,
+        "running": running,
+        "session": session,
+        "lease_state": lease.get("state"),
+        "held_by_this_server": bool(lease.get("held_by_this_server")),
+        "dry_run": dry_run,
+        "usage_watchdog": usage_watchdog,
+        "raw_output": "not_returned",
+        "response_output": "not_returned",
+    }
+
+    if usage_watchdog.get("blocked"):
+        marker = {
+            "agent": agent,
+            "blocked_until_utc": usage_watchdog.get("blocked_until_utc"),
+            "reason": usage_watchdog.get("reason"),
+            "source": usage_watchdog.get("source"),
+        }
+        if not running:
+            if not dry_run:
+                update_codex_usage_watchdog_marker(agent, marker)
+            return {**base, "usage_watchdog_state": "blocked_marked", "action_taken": "none"}
+        if not lease.get("held_by_this_server") and lease.get("state") == "held":
+            return {**base, "usage_watchdog_state": "skipped_not_leased_by_this_server", "action_taken": "none"}
+        if dry_run:
+            return {**base, "usage_watchdog_state": "would_stop", "action_taken": "none"}
+        update_codex_usage_watchdog_marker(agent, marker)
+        result = stop_agent(agent, force=False)
+        return {
+            **base,
+            "usage_watchdog_state": "stopped",
+            "action_taken": "stop",
+            "action_result": public_watchdog_action_result(result),
+        }
+
+    if codex_usage_watchdog_marker(read_meta(agent)):
+        if not dry_run:
+            update_codex_usage_watchdog_marker(agent, None)
+        return {**base, "usage_watchdog_state": "released", "action_taken": "none"}
+
+    return {**base, "usage_watchdog_state": "clear", "action_taken": "none"}
+
+
+def fleet_usage_watchdog(agent: str = "all", *, dry_run: bool = False) -> dict[str, Any]:
+    selected = agent_ids(agent)
+    results = multi_agent_result(
+        selected,
+        lambda item: call_agent_lifecycle(
+            item,
+            lambda: usage_watchdog_agent(item, dry_run=dry_run),
+        ),
+    )["results"]
+    return {
+        "agent": agent,
+        "dry_run": dry_run,
+        "results": results,
+        "result_count": len(results),
+        "total_count": len(selected),
+        "raw_output": "not_returned",
     }
 
 
@@ -3188,14 +3750,6 @@ def list_skill_files(root: Path) -> list[Path]:
     if not is_real_directory_no_symlink(root):
         return []
     return sorted(path for path in root.rglob("SKILL.md") if is_regular_file_no_symlink(path))
-
-
-def is_regular_file_no_symlink(path: Path) -> bool:
-    try:
-        mode = path.lstat().st_mode
-    except OSError:
-        return False
-    return stat_module.S_ISREG(mode)
 
 
 def paged_mapping(items: dict[str, int], offset: int, limit: int) -> tuple[dict[str, int], bool]:
@@ -3491,13 +4045,13 @@ def assignment_prompt(
     context: list[str],
     forbidden: list[str],
     name: str | None,
+    model: str,
     allow_subagents: bool,
     requires_search: bool = False,
     live_data_topic: str | None = None,
 ) -> str:
     display_name = (name or default_agentin_name(agent)).strip()
     skill_line = skill.strip() if skill else "kein spezieller Skill vorgegeben"
-    model = assignment_model(role)
     search_lines: list[str] = []
     if requires_search:
         topic = live_data_topic.strip() if live_data_topic else task
@@ -3554,6 +4108,52 @@ def assignment_model(role: str) -> str:
     return DEFAULT_AGENT_MODEL
 
 
+def ensure_assignment_session_model(
+    agent: str,
+    *,
+    model: str,
+    reasoning_effort: str,
+    lease: dict[str, Any],
+) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
+    cfg = AGENTS[agent]
+    if not tmux_alive(cfg["session"]):
+        raise AgentError(f"agent {agent} is not running")
+    meta = read_meta(agent)
+    current_model = meta.get("model") or DEFAULT_AGENT_MODEL
+    if current_model == model:
+        return {
+            "status": "unchanged",
+            "previous_model": current_model,
+            "model": model,
+            "raw_output": "not_returned",
+        }
+    status = status_agent(agent)
+    response_state = (status.get("response_state") or {}).get("state")
+    if response_state not in {"running_tui_starter_context", "running_idle"}:
+        raise AgentError(
+            "routed model differs from active session; controlled restart requires "
+            f"an inactive Agentin; current_state={response_state}"
+        )
+    cp = run_tmux(["kill-session", "-t", cfg["session"]], check=False)
+    if cp.returncode != 0:
+        raise AgentError(f"tmux model-switch stop failed for agent {agent}")
+    restarted = start_agent(
+        agent,
+        cwd=meta.get("cwd"),
+        lease=lease,
+        model=model,
+        model_reasoning_effort=reasoning_effort,
+    )
+    return {
+        "status": "restarted",
+        "previous_model": current_model,
+        "model": model,
+        "start_status": restarted.get("status"),
+        "raw_output": "not_returned",
+    }
+
+
 def assign_agent(
     agent: str,
     *,
@@ -3565,6 +4165,8 @@ def assign_agent(
     context: Any = None,
     forbidden: Any = None,
     name: str | None = None,
+    group_id: str | None = None,
+    job_id: str | None = None,
     enter: bool = True,
     allow_missing_skill: bool = False,
     allow_subagents: bool = False,
@@ -3586,6 +4188,8 @@ def assign_agent(
     task = bounded_text(task, field="task", max_chars=MAX_TASK_TEXT, required=True) or ""
     skill = bounded_text(skill, field="skill", max_chars=MAX_SKILL_REF) if skill is not None else None
     name = bounded_text(name, field="name", max_chars=MAX_AGENTIN_NAME) if name is not None else None
+    group_id = normalize_routing_context_id(group_id, field="group_id")
+    job_id = normalize_routing_context_id(job_id, field="job_id")
     scope = as_string_list(scope, field="scope", max_chars=MAX_PATH_TEXT)
     write_paths = as_string_list(write_paths, field="write_paths", max_chars=MAX_PATH_TEXT)
     context = as_string_list(context, field="context")
@@ -3609,7 +4213,24 @@ def assign_agent(
         if not matches and not allow_missing_skill:
             raise AgentError(f"skill not found for agent {agent}")
 
-    model = assignment_model(role)
+    routing = codex_usage_routing_decision(
+        agent,
+        role=role,
+        group_id=group_id,
+        job_id=job_id,
+    )
+    if routing["decision"] == "blocked" or routing["model"] is None:
+        raise AgentError(
+            "codex-usage blocked assignment before prompt send: "
+            f"reason={routing.get('reason') or 'unknown'}; "
+            f"policy_source={routing.get('policy_source') or 'unknown'}"
+        )
+    model = routing["model"]
+    reasoning_effort = (
+        WRITE_AGENT_MODEL_EFFORT
+        if model == WRITE_AGENT_MODEL
+        else DEFAULT_AGENT_MODEL_EFFORT
+    )
     prompt = assignment_prompt(
         agent=agent,
         role=role,
@@ -3620,6 +4241,7 @@ def assign_agent(
         context=context,
         forbidden=forbidden,
         name=name,
+        model=model,
         allow_subagents=allow_subagents,
         requires_search=requires_search,
         live_data_topic=live_data_topic,
@@ -3631,6 +4253,13 @@ def assign_agent(
     if lease is None:
         lease, release_on_failure = claim_for_agent_mutation(agent)
     try:
+        model_switch = ensure_assignment_session_model(
+            agent,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            lease=lease,
+        )
+        remember_agent_routing(agent, routing)
         sent = send_agent(agent, prompt, enter, operation=operation)
     except Exception:
         if release_on_failure:
@@ -3645,6 +4274,11 @@ def assign_agent(
             "role": role,
             "name": name or default_agentin_name(agent),
             "model": model,
+            "model_reasoning_effort": reasoning_effort,
+            "model_switch": model_switch,
+            "routing": routing,
+            "group_id": group_id,
+            "job_id": job_id,
             "skill": {
                 "requested": skill,
                 "available": bool(matches) if skill else None,
@@ -3682,6 +4316,11 @@ def assign_agent(
         "role": role,
         "name": name or default_agentin_name(agent),
         "model": model,
+        "model_reasoning_effort": reasoning_effort,
+        "model_switch": model_switch,
+        "routing": routing,
+        "group_id": group_id,
+        "job_id": job_id,
         "skill": {"requested": skill, "available": bool(matches) if skill else None, "matches": matches[:5]},
         "scope_count": len(scope),
         "write_policy": "read_only" if role == "exploriererin" else "explicit_paths_only",
@@ -5301,6 +5940,7 @@ def master_namespace_status() -> dict[str, Any]:
         "master_release_status": "master_release_status" in tool_names,
         "master_watchdog_status": "master_watchdog_status" in tool_names,
         "master_timeout_policy": "master_timeout_policy" in tool_names,
+        "usage_watchdog": "usage_watchdog" in tool_names,
         "agent_pool_validate": "agent_pool_validate" in tool_names,
         "agent_pool_install": "agent_pool_install" in tool_names,
         "agent_pool_status": "agent_pool_status" in tool_names,
@@ -5334,6 +5974,7 @@ def master_namespace_status() -> dict[str, Any]:
             "master_release_status": local_tool_contract["master_release_status"],
             "master_watchdog_status": local_tool_contract["master_watchdog_status"],
             "master_timeout_policy": local_tool_contract["master_timeout_policy"],
+            "usage_watchdog": local_tool_contract["usage_watchdog"],
             "agent_pool_validate": local_tool_contract["agent_pool_validate"],
             "agent_pool_install": local_tool_contract["agent_pool_install"],
             "agent_pool_status": local_tool_contract["agent_pool_status"],
@@ -5575,15 +6216,17 @@ def install(
         if not current.get("startup_timeout_ok"):
             startup_timeout_config = ensure_mcp_startup_timeout_configured()
         else:
-            startup_timeout_config = {
-                "status": "already_configured",
-                "startup_timeout_sec": current.get(
-                    "startup_timeout_sec", RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS
-                ),
-                "previous_startup_timeout_sec": current.get("startup_timeout_sec"),
-                "config_path": "not_returned",
-                "raw_output": "not_returned",
-            }
+            client_config = codex_client_mcp_config_status(command_path=install_path)
+            if not client_config.get("startup_timeout_ok"):
+                startup_timeout_config = ensure_mcp_startup_timeout_configured()
+            else:
+                startup_timeout_config = {
+                    "status": "already_configured",
+                    "startup_timeout_sec": RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
+                    "previous_startup_timeout_sec": RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
+                    "config_path": "not_returned",
+                    "raw_output": "not_returned",
+                }
         registration["startup_timeout"] = startup_timeout_config
     plugin_cache_install = (
         sync_plugin_cache_from_repo()
@@ -6040,6 +6683,11 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             manage_unclaimed=bool_arg(args, "manage_unclaimed", False),
             dry_run=bool_arg(args, "dry_run", False),
         )
+    if name == "usage_watchdog":
+        return fleet_usage_watchdog(
+            str(args.get("agent", "all")),
+            dry_run=bool_arg(args, "dry_run", False),
+        )
     if name == "agent_skills":
         selected = agent_ids(str(args.get("agent", "all")))
         include_names = bool_arg(args, "include_names", False)
@@ -6062,6 +6710,17 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "agent_capabilities":
         selected = agent_ids(str(args.get("agent", "all")))
         return paged_multi_agent_result(selected, args, capabilities_agent)
+    if name == "agent_routing_decision":
+        selected_agent = single_agent_id(str(args.get("agent", "")), "agent_routing_decision")
+        role = str(args.get("role", "arbeitsbiene"))
+        if role not in {"exploriererin", "arbeitsbiene"}:
+            raise AgentError("role must be 'exploriererin' or 'arbeitsbiene'")
+        return codex_usage_routing_decision(
+            selected_agent,
+            role=role,
+            group_id=args.get("group_id") if isinstance(args.get("group_id"), str) else None,
+            job_id=args.get("job_id") if isinstance(args.get("job_id"), str) else None,
+        )
     if name == "agent_scope_check":
         return scope_check(
             as_string_list(args.get("scope"), field="scope"),
@@ -6082,6 +6741,8 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 context=args.get("context"),
                 forbidden=args.get("forbidden"),
                 name=args.get("name") if isinstance(args.get("name"), str) else None,
+                group_id=args.get("group_id") if isinstance(args.get("group_id"), str) else None,
+                job_id=args.get("job_id") if isinstance(args.get("job_id"), str) else None,
                 enter=bool_arg(args, "enter", True),
                 allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
                 allow_subagents=bool_arg(args, "allow_subagents", False),
@@ -6102,6 +6763,8 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 context=args.get("context"),
                 forbidden=args.get("forbidden"),
                 name=args.get("name") if isinstance(args.get("name"), str) else None,
+                group_id=args.get("group_id") if isinstance(args.get("group_id"), str) else None,
+                job_id=args.get("job_id") if isinstance(args.get("job_id"), str) else None,
                 enter=bool_arg(args, "enter", True),
                 allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
                 allow_subagents=bool_arg(args, "allow_subagents", False),
@@ -6122,6 +6785,8 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 context=args.get("context"),
                 forbidden=args.get("forbidden"),
                 name=args.get("name") if isinstance(args.get("name"), str) else None,
+                group_id=args.get("group_id") if isinstance(args.get("group_id"), str) else None,
+                job_id=args.get("job_id") if isinstance(args.get("job_id"), str) else None,
                 enter=bool_arg(args, "enter", True),
                 allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
                 allow_subagents=bool_arg(args, "allow_subagents", False),
@@ -6145,6 +6810,8 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 context=args.get("context"),
                 forbidden=args.get("forbidden"),
                 name=args.get("name") if isinstance(args.get("name"), str) else None,
+                group_id=args.get("group_id") if isinstance(args.get("group_id"), str) else None,
+                job_id=args.get("job_id") if isinstance(args.get("job_id"), str) else None,
                 enter=bool_arg(args, "enter", True),
                 allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
                 allow_subagents=bool_arg(args, "allow_subagents", False),
@@ -6726,7 +7393,7 @@ def pool_wrapper_text(agent: str, home: Path, codex_bin: str) -> str:
             "fi",
             "export CODEX_AGENT_BIN",
             "unset CODEX_ACCESS_TOKEN OPENAI_API_KEY",
-            'exec -- "${CODEX_AGENT_BIN}" "$@"',
+            'exec taskset --cpu-list 4-10 /usr/bin/env -- "${CODEX_AGENT_BIN}" "$@"',
             "",
         ]
     )
@@ -7348,6 +8015,21 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "usage_watchdog",
+        "description": (
+            "Synchronize Codex-usage limit blocks with Agentin state. "
+            "Writes or clears the local usage watchdog marker and stops blocked running Agentinnen when possible."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent": agent_selector_schema(default="all"),
+                "dry_run": {"type": "boolean", "default": False},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "agent_send",
         "description": "Send text to one running Agentin through its tmux PTY. The Agentin response is not returned automatically.",
         "inputSchema": {
@@ -7468,6 +8150,25 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "agent_routing_decision",
+        "description": "Dry-run der codex-usage Modell- und Credit-Entscheidung fuer eine Agentin; sendet keinen Prompt.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["agent"],
+            "properties": {
+                "agent": agent_selector_schema(single=True),
+                "role": {
+                    "type": "string",
+                    "enum": ["exploriererin", "arbeitsbiene"],
+                    "default": "arbeitsbiene",
+                },
+                "group_id": text_schema(128),
+                "job_id": text_schema(128),
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "agent_assign",
         "description": "Send a structured, skill-aware assignment to one Agentin with explicit scope, write boundaries, and model policy. Does not return the prompt or response output.",
         "inputSchema": {
@@ -7483,6 +8184,8 @@ TOOLS: list[dict[str, Any]] = [
                 "context": text_array_schema(default=[]),
                 "forbidden": text_array_schema(default=[]),
                 "name": text_schema(MAX_AGENTIN_NAME),
+                "group_id": text_schema(128),
+                "job_id": text_schema(128),
                 "enter": {"type": "boolean", "default": True},
                 "allow_missing_skill": {"type": "boolean", "default": False},
                 "allow_subagents": {"type": "boolean", "default": False},
@@ -7505,6 +8208,8 @@ TOOLS: list[dict[str, Any]] = [
                 "context": text_array_schema(default=[]),
                 "forbidden": text_array_schema(default=[]),
                 "name": text_schema(MAX_AGENTIN_NAME),
+                "group_id": text_schema(128),
+                "job_id": text_schema(128),
                 "enter": {"type": "boolean", "default": True},
                 "allow_missing_skill": {"type": "boolean", "default": False},
                 "allow_subagents": {"type": "boolean", "default": False},
@@ -7531,6 +8236,8 @@ TOOLS: list[dict[str, Any]] = [
                 "context": text_array_schema(default=[]),
                 "forbidden": text_array_schema(default=[]),
                 "name": text_schema(MAX_AGENTIN_NAME),
+                "group_id": text_schema(128),
+                "job_id": text_schema(128),
                 "enter": {"type": "boolean", "default": True},
                 "allow_missing_skill": {"type": "boolean", "default": False},
                 "allow_subagents": {"type": "boolean", "default": False},
@@ -7554,6 +8261,8 @@ TOOLS: list[dict[str, Any]] = [
                 "context": text_array_schema(default=[]),
                 "forbidden": text_array_schema(default=[]),
                 "name": text_schema(MAX_AGENTIN_NAME),
+                "group_id": text_schema(128),
+                "job_id": text_schema(128),
                 "enter": {"type": "boolean", "default": True},
                 "allow_missing_skill": {"type": "boolean", "default": False},
                 "allow_subagents": {"type": "boolean", "default": False},
@@ -8020,6 +8729,10 @@ def main_cli(argv: list[str]) -> int:
     p_watchdog.add_argument("--dry-run", action="store_true")
     p_watchdog.add_argument("--quiet", action="store_true")
 
+    p_usage_watchdog = sub.add_parser("usage-watchdog")
+    p_usage_watchdog.add_argument("agent", nargs="?", default="all", help=AGENT_SELECTOR_DESCRIPTION)
+    p_usage_watchdog.add_argument("--dry-run", action="store_true")
+
     p_send = sub.add_parser("send")
     p_send.add_argument("agent")
     p_send.add_argument("text")
@@ -8093,6 +8806,16 @@ def main_cli(argv: list[str]) -> int:
     p_scope_check.add_argument("--write-path", dest="write_paths", action="append", default=[])
     p_scope_check.add_argument("--cwd")
 
+    p_routing_decision = sub.add_parser("routing-decision")
+    p_routing_decision.add_argument("agent")
+    p_routing_decision.add_argument(
+        "--role",
+        choices=["exploriererin", "arbeitsbiene"],
+        default="arbeitsbiene",
+    )
+    p_routing_decision.add_argument("--group-id")
+    p_routing_decision.add_argument("--job-id")
+
     p_assign = sub.add_parser("assign")
     p_assign.add_argument("agent")
     p_assign.add_argument("--role", choices=["exploriererin", "arbeitsbiene"], required=True)
@@ -8103,6 +8826,8 @@ def main_cli(argv: list[str]) -> int:
     p_assign.add_argument("--context", action="append", default=[])
     p_assign.add_argument("--forbid", dest="forbidden", action="append", default=[])
     p_assign.add_argument("--name")
+    p_assign.add_argument("--group-id")
+    p_assign.add_argument("--job-id")
     p_assign.add_argument("--no-enter", action="store_true")
     p_assign.add_argument("--allow-missing-skill", action="store_true")
     p_assign.add_argument("--allow-subagents", action="store_true")
@@ -8116,6 +8841,8 @@ def main_cli(argv: list[str]) -> int:
     p_assign_readonly.add_argument("--context", action="append", default=[])
     p_assign_readonly.add_argument("--forbid", dest="forbidden", action="append", default=[])
     p_assign_readonly.add_argument("--name")
+    p_assign_readonly.add_argument("--group-id")
+    p_assign_readonly.add_argument("--job-id")
     p_assign_readonly.add_argument("--no-enter", action="store_true")
     p_assign_readonly.add_argument("--allow-missing-skill", action="store_true")
     p_assign_readonly.add_argument("--allow-subagents", action="store_true")
@@ -8130,6 +8857,8 @@ def main_cli(argv: list[str]) -> int:
     p_assign_live_data.add_argument("--context", action="append", default=[])
     p_assign_live_data.add_argument("--forbid", dest="forbidden", action="append", default=[])
     p_assign_live_data.add_argument("--name")
+    p_assign_live_data.add_argument("--group-id")
+    p_assign_live_data.add_argument("--job-id")
     p_assign_live_data.add_argument("--no-enter", action="store_true")
     p_assign_live_data.add_argument("--allow-missing-skill", action="store_true")
     p_assign_live_data.add_argument("--allow-subagents", action="store_true")
@@ -8144,6 +8873,8 @@ def main_cli(argv: list[str]) -> int:
     p_assign_write.add_argument("--context", action="append", default=[])
     p_assign_write.add_argument("--forbid", dest="forbidden", action="append", default=[])
     p_assign_write.add_argument("--name")
+    p_assign_write.add_argument("--group-id")
+    p_assign_write.add_argument("--job-id")
     p_assign_write.add_argument("--no-enter", action="store_true")
     p_assign_write.add_argument("--allow-missing-skill", action="store_true")
     p_assign_write.add_argument("--allow-subagents", action="store_true")
@@ -8411,6 +9142,18 @@ def main_cli(argv: list[str]) -> int:
                     {"scope": args.scope, "write_paths": args.write_paths, "cwd": args.cwd},
                 )
             )
+        if args.command == "routing-decision":
+            return print_json(
+                call_validated_tool(
+                    "agent_routing_decision",
+                    {
+                        "agent": args.agent,
+                        "role": args.role,
+                        "group_id": args.group_id,
+                        "job_id": args.job_id,
+                    },
+                )
+            )
         if args.command == "assign":
             return print_json(
                 call_validated_tool(
@@ -8425,6 +9168,8 @@ def main_cli(argv: list[str]) -> int:
                         "context": args.context,
                         "forbidden": args.forbidden,
                         "name": args.name,
+                        "group_id": args.group_id,
+                        "job_id": args.job_id,
                         "enter": not args.no_enter,
                         "allow_missing_skill": args.allow_missing_skill,
                         "allow_subagents": args.allow_subagents,
@@ -8444,6 +9189,8 @@ def main_cli(argv: list[str]) -> int:
                         "context": args.context,
                         "forbidden": args.forbidden,
                         "name": args.name,
+                        "group_id": args.group_id,
+                        "job_id": args.job_id,
                         "enter": not args.no_enter,
                         "allow_missing_skill": args.allow_missing_skill,
                         "allow_subagents": args.allow_subagents,
@@ -8464,6 +9211,8 @@ def main_cli(argv: list[str]) -> int:
                         "context": args.context,
                         "forbidden": args.forbidden,
                         "name": args.name,
+                        "group_id": args.group_id,
+                        "job_id": args.job_id,
                         "enter": not args.no_enter,
                         "allow_missing_skill": args.allow_missing_skill,
                         "allow_subagents": args.allow_subagents,
@@ -8484,6 +9233,8 @@ def main_cli(argv: list[str]) -> int:
                         "context": args.context,
                         "forbidden": args.forbidden,
                         "name": args.name,
+                        "group_id": args.group_id,
+                        "job_id": args.job_id,
                         "enter": not args.no_enter,
                         "allow_missing_skill": args.allow_missing_skill,
                         "allow_subagents": args.allow_subagents,
@@ -8530,6 +9281,13 @@ def main_cli(argv: list[str]) -> int:
             return print_json(call_validated_tool("master_release_status", {}))
         if args.command == "watchdog-status":
             return print_json(call_validated_tool("master_watchdog_status", {}))
+        if args.command == "usage-watchdog":
+            return print_json(
+                call_validated_tool(
+                    "usage_watchdog",
+                    {"agent": args.agent, "dry_run": args.dry_run},
+                )
+            )
         if args.command == "timeout-policy":
             return print_json(call_validated_tool("master_timeout_policy", {}))
         if args.command == "pool":

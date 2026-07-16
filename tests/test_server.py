@@ -32,7 +32,6 @@ from codex_master.server import (
     MAX_RAW_LOG_BYTES,
     MAX_SEND_TEXT,
     MAX_TAIL_CHARS,
-    MAX_TAIL_LINES,
     MAX_SKILL_NAMES,
     MAX_TASK_TEXT,
     MAX_WAIT_POLL_SECONDS,
@@ -66,10 +65,14 @@ from codex_master.server import (
     classify_limit_text,
     classify_tui_context,
     codex_related_process_summary,
+    codex_usage_watchdog_status,
+    codex_usage_routing_decision,
+    codex_usage_spark_health_update,
     DEFAULT_AGENT_MODEL,
     DEFAULT_ORDINAL_AGENT_SERIES,
     doctor,
     ensure_state,
+    ensure_assignment_session_model,
     handle_rpc,
     install,
     installed_source_worktree_state,
@@ -101,13 +104,13 @@ from codex_master.server import (
     run_tmux,
     send_agent,
     server_instance_identity_status,
-    selector_policy_series,
     selector_policy_status,
     start_agent,
     start_agent_with_lease,
     stop_agent,
     strip_ansi,
     skill_match_agent,
+    usage_watchdog_agent,
     sync_plugin_cache_from_repo,
     trim_chars,
     trim_lines,
@@ -142,6 +145,37 @@ class FakeStdin:
 
 
 class ServerHelpersTest(unittest.TestCase):
+    def setUp(self) -> None:
+        routing = patch(
+            "codex_master.server.codex_usage_routing_decision",
+            side_effect=lambda agent, *, role, group_id=None, job_id=None: {
+                "schema_version": 1,
+                "account": "test-account",
+                "backend_account_id": "backend-test",
+                "role": role,
+                "decision": "spark",
+                "model": WRITE_AGENT_MODEL,
+                "reason": "spark_available",
+                "usage_state": "known",
+                "paid_overage_allowed": False,
+                "policy_source": "global",
+                "raw_output": "not_returned",
+            },
+        )
+        session_model = patch(
+            "codex_master.server.ensure_assignment_session_model",
+            return_value={
+                "status": "unchanged",
+                "previous_model": WRITE_AGENT_MODEL,
+                "model": WRITE_AGENT_MODEL,
+                "raw_output": "not_returned",
+            },
+        )
+        routing.start()
+        session_model.start()
+        self.addCleanup(routing.stop)
+        self.addCleanup(session_model.stop)
+
     def test_github_ci_pins_external_actions_to_full_shas(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
@@ -310,6 +344,12 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(high_previous, 180)
         self.assertIn("startup_timeout_sec = 180", high_updated)
 
+        existing_float = existing_low.replace("startup_timeout_sec = 30", "startup_timeout_sec = 120.0")
+        float_updated, float_changed, float_previous = updated_mcp_startup_timeout_config(existing_float)
+        self.assertFalse(float_changed)
+        self.assertEqual(float_previous, 120)
+        self.assertEqual(float_updated.count("startup_timeout_sec"), 1)
+
         missing_value = existing_low.replace("\nstartup_timeout_sec = 30", "")
         inserted, inserted_changed, inserted_previous = updated_mcp_startup_timeout_config(missing_value)
         self.assertTrue(inserted_changed)
@@ -457,6 +497,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("agent_skill_match", names)
         self.assertIn("agent_capabilities", names)
         self.assertIn("agent_scope_check", names)
+        self.assertIn("agent_routing_decision", names)
         self.assertIn("agent_assign_readonly", names)
         self.assertIn("agent_assign_live_data", names)
         self.assertIn("agent_assign_write", names)
@@ -470,6 +511,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("master_release_status", names)
         self.assertIn("master_watchdog_status", names)
         self.assertIn("master_timeout_policy", names)
+        self.assertIn("usage_watchdog", names)
         by_name = {tool["name"]: tool for tool in response["result"]["tools"]}
         assign_props = by_name["agent_assign"]["inputSchema"]["properties"]
         claim_props = by_name["agent_claim"]["inputSchema"]["properties"]
@@ -1577,6 +1619,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["expected_tools"]["master_namespace_status"])
         self.assertTrue(result["expected_tools"]["master_release_status"])
         self.assertTrue(result["expected_tools"]["master_timeout_policy"])
+        self.assertTrue(result["expected_tools"]["usage_watchdog"])
         self.assertTrue(result["expected_tools"]["agent_pool_validate"])
         self.assertTrue(result["expected_tools"]["agent_pool_install"])
         self.assertTrue(result["expected_tools"]["agent_pool_status"])
@@ -1806,7 +1849,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.41")
+        self.assertEqual(result["expected_tag"], "v0.9.42")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -2923,6 +2966,78 @@ class ServerHelpersTest(unittest.TestCase):
         mock_report.assert_not_called()
         mock_interrupt.assert_not_called()
 
+    def test_legacy_codex_usage_watchdog_status_remains_visible_until_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            snapshot_dir = Path(tmpdir) / "codex-usage" / "snapshots"
+            snapshot_dir.mkdir(parents=True)
+            snapshot_path = snapshot_dir / "a1.json"
+            snapshot_path.write_text(
+                json.dumps(
+                    {
+                        "account": "a1",
+                        "label": "A1",
+                        "captured_at": "2026-06-08T04:20:00+02:00",
+                        "status": "blocked",
+                        "blocked_until": "2099-06-08T06:50:00+02:00",
+                        "blocked_reason": "usage limit reached",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"XDG_DATA_HOME": tmpdir}, clear=False):
+                status = codex_usage_watchdog_status("a1")
+                self.assertEqual(status["state"], "blocked")
+                self.assertTrue(status["blocked"])
+                self.assertEqual(status["source"], "snapshot")
+
+    def test_usage_watchdog_agent_stops_blocked_running_agent_and_writes_marker(self) -> None:
+        marker_store: list[dict[str, Any]] = []
+
+        def fake_update_marker(agent: str, marker: dict[str, Any] | None) -> None:
+            if marker is None:
+                marker_store.clear()
+            else:
+                marker_store.append(marker)
+
+        blocked_status = {
+            "agent": "a1",
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": "2099-06-08T06:50:00+02:00",
+            "reason": "usage limit reached",
+            "source": "snapshot",
+            "raw_output": "not_returned",
+        }
+        with patch.dict("codex_master.server.AGENTS", {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}}, clear=True), patch(
+            "codex_master.server.ensure_state"
+        ), patch("codex_master.server.tmux_alive", return_value=True), patch(
+            "codex_master.server.agent_lease_status",
+            return_value={"state": "held", "held_by_this_server": True, "raw_output": "not_returned"},
+        ), patch("codex_master.server.codex_usage_watchdog_status", return_value=blocked_status), patch(
+            "codex_master.server.update_codex_usage_watchdog_marker", side_effect=fake_update_marker
+        ), patch("codex_master.server.stop_agent", return_value={"agent": "a1", "status": "stopped", "lease": {"state": "released"}, "raw_output": "not_returned"}) as mock_stop:
+            result = usage_watchdog_agent("a1", dry_run=False)
+
+        self.assertEqual(result["usage_watchdog_state"], "stopped")
+        self.assertEqual(result["action_taken"], "stop")
+        self.assertEqual(marker_store[0]["blocked_until_utc"], "2099-06-08T06:50:00+02:00")
+        mock_stop.assert_called_once_with("a1", force=False)
+
+    def test_cli_usage_watchdog_routes_to_tool(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def fake_call_validated_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+            captured["name"] = name
+            captured["args"] = args
+            return {"ok": True}
+
+        with patch("codex_master.server.call_validated_tool", side_effect=fake_call_validated_tool):
+            result = main_cli(["usage-watchdog", "a1", "--dry-run"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(captured["name"], "usage_watchdog")
+        self.assertEqual(captured["args"], {"agent": "a1", "dry_run": True})
+
     def test_append_bounded_raw_log_caps_file_size(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             log_path = Path(tmpdir) / "agent.log"
@@ -3561,7 +3676,7 @@ class ServerHelpersTest(unittest.TestCase):
     @patch("codex_master.server.tmux_alive", return_value=False)
     @patch("codex_master.server.start_agent")
     def test_start_agent_with_lease_releases_fresh_successful_start(self, mock_start_agent, _mock_tmux_alive) -> None:
-        def fake_start(agent, cwd=None, prompt=None, lease=None, release_lease_on_failure=False):
+        def fake_start(agent, cwd=None, prompt=None, lease=None, release_lease_on_failure=False, **kwargs):
             return {
                 "agent": agent,
                 "status": "started",
@@ -3594,7 +3709,7 @@ class ServerHelpersTest(unittest.TestCase):
     @patch("codex_master.server.tmux_alive", return_value=False)
     @patch("codex_master.server.start_agent")
     def test_start_agent_with_lease_keeps_existing_same_client_claim(self, mock_start_agent, _mock_tmux_alive) -> None:
-        def fake_start(agent, cwd=None, prompt=None, lease=None, release_lease_on_failure=False):
+        def fake_start(agent, cwd=None, prompt=None, lease=None, release_lease_on_failure=False, **kwargs):
             return {
                 "agent": agent,
                 "status": "started",
@@ -3808,7 +3923,13 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["results"][0]["auth_gate"]["auth_state"], "present_regular")
         self.assertEqual(events, [("lock", "a1"), ("unlock", "a1")])
         mock_ensure_lease.assert_called_once_with("a1")
-        mock_start_agent.assert_called_once_with("a1", "/tmp/work", "hi")
+        mock_start_agent.assert_called_once_with(
+            "a1",
+            "/tmp/work",
+            "hi",
+            model=WRITE_AGENT_MODEL,
+            model_reasoning_effort="low",
+        )
 
     @patch("codex_master.server.claim_agent_with_wait")
     def test_mutating_tools_require_auth_by_default_and_allow_bootstrap_override(self, mock_claim_with_wait) -> None:
@@ -4964,7 +5085,7 @@ class ServerHelpersTest(unittest.TestCase):
         assignment_id = payload["assignment_id"]
         self.assertEqual(payload["status"], "assigned")
         self.assertEqual(payload["role"], "exploriererin")
-        self.assertEqual(payload["model"], "gpt-5.4-mini")
+        self.assertEqual(payload["model"], WRITE_AGENT_MODEL)
         self.assertEqual(payload["write_policy"], "read_only")
         self.assertFalse(payload["subagents_allowed"])
         self.assertEqual(payload["skill"]["requested"], "codex-security:security-scan")
@@ -4980,7 +5101,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(sent_agent, "a")
         self.assertTrue(sent_enter)
         self.assertIn("[EXPLORER_BEE_TASK]", sent_prompt)
-        self.assertIn("Modell: gpt-5.4-mini", sent_prompt)
+        self.assertIn(f"Modell: {WRITE_AGENT_MODEL}", sent_prompt)
         self.assertIn("Skill: codex-security:security-scan", sent_prompt)
         self.assertIn("Darf schreiben: nein", sent_prompt)
         self.assertIn("Darf eigene Subagentinnen starten: nein", sent_prompt)
@@ -4994,7 +5115,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(record["assignment_id"], assignment_id)
         self.assertEqual(record["agent"], "a")
         self.assertEqual(record["role"], "exploriererin")
-        self.assertEqual(record["model"], "gpt-5.4-mini")
+        self.assertEqual(record["model"], WRITE_AGENT_MODEL)
         self.assertEqual(record["scope"], ["src/codex_master/server.py"])
         self.assertEqual(record["write_policy"], "read_only")
         self.assertFalse(record["allow_subagents"])
@@ -5002,6 +5123,231 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("[EXPLORER_BEE_TASK]", ledger_text)
         self.assertNotIn("Pruefe nur lesend.", ledger_text)
         self.assertNotIn("Skill body must not be returned", ledger_text)
+
+    def test_codex_usage_routing_uses_auth_identity_and_assignment_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            payload = {
+                "schema_version": 1,
+                "account": "BW_Nufker",
+                "backend_account_id": "backend-nufker",
+                "role": "arbeitsbiene",
+                "decision": "spark",
+                "model": WRITE_AGENT_MODEL,
+                "reason": "spark_available",
+                "usage_state": "known",
+                "paid_overage_allowed": False,
+                "policy_source": "job:release",
+            }
+            completed = subprocess.CompletedProcess(
+                ["codex-usage"], 0, json.dumps(payload), ""
+            )
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ), patch(
+                "codex_master.server.codex_usage_executable",
+                return_value="/usr/bin/codex-usage",
+            ), patch(
+                "codex_master.server.run_command",
+                return_value=completed,
+            ) as run:
+                decision = codex_usage_routing_decision(
+                    "a",
+                    role="arbeitsbiene",
+                    group_id="build",
+                    job_id="release",
+                )
+
+        command = run.call_args.args[0]
+        self.assertEqual(run.call_count, 1)
+        self.assertIn("--auth-json", command)
+        self.assertIn("--agent", command)
+        self.assertIn("--group", command)
+        self.assertIn("build", command)
+        self.assertIn("--job", command)
+        self.assertIn("release", command)
+        self.assertEqual(decision["decision"], "spark")
+        self.assertEqual(decision["backend_account_id"], "backend-nufker")
+
+    def test_spark_health_update_is_bounded_and_uses_config(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["codex-usage"], 0, '{"state":"failed"}\n', ""
+        )
+        with patch.dict("os.environ", {"CODEX_USAGE_CONFIG": "/tmp/codex-config.toml"}, clear=False), patch(
+            "codex_master.server.codex_usage_executable",
+            return_value="/usr/bin/codex-usage",
+        ), patch("codex_master.server.run_command", return_value=completed) as run:
+            result = codex_usage_spark_health_update(
+                "backend-nufker",
+                state="failed",
+                reason="spark_turn_timeout",
+            )
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[:3], ["/usr/bin/codex-usage", "--config", "/tmp/codex-config.toml"])
+        self.assertIn("spark-health", command)
+        self.assertIn("backend-nufker", command)
+        self.assertEqual(result["state"], "failed")
+
+    @patch("codex_master.server.update_agent_spark_health")
+    @patch("codex_master.server.time.sleep")
+    @patch("codex_master.server.status_agent")
+    def test_wait_marks_spark_activity_healthy(
+        self, mock_status_agent, _mock_sleep, mock_health
+    ) -> None:
+        mock_status_agent.side_effect = [
+            {
+                "agent": "a",
+                "running": True,
+                "raw_log_bytes": 10,
+                "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
+                "response_state": {"state": "running_idle"},
+                "limit_state": {"limited": False},
+            },
+            {
+                "agent": "a",
+                "running": True,
+                "raw_log_bytes": 11,
+                "raw_log_updated_at_utc": "2026-06-07T10:00:01+00:00",
+                "response_state": {"state": "running_recent_output"},
+                "limit_state": {"limited": False},
+            },
+        ]
+        mock_health.return_value = {"state": "healthy", "updated": True, "raw_output": "not_returned"}
+
+        result = wait_agent("a", timeout_seconds=10, poll_interval_seconds=1)
+
+        self.assertEqual(result["status"], "activity_observed")
+        self.assertEqual(result["spark_health"]["state"], "healthy")
+        mock_health.assert_called_once_with(
+            "a1", state="healthy", reason="spark_turn_activity_observed"
+        )
+
+    @patch("codex_master.server.update_agent_spark_health")
+    @patch("codex_master.server.status_agent")
+    def test_wait_marks_spark_timeout_failed(self, mock_status_agent, mock_health) -> None:
+        mock_status_agent.return_value = {
+            "agent": "a",
+            "running": True,
+            "raw_log_bytes": 10,
+            "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
+            "last_assignment": {
+                "assignment_id": "assign-1",
+                "created_at_utc": "2026-06-07T10:00:30+00:00",
+            },
+            "response_state": {"state": "running_tui_starter_context"},
+            "limit_state": {"limited": False},
+            "tui_context": {"state": "starter_placeholder", "evidence": "not_returned"},
+        }
+        mock_health.return_value = {"state": "failed", "updated": True, "raw_output": "not_returned"}
+
+        result = wait_agent("a", timeout_seconds=0, poll_interval_seconds=1)
+
+        self.assertEqual(result["status"], "timeout")
+        self.assertEqual(result["spark_health"]["state"], "failed")
+        mock_health.assert_called_once_with(
+            "a1", state="failed", reason="spark_turn_timeout"
+        )
+
+    def test_routing_decision_tool_is_prompt_free(self) -> None:
+        with patch("codex_master.server.send_agent") as send:
+            result = call_tool(
+                "agent_routing_decision",
+                {
+                    "agent": "a",
+                    "role": "arbeitsbiene",
+                    "group_id": "build",
+                    "job_id": "release",
+                },
+            )
+
+        self.assertEqual(result["decision"], "spark")
+        self.assertEqual(result["model"], WRITE_AGENT_MODEL)
+        send.assert_not_called()
+
+    def test_blocked_routing_sends_no_assignment_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            blocked = {
+                "schema_version": 1,
+                "account": "work",
+                "backend_account_id": "backend-work",
+                "role": "exploriererin",
+                "decision": "blocked",
+                "model": None,
+                "reason": "main_limit_at_or_below_threshold",
+                "usage_state": "known",
+                "paid_overage_allowed": False,
+                "policy_source": "global",
+                "raw_output": "not_returned",
+            }
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ), patch(
+                "codex_master.server.codex_usage_routing_decision",
+                return_value=blocked,
+            ), patch("codex_master.server.send_agent") as send:
+                with self.assertRaisesRegex(AgentError, "blocked assignment before prompt send"):
+                    call_tool(
+                        "agent_assign_readonly",
+                        {"agent": "a", "task": "do not send", "scope": ["src"]},
+                    )
+                send.assert_not_called()
+
+    def test_model_switch_restarts_only_inactive_agentin(self) -> None:
+        lease = {"state": "held", "holder": "test", "held_by_this_server": True}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            agent = {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}
+            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
+                "codex_master.server.tmux_alive", return_value=True
+            ), patch(
+                "codex_master.server.read_meta",
+                return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(home)},
+            ), patch(
+                "codex_master.server.status_agent",
+                return_value={"response_state": {"state": "running_idle"}},
+            ), patch(
+                "codex_master.server.run_tmux",
+                return_value=subprocess.CompletedProcess(["tmux"], 0, "", ""),
+            ), patch("codex_master.server.start_agent", return_value={"status": "started"}) as start:
+                result = ensure_assignment_session_model(
+                    "a",
+                    model=WRITE_AGENT_MODEL,
+                    reasoning_effort="low",
+                    lease=lease,
+                )
+
+        self.assertEqual(result["status"], "restarted")
+        self.assertEqual(start.call_args.kwargs["model"], WRITE_AGENT_MODEL)
+        self.assertEqual(start.call_args.kwargs["lease"], lease)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            agent = {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}
+            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
+                "codex_master.server.tmux_alive", return_value=True
+            ), patch(
+                "codex_master.server.read_meta",
+                return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(home)},
+            ), patch(
+                "codex_master.server.status_agent",
+                return_value={"response_state": {"state": "running_recent_output"}},
+            ), patch("codex_master.server.run_tmux") as tmux:
+                with self.assertRaisesRegex(AgentError, "controlled restart requires an inactive Agentin"):
+                    ensure_assignment_session_model(
+                        "a",
+                        model=WRITE_AGENT_MODEL,
+                        reasoning_effort="low",
+                        lease=lease,
+                    )
+                tmux.assert_not_called()
 
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.send_agent")
@@ -7371,6 +7717,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             fake_codex.write_text(
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
+                'printf "AFFINITY:%s\\n" "$(taskset -pc $$ 2>/dev/null)"\n'
                 'printf "FAKE_OK:%s\\n" "${CODEX_HOME}"\n',
                 encoding="utf-8",
             )
@@ -7388,6 +7735,8 @@ class AgentPoolManagementTest(unittest.TestCase):
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn("FAKE_OK:", completed.stdout)
+            self.assertIn("AFFINITY:", completed.stdout)
+            self.assertIn("4-10", completed.stdout)
             self.assertNotIn("BAD", completed.stdout + completed.stderr)
 
     def test_agent_pool_wrapper_treats_command_name_as_data_not_exec_option(self) -> None:

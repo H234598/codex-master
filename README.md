@@ -138,6 +138,10 @@ Agentinnen leased by the current server; the systemd supervisor uses
 `--manage-unclaimed --quiet` to handle unclaimed or expired leases while still
 skipping active leases held by other clients and avoiding successful JSON noise
 in the user journal.
+`usage-watchdog` consumes `codex-usage` snapshot state, writes a local
+codex-usage block marker, and stops running Agentinnen whose accounts are still
+blocked until their next reset. `agent_start` and claim flows refuse to start a
+blocked Agentin until the codex-usage watchdog releases it again.
 
 ## Tools
 
@@ -158,6 +162,9 @@ in the user journal.
   defaulting to 120 seconds and capped at 10 minutes per call
 - `fleet_watchdog`: request a report from idle Agentinnen, wait a grace window,
   then optionally interrupt, stop, or release without raw output
+- `usage_watchdog`: synchronize codex-usage limit blocks with local Agentin
+  state, stopping blocked running Agentinnen and clearing the local block
+  marker once the codex-usage watchdog releases them
 - `agent_send`: send text to one running Agentin
 - `agent_interrupt`: send Ctrl-C to one running Agentin
 - `agent_stop`: stop selected Agentinnen; `all`/series selectors require
@@ -409,6 +416,10 @@ the auth-copy safety model.
   `NoNewPrivileges`, `MemoryDenyWriteExecute`, native syscall architecture,
   and `UMask=0077`; it intentionally keeps normal user home read access because
   the watchdog needs Codex config, tmux IPC, and managed state files
+- `codex-usage` stores its snapshots under `~/.local/share/codex-usage/snapshots`
+  by default; `usage_watchdog` reads those snapshots, writes the local
+  codex-usage block marker, and refuses new `agent_start`/claim flows until the
+  next reset window
 
 `watchdog-status`
 - reports whether the systemd timer is active and whether the last service run
