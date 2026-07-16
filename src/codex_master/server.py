@@ -3235,7 +3235,12 @@ def agent_spark_routing(agent: str) -> dict[str, Any] | None:
     if meta.get("model") != WRITE_AGENT_MODEL:
         return None
     route = meta.get("routing")
-    if not isinstance(route, dict) or route.get("decision") is None:
+    account_only_route = (
+        isinstance(route, dict)
+        and isinstance(route.get("account"), str)
+        and route.get("decision") is None
+    )
+    if not isinstance(route, dict) or account_only_route:
         meta_account = route.get("account") if isinstance(route, dict) else None
         try:
             records = list_assignments(agent, 1).get("records", [])

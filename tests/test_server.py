@@ -4190,6 +4190,29 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertIsNone(route)
 
+    def test_agent_spark_routing_does_not_use_assignment_for_empty_metadata(self) -> None:
+        with patch(
+            "codex_master.server.read_meta",
+            return_value={"model": WRITE_AGENT_MODEL, "routing": {}},
+        ), patch(
+            "codex_master.server.list_assignments",
+            return_value={
+                "records": [
+                    {
+                        "routing": {
+                            "account": "BW_Neu",
+                            "decision": "spark",
+                            "backend_account_id": "backend-old",
+                        }
+                    }
+                ]
+            },
+        ) as list_assignments_mock:
+            route = agent_spark_routing("a1")
+
+        self.assertIsNone(route)
+        list_assignments_mock.assert_not_called()
+
     def test_usage_mutation_guard_rechecks_non_actionable_snapshot_via_routing(self) -> None:
         status = {
             "agent": "BW_Privat",
