@@ -5991,6 +5991,68 @@ class ServerHelpersTest(unittest.TestCase):
                 self.assertEqual(claim_errors, [])
                 self.assertEqual(agent_lease_status("a")["state"], "held")
 
+    def test_direct_stop_does_not_delete_newly_claimed_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            kill_started = threading.Event()
+            claim_started = threading.Event()
+            claim_finished = threading.Event()
+            claim_errors: list[BaseException] = []
+
+            def fake_kill(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+                kill_started.set()
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            def concurrent_claim() -> None:
+                if not kill_started.wait(1):
+                    claim_errors.append(AssertionError("stop did not reach tmux kill"))
+                    claim_finished.set()
+                    return
+                claim_started.set()
+                try:
+                    claim_agent("a")
+                except BaseException as exc:
+                    claim_errors.append(exc)
+                finally:
+                    claim_finished.set()
+
+            from codex_master import server as server_module
+
+            real_release_agent = server_module.release_agent
+
+            def release_after_claim_attempt(agent: str, force: bool = False) -> dict[str, Any]:
+                if not claim_started.wait(1):
+                    claim_errors.append(AssertionError("stop did not reach lease release"))
+                claim_finished.wait(1)
+                return real_release_agent(agent, force=force)
+
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
+                "codex_master.server.SERVER_INSTANCE_ID", "owner-one"
+            ), patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"session": "session-a", "home": root, "runner": root / "codex"}},
+                clear=True,
+            ), patch("codex_master.server.tmux_alive", return_value=True), patch(
+                "codex_master.server.run_tmux", side_effect=fake_kill
+            ), patch(
+                "codex_master.server.release_agent", side_effect=release_after_claim_attempt
+            ):
+                worker = threading.Thread(target=concurrent_claim)
+                worker.start()
+                result = stop_agent("a")
+                worker.join(2)
+                lease = agent_lease_status("a")
+
+        self.assertEqual(result["status"], "stopped")
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(claim_errors, [])
+        self.assertEqual(lease["state"], "held")
+
     def test_agent_lease_blocks_other_client_with_retry_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -10312,6 +10374,17 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(copied["copied_count"], 1)
             self.assertEqual((pool / "a2" / "auth.json").read_text(encoding="utf-8"), '{"token":"secret"}\n')
             self.assertNotIn("a-series", json.dumps(copied, sort_keys=True))
+
+            case_insensitive = server_module.agent_pool_copy_auth(
+                str(spec_path),
+                target_dir=str(pool),
+                codex_bin="/bin/echo",
+                from_agent="A1",
+                to="A-SERIES",
+                yes=True,
+                overwrite=True,
+            )
+            self.assertEqual(case_insensitive["copied_count"], 1)
 
             status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
             self.assertTrue(status["ok"])

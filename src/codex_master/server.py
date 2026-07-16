@@ -3146,6 +3146,11 @@ def start_agent_with_lease(
 
 
 def stop_agent(agent: str, force: bool = False) -> dict[str, Any]:
+    with agent_lifecycle_lock(agent):
+        return _stop_agent_unlocked(agent, force=force)
+
+
+def _stop_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     cfg = AGENTS[agent]
     session = cfg["session"]
@@ -8437,16 +8442,19 @@ def pool_normalize_spec(
     for alias, target in raw_aliases.items():
         if not isinstance(alias, str) or not alias or len(alias) > 64:
             raise AgentError("alias names must be short strings")
-        if alias in reserved_aliases:
+        normalized_alias = alias.strip().lower()
+        if not normalized_alias:
+            raise AgentError("alias names must be short strings")
+        if normalized_alias in reserved_aliases or normalized_alias in aliases:
             raise AgentError("alias conflicts with a pool selector")
         if isinstance(target, str):
             if target not in valid_targets:
                 raise AgentError("alias points to an unknown target")
-            aliases[alias] = target
+            aliases[normalized_alias] = target
         elif isinstance(target, list) and target and all(isinstance(agent, str) for agent in target):
             if any(agent not in valid_targets for agent in target):
                 raise AgentError("alias points to an unknown target")
-            aliases[alias] = target[:]
+            aliases[normalized_alias] = target[:]
         else:
             raise AgentError("alias must point to an Agentin id, series selector, or non-empty list")
 
@@ -8486,6 +8494,9 @@ def pool_normalize_spec(
 
 
 def pool_selector_ids(normalized: dict[str, Any], selector: str) -> list[str]:
+    if not isinstance(selector, str):
+        raise AgentError("unknown pool selector")
+    selector = selector.strip().lower()
     if selector == "all":
         return list(normalized["ids"])
     series_ids = normalized["series_ids"]
@@ -9014,6 +9025,9 @@ def agent_pool_copy_auth(
     overwrite: bool = False,
 ) -> dict[str, Any]:
     normalized = pool_normalize_spec(spec, target_dir=target_dir, codex_bin=codex_bin)
+    if not isinstance(from_agent, str):
+        raise AgentError("from_agent must be a concrete pool Agentin id")
+    from_agent = from_agent.strip().lower()
     root = normalized["pool_root"]
     pool_guard_root(root)
     try:
