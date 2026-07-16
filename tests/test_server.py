@@ -3875,7 +3875,9 @@ class ServerHelpersTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with patch.dict(os.environ, {"XDG_DATA_HOME": tmpdir}, clear=False):
+            with patch.dict(os.environ, {"XDG_DATA_HOME": tmpdir}, clear=False), patch(
+                "codex_master.server.read_meta", return_value={}
+            ), patch("codex_master.server.list_assignments", return_value={"records": []}):
                 status = codex_usage_watchdog_status("a1")
                 self.assertEqual(status["state"], "blocked")
                 self.assertTrue(status["blocked"])
@@ -3928,6 +3930,31 @@ class ServerHelpersTest(unittest.TestCase):
             status = codex_usage_watchdog_status("a1")
 
         self.assertTrue(status["blocked"])
+        read_snapshot.assert_called_once_with("BW_Neu")
+
+    def test_codex_usage_watchdog_does_not_fallback_to_old_account_snapshot(self) -> None:
+        with patch(
+            "codex_master.server.read_meta",
+            return_value={
+                "started_at_utc": "2026-07-16T10:00:00+00:00",
+                "routing": {"account": "BW_Neu"},
+            },
+        ), patch(
+            "codex_master.server.list_assignments",
+            return_value={
+                "records": [
+                    {
+                        "created_at_utc": "2026-07-16T09:00:00+00:00",
+                        "routing": {"account": "BW_Alt"},
+                    }
+                ]
+            },
+        ), patch(
+            "codex_master.server.read_codex_usage_snapshot", return_value={}
+        ) as read_snapshot:
+            status = codex_usage_watchdog_status("a1")
+
+        self.assertEqual(status["state"], "missing")
         read_snapshot.assert_called_once_with("BW_Neu")
 
     def test_remember_agent_routing_persists_main_usage_account(self) -> None:
@@ -4005,7 +4032,7 @@ class ServerHelpersTest(unittest.TestCase):
             (snapshot_dir / "a1.json").write_text("{not-json", encoding="utf-8")
             with patch.dict("os.environ", {"CODEX_USAGE_STATE_ROOT": tmpdir}, clear=False), patch(
                 "codex_master.server.read_meta", return_value={}
-            ):
+            ), patch("codex_master.server.list_assignments", return_value={"records": []}):
                 with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
                     codex_usage_watchdog_status("a")
 
