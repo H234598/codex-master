@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import datetime as _dt
 import fcntl
 import hashlib
@@ -1520,19 +1521,35 @@ def open_private_regular_update(path: Path) -> Any:
         raise
 
 
+_LIFECYCLE_LOCK_STACK: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "codex_master_lifecycle_lock_stack", default=()
+)
+
+
 @contextlib.contextmanager
 def agent_lifecycle_lock(agent: str) -> Any:
     agent = canonical_agent_id(agent)
+    held_locks = _LIFECYCLE_LOCK_STACK.get()
+    if agent in held_locks:
+        yield
+        return
     ensure_private_dir(STATE_ROOT)
     ensure_private_dir(LOCK_DIR)
     lock_path = LOCK_DIR / f"agent-{agent}.lock"
     with open_private_regular_update(lock_path) as fh:
+        token = None
         try:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-            yield
+            token = _LIFECYCLE_LOCK_STACK.set((*held_locks, agent))
+            try:
+                yield
+            except OSError as exc:
+                raise AgentError("could not acquire agent lifecycle lock") from exc
         except OSError as exc:
             raise AgentError("could not acquire agent lifecycle lock") from exc
         finally:
+            if token is not None:
+                _LIFECYCLE_LOCK_STACK.reset(token)
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
             except OSError:
@@ -1851,6 +1868,23 @@ def claim_agent(
     recover_stopped: bool = False,
     stopped_grace_seconds: int = DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
 ) -> dict[str, Any]:
+    with agent_lifecycle_lock(agent):
+        return _claim_agent_unlocked(
+            agent,
+            ttl_seconds=ttl_seconds,
+            force=force,
+            recover_stopped=recover_stopped,
+            stopped_grace_seconds=stopped_grace_seconds,
+        )
+
+
+def _claim_agent_unlocked(
+    agent: str,
+    ttl_seconds: int = DEFAULT_AGENT_LEASE_SECONDS,
+    force: bool = False,
+    recover_stopped: bool = False,
+    stopped_grace_seconds: int = DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
+) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     ensure_state()
     ttl_seconds = normalize_lease_seconds(ttl_seconds)
@@ -1889,6 +1923,11 @@ def claim_agent(
 
 
 def release_agent(agent: str, force: bool = False) -> dict[str, Any]:
+    with agent_lifecycle_lock(agent):
+        return _release_agent_unlocked(agent, force=force)
+
+
+def _release_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     ensure_state()
     current = read_agent_lease_record(agent)

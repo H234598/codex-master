@@ -4,6 +4,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 import os
@@ -5930,6 +5931,64 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(lease["holder"], "none")
         self.assertEqual(lease["seconds_remaining"], 0)
         self.assertIsNone(lease["expires_at_utc"])
+
+    def test_agent_release_does_not_delete_newly_claimed_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            before_remove = threading.Event()
+            claim_started = threading.Event()
+            claim_written = threading.Event()
+            claim_finished = threading.Event()
+            claim_errors: list[BaseException] = []
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
+                "codex_master.server.SERVER_INSTANCE_ID", "owner-one"
+            ):
+
+                claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
+
+                def concurrent_claim() -> None:
+                    before_remove.wait(1)
+                    claim_started.set()
+                    try:
+                        claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
+                    except BaseException as exc:
+                        claim_errors.append(exc)
+                    finally:
+                        claim_finished.set()
+
+                def remove_after_claim_starts(agent: str) -> bool:
+                    before_remove.set()
+                    self.assertTrue(claim_started.wait(1))
+                    claim_written.wait(1)
+                    path = state / "leases" / f"{agent}.json"
+                    path.unlink(missing_ok=True)
+                    return True
+
+                from codex_master import server as server_module
+
+                real_write_agent_lease = server_module.write_agent_lease
+
+                def write_and_signal(agent: str, ttl_seconds: int) -> dict[str, Any]:
+                    record = real_write_agent_lease(agent, ttl_seconds)
+                    claim_written.set()
+                    return record
+
+                worker = threading.Thread(target=concurrent_claim)
+                with patch("codex_master.server.remove_agent_lease", side_effect=remove_after_claim_starts), patch(
+                    "codex_master.server.write_agent_lease", side_effect=write_and_signal
+                ):
+                    worker.start()
+                    release_agent("a", force=True)
+                worker.join(1)
+
+                self.assertTrue(claim_finished.is_set())
+                self.assertEqual(claim_errors, [])
+                self.assertEqual(agent_lease_status("a")["state"], "held")
 
     def test_agent_lease_blocks_other_client_with_retry_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
