@@ -13,6 +13,7 @@ import datetime as _dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -1621,6 +1622,7 @@ def read_agent_lease_record(agent: str) -> dict[str, Any] | None:
 def public_agent_lease(agent: str, record: dict[str, Any] | None = None) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     now = time.time()
+    valid_expiry = True
     if not record:
         return {
             "agent": agent,
@@ -1634,8 +1636,12 @@ def public_agent_lease(agent: str, record: dict[str, Any] | None = None) -> dict
         }
     try:
         expires_at = float(record.get("expires_at_epoch", 0))
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         expires_at = 0.0
+        valid_expiry = False
+    if not math.isfinite(expires_at):
+        expires_at = 0.0
+        valid_expiry = False
     active = expires_at > now
     held_by_this_server = active and record.get("owner") == SERVER_INSTANCE_ID
     holder = "this_server" if held_by_this_server else "other_server" if active else "none"
@@ -1644,7 +1650,7 @@ def public_agent_lease(agent: str, record: dict[str, Any] | None = None) -> dict
         "state": "held" if active else "expired",
         "holder": holder,
         "held_by_this_server": held_by_this_server,
-        "expires_at_utc": lease_utc(expires_at),
+        "expires_at_utc": lease_utc(expires_at) if valid_expiry else None,
         "seconds_remaining": max(0, int(expires_at - now)) if active else 0,
         "ttl_seconds": record.get("ttl_seconds") if isinstance(record.get("ttl_seconds"), int) else None,
         "raw_output": "not_returned",

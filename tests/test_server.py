@@ -79,6 +79,7 @@ from codex_master.server import (
     install,
     installed_source_worktree_state,
     agent_lease_status,
+    public_agent_lease,
     agent_auth_status,
     assign_agent,
     interrupt_agent,
@@ -3946,6 +3947,22 @@ class ServerHelpersTest(unittest.TestCase):
                 lock_still_symlink = lock_path.is_symlink()
 
         self.assertTrue(lock_still_symlink)
+
+    def test_public_agent_lease_treats_non_finite_expiry_as_expired(self) -> None:
+        lease = public_agent_lease(
+            "a",
+            {
+                "agent": "a1",
+                "owner": "other-server",
+                "expires_at_epoch": float("inf"),
+                "ttl_seconds": DEFAULT_AGENT_LEASE_SECONDS,
+            },
+        )
+
+        self.assertEqual(lease["state"], "expired")
+        self.assertEqual(lease["holder"], "none")
+        self.assertEqual(lease["seconds_remaining"], 0)
+        self.assertIsNone(lease["expires_at_utc"])
 
     def test_agent_lease_blocks_other_client_with_retry_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
