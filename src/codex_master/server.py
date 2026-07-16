@@ -3084,7 +3084,11 @@ def stop_agent(agent: str, force: bool = False) -> dict[str, Any]:
     if was_running:
         cp = run_tmux(["kill-session", "-t", session], check=False)
         if cp.returncode != 0:
-            raise AgentError(f"tmux stop failed for agent {agent}")
+            if cp.returncode in {COMMAND_TIMEOUT_RETURN_CODE, COMMAND_UNAVAILABLE_RETURN_CODE} or tmux_alive(session):
+                raise AgentError(f"tmux stop failed for agent {agent}")
+            process_count = agent_home_process_summary(agent).get("process_count")
+            if not isinstance(process_count, int) or isinstance(process_count, bool) or process_count != 0:
+                raise AgentError(f"tmux stop failed for agent {agent}")
         release = release_agent(agent, force=True)
     else:
         current_lease = agent_lease_status(agent)
