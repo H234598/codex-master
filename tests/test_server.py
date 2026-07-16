@@ -4227,6 +4227,15 @@ class ServerHelpersTest(unittest.TestCase):
 
         read_snapshot.assert_not_called()
 
+    def test_codex_usage_watchdog_rejects_non_mapping_routing_metadata(self) -> None:
+        with patch("codex_master.server.read_meta", return_value={"routing": []}), patch(
+            "codex_master.server.list_assignments", return_value={"records": []}
+        ), patch("codex_master.server.read_codex_usage_snapshot") as read_snapshot:
+            with self.assertRaisesRegex(AgentError, "codex-usage routing metadata is invalid"):
+                codex_usage_watchdog_status("a1")
+
+        read_snapshot.assert_not_called()
+
     def test_codex_usage_watchdog_ignores_marker_for_previous_account(self) -> None:
         with patch(
             "codex_master.server.read_meta",

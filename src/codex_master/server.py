@@ -3210,6 +3210,8 @@ def codex_usage_snapshot_accounts(
     record = records[-1] if records and isinstance(records[-1], dict) else {}
     assignment_routing = record.get("routing") if isinstance(record, dict) else None
     routing = meta.get("routing")
+    if "routing" in meta and not isinstance(routing, dict):
+        raise AgentError("codex-usage routing metadata is invalid")
     assignment_account = assignment_routing.get("account") if isinstance(assignment_routing, dict) else None
     meta_account = routing.get("account") if isinstance(routing, dict) else None
     if meta_account is not None and (
