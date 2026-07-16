@@ -7618,6 +7618,8 @@ class ServerHelpersTest(unittest.TestCase):
                     error_text = str(raised.exception)
                     self.assertNotIn("SECRET_SEND_OUTPUT_SHOULD_NOT_RETURN", error_text)
                     self.assertNotIn(tmpdir, error_text)
+                    if failing_step == "paste-buffer":
+                        self.assertTrue(any(call["args"][0] == "delete-buffer" for call in calls))
 
 
 class CliLifecycleTest(unittest.TestCase):
