@@ -3256,12 +3256,15 @@ def agent_spark_routing(agent: str) -> dict[str, Any] | None:
             return None
         assignment_created = parse_utc_timestamp(record.get("created_at_utc")) if isinstance(record, dict) else None
         session_started = parse_utc_timestamp(meta.get("started_at_utc"))
-        if meta_account is not None and session_started is not None and (
-            assignment_created is None
-            or assignment_created < session_started
-            or assignment_created > time.time()
-        ):
-            return None
+        if meta_account is not None:
+            if assignment_created is not None and assignment_created > time.time():
+                return None
+            if "started_at_utc" in meta and (
+                session_started is None
+                or assignment_created is None
+                or assignment_created < session_started
+            ):
+                return None
         route = assignment_route
     if not isinstance(route, dict) or route.get("decision") != "spark":
         return None
