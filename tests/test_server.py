@@ -146,6 +146,7 @@ from codex_master.server import (
     master_release_status,
     plugin_cache_status,
     plugin_manifest_version,
+    prune_plugin_cache_versions,
     watchdog_effective_idle,
     watchdog_marker_matches,
 )
@@ -1537,6 +1538,54 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("0.3.100+codex.symlink", remaining_versions)
         self.assertTrue(symlink_survived)
         self.assertNotIn(str(cache), json.dumps(result, sort_keys=True))
+
+    def test_sync_plugin_cache_rejects_cache_root_swap_before_retention(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            root = tmp_path / "repo"
+            cache = tmp_path / "cache"
+            backup_cache = tmp_path / "cache-backup"
+            redirected_cache = tmp_path / "redirected-cache"
+            old_version = "0.3.4+codex.old"
+            current_version = "0.3.5+codex.current"
+            (root / ".codex-plugin").mkdir(parents=True)
+            (root / "bin").mkdir()
+            (root / "skills").mkdir()
+            (root / "systemd" / "user").mkdir(parents=True)
+            (root / "src" / "codex_master").mkdir(parents=True)
+            (root / ".codex-plugin" / "plugin.json").write_text(
+                json.dumps({"name": "codex-master", "version": current_version}), encoding="utf-8"
+            )
+            (root / ".app.json").write_text("{}", encoding="utf-8")
+            (root / ".mcp.json").write_text("{}", encoding="utf-8")
+            (root / "README.md").write_text("readme", encoding="utf-8")
+            (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
+            (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
+            (root / "skills" / "SKILL.md").write_text("skill", encoding="utf-8")
+            (root / "src" / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
+            old_manifest = redirected_cache / old_version / ".codex-plugin" / "plugin.json"
+            old_manifest.parent.mkdir(parents=True)
+            old_manifest.write_text(
+                json.dumps({"name": "codex-master", "version": old_version}), encoding="utf-8"
+            )
+            cache.mkdir()
+
+            real_prune = prune_plugin_cache_versions
+
+            def swap_then_prune(cache_root: Path, *, keep_version: str, max_versions: int) -> dict[str, Any]:
+                cache.rename(backup_cache)
+                cache.symlink_to(redirected_cache, target_is_directory=True)
+                return real_prune(cache_root, keep_version=keep_version, max_versions=max_versions)
+
+            with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False), patch(
+                "codex_master.server.prune_plugin_cache_versions", side_effect=swap_then_prune
+            ):
+                with self.assertRaisesRegex(AgentError, "could_not_sync_plugin_cache"):
+                    sync_plugin_cache_from_repo(root, cache, retained_versions=1)
+
+            self.assertTrue((backup_cache / current_version).is_dir())
+            self.assertTrue((redirected_cache / old_version).is_dir())
+            self.assertTrue(cache.is_symlink())
 
     def test_plugin_manifest_version_is_path_sparse(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

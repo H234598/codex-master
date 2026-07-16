@@ -5737,25 +5737,43 @@ def prune_plugin_cache_versions(
 ) -> dict[str, Any]:
     max_versions = normalize_int_field(max_versions, field="max_versions", minimum=1, maximum=MAX_PLUGIN_CACHE_VERSIONS)
     try:
-        entries = list(cache_root.iterdir())
+        cache_stat = cache_root.lstat()
     except OSError as exc:
         raise AgentError("could_not_sync_plugin_cache") from exc
-    candidates: list[tuple[float, str, Path]] = []
-    for entry in entries:
-        version = valid_plugin_cache_entry_version(entry)
-        if not version or version == keep_version:
-            continue
-        try:
-            modified = entry.lstat().st_mtime
-        except OSError:
-            continue
-        candidates.append((modified, version, entry))
-    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    keep_slots = max(0, max_versions - 1)
-    to_prune = candidates[keep_slots:]
-    for _, _, entry in to_prune:
-        remove_real_plugin_cache_dir(entry)
-    retained_old_count = len(candidates) - len(to_prune)
+    if stat_module.S_ISLNK(cache_stat.st_mode) or not stat_module.S_ISDIR(cache_stat.st_mode):
+        raise AgentError("could_not_sync_plugin_cache")
+
+    cache_fd = -1
+    try:
+        cache_fd = open_directory_no_follow_matching(
+            cache_root,
+            cache_stat,
+            error_text="could_not_sync_plugin_cache",
+            changed_text="plugin cache root changed during retention",
+        )
+        cache_fd_path = Path(f"/proc/self/fd/{cache_fd}")
+        entries = [cache_fd_path / name for name in sorted(os.listdir(cache_fd))]
+        candidates: list[tuple[float, str, str]] = []
+        for entry in entries:
+            version = valid_plugin_cache_entry_version(entry)
+            if not version or version == keep_version:
+                continue
+            try:
+                modified = entry.lstat().st_mtime
+            except OSError:
+                continue
+            candidates.append((modified, version, entry.name))
+        candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        keep_slots = max(0, max_versions - 1)
+        to_prune = candidates[keep_slots:]
+        for _, _, entry_name in to_prune:
+            remove_real_plugin_cache_dir(cache_fd_path / entry_name)
+        retained_old_count = len(candidates) - len(to_prune)
+    except OSError as exc:
+        raise AgentError("could_not_sync_plugin_cache") from exc
+    finally:
+        if cache_fd >= 0:
+            os.close(cache_fd)
     return {
         "max_versions": max_versions,
         "current_version_retained": True,
