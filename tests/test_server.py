@@ -9263,6 +9263,46 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn(str(tmp), payload_text)
             self.assertNotIn("outside-runtime-target", payload_text)
 
+    def test_agent_pool_install_rejects_pool_root_swap_before_mutation(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            backup = tmp / "agents-backup"
+            replacement = tmp / "replacement"
+            pool.mkdir()
+            replacement.mkdir()
+            spec_path = self._write_spec_payload(
+                tmp,
+                {
+                    "schema_version": 1,
+                    "pool_root": str(pool),
+                    "codex_bin": "/bin/echo",
+                    "series": [{"prefix": "a", "count": 1, "template": "a1", "authenticated": []}],
+                    "shared_assets": [],
+                    "runtime_dirs": [],
+                },
+            )
+            real_ensure = server_module.ensure_private_dir
+            swapped = False
+
+            def swap_after_root(path: Path) -> None:
+                nonlocal swapped
+                real_ensure(path)
+                if path == pool and not swapped:
+                    swapped = True
+                    pool.rename(backup)
+                    replacement.rename(pool)
+
+            with patch.object(server_module, "ensure_private_dir", side_effect=swap_after_root):
+                with self.assertRaisesRegex(AgentError, "pool root changed during install"):
+                    server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+
+            self.assertTrue(swapped)
+            self.assertFalse((backup / "a1").exists())
+            self.assertFalse((pool / "a1").exists())
+
     def test_agent_pool_destroy_requires_regular_marker_without_path_leak(self) -> None:
         from codex_master import server as server_module
 

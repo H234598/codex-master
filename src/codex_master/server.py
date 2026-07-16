@@ -8204,6 +8204,61 @@ def agent_pool_status(
     }
 
 
+@contextlib.contextmanager
+def pool_install_root(root: Path) -> Any:
+    try:
+        parent_stat = root.parent.lstat()
+    except FileNotFoundError:
+        parent_stat = None
+    except OSError as exc:
+        raise AgentError("pool root changed during install") from exc
+    try:
+        root_stat = root.lstat()
+    except FileNotFoundError:
+        root_stat = None
+    except OSError as exc:
+        raise AgentError("pool root changed during install") from exc
+
+    ensure_private_dir(root)
+    if parent_stat is None:
+        try:
+            parent_stat = root.parent.lstat()
+        except OSError as exc:
+            raise AgentError("pool root changed during install") from exc
+    if root_stat is None:
+        try:
+            root_stat = root.lstat()
+        except OSError as exc:
+            raise AgentError("pool root changed during install") from exc
+
+    parent_fd = -1
+    root_fd = -1
+    try:
+        parent_fd = open_directory_no_follow_matching(
+            root.parent,
+            parent_stat,
+            error_text="pool root changed during install",
+            changed_text="pool root changed during install",
+        )
+        root_fd = open_directory_no_follow_matching(
+            root.name,
+            root_stat,
+            error_text="pool root changed during install",
+            changed_text="pool root changed during install",
+            dir_fd=parent_fd,
+        )
+        try:
+            operation_root = Path(f"/proc/self/fd/{root_fd}").resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise AgentError("pool root changed during install") from exc
+        yield operation_root
+    finally:
+        if root_fd >= 0:
+            os.close(root_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
 def agent_pool_install(
     spec: str | None = None,
     target_dir: str | None = None,
@@ -8229,88 +8284,91 @@ def agent_pool_install(
         )
     root = normalized["pool_root"]
     pool_guard_root(root)
-    ensure_private_dir(root)
+    with pool_install_root(root) as root:
+        created = 0
+        updated_wrappers = 0
+        created_configs = 0
+        created_runtime_dirs = 0
+        linked_assets = 0
+        missing_asset_sources = 0
+        skipped_existing_assets = 0
 
-    created = 0
-    updated_wrappers = 0
-    created_configs = 0
-    created_runtime_dirs = 0
-    linked_assets = 0
-    missing_asset_sources = 0
-    skipped_existing_assets = 0
+        for agent in normalized["ids"]:
+            home = root / agent
+            before = home.exists()
+            ensure_private_dir(home)
+            if not before:
+                created += 1
 
-    for agent in normalized["ids"]:
-        home = root / agent
-        before = home.exists()
-        ensure_private_dir(home)
-        if not before:
-            created += 1
+            wrapper = pool_wrapper_text(agent, home, normalized["codex_bin"])
+            wrapper_path = home / "codex"
+            if not pool_private_text_matches(wrapper_path, wrapper, MAX_CODEX_CONFIG_BYTES):
+                pool_write_private_file(wrapper_path, wrapper, 0o700)
+                updated_wrappers += 1
 
-        wrapper = pool_wrapper_text(agent, home, normalized["codex_bin"])
-        wrapper_path = home / "codex"
-        if not pool_private_text_matches(wrapper_path, wrapper, MAX_CODEX_CONFIG_BYTES):
-            pool_write_private_file(wrapper_path, wrapper, 0o700)
-            updated_wrappers += 1
+            config_path = home / "config.toml"
+            if not is_regular_file_no_symlink(config_path):
+                pool_write_private_file(config_path, pool_minimal_config(home), 0o600)
+                created_configs += 1
 
-        config_path = home / "config.toml"
-        if not is_regular_file_no_symlink(config_path):
-            pool_write_private_file(config_path, pool_minimal_config(home), 0o600)
-            created_configs += 1
+            for runtime_dir in normalized["runtime_dirs"]:
+                runtime_path = home / runtime_dir
+                runtime_existed = is_real_directory_no_symlink(runtime_path)
+                ensure_private_dir(runtime_path)
+                if not runtime_existed:
+                    created_runtime_dirs += 1
 
-        for runtime_dir in normalized["runtime_dirs"]:
-            runtime_path = home / runtime_dir
-            runtime_existed = is_real_directory_no_symlink(runtime_path)
-            ensure_private_dir(runtime_path)
-            if not runtime_existed:
-                created_runtime_dirs += 1
-
-        template = normalized["templates"][agent]
-        if template == agent:
-            continue
-        template_home = root / template
-        for asset in normalized["shared_assets"]:
-            source = template_home / asset
-            target = home / asset
-            if path_present_no_follow(target):
-                skipped_existing_assets += 1
+            template = normalized["templates"][agent]
+            if template == agent:
                 continue
-            if not pool_shared_asset_source(source, root):
-                missing_asset_sources += 1
-                continue
-            ensure_private_dir(target.parent)
-            relative_source = os.path.relpath(source, target.parent)
-            target.symlink_to(relative_source)
-            linked_assets += 1
+            template_home = root / template
+            for asset in normalized["shared_assets"]:
+                source = template_home / asset
+                target = home / asset
+                if path_present_no_follow(target):
+                    skipped_existing_assets += 1
+                    continue
+                if not pool_shared_asset_source(source, root):
+                    missing_asset_sources += 1
+                    continue
+                ensure_private_dir(target.parent)
+                relative_source = os.path.relpath(source, target.parent)
+                target.symlink_to(relative_source)
+                linked_assets += 1
 
-    marker = root / POOL_MARKER_FILE
-    pool_write_private_file(marker, json.dumps(pool_marker_payload(normalized), indent=2, sort_keys=True) + "\n", 0o600)
-
-    auth_result: dict[str, Any] | None = None
-    if copy_auth_from or copy_auth_to:
-        auth_result = agent_pool_copy_auth(
-            spec,
-            target_dir,
-            codex_bin,
-            from_agent=copy_auth_from,
-            to=copy_auth_to,
-            yes=yes,
-            overwrite=overwrite_auth,
+        marker = root / POOL_MARKER_FILE
+        pool_write_private_file(
+            marker,
+            json.dumps(pool_marker_payload(normalized), indent=2, sort_keys=True) + "\n",
+            0o600,
         )
 
-    return {
-        "ok": True,
-        "pool_root": PATH_NOT_RETURNED,
-        "installed_agent_count": len(normalized["ids"]),
-        "created_agent_homes": created,
-        "updated_wrappers": updated_wrappers,
-        "created_configs": created_configs,
-        "created_runtime_dirs": created_runtime_dirs,
-        "linked_shared_assets": linked_assets,
-        "skipped_existing_shared_assets": skipped_existing_assets,
-        "missing_shared_asset_sources": missing_asset_sources,
-        "auth": auth_result,
-        "raw_output": "not_returned",
-    }
+        auth_result: dict[str, Any] | None = None
+        if copy_auth_from or copy_auth_to:
+            auth_result = agent_pool_copy_auth(
+                spec,
+                str(root),
+                codex_bin,
+                from_agent=copy_auth_from,
+                to=copy_auth_to,
+                yes=yes,
+                overwrite=overwrite_auth,
+            )
+
+        return {
+            "ok": True,
+            "pool_root": PATH_NOT_RETURNED,
+            "installed_agent_count": len(normalized["ids"]),
+            "created_agent_homes": created,
+            "updated_wrappers": updated_wrappers,
+            "created_configs": created_configs,
+            "created_runtime_dirs": created_runtime_dirs,
+            "linked_shared_assets": linked_assets,
+            "skipped_existing_shared_assets": skipped_existing_assets,
+            "missing_shared_asset_sources": missing_asset_sources,
+            "auth": auth_result,
+            "raw_output": "not_returned",
+        }
 
 
 def agent_pool_copy_auth(
