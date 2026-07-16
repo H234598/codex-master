@@ -4122,10 +4122,10 @@ class ServerHelpersTest(unittest.TestCase):
         route.assert_called_once_with("a1", role="arbeitsbiene")
         remember.assert_called_once_with("a1", "BW_Privat")
 
-    def test_remember_agent_usage_account_preserves_existing_route(self) -> None:
+    def test_remember_agent_usage_account_preserves_same_account_route(self) -> None:
         meta = {
             "routing": {
-                "account": "BW_Alt",
+                "account": "BW_Neu",
                 "backend_account_id": "backend-old",
                 "decision": "spark",
                 "model": WRITE_AGENT_MODEL,
@@ -4145,6 +4145,22 @@ class ServerHelpersTest(unittest.TestCase):
                 "model": WRITE_AGENT_MODEL,
             },
         )
+
+    def test_remember_agent_usage_account_drops_route_bound_to_old_account(self) -> None:
+        meta = {
+            "routing": {
+                "account": "BW_Alt",
+                "backend_account_id": "backend-old",
+                "decision": "spark",
+                "model": WRITE_AGENT_MODEL,
+            }
+        }
+        with patch("codex_master.server.read_meta", return_value=meta), patch(
+            "codex_master.server.write_meta"
+        ) as write:
+            remember_agent_usage_account("a1", "BW_Neu")
+
+        self.assertEqual(write.call_args.args[1]["routing"], {"account": "BW_Neu"})
 
     def test_agent_spark_routing_recovers_from_account_only_metadata(self) -> None:
         with patch(

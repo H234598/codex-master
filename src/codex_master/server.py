@@ -3290,6 +3290,8 @@ def remember_agent_usage_account(agent: str, account: Any) -> None:
     routing = meta.get("routing")
     if not isinstance(routing, dict):
         routing = {}
+    elif routing.get("account") != account:
+        routing = {}
     routing["account"] = account
     meta["routing"] = routing
     write_meta(agent, meta)
