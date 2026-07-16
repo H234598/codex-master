@@ -3216,8 +3216,7 @@ def codex_usage_snapshot_accounts(
     session_started = parse_utc_timestamp(meta.get("started_at_utc"))
     selected_account = None
     if (
-        meta_account is not None
-        and assignment_account is not None
+        assignment_account is not None
         and session_started is not None
         and assignment_created is not None
         and assignment_created < session_started
