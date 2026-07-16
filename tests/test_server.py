@@ -141,6 +141,7 @@ from codex_master.server import (
     ensure_mcp_startup_timeout_configured,
     default_server_instance_id,
     fleet_watchdog,
+    fleet_usage_watchdog,
     mcp_startup_timeout_seconds,
     updated_mcp_startup_timeout_config,
     mcp_command_tools_list_self_test,
@@ -4281,6 +4282,17 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["usage_watchdog_state"], "would_mark")
         remember.assert_not_called()
         update_marker.assert_not_called()
+
+    def test_fleet_usage_watchdog_dry_run_skips_lifecycle_lock(self) -> None:
+        with patch("codex_master.server.agent_ids", return_value=["a1"]), patch(
+            "codex_master.server.usage_watchdog_agent",
+            return_value={"agent": "a1", "usage_watchdog_state": "clear"},
+        ) as run_agent, patch("codex_master.server.call_agent_lifecycle") as lifecycle:
+            result = fleet_usage_watchdog("a1", dry_run=True)
+
+        self.assertEqual(result["result_count"], 1)
+        run_agent.assert_called_once_with("a1", dry_run=True)
+        lifecycle.assert_not_called()
 
     def test_usage_watchdog_agent_stops_blocked_running_agent_and_writes_marker(self) -> None:
         marker_store: list[dict[str, Any]] = []

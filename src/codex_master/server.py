@@ -4289,12 +4289,17 @@ def usage_watchdog_agent(agent: str, *, dry_run: bool) -> dict[str, Any]:
 
 def fleet_usage_watchdog(agent: str = "all", *, dry_run: bool = False) -> dict[str, Any]:
     selected = agent_ids(agent)
+    run_agent = (
+        (lambda item: usage_watchdog_agent(item, dry_run=True))
+        if dry_run
+        else lambda item: call_agent_lifecycle(
+            item,
+            lambda: usage_watchdog_agent(item, dry_run=False),
+        )
+    )
     results = multi_agent_result(
         selected,
-        lambda item: call_agent_lifecycle(
-            item,
-            lambda: usage_watchdog_agent(item, dry_run=dry_run),
-        ),
+        run_agent,
     )["results"]
     return {
         "agent": agent,
