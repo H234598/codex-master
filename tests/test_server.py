@@ -7401,6 +7401,25 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(listed["record_count"], 1)
         self.assertEqual(listed["records"][0]["assignment_id"], "ok")
 
+    @patch("codex_master.server.ensure_state")
+    def test_assignment_log_skips_unhashable_agent_values(self, _mock_ensure_state) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            assignment_log = root / "assignments.jsonl"
+            assignment_log.write_text(
+                '{"agent": [], "assignment_id": "list-agent"}\n'
+                '{"agent": {"id": "a1"}, "assignment_id": "dict-agent"}\n'
+                '{"agent": "a1", "assignment_id": "ok"}\n',
+                encoding="utf-8",
+            )
+            with patch("codex_master.server.STATE_ROOT", root / "state"), patch(
+                "codex_master.server.LOCK_DIR", root / "locks"
+            ), patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+                listed = list_assignments("a", limit=10)
+
+        self.assertEqual(listed["record_count"], 1)
+        self.assertEqual(listed["records"][0]["assignment_id"], "ok")
+
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.send_agent")
     def test_agent_assign_sends_structured_prompt_without_returning_prompt(self, mock_send_agent, _mock_alive) -> None:

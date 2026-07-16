@@ -5223,7 +5223,8 @@ def list_assignments(agent: str = "all", limit: int = 20) -> dict[str, Any]:
             continue
         if not isinstance(record, dict):
             continue
-        if record.get("agent") in selected_records:
+        record_agent = record.get("agent")
+        if isinstance(record_agent, str) and record_agent in selected_records:
             records.append(sanitize_assignment_record(record))
     return {
         "agent": agent,
