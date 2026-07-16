@@ -3701,8 +3701,12 @@ def update_watchdog_marker(agent: str, marker: dict[str, Any] | None) -> None:
 
 
 def codex_usage_watchdog_marker(meta: dict[str, Any]) -> dict[str, Any]:
-    value = meta.get(CODEX_USAGE_BLOCK_METADATA_KEY)
-    return value if isinstance(value, dict) else {}
+    if CODEX_USAGE_BLOCK_METADATA_KEY not in meta:
+        return {}
+    value = meta[CODEX_USAGE_BLOCK_METADATA_KEY]
+    if not isinstance(value, dict):
+        raise AgentError("could_not_read_codex_usage_watchdog_marker")
+    return value
 
 
 def update_codex_usage_watchdog_marker(agent: str, marker: dict[str, Any] | None) -> None:

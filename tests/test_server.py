@@ -4389,6 +4389,14 @@ class ServerHelpersTest(unittest.TestCase):
             with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_watchdog_metadata"):
                 codex_usage_watchdog_status("a")
 
+    def test_codex_usage_watchdog_status_fails_closed_on_invalid_marker_type(self) -> None:
+        with patch(
+            "codex_master.server.read_meta",
+            return_value={"codex_usage_watchdog": []},
+        ):
+            with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_watchdog_marker"):
+                codex_usage_watchdog_status("a")
+
     def test_codex_usage_watchdog_status_fails_closed_on_invalid_marker_expiry(self) -> None:
         with patch(
             "codex_master.server.read_meta",
