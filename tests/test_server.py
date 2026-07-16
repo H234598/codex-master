@@ -4163,6 +4163,48 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["action_taken"], "none")
         update_marker.assert_not_called()
 
+    def test_usage_watchdog_resolves_unmapped_account_before_marking(self) -> None:
+        missing = {
+            "agent": "a1",
+            "account": "a1",
+            "state": "missing",
+            "blocked": False,
+        }
+        blocked = {
+            "agent": "BW_Work",
+            "account": "BW_Work",
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": "2099-06-08T06:50:00+00:00",
+            "reason": "usage limit reached",
+            "source": "snapshot",
+        }
+        routing = {"account": "BW_Work", "decision": "blocked", "reason": "main_limit_unknown"}
+        with patch.dict(
+            "codex_master.server.AGENTS",
+            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
+            clear=True,
+        ), patch("codex_master.server.ensure_state"), patch(
+            "codex_master.server.tmux_alive", return_value=False
+        ), patch(
+            "codex_master.server.agent_lease_status",
+            return_value={"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
+        ), patch(
+            "codex_master.server.codex_usage_watchdog_status", side_effect=[missing, blocked]
+        ), patch(
+            "codex_master.server.agent_auth_status", return_value={"authenticated": True}
+        ), patch(
+            "codex_master.server.codex_usage_routing_decision", return_value=routing
+        ), patch("codex_master.server.remember_agent_usage_account") as remember, patch(
+            "codex_master.server.update_codex_usage_watchdog_marker"
+        ) as update_marker:
+            result = usage_watchdog_agent("a1", dry_run=False)
+
+        self.assertEqual(result["usage_watchdog_state"], "blocked_marked")
+        remember.assert_called_once_with("a1", "BW_Work")
+        update_marker.assert_called_once()
+        self.assertEqual(update_marker.call_args.args[1]["account"], "BW_Work")
+
     def test_usage_watchdog_agent_stops_blocked_running_agent_and_writes_marker(self) -> None:
         marker_store: list[dict[str, Any]] = []
 
