@@ -3744,6 +3744,12 @@ def watchdog_agent(
 
     if dry_run:
         return {**base, "watchdog_state": f"would_{action}", "action_taken": "none"}
+    if action == "none" and release_watchdog_lease and agent_lease_status(agent).get("held_by_this_server"):
+        released = release_agent(agent, force=True)
+        released_lease = released.get("lease") if isinstance(released, dict) else None
+        if isinstance(released_lease, dict):
+            base["lease_state"] = released_lease.get("state")
+            base["held_by_this_server"] = bool(released_lease.get("held_by_this_server"))
     spark_health = update_agent_spark_health(
         agent,
         state="failed",
