@@ -3721,6 +3721,7 @@ def codex_usage_watchdog_status(agent: str) -> dict[str, Any]:
 
     return {
         "agent": agent,
+        "account": current_account,
         "state": "missing",
         "blocked": False,
         "blocked_until_utc": None,
@@ -3738,6 +3739,15 @@ def safe_codex_usage_reason(value: Any) -> str | None:
 
 def ensure_agent_not_blocked_by_codex_usage(agent: str) -> dict[str, Any]:
     status = codex_usage_watchdog_status(agent)
+    if status.get("state") == "missing" and status.get("account") == canonical_agent_id(agent):
+        auth = agent_auth_status(agent)
+        if auth.get("authenticated"):
+            routing = codex_usage_routing_decision(agent, role="teamleiterin")
+            remember_agent_routing(agent, routing)
+            if routing.get("decision") == "blocked":
+                reason = routing.get("reason") or "codex usage limit reached"
+                raise AgentError(f"agent {canonical_agent_id(agent)} is blocked by codex-usage routing: {reason}")
+            status = codex_usage_watchdog_status(agent)
     if status.get("blocked"):
         blocked_until = status.get("blocked_until_utc")
         reason = status.get("reason") or "codex usage limit reached"

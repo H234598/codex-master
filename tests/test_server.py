@@ -75,6 +75,7 @@ from codex_master.server import (
     DEFAULT_ORDINAL_AGENT_SERIES,
     doctor,
     ensure_state,
+    ensure_agent_not_blocked_by_codex_usage,
     ensure_assignment_session_model,
     handle_rpc,
     install,
@@ -3999,6 +4000,34 @@ class ServerHelpersTest(unittest.TestCase):
                 "model": DEFAULT_AGENT_MODEL,
             },
         )
+
+    def test_usage_mutation_guard_resolves_unmapped_authenticated_account(self) -> None:
+        missing = {
+            "agent": "a1",
+            "account": "a1",
+            "state": "missing",
+            "blocked": False,
+        }
+        clear = {
+            "agent": "BW_Privat",
+            "account": "BW_Privat",
+            "state": "clear",
+            "blocked": False,
+        }
+        routing = {"account": "BW_Privat", "decision": "unchanged", "model": None}
+        with patch(
+            "codex_master.server.codex_usage_watchdog_status", side_effect=[missing, clear]
+        ), patch(
+            "codex_master.server.agent_auth_status",
+            return_value={"authenticated": True},
+        ), patch(
+            "codex_master.server.codex_usage_routing_decision", return_value=routing
+        ) as route, patch("codex_master.server.remember_agent_routing") as remember:
+            status = ensure_agent_not_blocked_by_codex_usage("a1")
+
+        self.assertEqual(status, clear)
+        route.assert_called_once_with("a1", role="teamleiterin")
+        remember.assert_called_once_with("a1", routing)
 
     def test_codex_usage_watchdog_reason_is_bounded_and_redacted(self) -> None:
         secret_reason = "/home/teladi/private-token sk-usage-secret1234567890 " + ("x" * 500)
