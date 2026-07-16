@@ -3848,6 +3848,7 @@ def codex_usage_status_with_routing(
                 remember_agent_usage_account(agent, routing.get("account"))
                 status = codex_usage_watchdog_status(
                     agent,
+                    snapshot_account=routing.get("account"),
                     include_assignment_history=include_assignment_history,
                 )
             else:

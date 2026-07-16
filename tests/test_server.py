@@ -4122,6 +4122,39 @@ class ServerHelpersTest(unittest.TestCase):
         route.assert_called_once_with("a1", role="arbeitsbiene")
         remember.assert_called_once_with("a1", "BW_Privat")
 
+    def test_usage_mutation_guard_rechecks_resolved_account_explicitly(self) -> None:
+        fallback = {
+            "agent": "BW_Alt",
+            "account": "BW_Alt",
+            "account_mapping": "fallback",
+            "state": "clear",
+            "blocked": False,
+        }
+        resolved = {
+            "agent": "BW_Neu",
+            "account": "BW_Neu",
+            "account_mapping": "override",
+            "state": "clear",
+            "blocked": False,
+        }
+        routing = {"account": "BW_Neu", "decision": "main", "model": DEFAULT_AGENT_MODEL}
+        with patch(
+            "codex_master.server.codex_usage_watchdog_status", side_effect=[fallback, resolved]
+        ) as status_mock, patch(
+            "codex_master.server.agent_auth_status", return_value={"authenticated": True}
+        ), patch(
+            "codex_master.server.codex_usage_routing_decision", return_value=routing
+        ) as route, patch("codex_master.server.remember_agent_usage_account") as remember:
+            status = ensure_agent_not_blocked_by_codex_usage("a1")
+
+        self.assertEqual(status, resolved)
+        self.assertEqual(
+            status_mock.call_args_list[1].kwargs,
+            {"snapshot_account": "BW_Neu", "include_assignment_history": True},
+        )
+        route.assert_called_once_with("a1", role="arbeitsbiene")
+        remember.assert_called_once_with("a1", "BW_Neu")
+
     def test_remember_agent_usage_account_preserves_same_account_route(self) -> None:
         meta = {
             "routing": {
