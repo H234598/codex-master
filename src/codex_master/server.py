@@ -2734,29 +2734,38 @@ def start_agent_with_lease(
         if selected_model == WRITE_AGENT_MODEL
         else DEFAULT_AGENT_MODEL_EFFORT
     )
-    if tmux_alive(AGENTS[agent]["session"]):
-        ensure_agent_lease_available(agent)
-        result = start_agent(
-            agent,
-            cwd,
-            prompt,
-            model=selected_model,
-            model_reasoning_effort=selected_effort,
-        )
-        if result.get("status") == "already_running":
-            active_model = (result.get("meta") or {}).get("model") or DEFAULT_AGENT_MODEL
-            if active_model != selected_model:
-                raise AgentError(
-                    "routed model differs from active session; controlled restart requires "
-                    "an inactive Agentin"
-                )
-        remember_agent_routing(agent, routing)
-        result["auth_gate"] = auth_gate
-        result["routing"] = routing
-        return result
     claim = claim_agent(agent)
     lease = claim["lease"]
     release_on_completion = claim["status"] in {"claimed", "claimed_expired"}
+    if tmux_alive(AGENTS[agent]["session"]):
+        try:
+            result = start_agent(
+                agent,
+                cwd,
+                prompt,
+                lease=lease,
+                release_lease_on_failure=release_on_completion,
+                model=selected_model,
+                model_reasoning_effort=selected_effort,
+            )
+            if result.get("status") == "already_running":
+                active_model = (result.get("meta") or {}).get("model") or DEFAULT_AGENT_MODEL
+                if active_model != selected_model:
+                    raise AgentError(
+                        "routed model differs from active session; controlled restart requires "
+                        "an inactive Agentin"
+                    )
+            remember_agent_routing(agent, routing)
+        except Exception:
+            if release_on_completion and agent_lease_status(agent).get("held_by_this_server"):
+                release_agent(agent, force=True)
+            raise
+        if release_on_completion and agent_lease_status(agent).get("held_by_this_server"):
+            release = release_agent(agent, force=True)
+            result["lease"] = release["lease"]
+        result["auth_gate"] = auth_gate
+        result["routing"] = routing
+        return result
     try:
         result = start_agent(
             agent,

@@ -4188,11 +4188,12 @@ class ServerHelpersTest(unittest.TestCase):
 
     @patch("codex_master.server.remember_agent_routing")
     @patch("codex_master.server.start_agent")
-    @patch("codex_master.server.ensure_agent_lease_available")
+    @patch("codex_master.server.claim_agent")
     @patch("codex_master.server.tmux_alive", return_value=True)
     def test_start_agent_with_lease_rejects_running_model_mismatch(
-        self, _mock_alive, _mock_ensure_lease, mock_start_agent, mock_remember_routing
+        self, _mock_alive, mock_claim, mock_start_agent, mock_remember_routing
     ) -> None:
+        mock_claim.return_value = {"status": "renewed", "lease": {"held_by_this_server": True}}
         mock_start_agent.return_value = {
             "agent": "a",
             "status": "already_running",
@@ -4208,6 +4209,32 @@ class ServerHelpersTest(unittest.TestCase):
                 start_agent_with_lease("a")
 
         mock_remember_routing.assert_not_called()
+
+    def test_start_agent_with_lease_claims_transient_lease_for_running_session(self) -> None:
+        lease = {"state": "held", "holder": "this_server", "held_by_this_server": True}
+        with patch("codex_master.server.tmux_alive", return_value=True), patch(
+            "codex_master.server.claim_agent", return_value={"status": "claimed", "lease": lease}
+        ) as mock_claim, patch(
+            "codex_master.server.start_agent",
+            return_value={
+                "agent": "a",
+                "status": "already_running",
+                "meta": {"model": DEFAULT_AGENT_MODEL},
+                "raw_output": "not_returned",
+            },
+        ) as mock_start, patch(
+            "codex_master.server.agent_lease_status",
+            return_value={"held_by_this_server": True},
+        ), patch(
+            "codex_master.server.release_agent", return_value={"lease": {"state": "unclaimed"}}
+        ) as mock_release:
+            result = start_agent_with_lease("a", allow_unauthenticated=True)
+
+        self.assertEqual(result["status"], "already_running")
+        mock_claim.assert_called_once_with("a1")
+        self.assertEqual(mock_start.call_args.kwargs["lease"], lease)
+        self.assertTrue(mock_start.call_args.kwargs["release_lease_on_failure"])
+        mock_release.assert_called_once_with("a1", force=True)
 
     @patch("codex_master.server.release_agent")
     @patch("codex_master.server.cleanup_failed_start")
@@ -4368,7 +4395,10 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn(tmpdir, error_text)
 
     @patch("codex_master.server.start_agent", return_value={"agent": "a1", "status": "started"})
-    @patch("codex_master.server.ensure_agent_lease_available", return_value=None)
+    @patch(
+        "codex_master.server.claim_agent",
+        return_value={"status": "claimed", "lease": {"state": "held", "held_by_this_server": True}},
+    )
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch(
         "codex_master.server.agent_auth_status",
@@ -4381,7 +4411,7 @@ class ServerHelpersTest(unittest.TestCase):
     )
     @patch("codex_master.server.agent_lifecycle_lock")
     def test_call_tool_agent_start_acquires_lifecycle_lock(
-        self, mock_lock, _mock_auth, _mock_alive, mock_ensure_lease, mock_start_agent
+        self, mock_lock, _mock_auth, _mock_alive, mock_claim, mock_start_agent
     ) -> None:
         events = []
 
@@ -4404,11 +4434,13 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["results"][0]["status"], "started")
         self.assertEqual(result["results"][0]["auth_gate"]["auth_state"], "present_regular")
         self.assertEqual(events, [("lock", "a1"), ("unlock", "a1")])
-        mock_ensure_lease.assert_called_once_with("a1")
+        mock_claim.assert_called_once_with("a1")
         mock_start_agent.assert_called_once_with(
             "a1",
             "/tmp/work",
             "hi",
+            lease={"state": "held", "held_by_this_server": True},
+            release_lease_on_failure=True,
             model=WRITE_AGENT_MODEL,
             model_reasoning_effort="low",
         )
