@@ -52,6 +52,7 @@ from codex_master.server import (
     DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS,
     DEFAULT_TMUX_TIMEOUT_SECONDS,
     SEND_READY_POLL_SECONDS,
+    AGENTS,
     agent_ids,
     allowed_raw_log_path,
     append_bounded_raw_log,
@@ -354,6 +355,20 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(float_changed)
         self.assertEqual(float_previous, 120)
         self.assertEqual(float_updated.count("startup_timeout_sec"), 1)
+
+        existing_underscored = existing_low.replace("startup_timeout_sec = 30", "startup_timeout_sec = 1_2_0")
+        underscored_updated, underscored_changed, underscored_previous = updated_mcp_startup_timeout_config(
+            existing_underscored
+        )
+        self.assertFalse(underscored_changed)
+        self.assertEqual(underscored_previous, 120)
+        self.assertEqual(underscored_updated.count("startup_timeout_sec"), 1)
+
+        existing_exponent = existing_low.replace("startup_timeout_sec = 30", "startup_timeout_sec = 1.2e2")
+        exponent_updated, exponent_changed, exponent_previous = updated_mcp_startup_timeout_config(existing_exponent)
+        self.assertFalse(exponent_changed)
+        self.assertEqual(exponent_previous, 120)
+        self.assertEqual(exponent_updated.count("startup_timeout_sec"), 1)
 
         missing_value = existing_low.replace("\nstartup_timeout_sec = 30", "")
         inserted, inserted_changed, inserted_previous = updated_mcp_startup_timeout_config(missing_value)
@@ -1990,6 +2005,15 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(resources["result"], {"resources": []})
         self.assertEqual(prompts["result"], {"prompts": []})
 
+    def test_handle_rpc_distinguishes_notifications_from_null_id(self) -> None:
+        for method in ("initialize", "tools/list", "resources/list", "prompts/list"):
+            self.assertIsNone(handle_rpc({"jsonrpc": "2.0", "method": method}))
+
+        response = handle_rpc({"jsonrpc": "2.0", "id": None, "method": "tools/list"})
+
+        self.assertIsNotNone(response)
+        self.assertIsNone(response["id"])
+
     def test_read_message_rejects_oversized_content_length(self) -> None:
         data = f"Content-Length: {MAX_RPC_MESSAGE_BYTES + 1}\r\n\r\n".encode("ascii")
         with patch("sys.stdin", FakeStdin(data)):
@@ -2796,6 +2820,28 @@ class ServerHelpersTest(unittest.TestCase):
 
     @patch("codex_master.server.time.sleep")
     @patch("codex_master.server.status_agent")
+    def test_wait_agent_does_not_call_idle_transition_activity(self, mock_status_agent, mock_sleep) -> None:
+        status = {
+            "agent": "a",
+            "running": True,
+            "raw_log_bytes": 10,
+            "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
+            "limit_state": {"limited": False},
+        }
+        mock_status_agent.side_effect = [
+            {**status, "response_state": {"state": "running_recent_output"}},
+            {**status, "response_state": {"state": "running_idle"}},
+        ]
+
+        with patch("codex_master.server.time.monotonic", side_effect=[0.0, 1.0, 2.0, 11.0, 12.0]):
+            result = wait_agent("a", timeout_seconds=10, poll_interval_seconds=1)
+
+        self.assertEqual(result["status"], "timeout")
+        self.assertEqual(result["poll_count"], 1)
+        mock_sleep.assert_called_once()
+
+    @patch("codex_master.server.time.sleep")
+    @patch("codex_master.server.status_agent")
     def test_wait_agent_returns_blocked_by_limit_immediately(self, mock_status_agent, mock_sleep) -> None:
         mock_status_agent.return_value = {
             "agent": "a",
@@ -2956,6 +3002,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(watchdog_marker_matches(marker, action="interrupt", assignment_id="old-assignment"))
         self.assertFalse(watchdog_marker_matches(marker, action="interrupt", assignment_id=None))
         self.assertFalse(watchdog_marker_matches(marker, action="interrupt", assignment_id="new-assignment"))
+        invalid_time = {**marker, "requested_at_utc": "not-a-timestamp"}
+        self.assertFalse(watchdog_marker_matches(invalid_time, action="interrupt", assignment_id="old-assignment"))
 
     def test_fleet_watchdog_requests_report_before_interrupt(self) -> None:
         meta_store: dict[str, object] = {}
@@ -3292,6 +3340,22 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["deleted_count"], 0)
         self.assertEqual(result["truncated_count"], 0)
         self.assertTrue(outside_exists)
+
+    def test_allowed_raw_log_path_rejects_file_symlink_inside_managed_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw"
+            raw_dir.mkdir()
+            target = raw_dir / "target.log"
+            link = raw_dir / "linked.log"
+            target.write_text("secret\n", encoding="utf-8")
+            link.symlink_to(target)
+
+            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
+                "codex_master.server.LEGACY_STATE_ROOT", Path(tmpdir) / "legacy"
+            ):
+                allowed = allowed_raw_log_path(str(link))
+
+        self.assertIsNone(allowed)
 
     def test_append_bounded_raw_log_rejects_symlink_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3645,6 +3709,9 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result)
 
+    def test_same_path_text_does_not_treat_empty_path_as_current_directory(self) -> None:
+        self.assertFalse(same_path_text("", Path.cwd()))
+
     def test_agent_identity_guard_blocks_orphaned_managed_home_process(self) -> None:
         summary = {
             "process_count": 1,
@@ -3987,6 +4054,62 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(caught.exception.payload["lease"]["holder"], "other_server")
         self.assertEqual(caught.exception.payload["raw_output"], "not_returned")
         mock_start_agent.assert_not_called()
+
+    @patch("codex_master.server.remember_agent_routing")
+    @patch("codex_master.server.start_agent")
+    @patch("codex_master.server.ensure_agent_lease_available")
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    def test_start_agent_with_lease_rejects_running_model_mismatch(
+        self, _mock_alive, _mock_ensure_lease, mock_start_agent, mock_remember_routing
+    ) -> None:
+        mock_start_agent.return_value = {
+            "agent": "a",
+            "status": "already_running",
+            "meta": {"model": DEFAULT_AGENT_MODEL},
+            "raw_output": "not_returned",
+        }
+
+        with patch(
+            "codex_master.server.agent_auth_status",
+            return_value={"authenticated": True, "auth_state": "present_regular"},
+        ):
+            with self.assertRaisesRegex(AgentError, "routed model differs from active session"):
+                start_agent_with_lease("a")
+
+        mock_remember_routing.assert_not_called()
+
+    @patch("codex_master.server.release_agent")
+    @patch("codex_master.server.cleanup_failed_start")
+    @patch("codex_master.server.allowed_raw_log_path", return_value=Path("/tmp/managed-a.log"))
+    @patch("codex_master.server.read_meta", return_value={"raw_log": "/tmp/managed-a.log"})
+    @patch("codex_master.server.remember_agent_routing", side_effect=AgentError("routing failed"))
+    @patch("codex_master.server.start_agent", return_value={"agent": "a", "status": "started"})
+    @patch("codex_master.server.claim_agent")
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    def test_start_agent_with_lease_cleans_up_after_routing_metadata_failure(
+        self,
+        _mock_alive,
+        mock_claim,
+        _mock_start,
+        _mock_remember,
+        _mock_read_meta,
+        _mock_allowed_raw_log,
+        mock_cleanup,
+        mock_release,
+    ) -> None:
+        mock_claim.return_value = {
+            "status": "claimed",
+            "lease": {"held_by_this_server": True},
+        }
+
+        with patch("codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}):
+            with self.assertRaisesRegex(AgentError, "routing failed"):
+                start_agent_with_lease("a", allow_unauthenticated=True)
+
+        mock_cleanup.assert_called_once_with(
+            AGENTS["a1"]["session"], Path("/tmp/managed-a.log"), kill_session=True
+        )
+        mock_release.assert_called_once_with("a1", force=True)
 
     def test_agent_claim_wait_rejects_invalid_direct_interval_values(self) -> None:
         with self.assertRaisesRegex(AgentError, "wait_seconds must be an integer or forever"):
@@ -5170,6 +5293,7 @@ class ServerHelpersTest(unittest.TestCase):
         payload_text = json.dumps(skills_payload, sort_keys=True)
         self.assertEqual(skills_payload["total"], 1)
         self.assertEqual(skills_payload["roots"][0]["skill_count"], 1)
+        self.assertFalse(skills_payload["roots"][1]["exists"])
         self.assertEqual(skills_payload["roots"][1]["skill_count"], 0)
         self.assertEqual(skills_payload["roots"][0]["path"], "not_returned")
         self.assertEqual(skills_payload["home"], "not_returned")
@@ -7868,6 +7992,29 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertTrue((pool / "a2" / "skills").is_symlink())
             self.assertFalse((pool / "a2" / "skills").exists())
             self.assertTrue((pool / "a2" / "plugins").is_symlink())
+
+    def test_agent_pool_install_rejects_symlinked_template_asset(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            outside = tmp / "outside-skills"
+            outside.mkdir()
+            spec_path = self._write_spec(tmp, pool)
+            pool.mkdir()
+            (pool / "a1").mkdir()
+            (pool / "a1" / "skills").symlink_to(outside, target_is_directory=True)
+            (pool / "a1" / "plugins").mkdir()
+
+            result = server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+            status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["missing_shared_asset_sources"], 1)
+        self.assertFalse((pool / "a2" / "skills").exists())
+        self.assertTrue(status["shared_asset_template_source_missing_count"] >= 1)
+        self.assertFalse(status["ok"])
 
     def test_agent_pool_copy_auth_treats_broken_target_symlink_as_existing(self) -> None:
         from codex_master import server as server_module

@@ -603,12 +603,14 @@ def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | floa
             section_end = index
             break
 
-    timeout_line_re = re.compile(r"^(\s*startup_timeout_sec\s*=\s*)(\d+(?:\.\d+)?)(\s*(?:#.*)?)$")
+    timeout_line_re = re.compile(
+        r"^(\s*startup_timeout_sec\s*=\s*)([+-]?(?:\d(?:_?\d)*)(?:\.(?:\d(?:_?\d)*))?(?:[eE][+-]?\d(?:_?\d)*)?)(\s*(?:#.*)?)$"
+    )
     for index in range(section_start + 1, section_end):
         match = timeout_line_re.match(lines[index])
         if not match:
             continue
-        numeric = float(match.group(2))
+        numeric = float(match.group(2).replace("_", ""))
         previous = int(numeric) if numeric.is_integer() else numeric
         if previous >= RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS:
             return text if text.endswith("\n") else text + "\n", False, previous
@@ -2128,8 +2130,23 @@ def managed_raw_dirs() -> tuple[Path, ...]:
 def allowed_raw_log_path(raw_log: Any) -> Path | None:
     if not isinstance(raw_log, str) or not raw_log.strip():
         return None
+    raw_path = Path(raw_log).expanduser()
+    if not raw_path.is_absolute():
+        raw_path = Path.cwd() / raw_path
+    raw_path = raw_path.absolute()
+    if not directory_chain_is_real_no_symlink(raw_path.parent):
+        return None
     try:
-        candidate = Path(raw_log).expanduser().resolve(strict=False)
+        current_stat = raw_path.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return None
+    else:
+        if stat_module.S_ISLNK(current_stat.st_mode):
+            return None
+    try:
+        candidate = raw_path.resolve(strict=False)
     except OSError:
         return None
     if candidate.suffix != ".log":
@@ -2360,6 +2377,8 @@ def read_proc_cmdline(pid_dir: Path) -> list[str]:
 
 
 def same_path_text(left: str, right: Path) -> bool:
+    if not isinstance(left, str) or not left.strip():
+        return False
     try:
         return Path(left).expanduser().resolve(strict=False) == right.expanduser().resolve(strict=False)
     except (OSError, RuntimeError):
@@ -2724,6 +2743,13 @@ def start_agent_with_lease(
             model=selected_model,
             model_reasoning_effort=selected_effort,
         )
+        if result.get("status") == "already_running":
+            active_model = (result.get("meta") or {}).get("model") or DEFAULT_AGENT_MODEL
+            if active_model != selected_model:
+                raise AgentError(
+                    "routed model differs from active session; controlled restart requires "
+                    "an inactive Agentin"
+                )
         remember_agent_routing(agent, routing)
         result["auth_gate"] = auth_gate
         result["routing"] = routing
@@ -2741,8 +2767,19 @@ def start_agent_with_lease(
             model=selected_model,
             model_reasoning_effort=selected_effort,
         )
+    except Exception:
+        if release_on_completion and agent_lease_status(agent).get("held_by_this_server"):
+            release_agent(agent, force=True)
+        raise
+    try:
         remember_agent_routing(agent, routing)
     except Exception:
+        raw_log = read_meta(agent).get("raw_log")
+        raw_log_path = allowed_raw_log_path(raw_log)
+        if raw_log_path is not None:
+            cleanup_failed_start(AGENTS[agent]["session"], raw_log_path, kill_session=True)
+        else:
+            run_tmux(["kill-session", "-t", AGENTS[agent]["session"]], check=False)
         if release_on_completion and agent_lease_status(agent).get("held_by_this_server"):
             release_agent(agent, force=True)
         raise
@@ -3098,11 +3135,10 @@ def agent_response_state(
     }
 
 
-def activity_signature(status: dict[str, Any]) -> tuple[Any, Any, Any]:
+def activity_signature(status: dict[str, Any]) -> tuple[Any, Any]:
     return (
         status.get("raw_log_bytes"),
         status.get("raw_log_updated_at_utc"),
-        (status.get("response_state") or {}).get("state"),
     )
 
 
@@ -3122,6 +3158,10 @@ def wait_terminal_status(status: dict[str, Any], initial: dict[str, Any]) -> str
     if assignment_changed and assignment_created is not None and raw_log_updated is not None and raw_log_updated > assignment_created:
         return "activity_observed"
     if activity_signature(status) != activity_signature(initial):
+        return "activity_observed"
+    initial_response_state = (initial.get("response_state") or {}).get("state")
+    current_response_state = (status.get("response_state") or {}).get("state")
+    if initial_response_state == "running_tui_starter_context" and current_response_state != initial_response_state:
         return "activity_observed"
     if ((status.get("response_state") or {}).get("state")) == "running_tui_starter_context":
         if assignment_created is not None:
@@ -3438,7 +3478,7 @@ def watchdog_marker_matches(marker: dict[str, Any], *, action: str, assignment_i
     marker_assignment = marker.get("assignment_id")
     if marker_assignment != assignment_id:
         return False
-    return bool(marker.get("requested_at_utc"))
+    return parse_utc_timestamp(marker.get("requested_at_utc")) is not None
 
 
 def watchdog_output_changed_since_marker(status: dict[str, Any], marker: dict[str, Any]) -> bool:
@@ -3816,7 +3856,7 @@ def skills_agent(
                 "kind": kind,
                 "path": PATH_NOT_RETURNED,
                 "path_state": "configured",
-                "exists": root.exists(),
+                "exists": is_real_directory_no_symlink(root),
                 "skill_count": len(paths),
             }
         )
@@ -7252,6 +7292,16 @@ def pool_public_path_state(path: Path) -> str:
     return "other"
 
 
+def pool_shared_asset_source(path: Path, root: Path) -> bool:
+    try:
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root.resolve(strict=False))
+        source_stat = resolved.lstat()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return stat_module.S_ISREG(source_stat.st_mode) or stat_module.S_ISDIR(source_stat.st_mode)
+
+
 def pool_regular_marker_present(path: Path) -> bool:
     try:
         mode = path.lstat().st_mode
@@ -7677,7 +7727,7 @@ def agent_pool_status(
         for asset in normalized["shared_assets"]:
             target = home / asset
             if template == agent:
-                if path_present_no_follow(target):
+                if pool_shared_asset_source(target, root):
                     template_sources += 1
                 elif agent in templates_with_consumers:
                     template_sources_missing += 1
@@ -7700,7 +7750,7 @@ def agent_pool_status(
                 shared_invalid += 1
                 continue
             expected_source = root / template / asset
-            if os.path.isabs(link_target) or not path_present_no_follow(expected_source):
+            if os.path.isabs(link_target) or not pool_shared_asset_source(expected_source, root):
                 shared_invalid += 1
                 continue
             actual_path = os.path.normpath(os.path.abspath(target.parent / link_target))
@@ -7803,7 +7853,7 @@ def agent_pool_install(
             if path_present_no_follow(target):
                 skipped_existing_assets += 1
                 continue
-            if not source.exists():
+            if not pool_shared_asset_source(source, root):
                 missing_asset_sources += 1
                 continue
             ensure_private_dir(target.parent)
@@ -8680,35 +8730,43 @@ def handle_rpc(msg: dict[str, Any]) -> dict[str, Any] | None:
         raise AgentError("RPC message must be an object")
     method = msg.get("method")
     message_id = msg.get("id")
+
+    def reply(payload: dict[str, Any]) -> dict[str, Any] | None:
+        return payload if "id" in msg else None
+
     if method == "initialize":
         params = msg.get("params", {})
         if params is None:
             params = {}
         if not isinstance(params, dict):
-            return rpc_error(message_id, -32602, "initialize params must be an object")
+            return reply(rpc_error(message_id, -32602, "initialize params must be an object"))
         requested = params.get("protocolVersion")
         try:
             protocol_version = negotiate_protocol_version(requested)
         except AgentError:
-            return rpc_error(
-                message_id,
-                -32602,
-                "Unsupported protocol version",
+            return reply(
+                rpc_error(
+                    message_id,
+                    -32602,
+                    "Unsupported protocol version",
+                )
             )
-        return rpc_result(
-            message_id,
-            {
-                "protocolVersion": protocol_version,
-                "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
-                "serverInfo": {"name": MCP_SERVER_NAME, "version": __version__},
-            },
+        return reply(
+            rpc_result(
+                message_id,
+                {
+                    "protocolVersion": protocol_version,
+                    "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+                    "serverInfo": {"name": MCP_SERVER_NAME, "version": __version__},
+                },
+            )
         )
     if method == "tools/list":
-        return rpc_result(message_id, {"tools": TOOLS})
+        return reply(rpc_result(message_id, {"tools": TOOLS}))
     if method == "resources/list":
-        return rpc_result(message_id, {"resources": []})
+        return reply(rpc_result(message_id, {"resources": []}))
     if method == "prompts/list":
-        return rpc_result(message_id, {"prompts": []})
+        return reply(rpc_result(message_id, {"prompts": []}))
     if method == "tools/call":
         try:
             params = msg.get("params", {})
@@ -8719,13 +8777,13 @@ def handle_rpc(msg: dict[str, Any]) -> dict[str, Any] | None:
             name, args = validate_tool_call(params.get("name"), params.get("arguments", {}))
             payload = call_tool(name, args)
             text = json.dumps(payload, indent=2, sort_keys=True)
-            return rpc_result(message_id, {"content": [{"type": "text", "text": text}], "isError": False})
+            return reply(rpc_result(message_id, {"content": [{"type": "text", "text": text}], "isError": False}))
         except Exception as exc:
             text = json.dumps(public_error_payload(exc), indent=2, sort_keys=True)
-            return rpc_result(message_id, {"content": [{"type": "text", "text": text}], "isError": True})
+            return reply(rpc_result(message_id, {"content": [{"type": "text", "text": text}], "isError": True}))
     if method in ("notifications/initialized", "notifications/cancelled"):
         return None
-    if message_id is None:
+    if "id" not in msg:
         return None
     return rpc_error(message_id, -32601, "method not found")
 
