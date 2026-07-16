@@ -3462,6 +3462,8 @@ def update_codex_usage_watchdog_marker(agent: str, marker: dict[str, Any] | None
 def codex_usage_watchdog_status(agent: str) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     meta = read_meta(agent)
+    if meta.get("meta_error"):
+        raise AgentError("could_not_read_codex_usage_watchdog_metadata")
     marker = codex_usage_watchdog_marker(meta)
     now = time.time()
 

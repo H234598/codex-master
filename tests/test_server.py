@@ -3601,6 +3601,11 @@ class ServerHelpersTest(unittest.TestCase):
                 self.assertTrue(status["blocked"])
                 self.assertEqual(status["source"], "snapshot")
 
+    def test_codex_usage_watchdog_status_fails_closed_on_unreadable_metadata(self) -> None:
+        with patch("codex_master.server.read_meta", return_value={"meta_error": "could_not_read"}):
+            with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_watchdog_metadata"):
+                codex_usage_watchdog_status("a")
+
     def test_usage_watchdog_dry_run_reports_marker_changes_without_mutating(self) -> None:
         blocked_status = {
             "agent": "a1",
