@@ -373,6 +373,12 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(exponent_previous, 120)
         self.assertEqual(exponent_updated.count("startup_timeout_sec"), 1)
 
+        existing_non_finite = existing_low.replace("startup_timeout_sec = 30", "startup_timeout_sec = 1e999")
+        finite_updated, finite_changed, finite_previous = updated_mcp_startup_timeout_config(existing_non_finite)
+        self.assertTrue(finite_changed)
+        self.assertIsNone(finite_previous)
+        self.assertIn("startup_timeout_sec = 120", finite_updated)
+
         missing_value = existing_low.replace("\nstartup_timeout_sec = 30", "")
         inserted, inserted_changed, inserted_previous = updated_mcp_startup_timeout_config(missing_value)
         self.assertTrue(inserted_changed)
@@ -428,6 +434,29 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["startup_timeout_ok"])
         self.assertEqual(result["path"], "not_returned")
         self.assertNotIn(str(install_path), json.dumps(result, sort_keys=True))
+
+    def test_codex_client_mcp_config_status_rejects_non_finite_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = Path(tmpdir) / ".codex" / "config.toml"
+            install_path = Path(tmpdir) / "bin" / "codex-master-mcp"
+            config.parent.mkdir()
+            config.write_text(
+                "\n".join(
+                    [
+                        "[mcp_servers.codex-master-mcp]",
+                        f'command = "{install_path}"',
+                        "startup_timeout_sec = 1e999",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = codex_client_mcp_config_status(config, install_path)
+
+        self.assertIsNone(result["startup_timeout_sec"])
+        self.assertFalse(result["startup_timeout_ok"])
+        self.assertFalse(result["ok"])
 
     def test_codex_client_mcp_config_status_detects_mismatch_without_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

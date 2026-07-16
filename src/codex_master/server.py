@@ -613,6 +613,9 @@ def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | floa
         if not match:
             continue
         numeric = float(match.group(2).replace("_", ""))
+        if not math.isfinite(numeric):
+            lines[index] = f"{match.group(1)}{RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS}{match.group(3)}"
+            return "\n".join(lines) + "\n", True, None
         previous = int(numeric) if numeric.is_integer() else numeric
         if previous >= RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS:
             return text if text.endswith("\n") else text + "\n", False, previous
@@ -714,12 +717,13 @@ def codex_client_mcp_config_status(
     command = server_config.get("command")
     command_configured = isinstance(command, str) and bool(command.strip())
     startup_timeout = server_config.get("startup_timeout_sec")
-    startup_timeout_sec = (
-        startup_timeout
-        if isinstance(startup_timeout, (int, float))
-        and not isinstance(startup_timeout, bool)
-        else None
-    )
+    startup_timeout_sec = None
+    if isinstance(startup_timeout, (int, float)) and not isinstance(startup_timeout, bool):
+        try:
+            if math.isfinite(startup_timeout):
+                startup_timeout_sec = startup_timeout
+        except OverflowError:
+            pass
     startup_timeout_ok = (
         startup_timeout_sec is not None and startup_timeout_sec >= RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS
     )
