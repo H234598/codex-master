@@ -6801,7 +6801,9 @@ def multi_agent_result(
         try:
             results.append(fn(agent))
         except Exception as exc:
-            results.append({"agent": agent, "error": safe_error_text(exc)})
+            error = public_error_payload(exc)
+            error["agent"] = agent
+            results.append(error)
     payload: dict[str, Any] = {"results": results}
     if paged:
         payload.update(

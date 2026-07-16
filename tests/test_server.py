@@ -753,6 +753,27 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["broad_selection"]["raw_output"], "not_returned")
         self.assertEqual(mock_lifecycle.call_count, MAX_MUTATING_AGENTS_WITHOUT_CONFIRM + 1)
 
+    @patch("codex_master.server.call_agent_lifecycle")
+    def test_multi_agent_mutation_preserves_structured_lease_errors(self, mock_lifecycle) -> None:
+        mock_lifecycle.side_effect = AgentBusyError(
+            "agent is busy",
+            {
+                "error_code": "agent_lease_held_by_other_client",
+                "retryable": True,
+                "retry_after_seconds": 3,
+                "lease": {"holder": "other_server", "raw_output": "not_returned"},
+            },
+        )
+
+        result = call_tool("agent_start", {"agent": "a"})
+
+        item = result["results"][0]
+        self.assertEqual(item["agent"], "a1")
+        self.assertEqual(item["error_code"], "agent_lease_held_by_other_client")
+        self.assertTrue(item["retryable"])
+        self.assertEqual(item["retry_after_seconds"], 3)
+        self.assertEqual(item["lease"]["holder"], "other_server")
+
     def test_agent_selector_policy_can_switch_ordinal_rotation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "state"
