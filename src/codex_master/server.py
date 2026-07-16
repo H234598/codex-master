@@ -3235,13 +3235,24 @@ def agent_spark_routing(agent: str) -> dict[str, Any] | None:
     if meta.get("model") != WRITE_AGENT_MODEL:
         return None
     route = meta.get("routing")
-    if not isinstance(route, dict):
+    if not isinstance(route, dict) or route.get("decision") is None:
+        meta_account = route.get("account") if isinstance(route, dict) else None
         try:
             records = list_assignments(agent, 1).get("records", [])
         except AgentError:
             records = []
         record = records[-1] if records and isinstance(records[-1], dict) else {}
-        route = record.get("routing") if isinstance(record, dict) else None
+        assignment_route = record.get("routing") if isinstance(record, dict) else None
+        assignment_account = (
+            assignment_route.get("account") if isinstance(assignment_route, dict) else None
+        )
+        if (
+            meta_account is not None
+            and assignment_account is not None
+            and assignment_account != meta_account
+        ):
+            return None
+        route = assignment_route
     if not isinstance(route, dict) or route.get("decision") != "spark":
         return None
     backend_account_id = route.get("backend_account_id")

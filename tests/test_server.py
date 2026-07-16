@@ -60,6 +60,7 @@ from codex_master.server import (
     agent_lifecycle_lock,
     agent_identity_guard,
     agent_home_process_summary,
+    agent_spark_routing,
     check_mcp_registration,
     call_tool,
     claim_agent,
@@ -4144,6 +4145,50 @@ class ServerHelpersTest(unittest.TestCase):
                 "model": WRITE_AGENT_MODEL,
             },
         )
+
+    def test_agent_spark_routing_recovers_from_account_only_metadata(self) -> None:
+        with patch(
+            "codex_master.server.read_meta",
+            return_value={"model": WRITE_AGENT_MODEL, "routing": {"account": "BW_Neu"}},
+        ), patch(
+            "codex_master.server.list_assignments",
+            return_value={
+                "records": [
+                    {
+                        "routing": {
+                            "account": "BW_Neu",
+                            "decision": "spark",
+                            "backend_account_id": "backend-new",
+                        }
+                    }
+                ]
+            },
+        ):
+            route = agent_spark_routing("a1")
+
+        self.assertEqual(route["backend_account_id"], "backend-new")
+
+    def test_agent_spark_routing_rejects_stale_assignment_account(self) -> None:
+        with patch(
+            "codex_master.server.read_meta",
+            return_value={"model": WRITE_AGENT_MODEL, "routing": {"account": "BW_Neu"}},
+        ), patch(
+            "codex_master.server.list_assignments",
+            return_value={
+                "records": [
+                    {
+                        "routing": {
+                            "account": "BW_Alt",
+                            "decision": "spark",
+                            "backend_account_id": "backend-old",
+                        }
+                    }
+                ]
+            },
+        ):
+            route = agent_spark_routing("a1")
+
+        self.assertIsNone(route)
 
     def test_usage_mutation_guard_rechecks_non_actionable_snapshot_via_routing(self) -> None:
         status = {
