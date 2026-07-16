@@ -2817,6 +2817,8 @@ class ServerHelpersTest(unittest.TestCase):
             "Not too many requests are pending.",
             "No rate limit reached.",
             "Context window is not too long.",
+            "Requests are rate limited to 100/minute.",
+            "Requests are rate-limited to 100/minute.",
         ):
             with self.subTest(text=text):
                 result = classify_limit_text(text)

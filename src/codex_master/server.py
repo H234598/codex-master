@@ -3080,8 +3080,7 @@ def limit_model_pool(model: Any) -> str:
 
 
 LIMIT_TEXT_PATTERNS = (
-    r"\brate limited\b",
-    r"\brate-limited\b",
+    r"\brate[- ]limited\b(?!\s+to\b)",
     r"\brate limits?\b.{0,80}\b(?:reached|exceeded|hit|error|retry|again)\b",
     r"\brate-limits?\b.{0,80}\b(?:reached|exceeded|hit|error|retry|again)\b",
     r"\busage limit\b.{0,80}\b(?:reached|exceeded|hit|blocked|retry|again)\b",
