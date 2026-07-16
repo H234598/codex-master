@@ -3893,7 +3893,9 @@ def _codex_usage_watchdog_state_from_snapshot(snapshot: dict[str, Any], *, now: 
     agent = str(identity or "")
     blocked_until_ts = parse_utc_timestamp(snapshot.get("blocked_until"))
     blocked_reason = safe_codex_usage_reason(snapshot.get("blocked_reason"))
-    status = str(snapshot.get("status") or "")
+    status = snapshot["status"] if "status" in snapshot else ""
+    if not isinstance(status, str):
+        raise AgentError("could_not_read_codex_usage_snapshot")
     if status not in {"", "ok", "login_required", "partial", "error", "blocked"}:
         raise AgentError("could_not_read_codex_usage_snapshot")
     if status == "blocked" and blocked_until_ts is None:

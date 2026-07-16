@@ -3985,6 +3985,16 @@ class ServerHelpersTest(unittest.TestCase):
             with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
                 codex_usage_watchdog_status("a1")
 
+    def test_codex_usage_watchdog_rejects_non_string_snapshot_status(self) -> None:
+        with patch("codex_master.server.read_meta", return_value={}), patch(
+            "codex_master.server.list_assignments", return_value={"records": []}
+        ), patch(
+            "codex_master.server.read_codex_usage_snapshot",
+            return_value={"account": "a1", "status": False},
+        ):
+            with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
+                codex_usage_watchdog_status("a1")
+
     def test_codex_usage_watchdog_ignores_marker_for_previous_account(self) -> None:
         with patch(
             "codex_master.server.read_meta",
