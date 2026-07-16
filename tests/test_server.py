@@ -4131,6 +4131,37 @@ class ServerHelpersTest(unittest.TestCase):
         route.assert_called_once_with("a1", role="arbeitsbiene")
         remember.assert_called_once_with("a1", "BW_Work")
 
+    def test_usage_mutation_guard_rechecks_blocked_legacy_agent_snapshot(self) -> None:
+        legacy = {
+            "agent": "a1",
+            "account": "a1",
+            "account_mapping": "fallback",
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": "2099-06-08T06:50:00+00:00",
+            "reason": "old account limit",
+        }
+        clear = {
+            "agent": "BW_Work",
+            "account": "BW_Work",
+            "account_mapping": "routing",
+            "state": "clear",
+            "blocked": False,
+        }
+        routing = {"account": "BW_Work", "decision": "main", "model": DEFAULT_AGENT_MODEL}
+        with patch(
+            "codex_master.server.codex_usage_watchdog_status", side_effect=[legacy, clear]
+        ), patch(
+            "codex_master.server.agent_auth_status", return_value={"authenticated": True}
+        ), patch(
+            "codex_master.server.codex_usage_routing_decision", return_value=routing
+        ) as route, patch("codex_master.server.remember_agent_usage_account") as remember:
+            status = ensure_agent_not_blocked_by_codex_usage("a1")
+
+        self.assertEqual(status, clear)
+        route.assert_called_once_with("a1", role="arbeitsbiene")
+        remember.assert_called_once_with("a1", "BW_Work")
+
     def test_codex_usage_watchdog_reason_is_bounded_and_redacted(self) -> None:
         secret_reason = "/home/teladi/private-token sk-usage-secret1234567890 " + ("x" * 500)
         with patch("codex_master.server.read_meta", return_value={}), patch(

@@ -3812,7 +3812,7 @@ def codex_usage_status_with_routing(
     persist_account: bool = True,
     include_assignment_history: bool = True,
 ) -> dict[str, Any]:
-    needs_routing_check = not status.get("blocked") and (
+    needs_routing_check = (
         status.get("usage_status") in {"login_required", "partial", "error"}
         or status.get("account_mapping") == "fallback"
     )
