@@ -601,7 +601,7 @@ def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | floa
 
     for index in range(section_start + 1, len(lines)):
         stripped = lines[index].lstrip()
-        if stripped.startswith("[") and not stripped.startswith("[["):
+        if stripped.startswith("["):
             section_end = index
             break
 
