@@ -1229,7 +1229,11 @@ def read_json_file(path: Path) -> dict[str, Any]:
         current_stat = path.lstat()
     except OSError:
         return error
-    if not stat_module.S_ISREG(current_stat.st_mode) or current_stat.st_size > MAX_META_BYTES:
+    if (
+        not stat_module.S_ISREG(current_stat.st_mode)
+        or getattr(current_stat, "st_nlink", 1) > 1
+        or current_stat.st_size > MAX_META_BYTES
+    ):
         return error
 
     flags = os.O_RDONLY
@@ -1239,7 +1243,11 @@ def read_json_file(path: Path) -> dict[str, Any]:
     try:
         fd = os.open(path, flags)
         opened_stat = os.fstat(fd)
-        if not stat_module.S_ISREG(opened_stat.st_mode) or opened_stat.st_size > MAX_META_BYTES:
+        if (
+            not stat_module.S_ISREG(opened_stat.st_mode)
+            or getattr(opened_stat, "st_nlink", 1) > 1
+            or opened_stat.st_size > MAX_META_BYTES
+        ):
             return error
         with os.fdopen(fd, "rb") as fh:
             fd = -1
@@ -1265,7 +1273,11 @@ def read_codex_usage_snapshot(agent: str) -> dict[str, Any]:
         current_stat = path.lstat()
     except OSError:
         return {}
-    if not stat_module.S_ISREG(current_stat.st_mode) or current_stat.st_size > MAX_CODEX_USAGE_SNAPSHOT_BYTES:
+    if (
+        not stat_module.S_ISREG(current_stat.st_mode)
+        or getattr(current_stat, "st_nlink", 1) > 1
+        or current_stat.st_size > MAX_CODEX_USAGE_SNAPSHOT_BYTES
+    ):
         return {}
 
     flags = os.O_RDONLY
@@ -1275,7 +1287,11 @@ def read_codex_usage_snapshot(agent: str) -> dict[str, Any]:
     try:
         fd = os.open(path, flags)
         opened_stat = os.fstat(fd)
-        if not stat_module.S_ISREG(opened_stat.st_mode) or opened_stat.st_size > MAX_CODEX_USAGE_SNAPSHOT_BYTES:
+        if (
+            not stat_module.S_ISREG(opened_stat.st_mode)
+            or getattr(opened_stat, "st_nlink", 1) > 1
+            or opened_stat.st_size > MAX_CODEX_USAGE_SNAPSHOT_BYTES
+        ):
             return {}
         with os.fdopen(fd, "rb") as fh:
             fd = -1
@@ -1377,7 +1393,11 @@ def read_private_regular_text(path: Path, max_bytes: int, error_text: str) -> st
         current_stat = path.lstat()
     except OSError as exc:
         raise AgentError(error_text) from exc
-    if not stat_module.S_ISREG(current_stat.st_mode) or current_stat.st_size > max_bytes:
+    if (
+        not stat_module.S_ISREG(current_stat.st_mode)
+        or getattr(current_stat, "st_nlink", 1) > 1
+        or current_stat.st_size > max_bytes
+    ):
         raise AgentError(error_text)
 
     flags = os.O_RDONLY
@@ -1387,7 +1407,11 @@ def read_private_regular_text(path: Path, max_bytes: int, error_text: str) -> st
     try:
         fd = os.open(path, flags)
         opened_stat = os.fstat(fd)
-        if not stat_module.S_ISREG(opened_stat.st_mode) or opened_stat.st_size > max_bytes:
+        if (
+            not stat_module.S_ISREG(opened_stat.st_mode)
+            or getattr(opened_stat, "st_nlink", 1) > 1
+            or opened_stat.st_size > max_bytes
+        ):
             raise AgentError(error_text)
         with os.fdopen(fd, "rb") as fh:
             fd = -1
@@ -1439,7 +1463,7 @@ def write_private_new_bytes(path: Path, data: bytes) -> None:
         raise AgentError("could not create private state temp file without following symlinks") from exc
     try:
         current_stat = os.fstat(fd)
-        if not stat_module.S_ISREG(current_stat.st_mode):
+        if not stat_module.S_ISREG(current_stat.st_mode) or getattr(current_stat, "st_nlink", 1) > 1:
             raise AgentError("private state temp path is not a regular file")
         try:
             os.fchmod(fd, 0o600)
@@ -1469,7 +1493,7 @@ def open_private_regular_update(path: Path) -> Any:
         raise AgentError("could not open private state file without following symlinks") from exc
     try:
         current_stat = os.fstat(fd)
-        if not stat_module.S_ISREG(current_stat.st_mode):
+        if not stat_module.S_ISREG(current_stat.st_mode) or getattr(current_stat, "st_nlink", 1) > 1:
             raise AgentError("private state path is not a regular file")
         try:
             os.fchmod(fd, 0o600)
@@ -1948,20 +1972,20 @@ def is_real_directory_no_symlink(path: Path) -> bool:
 
 def is_regular_executable_no_symlink(path: Path) -> bool:
     try:
-        mode = path.lstat().st_mode
+        current = path.lstat()
     except OSError:
         return False
-    if not stat_module.S_ISREG(mode):
+    if not stat_module.S_ISREG(current.st_mode) or getattr(current, "st_nlink", 1) > 1:
         return False
     return os.access(path, os.X_OK)
 
 
 def is_regular_file_no_symlink(path: Path) -> bool:
     try:
-        mode = path.lstat().st_mode
+        current = path.lstat()
     except OSError:
         return False
-    return stat_module.S_ISREG(mode)
+    return stat_module.S_ISREG(current.st_mode) and getattr(current, "st_nlink", 1) == 1
 
 
 def agent_auth_status(agent: str) -> dict[str, Any]:
@@ -1982,6 +2006,9 @@ def agent_auth_status(agent: str) -> dict[str, Any]:
         elif not stat_module.S_ISREG(auth_stat.st_mode):
             state = "not_regular"
             authenticated = False
+        elif getattr(auth_stat, "st_nlink", 1) > 1:
+            state = "hardlink_rejected"
+            authenticated = False
         elif auth_stat.st_size > MAX_CODEX_CONFIG_BYTES:
             state = "too_large"
             authenticated = False
@@ -1993,7 +2020,11 @@ def agent_auth_status(agent: str) -> dict[str, Any]:
             try:
                 fd = os.open(auth_file, flags)
                 opened_stat = os.fstat(fd)
-                if not stat_module.S_ISREG(opened_stat.st_mode) or opened_stat.st_size > MAX_CODEX_CONFIG_BYTES:
+                if (
+                    not stat_module.S_ISREG(opened_stat.st_mode)
+                    or getattr(opened_stat, "st_nlink", 1) > 1
+                    or opened_stat.st_size > MAX_CODEX_CONFIG_BYTES
+                ):
                     raise OSError("auth file changed unexpectedly")
                 if not os.read(fd, 1):
                     state = "empty"
@@ -7454,15 +7485,17 @@ def pool_shared_asset_source(path: Path, root: Path) -> bool:
         source_stat = resolved.lstat()
     except (OSError, RuntimeError, ValueError):
         return False
-    return stat_module.S_ISREG(source_stat.st_mode) or stat_module.S_ISDIR(source_stat.st_mode)
+    return (stat_module.S_ISREG(source_stat.st_mode) and getattr(source_stat, "st_nlink", 1) == 1) or stat_module.S_ISDIR(
+        source_stat.st_mode
+    )
 
 
 def pool_regular_marker_present(path: Path) -> bool:
     try:
-        mode = path.lstat().st_mode
+        current = path.lstat()
     except OSError:
         return False
-    return stat_module.S_ISREG(mode)
+    return stat_module.S_ISREG(current.st_mode) and getattr(current, "st_nlink", 1) == 1
 
 
 def remove_agent_pool_entry(path: Path) -> str:
@@ -7740,7 +7773,12 @@ def pool_read_private_bytes(path: Path, max_bytes: int, error_text: str) -> byte
         current = path.lstat()
     except OSError as exc:
         raise AgentError(error_text) from exc
-    if stat_module.S_ISLNK(current.st_mode) or not stat_module.S_ISREG(current.st_mode) or current.st_size > max_bytes:
+    if (
+        stat_module.S_ISLNK(current.st_mode)
+        or not stat_module.S_ISREG(current.st_mode)
+        or getattr(current, "st_nlink", 1) > 1
+        or current.st_size > max_bytes
+    ):
         raise AgentError(error_text)
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -7749,7 +7787,12 @@ def pool_read_private_bytes(path: Path, max_bytes: int, error_text: str) -> byte
     try:
         fd = os.open(path, flags)
         opened = os.fstat(fd)
-        if stat_module.S_ISLNK(opened.st_mode) or not stat_module.S_ISREG(opened.st_mode) or opened.st_size > max_bytes:
+        if (
+            stat_module.S_ISLNK(opened.st_mode)
+            or not stat_module.S_ISREG(opened.st_mode)
+            or getattr(opened, "st_nlink", 1) > 1
+            or opened.st_size > max_bytes
+        ):
             raise AgentError(error_text)
         with os.fdopen(fd, "rb") as fh:
             fd = -1

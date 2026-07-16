@@ -896,6 +896,9 @@ class ServerHelpersTest(unittest.TestCase):
                 (home / "auth.json").unlink()
                 outside = Path(tmpdir) / "outside-auth.json"
                 outside.write_text("secret\n", encoding="utf-8")
+                os.link(outside, home / "auth.json")
+                hardlinked = agent_auth_status("a")
+                (home / "auth.json").unlink()
                 (home / "auth.json").symlink_to(outside)
                 linked = agent_auth_status("a")
                 (home / "auth.json").unlink()
@@ -909,6 +912,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(missing["auth_state"], "missing")
         self.assertTrue(present["authenticated"])
         self.assertEqual(present["auth_state"], "present_regular")
+        self.assertFalse(hardlinked["authenticated"])
+        self.assertEqual(hardlinked["auth_state"], "hardlink_rejected")
         self.assertFalse(empty_file["authenticated"])
         self.assertEqual(empty_file["auth_state"], "empty")
         self.assertFalse(linked["authenticated"])
@@ -3797,7 +3802,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.LEGACY_STATE_ROOT", tmp / "legacy"
             ):
                 allowed = allowed_raw_log_path(str(link))
-                with self.assertRaisesRegex(RuntimeError, "hardlink"):
+                with self.assertRaisesRegex(AgentError, "private state path is not a regular file"):
                     append_bounded_raw_log(link, b"payload", max_bytes=128)
                 result = prune_raw_logs(max_files=2, max_bytes=80)
                 target_content = target.read_bytes()
@@ -3865,6 +3870,8 @@ class ServerHelpersTest(unittest.TestCase):
             target.write_text('{"secret": "SECRET_META_SHOULD_NOT_LEAK"}\n', encoding="utf-8")
             symlink_meta = meta_dir / "a.json"
             symlink_meta.symlink_to(target)
+            hardlink_meta = meta_dir / "c1.json"
+            os.link(target, hardlink_meta)
             oversized_meta = meta_dir / "b.json"
             oversized_meta.write_text('{"payload": "' + ("x" * MAX_META_BYTES) + '"}\n', encoding="utf-8")
             non_object_meta = meta_dir / "a1.json"
@@ -3873,6 +3880,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.LEGACY_META_DIR", legacy_meta_dir
             ):
                 symlink_result = read_meta("a")
+                hardlink_result = read_meta("c1")
                 oversized_result = read_meta("b")
                 non_object_meta.write_text('["not", "metadata"]\n', encoding="utf-8")
                 non_object_result = read_meta("a")
@@ -3883,6 +3891,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn(str(meta_dir), json.dumps(symlink_result, sort_keys=True))
         self.assertNotIn("SECRET_META_SHOULD_NOT_LEAK", json.dumps(symlink_result, sort_keys=True))
         self.assertTrue(symlink_still_exists)
+        self.assertEqual(hardlink_result, {"meta_error": "could_not_read"})
         self.assertIn("meta_error", oversized_result)
         self.assertEqual(oversized_result["meta_error"], "could_not_read")
         self.assertNotIn(str(meta_dir), json.dumps(oversized_result, sort_keys=True))
