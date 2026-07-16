@@ -3601,6 +3601,34 @@ class ServerHelpersTest(unittest.TestCase):
                 self.assertTrue(status["blocked"])
                 self.assertEqual(status["source"], "snapshot")
 
+    def test_usage_watchdog_dry_run_reports_marker_changes_without_mutating(self) -> None:
+        blocked_status = {
+            "agent": "a1",
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": "2099-06-08T06:50:00+02:00",
+            "reason": "usage limit reached",
+            "source": "snapshot",
+            "raw_output": "not_returned",
+        }
+        with patch.dict(
+            "codex_master.server.AGENTS",
+            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
+            clear=True,
+        ), patch("codex_master.server.ensure_state"), patch(
+            "codex_master.server.tmux_alive", return_value=False
+        ), patch(
+            "codex_master.server.agent_lease_status",
+            return_value={"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
+        ), patch("codex_master.server.codex_usage_watchdog_status", return_value=blocked_status), patch(
+            "codex_master.server.update_codex_usage_watchdog_marker"
+        ) as update_marker:
+            result = usage_watchdog_agent("a1", dry_run=True)
+
+        self.assertEqual(result["usage_watchdog_state"], "would_mark")
+        self.assertEqual(result["action_taken"], "none")
+        update_marker.assert_not_called()
+
     def test_usage_watchdog_agent_stops_blocked_running_agent_and_writes_marker(self) -> None:
         marker_store: list[dict[str, Any]] = []
 

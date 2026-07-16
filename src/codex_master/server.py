@@ -3853,7 +3853,11 @@ def usage_watchdog_agent(agent: str, *, dry_run: bool) -> dict[str, Any]:
         if not running:
             if not dry_run:
                 update_codex_usage_watchdog_marker(agent, marker)
-            return {**base, "usage_watchdog_state": "blocked_marked", "action_taken": "none"}
+            return {
+                **base,
+                "usage_watchdog_state": "would_mark" if dry_run else "blocked_marked",
+                "action_taken": "none",
+            }
         if not lease.get("held_by_this_server") and lease.get("state") == "held":
             return {**base, "usage_watchdog_state": "skipped_not_leased_by_this_server", "action_taken": "none"}
         if dry_run:
@@ -3882,7 +3886,11 @@ def usage_watchdog_agent(agent: str, *, dry_run: bool) -> dict[str, Any]:
     if codex_usage_watchdog_marker(read_meta(agent)):
         if not dry_run:
             update_codex_usage_watchdog_marker(agent, None)
-        return {**base, "usage_watchdog_state": "released", "action_taken": "none"}
+        return {
+            **base,
+            "usage_watchdog_state": "would_release" if dry_run else "released",
+            "action_taken": "none",
+        }
 
     return {**base, "usage_watchdog_state": "clear", "action_taken": "none"}
 
