@@ -3973,6 +3973,8 @@ def _codex_usage_watchdog_state_from_snapshot(snapshot: dict[str, Any], *, now: 
 def watchdog_effective_idle(status: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
     current = time.time() if now is None else now
     raw_idle = status.get("raw_log_idle_seconds")
+    raw_log_updated = parse_utc_timestamp(status.get("raw_log_updated_at_utc"))
+    raw_log_is_current = raw_log_updated is None or raw_log_updated <= current
     latest_assignment = status.get("last_assignment") if isinstance(status.get("last_assignment"), dict) else {}
     assignment_value = latest_assignment.get("created_at_utc")
     assignment_created = parse_utc_timestamp(assignment_value)
@@ -3981,6 +3983,7 @@ def watchdog_effective_idle(status: dict[str, Any], *, now: float | None = None)
     if (
         isinstance(raw_idle, int)
         and not isinstance(raw_idle, bool)
+        and raw_log_is_current
         and (assignment_age is None or not assignment_is_current or max(0, raw_idle) <= assignment_age)
     ):
         return {
