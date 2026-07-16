@@ -2522,17 +2522,17 @@ def public_config_path_state(path: Any) -> str:
     return "configured" if public_path(path) is not None else "not_configured"
 
 
-def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[dict[str, Any]]:
+def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[dict[str, Any]] | None:
     agent = canonical_agent_id(agent)
     cfg = AGENTS[agent]
     home = cfg["home"]
     processes: list[dict[str, Any]] = []
     if not proc_root.exists():
-        return processes
+        return None
     try:
         pid_dirs = list(proc_root.iterdir())
     except OSError:
-        return processes
+        return None
     for pid_dir in pid_dirs:
         if not pid_dir.name.isdigit():
             continue
@@ -2563,6 +2563,18 @@ def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[di
 def agent_home_process_summary(agent: str, proc_root: Path = Path("/proc")) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     processes = agent_home_processes(agent, proc_root)
+    if processes is None:
+        return {
+            "agent": agent,
+            "home": PATH_NOT_RETURNED,
+            "home_kind": "managed_agent_home",
+            "process_count": None,
+            "external_process_count": None,
+            "managed_process_count": None,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        }
     external = [item for item in processes if not item["managed_by_masterjet"]]
     return {
         "agent": agent,
@@ -2578,10 +2590,17 @@ def agent_home_process_summary(agent: str, proc_root: Path = Path("/proc")) -> d
 
 
 def agent_identity_guard(running: bool, process_summary: dict[str, Any]) -> dict[str, Any]:
-    process_count = int(process_summary.get("process_count") or 0)
-    external_process_count = int(process_summary.get("external_process_count") or 0)
-    managed_process_count = int(process_summary.get("managed_process_count") or 0)
-    if external_process_count > 0:
+    process_count = process_summary.get("process_count")
+    external_process_count = process_summary.get("external_process_count")
+    managed_process_count = process_summary.get("managed_process_count")
+    counts_available = all(
+        isinstance(value, int) and not isinstance(value, bool)
+        for value in (process_count, external_process_count, managed_process_count)
+    )
+    if not counts_available:
+        state = "blocked_process_scan_unavailable"
+        ok = False
+    elif external_process_count > 0:
         state = "blocked_external_home_user"
         ok = False
     elif not running and managed_process_count > 0:
@@ -2725,6 +2744,8 @@ def start_agent(
         raise AgentError(f"runner for agent {agent} must be a regular executable file")
     if tmux_alive(session):
         process_summary = agent_home_process_summary(agent)
+        if process_summary["external_process_count"] is None:
+            raise AgentError(f"agent {agent} CODEX_HOME process scan is unavailable; retry before starting")
         if process_summary["external_process_count"]:
             raise AgentError(
                 f"agent {agent} is already running in tmux, but CODEX_HOME is also used by "
@@ -2744,6 +2765,8 @@ def start_agent(
 
     process_summary = agent_home_process_summary(agent)
     identity_guard = agent_identity_guard(False, process_summary)
+    if process_summary["external_process_count"] is None:
+        raise AgentError(f"agent {agent} CODEX_HOME process scan is unavailable; retry before starting")
     if process_summary["external_process_count"]:
         raise AgentError(
             f"agent {agent} CODEX_HOME is already used by {process_summary['external_process_count']} external process(es); "

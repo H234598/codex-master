@@ -4252,10 +4252,25 @@ class ServerHelpersTest(unittest.TestCase):
         ):
             summary = agent_home_process_summary("a", proc_root)
 
-        self.assertEqual(summary["process_count"], 0)
-        self.assertEqual(summary["external_process_count"], 0)
-        self.assertEqual(summary["managed_process_count"], 0)
+        self.assertIsNone(summary["process_count"])
+        self.assertIsNone(summary["external_process_count"])
+        self.assertIsNone(summary["managed_process_count"])
         self.assertEqual(summary["raw_output"], "not_returned")
+
+    def test_agent_identity_guard_blocks_unavailable_process_scan(self) -> None:
+        result = agent_identity_guard(
+            False,
+            {
+                "process_count": None,
+                "managed_process_count": None,
+                "external_process_count": None,
+                "raw_output": "not_returned",
+            },
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["state"], "blocked_process_scan_unavailable")
+        self.assertIsNone(result["home_process_count"])
 
     def test_same_path_text_handles_resolution_runtime_error(self) -> None:
         with patch("pathlib.Path.resolve", side_effect=RuntimeError("loop")):
@@ -5188,6 +5203,34 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["meta"]["cwd_state"], "set")
         self.assertNotIn("/tmp/private-agent", json.dumps(result, sort_keys=True))
         self.assertEqual(result["raw_output"], "not_returned")
+
+    @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": None,
+            "external_process_count": None,
+            "managed_process_count": None,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
+    def test_start_agent_refuses_unavailable_process_scan(
+        self, _mock_summary, _mock_tmux_alive, _mock_ensure_state
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runner = Path(tmpdir) / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
+                clear=False,
+            ):
+                with self.assertRaisesRegex(AgentError, "process scan is unavailable"):
+                    start_agent("a", cwd=tmpdir)
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.pane_pid", return_value=321)
