@@ -3712,6 +3712,9 @@ def codex_usage_watchdog_status(agent: str) -> dict[str, Any]:
             snapshot_account = account
             break
     if snapshot:
+        snapshot_identity = snapshot.get("account") or snapshot.get("agent")
+        if snapshot_identity != snapshot_account:
+            raise AgentError("could_not_read_codex_usage_snapshot")
         state = _codex_usage_watchdog_state_from_snapshot(snapshot, now=now)
         state["account"] = snapshot_account
         if state["state"] == "blocked":
