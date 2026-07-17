@@ -11902,6 +11902,28 @@ class ServerHelpersTest(unittest.TestCase):
         mock_wait_ready.assert_not_called()
         mock_run_tmux.assert_not_called()
 
+    def test_send_agent_rechecks_session_identity_before_paste(self) -> None:
+        with patch("codex_master.server.tmux_alive", return_value=True), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={
+                "process_count": 1,
+                "managed_process_count": 1,
+                "external_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            },
+        ), patch("codex_master.server.wait_agent_input_ready", return_value={"ready": True}), patch(
+            "codex_master.server.require_managed_tmux_session",
+            side_effect=[None, None, AgentError("session identity could not be verified")],
+        ), patch("codex_master.server.run_tmux") as mock_run_tmux:
+            mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "", "")
+            with self.assertRaisesRegex(AgentError, "session identity could not be verified"):
+                send_agent("a", "do not send")
+
+        commands = [call.args[0][0] for call in mock_run_tmux.call_args_list]
+        self.assertEqual(commands, ["load-buffer", "delete-buffer"])
+
     def test_send_agent_uses_bracketed_paste_for_multiline_text(self) -> None:
         calls = []
 

@@ -8786,6 +8786,7 @@ def send_agent(
                     "response_output": "not_returned",
                 },
             )
+        require_managed_tmux_session(agent)
         paste_mode = "bracketed_paste" if "\n" in text else "plain_paste"
         payload = f"{BRACKETED_PASTE_BEGIN}{text}{BRACKETED_PASTE_END}" if paste_mode == "bracketed_paste" else text
         buffer_name = f"codex-master-mcp-{agent}-{uuid.uuid4().hex}"
@@ -8793,6 +8794,7 @@ def send_agent(
         if cp.returncode != 0:
             raise AgentError(f"tmux load-buffer failed for agent {agent}")
         try:
+            require_managed_tmux_session(agent)
             cp = run_tmux(["paste-buffer", "-d", "-b", buffer_name, "-t", session], check=False)
             if cp.returncode != 0:
                 raise AgentError(f"tmux paste-buffer failed for agent {agent}")
