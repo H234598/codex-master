@@ -3219,13 +3219,16 @@ def _stop_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]:
         if cp.returncode != 0:
             if cp.returncode in {COMMAND_TIMEOUT_RETURN_CODE, COMMAND_UNAVAILABLE_RETURN_CODE} or tmux_alive(session):
                 raise AgentError(f"tmux stop failed for agent {agent}")
-            process_count = agent_home_process_summary(agent).get("process_count")
-            if not isinstance(process_count, int) or isinstance(process_count, bool) or process_count != 0:
-                raise AgentError(f"tmux stop failed for agent {agent}")
+        process_count = agent_home_process_summary(agent).get("process_count")
+        if not isinstance(process_count, int) or isinstance(process_count, bool) or process_count != 0:
+            raise AgentError(f"tmux stop failed for agent {agent}")
         release = release_agent(agent, force=True)
     else:
         current_lease = agent_lease_status(agent)
         if force or current_lease["held_by_this_server"] or current_lease["state"] == "expired":
+            process_count = agent_home_process_summary(agent).get("process_count")
+            if not isinstance(process_count, int) or isinstance(process_count, bool) or process_count != 0:
+                raise AgentError(f"tmux stop failed for agent {agent}")
             release = release_agent(agent, force=True)
         else:
             release = {"status": "skipped", "lease": current_lease, "raw_output": "not_returned"}

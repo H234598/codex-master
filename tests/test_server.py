@@ -7324,6 +7324,31 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertNotIn("SECRET_STOP_OUTPUT_SHOULD_NOT_RETURN", error_text)
             self.assertNotIn(tmpdir, error_text)
 
+    def test_stop_agent_keeps_lease_when_kill_succeeds_but_home_process_remains(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}},
+                clear=True,
+            ), patch("codex_master.server.tmux_alive", return_value=True), patch(
+                "codex_master.server.ensure_agent_lease_available", return_value={"state": "held"}
+            ), patch(
+                "codex_master.server.run_tmux",
+                return_value=subprocess.CompletedProcess(["tmux", "kill-session"], 0, "", ""),
+            ), patch(
+                "codex_master.server.agent_home_process_summary", return_value={"process_count": 1}
+            ), patch("codex_master.server.release_agent") as mock_release:
+                with self.assertRaisesRegex(AgentError, "tmux stop failed"):
+                    stop_agent("a")
+
+        mock_release.assert_not_called()
+
     @patch("codex_master.server.ensure_agent_lease_available")
     @patch("codex_master.server.tmux_alive", side_effect=[True, False])
     @patch("codex_master.server.agent_home_process_summary", return_value={"process_count": 0})
@@ -7368,6 +7393,32 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["status"], "not_running")
         self.assertEqual(result["lease"]["state"], "unclaimed")
         self.assertEqual(result["lease"]["holder"], "none")
+
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("codex_master.server.agent_home_process_summary", return_value={"process_count": 1})
+    def test_stop_agent_keeps_own_lease_when_not_running_but_home_process_remains(
+        self, _mock_processes, _mock_alive
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
+                clear=False,
+            ):
+                claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
+
+                with self.assertRaisesRegex(AgentError, "tmux stop failed"):
+                    stop_agent("a")
+
+                lease = agent_lease_status("a")
+
+        self.assertEqual(lease["state"], "held")
 
     @patch("codex_master.server.tmux_alive", return_value=False)
     def test_stop_agent_keeps_foreign_lease_when_already_not_running(self, _mock_alive) -> None:
