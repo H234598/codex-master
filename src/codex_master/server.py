@@ -8927,6 +8927,7 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
         raw_log_identity = allowed_raw_log_identity(raw_log)
         raw_log_path = raw_log_identity[0] if raw_log_identity is not None else None
         if tmux_alive(AGENTS[agent]["session"]) and (raw_log_path is None or raw_log_identity[1] is None):
+            require_managed_tmux_session(agent)
             raw_log_path = latest_managed_raw_log(agent, include_legacy=bool(raw_log))
         if raw_log and raw_log_path is None:
             raise AgentError("raw_log path is outside managed raw log state")

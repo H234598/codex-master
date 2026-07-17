@@ -3728,15 +3728,55 @@ class ServerHelpersTest(unittest.TestCase):
             log_path = raw_dir / "20260717T070001000000Z-a.log"
             log_path.write_text("current\n", encoding="utf-8")
             agent = {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}
+            summary = {
+                "process_count": 1,
+                "managed_process_count": 1,
+                "external_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            }
             with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
                 "codex_master.server.RAW_DIR", raw_dir
             ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
                 "codex_master.server.read_meta", return_value={}
-            ), patch("codex_master.server.tmux_alive", return_value=True):
+            ), patch("codex_master.server.tmux_alive", return_value=True), patch(
+                "codex_master.server.agent_home_process_summary", return_value=summary
+            ):
                 result = safe_tail("a", source="log")
 
         self.assertEqual(result["output"], "current")
         self.assertEqual(result["raw_log"], "not_returned")
+
+    @patch("codex_master.server.ensure_agent_lease_available")
+    @patch("codex_master.server.ensure_state")
+    def test_safe_tail_log_recovery_rejects_unmanaged_tmux_session(
+        self, _mock_ensure_state, mock_lease
+    ) -> None:
+        mock_lease.return_value = {"state": "unclaimed", "holder": "none", "raw_output": "not_returned"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "raw"
+            raw_dir.mkdir()
+            (raw_dir / "20260717T070001000000Z-a.log").write_text("foreign\n", encoding="utf-8")
+            agent = {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}
+            foreign = {
+                "process_count": 1,
+                "managed_process_count": 0,
+                "external_process_count": 1,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            }
+            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
+                "codex_master.server.RAW_DIR", raw_dir
+            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "codex_master.server.read_meta", return_value={}
+            ), patch("codex_master.server.tmux_alive", return_value=True), patch(
+                "codex_master.server.agent_home_process_summary", return_value=foreign
+            ):
+                with self.assertRaisesRegex(AgentError, "also used by an external process"):
+                    safe_tail("a", source="log")
 
     @patch("codex_master.server.ensure_agent_lease_available")
     @patch("codex_master.server.ensure_state")
