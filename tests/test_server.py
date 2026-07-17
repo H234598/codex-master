@@ -6485,6 +6485,30 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(mock_start_agent.call_args.kwargs["release_lease_on_failure"])
         self.assertEqual(next_claim["status"], "claimed")
 
+    def test_start_agent_with_lease_keeps_claim_when_start_fails_with_home_process(self) -> None:
+        with patch.dict(
+            "codex_master.server.AGENTS",
+            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
+            clear=True,
+        ), patch(
+            "codex_master.server.agent_auth_status", return_value={"authenticated": False, "auth_state": "empty"}
+        ), patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"), patch(
+            "codex_master.server.tmux_alive", return_value=False
+        ), patch(
+            "codex_master.server.claim_agent",
+            return_value={
+                "status": "claimed",
+                "lease": {"state": "held", "held_by_this_server": True},
+            },
+        ), patch("codex_master.server.start_agent", side_effect=AgentError("tmux pipe-pane failed")), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={"process_count": 1, "external_process_count": 1, "managed_process_count": 0},
+        ), patch("codex_master.server.release_agent") as mock_release:
+            with self.assertRaisesRegex(AgentError, "tmux pipe-pane failed"):
+                start_agent_with_lease("a1", allow_unauthenticated=True)
+
+        mock_release.assert_not_called()
+
     @patch("codex_master.server.tmux_alive", return_value=False)
     @patch("codex_master.server.start_agent")
     def test_start_agent_with_lease_keeps_existing_same_client_claim(self, mock_start_agent, _mock_tmux_alive) -> None:
@@ -7336,6 +7360,46 @@ class ServerHelpersTest(unittest.TestCase):
             error_text = str(raised.exception)
             self.assertNotIn("SECRET_PIPE_OUTPUT_SHOULD_NOT_RETURN", error_text)
             self.assertNotIn(str(tmpdir), error_text)
+
+    def test_start_agent_keeps_lease_when_pipe_fails_but_home_process_remains(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            runner = root / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            summaries = [
+                {"process_count": 0, "external_process_count": 0, "managed_process_count": 0},
+                {"process_count": 1, "external_process_count": 1, "managed_process_count": 0},
+            ]
+
+            def fake_run_tmux(args, **_kwargs):
+                code = 1 if args[0] == "pipe-pane" else 0
+                return subprocess.CompletedProcess(["tmux", *args], code, "", "")
+
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": root, "session": "test_session"}},
+                clear=False,
+            ), patch("codex_master.server.RAW_DIR", root), patch(
+                "codex_master.server.META_DIR", root / "meta"
+            ), patch("codex_master.server.ensure_state"), patch(
+                "codex_master.server.tmux_alive", side_effect=[False, True]
+            ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux), patch(
+                "codex_master.server.agent_home_process_summary", side_effect=summaries
+            ) as mock_summary, patch(
+                "codex_master.server.agent_lease_status",
+                return_value={"held_by_this_server": True},
+            ), patch("codex_master.server.release_agent") as mock_release:
+                with self.assertRaisesRegex(AgentError, "tmux pipe-pane failed"):
+                    start_agent(
+                        "a",
+                        cwd=tmpdir,
+                        lease={"state": "held", "held_by_this_server": True},
+                        release_lease_on_failure=True,
+                    )
+
+        self.assertEqual(mock_summary.call_count, 2)
+        mock_release.assert_not_called()
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.write_meta", side_effect=AgentError("meta failed"))

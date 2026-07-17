@@ -2963,6 +2963,17 @@ def cleanup_failed_start(session: str, raw_log: Path, *, kill_session: bool) -> 
         pass
 
 
+def release_start_lease_if_safe(agent: str, lease: dict[str, Any] | None, enabled: bool) -> None:
+    if not enabled or not lease or not lease.get("held_by_this_server"):
+        return
+    if not agent_lease_status(agent).get("held_by_this_server"):
+        return
+    process_count = agent_home_process_summary(agent).get("process_count")
+    if not isinstance(process_count, int) or isinstance(process_count, bool) or process_count != 0:
+        return
+    release_agent(agent, force=True)
+
+
 def start_agent(
     agent: str,
     cwd: str | None = None,
@@ -3038,16 +3049,14 @@ def start_agent(
     cp = run_tmux(["new-session", "-d", "-s", session, "-c", str(start_cwd), command], check=False)
     if cp.returncode != 0:
         cleanup_failed_start(session, raw_log, kill_session=False)
-        if release_lease_on_failure and lease and lease.get("held_by_this_server"):
-            release_agent(agent, force=True)
+        release_start_lease_if_safe(agent, lease, release_lease_on_failure)
         raise AgentError(f"tmux start failed for agent {agent}")
 
     pipe_command = raw_log_writer_command(raw_log)
     pipe = run_tmux(["pipe-pane", "-o", "-t", session, pipe_command], check=False)
     if pipe.returncode != 0:
         cleanup_failed_start(session, raw_log, kill_session=True)
-        if release_lease_on_failure and lease and lease.get("held_by_this_server"):
-            release_agent(agent, force=True)
+        release_start_lease_if_safe(agent, lease, release_lease_on_failure)
         raise AgentError(f"tmux pipe-pane failed for agent {agent}")
 
     data = {
@@ -3071,8 +3080,7 @@ def start_agent(
         write_meta(agent, data)
     except Exception:
         cleanup_failed_start(session, raw_log, kill_session=True)
-        if release_lease_on_failure and lease and lease.get("held_by_this_server"):
-            release_agent(agent, force=True)
+        release_start_lease_if_safe(agent, lease, release_lease_on_failure)
         raise
     return {
         "agent": agent,
@@ -3157,8 +3165,7 @@ def start_agent_with_lease(
                     cleanup_failed_start(AGENTS[agent]["session"], raw_log_path, kill_session=True)
                 else:
                     run_tmux(["kill-session", "-t", AGENTS[agent]["session"]], check=False)
-            if release_on_completion and agent_lease_status(agent).get("held_by_this_server"):
-                release_agent(agent, force=True)
+            release_start_lease_if_safe(agent, lease, release_on_completion)
             raise
         if release_on_completion and agent_lease_status(agent).get("held_by_this_server"):
             release = release_agent(agent, force=True)
@@ -3177,8 +3184,7 @@ def start_agent_with_lease(
             model_reasoning_effort=selected_effort,
         )
     except Exception:
-        if release_on_completion and agent_lease_status(agent).get("held_by_this_server"):
-            release_agent(agent, force=True)
+        release_start_lease_if_safe(agent, lease, release_on_completion)
         raise
     try:
         validate_existing_session(result)
@@ -3191,8 +3197,7 @@ def start_agent_with_lease(
                 cleanup_failed_start(AGENTS[agent]["session"], raw_log_path, kill_session=True)
             else:
                 run_tmux(["kill-session", "-t", AGENTS[agent]["session"]], check=False)
-        if release_on_completion and agent_lease_status(agent).get("held_by_this_server"):
-            release_agent(agent, force=True)
+        release_start_lease_if_safe(agent, lease, release_on_completion)
         raise
     if release_on_completion and agent_lease_status(agent).get("held_by_this_server"):
         release = release_agent(agent, force=True)
