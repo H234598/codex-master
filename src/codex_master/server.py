@@ -4551,6 +4551,32 @@ def update_agent_spark_health(agent: str, *, state: str, reason: str) -> dict[st
     return {**result, "account_state": "spark_routed", "raw_output": "not_returned"}
 
 
+def update_wait_agent_spark_health(
+    agent: str,
+    status: dict[str, Any],
+    *,
+    state: str,
+    reason: str,
+) -> dict[str, Any]:
+    lease = status.get("lease")
+    if not isinstance(lease, dict) or lease.get("held_by_this_server") is not True:
+        return {
+            "state": "not_checked",
+            "updated": False,
+            "reason": "lease_not_held_by_this_server",
+            "raw_output": "not_returned",
+        }
+    with agent_lifecycle_lock(agent):
+        if agent_lease_status(agent).get("held_by_this_server") is not True:
+            return {
+                "state": "not_checked",
+                "updated": False,
+                "reason": "lease_not_held_by_this_server",
+                "raw_output": "not_returned",
+            }
+        return update_agent_spark_health(agent, state=state, reason=reason)
+
+
 def limit_model_pool(model: Any) -> str:
     text = str(model or "").lower()
     if "spark" in text or WRITE_AGENT_MODEL in text:
@@ -4851,14 +4877,16 @@ def wait_agent(agent: str, timeout_seconds: int = DEFAULT_WAIT_SECONDS, poll_int
     if status is None:
         status = "timeout"
     if status == "activity_observed":
-        spark_health = update_agent_spark_health(
+        spark_health = update_wait_agent_spark_health(
             agent,
+            current,
             state="healthy",
             reason="spark_turn_activity_observed",
         )
     elif status in {"timeout", "blocked_by_limit"}:
-        spark_health = update_agent_spark_health(
+        spark_health = update_wait_agent_spark_health(
             agent,
+            current,
             state="failed",
             reason=f"spark_turn_{status}",
         )
