@@ -12819,6 +12819,43 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn("outside-marker", payload_text)
             self.assertTrue(marker.is_symlink())
 
+    def test_agent_pool_destroy_rejects_marker_swap_before_unlink(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec(tmp, pool)
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+            marker = pool / server_module.POOL_MARKER_FILE
+            original_marker = tmp / "original-marker"
+            real_lstat = Path.lstat
+            marker_lstat_count = 0
+
+            def swap_marker_on_second_lstat(path: Path):
+                nonlocal marker_lstat_count
+                result = real_lstat(path)
+                if path.name == server_module.POOL_MARKER_FILE:
+                    marker_lstat_count += 1
+                    if marker_lstat_count == 2:
+                        marker.rename(original_marker)
+                        marker.write_text("foreign marker\n", encoding="utf-8")
+                        return real_lstat(path)
+                return result
+
+            with patch.object(Path, "lstat", autospec=True, side_effect=swap_marker_on_second_lstat):
+                with self.assertRaisesRegex(AgentError, "pool marker changed during removal"):
+                    server_module.agent_pool_destroy_pool(
+                        str(spec_path),
+                        target_dir=str(pool),
+                        codex_bin="/bin/echo",
+                        yes=True,
+                    )
+
+            self.assertEqual(marker_lstat_count, 2)
+            self.assertTrue(original_marker.is_file())
+            self.assertEqual(marker.read_text(encoding="utf-8"), "foreign marker\n")
+
     def test_agent_pool_destroy_rejects_symlinked_pool_root_without_removing_external_entries(self) -> None:
         from codex_master import server as server_module
 

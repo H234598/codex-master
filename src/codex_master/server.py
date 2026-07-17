@@ -9847,7 +9847,18 @@ def agent_pool_destroy_pool(
             raise AgentError("pool root must be a real directory")
 
         marker = operation_root / POOL_MARKER_FILE
-        if not pool_regular_marker_present(marker) and not force:
+        try:
+            marker_stat = marker.lstat()
+        except FileNotFoundError:
+            marker_stat = None
+        except OSError as exc:
+            raise AgentError("pool marker could not be read") from exc
+        marker_valid = (
+            marker_stat is not None
+            and stat_module.S_ISREG(marker_stat.st_mode)
+            and getattr(marker_stat, "st_nlink", 1) == 1
+        )
+        if not marker_valid and not force:
             raise AgentError("destroy_pool requires an installed pool marker or force=true")
         for agent in normalized["ids"]:
             target = operation_root / agent
@@ -9859,8 +9870,27 @@ def agent_pool_destroy_pool(
             else:
                 skipped += 1
 
-        if pool_regular_marker_present(marker):
-            marker.unlink()
+        if marker_valid:
+            try:
+                latest_marker_stat = marker.lstat()
+            except FileNotFoundError:
+                latest_marker_stat = None
+            except OSError as exc:
+                raise AgentError("pool marker changed during removal") from exc
+            if latest_marker_stat is not None:
+                if (
+                    not stat_module.S_ISREG(latest_marker_stat.st_mode)
+                    or getattr(latest_marker_stat, "st_nlink", 1) != 1
+                    or not source_identity_matches(latest_marker_stat, marker_stat)
+                ):
+                    raise AgentError("pool marker changed during removal")
+                try:
+                    if root_fd >= 0:
+                        os.unlink(POOL_MARKER_FILE, dir_fd=root_fd)
+                    else:
+                        marker.unlink()
+                except FileNotFoundError:
+                    pass
         if remove_root:
             if root_fd >= 0:
                 try:
