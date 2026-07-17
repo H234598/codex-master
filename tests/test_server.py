@@ -16382,6 +16382,19 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertFalse(result["root_removed"])
             self.assertFalse((pool / "a1").exists())
             self.assertTrue((pool / "unexpected-entry").is_file())
+            self.assertTrue((pool / server_module.POOL_MARKER_FILE).is_file())
+
+            (pool / "unexpected-entry").unlink()
+            retry = server_module.agent_pool_destroy_pool(
+                str(spec_path),
+                target_dir=str(pool),
+                codex_bin="/bin/echo",
+                yes=True,
+                remove_root=True,
+            )
+            self.assertTrue(retry["ok"])
+            self.assertTrue(retry["root_removed"])
+            self.assertFalse(pool.exists())
 
     def test_agent_pool_tools_are_registered_and_cli_invokes_pool_namespace(self) -> None:
         from codex_master import server as server_module

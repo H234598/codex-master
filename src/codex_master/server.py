@@ -11421,6 +11421,17 @@ def _agent_pool_destroy_pool_unlocked(
         marker_valid = marker_present and pool_marker_matches(marker, marker_stat, normalized)
         if not marker_valid and not force:
             raise AgentError("destroy_pool requires an installed pool marker or force=true")
+        marker_bytes: bytes | None = None
+        if marker_present:
+            try:
+                marker_bytes = pool_read_private_bytes(
+                    marker,
+                    MAX_POOL_SPEC_BYTES,
+                    "pool marker could not be read",
+                )
+            except AgentError:
+                if remove_root:
+                    marker_bytes = None
         with pool_agent_lifecycle_locks(normalized["ids"]):
             for agent in normalized["ids"]:
                 if agent in AGENTS:
@@ -11451,7 +11462,8 @@ def _agent_pool_destroy_pool_unlocked(
                 else:
                     skipped += 1
 
-            if marker_present:
+            marker_removed = False
+            if marker_present and skipped == 0 and (not remove_root or marker_bytes is not None):
                 try:
                     latest_marker_stat = marker.lstat()
                 except FileNotFoundError:
@@ -11470,9 +11482,10 @@ def _agent_pool_destroy_pool_unlocked(
                             os.unlink(POOL_MARKER_FILE, dir_fd=root_fd)
                         else:
                             marker.unlink()
+                        marker_removed = True
                     except FileNotFoundError:
                         pass
-            if remove_root:
+            if remove_root and skipped == 0 and (not marker_present or marker_removed):
                 if root_fd >= 0:
                     try:
                         current_root = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
@@ -11489,6 +11502,13 @@ def _agent_pool_destroy_pool_unlocked(
                         root_removed = True
                     except OSError:
                         root_removed = False
+            if remove_root and not root_removed and marker_removed and marker_bytes is not None:
+                try:
+                    marker.lstat()
+                except FileNotFoundError:
+                    pool_write_private_bytes(marker, marker_bytes, 0o600)
+                except OSError as exc:
+                    raise AgentError("pool marker changed during removal") from exc
     finally:
         if root_fd >= 0:
             os.close(root_fd)
