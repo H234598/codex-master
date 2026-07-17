@@ -8863,7 +8863,8 @@ def pool_read_private_bytes(path: Path, max_bytes: int, error_text: str) -> byte
         fd = os.open(path, flags)
         opened = os.fstat(fd)
         if (
-            stat_module.S_ISLNK(opened.st_mode)
+            not source_identity_matches(opened, current)
+            or stat_module.S_ISLNK(opened.st_mode)
             or not stat_module.S_ISREG(opened.st_mode)
             or getattr(opened, "st_nlink", 1) > 1
             or opened.st_size > max_bytes

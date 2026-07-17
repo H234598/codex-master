@@ -11633,6 +11633,53 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn(str(tmp), str(ctx.exception))
             self.assertNotIn("external-secret", str(ctx.exception))
 
+    def test_agent_pool_copy_auth_rejects_regular_source_swap_before_open(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents-secret"
+            (pool / "a1").mkdir(parents=True)
+            (pool / "a2").mkdir()
+            source = pool / "a1" / "auth.json"
+            source.write_text("source-secret\n", encoding="utf-8")
+            outside = tmp / "outside-auth-secret"
+            outside.write_text("external-secret\n", encoding="utf-8")
+            spec = {
+                "schema_version": 1,
+                "pool_root": str(pool),
+                "codex_bin": "/bin/echo",
+                "series": [{"prefix": "a", "count": 2, "template": "a1", "authenticated": []}],
+                "shared_assets": [],
+                "runtime_dirs": [],
+            }
+            spec_path = self._write_spec_payload(tmp, spec)
+            real_open = server_module.os.open
+            swapped = False
+
+            def swap_before_source_open(path, flags, *args, **kwargs):
+                nonlocal swapped
+                if not swapped and isinstance(path, (str, bytes, Path)) and Path(path).name == "auth.json":
+                    source.rename(tmp / "original-auth.json")
+                    source.write_bytes(outside.read_bytes())
+                    swapped = True
+                return real_open(path, flags, *args, **kwargs)
+
+            with patch.object(server_module.os, "open", side_effect=swap_before_source_open):
+                with self.assertRaisesRegex(AgentError, "source auth is missing or invalid"):
+                    server_module.agent_pool_copy_auth(
+                        str(spec_path),
+                        target_dir=str(pool),
+                        codex_bin="/bin/echo",
+                        from_agent="a1",
+                        to="a-series",
+                        yes=True,
+                    )
+
+            self.assertTrue(swapped)
+            self.assertFalse((pool / "a2" / "auth.json").exists())
+            self.assertEqual((tmp / "original-auth.json").read_text(encoding="utf-8"), "source-secret\n")
+
     def test_agent_pool_copy_auth_rejects_symlinked_pool_root_without_copying(self) -> None:
         from codex_master import server as server_module
 
