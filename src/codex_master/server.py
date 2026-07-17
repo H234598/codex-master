@@ -286,7 +286,7 @@ PLUGIN_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]{0,199}$")
 RELEASE_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+(?:[A-Za-z0-9.+_-]*)?$")
 BRACKETED_PASTE_BEGIN = "\x1b[200~"
 BRACKETED_PASTE_END = "\x1b[201~"
-CODEX_TUI_SUBMIT_KEY = "S-Enter"
+CODEX_TUI_SUBMIT_KEY = "C-Enter"
 CODEX_TUI_INPUT_MARKERS = ("›",)
 CODEX_TUI_INPUT_MARKER_WINDOW_LINES = 8
 CODEX_TUI_BLOCKING_PROMPT_PATTERNS = (
@@ -2809,8 +2809,9 @@ def write_bounded_raw_log(path: Path, max_bytes: int = MAX_RAW_LOG_BYTES) -> int
     if allowed_identity is None:
         raise AgentError("raw log path is outside managed raw log state")
     allowed, expected_stat = allowed_identity
+    stream = sys.stdin.buffer
     while True:
-        chunk = sys.stdin.buffer.read(RAW_LOG_CHUNK_BYTES)
+        chunk = stream.read1(RAW_LOG_CHUNK_BYTES) if hasattr(stream, "read1") else stream.read(RAW_LOG_CHUNK_BYTES)
         if not chunk:
             return 0
         append_bounded_raw_log(allowed, chunk, max_bytes, expected_stat=expected_stat)
@@ -3704,6 +3705,7 @@ def agent_spark_routing(agent: str) -> dict[str, Any] | None:
 
 
 def remember_agent_routing(agent: str, routing: dict[str, Any] | None) -> None:
+    agent = canonical_agent_id(agent)
     if not isinstance(routing, dict):
         return
     account = routing.get("account")
@@ -3725,17 +3727,19 @@ def remember_agent_routing(agent: str, routing: dict[str, Any] | None) -> None:
 
 
 def remember_agent_usage_account(agent: str, account: Any) -> None:
+    agent = canonical_agent_id(agent)
     if not isinstance(account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(account):
         return
-    meta = read_meta(agent)
-    routing = meta.get("routing")
-    if not isinstance(routing, dict):
-        routing = {}
-    elif routing.get("account") != account:
-        routing = {}
-    routing["account"] = account
-    meta["routing"] = routing
-    write_meta(agent, meta)
+    with agent_lifecycle_lock(agent):
+        meta = read_meta(agent)
+        routing = meta.get("routing")
+        if not isinstance(routing, dict):
+            routing = {}
+        elif routing.get("account") != account:
+            routing = {}
+        routing["account"] = account
+        meta["routing"] = routing
+        write_meta(agent, meta)
 
 
 def update_agent_spark_health(agent: str, *, state: str, reason: str) -> dict[str, Any]:

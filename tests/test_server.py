@@ -389,6 +389,24 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(original.read_text(encoding="utf-8"), "original-secret-data\n")
             self.assertEqual(path.read_text(encoding="utf-8"), "external-secret-data\n")
 
+    def test_write_bounded_raw_log_persists_short_partial_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw"
+            raw_dir.mkdir()
+            path = raw_dir / "run.log"
+            path.write_bytes(b"")
+
+            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
+                "codex_master.server.LEGACY_STATE_ROOT", Path(tmpdir) / "legacy"
+            ), patch("codex_master.server.ensure_state"), patch(
+                "codex_master.server.sys.stdin", FakeStdin(b"short-report\n")
+            ):
+                result = write_bounded_raw_log(path, max_bytes=128)
+            content = path.read_bytes()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(content, b"short-report\n")
+
     def test_github_ci_smokes_agent_pool_installer(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
@@ -7620,6 +7638,35 @@ class ServerHelpersTest(unittest.TestCase):
             with self.assertRaisesRegex(AgentError, "timeout_seconds must be a finite number"):
                 wait_agent_input_ready("a", timeout)
 
+    def test_tui_accepts_input_rejects_startup_and_selection_prompts(self) -> None:
+        self.assertTrue(tui_accepts_input("\n› Ready\n"))
+        self.assertFalse(
+            tui_accepts_input(
+                "Update available! 0.144.4 -> 0.144.5\n› 2. Skip\nPress enter to continue\n"
+            )
+        )
+
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("codex_master.server.run_tmux")
+    def test_pane_tail_can_read_visible_screen_without_scrollback(self, mock_run_tmux, _mock_alive) -> None:
+        mock_run_tmux.return_value = subprocess.CompletedProcess(
+            ["tmux", "capture-pane"], 0, "› Ready\n", ""
+        )
+
+        from codex_master.server import pane_tail
+
+        self.assertEqual(pane_tail("a", 24, visible_only=True), "› Ready\n")
+        mock_run_tmux.assert_called_once_with(
+            ["capture-pane", "-p", "-t", "codex_agent_a1_mcp"], check=False
+        )
+        self.assertFalse(tui_accepts_input("MCP startup incomplete\n› Summarize recent commits\n"))
+        self.assertFalse(
+            tui_accepts_input(
+                "Your access token could not be refreshed because your refresh token was already used.\n"
+                "› Summarize recent commits\n"
+            )
+        )
+
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.run_tmux")
     def test_interrupt_releases_fresh_lease_when_tmux_fails(self, mock_run_tmux, _mock_alive) -> None:
@@ -7716,7 +7763,10 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["results"][0]["agent"], "a1")
         self.assertEqual(result["results"][0]["status"], "started")
         self.assertEqual(result["results"][0]["auth_gate"]["auth_state"], "present_regular")
-        self.assertEqual(events, [("lock", "a1"), ("unlock", "a1")])
+        self.assertEqual(
+            events,
+            [("lock", "a1"), ("lock", "a1"), ("unlock", "a1"), ("unlock", "a1")],
+        )
         mock_claim.assert_called_once_with("a1")
         mock_start_agent.assert_called_once_with(
             "a1",
@@ -10115,7 +10165,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["status"], "sent")
         self.assertEqual(result["chars"], len("line 1\nline 2"))
         self.assertEqual(result["paste_mode"], "bracketed_paste")
-        self.assertEqual(CODEX_TUI_SUBMIT_KEY, "Enter")
+        self.assertEqual(CODEX_TUI_SUBMIT_KEY, "C-Enter")
         self.assertEqual(result["submit_key"], CODEX_TUI_SUBMIT_KEY)
         self.assertEqual(result["response_output"], "not_returned")
         load_call = next(call for call in calls if call["args"][0] == "load-buffer")

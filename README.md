@@ -54,9 +54,9 @@ errors use generic markers rather than local file paths. Safe-tail log reads
 ignore non-regular raw-log targets. Tmux control errors are redacted and bounded
 before they are returned or raised. MCP tool responses do not return raw output
 by default and expose raw-log presence without returning local raw-log paths.
-Text is pasted into the Codex TUI through tmux and submitted with `Enter`.
-This matches the current Codex CLI submit binding; modified Enter sequences are
-terminal-dependent and are not used by the controller.
+Text is pasted into the Codex TUI through tmux and submitted with `C-Enter`.
+Plain `Enter` can leave multi-line or wrapped prompts sitting in the composer
+instead of starting the model response in current Codex CLI builds.
 Before pasting, `send`, `assign-*`, and `report-request` wait briefly for an
 identifiable Codex TUI input prompt marker in the current visible pane tail. If
 the Agentin is still in startup warnings, only shows starter text, or no input
