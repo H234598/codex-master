@@ -87,6 +87,7 @@ from codex_master.server import (
     agent_lease_status,
     public_agent_lease,
     agent_auth_status,
+    assignment_report,
     assign_agent,
     interrupt_agent,
     mcp_command_startup_self_test,
@@ -293,6 +294,34 @@ class ServerHelpersTest(unittest.TestCase):
 
             self.assertTrue(swapped)
             self.assertEqual(original.read_text(encoding="utf-8"), "expected = true\n")
+
+    def test_read_log_tail_rejects_regular_file_swap_before_open(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            path = tmp / "agent.log"
+            original = tmp / "original-agent.log"
+            replacement = tmp / "replacement-agent.log"
+            path.write_text("expected\n", encoding="utf-8")
+            replacement.write_text("forged\n", encoding="utf-8")
+            real_open = server_module.os.open
+            swapped = False
+
+            def swap_before_open(candidate, flags, *args, **kwargs):
+                nonlocal swapped
+                if not swapped and isinstance(candidate, (str, bytes, Path)) and Path(candidate) == path:
+                    path.rename(original)
+                    replacement.rename(path)
+                    swapped = True
+                return real_open(candidate, flags, *args, **kwargs)
+
+            with patch.object(server_module.os, "open", side_effect=swap_before_open):
+                result = server_module.read_log_tail(path, 1024)
+
+            self.assertTrue(swapped)
+            self.assertEqual(result, "")
+            self.assertEqual(original.read_text(encoding="utf-8"), "expected\n")
 
     def test_github_ci_smokes_agent_pool_installer(self) -> None:
         root = Path(__file__).resolve().parents[1]

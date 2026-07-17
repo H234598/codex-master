@@ -7924,7 +7924,11 @@ def read_log_tail(path: Path, approx_bytes: int) -> str:
     try:
         fd = os.open(path, flags)
         opened_stat = os.fstat(fd)
-        if not stat_module.S_ISREG(opened_stat.st_mode) or getattr(opened_stat, "st_nlink", 1) > 1:
+        if (
+            not source_identity_matches(opened_stat, current_stat)
+            or not stat_module.S_ISREG(opened_stat.st_mode)
+            or getattr(opened_stat, "st_nlink", 1) > 1
+        ):
             return ""
         with os.fdopen(fd, "rb") as fh:
             fd = -1
@@ -9669,7 +9673,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "agent_wait",
-        "description": "Wait briefly for one Agentin to show activity, stop, or hit a classified limit. Returns metadata and status only; does not return raw output.",
+        "description": "Wait briefly for one Agentin to show activity, stop, or hit a classified limit. Returns metadata only; call agent_assignment_report with the assignment_id to read an explicit capped report excerpt.",
         "inputSchema": {
             "type": "object",
             "required": ["agent"],
@@ -9880,7 +9884,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "agent_assign",
-        "description": "Send a structured, skill-aware assignment to one Agentin with explicit scope, write boundaries, and model policy. Does not return the prompt or response output.",
+        "description": "Send a structured, skill-aware assignment to one Agentin with explicit scope, write boundaries, and model policy. Does not return the prompt or response output; use agent_assignment_report with the returned assignment_id after activity.",
         "inputSchema": {
             "type": "object",
             "required": ["agent", "role", "task"],
@@ -9906,7 +9910,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "agent_assign_readonly",
-        "description": "Shortcut for a read-only Exploriererin assignment. Does not return the prompt or response output.",
+        "description": "Shortcut for a read-only Exploriererin assignment. Does not return the prompt or response output; use agent_assignment_report with the returned assignment_id after activity.",
         "inputSchema": {
             "type": "object",
             "required": ["agent", "task"],
@@ -10005,7 +10009,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "agent_report_request",
-        "description": "Ask one running Agentin for a concise report. The Agentin response is not returned automatically.",
+        "description": "Ask one running Agentin for a concise report. The response is asynchronous; call agent_assignment_report with the assignment_id to read a capped redacted excerpt.",
         "inputSchema": {
             "type": "object",
             "required": ["agent"],
@@ -10014,6 +10018,25 @@ TOOLS: list[dict[str, Any]] = [
                 "assignment_id": text_schema(MAX_ASSIGNMENT_ID),
                 "enter": {"type": "boolean", "default": True},
                 "allow_unauthenticated": allow_unauthenticated_schema(),
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "agent_assignment_report",
+        "description": (
+            "Read an explicit, capped, ANSI-stripped, redacted terminal excerpt for a known assignment. "
+            "Call after agent_wait or agent_report_request; unlike metadata tools this returns output."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["agent", "assignment_id"],
+            "properties": {
+                "agent": agent_selector_schema(single=True),
+                "assignment_id": text_schema(MAX_ASSIGNMENT_ID),
+                "source": {"type": "string", "enum": ["pane", "log"], "default": "pane"},
+                "lines": {"type": "integer", "minimum": 1, "maximum": MAX_TAIL_LINES, "default": 40},
+                "chars": {"type": "integer", "minimum": 1, "maximum": MAX_TAIL_CHARS, "default": 4000},
             },
             "additionalProperties": False,
         },
@@ -10674,6 +10697,13 @@ def main_cli(argv: list[str]) -> int:
     p_report.add_argument("--no-enter", action="store_true")
     p_report.add_argument("--allow-unauthenticated", action="store_true")
 
+    p_assignment_report = sub.add_parser("assignment-report")
+    p_assignment_report.add_argument("agent")
+    p_assignment_report.add_argument("assignment_id")
+    p_assignment_report.add_argument("--source", choices=["pane", "log"], default="pane")
+    p_assignment_report.add_argument("--lines", type=int, default=40)
+    p_assignment_report.add_argument("--chars", type=int, default=4000)
+
     p_worktree_create = sub.add_parser("worktree-create")
     p_worktree_create.add_argument("agent")
     p_worktree_create.add_argument("--path")
@@ -11047,6 +11077,19 @@ def main_cli(argv: list[str]) -> int:
                         "assignment_id": args.assignment_id,
                         "enter": not args.no_enter,
                         "allow_unauthenticated": True if args.allow_unauthenticated else None,
+                    },
+                )
+            )
+        if args.command == "assignment-report":
+            return print_json(
+                call_validated_tool(
+                    "agent_assignment_report",
+                    {
+                        "agent": args.agent,
+                        "assignment_id": args.assignment_id,
+                        "source": args.source,
+                        "lines": args.lines,
+                        "chars": args.chars,
                     },
                 )
             )
