@@ -11210,13 +11210,6 @@ def _agent_pool_install_unlocked(
                     os.close(parent_fd)
                 linked_assets += 1
 
-        marker = root / POOL_MARKER_FILE
-        pool_write_private_file(
-            marker,
-            json.dumps(pool_marker_payload(normalized), indent=2, sort_keys=True) + "\n",
-            0o600,
-        )
-
         auth_result: dict[str, Any] | None = None
         if copy_auth_from or copy_auth_to:
             auth_result = _agent_pool_copy_auth_unlocked(
@@ -11226,6 +11219,13 @@ def _agent_pool_install_unlocked(
                 yes=yes,
                 overwrite=overwrite_auth,
             )
+
+        marker = root / POOL_MARKER_FILE
+        pool_write_private_file(
+            marker,
+            json.dumps(pool_marker_payload(normalized), indent=2, sort_keys=True) + "\n",
+            0o600,
+        )
 
         return {
             "ok": True,

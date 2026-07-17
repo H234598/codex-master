@@ -14882,6 +14882,44 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertFalse((pool / "a2").exists())
             self.assertFalse((pool / server_module.POOL_MARKER_FILE).exists())
 
+    def test_agent_pool_install_writes_marker_only_after_auth_copy(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec(tmp, pool)
+            pool.mkdir()
+            (pool / "a1").mkdir()
+            (pool / "a1" / "auth.json").write_text('{"token":"source"}\n', encoding="utf-8")
+            original_copy = server_module._agent_pool_copy_auth_unlocked
+
+            def fail_after_preflight(
+                normalized: dict[str, Any], *, from_agent: str, to: str, yes: bool = False, overwrite: bool = False
+            ) -> dict[str, Any]:
+                if yes:
+                    raise AgentError("injected auth copy failure")
+                return original_copy(
+                    normalized,
+                    from_agent=from_agent,
+                    to=to,
+                    yes=yes,
+                    overwrite=overwrite,
+                )
+
+            with patch.object(server_module, "_agent_pool_copy_auth_unlocked", side_effect=fail_after_preflight):
+                with self.assertRaisesRegex(AgentError, "injected auth copy failure"):
+                    server_module.agent_pool_install(
+                        str(spec_path),
+                        target_dir=str(pool),
+                        codex_bin="/bin/echo",
+                        copy_auth_from="a1",
+                        copy_auth_to="a-series",
+                        yes=True,
+                    )
+
+            self.assertFalse((pool / server_module.POOL_MARKER_FILE).exists())
+
     def test_agent_pool_copy_auth_does_not_echo_custom_target_selector(self) -> None:
         from codex_master import server as server_module
 
