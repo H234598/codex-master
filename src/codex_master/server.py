@@ -2823,7 +2823,14 @@ def latest_managed_raw_log(agent: str, *, include_legacy: bool = True) -> Path |
         except OSError:
             continue
         for path in entries:
-            if not path.name.endswith(suffixes):
+            if not path.name.endswith(suffixes) or not path.name.endswith(".log"):
+                continue
+            run_timestamp, separator, run_agent = path.name[:-4].rpartition("-")
+            if separator != "-" or run_agent not in agent_record_aliases(agent):
+                continue
+            try:
+                _dt.datetime.strptime(run_timestamp, "%Y%m%dT%H%M%S%fZ")
+            except ValueError:
                 continue
             identity = allowed_raw_log_identity(str(path))
             if (

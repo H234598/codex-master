@@ -2956,6 +2956,25 @@ class ServerHelpersTest(unittest.TestCase):
                 os.utime(newer, (1000, 1000))
                 self.assertIsNone(latest_managed_raw_log("a"))
 
+    def test_latest_managed_raw_log_ignores_unrelated_suffix_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "raw"
+            raw_dir.mkdir()
+            valid = raw_dir / "20260717T070001000000Z-a.log"
+            unrelated = raw_dir / "manual-a.log"
+            valid.write_text("valid\n", encoding="utf-8")
+            unrelated.write_text("unrelated\n", encoding="utf-8")
+            os.utime(valid, (1000, 1000))
+            os.utime(unrelated, (2000, 2000))
+
+            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
+                "codex_master.server.LEGACY_STATE_ROOT", root / "legacy"
+            ):
+                result = latest_managed_raw_log("a")
+
+        self.assertEqual(result, valid)
+
     def test_agent_status_recovers_stale_raw_log_metadata_for_running_agent(self) -> None:
         from codex_master import server as server_module
 
