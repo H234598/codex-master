@@ -5984,6 +5984,42 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(redirected_sizes, [200, 200])
         self.assertEqual(redirected_modes, [0o644, 0o644])
 
+    def test_prune_raw_logs_rejects_log_swap_before_unlink(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "raw"
+            raw_dir.mkdir()
+            old_log = raw_dir / "old.log"
+            newest_log = raw_dir / "newest.log"
+            backup_log = root / "old-original.log"
+            outside_log = root / "outside.log"
+            old_log.write_bytes(b"managed-old\n")
+            newest_log.write_bytes(b"managed-newest\n")
+            outside_log.write_bytes(b"external-secret\n")
+            os.utime(old_log, (1000, 1000))
+            os.utime(newest_log, (1001, 1001))
+            real_harden = server_module.harden_raw_log_at_dir_fd
+
+            def swap_before_unlink(directory_fd, name, expected_stat):
+                if name == old_log.name and old_log.exists():
+                    old_log.rename(backup_log)
+                    outside_log.rename(old_log)
+                return real_harden(directory_fd, name, expected_stat)
+
+            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
+                "codex_master.server.LEGACY_STATE_ROOT", root / "legacy"
+            ), patch("codex_master.server.harden_raw_log_at_dir_fd", side_effect=swap_before_unlink):
+                result = server_module.prune_raw_logs(max_files=1, max_bytes=80)
+
+            external_content = old_log.read_text(encoding="utf-8")
+            original_exists = backup_log.exists()
+
+        self.assertEqual(result["deleted_count"], 0)
+        self.assertEqual(external_content, "external-secret\n")
+        self.assertTrue(original_exists)
+
     def test_legacy_raw_symlink_is_not_traversed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             raw_dir = Path(tmpdir) / "raw"

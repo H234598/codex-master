@@ -2685,6 +2685,22 @@ def harden_raw_log_at_dir_fd(directory_fd: int, name: str, expected_stat: os.sta
             os.close(fd)
 
 
+def unlink_raw_entry_at_dir_fd(directory_fd: int, name: str, expected_stat: os.stat_result) -> bool:
+    try:
+        latest = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    if not source_identity_matches(latest, expected_stat):
+        return False
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    return True
+
+
 def replace_private_bytes_at_dir_fd(directory_fd: int, name: str, data: bytes) -> None:
     tmp_name = f".{name}.{now_id()}.{uuid.uuid4().hex}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -2840,19 +2856,13 @@ def prune_raw_logs(max_files: int = MAX_RAW_LOG_FILES, max_bytes: int = MAX_RAW_
                 except OSError:
                     continue
                 if stat_module.S_ISLNK(current_stat.st_mode):
-                    try:
-                        os.unlink(name, dir_fd=raw_fd)
+                    if unlink_raw_entry_at_dir_fd(raw_fd, name, current_stat):
                         deleted += 1
                         deleted_symlink += 1
-                    except FileNotFoundError:
-                        pass
                     continue
                 if stat_module.S_ISREG(current_stat.st_mode) and getattr(current_stat, "st_nlink", 1) > 1:
-                    try:
-                        os.unlink(name, dir_fd=raw_fd)
+                    if unlink_raw_entry_at_dir_fd(raw_fd, name, current_stat):
                         deleted += 1
-                    except FileNotFoundError:
-                        pass
                     continue
                 if stat_module.S_ISREG(current_stat.st_mode):
                     logs.append((name, current_stat))
@@ -2865,15 +2875,17 @@ def prune_raw_logs(max_files: int = MAX_RAW_LOG_FILES, max_bytes: int = MAX_RAW_
                 resolved = path.resolve(strict=False)
                 harden_raw_log_at_dir_fd(raw_fd, name, current_stat)
                 if resolved not in protected and current_stat.st_size > max_bytes:
-                    truncated += 1 if bound_raw_log_at_dir_fd(raw_fd, name, max_bytes) else 0
+                    if bound_raw_log_at_dir_fd(raw_fd, name, max_bytes):
+                        truncated += 1
+                        try:
+                            current_stat = os.stat(name, dir_fd=raw_fd, follow_symlinks=False)
+                        except OSError:
+                            continue
                 if resolved in keep:
                     retained += 1
                     continue
-                try:
-                    os.unlink(name, dir_fd=raw_fd)
+                if unlink_raw_entry_at_dir_fd(raw_fd, name, current_stat):
                     deleted += 1
-                except FileNotFoundError:
-                    pass
         finally:
             if raw_fd >= 0:
                 os.close(raw_fd)
