@@ -2828,9 +2828,14 @@ def latest_managed_raw_log(agent: str) -> Path | None:
 def protected_raw_log_paths() -> set[Path]:
     protected: set[Path] = set()
     for agent in AGENTS:
-        path = allowed_raw_log_path(read_meta(agent).get("raw_log"))
-        if path is not None:
-            protected.add(path)
+        identity = allowed_raw_log_identity(read_meta(agent).get("raw_log"))
+        if identity is not None and identity[1] is not None:
+            protected.add(identity[0])
+            continue
+        if tmux_alive(AGENTS[agent]["session"]):
+            recovered = latest_managed_raw_log(agent)
+            if recovered is not None:
+                protected.add(recovered)
     return protected
 
 

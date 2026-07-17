@@ -2943,6 +2943,32 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(status["raw_log_bytes"], len("current\n"))
         self.assertTrue(status["raw_log_path_valid"])
 
+    def test_prune_raw_logs_preserves_recoverable_live_agent_log(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "raw"
+            raw_dir.mkdir()
+            active = raw_dir / "20260717T070000000000Z-a.log"
+            newer = raw_dir / "20260717T070001000000Z-b.log"
+            active.write_text("active\n", encoding="utf-8")
+            newer.write_text("newer\n", encoding="utf-8")
+            os.utime(active, (1000, 1000))
+            os.utime(newer, (1001, 1001))
+            agent = {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}
+
+            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=True), patch(
+                "codex_master.server.RAW_DIR", raw_dir
+            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "codex_master.server.META_DIR", root / "meta"
+            ), patch("codex_master.server.tmux_alive", return_value=True):
+                result = server_module.prune_raw_logs(max_files=1)
+
+            self.assertEqual(result["deleted_count"], 0)
+            self.assertTrue(active.is_file())
+            self.assertTrue(newer.is_file())
+
     def test_initialize_rejects_unsupported_protocol(self) -> None:
         response = handle_rpc(
             {"jsonrpc": "2.0", "id": 10, "method": "initialize", "params": {"protocolVersion": "2025-12-31"}}
