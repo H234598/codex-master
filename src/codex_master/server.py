@@ -8985,6 +8985,30 @@ def pool_regular_marker_present(path: Path) -> bool:
     return stat_module.S_ISREG(current.st_mode) and getattr(current, "st_nlink", 1) == 1
 
 
+def open_pool_entry_parent(path: Path, expected_stat: os.stat_result) -> int:
+    parent = path.parent
+    parent_parts = parent.parts
+    if len(parent_parts) == 5 and parent_parts[:4] == ("/", "proc", "self", "fd") and parent_parts[4].isdigit():
+        parent_fd = -1
+        try:
+            parent_fd = os.dup(int(parent_parts[4]))
+            opened_parent = os.fstat(parent_fd)
+        except OSError as exc:
+            if parent_fd >= 0:
+                os.close(parent_fd)
+            raise AgentError("pool entry changed during removal") from exc
+        if not stat_module.S_ISDIR(opened_parent.st_mode):
+            os.close(parent_fd)
+            raise AgentError("pool entry changed during removal")
+        return parent_fd
+    return open_directory_no_follow_matching(
+        parent,
+        expected_stat,
+        error_text="pool entry changed during removal",
+        changed_text="pool entry changed during removal",
+    )
+
+
 def remove_agent_pool_entry(path: Path) -> str:
     try:
         current = path.lstat()
@@ -8994,16 +9018,28 @@ def remove_agent_pool_entry(path: Path) -> str:
         return "skipped"
     mode = current.st_mode
     if stat_module.S_ISLNK(mode) or stat_module.S_ISREG(mode):
+        parent_fd = -1
         try:
-            latest = path.lstat()
-        except FileNotFoundError:
-            return "missing"
-        except OSError:
-            return "skipped"
-        if not source_identity_matches(latest, current):
-            return "skipped"
-        path.unlink()
-        return "removed"
+            try:
+                parent_stat = path.parent.lstat()
+                parent_fd = open_pool_entry_parent(path, parent_stat)
+                latest = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return "missing"
+            except (AgentError, OSError):
+                return "skipped"
+            if not source_identity_matches(latest, current):
+                return "skipped"
+            try:
+                os.unlink(path.name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                return "missing"
+            except OSError:
+                return "skipped"
+            return "removed"
+        finally:
+            if parent_fd >= 0:
+                os.close(parent_fd)
     if stat_module.S_ISDIR(mode):
         if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
             raise AgentError("safe pool removal is unavailable")

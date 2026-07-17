@@ -12786,6 +12786,39 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertTrue((target / "secret.txt").exists())
             self.assertFalse((original / "keep.txt").exists())
 
+    def test_remove_agent_pool_entry_pins_parent_for_regular_unlink(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            pool = root / "pool"
+            target = pool / "a1"
+            original = root / "original-pool"
+            foreign = root / "foreign-pool"
+            pool.mkdir()
+            foreign.mkdir()
+            target.write_text("managed\n", encoding="utf-8")
+            (foreign / "a1").write_text("foreign\n", encoding="utf-8")
+            real_unlink = os.unlink
+            swapped = False
+
+            def swap_parent_before_unlink(name, *, dir_fd=None):
+                nonlocal swapped
+                if not swapped:
+                    pool.rename(original)
+                    foreign.rename(pool)
+                    swapped = True
+                return real_unlink(name, dir_fd=dir_fd)
+
+            with patch.object(server_module.os, "unlink", side_effect=swap_parent_before_unlink):
+                result = server_module.remove_agent_pool_entry(target)
+
+            self.assertTrue(swapped)
+            self.assertEqual(result, "removed")
+            self.assertFalse((original / "a1").exists())
+            self.assertTrue(target.is_file())
+            self.assertEqual(target.read_text(encoding="utf-8"), "foreign\n")
+
     def test_agent_pool_destroy_requires_regular_marker_without_path_leak(self) -> None:
         from codex_master import server as server_module
 
