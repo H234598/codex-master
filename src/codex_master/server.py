@@ -5033,6 +5033,7 @@ def ensure_assignment_session_model(
     model: str,
     reasoning_effort: str,
     lease: dict[str, Any],
+    release_lease_on_failure: bool = False,
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     cfg = AGENTS[agent]
@@ -5064,6 +5065,7 @@ def ensure_assignment_session_model(
         agent,
         cwd=meta.get("cwd"),
         lease=lease,
+        release_lease_on_failure=release_lease_on_failure,
         model=model,
         model_reasoning_effort=reasoning_effort,
     )
@@ -5174,18 +5176,23 @@ def assign_agent(
     release_on_failure = False
     if lease is None:
         lease, release_on_failure = claim_for_agent_mutation(agent)
+    model_switch: dict[str, Any] | None = None
     try:
         model_switch = ensure_assignment_session_model(
             agent,
             model=model,
             reasoning_effort=reasoning_effort,
             lease=lease,
+            release_lease_on_failure=release_on_failure,
         )
         remember_agent_routing(agent, routing)
         sent = send_agent(agent, prompt, enter, operation=operation)
     except Exception:
         if release_on_failure:
-            release_agent(agent, force=True)
+            if model_switch is None:
+                release_start_lease_if_safe(agent, lease, True)
+            else:
+                release_agent(agent, force=True)
         raise
     assignment_id = f"{now_id()}-{agent}"
     assignment_record = {

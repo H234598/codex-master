@@ -8875,6 +8875,45 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(start.call_args.kwargs["model"], DEFAULT_AGENT_MODEL)
         self.assertEqual(start.call_args.kwargs["model_reasoning_effort"], DEFAULT_AGENT_MODEL_EFFORT)
 
+    def test_agent_assign_keeps_fresh_lease_when_model_switch_leaves_home_process(self) -> None:
+        routing = {
+            "decision": "main",
+            "model": DEFAULT_AGENT_MODEL,
+            "account": "a1",
+            "backend_account_id": "backend",
+            "role": "exploriererin",
+            "paid_overage_allowed": False,
+        }
+        with patch.dict(
+            "codex_master.server.AGENTS",
+            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
+            clear=True,
+        ), patch(
+            "codex_master.server.agent_auth_status", return_value={"authenticated": False, "auth_state": "empty"}
+        ), patch("codex_master.server.codex_usage_routing_decision", return_value=routing), patch(
+            "codex_master.server.claim_for_agent_mutation",
+            return_value=({"state": "held", "held_by_this_server": True}, True),
+        ), patch(
+            "codex_master.server.ensure_assignment_session_model",
+            side_effect=AgentError("orphaned process"),
+        ) as mock_model, patch(
+            "codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}
+        ), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={"process_count": 1},
+        ), patch("codex_master.server.release_agent") as mock_release:
+            with self.assertRaisesRegex(AgentError, "orphaned process"):
+                assign_agent(
+                    "a1",
+                    role="exploriererin",
+                    task="inspect",
+                    scope=[],
+                    allow_unauthenticated=True,
+                )
+
+        self.assertTrue(mock_model.call_args.kwargs["release_lease_on_failure"])
+        mock_release.assert_not_called()
+
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.send_agent")
     def test_agent_assign_live_data_requires_search_without_returning_prompt(self, mock_send_agent, _mock_alive) -> None:
