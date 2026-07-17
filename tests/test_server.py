@@ -2943,6 +2943,45 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(status["raw_log_bytes"], len("current\n"))
         self.assertTrue(status["raw_log_path_valid"])
 
+    def test_agent_status_recovers_missing_raw_log_metadata_for_running_agent(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "raw"
+            raw_dir.mkdir()
+            current = raw_dir / "20260717T070001000000Z-a.log"
+            current.write_text("current\n", encoding="utf-8")
+            runner = root / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            agent = {"label": "A", "runner": runner, "home": root, "session": "session-a"}
+            summary = {
+                "process_count": 1,
+                "managed_process_count": 1,
+                "external_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            }
+            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
+                "codex_master.server.RAW_DIR", raw_dir
+            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "codex_master.server.ensure_state"
+            ), patch("codex_master.server.agent_home_process_summary", return_value=summary), patch(
+                "codex_master.server.tmux_alive", return_value=True
+            ), patch("codex_master.server.pane_pid", return_value=123), patch(
+                "codex_master.server.pane_tail", return_value=""
+            ), patch("codex_master.server.read_meta", return_value={}), patch(
+                "codex_master.server.latest_assignment_summary", return_value=None
+            ), patch("codex_master.server.agent_auth_status", return_value={}), patch(
+                "codex_master.server.agent_lease_status", return_value={}
+            ), patch("codex_master.server.codex_usage_watchdog_status", return_value={}):
+                status = server_module.status_agent("a")
+
+        self.assertEqual(status["raw_log_bytes"], len("current\n"))
+        self.assertTrue(status["raw_log_path_valid"])
+
     def test_prune_raw_logs_preserves_recoverable_live_agent_log(self) -> None:
         from codex_master import server as server_module
 
@@ -3632,6 +3671,29 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(payload["redaction_applied"])
         self.assertEqual(payload["raw_log"], "not_returned")
         self.assertNotIn(str(log_path), json.dumps(payload, sort_keys=True))
+
+    @patch("codex_master.server.ensure_agent_lease_available")
+    @patch("codex_master.server.ensure_state")
+    def test_safe_tail_log_source_recovers_missing_raw_log_metadata_for_running_agent(
+        self, _mock_ensure_state, mock_lease
+    ) -> None:
+        mock_lease.return_value = {"state": "unclaimed", "holder": "none", "raw_output": "not_returned"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "raw"
+            raw_dir.mkdir()
+            log_path = raw_dir / "20260717T070001000000Z-a.log"
+            log_path.write_text("current\n", encoding="utf-8")
+            agent = {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}
+            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
+                "codex_master.server.RAW_DIR", raw_dir
+            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "codex_master.server.read_meta", return_value={}
+            ), patch("codex_master.server.tmux_alive", return_value=True):
+                result = safe_tail("a", source="log")
+
+        self.assertEqual(result["output"], "current")
+        self.assertEqual(result["raw_log"], "not_returned")
 
     @patch("codex_master.server.ensure_agent_lease_available")
     @patch("codex_master.server.ensure_state")

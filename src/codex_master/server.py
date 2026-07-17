@@ -4561,13 +4561,7 @@ def status_agent(agent: str) -> dict[str, Any]:
     process_summary = agent_home_process_summary(agent)
     running = tmux_alive(session)
     identity_guard = agent_identity_guard(running, process_summary)
-    if (
-        running
-        and identity_guard["ok"]
-        and isinstance(raw_log, str)
-        and raw_log.strip()
-        and (raw_log_identity is None or raw_log_identity[1] is None)
-    ):
+    if running and identity_guard["ok"] and (raw_log_identity is None or raw_log_identity[1] is None):
         recovered_raw_log_path = latest_managed_raw_log(agent)
         if recovered_raw_log_path is not None:
             raw_log_path = recovered_raw_log_path
@@ -4612,7 +4606,7 @@ def status_agent(agent: str) -> dict[str, Any]:
         "limit_state": limit_state,
         "usage_watchdog": usage_watchdog,
         "response_state": response_state,
-        "raw_log": "not_returned" if raw_log else None,
+        "raw_log": "not_returned" if raw_log or raw_log_path is not None else None,
         "raw_log_bytes": raw_log_info["bytes"],
         "raw_log_updated_at_utc": raw_log_info["updated_at_utc"],
         "raw_log_idle_seconds": raw_log_info["idle_seconds"],
@@ -8911,12 +8905,7 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
         raw_log = meta.get("raw_log")
         raw_log_identity = allowed_raw_log_identity(raw_log)
         raw_log_path = raw_log_identity[0] if raw_log_identity is not None else None
-        if (
-            tmux_alive(AGENTS[agent]["session"])
-            and isinstance(raw_log, str)
-            and raw_log.strip()
-            and (raw_log_path is None or raw_log_identity[1] is None)
-        ):
+        if tmux_alive(AGENTS[agent]["session"]) and (raw_log_path is None or raw_log_identity[1] is None):
             raw_log_path = latest_managed_raw_log(agent)
         if raw_log and raw_log_path is None:
             raise AgentError("raw_log path is outside managed raw log state")
@@ -8938,7 +8927,7 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
         "output_truncated": output_truncated_by_lines or output_truncated_by_chars,
         "output_truncated_by_lines": output_truncated_by_lines,
         "output_truncated_by_chars": output_truncated_by_chars,
-        "raw_log": "not_returned" if meta.get("raw_log") else None,
+        "raw_log": "not_returned" if meta.get("raw_log") or raw_log_path is not None else None,
         "lease": lease,
         "output": output,
     }
