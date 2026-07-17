@@ -10520,6 +10520,68 @@ def pool_write_private_bytes(path: Path, data: bytes, mode: int) -> None:
     replace_private_bytes(path, data, mode=mode)
 
 
+def pool_write_private_bytes_if_absent(path: Path, data: bytes, mode: int = 0o600) -> bool:
+    try:
+        parent_stat = path.parent.lstat()
+    except OSError as exc:
+        raise AgentError("pool auth target changed during copy") from exc
+    parent_fd = open_directory_no_follow_matching(
+        path.parent,
+        parent_stat,
+        error_text="pool auth target changed during copy",
+        changed_text="pool auth target changed during copy",
+    )
+    tmp_name = f".{path.name}.{now_id()}.{uuid.uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    tmp_created = False
+    linked = False
+    try:
+        try:
+            fd = os.open(tmp_name, flags, mode, dir_fd=parent_fd)
+        except OSError as exc:
+            raise AgentError("pool auth target changed during copy") from exc
+        tmp_created = True
+        current = os.fstat(fd)
+        if not stat_module.S_ISREG(current.st_mode) or getattr(current, "st_nlink", 1) != 1:
+            raise AgentError("pool auth target changed during copy")
+        try:
+            os.fchmod(fd, mode)
+        except PermissionError:
+            pass
+        with os.fdopen(fd, "wb") as fh:
+            fd = -1
+            fh.write(data)
+        try:
+            os.link(
+                tmp_name,
+                path.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            return False
+        except OSError as exc:
+            raise AgentError("pool auth target changed during copy") from exc
+        linked = True
+        return True
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if tmp_created:
+            try:
+                os.unlink(tmp_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                if linked:
+                    raise AgentError("pool auth target changed during copy") from exc
+        os.close(parent_fd)
+
+
 def pool_read_private_bytes(path: Path, max_bytes: int, error_text: str) -> bytes:
     parent_fd = -1
     try:
@@ -11121,10 +11183,18 @@ def _agent_pool_copy_auth_unlocked(
             if path_present_no_follow(target) and not overwrite:
                 skipped_existing += 1
                 continue
-            copyable += 1
-            if yes:
+            if not yes:
+                copyable += 1
+                continue
+            if overwrite:
+                copyable += 1
                 pool_write_private_bytes(target, auth_bytes, 0o600)
                 copied += 1
+            elif pool_write_private_bytes_if_absent(target, auth_bytes):
+                copyable += 1
+                copied += 1
+            else:
+                skipped_existing += 1
 
         return {
             "ok": True,

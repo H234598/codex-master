@@ -14663,6 +14663,53 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn("SECRET_COPY_TARGET", payload)
             self.assertNotIn(str(pool), payload)
 
+    def test_agent_pool_copy_auth_does_not_clobber_target_created_after_check(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec_payload(
+                tmp,
+                {
+                    "schema_version": 1,
+                    "pool_root": str(pool),
+                    "codex_bin": "/bin/echo",
+                    "series": [{"prefix": "a", "count": 2, "template": "a1", "authenticated": ["a1"]}],
+                    "shared_assets": [],
+                    "runtime_dirs": [],
+                },
+            )
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+            source = pool / "a1" / "auth.json"
+            target = pool / "a2" / "auth.json"
+            source.write_text('{"token":"source"}\n', encoding="utf-8")
+            real_path_present = server_module.path_present_no_follow
+            injected = False
+
+            def race(path: Path) -> bool:
+                nonlocal injected
+                present = real_path_present(path)
+                if path.name == target.name and path.parent.name == target.parent.name and not injected:
+                    target.write_text('{"token":"concurrent"}\n', encoding="utf-8")
+                    injected = True
+                    return False
+                return present
+
+            with patch.object(server_module, "path_present_no_follow", side_effect=race):
+                result = server_module.agent_pool_copy_auth(
+                    str(spec_path),
+                    target_dir=str(pool),
+                    codex_bin="/bin/echo",
+                    from_agent="a1",
+                    to="a2",
+                    yes=True,
+                )
+
+            self.assertEqual(result["copied_count"], 0)
+            self.assertEqual(result["skipped_existing_count"], 1)
+            self.assertEqual(target.read_text(encoding="utf-8"), '{"token":"concurrent"}\n')
+
     def test_agent_pool_destroy_supports_custom_pool_ids(self) -> None:
         from codex_master import server as server_module
 
