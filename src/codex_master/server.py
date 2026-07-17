@@ -640,18 +640,31 @@ def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | floa
             section_end = index
             break
 
+    numeric_token = (
+        r"[+-]?(?:"
+        r"0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f])*|"
+        r"0[oO][0-7](?:_?[0-7])*|"
+        r"0[bB][01](?:_?[01])*|"
+        r"[0-9](?:_?[0-9])*(?:\.[0-9](?:_?[0-9])*)?(?:[eE][+-]?[0-9](?:_?[0-9])*)?|"
+        r"inf|nan"
+        r")"
+    )
     timeout_line_re = re.compile(
-        r"^(\s*(?:startup_timeout_sec|\"startup_timeout_sec\")\s*=\s*)([+-]?(?:\d(?:_?\d)*)(?:\.(?:\d(?:_?\d)*))?(?:[eE][+-]?\d(?:_?\d)*)?)(\s*(?:#.*)?)$"
+        rf"^(\s*(?:startup_timeout_sec|\"startup_timeout_sec\")\s*=\s*)({numeric_token})(\s*(?:#.*)?)$"
     )
     for index in range(section_start + 1, section_end):
         match = timeout_line_re.match(lines[index])
         if not match:
             continue
-        numeric = float(match.group(2).replace("_", ""))
+        numeric_text = match.group(2).replace("_", "")
+        if numeric_text.lstrip("+-").lower().startswith(("0x", "0o", "0b")):
+            numeric: int | float = int(numeric_text, 0)
+        else:
+            numeric = float(numeric_text)
         if not math.isfinite(numeric):
             lines[index] = f"{match.group(1)}{RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS}{match.group(3)}"
             return "\n".join(lines) + "\n", True, None
-        previous = int(numeric) if numeric.is_integer() else numeric
+        previous = numeric if isinstance(numeric, int) else int(numeric) if numeric.is_integer() else numeric
         if previous >= RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS:
             return text if text.endswith("\n") else text + "\n", False, previous
         lines[index] = f"{match.group(1)}{RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS}{match.group(3)}"

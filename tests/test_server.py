@@ -459,6 +459,24 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(spaced_changed)
         self.assertEqual(loads(spaced_updated)["mcp_servers"]["codex-master-mcp"]["startup_timeout_sec"], 120)
 
+        for literal, expected_changed, expected_previous in (
+            ("0x78", False, 120),
+            ("0o170", False, 120),
+            ("0b1111000", False, 120),
+            ("inf", True, None),
+            ("nan", True, None),
+        ):
+            numeric_config = existing_low.replace("startup_timeout_sec = 30", f"startup_timeout_sec = {literal}")
+            numeric_updated, numeric_changed, numeric_previous = updated_mcp_startup_timeout_config(
+                numeric_config
+            )
+            self.assertEqual(numeric_changed, expected_changed)
+            self.assertEqual(numeric_previous, expected_previous)
+            self.assertEqual(
+                loads(numeric_updated)["mcp_servers"]["codex-master-mcp"]["startup_timeout_sec"],
+                120,
+            )
+
     def test_ensure_mcp_startup_timeout_configured_is_path_sparse_and_no_follow(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = Path(tmpdir) / ".codex" / "config.toml"
