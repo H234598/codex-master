@@ -11569,6 +11569,21 @@ def _agent_pool_destroy_pool_unlocked(
             except AgentError:
                 if remove_root:
                     marker_bytes = None
+
+        def verify_marker_before_removal() -> None:
+            if not marker_present:
+                return
+            try:
+                latest_marker_stat = marker.lstat()
+            except (FileNotFoundError, OSError) as exc:
+                raise AgentError("pool marker changed during removal") from exc
+            if (
+                not stat_module.S_ISREG(latest_marker_stat.st_mode)
+                or getattr(latest_marker_stat, "st_nlink", 1) != 1
+                or not source_identity_matches(latest_marker_stat, marker_stat)
+            ):
+                raise AgentError("pool marker changed during removal")
+
         with pool_agent_lifecycle_locks(normalized["ids"]):
             for agent in normalized["ids"]:
                 if agent in AGENTS:
@@ -11590,6 +11605,7 @@ def _agent_pool_destroy_pool_unlocked(
                         raise AgentError("pool Agentin home is in use")
 
             for agent in normalized["ids"]:
+                verify_marker_before_removal()
                 target = operation_root / agent
                 removal_state = remove_agent_pool_entry(target)
                 if removal_state == "missing":

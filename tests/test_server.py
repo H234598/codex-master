@@ -16450,6 +16450,7 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(marker_lstat_count, 2)
             self.assertTrue(original_marker.is_file())
             self.assertEqual(marker.read_text(encoding="utf-8"), "foreign marker\n")
+            self.assertTrue((pool / "a1").is_dir())
 
     def test_agent_pool_destroy_rejects_pool_home_process_before_removal(self) -> None:
         from codex_master import server as server_module
