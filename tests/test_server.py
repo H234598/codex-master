@@ -1898,6 +1898,45 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn(str(entry), json.dumps(result, sort_keys=True))
         self.assertNotIn(str(cache), json.dumps(result, sort_keys=True))
 
+    def test_sync_plugin_cache_from_repo_restores_existing_version_after_replace_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            root = tmp_path / "repo"
+            cache = tmp_path / "cache"
+            version = "0.3.4+codex.test"
+            (root / ".codex-plugin").mkdir(parents=True)
+            (root / "bin").mkdir()
+            (root / "skills").mkdir()
+            (root / "systemd" / "user").mkdir(parents=True)
+            (root / "src" / "codex_master").mkdir(parents=True)
+            (root / ".codex-plugin" / "plugin.json").write_text(
+                json.dumps({"name": "codex-master", "version": version}), encoding="utf-8"
+            )
+            (root / ".app.json").write_text("{}", encoding="utf-8")
+            (root / ".mcp.json").write_text("{}", encoding="utf-8")
+            (root / "README.md").write_text("source-cache\n", encoding="utf-8")
+            (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
+            (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
+            (root / "skills" / "SKILL.md").write_text("skill\n", encoding="utf-8")
+            (root / "src" / "codex_master" / "server.py").write_text("print('source')\n", encoding="utf-8")
+
+            with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False):
+                sync_plugin_cache_from_repo(root, cache)
+                entry = cache / version
+                (entry / "README.md").write_text("old-cache\n", encoding="utf-8")
+
+                with patch("codex_master.server.os.replace", side_effect=OSError("injected replace failure")):
+                    with self.assertRaisesRegex(AgentError, "could_not_sync_plugin_cache"):
+                        sync_plugin_cache_from_repo(root, cache)
+
+                restored = (entry / "README.md").read_text(encoding="utf-8")
+                temp_entries = list(cache.glob(f".{version}.tmp.*"))
+                backup_entries = list(cache.glob(f".{version}.backup.*"))
+
+        self.assertEqual(restored, "old-cache\n")
+        self.assertEqual(temp_entries, [])
+        self.assertEqual(backup_entries, [])
+
     def test_sync_plugin_cache_from_repo_rejects_symlink_sources(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)

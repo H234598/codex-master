@@ -8265,6 +8265,8 @@ def _sync_plugin_cache_from_repo_unlocked(
     copied_files = 0
     copied_directories = 0
     tmp_entry_created = False
+    backup_entry_created = False
+    backup_name: str | None = None
     source_entry_stats: dict[str, os.stat_result] = {}
     try:
         cache_fd_path = Path(f"/proc/self/fd/{cache_fd}")
@@ -8327,12 +8329,44 @@ def _sync_plugin_cache_from_repo_unlocked(
                     raise AgentError("could_not_sync_plugin_cache") from exc
                 if not source_identity_matches(current_stat, expected_stat):
                     raise AgentError("plugin source changed during copy")
-        remove_real_plugin_cache_dir(cache_fd_path / version)
+
+        try:
+            existing_version_stat = os.lstat(version, dir_fd=cache_fd)
+        except FileNotFoundError:
+            existing_version_stat = None
+        except OSError as exc:
+            raise AgentError("could_not_sync_plugin_cache") from exc
+        if existing_version_stat is not None:
+            if stat_module.S_ISLNK(existing_version_stat.st_mode) or not stat_module.S_ISDIR(existing_version_stat.st_mode):
+                raise AgentError("plugin cache entry is not a real directory")
+            if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+                raise AgentError("safe plugin cache removal is unavailable")
+            try:
+                latest_version_stat = os.lstat(version, dir_fd=cache_fd)
+            except OSError as exc:
+                raise AgentError("plugin cache entry changed during sync") from exc
+            if not source_identity_matches(latest_version_stat, existing_version_stat):
+                raise AgentError("plugin cache entry changed during sync")
+            backup_name = f".{version}.backup.{now_id()}.{uuid.uuid4().hex}"
+            try:
+                os.rename(version, backup_name, src_dir_fd=cache_fd, dst_dir_fd=cache_fd)
+            except OSError as exc:
+                raise AgentError("could_not_sync_plugin_cache") from exc
+            backup_entry_created = True
         try:
             os.replace(tmp_name, version, src_dir_fd=cache_fd, dst_dir_fd=cache_fd)
             tmp_entry_created = False
         except OSError as exc:
+            if backup_entry_created and backup_name is not None:
+                backup_entry_created = False
+                try:
+                    os.rename(backup_name, version, src_dir_fd=cache_fd, dst_dir_fd=cache_fd)
+                except OSError as restore_exc:
+                    raise AgentError("could_not_sync_plugin_cache") from restore_exc
             raise AgentError("could_not_sync_plugin_cache") from exc
+        if backup_entry_created and backup_name is not None:
+            backup_entry_created = False
+            remove_real_plugin_cache_dir(cache_fd_path / backup_name)
     except Exception:
         if tmp_entry_created:
             with contextlib.suppress(Exception):
