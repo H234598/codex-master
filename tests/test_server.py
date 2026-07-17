@@ -238,6 +238,34 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("CLI wrapper smoke", readme)
         self.assertIn("agent-pool installer smoke", readme)
 
+    def test_read_json_file_rejects_regular_file_swap_before_open(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            record = tmp / "lease.json"
+            original = tmp / "original-lease.json"
+            replacement = tmp / "replacement-lease.json"
+            record.write_text('{"owner":"expected"}\n', encoding="utf-8")
+            replacement.write_text('{"owner":"forged"}\n', encoding="utf-8")
+            real_open = server_module.os.open
+            swapped = False
+
+            def swap_before_record_open(path, flags, *args, **kwargs):
+                nonlocal swapped
+                if not swapped and isinstance(path, (str, bytes, Path)) and Path(path) == record:
+                    record.rename(original)
+                    replacement.rename(record)
+                    swapped = True
+                return real_open(path, flags, *args, **kwargs)
+
+            with patch.object(server_module.os, "open", side_effect=swap_before_record_open):
+                result = server_module.read_json_file(record)
+
+            self.assertTrue(swapped)
+            self.assertEqual(result, {"meta_error": "could_not_read"})
+            self.assertEqual(original.read_text(encoding="utf-8"), '{"owner":"expected"}\n')
+
     def test_github_ci_smokes_agent_pool_installer(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
