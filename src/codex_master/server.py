@@ -5536,7 +5536,13 @@ def ensure_assignment_session_model(
     }
 
 
-def assign_agent(
+def assign_agent(agent: str, **kwargs: Any) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
+    with agent_lifecycle_lock(agent):
+        return _assign_agent_unlocked(agent, **kwargs)
+
+
+def _assign_agent_unlocked(
     agent: str,
     *,
     role: str,
@@ -8655,7 +8661,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         selected_agent = single_agent_id(str(args.get("agent", "")), "agent_assign")
         return call_agent_lifecycle(
             selected_agent,
-            lambda: assign_agent(
+            lambda: _assign_agent_unlocked(
                 selected_agent,
                 role=str(args.get("role", "")),
                 task=args.get("task"),
@@ -8678,7 +8684,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         selected_agent = single_agent_id(str(args.get("agent", "")), "agent_assign_readonly")
         return call_agent_lifecycle(
             selected_agent,
-            lambda: assign_agent(
+            lambda: _assign_agent_unlocked(
                 selected_agent,
                 role="exploriererin",
                 task=args.get("task"),
@@ -8700,7 +8706,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         selected_agent = single_agent_id(str(args.get("agent", "")), "agent_assign_live_data")
         return call_agent_lifecycle(
             selected_agent,
-            lambda: assign_agent(
+            lambda: _assign_agent_unlocked(
                 selected_agent,
                 role="exploriererin",
                 task=args.get("task"),
@@ -8724,7 +8730,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         selected_agent = single_agent_id(str(args.get("agent", "")), "agent_assign_write")
         return call_agent_lifecycle(
             selected_agent,
-            lambda: assign_agent(
+            lambda: _assign_agent_unlocked(
                 selected_agent,
                 role="arbeitsbiene",
                 task=args.get("task"),
