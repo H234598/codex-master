@@ -4022,7 +4022,8 @@ def raw_log_metadata(raw_log_path: Path | None) -> dict[str, Any]:
         return {"bytes": None, "updated_at_utc": None, "idle_seconds": None}
     try:
         updated = _dt.datetime.fromtimestamp(current_stat.st_mtime, _dt.timezone.utc)
-        idle_seconds = max(0, int(time.time() - current_stat.st_mtime))
+        now = time.time()
+        idle_seconds = None if current_stat.st_mtime > now else max(0, int(now - current_stat.st_mtime))
     except (OverflowError, OSError, ValueError):
         return {"bytes": current_stat.st_size, "updated_at_utc": None, "idle_seconds": None}
     return {

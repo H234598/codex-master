@@ -2924,6 +2924,17 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(result, {"bytes": 12, "updated_at_utc": None, "idle_seconds": None})
 
+    def test_raw_log_metadata_fails_closed_on_future_mtime(self) -> None:
+        fake_stat = Mock(st_mode=stat.S_IFREG, st_size=12, st_mtime=1060.0)
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(Path, "lstat", return_value=fake_stat), patch(
+            "codex_master.server.time.time", return_value=1000.0
+        ):
+            result = raw_log_metadata(Path(tmpdir) / "agent.log")
+
+        self.assertEqual(result["bytes"], 12)
+        self.assertIsNotNone(result["updated_at_utc"])
+        self.assertIsNone(result["idle_seconds"])
+
     def test_latest_managed_raw_log_selects_newest_unambiguous_agent_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
