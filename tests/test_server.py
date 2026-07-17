@@ -3285,10 +3285,11 @@ class ServerHelpersTest(unittest.TestCase):
 
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.pane_tail")
+    @patch("codex_master.server.require_managed_tmux_session")
     @patch("codex_master.server.ensure_agent_lease_available")
     @patch("codex_master.server.ensure_state")
     def test_safe_tail_tools_call_limits_and_redacts(
-        self, _mock_ensure_state, mock_lease, mock_pane_tail, _mock_tmux_alive
+        self, _mock_ensure_state, mock_lease, _mock_identity, mock_pane_tail, _mock_tmux_alive
     ) -> None:
         mock_lease.return_value = {"state": "unclaimed", "holder": "none", "raw_output": "not_returned"}
         raw = "\n".join([f"line-{i:03d}" for i in range(1, 101)])
@@ -3324,10 +3325,11 @@ class ServerHelpersTest(unittest.TestCase):
 
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.pane_tail")
+    @patch("codex_master.server.require_managed_tmux_session")
     @patch("codex_master.server.ensure_agent_lease_available")
     @patch("codex_master.server.ensure_state")
     def test_safe_tail_tools_call_applies_char_limit(
-        self, _mock_ensure_state, mock_lease, mock_pane_tail, _mock_tmux_alive
+        self, _mock_ensure_state, mock_lease, _mock_identity, mock_pane_tail, _mock_tmux_alive
     ) -> None:
         mock_lease.return_value = {"state": "unclaimed", "holder": "none", "raw_output": "not_returned"}
         raw = "x" * 8190 + "\x1b[31mOPENAI_API_KEY=sk-verylongtoken01234567890\x1b[0m"
@@ -3367,6 +3369,28 @@ class ServerHelpersTest(unittest.TestCase):
             safe_tail("a", lines=0, chars=4000)
         with self.assertRaisesRegex(AgentError, f"chars must be <= {MAX_TAIL_CHARS}"):
             safe_tail("a", lines=1, chars=MAX_TAIL_CHARS + 1)
+
+    def test_safe_tail_rejects_unmanaged_tmux_session_before_capture(self) -> None:
+        with patch("codex_master.server.ensure_state"), patch(
+            "codex_master.server.ensure_agent_lease_available",
+            return_value={"state": "unclaimed", "holder": "none", "raw_output": "not_returned"},
+        ), patch("codex_master.server.read_meta", return_value={}), patch(
+            "codex_master.server.tmux_alive", return_value=True
+        ), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={
+                "process_count": 0,
+                "external_process_count": 0,
+                "managed_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            },
+        ), patch("codex_master.server.pane_tail") as mock_pane_tail:
+            with self.assertRaisesRegex(AgentError, "session identity could not be verified"):
+                safe_tail("a")
+
+        mock_pane_tail.assert_not_called()
 
     @patch("codex_master.server.pane_tail")
     def test_safe_tail_blocks_foreign_lease_before_reading_output(self, mock_pane_tail) -> None:
@@ -3820,6 +3844,40 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(payload["identity_guard"]["state"], "managed_session_running")
         self.assertNotIn(str(log_path), payload_text)
         self.assertNotIn(str(tmp_path), payload_text)
+
+    def test_agent_status_does_not_capture_unmanaged_tmux_session(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            agent = {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}
+            summary = {
+                "process_count": 1,
+                "managed_process_count": 0,
+                "external_process_count": 1,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            }
+            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
+                "codex_master.server.ensure_state"
+            ), patch("codex_master.server.agent_home_process_summary", return_value=summary), patch(
+                "codex_master.server.tmux_alive", return_value=True
+            ), patch("codex_master.server.pane_pid", return_value=123) as mock_pane_pid, patch(
+                "codex_master.server.pane_tail"
+            ) as mock_pane_tail, patch("codex_master.server.read_meta", return_value={}), patch(
+                "codex_master.server.latest_assignment_summary", return_value=None
+            ), patch("codex_master.server.agent_auth_status", return_value={}), patch(
+                "codex_master.server.agent_lease_status", return_value={}
+            ), patch("codex_master.server.codex_usage_watchdog_status", return_value={}):
+                status = server_module.status_agent("a")
+
+        self.assertFalse(status["identity_guard"]["ok"])
+        self.assertEqual(status["identity_guard"]["state"], "blocked_external_home_user")
+        self.assertIsNone(status["pid"])
+        self.assertEqual(status["tui_context"]["state"], "no_pane_text")
+        mock_pane_tail.assert_not_called()
+        mock_pane_pid.assert_not_called()
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.latest_assignment_summary", return_value=None)

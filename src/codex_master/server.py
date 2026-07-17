@@ -4510,8 +4510,9 @@ def status_agent(agent: str) -> dict[str, Any]:
     raw_log_info = raw_log_metadata(raw_log_path)
     latest_assignment = latest_assignment_summary(agent)
     auth = agent_auth_status(agent)
-    pane_text = pane_tail(agent, MAX_TAIL_LINES) if running else ""
-    visible_pane_text = pane_tail(agent, 24, visible_only=True) if running else ""
+    pane_is_managed = running and identity_guard["ok"]
+    pane_text = pane_tail(agent, MAX_TAIL_LINES) if pane_is_managed else ""
+    visible_pane_text = pane_tail(agent, 24, visible_only=True) if pane_is_managed else ""
     tui_context = classify_tui_context(visible_pane_text, running)
     limit_state = agent_limit_state(
         agent,
@@ -4528,7 +4529,7 @@ def status_agent(agent: str) -> dict[str, Any]:
         "backend": "tmux",
         "running": running,
         "session": session,
-        "pid": pane_pid(session),
+        "pid": pane_pid(session) if pane_is_managed else None,
         "home": PATH_NOT_RETURNED,
         "home_kind": "managed_agent_home",
         "runner": PATH_NOT_RETURNED,
@@ -8810,6 +8811,8 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
     lease = ensure_agent_lease_available(agent)
     meta = read_meta(agent)
     if source == "pane":
+        if tmux_alive(AGENTS[agent]["session"]):
+            require_managed_tmux_session(agent)
         raw = pane_tail(agent, lines)
     else:
         raw_log = meta.get("raw_log")
