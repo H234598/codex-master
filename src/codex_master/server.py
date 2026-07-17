@@ -1074,7 +1074,8 @@ def iter_mcp_json_messages(text: str) -> list[dict[str, Any]]:
         remaining = remaining.lstrip()
         if not remaining:
             break
-        if remaining.lower().startswith("content-length:"):
+        first_header_line = remaining.partition("\n")[0]
+        if mcp_header_name(first_header_line):
             separator = "\r\n\r\n"
             header_end = remaining.find(separator)
             sep_len = len(separator)
@@ -1084,7 +1085,16 @@ def iter_mcp_json_messages(text: str) -> list[dict[str, Any]]:
                 sep_len = len(separator)
             if header_end < 0:
                 break
-            header_line = remaining[:header_end].splitlines()[0]
+            header_line = next(
+                (
+                    line
+                    for line in remaining[:header_end].splitlines()
+                    if mcp_header_name(line) == "content-length"
+                ),
+                "",
+            )
+            if not header_line:
+                return []
             try:
                 body_length = parse_content_length(header_line.encode("ascii"))
             except AgentError:
@@ -10203,6 +10213,19 @@ def parse_content_length(line: bytes, max_bytes: int = MAX_RPC_MESSAGE_BYTES) ->
     return length
 
 
+def mcp_header_name(line: str | bytes) -> str:
+    if isinstance(line, bytes):
+        try:
+            line = line.decode("ascii")
+        except UnicodeDecodeError:
+            return ""
+    name, separator, _ = line.partition(":")
+    name = name.strip()
+    if not separator or not re.fullmatch(r"[A-Za-z0-9-]+", name):
+        return ""
+    return name.lower()
+
+
 def read_message() -> dict[str, Any] | None:
     while True:
         first = sys.stdin.buffer.readline(MAX_RPC_MESSAGE_BYTES + 1)
@@ -10212,8 +10235,8 @@ def read_message() -> dict[str, Any] | None:
             return None
         if first.strip():
             break
-    if first.lstrip().lower().startswith(b"content-length:"):
-        length = parse_content_length(first)
+    if mcp_header_name(first):
+        header_lines = [first]
         header_bytes = len(first)
         while True:
             line = sys.stdin.buffer.readline(MAX_RPC_MESSAGE_BYTES + 1)
@@ -10224,6 +10247,14 @@ def read_message() -> dict[str, Any] | None:
                 raise AgentError(f"RPC header block exceeds {MAX_RPC_MESSAGE_BYTES} bytes")
             if line in (b"\r\n", b"\n", b""):
                 break
+            header_lines.append(line)
+        content_length_line = next(
+            (line for line in header_lines if mcp_header_name(line) == "content-length"),
+            None,
+        )
+        if content_length_line is None:
+            raise AgentError("missing Content-Length header")
+        length = parse_content_length(content_length_line)
         body = sys.stdin.buffer.read(length)
         if len(body) != length:
             raise AgentError("incomplete RPC message body")
