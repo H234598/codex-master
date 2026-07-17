@@ -7962,14 +7962,15 @@ class ServerHelpersTest(unittest.TestCase):
 
         mock_lock.side_effect = lambda agent: FakeLock(agent)
 
-        result = call_tool("agent_start", {"agent": "a", "cwd": "/tmp/work", "prompt": "hi"})
+        with patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"):
+            result = call_tool("agent_start", {"agent": "a", "cwd": "/tmp/work", "prompt": "hi"})
 
         self.assertEqual(result["results"][0]["agent"], "a1")
         self.assertEqual(result["results"][0]["status"], "started")
         self.assertEqual(result["results"][0]["auth_gate"]["auth_state"], "present_regular")
         self.assertEqual(
             events,
-            [("lock", "a1"), ("lock", "a1"), ("unlock", "a1"), ("unlock", "a1")],
+            [("lock", "a1"), ("unlock", "a1")],
         )
         mock_claim.assert_called_once_with("a1")
         mock_start_agent.assert_called_once_with(
@@ -8103,6 +8104,80 @@ class ServerHelpersTest(unittest.TestCase):
             False,
             lease={"state": "held"},
         )
+
+    def test_direct_watchdog_agent_acquires_lifecycle_lock(self) -> None:
+        from codex_master import server as server_module
+
+        events = []
+
+        class FakeLock:
+            def __enter__(self):
+                events.append("lock")
+
+            def __exit__(self, exc_type, exc, tb):
+                events.append("unlock")
+                return False
+
+        with patch.object(
+            server_module,
+            "agent_lifecycle_lock",
+            return_value=FakeLock(),
+        ) as mock_lock, patch.object(
+            server_module,
+            "_watchdog_agent_unlocked",
+            return_value={"status": "ok"},
+        ) as mock_unlocked:
+            result = server_module.watchdog_agent(
+                "a",
+                idle_seconds=60,
+                action="interrupt",
+                report_grace_seconds=30,
+                require_lease=True,
+                manage_unclaimed=False,
+                dry_run=False,
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(events, ["lock", "unlock"])
+        mock_lock.assert_called_once_with("a1")
+        mock_unlocked.assert_called_once_with(
+            "a1",
+            idle_seconds=60,
+            action="interrupt",
+            report_grace_seconds=30,
+            require_lease=True,
+            manage_unclaimed=False,
+            dry_run=False,
+        )
+
+    def test_direct_usage_watchdog_acquires_lifecycle_lock_when_mutating(self) -> None:
+        from codex_master import server as server_module
+
+        events = []
+
+        class FakeLock:
+            def __enter__(self):
+                events.append("lock")
+
+            def __exit__(self, exc_type, exc, tb):
+                events.append("unlock")
+                return False
+
+        with patch.object(
+            server_module,
+            "agent_lifecycle_lock",
+            return_value=FakeLock(),
+        ) as mock_lock, patch.object(
+            server_module,
+            "_usage_watchdog_agent_unlocked",
+            return_value={"status": "ok"},
+        ) as mock_unlocked:
+            result = server_module.usage_watchdog_agent("a", dry_run=False)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(events, ["lock", "unlock"])
+        mock_lock.assert_called_once_with("a1")
+        mock_unlocked.assert_called_once_with("a1", dry_run=False)
 
     @patch("codex_master.server.claim_agent_with_wait")
     def test_mutating_tools_require_auth_by_default_and_allow_bootstrap_override(self, mock_claim_with_wait) -> None:

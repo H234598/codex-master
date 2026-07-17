@@ -4783,6 +4783,30 @@ def watchdog_agent(
     manage_unclaimed: bool,
     dry_run: bool,
 ) -> dict[str, Any]:
+
+    agent = canonical_agent_id(agent)
+    with agent_lifecycle_lock(agent):
+        return _watchdog_agent_unlocked(
+            agent,
+            idle_seconds=idle_seconds,
+            action=action,
+            report_grace_seconds=report_grace_seconds,
+            require_lease=require_lease,
+            manage_unclaimed=manage_unclaimed,
+            dry_run=dry_run,
+        )
+
+
+def _watchdog_agent_unlocked(
+    agent: str,
+    *,
+    idle_seconds: int,
+    action: str,
+    report_grace_seconds: int,
+    require_lease: bool,
+    manage_unclaimed: bool,
+    dry_run: bool,
+) -> dict[str, Any]:
     now = time.time()
     status = status_agent(agent)
     lease = status.get("lease") if isinstance(status.get("lease"), dict) else {}
@@ -4978,6 +5002,14 @@ def watchdog_agent(
 
 def usage_watchdog_agent(agent: str, *, dry_run: bool) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
+    if dry_run:
+        return _usage_watchdog_agent_unlocked(agent, dry_run=True)
+    with agent_lifecycle_lock(agent):
+        return _usage_watchdog_agent_unlocked(agent, dry_run=False)
+
+
+def _usage_watchdog_agent_unlocked(agent: str, *, dry_run: bool) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     if not dry_run:
         ensure_state()
     cfg = AGENTS[agent]
@@ -5067,7 +5099,7 @@ def fleet_usage_watchdog(agent: str = "all", *, dry_run: bool = False) -> dict[s
         if dry_run
         else lambda item: call_agent_lifecycle(
             item,
-            lambda: usage_watchdog_agent(item, dry_run=False),
+            lambda: _usage_watchdog_agent_unlocked(item, dry_run=False),
         )
     )
     results = multi_agent_result(
@@ -5105,7 +5137,7 @@ def fleet_watchdog(
         selected,
         lambda item: call_agent_lifecycle(
             item,
-            lambda: watchdog_agent(
+            lambda: _watchdog_agent_unlocked(
                 item,
                 idle_seconds=idle_seconds,
                 action=action,
