@@ -658,7 +658,22 @@ def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | floa
         if not match:
             key_match = timeout_key_re.match(lines[index])
             if key_match:
-                lines[index] = f"{key_match.group(1)}{RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS}"
+                value_end = index
+                for candidate_end in range(index, section_end):
+                    try:
+                        candidate = tomllib.loads("\n".join(lines[section_start : candidate_end + 1]))
+                    except tomllib.TOMLDecodeError:
+                        continue
+                    candidate_servers = candidate.get("mcp_servers")
+                    candidate_server = (
+                        candidate_servers.get(MCP_SERVER_NAME) if isinstance(candidate_servers, dict) else None
+                    )
+                    if isinstance(candidate_server, dict) and "startup_timeout_sec" in candidate_server:
+                        value_end = candidate_end
+                        break
+                lines[index : value_end + 1] = [
+                    f"{key_match.group(1)}{RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS}"
+                ]
                 return "\n".join(lines) + "\n", True, None
             continue
         numeric_text = match.group(2).replace("_", "")

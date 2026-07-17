@@ -487,6 +487,21 @@ class ServerHelpersTest(unittest.TestCase):
                 120,
             )
 
+        for multiline_literal in (
+            "startup_timeout_sec = [\n120,\n]",
+            'startup_timeout_sec = """\n120\n"""',
+        ):
+            multiline_config = existing_low.replace("startup_timeout_sec = 30", multiline_literal)
+            multiline_updated, multiline_changed, multiline_previous = updated_mcp_startup_timeout_config(
+                multiline_config
+            )
+            self.assertTrue(multiline_changed)
+            self.assertIsNone(multiline_previous)
+            self.assertEqual(
+                loads(multiline_updated)["mcp_servers"]["codex-master-mcp"]["startup_timeout_sec"],
+                120,
+            )
+
     def test_ensure_mcp_startup_timeout_configured_is_path_sparse_and_no_follow(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = Path(tmpdir) / ".codex" / "config.toml"
