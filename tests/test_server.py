@@ -2763,7 +2763,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.42")
+        self.assertEqual(result["expected_tag"], "v0.9.43")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -3682,6 +3682,16 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertNotIn("SECRET_SHOULD_NOT_RETURN", json.dumps(result, sort_keys=True))
 
+    def test_classify_tui_context_exposes_blocking_update_prompt_state(self) -> None:
+        result = classify_tui_context(
+            "Update available! 0.144.4 -> 0.144.5\n› 1. Update now\n2. Skip\nPress enter to continue\n",
+            running=True,
+        )
+
+        self.assertEqual(result["state"], "update_prompt")
+        self.assertEqual(result["source"], "classified_from_bounded_pane_text")
+        self.assertNotIn("0.144.5", json.dumps(result, sort_keys=True))
+
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.pane_pid", return_value=None)
     @patch("codex_master.server.tmux_alive", return_value=False)
@@ -4271,6 +4281,52 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(meta_store["watchdog"]["started_at_utc"], "2026-06-07T09:00:00+00:00")
         mock_report.assert_called_once()
         mock_interrupt.assert_not_called()
+
+    def test_fleet_watchdog_escalates_when_report_input_is_not_ready(self) -> None:
+        status = {
+            "agent": "a",
+            "running": True,
+            "lease": {"state": "expired", "held_by_this_server": False, "raw_output": "not_returned"},
+            "response_state": {"state": "running_idle"},
+            "raw_log_idle_seconds": 600,
+            "raw_log_bytes": 0,
+            "raw_log_updated_at_utc": "1970-01-01T00:15:00+00:00",
+            "started_at_utc": "2026-06-07T09:00:00+00:00",
+            "last_assignment": {"assignment_id": "assign-1", "created_at_utc": "2026-06-07T09:58:00+00:00"},
+        }
+        lease = {"state": "held", "holder": "this_server", "held_by_this_server": True}
+        report_error = AgentInputNotReadyError(
+            "agent input is not ready",
+            {
+                "error_code": "agent_input_not_ready",
+                "operation": "agent_report_request",
+                "retryable": True,
+                "paste_attempted": False,
+                "raw_output": "not_returned",
+                "response_output": "not_returned",
+            },
+        )
+        action_result = {"agent": "a1", "status": "stopped", "lease": lease, "raw_output": "not_returned"}
+
+        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "codex_master.server.status_agent", return_value=status
+        ), patch("codex_master.server.read_meta", return_value={}), patch(
+            "codex_master.server.claim_agent", return_value={"status": "claimed_expired", "lease": lease}
+        ) as mock_claim, patch(
+            "codex_master.server.request_agent_report", side_effect=report_error
+        ), patch("codex_master.server.watchdog_action", return_value=action_result) as mock_action, patch(
+            "codex_master.server.update_watchdog_marker"
+        ) as mock_marker:
+            result = fleet_watchdog("a", action="stop", manage_unclaimed=True)
+
+        payload = result["results"][0]
+        self.assertEqual(payload["watchdog_state"], "action_sent")
+        self.assertEqual(payload["action_taken"], "stop")
+        self.assertEqual(payload["report_error"]["error_code"], "agent_input_not_ready")
+        self.assertFalse(payload["report_error"]["paste_attempted"])
+        mock_claim.assert_called_once_with("a1")
+        mock_action.assert_called_once_with("a1", "stop", release_after_interrupt=False)
+        mock_marker.assert_called_once_with("a1", None)
 
     def test_fleet_watchdog_does_not_reuse_release_flag_after_session_restart(self) -> None:
         meta_store: dict[str, object] = {

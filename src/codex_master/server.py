@@ -4271,7 +4271,10 @@ def classify_tui_context(text: str, running: bool) -> dict[str, Any]:
             r"\bwhat can i help(?: you)?(?: with)?\b",
             r"\bask me anything\b",
         )
-        if any(re.search(pattern, lowered) for pattern in starter_patterns):
+        if codex_update_prompt_visible(cleaned):
+            state = "update_prompt"
+            source = "classified_from_bounded_pane_text"
+        elif any(re.search(pattern, lowered) for pattern in starter_patterns):
             state = "starter_placeholder"
             source = "classified_from_bounded_pane_text"
         elif cleaned.strip():
@@ -4315,6 +4318,8 @@ def agent_response_state(
         state = "blocked_by_limit"
     elif not running:
         state = "not_running"
+    elif (tui_context or {}).get("state") == "update_prompt":
+        state = "running_tui_update_prompt"
     elif (tui_context or {}).get("state") == "starter_placeholder":
         state = "running_tui_starter_context"
     elif raw_log_info.get("idle_seconds") is None:
@@ -5089,7 +5094,7 @@ def _watchdog_agent_unlocked(
             if isinstance(lease.get("lease_id"), str):
                 marker_to_write["lease_id"] = lease["lease_id"]
             update_watchdog_marker(agent, marker_to_write)
-        except Exception:
+        except Exception as exc:
             report_sent = (
                 isinstance(report, dict)
                 and isinstance(report.get("send"), dict)
@@ -5097,6 +5102,35 @@ def _watchdog_agent_unlocked(
             )
             if report_lease_claimed and not report_sent and agent_lease_status(agent).get("held_by_this_server"):
                 release_agent(agent, force=True)
+            if isinstance(exc, AgentInputNotReadyError):
+                report_error = public_error_payload(exc)
+                spark_health = update_agent_spark_health(
+                    agent,
+                    state="failed",
+                    reason="spark_turn_watchdog_report_unavailable",
+                )
+                release_after_interrupt = action == "interrupt" and (
+                    (manage_unclaimed and unclaimed_or_expired) or release_watchdog_lease
+                )
+                try:
+                    action_result = watchdog_action(
+                        agent,
+                        action,
+                        release_after_interrupt=release_after_interrupt,
+                    )
+                    update_watchdog_marker(agent, None)
+                except Exception:
+                    if report_lease_claimed and agent_lease_status(agent).get("held_by_this_server"):
+                        release_agent(agent, force=True)
+                    raise
+                return {
+                    **base,
+                    "watchdog_state": "action_sent" if action != "none" else "no_action",
+                    "action_taken": action,
+                    "report_error": report_error,
+                    "spark_health": spark_health,
+                    "action_result": public_watchdog_action_result(action_result),
+                }
             raise
         return {
             **base,
