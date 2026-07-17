@@ -12002,7 +12002,9 @@ class ServerHelpersTest(unittest.TestCase):
         def fail(_lease: dict[str, Any]) -> dict[str, Any]:
             raise AgentError("send failed after paste")
 
-        with patch("codex_master.server.claim_for_agent_mutation", return_value=(lease, True)), patch(
+        with patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"), patch(
+            "codex_master.server.claim_for_agent_mutation", return_value=(lease, True)
+        ), patch(
             "codex_master.server.agent_lease_status",
             return_value={"held_by_this_server": True},
         ), patch(
@@ -12013,6 +12015,18 @@ class ServerHelpersTest(unittest.TestCase):
                 server_module.run_with_agent_lease("a", fail)
 
         mock_release.assert_not_called()
+
+    def test_run_with_agent_lease_blocks_usage_before_claim(self) -> None:
+        from codex_master import server as server_module
+
+        with patch(
+            "codex_master.server.ensure_agent_not_blocked_by_codex_usage",
+            side_effect=AgentError("agent blocked by codex-usage watchdog"),
+        ), patch("codex_master.server.claim_for_agent_mutation") as mock_claim:
+            with self.assertRaisesRegex(AgentError, "blocked by codex-usage watchdog"):
+                server_module.run_with_agent_lease("a", lambda _lease: {"status": "sent"})
+
+        mock_claim.assert_not_called()
 
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.send_agent")

@@ -4197,6 +4197,7 @@ def require_running_agent(agent: str) -> None:
 
 def run_with_agent_lease(agent: str, fn: Any) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
+    ensure_agent_not_blocked_by_codex_usage(agent)
     lease, release_on_failure = claim_for_agent_mutation(agent)
     try:
         return fn(lease)

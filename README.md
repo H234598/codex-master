@@ -150,8 +150,8 @@ skipping active leases held by other clients and avoiding successful JSON noise
 in the user journal.
 `usage-watchdog` consumes `codex-usage` snapshot state, writes a local
 codex-usage block marker, and stops running Agentinnen whose accounts are still
-blocked until their next reset. `agent_start` and claim flows refuse to start a
-blocked Agentin until the codex-usage watchdog releases it again.
+blocked until their next reset. `agent_start`, claim, send, and report-request
+flows refuse to use a blocked Agentin until the codex-usage watchdog releases it again.
 
 ## Tools
 
