@@ -6312,6 +6312,17 @@ def open_plugin_source_dir_no_follow(src: Path, expected_stat: os.stat_result) -
     )
 
 
+@contextlib.contextmanager
+def plugin_source_root_operation(root: Path, expected_stat: os.stat_result) -> Any:
+    source_fd = -1
+    try:
+        source_fd = open_plugin_source_dir_no_follow(root, expected_stat)
+        yield Path(f"/proc/self/fd/{source_fd}")
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+
+
 def copy_regular_plugin_file_from_dir_no_follow(
     src_dir_fd: int, name: str, dst: Path, expected_stat: os.stat_result
 ) -> None:
@@ -6575,7 +6586,12 @@ def sync_plugin_cache_from_repo(
     if not is_real_directory_no_symlink(source_root):
         raise AgentError("plugin source root must be a real directory")
 
-    manifest = plugin_manifest_version(source_root)
+    try:
+        source_stat = source_root.lstat()
+    except OSError as exc:
+        raise AgentError("plugin source root must be a real directory") from exc
+    with plugin_source_root_operation(source_root, source_stat) as source_view:
+        manifest = plugin_manifest_version(source_view)
     if not manifest.get("ok"):
         raise AgentError("plugin manifest name or version is invalid")
     version = manifest["version"]
@@ -6603,6 +6619,7 @@ def sync_plugin_cache_from_repo(
     copied_files = 0
     copied_directories = 0
     tmp_entry_created = False
+    source_entry_stats: dict[str, os.stat_result] = {}
     try:
         cache_fd = open_directory_no_follow_matching(
             target_cache,
@@ -6618,24 +6635,58 @@ def sync_plugin_cache_from_repo(
             raise AgentError("could_not_sync_plugin_cache") from exc
         tmp_entry_created = True
         copied_directories += 1
-        for name in PLUGIN_CACHE_ALLOWED_FILES:
-            src = source_root / name
-            if not path_present_no_follow(src):
-                if name in PLUGIN_CACHE_OPTIONAL_FILES:
-                    continue
-                raise AgentError("plugin source is missing a required file")
-            counts = copy_plugin_cache_path(src, tmp_entry / name)
-            copied_files += counts["files"]
-            copied_directories += counts["directories"]
-        for name in PLUGIN_CACHE_ALLOWED_DIRS:
-            src = source_root / name
-            if not path_present_no_follow(src):
-                if name in PLUGIN_CACHE_OPTIONAL_DIRS:
-                    continue
-                raise AgentError("plugin source is missing a required directory")
-            counts = copy_plugin_cache_path(src, tmp_entry / name)
-            copied_files += counts["files"]
-            copied_directories += counts["directories"]
+        with plugin_source_root_operation(source_root, source_stat) as source_view:
+            for name in PLUGIN_CACHE_ALLOWED_FILES:
+                original_src = source_root / name
+                if not path_present_no_follow(original_src):
+                    if name in PLUGIN_CACHE_OPTIONAL_FILES:
+                        continue
+                    raise AgentError("plugin source is missing a required file")
+                try:
+                    source_entry_stats[name] = original_src.lstat()
+                except OSError as exc:
+                    raise AgentError("could_not_sync_plugin_cache") from exc
+                if stat_module.S_ISLNK(source_entry_stats[name].st_mode):
+                    raise AgentError("plugin source contains unsupported symlink")
+                src = source_view / name
+                try:
+                    current_stat = src.lstat()
+                except OSError as exc:
+                    raise AgentError("could_not_sync_plugin_cache") from exc
+                if not source_identity_matches(current_stat, source_entry_stats[name]):
+                    raise AgentError("plugin source changed during copy")
+                counts = copy_plugin_cache_path(src, tmp_entry / name)
+                copied_files += counts["files"]
+                copied_directories += counts["directories"]
+            for name in PLUGIN_CACHE_ALLOWED_DIRS:
+                original_src = source_root / name
+                if not path_present_no_follow(original_src):
+                    if name in PLUGIN_CACHE_OPTIONAL_DIRS:
+                        continue
+                    raise AgentError("plugin source is missing a required directory")
+                try:
+                    source_entry_stats[name] = original_src.lstat()
+                except OSError as exc:
+                    raise AgentError("could_not_sync_plugin_cache") from exc
+                if stat_module.S_ISLNK(source_entry_stats[name].st_mode):
+                    raise AgentError("plugin source contains unsupported symlink")
+                src = source_view / name
+                try:
+                    current_stat = src.lstat()
+                except OSError as exc:
+                    raise AgentError("could_not_sync_plugin_cache") from exc
+                if not source_identity_matches(current_stat, source_entry_stats[name]):
+                    raise AgentError("plugin source changed during copy")
+                counts = copy_plugin_cache_path(src, tmp_entry / name)
+                copied_files += counts["files"]
+                copied_directories += counts["directories"]
+            for name, expected_stat in source_entry_stats.items():
+                try:
+                    current_stat = (source_root / name).lstat()
+                except OSError as exc:
+                    raise AgentError("could_not_sync_plugin_cache") from exc
+                if not source_identity_matches(current_stat, expected_stat):
+                    raise AgentError("plugin source changed during copy")
         remove_real_plugin_cache_dir(cache_fd_path / version)
         try:
             os.replace(tmp_name, version, src_dir_fd=cache_fd, dst_dir_fd=cache_fd)
@@ -6652,7 +6703,8 @@ def sync_plugin_cache_from_repo(
             os.close(cache_fd)
 
     retention = prune_plugin_cache_versions(target_cache, keep_version=version, max_versions=retained_versions)
-    status = plugin_cache_status(source_root, target_cache)
+    with plugin_source_root_operation(source_root, source_stat) as source_view:
+        status = plugin_cache_status(source_view, target_cache)
     return {
         "ok": bool(status.get("ok")),
         "status": "synced" if status.get("ok") else "sync_incomplete",

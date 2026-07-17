@@ -1475,7 +1475,7 @@ class ServerHelpersTest(unittest.TestCase):
 
             def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
                 nonlocal swapped
-                if not swapped and dir_fd is None and Path(path) == source_dir:
+                if not swapped and dir_fd is None and Path(path).name == source_dir.name:
                     swapped = True
                     source_dir.rename(backup_dir)
                     source_dir.symlink_to(redirected_dir, target_is_directory=True)
@@ -1543,6 +1543,54 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(swapped)
         self.assertEqual(redirected_entries, [])
         self.assertEqual(backup_entries, [])
+
+    def test_sync_plugin_cache_rejects_real_source_root_swap_during_copy(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            root = tmp_path / "repo"
+            backup_root = tmp_path / "repo-backup"
+            replacement_root = tmp_path / "repo-replacement"
+            cache = tmp_path / "cache"
+            version = "0.3.8+codex.root-race"
+
+            def make_repo(repo: Path, readme: str) -> None:
+                for relative in (".codex-plugin", "bin", "skills", "src", "systemd"):
+                    (repo / relative).mkdir(parents=True, exist_ok=True)
+                (repo / ".codex-plugin" / "plugin.json").write_text(
+                    json.dumps({"name": "codex-master", "version": version}), encoding="utf-8"
+                )
+                for relative, content in {
+                    ".app.json": "{}",
+                    ".mcp.json": "{}",
+                    "README.md": readme,
+                    "pyproject.toml": "[project]\nname='codex-master'\n",
+                    "bin/codex-master-mcp": "#!/bin/sh\n",
+                }.items():
+                    (repo / relative).write_text(content, encoding="utf-8")
+
+            make_repo(root, "original\n")
+            make_repo(replacement_root, "replacement\n")
+            real_path_present = server_module.path_present_no_follow
+            swapped = False
+
+            def swap_source_root(path: Path) -> bool:
+                nonlocal swapped
+                if path.name == ".app.json" and not swapped:
+                    swapped = True
+                    root.rename(backup_root)
+                    replacement_root.rename(root)
+                return real_path_present(path)
+
+            with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False), patch(
+                "codex_master.server.path_present_no_follow", side_effect=swap_source_root
+            ):
+                with self.assertRaisesRegex(AgentError, "plugin source changed during copy"):
+                    sync_plugin_cache_from_repo(root, cache)
+
+            self.assertTrue(swapped)
+            self.assertFalse((cache / version).exists())
 
     def test_sync_plugin_cache_from_repo_prunes_old_valid_versions_without_touching_invalid_entries(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
