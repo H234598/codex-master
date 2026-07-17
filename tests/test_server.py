@@ -14396,6 +14396,54 @@ class AgentPoolManagementTest(unittest.TestCase):
         self.assertTrue(destroyed["ok"])
         self.assertEqual(destroyed["removed_agent_entries"], 1)
 
+    def test_agent_pool_destroy_force_does_not_remove_root_created_after_missing_check(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec_payload(
+                tmp,
+                {
+                    "schema_version": 1,
+                    "pool_root": str(pool),
+                    "codex_bin": "/bin/echo",
+                    "series": [{"prefix": "late", "count": 1, "template": "late1", "authenticated": []}],
+                    "shared_assets": [],
+                    "runtime_dirs": [],
+                },
+            )
+            real_path_state = server_module.pool_public_path_state
+            created = False
+
+            def create_after_missing_check(path: Path) -> str:
+                nonlocal created
+                state = real_path_state(path)
+                if path == pool and state == "missing" and not created:
+                    pool.mkdir()
+                    (pool / "foreign.txt").write_text("must survive\n", encoding="utf-8")
+                    created = True
+                return state
+
+            with patch.object(server_module, "pool_public_path_state", side_effect=create_after_missing_check):
+                result = server_module.agent_pool_destroy_pool(
+                    str(spec_path),
+                    target_dir=str(pool),
+                    codex_bin="/bin/echo",
+                    yes=True,
+                    force=True,
+                    remove_root=True,
+                )
+
+            foreign_file_exists = (pool / "foreign.txt").exists()
+            pool_exists = pool.exists()
+
+        self.assertTrue(created)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["missing_agent_entries"], 1)
+        self.assertTrue(foreign_file_exists)
+        self.assertTrue(pool_exists)
+
     def test_agent_pool_copy_auth_does_not_echo_custom_source_agent(self) -> None:
         from codex_master import server as server_module
 

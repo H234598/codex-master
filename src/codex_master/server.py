@@ -11047,6 +11047,16 @@ def _agent_pool_destroy_pool_unlocked(
     root_state = pool_public_path_state(root)
     if root_state != "directory" and not (root_state == "missing" and force):
         raise AgentError("pool root must be a real directory")
+    if root_state == "missing":
+        return {
+            "ok": True,
+            "pool_root": PATH_NOT_RETURNED,
+            "removed_agent_entries": 0,
+            "missing_agent_entries": len(normalized["ids"]),
+            "skipped_agent_entries": 0,
+            "root_removed": False,
+            "raw_output": "not_returned",
+        }
 
     removed = 0
     missing = 0
