@@ -10329,7 +10329,7 @@ class CliLifecycleTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
             install_link = tmp_path / "bin" / "codex-master-mcp"
-            mock_registration.return_value = {"registered": True, "ok": False}
+            mock_registration.return_value = {"registered": True, "command_matches": True, "ok": False}
             mock_run.return_value = subprocess.CompletedProcess(
                 ["codex", "mcp", "remove"],
                 1,
@@ -10343,6 +10343,18 @@ class CliLifecycleTest(unittest.TestCase):
         error_text = str(raised.exception)
         self.assertNotIn(str(tmp_path), error_text)
         self.assertNotIn("SECRET_OUTPUT_SHOULD_NOT_RETURN", error_text)
+
+    @patch("codex_master.server.run_command")
+    @patch("codex_master.server.check_mcp_registration")
+    def test_uninstall_leaves_different_mcp_registration_in_place(self, mock_registration, mock_run) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            install_link = Path(tmpdir) / "bin" / "codex-master-mcp"
+            mock_registration.return_value = {"registered": True, "command_matches": False, "ok": False}
+
+            result = uninstall(unregister=True, remove_symlink=False, install_path=install_link)
+
+        self.assertEqual(result["mcp"], "left_in_place_different_command")
+        mock_run.assert_not_called()
 
     @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
     @patch("codex_master.server.repo_wrapper_path")

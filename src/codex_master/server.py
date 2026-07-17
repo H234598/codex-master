@@ -7508,10 +7508,13 @@ def uninstall(unregister: bool = True, remove_symlink: bool = False, install_pat
     if unregister:
         current = check_mcp_registration(install_path)
         if current.get("registered"):
-            remove = run_command(["codex", "mcp", "remove", MCP_SERVER_NAME])
-            if remove.returncode != 0:
-                raise AgentError("codex mcp remove failed")
-            mcp_status = "removed"
+            if current.get("command_matches"):
+                remove = run_command(["codex", "mcp", "remove", MCP_SERVER_NAME])
+                if remove.returncode != 0:
+                    raise AgentError("codex mcp remove failed")
+                mcp_status = "removed"
+            else:
+                mcp_status = "left_in_place_different_command"
         else:
             mcp_status = "not_registered"
 
