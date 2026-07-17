@@ -9967,6 +9967,44 @@ def pool_marker_payload(normalized: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def pool_marker_matches(path: Path, expected_stat: os.stat_result, normalized: dict[str, Any]) -> bool:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(path, flags)
+        opened = os.fstat(fd)
+        if (
+            not source_identity_matches(opened, expected_stat)
+            or not stat_module.S_ISREG(opened.st_mode)
+            or getattr(opened, "st_nlink", 1) != 1
+        ):
+            return False
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            raw = fh.read(MAX_POOL_SPEC_BYTES + 1)
+    except OSError:
+        return False
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) > MAX_POOL_SPEC_BYTES:
+        return False
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    expected = pool_marker_payload(normalized)
+    return (
+        isinstance(payload, dict)
+        and payload.get("schema_version") == expected["schema_version"]
+        and payload.get("agent_count") == expected["agent_count"]
+        and payload.get("series_count") == expected["series_count"]
+        and payload.get("spec_sha256") == expected["spec_sha256"]
+    )
+
+
 def agent_pool_validate(
     spec: str | None = None,
     target_dir: str | None = None,
@@ -10522,11 +10560,12 @@ def _agent_pool_destroy_pool_unlocked(
             marker_stat = None
         except OSError as exc:
             raise AgentError("pool marker could not be read") from exc
-        marker_valid = (
+        marker_present = (
             marker_stat is not None
             and stat_module.S_ISREG(marker_stat.st_mode)
             and getattr(marker_stat, "st_nlink", 1) == 1
         )
+        marker_valid = marker_present and pool_marker_matches(marker, marker_stat, normalized)
         if not marker_valid and not force:
             raise AgentError("destroy_pool requires an installed pool marker or force=true")
         with pool_agent_lifecycle_locks(normalized["ids"]):
@@ -10559,7 +10598,7 @@ def _agent_pool_destroy_pool_unlocked(
                 else:
                     skipped += 1
 
-            if marker_valid:
+            if marker_present:
                 try:
                     latest_marker_stat = marker.lstat()
                 except FileNotFoundError:

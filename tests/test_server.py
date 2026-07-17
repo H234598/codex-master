@@ -14418,6 +14418,37 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn("outside-marker", payload_text)
             self.assertTrue(marker.is_symlink())
 
+    def test_agent_pool_destroy_rejects_marker_for_different_spec(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            installed_spec = self._write_spec(tmp, pool)
+            server_module.agent_pool_install(str(installed_spec), target_dir=str(pool), codex_bin="/bin/echo")
+            mismatched_spec = tmp / "mismatched.json"
+            mismatched_spec.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "pool_root": str(pool),
+                        "codex_bin": "/bin/echo",
+                        "series": [{"prefix": "a", "count": 1, "template": "a1", "authenticated": []}],
+                        "shared_assets": [],
+                        "runtime_dirs": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(AgentError, "destroy_pool requires an installed pool marker or force=true"):
+                server_module.agent_pool_destroy_pool(
+                    str(mismatched_spec), target_dir=str(pool), codex_bin="/bin/echo", yes=True
+                )
+
+            self.assertTrue((pool / "a1").is_dir())
+            self.assertTrue((pool / server_module.POOL_MARKER_FILE).is_file())
+
     def test_agent_pool_destroy_rejects_marker_swap_before_unlink(self) -> None:
         from codex_master import server as server_module
 
