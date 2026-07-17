@@ -11681,6 +11681,9 @@ class ServerHelpersTest(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(run.call_count, 1)
         self.assertIn("--auth-json", command)
+        auth_path = command[command.index("--auth-json") + 1]
+        self.assertRegex(auth_path, r"^/proc/self/fd/\d+$")
+        self.assertEqual(run.call_args.kwargs["pass_fds"], (int(auth_path.rsplit("/", 1)[1]),))
         self.assertIn("--agent", command)
         self.assertIn("--group", command)
         self.assertIn("build", command)
@@ -11688,6 +11691,47 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("release", command)
         self.assertEqual(decision["decision"], "spark")
         self.assertEqual(decision["backend_account_id"], "backend-nufker")
+
+    def test_codex_usage_routing_keeps_auth_fd_across_path_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            auth_file = root / "auth.json"
+            original = root / "auth-original.json"
+            replacement = root / "auth-replacement.json"
+            auth_file.write_text('{"account":"original"}\n', encoding="utf-8")
+            replacement.write_text('{"account":"replacement"}\n', encoding="utf-8")
+            payload = {
+                "schema_version": 1,
+                "account": "BW_Nufker",
+                "backend_account_id": "backend-nufker",
+                "role": "arbeitsbiene",
+                "decision": "spark",
+                "model": WRITE_AGENT_MODEL,
+                "reason": "spark_available",
+                "usage_state": "known",
+                "paid_overage_allowed": False,
+                "policy_source": "global",
+            }
+
+            def fake_run(command, *, pass_fds, **_kwargs):
+                path = Path(command[command.index("--auth-json") + 1])
+                auth_file.rename(original)
+                replacement.rename(auth_file)
+                self.assertEqual(path.read_text(encoding="utf-8"), '{"account":"original"}\n')
+                self.assertEqual(pass_fds, (int(path.name.rsplit("/", 1)[-1]),))
+                return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}},
+                clear=False,
+            ), patch(
+                "codex_master.server.codex_usage_executable",
+                return_value="/usr/bin/codex-usage",
+            ), patch("codex_master.server.run_command", side_effect=fake_run):
+                decision = codex_usage_routing_decision("a", role="arbeitsbiene")
+
+        self.assertEqual(decision["decision"], "spark")
 
     def test_codex_usage_routing_rejects_unhashable_decision(self) -> None:
         with self.assertRaisesRegex(AgentError, "codex-usage routing decision is invalid"):

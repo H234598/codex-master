@@ -1109,6 +1109,7 @@ def run_command(
     cwd: Path | str | None = None,
     env: dict[str, str] | None = None,
     timeout: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -1120,6 +1121,7 @@ def run_command(
             cwd=cwd,
             env=env,
             timeout=timeout,
+            pass_fds=pass_fds,
         )
     except subprocess.TimeoutExpired as exc:
         cp = timeout_completed_process(args, exc, "command")
@@ -2595,6 +2597,65 @@ def is_regular_file_no_symlink(path: Path) -> bool:
     return stat_module.S_ISREG(current.st_mode) and getattr(current, "st_nlink", 1) == 1
 
 
+def open_agent_auth_fd(agent: str) -> int:
+    agent = canonical_agent_id(agent)
+    auth_file = AGENTS[agent]["home"] / "auth.json"
+    try:
+        auth_stat = auth_file.lstat()
+        parent_stat = auth_file.parent.lstat()
+    except OSError as exc:
+        raise AgentError("codex-usage routing requires regular per-Agentin auth.json") from exc
+    if (
+        not stat_module.S_ISREG(auth_stat.st_mode)
+        or getattr(auth_stat, "st_nlink", 1) > 1
+        or auth_stat.st_size > MAX_CODEX_CONFIG_BYTES
+    ):
+        raise AgentError("codex-usage routing requires regular per-Agentin auth.json")
+
+    parent_fd = -1
+    auth_fd = -1
+    try:
+        parent_fd = open_directory_no_follow_matching(
+            auth_file.parent,
+            parent_stat,
+            error_text="auth file parent is unavailable",
+            changed_text="auth file parent changed unexpectedly",
+        )
+        current_stat = os.stat(auth_file.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not source_identity_matches(current_stat, auth_stat)
+            or not stat_module.S_ISREG(current_stat.st_mode)
+            or getattr(current_stat, "st_nlink", 1) > 1
+            or current_stat.st_size > MAX_CODEX_CONFIG_BYTES
+        ):
+            raise AgentError("auth file changed unexpectedly")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        auth_fd = os.open(auth_file.name, flags, dir_fd=parent_fd)
+        opened_stat = os.fstat(auth_fd)
+        if (
+            not source_identity_matches(opened_stat, auth_stat)
+            or not source_identity_matches(opened_stat, current_stat)
+            or not stat_module.S_ISREG(opened_stat.st_mode)
+            or getattr(opened_stat, "st_nlink", 1) > 1
+            or opened_stat.st_size > MAX_CODEX_CONFIG_BYTES
+        ):
+            raise AgentError("auth file changed unexpectedly")
+        result = auth_fd
+        auth_fd = -1
+        return result
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError("auth file changed unexpectedly") from exc
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        if auth_fd >= 0:
+            os.close(auth_fd)
+
+
 def auth_access_token_state(value: Any) -> str:
     if not isinstance(value, str) or not value:
         return "missing"
@@ -2752,34 +2813,39 @@ def codex_usage_routing_decision(
     agent = canonical_agent_id(agent)
     group_id = normalize_routing_context_id(group_id, field="group_id")
     job_id = normalize_routing_context_id(job_id, field="job_id")
-    auth_path = AGENTS[agent]["home"] / "auth.json"
-    if not is_regular_file_no_symlink(auth_path):
-        raise AgentError("codex-usage routing requires regular per-Agentin auth.json")
-    command = [codex_usage_executable()]
-    config_path = os.environ.get("CODEX_USAGE_CONFIG", "").strip()
-    if config_path:
-        if "\x00" in config_path:
-            raise AgentError("CODEX_USAGE_CONFIG is invalid")
-        command.extend(["--config", str(Path(config_path).expanduser())])
-    command.extend(
-        [
-            "policy",
-            "evaluate",
-            "--auth-json",
-            str(auth_path),
-            "--role",
-            role,
-            "--agent",
-            agent,
-            "--format",
-            "json",
-        ]
-    )
-    if group_id:
-        command.extend(["--group", group_id])
-    if job_id:
-        command.extend(["--job", job_id])
-    cp = run_command(command, timeout=CODEX_USAGE_DECISION_TIMEOUT_SECONDS)
+    auth_fd = open_agent_auth_fd(agent)
+    try:
+        command = [codex_usage_executable()]
+        config_path = os.environ.get("CODEX_USAGE_CONFIG", "").strip()
+        if config_path:
+            if "\x00" in config_path:
+                raise AgentError("CODEX_USAGE_CONFIG is invalid")
+            command.extend(["--config", str(Path(config_path).expanduser())])
+        command.extend(
+            [
+                "policy",
+                "evaluate",
+                "--auth-json",
+                f"/proc/self/fd/{auth_fd}",
+                "--role",
+                role,
+                "--agent",
+                agent,
+                "--format",
+                "json",
+            ]
+        )
+        if group_id:
+            command.extend(["--group", group_id])
+        if job_id:
+            command.extend(["--job", job_id])
+        cp = run_command(
+            command,
+            timeout=CODEX_USAGE_DECISION_TIMEOUT_SECONDS,
+            pass_fds=(auth_fd,),
+        )
+    finally:
+        os.close(auth_fd)
     combined_size = len(cp.stdout.encode("utf-8")) + len(cp.stderr.encode("utf-8"))
     if combined_size > MAX_CODEX_USAGE_DECISION_BYTES:
         raise AgentError("codex-usage routing output exceeded size limit")
