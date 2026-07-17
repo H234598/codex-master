@@ -94,6 +94,7 @@ from codex_master.server import (
     assign_agent,
     interrupt_agent,
     mcp_command_startup_self_test,
+    MCP_SERVER_NAME,
     mcp_probe_response_ok,
     mcp_registration_command_matches,
     master_app_bridge_status,
@@ -13744,6 +13745,50 @@ class CliLifecycleTest(unittest.TestCase):
         error_text = str(raised.exception)
         self.assertNotIn(str(tmp_path), error_text)
         self.assertNotIn("SECRET_OUTPUT_SHOULD_NOT_RETURN", error_text)
+
+    @patch("codex_master.server.run_command")
+    @patch("codex_master.server.check_mcp_registration")
+    @patch("codex_master.server.mcp_command_startup_self_test")
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_force_restores_previous_mcp_registration_after_add_failure(
+        self, mock_wrapper_path, mock_self_test, mock_registration, mock_run
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "secret-repo" / "bin" / "codex-master-mcp"
+            previous_command = tmp_path / "previous-codex"
+            wrapper.parent.mkdir(parents=True)
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            previous_command.write_text("#!/bin/sh\n", encoding="utf-8")
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            mock_wrapper_path.return_value = wrapper
+            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
+            mock_registration.return_value = {
+                "registered": True,
+                "command_matches": False,
+                "startup_timeout_ok": True,
+                "_registered_command": str(previous_command),
+            }
+            mock_run.side_effect = [
+                subprocess.CompletedProcess(["codex", "mcp", "remove"], 0, "", ""),
+                subprocess.CompletedProcess(["codex", "mcp", "add"], 1, "", ""),
+                subprocess.CompletedProcess(["codex", "mcp", "add"], 0, "", ""),
+            ]
+
+            with self.assertRaisesRegex(AgentError, "codex mcp add failed"):
+                install(register=True, force=True, install_path=install_link, sync_plugin_cache=False)
+
+            commands = [call.args[0] for call in mock_run.call_args_list]
+
+        self.assertEqual(
+            commands,
+            [
+                ["codex", "mcp", "remove", MCP_SERVER_NAME],
+                ["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(install_link)],
+                ["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(previous_command)],
+            ],
+        )
 
     def test_install_cache_failure_preserves_existing_install_link(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

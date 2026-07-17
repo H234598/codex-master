@@ -8971,7 +8971,11 @@ def mcp_startup_timeout_seconds(output: str) -> int | None:
         return None
 
 
-def check_mcp_registration(command_path: Path = DEFAULT_INSTALL_PATH) -> dict[str, Any]:
+def check_mcp_registration(
+    command_path: Path = DEFAULT_INSTALL_PATH,
+    *,
+    include_command: bool = False,
+) -> dict[str, Any]:
     codex_path = shutil.which("codex")
     if not codex_path:
         return {"registered": False, "ok": False, "reason": "codex command not found"}
@@ -8979,12 +8983,13 @@ def check_mcp_registration(command_path: Path = DEFAULT_INSTALL_PATH) -> dict[st
     raw_output = cp.stdout + cp.stderr
     output, redacted = command_excerpt(raw_output)
     registered = cp.returncode == 0
+    registered_command = mcp_get_field(raw_output, "command") if registered else None
     command_matches = mcp_registration_command_matches(raw_output, command_path) if registered else False
     startup_timeout_sec = mcp_startup_timeout_seconds(raw_output) if registered else None
     startup_timeout_ok = (
         startup_timeout_sec is not None and startup_timeout_sec >= RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS
     )
-    return {
+    result = {
         "registered": registered,
         "command_matches": command_matches,
         "startup_timeout_sec": startup_timeout_sec,
@@ -8994,6 +8999,9 @@ def check_mcp_registration(command_path: Path = DEFAULT_INSTALL_PATH) -> dict[st
         "redaction_applied": redacted,
         "output_excerpt": output if not registered or not command_matches else "",
     }
+    if include_command:
+        result["_registered_command"] = registered_command
+    return result
 
 
 def doctor() -> dict[str, Any]:
@@ -9156,11 +9164,14 @@ def _install_unlocked(
         startup_self_test = {"requested": True, **mcp_command_startup_self_test(install_path)}
         if not startup_self_test["ok"]:
             raise AgentError("install path failed MCP startup self-test")
-        current = check_mcp_registration(install_path)
+        current = check_mcp_registration(install_path, include_command=True)
         startup_timeout_config = None
         if current.get("ok") or (current.get("registered") and current.get("command_matches")):
             registration = {"requested": True, "status": "already_registered"}
         else:
+            previous_command = current.get("_registered_command")
+            if not isinstance(previous_command, str) or not previous_command.strip():
+                previous_command = None
             if current.get("registered") and force:
                 remove = run_command(["codex", "mcp", "remove", MCP_SERVER_NAME])
                 if remove.returncode != 0:
@@ -9169,6 +9180,10 @@ def _install_unlocked(
                 raise AgentError("MCP server is registered with a different command; rerun install with --force")
             add = run_command(["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(install_path)])
             if add.returncode != 0:
+                if previous_command is not None:
+                    restore = run_command(["codex", "mcp", "add", MCP_SERVER_NAME, "--", previous_command])
+                    if restore.returncode != 0:
+                        raise AgentError("codex mcp add failed")
                 raise AgentError("codex mcp add failed")
             registration = {"requested": True, "status": "registered"}
         if not current.get("startup_timeout_ok"):
