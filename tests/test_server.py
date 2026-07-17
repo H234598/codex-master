@@ -3947,7 +3947,7 @@ class ServerHelpersTest(unittest.TestCase):
             root = Path(tmpdir)
             raw_dir = root / "raw"
             raw_dir.mkdir()
-            log_path = raw_dir / "20260717T070001000000Z-a1.log"
+            log_path = raw_dir / "20260717T070001000000Z-a.log"
             log_path.write_text("foreign\n", encoding="utf-8")
             agent = {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}
             foreign = {
@@ -3967,6 +3967,48 @@ class ServerHelpersTest(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(AgentError, "also used by an external process"):
                     safe_tail("a", source="log")
+
+    @patch("codex_master.server.ensure_agent_lease_available")
+    @patch("codex_master.server.ensure_state")
+    def test_safe_tail_log_fails_closed_after_raw_log_parent_swap(
+        self, _mock_ensure_state, mock_lease
+    ) -> None:
+        from codex_master import server as server_module
+
+        mock_lease.return_value = {"state": "unclaimed", "holder": "none", "raw_output": "not_returned"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "raw"
+            outside_dir = root / "outside"
+            raw_dir.mkdir()
+            outside_dir.mkdir()
+            log_path = raw_dir / "20260717T070001000000Z-a.log"
+            log_path.write_text("managed\n", encoding="utf-8")
+            (outside_dir / log_path.name).write_text("outside-secret\n", encoding="utf-8")
+            agent = {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}
+            real_identity = server_module.allowed_agent_raw_log_identity
+            swapped = False
+
+            def swap_after_validation(agent_name: str, raw_log: Any):
+                nonlocal swapped
+                identity = real_identity(agent_name, raw_log)
+                if identity is not None and not swapped:
+                    raw_dir.rename(root / "raw-original")
+                    outside_dir.rename(raw_dir)
+                    swapped = True
+                return identity
+
+            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
+                "codex_master.server.RAW_DIR", raw_dir
+            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "codex_master.server.read_meta", return_value={"raw_log": str(log_path)}
+            ), patch("codex_master.server.tmux_alive", return_value=False), patch(
+                "codex_master.server.allowed_agent_raw_log_identity", side_effect=swap_after_validation
+            ):
+                result = safe_tail("a", source="log")
+
+        self.assertTrue(swapped)
+        self.assertEqual(result["output"], "")
 
     @patch("codex_master.server.ensure_agent_lease_available")
     @patch("codex_master.server.ensure_state")

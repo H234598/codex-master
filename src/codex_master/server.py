@@ -8913,13 +8913,21 @@ def command_error_text(value: Any) -> str:
     return text or "no stderr"
 
 
-def read_log_tail(path: Path, approx_bytes: int) -> str:
+def read_log_tail(
+    path: Path,
+    approx_bytes: int,
+    *,
+    expected_stat: os.stat_result | None = None,
+) -> str:
     approx_bytes = normalize_int_field(approx_bytes, field="approx_bytes", minimum=1, maximum=MAX_RAW_LOG_BYTES)
     try:
         current_stat = path.lstat()
     except OSError:
         return ""
-    if not stat_module.S_ISREG(current_stat.st_mode):
+    if (
+        not stat_module.S_ISREG(current_stat.st_mode)
+        or (expected_stat is not None and not source_identity_matches(current_stat, expected_stat))
+    ):
         return ""
 
     flags = os.O_RDONLY
@@ -8931,6 +8939,7 @@ def read_log_tail(path: Path, approx_bytes: int) -> str:
         opened_stat = os.fstat(fd)
         if (
             not source_identity_matches(opened_stat, current_stat)
+            or (expected_stat is not None and not source_identity_matches(opened_stat, expected_stat))
             or not stat_module.S_ISREG(opened_stat.st_mode)
             or getattr(opened_stat, "st_nlink", 1) > 1
         ):
@@ -8986,13 +8995,21 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
         if session_live:
             require_managed_tmux_session(agent)
             if raw_log_path is None or raw_log_identity[1] is None:
-                raw_log_path = latest_managed_raw_log(
+                recovered_path = latest_managed_raw_log(
                     agent,
                     include_legacy=raw_log_identity_is_legacy(raw_log_identity),
                 )
+                recovered_identity = (
+                    allowed_agent_raw_log_identity(agent, str(recovered_path))
+                    if recovered_path is not None
+                    else None
+                )
+                raw_log_identity = recovered_identity
+                raw_log_path = recovered_identity[0] if recovered_identity is not None else None
         if raw_log and raw_log_path is None:
             raise AgentError("raw_log path is outside managed raw log state")
-        raw = read_log_tail(raw_log_path, chars * 4) if raw_log_path else ""
+        expected_stat = raw_log_identity[1] if raw_log_identity is not None else None
+        raw = read_log_tail(raw_log_path, chars * 4, expected_stat=expected_stat) if raw_log_path else ""
     cleaned = strip_ansi(raw)
     redacted, was_redacted = redact(cleaned)
     output_truncated_by_lines = len(redacted.splitlines()) > lines
