@@ -1733,14 +1733,38 @@ def write_private_new_bytes(
 
 
 def open_private_regular_update(path: Path) -> Any:
+    try:
+        parent_stat = path.parent.lstat()
+    except FileNotFoundError:
+        parent_stat = None
+    except OSError as exc:
+        raise AgentError("could not open private state file without following symlinks") from exc
     ensure_private_dir(path.parent)
+    parent_fd = -1
+    try:
+        if parent_stat is None:
+            parent_stat = path.parent.lstat()
+        parent_fd = open_directory_no_follow_matching(
+            path.parent,
+            parent_stat,
+            error_text="could not open private state file without following symlinks",
+            changed_text="could not open private state file without following symlinks",
+        )
+    except (AgentError, OSError) as exc:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        raise AgentError("could not open private state file without following symlinks") from exc
     flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    fd = -1
     try:
-        fd = os.open(path, flags, 0o600)
+        fd = os.open(path.name, flags, 0o600, dir_fd=parent_fd)
     except OSError as exc:
         raise AgentError("could not open private state file without following symlinks") from exc
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
     try:
         current_stat = os.fstat(fd)
         if not stat_module.S_ISREG(current_stat.st_mode) or getattr(current_stat, "st_nlink", 1) > 1:

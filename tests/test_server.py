@@ -421,7 +421,11 @@ class ServerHelpersTest(unittest.TestCase):
 
             def swap_before_open(candidate, flags, *args, **kwargs):
                 nonlocal swapped
-                if not swapped and isinstance(candidate, (str, bytes, Path)) and Path(candidate) == path:
+                target_open = isinstance(candidate, (str, bytes, Path)) and (
+                    Path(candidate) == path
+                    or (kwargs.get("dir_fd") is not None and Path(candidate) == Path(path.name))
+                )
+                if not swapped and target_open:
                     path.rename(original)
                     replacement.rename(path)
                     swapped = True
@@ -8093,6 +8097,35 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertTrue(swapped)
         self.assertEqual(result, {"meta_error": "could_not_read"})
+
+    def test_private_state_update_fails_closed_after_parent_swap(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            managed = root / "managed"
+            outside = root / "outside"
+            managed.mkdir()
+            outside.mkdir()
+            path = managed / "lock"
+            path.write_text("managed\n", encoding="utf-8")
+            (outside / path.name).write_text("outside\n", encoding="utf-8")
+            real_ensure = server_module.ensure_private_dir
+            swapped = False
+
+            def swap_after_ensure(candidate: Path) -> None:
+                nonlocal swapped
+                real_ensure(candidate)
+                if candidate == managed and not swapped:
+                    managed.rename(root / "managed-original")
+                    outside.rename(managed)
+                    swapped = True
+
+            with patch.object(server_module, "ensure_private_dir", side_effect=swap_after_ensure):
+                with self.assertRaisesRegex(AgentError, "could not open private state file"):
+                    server_module.open_private_regular_update(path)
+
+        self.assertTrue(swapped)
 
     def test_remove_agent_lease_path_rejects_regular_file_swap_before_unlink(self) -> None:
         from codex_master import server as server_module
