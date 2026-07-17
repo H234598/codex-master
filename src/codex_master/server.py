@@ -2564,7 +2564,11 @@ def bound_raw_log_file(path: Path, max_bytes: int = MAX_RAW_LOG_BYTES) -> bool:
         return False
     marker = RAW_LOG_TRUNCATION_MARKER[: max(0, max_bytes - 1)]
     with open_private_regular_update(path) as fh:
-        if getattr(os.fstat(fh.fileno()), "st_nlink", 1) > 1:
+        opened_stat = os.fstat(fh.fileno())
+        if (
+            not source_identity_matches(opened_stat, current_stat)
+            or getattr(opened_stat, "st_nlink", 1) > 1
+        ):
             return False
         fh.seek(0, os.SEEK_END)
         size = fh.tell()

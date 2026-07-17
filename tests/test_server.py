@@ -323,6 +323,35 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(result, "")
             self.assertEqual(original.read_text(encoding="utf-8"), "expected\n")
 
+    def test_bound_raw_log_file_rejects_regular_file_swap_before_update(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            path = tmp / "run.log"
+            original = tmp / "original-run.log"
+            replacement = tmp / "replacement-run.log"
+            path.write_text("original-secret-data\n", encoding="utf-8")
+            replacement.write_text("external-secret-data\n", encoding="utf-8")
+            real_open = server_module.os.open
+            swapped = False
+
+            def swap_before_open(candidate, flags, *args, **kwargs):
+                nonlocal swapped
+                if not swapped and isinstance(candidate, (str, bytes, Path)) and Path(candidate) == path:
+                    path.rename(original)
+                    replacement.rename(path)
+                    swapped = True
+                return real_open(candidate, flags, *args, **kwargs)
+
+            with patch.object(server_module.os, "open", side_effect=swap_before_open):
+                result = server_module.bound_raw_log_file(path, max_bytes=8)
+
+            self.assertTrue(swapped)
+            self.assertFalse(result)
+            self.assertEqual(original.read_text(encoding="utf-8"), "original-secret-data\n")
+            self.assertEqual(path.read_text(encoding="utf-8"), "external-secret-data\n")
+
     def test_github_ci_smokes_agent_pool_installer(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
