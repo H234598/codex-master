@@ -2016,6 +2016,14 @@ def remove_agent_lease_path(path: Path) -> bool:
     if not stat_module.S_ISREG(current.st_mode) or stat_module.S_ISLNK(current.st_mode):
         raise AgentError("agent lease path is not a regular file")
     try:
+        latest = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise AgentError("could_not_read_agent_lease") from exc
+    if not source_identity_matches(latest, current):
+        raise AgentError("agent lease path changed unexpectedly")
+    try:
         path.unlink()
     except FileNotFoundError:
         return False
@@ -8721,17 +8729,34 @@ def pool_regular_marker_present(path: Path) -> bool:
 
 def remove_agent_pool_entry(path: Path) -> str:
     try:
-        mode = path.lstat().st_mode
+        current = path.lstat()
     except FileNotFoundError:
         return "missing"
     except OSError:
         return "skipped"
+    mode = current.st_mode
     if stat_module.S_ISLNK(mode) or stat_module.S_ISREG(mode):
+        try:
+            latest = path.lstat()
+        except FileNotFoundError:
+            return "missing"
+        except OSError:
+            return "skipped"
+        if not source_identity_matches(latest, current):
+            return "skipped"
         path.unlink()
         return "removed"
     if stat_module.S_ISDIR(mode):
         if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
             raise AgentError("safe pool removal is unavailable")
+        try:
+            latest = path.lstat()
+        except FileNotFoundError:
+            return "missing"
+        except OSError:
+            return "skipped"
+        if not source_identity_matches(latest, current):
+            return "skipped"
         shutil.rmtree(path)
         return "removed"
     return "skipped"

@@ -6540,6 +6540,36 @@ class ServerHelpersTest(unittest.TestCase):
                     with self.assertRaisesRegex(AgentError, "could_not_read_agent_lease"):
                         claim_agent("a1")
 
+    def test_remove_agent_lease_path_rejects_regular_file_swap_before_unlink(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            lease = root / "agent.json"
+            original = root / "original-agent.json"
+            replacement = root / "replacement-agent.json"
+            lease.write_text("expected lease\n", encoding="utf-8")
+            replacement.write_text("foreign data\n", encoding="utf-8")
+            real_lstat = Path.lstat
+            swapped = False
+
+            def swap_after_first_lstat():
+                nonlocal swapped
+                result = real_lstat(lease)
+                if not swapped:
+                    lease.rename(original)
+                    replacement.rename(lease)
+                    swapped = True
+                return result
+
+            with patch.object(Path, "lstat", side_effect=swap_after_first_lstat):
+                with self.assertRaisesRegex(AgentError, "agent lease path changed unexpectedly"):
+                    server_module.remove_agent_lease_path(lease)
+
+            self.assertTrue(swapped)
+            self.assertEqual(original.read_text(encoding="utf-8"), "expected lease\n")
+            self.assertEqual(lease.read_text(encoding="utf-8"), "foreign data\n")
+
     def test_agent_release_does_not_delete_newly_claimed_lease(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -12303,6 +12333,40 @@ class AgentPoolManagementTest(unittest.TestCase):
 
             self.assertTrue((backup / "sentinel").is_file())
             self.assertFalse((replacement / "sentinel").exists())
+
+    def test_remove_agent_pool_entry_rejects_directory_swap_before_rmtree(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            target = root / "a1"
+            original = root / "original-a1"
+            outside = root / "outside"
+            target.mkdir()
+            (target / "keep.txt").write_text("managed\n", encoding="utf-8")
+            outside.mkdir()
+            secret = outside / "secret.txt"
+            secret.write_text("external-secret\n", encoding="utf-8")
+            real_lstat = Path.lstat
+            swapped = False
+
+            def swap_after_first_lstat():
+                nonlocal swapped
+                result = real_lstat(target)
+                if not swapped:
+                    target.rename(original)
+                    outside.rename(target)
+                    swapped = True
+                return result
+
+            with patch.object(Path, "lstat", side_effect=swap_after_first_lstat):
+                result = server_module.remove_agent_pool_entry(target)
+
+            self.assertTrue(swapped)
+            self.assertEqual(result, "skipped")
+            self.assertTrue((target / "secret.txt").exists())
+            self.assertEqual((target / "secret.txt").read_text(encoding="utf-8"), "external-secret\n")
+            self.assertEqual((original / "keep.txt").read_text(encoding="utf-8"), "managed\n")
 
     def test_agent_pool_destroy_requires_regular_marker_without_path_leak(self) -> None:
         from codex_master import server as server_module
