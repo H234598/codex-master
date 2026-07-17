@@ -1575,41 +1575,54 @@ def replace_private_text(path: Path, text: str, mode: int = 0o600) -> None:
 
 def read_private_regular_text(path: Path, max_bytes: int, error_text: str) -> str:
     max_bytes = max(1, int(max_bytes))
+    parent_fd = -1
     try:
-        current_stat = path.lstat()
-    except OSError as exc:
+        parent_stat = path.parent.lstat()
+        parent_fd = open_directory_no_follow_matching(
+            path.parent,
+            parent_stat,
+            error_text=error_text,
+            changed_text=error_text,
+        )
+        current_stat = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+    except (AgentError, OSError) as exc:
+        if parent_fd >= 0:
+            os.close(parent_fd)
         raise AgentError(error_text) from exc
-    if (
-        not stat_module.S_ISREG(current_stat.st_mode)
-        or getattr(current_stat, "st_nlink", 1) > 1
-        or current_stat.st_size > max_bytes
-    ):
-        raise AgentError(error_text)
-
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = -1
     try:
-        fd = os.open(path, flags)
-        opened_stat = os.fstat(fd)
         if (
-            not source_identity_matches(opened_stat, current_stat)
-            or not stat_module.S_ISREG(opened_stat.st_mode)
-            or getattr(opened_stat, "st_nlink", 1) > 1
-            or opened_stat.st_size > max_bytes
+            not stat_module.S_ISREG(current_stat.st_mode)
+            or getattr(current_stat, "st_nlink", 1) > 1
+            or current_stat.st_size > max_bytes
         ):
             raise AgentError(error_text)
-        with os.fdopen(fd, "rb") as fh:
-            fd = -1
-            raw = fh.read(max_bytes + 1)
-    except AgentError:
-        raise
-    except OSError as exc:
-        raise AgentError(error_text) from exc
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = -1
+        try:
+            fd = os.open(path.name, flags, dir_fd=parent_fd)
+            opened_stat = os.fstat(fd)
+            if (
+                not source_identity_matches(opened_stat, current_stat)
+                or not stat_module.S_ISREG(opened_stat.st_mode)
+                or getattr(opened_stat, "st_nlink", 1) > 1
+                or opened_stat.st_size > max_bytes
+            ):
+                raise AgentError(error_text)
+            with os.fdopen(fd, "rb") as fh:
+                fd = -1
+                raw = fh.read(max_bytes + 1)
+        except AgentError:
+            raise
+        except OSError as exc:
+            raise AgentError(error_text) from exc
+        finally:
+            if fd >= 0:
+                os.close(fd)
     finally:
-        if fd >= 0:
-            os.close(fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
     if len(raw) > max_bytes:
         raise AgentError(error_text)
     try:

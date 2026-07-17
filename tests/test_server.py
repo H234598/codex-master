@@ -330,7 +330,11 @@ class ServerHelpersTest(unittest.TestCase):
 
             def swap_before_open(candidate, flags, *args, **kwargs):
                 nonlocal swapped
-                if not swapped and isinstance(candidate, (str, bytes, Path)) and Path(candidate) == path:
+                target_open = isinstance(candidate, (str, bytes, Path)) and (
+                    Path(candidate) == path
+                    or (kwargs.get("dir_fd") is not None and Path(candidate) == Path(path.name))
+                )
+                if not swapped and target_open:
                     path.rename(original)
                     replacement.rename(path)
                     swapped = True
@@ -342,6 +346,37 @@ class ServerHelpersTest(unittest.TestCase):
 
             self.assertTrue(swapped)
             self.assertEqual(original.read_text(encoding="utf-8"), "expected = true\n")
+
+    def test_read_private_regular_text_fails_closed_after_parent_swap(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            managed = root / "managed"
+            outside = root / "outside"
+            managed.mkdir()
+            outside.mkdir()
+            path = managed / "config.toml"
+            path.write_text("expected = true\n", encoding="utf-8")
+            (outside / path.name).write_text("forged = true\n", encoding="utf-8")
+            real_open = server_module.open_directory_no_follow_matching
+            swapped = False
+
+            def swap_before_open(candidate: Path, *args: Any, **kwargs: Any) -> int:
+                nonlocal swapped
+                if not swapped:
+                    managed.rename(root / "managed-original")
+                    outside.rename(managed)
+                    swapped = True
+                return real_open(candidate, *args, **kwargs)
+
+            with patch.object(
+                server_module, "open_directory_no_follow_matching", side_effect=swap_before_open
+            ):
+                with self.assertRaisesRegex(AgentError, "read failed"):
+                    server_module.read_private_regular_text(path, 1024, "read failed")
+
+        self.assertTrue(swapped)
 
     def test_read_log_tail_rejects_regular_file_swap_before_open(self) -> None:
         from codex_master import server as server_module
