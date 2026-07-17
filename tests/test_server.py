@@ -1805,6 +1805,19 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["response_found"])
         self.assertTrue(result["required_tool_available"])
 
+    def test_mcp_tools_list_probe_result_accepts_case_insensitive_content_length(self) -> None:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"tools": [{"name": "master_app_bridge_status"}]},
+        }
+        encoded = json.dumps(payload, separators=(",", ":"))
+
+        result = mcp_tools_list_probe_result(f"content-length: {len(encoded)}\r\n\r\n{encoded}", "master_app_bridge_status")
+
+        self.assertTrue(result["response_found"])
+        self.assertTrue(result["required_tool_available"])
+
     def test_mcp_tools_list_probe_result_rejects_embedded_json(self) -> None:
         output = (
             'Content-Length: 123\r\n\r\n{"jsonrpc":"2.0","id":2,'
@@ -2443,6 +2456,13 @@ class ServerHelpersTest(unittest.TestCase):
         data = b"\n  \n" + json.dumps(message).encode("utf-8") + b"\n"
 
         with patch("sys.stdin", FakeStdin(data)):
+            self.assertEqual(read_message(), message)
+
+    def test_read_message_accepts_case_insensitive_content_length(self) -> None:
+        message = {"jsonrpc": "2.0", "id": 1, "method": "resources/list"}
+        body = json.dumps(message).encode("utf-8")
+
+        with patch("sys.stdin", FakeStdin(b"content-length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body)):
             self.assertEqual(read_message(), message)
 
     def test_serve_mcp_maps_parse_and_invalid_request_errors(self) -> None:

@@ -1074,7 +1074,7 @@ def iter_mcp_json_messages(text: str) -> list[dict[str, Any]]:
         remaining = remaining.lstrip()
         if not remaining:
             break
-        if remaining.startswith("Content-Length:"):
+        if remaining.lower().startswith("content-length:"):
             separator = "\r\n\r\n"
             header_end = remaining.find(separator)
             sep_len = len(separator)
@@ -10212,7 +10212,7 @@ def read_message() -> dict[str, Any] | None:
             return None
         if first.strip():
             break
-    if first.startswith(b"Content-Length:"):
+    if first.lstrip().lower().startswith(b"content-length:"):
         length = parse_content_length(first)
         header_bytes = len(first)
         while True:
