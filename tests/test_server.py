@@ -3873,6 +3873,42 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("@filename", payload_text)
         self.assertNotIn(str(tmp_path), payload_text)
 
+    def test_agent_status_uses_visible_tui_screen_not_scrollback(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            agent = {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}
+            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
+                "codex_master.server.ensure_state"
+            ), patch(
+                "codex_master.server.agent_home_process_summary",
+                return_value={
+                    "process_count": 1,
+                    "managed_process_count": 1,
+                    "external_process_count": 0,
+                    "external_processes": [],
+                    "external_processes_truncated": False,
+                    "raw_output": "not_returned",
+                },
+            ), patch("codex_master.server.tmux_alive", return_value=True), patch(
+                "codex_master.server.pane_pid", return_value=123
+            ), patch(
+                "codex_master.server.pane_tail",
+                side_effect=[
+                    "Update available!\n› 1. Update now\n2. Skip\nPress enter to continue\n› Ready\n",
+                    "› Ready\n",
+                ],
+            ), patch("codex_master.server.read_meta", return_value={}), patch(
+                "codex_master.server.latest_assignment_summary", return_value=None
+            ), patch("codex_master.server.agent_auth_status", return_value={}), patch(
+                "codex_master.server.agent_lease_status", return_value={}
+            ), patch("codex_master.server.codex_usage_watchdog_status", return_value={}):
+                status = server_module.status_agent("a")
+
+        self.assertEqual(status["tui_context"]["state"], "unknown")
+        self.assertEqual(status["response_state"]["state"], "running_no_output_observed")
+
     @patch("codex_master.server.time.sleep")
     @patch("codex_master.server.status_agent")
     def test_wait_agent_reports_activity_without_output(self, mock_status_agent, mock_sleep) -> None:
@@ -7017,6 +7053,52 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(summary["external_processes"][0]["raw_output"], "not_returned")
         self.assertNotIn(str(home), json.dumps(summary, sort_keys=True))
 
+    def test_agent_home_process_summary_ignores_zombie_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "agent-home"
+            home.mkdir()
+            proc_root = Path(tmpdir) / "proc"
+            zombie = proc_root / "100"
+            zombie.mkdir(parents=True)
+            zombie.joinpath("environ").write_bytes(f"CODEX_HOME={home}\0".encode("utf-8"))
+            zombie.joinpath("status").write_text(
+                "Name:\tcodex\nState:\tZ (zombie)\nPPid:\t1\n", encoding="utf-8"
+            )
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                summary = agent_home_process_summary("a", proc_root)
+
+        self.assertEqual(summary["process_count"], 0)
+        self.assertEqual(summary["managed_process_count"], 0)
+        self.assertEqual(summary["external_process_count"], 0)
+
+    def test_agent_home_process_summary_resolves_relative_codex_home_from_process_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            work = root / "work"
+            home = work / "agent-home"
+            home.mkdir(parents=True)
+            proc_root = root / "proc"
+            process = proc_root / "100"
+            process.mkdir(parents=True)
+            process.joinpath("environ").write_bytes(b"CODEX_HOME=agent-home\0")
+            process.joinpath("status").write_text(
+                "Name:\tcodex\nState:\tS (sleeping)\nPPid:\t1\n", encoding="utf-8"
+            )
+            process.joinpath("cwd").symlink_to(work, target_is_directory=True)
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                summary = agent_home_process_summary("a", proc_root)
+
+        self.assertEqual(summary["process_count"], 1)
+        self.assertEqual(summary["external_process_count"], 1)
+
     def test_agent_home_process_summary_handles_unreadable_proc_root(self) -> None:
         proc_root = Mock(spec=Path)
         proc_root.exists.return_value = True
@@ -7074,6 +7156,45 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIsNotNone(processes)
         self.assertEqual([item["pid"] for item in processes], [100])
 
+    @patch("codex_master.server.read_proc_environ", return_value=None)
+    def test_pool_home_processes_uses_cwd_when_environment_is_unreadable(self, _mock_read_proc_environ) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home = root / "pool" / "a1"
+            home.mkdir(parents=True)
+            proc_root = root / "proc"
+            process = proc_root / "100"
+            process.mkdir(parents=True)
+            (process / "status").write_text("Name:\tsleep\nState:\tS (sleeping)\nPPid:\t1\n", encoding="utf-8")
+            (process / "cwd").symlink_to(home, target_is_directory=True)
+
+            processes = server_module.pool_home_processes(home, proc_root)
+
+        self.assertIsNotNone(processes)
+        self.assertEqual([item["pid"] for item in processes], [100])
+
+    def test_pool_home_processes_resolves_relative_codex_home_from_process_cwd(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            work = root / "work"
+            home = work / "a1"
+            home.mkdir(parents=True)
+            proc_root = root / "proc"
+            process = proc_root / "100"
+            process.mkdir(parents=True)
+            (process / "environ").write_bytes(b"CODEX_HOME=a1\0")
+            (process / "status").write_text("Name:\tsleep\nState:\tS (sleeping)\nPPid:\t1\n", encoding="utf-8")
+            (process / "cwd").symlink_to(work, target_is_directory=True)
+
+            processes = server_module.pool_home_processes(home, proc_root)
+
+        self.assertIsNotNone(processes)
+        self.assertEqual([item["pid"] for item in processes], [100])
+
     def test_agent_identity_guard_blocks_unavailable_process_scan(self) -> None:
         result = agent_identity_guard(
             False,
@@ -7088,6 +7209,20 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["state"], "blocked_process_scan_unavailable")
         self.assertIsNone(result["home_process_count"])
+
+    def test_agent_identity_guard_blocks_unmanaged_tmux_session(self) -> None:
+        result = agent_identity_guard(
+            True,
+            {
+                "process_count": 0,
+                "managed_process_count": 0,
+                "external_process_count": 0,
+                "raw_output": "not_returned",
+            },
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["state"], "blocked_tmux_session_without_managed_process")
 
     def test_same_path_text_handles_resolution_runtime_error(self) -> None:
         with patch("pathlib.Path.resolve", side_effect=RuntimeError("loop")):
@@ -7357,6 +7492,26 @@ class ServerHelpersTest(unittest.TestCase):
                 {"a": {"session": "session-a", "home": root, "runner": root / "codex"}},
                 clear=True,
             ), patch("codex_master.server.tmux_alive", return_value=True), patch(
+                "codex_master.server.agent_home_process_summary",
+                side_effect=[
+                    {
+                        "process_count": 1,
+                        "managed_process_count": 1,
+                        "external_process_count": 0,
+                        "external_processes": [],
+                        "external_processes_truncated": False,
+                        "raw_output": "not_returned",
+                    },
+                    {
+                        "process_count": 0,
+                        "managed_process_count": 0,
+                        "external_process_count": 0,
+                        "external_processes": [],
+                        "external_processes_truncated": False,
+                        "raw_output": "not_returned",
+                    },
+                ],
+            ), patch(
                 "codex_master.server.run_tmux", side_effect=fake_kill
             ), patch(
                 "codex_master.server.release_agent", side_effect=release_after_claim_attempt
@@ -7417,6 +7572,16 @@ class ServerHelpersTest(unittest.TestCase):
                 {"a": {"session": "session-a", "home": root, "runner": root / "codex"}},
                 clear=True,
             ), patch("codex_master.server.tmux_alive", return_value=True), patch(
+                "codex_master.server.agent_home_process_summary",
+                return_value={
+                    "process_count": 1,
+                    "managed_process_count": 1,
+                    "external_process_count": 0,
+                    "external_processes": [],
+                    "external_processes_truncated": False,
+                    "raw_output": "not_returned",
+                },
+            ), patch(
                 "codex_master.server.claim_agent", side_effect=fake_claim
             ), patch("codex_master.server.run_tmux", side_effect=fake_interrupt), patch(
                 "codex_master.server.release_agent", side_effect=concurrent_release
@@ -7564,9 +7729,22 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(caught.exception.payload["error_code"], "agent_lease_held_by_other_client")
         self.assertEqual(current["holder"], "other_server")
 
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 1,
+            "managed_process_count": 1,
+            "external_process_count": 0,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.run_tmux")
-    def test_interrupt_force_does_not_replace_foreign_lease(self, mock_run_tmux, _mock_alive) -> None:
+    def test_interrupt_force_does_not_replace_foreign_lease(
+        self, mock_run_tmux, _mock_alive, _mock_processes
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             state = root / "state"
@@ -8209,9 +8387,22 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["ready"])
         self.assertTrue(result["update_prompt_dismissed"])
 
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 1,
+            "managed_process_count": 1,
+            "external_process_count": 0,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.run_tmux")
-    def test_interrupt_releases_fresh_lease_when_tmux_fails(self, mock_run_tmux, _mock_alive) -> None:
+    def test_interrupt_releases_fresh_lease_when_tmux_fails(
+        self, mock_run_tmux, _mock_alive, _mock_processes
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             mock_run_tmux.return_value = subprocess.CompletedProcess(
@@ -8242,7 +8433,27 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("SECRET_INTERRUPT_OUTPUT_SHOULD_NOT_RETURN", error_text)
         self.assertNotIn(tmpdir, error_text)
 
-    @patch("codex_master.server.agent_home_process_summary", return_value={"process_count": 0})
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        side_effect=[
+            {
+                "process_count": 1,
+                "managed_process_count": 1,
+                "external_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            },
+            {
+                "process_count": 0,
+                "managed_process_count": 0,
+                "external_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            },
+        ],
+    )
     @patch("codex_master.server.tmux_alive", side_effect=[True, False])
     @patch("codex_master.server.run_tmux")
     def test_interrupt_treats_session_vanishing_before_send_as_not_running(
@@ -8843,6 +9054,35 @@ class ServerHelpersTest(unittest.TestCase):
     @patch(
         "codex_master.server.agent_home_process_summary",
         return_value={
+            "process_count": 0,
+            "external_process_count": 0,
+            "managed_process_count": 0,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
+    def test_start_agent_rejects_tmux_session_without_managed_codex_process(
+        self, _mock_summary, _mock_tmux_alive, _mock_ensure_state
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            runner = root / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": root, "session": "test_session"}},
+                clear=False,
+            ):
+                with self.assertRaisesRegex(AgentError, "session identity could not be verified"):
+                    start_agent("a", cwd=tmpdir)
+
+    @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
             "process_count": None,
             "external_process_count": None,
             "managed_process_count": None,
@@ -9017,8 +9257,21 @@ class ServerHelpersTest(unittest.TestCase):
 
     @patch("codex_master.server.ensure_agent_lease_available")
     @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 1,
+            "managed_process_count": 1,
+            "external_process_count": 0,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
     @patch("codex_master.server.run_tmux")
-    def test_stop_agent_tmux_failure_is_data_sparse(self, mock_run_tmux, _mock_alive, _mock_lease) -> None:
+    def test_stop_agent_tmux_failure_is_data_sparse(
+        self, mock_run_tmux, _mock_processes, _mock_alive, _mock_lease
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             mock_run_tmux.return_value = subprocess.CompletedProcess(
                 ["tmux", "kill-session"],
@@ -9056,7 +9309,15 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.run_tmux",
                 return_value=subprocess.CompletedProcess(["tmux", "kill-session"], 0, "", ""),
             ), patch(
-                "codex_master.server.agent_home_process_summary", return_value={"process_count": 1}
+                "codex_master.server.agent_home_process_summary",
+                return_value={
+                    "process_count": 1,
+                    "managed_process_count": 1,
+                    "external_process_count": 0,
+                    "external_processes": [],
+                    "external_processes_truncated": False,
+                    "raw_output": "not_returned",
+                },
             ), patch("codex_master.server.release_agent") as mock_release:
                 with self.assertRaisesRegex(AgentError, "tmux stop failed"):
                     stop_agent("a")
@@ -9065,7 +9326,27 @@ class ServerHelpersTest(unittest.TestCase):
 
     @patch("codex_master.server.ensure_agent_lease_available")
     @patch("codex_master.server.tmux_alive", side_effect=[True, False])
-    @patch("codex_master.server.agent_home_process_summary", return_value={"process_count": 0})
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        side_effect=[
+            {
+                "process_count": 1,
+                "managed_process_count": 1,
+                "external_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            },
+            {
+                "process_count": 0,
+                "managed_process_count": 0,
+                "external_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            },
+        ],
+    )
     @patch("codex_master.server.run_tmux")
     def test_stop_agent_releases_lease_when_session_vanishes_before_kill(
         self, mock_run_tmux, _mock_processes, _mock_alive, _mock_lease
@@ -10400,6 +10681,16 @@ class ServerHelpersTest(unittest.TestCase):
             with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
                 "codex_master.server.tmux_alive", return_value=True
             ), patch(
+                "codex_master.server.agent_home_process_summary",
+                return_value={
+                    "process_count": 1,
+                    "managed_process_count": 1,
+                    "external_process_count": 0,
+                    "external_processes": [],
+                    "external_processes_truncated": False,
+                    "raw_output": "not_returned",
+                },
+            ), patch(
                 "codex_master.server.read_meta",
                 return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(home)},
             ), patch(
@@ -10426,6 +10717,16 @@ class ServerHelpersTest(unittest.TestCase):
             with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
                 "codex_master.server.tmux_alive", return_value=True
             ), patch(
+                "codex_master.server.agent_home_process_summary",
+                return_value={
+                    "process_count": 1,
+                    "managed_process_count": 1,
+                    "external_process_count": 0,
+                    "external_processes": [],
+                    "external_processes_truncated": False,
+                    "raw_output": "not_returned",
+                },
+            ), patch(
                 "codex_master.server.read_meta",
                 return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(home)},
             ), patch(
@@ -10448,6 +10749,16 @@ class ServerHelpersTest(unittest.TestCase):
             agent = {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}
             with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
                 "codex_master.server.tmux_alive", return_value=True
+            ), patch(
+                "codex_master.server.agent_home_process_summary",
+                return_value={
+                    "process_count": 1,
+                    "managed_process_count": 1,
+                    "external_process_count": 0,
+                    "external_processes": [],
+                    "external_processes_truncated": False,
+                    "raw_output": "not_returned",
+                },
             ), patch(
                 "codex_master.server.read_meta",
                 return_value={
@@ -10821,11 +11132,22 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(too_many_context_items["result"]["isError"])
         self.assertIn("context must contain at most", too_many_context_items["result"]["content"][0]["text"])
 
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 1,
+            "managed_process_count": 1,
+            "external_process_count": 0,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.run_tmux")
     @patch("codex_master.server.wait_agent_input_ready")
     def test_agent_assign_fails_closed_when_tui_input_is_not_ready(
-        self, mock_wait_ready, mock_run_tmux, _mock_alive
+        self, mock_wait_ready, mock_run_tmux, _mock_alive, _mock_processes
     ) -> None:
         mock_wait_ready.return_value = {
             "ready": False,
@@ -10880,11 +11202,22 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(ledger["record_count"], 0)
         mock_run_tmux.assert_not_called()
 
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 1,
+            "managed_process_count": 1,
+            "external_process_count": 0,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.run_tmux")
     @patch("codex_master.server.wait_agent_input_ready")
     def test_agent_report_request_fails_closed_when_tui_input_is_not_ready(
-        self, mock_wait_ready, mock_run_tmux, _mock_alive
+        self, mock_wait_ready, mock_run_tmux, _mock_alive, _mock_processes
     ) -> None:
         mock_wait_ready.return_value = {
             "ready": False,
@@ -10944,6 +11277,29 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(response["result"]["isError"])
         self.assertIn("text must not exceed", response["result"]["content"][0]["text"])
 
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 0,
+            "managed_process_count": 0,
+            "external_process_count": 0,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
+    @patch("codex_master.server.wait_agent_input_ready")
+    @patch("codex_master.server.run_tmux")
+    def test_send_agent_rejects_unmanaged_tmux_session(
+        self, mock_run_tmux, mock_wait_ready, _mock_processes, _mock_alive
+    ) -> None:
+        with self.assertRaisesRegex(AgentError, "session identity could not be verified"):
+            send_agent("a", "do not send")
+
+        mock_wait_ready.assert_not_called()
+        mock_run_tmux.assert_not_called()
+
     def test_send_agent_uses_bracketed_paste_for_multiline_text(self) -> None:
         calls = []
 
@@ -10952,6 +11308,16 @@ class ServerHelpersTest(unittest.TestCase):
             return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
         with patch("codex_master.server.tmux_alive", return_value=True), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={
+                "process_count": 1,
+                "managed_process_count": 1,
+                "external_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            },
+        ), patch(
             "codex_master.server.pane_tail", return_value="› Ready"
         ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux):
             result = send_agent("a", "line 1\nline 2", enter=True)
@@ -10975,6 +11341,16 @@ class ServerHelpersTest(unittest.TestCase):
             return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
         with patch("codex_master.server.tmux_alive", return_value=True), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={
+                "process_count": 1,
+                "managed_process_count": 1,
+                "external_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            },
+        ), patch(
             "codex_master.server.pane_tail", return_value="› Ready"
         ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux):
             result = send_agent("a", "single line", enter=False)
@@ -11004,6 +11380,16 @@ class ServerHelpersTest(unittest.TestCase):
             return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
         with patch("codex_master.server.tmux_alive", return_value=True), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={
+                "process_count": 1,
+                "managed_process_count": 1,
+                "external_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            },
+        ), patch(
             "codex_master.server.pane_tail", return_value="› Ready"
         ), patch("codex_master.server.agent_lifecycle_lock", return_value=FakeLock()), patch(
             "codex_master.server.run_tmux", side_effect=fake_run_tmux
@@ -11041,6 +11427,16 @@ class ServerHelpersTest(unittest.TestCase):
             return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
         with patch("codex_master.server.tmux_alive", return_value=True), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={
+                "process_count": 1,
+                "managed_process_count": 1,
+                "external_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            },
+        ), patch(
             "codex_master.server.wait_agent_input_ready", side_effect=fake_ready
         ), patch("codex_master.server.agent_lifecycle_lock", return_value=FakeLock()), patch(
             "codex_master.server.run_tmux", side_effect=fake_run_tmux
@@ -11074,6 +11470,16 @@ class ServerHelpersTest(unittest.TestCase):
             return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
         with patch("codex_master.server.tmux_alive", return_value=True), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={
+                "process_count": 1,
+                "managed_process_count": 1,
+                "external_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            },
+        ), patch(
             "codex_master.server.wait_agent_input_ready", return_value={"ready": True}
         ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux), patch(
             "codex_master.server.time.time", return_value=1234.0
@@ -11095,6 +11501,16 @@ class ServerHelpersTest(unittest.TestCase):
             return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
         with patch("codex_master.server.tmux_alive", return_value=True), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={
+                "process_count": 1,
+                "managed_process_count": 1,
+                "external_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            },
+        ), patch(
             "codex_master.server.pane_tail", return_value="MCP startup incomplete"
         ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux):
             with self.assertRaisesRegex(AgentInputNotReadyError, "input is not ready") as raised:
@@ -11134,6 +11550,16 @@ class ServerHelpersTest(unittest.TestCase):
                         return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
                     with patch("codex_master.server.tmux_alive", return_value=True), patch(
+                        "codex_master.server.agent_home_process_summary",
+                        return_value={
+                            "process_count": 1,
+                            "managed_process_count": 1,
+                            "external_process_count": 0,
+                            "external_processes": [],
+                            "external_processes_truncated": False,
+                            "raw_output": "not_returned",
+                        },
+                    ), patch(
                         "codex_master.server.pane_tail", return_value="› Ready"
                     ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux):
                         with self.assertRaisesRegex(AgentError, expected_error) as raised:
@@ -11262,9 +11688,22 @@ class CliLifecycleTest(unittest.TestCase):
         )
 
     @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 1,
+            "managed_process_count": 1,
+            "external_process_count": 0,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
     @patch("codex_master.server.wait_agent_input_ready")
     @patch("codex_master.server.run_tmux")
-    def test_send_agent_success_response_is_data_sparse(self, mock_run_tmux, mock_ready, _mock_alive) -> None:
+    def test_send_agent_success_response_is_data_sparse(
+        self, mock_run_tmux, mock_ready, _mock_processes, _mock_alive
+    ) -> None:
         mock_ready.return_value = {
             "ready": True,
             "poll_count": 1,
@@ -11288,8 +11727,21 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertNotIn("SECRET_OUTPUT", json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 1,
+            "managed_process_count": 1,
+            "external_process_count": 0,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
     @patch("codex_master.server.run_tmux")
-    def test_interrupt_agent_success_response_is_data_sparse(self, mock_run_tmux, _mock_alive) -> None:
+    def test_interrupt_agent_success_response_is_data_sparse(
+        self, mock_run_tmux, _mock_processes, _mock_alive
+    ) -> None:
         mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "SECRET_OUTPUT", "SECRET_ERROR")
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

@@ -3151,6 +3151,15 @@ def read_proc_cmdline(pid_dir: Path) -> list[str]:
     return [item.decode("utf-8", errors="replace") for item in raw.split(b"\0") if item]
 
 
+def resolve_proc_cwd(pid_dir: Path) -> tuple[Path | None, bool]:
+    try:
+        return (pid_dir / "cwd").resolve(strict=True), False
+    except FileNotFoundError:
+        return None, False
+    except (OSError, RuntimeError):
+        return None, True
+
+
 def same_path_text(left: str, right: Path) -> bool:
     if not isinstance(left, str) or not left.strip():
         return False
@@ -3189,6 +3198,8 @@ def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[di
         if not pid_dir.name.isdigit():
             continue
         status = read_proc_status(pid_dir)
+        if status.get("State", "").startswith("Z"):
+            continue
         uid_parts = status.get("Uid", "").split()
         if uid_parts and uid_parts[0].isdigit() and int(uid_parts[0]) != os.getuid():
             continue
@@ -3208,7 +3219,23 @@ def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[di
                 return None
             # ponytail: opaque non-Codex processes skipped; privileged proc access needed to detect arbitrary same-home users.
             continue
-        if not same_path_text(env.get("CODEX_HOME", ""), home):
+        configured_home = env.get("CODEX_HOME", "")
+        if configured_home:
+            try:
+                configured_path = Path(configured_home).expanduser()
+                if not configured_path.is_absolute():
+                    current_dir, unavailable = resolve_proc_cwd(pid_dir)
+                    if unavailable:
+                        return None
+                    if current_dir is None:
+                        continue
+                    configured_path = current_dir / configured_path
+                matches_home = configured_path.resolve(strict=False) == home.expanduser().resolve(strict=False)
+            except (OSError, RuntimeError):
+                matches_home = False
+        else:
+            matches_home = False
+        if not matches_home:
             continue
         managed = env.get("CODEX_AGENT_MCP") == "1" or env.get("CODEX_MASTER_MCP") == "1"
         ppid_parts = status.get("PPid", "0").split()
@@ -3278,8 +3305,10 @@ def pool_home_processes(home: Path, proc_root: Path = Path("/proc")) -> list[dic
         if uid_parts and uid_parts[0].isdigit() and int(uid_parts[0]) != os.getuid():
             continue
         env = read_proc_environ(pid_dir)
+        environment_unreadable = env is None
         matches_home = False
         managed = False
+        current_dir: Path | None = None
         if env is None:
             name = (status.get("Name") or "").lower()
             argv = read_proc_cmdline(pid_dir)
@@ -3293,24 +3322,33 @@ def pool_home_processes(home: Path, proc_root: Path = Path("/proc")) -> list[dic
             )
             if codex_like:
                 return None
-            continue
-        if env is not None:
+        else:
             configured_home = env.get("CODEX_HOME", "")
             if configured_home:
                 try:
+                    configured_path = Path(configured_home).expanduser()
+                    if not configured_path.is_absolute():
+                        current_dir, unavailable = resolve_proc_cwd(pid_dir)
+                        if unavailable:
+                            return None
+                        if current_dir is None:
+                            continue
+                        configured_path = current_dir / configured_path
                     matches_home = path_is_within(
-                        Path(configured_home).expanduser().resolve(strict=False), resolved_home
+                        configured_path.resolve(strict=False), resolved_home
                     )
                 except (OSError, RuntimeError, ValueError):
                     matches_home = False
             managed = env.get("CODEX_AGENT_MCP") == "1" or env.get("CODEX_MASTER_MCP") == "1"
         if not matches_home:
-            try:
-                current_dir = (pid_dir / "cwd").resolve(strict=True)
-            except FileNotFoundError:
+            if current_dir is None:
+                current_dir, unavailable = resolve_proc_cwd(pid_dir)
+                if unavailable:
+                    if environment_unreadable:
+                        continue
+                    return None
+            if current_dir is None:
                 continue
-            except (OSError, RuntimeError):
-                return None
             matches_home = path_is_within(current_dir, resolved_home)
         if not matches_home:
             continue
@@ -3350,6 +3388,9 @@ def agent_identity_guard(running: bool, process_summary: dict[str, Any]) -> dict
     elif not running and managed_process_count > 0:
         state = "blocked_orphaned_managed_home_process"
         ok = False
+    elif running and managed_process_count == 0:
+        state = "blocked_tmux_session_without_managed_process"
+        ok = False
     elif running:
         state = "managed_session_running"
         ok = True
@@ -3366,6 +3407,21 @@ def agent_identity_guard(running: bool, process_summary: dict[str, Any]) -> dict
         "home_external_process_count": external_process_count,
         "raw_output": "not_returned",
     }
+
+
+def require_managed_tmux_session(agent: str, process_summary: dict[str, Any] | None = None) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
+    summary = process_summary if process_summary is not None else agent_home_process_summary(agent)
+    guard = agent_identity_guard(True, summary)
+    if guard["ok"]:
+        return guard
+    if guard["state"] == "blocked_process_scan_unavailable":
+        raise AgentError(f"agent {agent} CODEX_HOME process scan is unavailable; retry before using tmux session")
+    if guard["state"] == "blocked_external_home_user":
+        raise AgentError(f"agent {agent} CODEX_HOME is also used by an external process; stop it before using tmux session")
+    raise AgentError(
+        f"agent {agent} tmux session identity could not be verified; no managed CODEX_HOME process was detected"
+    )
 
 
 def empty_codex_process_summary(home_kind_counts: dict[str, int]) -> dict[str, Any]:
@@ -3576,6 +3632,7 @@ def _start_agent_unlocked(
                 f"agent {agent} is already running in tmux, but CODEX_HOME is also used by "
                 f"{process_summary['external_process_count']} external process(es); stop the external process(es) first"
             )
+        require_managed_tmux_session(agent, process_summary)
         return {
             "agent": agent,
             "status": "already_running",
@@ -3841,6 +3898,7 @@ def _stop_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]:
     session = cfg["session"]
     was_running = tmux_alive(session)
     if was_running:
+        require_managed_tmux_session(agent)
         ensure_agent_lease_available(agent, force=force)
     if was_running:
         cp = run_tmux(["kill-session", "-t", session], check=False)
@@ -4453,7 +4511,8 @@ def status_agent(agent: str) -> dict[str, Any]:
     latest_assignment = latest_assignment_summary(agent)
     auth = agent_auth_status(agent)
     pane_text = pane_tail(agent, MAX_TAIL_LINES) if running else ""
-    tui_context = classify_tui_context(pane_text, running)
+    visible_pane_text = pane_tail(agent, 24, visible_only=True) if running else ""
+    tui_context = classify_tui_context(visible_pane_text, running)
     limit_state = agent_limit_state(
         agent,
         running=running,
@@ -5754,6 +5813,7 @@ def ensure_assignment_session_model(
     cfg = AGENTS[agent]
     if not tmux_alive(cfg["session"]):
         raise AgentError(f"agent {agent} is not running")
+    require_managed_tmux_session(agent)
     meta = read_meta(agent)
     current_model = meta.get("model") or DEFAULT_AGENT_MODEL
     current_reasoning_effort = meta.get("model_reasoning_effort") or (
@@ -8548,6 +8608,7 @@ def send_agent(
     with agent_lifecycle_lock(agent):
         if not tmux_alive(session):
             raise AgentError(f"agent {agent} is not running")
+        require_managed_tmux_session(agent)
         readiness = wait_agent_input_ready(agent, ready_timeout_seconds)
         if not readiness["ready"]:
             raise AgentInputNotReadyError(
@@ -8605,6 +8666,7 @@ def _interrupt_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]
     session = cfg["session"]
     if not tmux_alive(session):
         raise AgentError(f"agent {agent} is not running")
+    require_managed_tmux_session(agent)
     if force:
         lease = ensure_agent_lease_available(agent, force=True)
         release_on_failure = False
