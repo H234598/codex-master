@@ -4177,6 +4177,25 @@ class ServerHelpersTest(unittest.TestCase):
                 session_started_at="2026-06-07T09:00:00+00:00",
             )
         )
+        lease_marker = {**marker, "lease_id": "lease-old"}
+        self.assertTrue(
+            watchdog_marker_matches(
+                lease_marker,
+                action="interrupt",
+                assignment_id="old-assignment",
+                session_started_at="2026-06-07T09:00:00+00:00",
+                lease_id="lease-old",
+            )
+        )
+        self.assertFalse(
+            watchdog_marker_matches(
+                lease_marker,
+                action="interrupt",
+                assignment_id="old-assignment",
+                session_started_at="2026-06-07T09:00:00+00:00",
+                lease_id="lease-new",
+            )
+        )
         self.assertFalse(
             watchdog_marker_matches(
                 marker,
@@ -4500,6 +4519,61 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(result["results"][0]["watchdog_state"], "action_sent")
         mock_action.assert_called_once_with("a1", "interrupt", release_after_interrupt=True)
+
+    def test_fleet_watchdog_does_not_reuse_marker_after_lease_changes(self) -> None:
+        status = {
+            "agent": "a",
+            "running": True,
+            "lease": {
+                "state": "held",
+                "held_by_this_server": True,
+                "lease_id": "lease-new",
+                "raw_output": "not_returned",
+            },
+            "response_state": {"state": "running_recent_output"},
+            "raw_log_idle_seconds": 240,
+            "raw_log_bytes": 100,
+            "raw_log_updated_at_utc": "1970-01-01T00:12:00+00:00",
+            "started_at_utc": "2026-07-17T09:00:00+00:00",
+            "last_assignment": {"assignment_id": "assign-1", "created_at_utc": "2026-07-17T09:58:00+00:00"},
+        }
+        marker = {
+            "watchdog": {
+                "phase": "report_requested",
+                "requested_at_utc": "1970-01-01T00:13:00+00:00",
+                "assignment_id": "assign-1",
+                "planned_action": "interrupt",
+                "started_at_utc": "2026-07-17T09:00:00+00:00",
+                "lease_id": "lease-old",
+                "raw_log_bytes": 100,
+                "raw_log_updated_at_utc": "1970-01-01T00:12:00+00:00",
+                "release_lease_after_action": True,
+            }
+        }
+        report = {
+            "status": "report_requested",
+            "submitted": True,
+            "assignment_id": "assign-1",
+            "send": {"status": "sent"},
+        }
+        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "codex_master.server.time.time", return_value=1000.0
+        ), patch("codex_master.server.status_agent", return_value=status), patch(
+            "codex_master.server.read_meta", return_value=marker
+        ), patch("codex_master.server.write_meta") as mock_write_meta, patch(
+            "codex_master.server.request_agent_report", return_value=report
+        ) as mock_report, patch("codex_master.server.interrupt_agent") as mock_interrupt, patch(
+            "codex_master.server.release_agent"
+        ) as mock_release:
+            result = fleet_watchdog("a")
+
+        payload = result["results"][0]
+        self.assertEqual(payload["watchdog_state"], "report_requested")
+        mock_report.assert_called_once()
+        mock_interrupt.assert_not_called()
+        mock_release.assert_not_called()
+        written_marker = mock_write_meta.call_args.args[1]["watchdog"]
+        self.assertEqual(written_marker["lease_id"], "lease-new")
 
     def test_fleet_watchdog_releases_watchdog_lease_when_activity_recovers(self) -> None:
         status = {

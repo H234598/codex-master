@@ -162,6 +162,7 @@ GIT_BASE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@{}~^+-]{0,199}$")
 GIT_BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9@][A-Za-z0-9@._+-]{0,199}$")
 ROUTING_CONTEXT_ID_RE = re.compile(r"^[A-Za-z0-9_.:@+-]{1,128}$")
 CODEX_USAGE_ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+LEASE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 MAX_POOL_AGENTS = 1000
 MAX_POOL_SERIES = 26
 MAX_POOL_SHARED_ASSETS = 40
@@ -2028,6 +2029,7 @@ def public_agent_lease(agent: str, record: dict[str, Any] | None = None) -> dict
             "state": "unclaimed",
             "holder": "none",
             "held_by_this_server": False,
+            "lease_id": None,
             "expires_at_utc": None,
             "seconds_remaining": 0,
             "ttl_seconds": DEFAULT_AGENT_LEASE_SECONDS,
@@ -2042,6 +2044,9 @@ def public_agent_lease(agent: str, record: dict[str, Any] | None = None) -> dict
         expires_at = 0.0
         valid_expiry = False
     ttl_seconds = record.get("ttl_seconds")
+    lease_id = record.get("lease_id")
+    if not isinstance(lease_id, str) or not LEASE_ID_RE.fullmatch(lease_id):
+        lease_id = None
     active = expires_at > now
     held_by_this_server = active and record.get("owner") == SERVER_INSTANCE_ID
     holder = "this_server" if held_by_this_server else "other_server" if active else "none"
@@ -2050,6 +2055,7 @@ def public_agent_lease(agent: str, record: dict[str, Any] | None = None) -> dict
         "state": "held" if active else "expired",
         "holder": holder,
         "held_by_this_server": held_by_this_server,
+        "lease_id": lease_id,
         "expires_at_utc": lease_utc(expires_at) if valid_expiry else None,
         "seconds_remaining": max(0, int(expires_at - now)) if active else 0,
         "ttl_seconds": ttl_seconds if isinstance(ttl_seconds, int) and not isinstance(ttl_seconds, bool) else None,
@@ -2165,6 +2171,7 @@ def write_agent_lease(agent: str, ttl_seconds: int) -> dict[str, Any]:
     record = {
         "agent": agent,
         "owner": SERVER_INSTANCE_ID,
+        "lease_id": uuid.uuid4().hex,
         "created_at_utc": _dt.datetime.fromtimestamp(now, _dt.timezone.utc).isoformat(),
         "updated_at_utc": _dt.datetime.fromtimestamp(now, _dt.timezone.utc).isoformat(),
         "expires_at_epoch": expires_at,
@@ -4806,10 +4813,14 @@ def watchdog_effective_idle(status: dict[str, Any], *, now: float | None = None)
 
 
 def watchdog_marker_lease_matches(
-    marker: dict[str, Any], *, assignment_id: Any, session_started_at: Any
+    marker: dict[str, Any], *, assignment_id: Any, session_started_at: Any, lease_id: Any = None
 ) -> bool:
     if marker.get("phase") != "report_requested" or marker.get("assignment_id") != assignment_id:
         return False
+    marker_lease_id = marker.get("lease_id")
+    if marker_lease_id is not None or lease_id is not None:
+        if not isinstance(marker_lease_id, str) or not isinstance(lease_id, str) or marker_lease_id != lease_id:
+            return False
     marker_started_at = parse_utc_timestamp(marker.get("started_at_utc"))
     current_started_at = parse_utc_timestamp(session_started_at)
     session_identity_present = marker.get("started_at_utc") is not None or session_started_at is not None
@@ -4826,6 +4837,7 @@ def watchdog_marker_matches(
     action: str,
     assignment_id: Any,
     session_started_at: Any = None,
+    lease_id: Any = None,
     now: float | None = None,
 ) -> bool:
     if marker.get("planned_action") != action:
@@ -4834,6 +4846,7 @@ def watchdog_marker_matches(
         marker,
         assignment_id=assignment_id,
         session_started_at=session_started_at,
+        lease_id=lease_id,
     ):
         return False
     requested_at = parse_utc_timestamp(marker.get("requested_at_utc"))
@@ -4970,6 +4983,7 @@ def _watchdog_agent_unlocked(
                 marker,
                 assignment_id=assignment_id,
                 session_started_at=status.get("started_at_utc"),
+                lease_id=lease.get("lease_id"),
             )
             home_process_count = status.get("home_process_count")
             home_processes_clear = (
@@ -5006,6 +5020,7 @@ def _watchdog_agent_unlocked(
                 marker,
                 assignment_id=assignment_id,
                 session_started_at=status.get("started_at_utc"),
+                lease_id=lease.get("lease_id"),
             )
             if (
                 marker.get("release_lease_after_action") is True
@@ -5026,6 +5041,7 @@ def _watchdog_agent_unlocked(
         marker,
         assignment_id=assignment_id,
         session_started_at=status.get("started_at_utc"),
+        lease_id=lease.get("lease_id"),
     )
     release_watchdog_lease = marker.get("release_lease_after_action") is True and marker_lease_matches
     marker_is_current = watchdog_marker_matches(
@@ -5033,6 +5049,7 @@ def _watchdog_agent_unlocked(
         action=action,
         assignment_id=assignment_id,
         session_started_at=status.get("started_at_utc"),
+        lease_id=lease.get("lease_id"),
         now=now,
     )
     output_changed = marker_is_current and watchdog_output_changed_since_marker(status, marker, now=now)
@@ -5056,22 +5073,22 @@ def _watchdog_agent_unlocked(
         try:
             report = request_agent_report(agent, assignment_id=assignment_id, lease=lease)
             requested_at_utc = _dt.datetime.now(_dt.timezone.utc).isoformat()
-            update_watchdog_marker(
-                agent,
-                {
-                    "phase": "report_requested",
-                    "requested_at_utc": requested_at_utc,
-                    "assignment_id": assignment_id,
-                    "planned_action": action,
-                    "started_at_utc": status.get("started_at_utc"),
-                    "raw_log_bytes": status.get("raw_log_bytes"),
-                    "raw_log_updated_at_utc": status.get("raw_log_updated_at_utc"),
-                    "idle_seconds": effective_idle,
-                    "idle_threshold_seconds": idle_seconds,
-                    "report_grace_seconds": report_grace_seconds,
-                    "release_lease_after_action": release_watchdog_lease,
-                },
-            )
+            marker_to_write = {
+                "phase": "report_requested",
+                "requested_at_utc": requested_at_utc,
+                "assignment_id": assignment_id,
+                "planned_action": action,
+                "started_at_utc": status.get("started_at_utc"),
+                "raw_log_bytes": status.get("raw_log_bytes"),
+                "raw_log_updated_at_utc": status.get("raw_log_updated_at_utc"),
+                "idle_seconds": effective_idle,
+                "idle_threshold_seconds": idle_seconds,
+                "report_grace_seconds": report_grace_seconds,
+                "release_lease_after_action": release_watchdog_lease,
+            }
+            if isinstance(lease.get("lease_id"), str):
+                marker_to_write["lease_id"] = lease["lease_id"]
+            update_watchdog_marker(agent, marker_to_write)
         except Exception:
             report_sent = (
                 isinstance(report, dict)
