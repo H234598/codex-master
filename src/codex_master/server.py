@@ -1696,17 +1696,39 @@ def write_private_new_bytes(
     *,
     dir_fd: int | None = None,
 ) -> None:
+    parent_fd = -1
+    effective_dir_fd = dir_fd
     if dir_fd is None:
+        try:
+            parent_stat = path.parent.lstat()
+        except FileNotFoundError:
+            parent_stat = None
+        except OSError as exc:
+            raise AgentError("private state parent directories must be real directories") from exc
         ensure_private_dir(path.parent)
+        if parent_stat is None:
+            try:
+                parent_stat = path.parent.lstat()
+            except OSError as exc:
+                raise AgentError("private state parent directories must be real directories") from exc
+        parent_fd = open_directory_no_follow_matching(
+            path.parent,
+            parent_stat,
+            error_text="private state parent directories must be real directories",
+            changed_text="private state parent directories changed unexpectedly",
+        )
+        effective_dir_fd = parent_fd
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        if dir_fd is None:
+        if effective_dir_fd is None:
             fd = os.open(path, flags, 0o600)
         else:
-            fd = os.open(path.name, flags, 0o600, dir_fd=dir_fd)
+            fd = os.open(path.name, flags, 0o600, dir_fd=effective_dir_fd)
     except OSError as exc:
+        if parent_fd >= 0:
+            os.close(parent_fd)
         raise AgentError("could not create private state temp file without following symlinks") from exc
     try:
         current_stat = os.fstat(fd)
@@ -1723,13 +1745,16 @@ def write_private_new_bytes(
         if fd >= 0:
             os.close(fd)
         try:
-            if dir_fd is None:
+            if effective_dir_fd is None:
                 path.unlink()
             else:
-                os.unlink(path.name, dir_fd=dir_fd)
+                os.unlink(path.name, dir_fd=effective_dir_fd)
         except FileNotFoundError:
             pass
         raise
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
 
 def open_private_regular_update(path: Path) -> Any:

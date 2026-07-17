@@ -8127,6 +8127,33 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertTrue(swapped)
 
+    def test_private_new_file_fails_closed_after_parent_swap(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            managed = root / "managed"
+            outside = root / "outside"
+            managed.mkdir()
+            outside.mkdir()
+            path = managed / "raw.log"
+            real_ensure = server_module.ensure_private_dir
+            swapped = False
+
+            def swap_after_ensure(candidate: Path) -> None:
+                nonlocal swapped
+                real_ensure(candidate)
+                if candidate == managed and not swapped:
+                    managed.rename(root / "managed-original")
+                    outside.rename(managed)
+                    swapped = True
+
+            with patch.object(server_module, "ensure_private_dir", side_effect=swap_after_ensure):
+                with self.assertRaisesRegex(AgentError, "parent directories changed unexpectedly"):
+                    server_module.write_private_new_bytes(path, b"raw")
+
+        self.assertTrue(swapped)
+
     def test_pool_private_bytes_read_fails_closed_after_parent_swap(self) -> None:
         from codex_master import server as server_module
 
