@@ -3643,6 +3643,9 @@ def agent_identity_guard(running: bool, process_summary: dict[str, Any]) -> dict
     elif running and managed_process_count == 0:
         state = "blocked_tmux_session_without_managed_process"
         ok = False
+    elif running and managed_process_count > 1:
+        state = "blocked_multiple_managed_home_processes"
+        ok = False
     elif running:
         state = "managed_session_running"
         ok = True
@@ -3671,6 +3674,10 @@ def require_managed_tmux_session(agent: str, process_summary: dict[str, Any] | N
         raise AgentError(f"agent {agent} CODEX_HOME process scan is unavailable; retry before using tmux session")
     if guard["state"] == "blocked_external_home_user":
         raise AgentError(f"agent {agent} CODEX_HOME is also used by an external process; stop it before using tmux session")
+    if guard["state"] == "blocked_multiple_managed_home_processes":
+        raise AgentError(
+            f"agent {agent} has multiple managed CODEX_HOME processes; stop orphaned processes before using tmux session"
+        )
     raise AgentError(
         f"agent {agent} tmux session identity could not be verified; no managed CODEX_HOME process was detected"
     )

@@ -8210,6 +8210,21 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["state"], "blocked_tmux_session_without_managed_process")
 
+    def test_agent_identity_guard_blocks_multiple_managed_processes(self) -> None:
+        result = agent_identity_guard(
+            True,
+            {
+                "process_count": 2,
+                "managed_process_count": 2,
+                "external_process_count": 0,
+                "raw_output": "not_returned",
+            },
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["state"], "blocked_multiple_managed_home_processes")
+        self.assertTrue(result["single_identity_required"])
+
     def test_same_path_text_handles_resolution_runtime_error(self) -> None:
         with patch("pathlib.Path.resolve", side_effect=RuntimeError("loop")):
             result = same_path_text("/tmp/loop", Path("/tmp/loop"))
