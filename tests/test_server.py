@@ -676,6 +676,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(wait_props["poll_interval_seconds"]["maximum"], MAX_WAIT_POLL_SECONDS)
         self.assertEqual(DEFAULT_CLAIM_WAIT_FOREVER, True)
         self.assertNotIn("maximum", claim_props["wait_seconds"])
+        self.assertNotIn("default", claim_props["wait_seconds"])
         self.assertEqual(claim_props["wait_forever"]["default"], DEFAULT_CLAIM_WAIT_FOREVER)
         self.assertEqual(claim_props["poll_interval_seconds"]["default"], DEFAULT_WAIT_POLL_SECONDS)
         self.assertEqual(claim_props["poll_interval_seconds"]["maximum"], MAX_WAIT_POLL_SECONDS)

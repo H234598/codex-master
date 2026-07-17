@@ -9343,7 +9343,6 @@ TOOLS: list[dict[str, Any]] = [
                 "wait_seconds": {
                     "type": "integer",
                     "minimum": 0,
-                    "default": 0,
                     "description": "Finite wait limit. Omit this and keep wait_forever true to retry until the Agentin becomes free.",
                 },
                 "wait_forever": {"type": "boolean", "default": DEFAULT_CLAIM_WAIT_FOREVER},
