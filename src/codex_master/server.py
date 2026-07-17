@@ -4059,14 +4059,21 @@ def run_with_agent_lease(agent: str, fn: Any) -> dict[str, Any]:
         raise
 
 
-def raw_log_metadata(raw_log_path: Path | None) -> dict[str, Any]:
+def raw_log_metadata(
+    raw_log_path: Path | None,
+    *,
+    expected_stat: os.stat_result | None = None,
+) -> dict[str, Any]:
     if raw_log_path is None:
         return {"bytes": None, "updated_at_utc": None, "idle_seconds": None}
     try:
         current_stat = raw_log_path.lstat()
     except OSError:
         return {"bytes": None, "updated_at_utc": None, "idle_seconds": None}
-    if not stat_module.S_ISREG(current_stat.st_mode):
+    if (
+        not stat_module.S_ISREG(current_stat.st_mode)
+        or (expected_stat is not None and not source_identity_matches(current_stat, expected_stat))
+    ):
         return {"bytes": None, "updated_at_utc": None, "idle_seconds": None}
     try:
         updated = _dt.datetime.fromtimestamp(current_stat.st_mtime, _dt.timezone.utc)
@@ -4470,6 +4477,7 @@ def agent_limit_state(
     running: bool,
     meta: dict[str, Any],
     raw_log_path: Path | None,
+    raw_log_expected_stat: os.stat_result | None = None,
     latest_assignment: dict[str, Any] | None,
     pane_text: str | None = None,
 ) -> dict[str, Any]:
@@ -4477,7 +4485,13 @@ def agent_limit_state(
     if running:
         samples.append(pane_text if pane_text is not None else pane_tail(agent, MAX_TAIL_LINES))
     if raw_log_path:
-        samples.append(read_log_tail(raw_log_path, MAX_LIMIT_STATUS_BYTES))
+        samples.append(
+            read_log_tail(
+                raw_log_path,
+                MAX_LIMIT_STATUS_BYTES,
+                expected_stat=raw_log_expected_stat,
+            )
+        )
     return classify_limit_text("\n".join(item for item in samples if item), meta, latest_assignment)
 
 
@@ -4627,13 +4641,19 @@ def status_agent(agent: str) -> dict[str, Any]:
     running = tmux_alive(session)
     identity_guard = agent_identity_guard(running, process_summary)
     if running and identity_guard["ok"] and (raw_log_identity is None or raw_log_identity[1] is None):
-        recovered_raw_log_path = latest_managed_raw_log(
+        recovered_path = latest_managed_raw_log(
             agent,
             include_legacy=raw_log_identity_is_legacy(raw_log_identity),
         )
-        if recovered_raw_log_path is not None:
-            raw_log_path = recovered_raw_log_path
-    raw_log_info = raw_log_metadata(raw_log_path)
+        recovered_identity = (
+            allowed_agent_raw_log_identity(agent, str(recovered_path))
+            if recovered_path is not None
+            else None
+        )
+        raw_log_identity = recovered_identity
+        raw_log_path = recovered_identity[0] if recovered_identity is not None else None
+    raw_log_expected_stat = raw_log_identity[1] if raw_log_identity is not None else None
+    raw_log_info = raw_log_metadata(raw_log_path, expected_stat=raw_log_expected_stat)
     latest_assignment = latest_assignment_summary(agent)
     auth = agent_auth_status(agent)
     pane_is_managed = running and identity_guard["ok"]
@@ -4645,6 +4665,7 @@ def status_agent(agent: str) -> dict[str, Any]:
         running=running,
         meta=meta,
         raw_log_path=raw_log_path,
+        raw_log_expected_stat=raw_log_expected_stat,
         latest_assignment=latest_assignment,
         pane_text=pane_text,
     )

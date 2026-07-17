@@ -3068,6 +3068,64 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(status["raw_log_bytes"], len("current\n"))
         self.assertTrue(status["raw_log_path_valid"])
 
+    def test_agent_status_fails_closed_after_raw_log_parent_swap(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "raw"
+            outside_dir = root / "outside"
+            raw_dir.mkdir()
+            outside_dir.mkdir()
+            log_path = raw_dir / "20260717T070001000000Z-a.log"
+            log_path.write_text("managed\n", encoding="utf-8")
+            (outside_dir / log_path.name).write_text("outside-secret\n", encoding="utf-8")
+            runner = root / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            agent = {"label": "A", "runner": runner, "home": root, "session": "session-a"}
+            summary = {
+                "process_count": 1,
+                "managed_process_count": 1,
+                "external_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            }
+            real_identity = server_module.allowed_agent_raw_log_identity
+            swapped = False
+
+            def swap_after_validation(agent_name: str, raw_log: Any):
+                nonlocal swapped
+                identity = real_identity(agent_name, raw_log)
+                if identity is not None and not swapped:
+                    raw_dir.rename(root / "raw-original")
+                    outside_dir.rename(raw_dir)
+                    swapped = True
+                return identity
+
+            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
+                "codex_master.server.RAW_DIR", raw_dir
+            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "codex_master.server.ensure_state"
+            ), patch("codex_master.server.agent_home_process_summary", return_value=summary), patch(
+                "codex_master.server.tmux_alive", return_value=True
+            ), patch("codex_master.server.pane_pid", return_value=123), patch(
+                "codex_master.server.pane_tail", return_value=""
+            ), patch(
+                "codex_master.server.read_meta", return_value={"raw_log": str(log_path)}
+            ), patch("codex_master.server.allowed_agent_raw_log_identity", side_effect=swap_after_validation), patch(
+                "codex_master.server.latest_assignment_summary", return_value=None
+            ), patch("codex_master.server.agent_auth_status", return_value={}), patch(
+                "codex_master.server.agent_lease_status", return_value={}
+            ), patch("codex_master.server.codex_usage_watchdog_status", return_value={}
+            ):
+                status = server_module.status_agent("a")
+
+        self.assertTrue(swapped)
+        self.assertIsNone(status["raw_log_bytes"])
+        self.assertIsNone(status["raw_log_updated_at_utc"])
+
     def test_agent_status_rejects_raw_log_metadata_for_other_agent(self) -> None:
         from codex_master import server as server_module
 
