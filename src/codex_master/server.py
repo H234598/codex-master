@@ -9777,13 +9777,15 @@ def pool_normalize_spec(
         if normalized_alias in reserved_aliases or normalized_alias in aliases:
             raise AgentError("alias conflicts with a pool selector")
         if isinstance(target, str):
-            if target not in valid_targets:
+            normalized_target = target.strip().lower()
+            if normalized_target not in valid_targets:
                 raise AgentError("alias points to an unknown target")
-            aliases[normalized_alias] = target
+            aliases[normalized_alias] = normalized_target
         elif isinstance(target, list) and target and all(isinstance(agent, str) for agent in target):
-            if any(agent not in valid_targets for agent in target):
+            normalized_targets = [agent.strip().lower() for agent in target]
+            if any(agent not in valid_targets for agent in normalized_targets):
                 raise AgentError("alias points to an unknown target")
-            aliases[normalized_alias] = target[:]
+            aliases[normalized_alias] = normalized_targets
         else:
             raise AgentError("alias must point to an Agentin id, series selector, or non-empty list")
 

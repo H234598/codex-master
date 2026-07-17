@@ -13145,6 +13145,29 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertIn("shared_assets[] must stay inside the Agentin home", dot_path_error)
             self.assertNotIn("IndexError", dot_path_error)
 
+    def test_agent_pool_alias_targets_use_selector_normalization(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec_payload(
+                tmp,
+                {
+                    "schema_version": 1,
+                    "pool_root": str(pool),
+                    "codex_bin": "/bin/echo",
+                    "series": [{"prefix": "a", "count": 2, "template": "a1", "authenticated": []}],
+                    "aliases": {"TEAM": " A-SERIES ", "PAIR": [" A1 ", "A2"]},
+                    "shared_assets": [],
+                    "runtime_dirs": [],
+                },
+            )
+            normalized = server_module.pool_normalize_spec(str(spec_path), codex_bin="/bin/echo")
+
+        self.assertEqual(server_module.pool_selector_ids(normalized, "team"), ["a1", "a2"])
+        self.assertEqual(server_module.pool_selector_ids(normalized, "pair"), ["a1", "a2"])
+
     def test_agent_pool_install_status_copy_auth_and_destroy_are_data_sparse(self) -> None:
         from codex_master import server as server_module
 
