@@ -6828,6 +6828,36 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(original.read_text(encoding="utf-8"), "expected lease\n")
             self.assertEqual(lease.read_text(encoding="utf-8"), "foreign data\n")
 
+    def test_remove_agent_lease_path_keeps_parent_pinned_during_unlink(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            leases = root / "leases"
+            leases.mkdir()
+            lease = leases / "agent.json"
+            lease.write_text("expected lease\n", encoding="utf-8")
+            original_parent = root / "leases-original"
+            swapped = False
+            real_unlink = os.unlink
+
+            def swap_parent_before_unlink(name, *args, **kwargs):
+                nonlocal swapped
+                if not swapped:
+                    leases.rename(original_parent)
+                    leases.mkdir()
+                    (leases / "agent.json").write_text("foreign data\n", encoding="utf-8")
+                    swapped = True
+                return real_unlink(name, *args, **kwargs)
+
+            with patch.object(server_module.os, "unlink", side_effect=swap_parent_before_unlink):
+                result = server_module.remove_agent_lease_path(lease)
+
+            self.assertTrue(result)
+            self.assertTrue(swapped)
+            self.assertFalse((original_parent / "agent.json").exists())
+            self.assertEqual((leases / "agent.json").read_text(encoding="utf-8"), "foreign data\n")
+
     def test_agent_release_does_not_delete_newly_claimed_lease(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

@@ -2073,6 +2073,9 @@ def remove_agent_lease(agent: str) -> bool:
 
 
 def remove_agent_lease_path(path: Path) -> bool:
+    path = path.expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
     try:
         current = path.lstat()
     except FileNotFoundError:
@@ -2082,17 +2085,28 @@ def remove_agent_lease_path(path: Path) -> bool:
     if not stat_module.S_ISREG(current.st_mode) or stat_module.S_ISLNK(current.st_mode):
         raise AgentError("agent lease path is not a regular file")
     try:
-        latest = path.lstat()
+        parent_stat = path.parent.lstat()
     except FileNotFoundError:
         return False
     except OSError as exc:
         raise AgentError("could_not_read_agent_lease") from exc
-    if not source_identity_matches(latest, current):
-        raise AgentError("agent lease path changed unexpectedly")
+    parent_fd = open_directory_no_follow_matching(
+        path.parent,
+        parent_stat,
+        error_text="agent lease path changed unexpectedly",
+        changed_text="agent lease path changed unexpectedly",
+    )
     try:
-        path.unlink()
+        latest = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not source_identity_matches(latest, current):
+            raise AgentError("agent lease path changed unexpectedly")
+        os.unlink(path.name, dir_fd=parent_fd)
     except FileNotFoundError:
         return False
+    except OSError as exc:
+        raise AgentError("could_not_read_agent_lease") from exc
+    finally:
+        os.close(parent_fd)
     return True
 
 
