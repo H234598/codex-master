@@ -6121,6 +6121,35 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(target.read_text(encoding="utf-8"), "managed\n")
             self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o644)
 
+    def test_pool_write_private_file_does_not_chmod_swapped_symlink_target(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            target = root / "wrapper"
+            outside = root / "outside-secret"
+            outside.write_text("secret\n", encoding="utf-8")
+            outside.chmod(0o644)
+            real_chmod = Path.chmod
+            swapped = False
+
+            def swap_before_target_chmod(mode, *args, **kwargs):
+                nonlocal swapped
+                if target.exists() and not swapped:
+                    target.unlink()
+                    target.symlink_to(outside)
+                    swapped = True
+                return real_chmod(target, mode, *args, **kwargs)
+
+            with patch.object(Path, "chmod", side_effect=swap_before_target_chmod):
+                server_module.pool_write_private_file(target, "managed\n", 0o700)
+
+            self.assertFalse(swapped)
+            self.assertFalse(target.is_symlink())
+            self.assertEqual(target.read_text(encoding="utf-8"), "managed\n")
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o644)
+
     def test_read_meta_refuses_symlink_and_oversized_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             meta_dir = Path(tmpdir) / "meta"

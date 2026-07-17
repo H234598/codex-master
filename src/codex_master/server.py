@@ -1518,8 +1518,8 @@ def write_meta(agent: str, data: dict[str, Any]) -> None:
     replace_private_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
-def replace_private_text(path: Path, text: str) -> None:
-    replace_private_bytes(path, text.encode("utf-8"))
+def replace_private_text(path: Path, text: str, mode: int = 0o600) -> None:
+    replace_private_bytes(path, text.encode("utf-8"), mode=mode)
 
 
 def read_private_regular_text(path: Path, max_bytes: int, error_text: str) -> str:
@@ -1567,12 +1567,12 @@ def read_private_regular_text(path: Path, max_bytes: int, error_text: str) -> st
         raise AgentError(error_text) from exc
 
 
-def replace_private_bytes(path: Path, data: bytes) -> None:
+def replace_private_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
     ensure_private_dir(path.parent)
     tmp_path = path.with_name(f".{path.name}.{now_id()}.{uuid.uuid4().hex}.tmp")
     tmp_created = False
     try:
-        write_private_new_bytes(tmp_path, data)
+        write_private_new_bytes(tmp_path, data, mode=mode)
         tmp_created = True
         tmp_path.replace(path)
         tmp_created = False
@@ -1584,7 +1584,7 @@ def replace_private_bytes(path: Path, data: bytes) -> None:
                 pass
 
 
-def write_private_new_bytes(path: Path, data: bytes) -> None:
+def write_private_new_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
     ensure_private_dir(path.parent)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
@@ -1598,7 +1598,7 @@ def write_private_new_bytes(path: Path, data: bytes) -> None:
         if not stat_module.S_ISREG(current_stat.st_mode) or getattr(current_stat, "st_nlink", 1) > 1:
             raise AgentError("private state temp path is not a regular file")
         try:
-            os.fchmod(fd, 0o600)
+            os.fchmod(fd, mode)
         except PermissionError:
             pass
         with os.fdopen(fd, "wb") as fh:
@@ -9010,19 +9010,11 @@ def pool_minimal_config(home: Path) -> str:
 
 
 def pool_write_private_file(path: Path, text: str, mode: int) -> None:
-    replace_private_text(path, text)
-    try:
-        path.chmod(mode)
-    except PermissionError:
-        pass
+    replace_private_text(path, text, mode=mode)
 
 
 def pool_write_private_bytes(path: Path, data: bytes, mode: int) -> None:
-    replace_private_bytes(path, data)
-    try:
-        path.chmod(mode)
-    except PermissionError:
-        pass
+    replace_private_bytes(path, data, mode=mode)
 
 
 def pool_read_private_bytes(path: Path, max_bytes: int, error_text: str) -> bytes:
