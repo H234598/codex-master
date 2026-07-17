@@ -120,6 +120,7 @@ MAX_TASK_TEXT = 4000
 MAX_TEXT_FIELD = 1000
 MAX_ASSIGNMENT_LIST_ITEMS = 50
 MAX_AGENTIN_NAME = 80
+MAX_AGENT_SELECTOR_TEXT = 32
 MAX_SKILL_REF = 300
 MAX_PATH_TEXT = 1000
 MAX_GIT_REF_TEXT = 200
@@ -289,8 +290,19 @@ RELEASE_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+(?:[A-Za-z0-9.+_-]*)?$")
 BRACKETED_PASTE_BEGIN = "\x1b[200~"
 BRACKETED_PASTE_END = "\x1b[201~"
 CODEX_TUI_SUBMIT_KEY = "C-Enter"
+CODEX_TUI_TRUST_PROMPT_SUBMIT_KEY = "Enter"
 CODEX_TUI_INPUT_MARKERS = ("›",)
 CODEX_TUI_INPUT_MARKER_WINDOW_LINES = 8
+ASSIGNMENT_REPORT_NOISE_TEXT_PATTERNS = (
+    r"^\s*mcp startup incomplete\b",
+    r"^\s*press enter to continue\b",
+    r"^\s*update available!",
+    r"^\s*›\s+[0-9]+\.\s+",
+    r"^\s*•\s*working\s*\(",
+)
+ASSIGNMENT_REPORT_NOISE_TEXT_RE = tuple(
+    re.compile(pattern, flags=re.IGNORECASE) for pattern in ASSIGNMENT_REPORT_NOISE_TEXT_PATTERNS
+)
 CODEX_TUI_BLOCKING_PROMPT_PATTERNS = (
     r"\bupdate available!\b",
     r"\bpress enter to continue\b",
@@ -298,7 +310,12 @@ CODEX_TUI_BLOCKING_PROMPT_PATTERNS = (
     r"\byour access token could not be refreshed\b",
 )
 CODEX_TUI_UPDATE_SELECTION_PATTERN = re.compile(r"^›\s+([123])\.\s+", re.IGNORECASE)
+CODEX_PROJECT_TRUST_PROMPT_RE = re.compile(
+    r"^do you trust the contents of this directory\?",
+    re.IGNORECASE,
+)
 PATH_NOT_RETURNED = "not_returned"
+_EXPECTED_EXISTING_STAT_UNSET = object()
 
 
 def agent_env_key(agent: str) -> str:
@@ -789,7 +806,11 @@ def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | floa
     return "\n".join(lines) + "\n", True, previous
 
 
-def ensure_mcp_startup_timeout_configured(config_path: Path | None = None) -> dict[str, Any]:
+def ensure_mcp_startup_timeout_configured(
+    config_path: Path | None = None,
+    *,
+    capture_snapshot: bool = False,
+) -> dict[str, Any]:
     path = config_path or codex_config_path()
     path = path.expanduser()
     if not path.is_absolute():
@@ -798,26 +819,98 @@ def ensure_mcp_startup_timeout_configured(config_path: Path | None = None) -> di
         path,
         "codex config parent directories must be real directories",
     )
-    if path.exists() or path.is_symlink():
-        if path.is_symlink():
+    try:
+        existing_stat = path.lstat()
+    except FileNotFoundError:
+        existing_stat = None
+    except OSError as exc:
+        raise AgentError("could not read codex config") from exc
+    if existing_stat is not None:
+        if stat_module.S_ISLNK(existing_stat.st_mode):
             raise AgentError("codex config path must be a regular file")
         text = read_private_regular_text(path, MAX_CODEX_CONFIG_BYTES, "could not read codex config")
     else:
         text = ""
     new_text, changed, previous = updated_mcp_startup_timeout_config(text)
+    original_mode = stat_module.S_IMODE(existing_stat.st_mode) if existing_stat is not None else 0o600
     if changed:
         replace_private_bytes(
             path,
             new_text.encode("utf-8"),
             expected_parent_stat=expected_parent_stat,
+            expected_existing_stat=existing_stat,
         )
-    return {
+    result = {
         "status": "updated" if changed else "already_configured",
         "startup_timeout_sec": RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
         "previous_startup_timeout_sec": previous,
         "config_path": "not_returned",
         "raw_output": "not_returned",
     }
+    if capture_snapshot and changed:
+        try:
+            updated_stat = path.lstat()
+        except OSError as exc:
+            raise AgentError("could_not_snapshot_codex_config") from exc
+        result["_config_snapshot"] = {
+            "path": path,
+            "parent_stat": expected_parent_stat,
+            "existing_stat": existing_stat,
+            "updated_stat": updated_stat,
+            "data": text.encode("utf-8"),
+            "mode": original_mode,
+        }
+    return result
+
+
+def restore_mcp_startup_timeout_snapshot(snapshot: dict[str, Any]) -> None:
+    path = snapshot.get("path")
+    parent_stat = snapshot.get("parent_stat")
+    updated_stat = snapshot.get("updated_stat")
+    existing_stat = snapshot.get("existing_stat")
+    data = snapshot.get("data")
+    mode = snapshot.get("mode")
+    if (
+        not isinstance(path, Path)
+        or not isinstance(parent_stat, os.stat_result)
+        or not isinstance(updated_stat, os.stat_result)
+        or not isinstance(data, bytes)
+        or not isinstance(mode, int)
+    ):
+        raise AgentError("could_not_restore_codex_config")
+    if existing_stat is None:
+        parent_fd = -1
+        try:
+            parent_fd = open_directory_no_follow_matching(
+                path.parent,
+                parent_stat,
+                error_text="could_not_restore_codex_config",
+                changed_text="could_not_restore_codex_config",
+            )
+            try:
+                current = os.lstat(path.name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                return
+            if not source_identity_matches(current, updated_stat):
+                raise AgentError("could_not_restore_codex_config")
+            os.unlink(path.name, dir_fd=parent_fd)
+        except AgentError:
+            raise
+        except OSError as exc:
+            raise AgentError("could_not_restore_codex_config") from exc
+        finally:
+            if parent_fd >= 0:
+                os.close(parent_fd)
+        return
+    if not isinstance(existing_stat, os.stat_result):
+        raise AgentError("could_not_restore_codex_config")
+    replace_private_bytes(
+        path,
+        data,
+        mode=mode,
+        expected_parent_stat=parent_stat,
+        expected_existing_stat=updated_stat,
+    )
 
 
 def codex_client_mcp_config_status(
@@ -1007,6 +1100,8 @@ def ordinal_mapping_preview(series: tuple[str, ...] | None = None, *, limit: int
 
 def ordinal_agent_id(selector: str, series: tuple[str, ...] | None = None) -> str:
     value = normalize_agent_selector_text(selector)
+    if len(value) > MAX_AGENT_SELECTOR_TEXT:
+        raise AgentError("ordinal selector is too long")
     if not value.isdecimal():
         raise AgentError("ordinal selector must be a positive integer")
     ordinal = int(value)
@@ -1683,6 +1778,7 @@ def replace_private_bytes(
     mode: int = 0o600,
     *,
     expected_parent_stat: os.stat_result | None = None,
+    expected_existing_stat: os.stat_result | None | object = _EXPECTED_EXISTING_STAT_UNSET,
 ) -> None:
     parent = path.parent.expanduser()
     if not parent.is_absolute():
@@ -1733,6 +1829,18 @@ def replace_private_bytes(
     try:
         write_private_new_bytes(tmp_path, data, mode=mode, dir_fd=parent_fd)
         tmp_created = True
+        if expected_existing_stat is not _EXPECTED_EXISTING_STAT_UNSET:
+            try:
+                current = os.lstat(path.name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                current = None
+            except OSError as exc:
+                raise AgentError("private state path changed unexpectedly") from exc
+            if expected_existing_stat is None:
+                if current is not None:
+                    raise AgentError("private state path changed unexpectedly")
+            elif current is None or not source_identity_matches(current, expected_existing_stat):
+                raise AgentError("private state path changed unexpectedly")
         os.replace(tmp_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         tmp_created = False
     finally:
@@ -2006,10 +2114,7 @@ def selector_policy_lock() -> Any:
 
 @contextlib.contextmanager
 def pool_root_lock(root: Path) -> Any:
-    try:
-        root_key = str(root.resolve(strict=False))
-    except (OSError, RuntimeError):
-        root_key = str(root.absolute())
+    root_key = _pool_root_digest_text(root)
     held_locks = _POOL_ROOT_LOCK_STACK.get()
     if root_key in held_locks:
         yield
@@ -2497,7 +2602,13 @@ def claim_agent_with_wait(
     stopped_grace_seconds = normalize_stopped_lease_recovery_grace_seconds(stopped_grace_seconds)
     started = time.monotonic()
     wait_forever = wait_seconds is None
-    deadline = None if wait_forever else started + wait_seconds
+    if wait_forever:
+        deadline = None
+    else:
+        try:
+            deadline = started + wait_seconds
+        except OverflowError:
+            deadline = math.inf
     polls = 0
 
     def claim_once() -> dict[str, Any]:
@@ -2513,7 +2624,8 @@ def claim_agent_with_wait(
     while True:
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         try:
-            result = call_agent_lifecycle(agent, claim_once, timeout_seconds=remaining)
+            lock_timeout = remaining if remaining is None or math.isfinite(remaining) else None
+            result = call_agent_lifecycle(agent, claim_once, timeout_seconds=lock_timeout)
             result["waited_seconds"] = max(0, int(time.monotonic() - started))
             result["poll_count"] = polls
             result["wait_forever"] = wait_forever
@@ -3231,6 +3343,16 @@ def bound_raw_log_at_dir_fd(directory_fd: int, name: str, max_bytes: int = MAX_R
     finally:
         if fd >= 0:
             os.close(fd)
+    try:
+        latest = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    if (
+        not stat_module.S_ISREG(latest.st_mode)
+        or getattr(latest, "st_nlink", 1) > 1
+        or not source_identity_matches(latest, current)
+    ):
+        return False
     replace_private_bytes_at_dir_fd(directory_fd, name, marker + tail)
     return True
 
@@ -3470,6 +3592,8 @@ def proc_is_codex_like(status: dict[str, str], argv: list[str]) -> bool:
     joined = "\0".join(argv).lower()
     return (
         name == "codex"
+        or name == "codex-code-mode-host"
+        or name == "codex-code-mode"
         or "codex" in argv_names
         or "@openai/codex" in joined
         or "node_modules/@openai/codex" in joined
@@ -3605,16 +3729,43 @@ def agent_home_process_summary(agent: str, proc_root: Path = Path("/proc")) -> d
             "external_processes_truncated": False,
             "raw_output": "not_returned",
         }
-    external = [item for item in processes if not item["managed_by_masterjet"]]
-    managed_process_ids = [item["pid"] for item in processes if item["managed_by_masterjet"]]
+    managed = [item for item in processes if item["managed_by_masterjet"]]
+    managed_process_ids = [item["pid"] for item in managed]
+    managed_process_id_set = set(managed_process_ids)
+    managed_root_process_ids = [
+        item["pid"]
+        for item in managed
+        if item.get("ppid") not in managed_process_id_set
+    ]
+    processes_by_pid = {item["pid"]: item for item in processes}
+
+    def has_managed_ancestor(item: dict[str, Any]) -> bool:
+        parent_id = item.get("ppid")
+        visited: set[int] = set()
+        while isinstance(parent_id, int) and parent_id not in visited:
+            if parent_id in managed_process_id_set:
+                return True
+            visited.add(parent_id)
+            parent = processes_by_pid.get(parent_id)
+            if parent is None:
+                break
+            parent_id = parent.get("ppid")
+        return False
+
+    external = [
+        item
+        for item in processes
+        if not item["managed_by_masterjet"] and not has_managed_ancestor(item)
+    ]
     return {
         "agent": agent,
         "home": PATH_NOT_RETURNED,
         "home_kind": "managed_agent_home",
         "process_count": len(processes),
         "external_process_count": len(external),
-        "managed_process_count": len(processes) - len(external),
+        "managed_process_count": len(managed_root_process_ids),
         "managed_process_ids": managed_process_ids,
+        "managed_root_process_ids": managed_root_process_ids,
         "external_processes": external[:10],
         "external_processes_truncated": len(external) > 10,
         "raw_output": "not_returned",
@@ -3832,21 +3983,13 @@ def codex_related_process_summary(proc_root: Path = Path("/proc")) -> dict[str, 
         if not pid_dir.name.isdigit():
             continue
         status = read_proc_status(pid_dir)
-        name = (status.get("Name") or "").lower()
         argv = read_proc_cmdline(pid_dir)
         joined = "\0".join(argv).lower()
         if "codex_master.server" in joined or "codex-master-mcp" in joined:
             mcp_server_count += 1
             continue
 
-        argv_names = {Path(item).name.lower() for item in argv if item}
-        codex_client = (
-            name == "codex"
-            or "codex" in argv_names
-            or "@openai/codex" in joined
-            or "node_modules/@openai/codex" in joined
-        )
-        if not codex_client:
+        if not proc_is_codex_like(status, argv):
             continue
 
         client_count += 1
@@ -3936,7 +4079,12 @@ def release_start_lease_if_safe(
 ) -> None:
     if not enabled or not lease or not lease.get("held_by_this_server"):
         return
-    if not agent_lease_status(agent).get("held_by_this_server"):
+    current_lease = agent_lease_status(agent)
+    if not current_lease.get("held_by_this_server"):
+        return
+    lease_id = lease.get("lease_id")
+    current_lease_id = current_lease.get("lease_id")
+    if lease_id is not None and current_lease_id is not None and lease_id != current_lease_id:
         return
     if not existing_session:
         process_count = agent_home_process_summary(agent).get("process_count")
@@ -4451,7 +4599,12 @@ def agent_spark_routing(agent: str) -> dict[str, Any] | None:
         and isinstance(route.get("account"), str)
         and route.get("decision") is None
     )
-    if not isinstance(route, dict) or account_only_route:
+    spark_metadata_route = (
+        isinstance(route, dict)
+        and route.get("decision") == "spark"
+        and isinstance(route.get("account"), str)
+    )
+    if not isinstance(route, dict) or account_only_route or spark_metadata_route:
         meta_account = route.get("account") if isinstance(route, dict) else None
         try:
             records = list_assignments(agent, 1).get("records", [])
@@ -4462,6 +4615,8 @@ def agent_spark_routing(agent: str) -> dict[str, Any] | None:
         assignment_account = (
             assignment_route.get("account") if isinstance(assignment_route, dict) else None
         )
+        if spark_metadata_route and (not isinstance(assignment_route, dict) or assignment_account is None):
+            return None
         if meta_account is not None and assignment_account != meta_account:
             return None
         assignment_created = parse_utc_timestamp(record.get("created_at_utc")) if isinstance(record, dict) else None
@@ -4474,7 +4629,8 @@ def agent_spark_routing(agent: str) -> dict[str, Any] | None:
             or assignment_created < session_started
         ):
             return None
-        route = assignment_route
+        if account_only_route or spark_metadata_route:
+            route = assignment_route
     if not isinstance(route, dict) or route.get("decision") != "spark":
         return None
     route_account = route.get("account")
@@ -4854,32 +5010,74 @@ def wait_terminal_status(
     )
     assignment_created = parse_utc_timestamp(latest_assignment.get("created_at_utc"))
     raw_log_updated = parse_utc_timestamp(status.get("raw_log_updated_at_utc"))
+    current_response_state = (status.get("response_state") or {}).get("state")
     current = time.time() if now is None else now
-    if (
-        assignment_changed
-        and assignment_created is not None
+    assignment_has_recent_output = (
+        assignment_created is not None
         and raw_log_updated is not None
         and raw_log_updated <= current
         and raw_log_updated > assignment_created
-    ):
+    )
+    if assignment_has_recent_output and (assignment_changed or current_response_state == "running_idle"):
         return "activity_observed"
-    if status.get("raw_log_bytes") != initial.get("raw_log_bytes"):
+    current_raw_log_bytes = status.get("raw_log_bytes")
+    initial_raw_log_bytes = initial.get("raw_log_bytes")
+    if (
+        isinstance(current_raw_log_bytes, int)
+        and not isinstance(current_raw_log_bytes, bool)
+        and isinstance(initial_raw_log_bytes, int)
+        and not isinstance(initial_raw_log_bytes, bool)
+        and current_raw_log_bytes != initial_raw_log_bytes
+        and (raw_log_updated is None or raw_log_updated <= current)
+    ):
         return "activity_observed"
     initial_raw_log_updated = parse_utc_timestamp(initial.get("raw_log_updated_at_utc"))
     if (
-        raw_log_updated is not None
+        initial_raw_log_updated is not None
+        and raw_log_updated is not None
         and raw_log_updated <= current
         and raw_log_updated != initial_raw_log_updated
     ):
         return "activity_observed"
     initial_response_state = (initial.get("response_state") or {}).get("state")
-    current_response_state = (status.get("response_state") or {}).get("state")
     if initial_response_state == "running_tui_starter_context" and current_response_state != initial_response_state:
         return "activity_observed"
     if ((status.get("response_state") or {}).get("state")) == "running_tui_starter_context":
         if assignment_created is not None:
             return None
         return "tui_starter_context"
+    return None
+
+
+def wait_terminal_visible_input_status(
+    agent: str,
+    status: dict[str, Any],
+    initial: dict[str, Any],
+    *,
+    now: float | None = None,
+) -> str | None:
+    latest_assignment = status.get("last_assignment") if isinstance(status.get("last_assignment"), dict) else {}
+    initial_assignment = initial.get("last_assignment") if isinstance(initial.get("last_assignment"), dict) else {}
+    assignment_changed = (
+        latest_assignment.get("assignment_id") != initial_assignment.get("assignment_id")
+        or latest_assignment.get("created_at_utc") != initial_assignment.get("created_at_utc")
+    )
+    assignment_created = parse_utc_timestamp(latest_assignment.get("created_at_utc"))
+    raw_log_updated = parse_utc_timestamp(status.get("raw_log_updated_at_utc"))
+    current_response_state = (status.get("response_state") or {}).get("state")
+    current = time.time() if now is None else now
+    if (
+        current_response_state != "running_tui_starter_context"
+        or assignment_created is None
+        or raw_log_updated is None
+        or raw_log_updated > current
+        or raw_log_updated <= assignment_created
+        or assignment_changed
+    ):
+        return None
+    visible_pane_text = pane_tail(agent, 24, visible_only=True, verify_identity=True)
+    if tui_accepts_input(visible_pane_text):
+        return "activity_observed"
     return None
 
 
@@ -4898,12 +5096,16 @@ def wait_agent(agent: str, timeout_seconds: int = DEFAULT_WAIT_SECONDS, poll_int
     current = initial
     polls = 0
     status = wait_terminal_status(current, initial)
+    if status is None:
+        status = wait_terminal_visible_input_status(agent, current, initial)
     while status is None and time.monotonic() < deadline:
         remaining = max(0.0, deadline - time.monotonic())
         time.sleep(min(float(poll_interval_seconds), remaining))
         polls += 1
         current = status_agent(agent)
         status = wait_terminal_status(current, initial)
+        if status is None:
+            status = wait_terminal_visible_input_status(agent, current, initial)
     if status is None:
         status = "timeout"
     if status == "activity_observed":
@@ -5432,13 +5634,18 @@ def public_watchdog_action_result(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def watchdog_action(agent: str, action: str, *, release_after_interrupt: bool) -> dict[str, Any]:
+def watchdog_action(
+    agent: str, action: str, *, release_after_interrupt: bool, release_lease_id: str | None = None
+) -> dict[str, Any]:
     if action == "none":
         return {"agent": agent, "status": "no_action", "raw_output": "not_returned"}
     if action == "interrupt":
         result = interrupt_agent(agent, force=False)
-        if release_after_interrupt and agent_lease_status(agent).get("held_by_this_server"):
-            result["watchdog_release"] = release_agent(agent, force=True)
+        current_lease = agent_lease_status(agent) if release_after_interrupt else {}
+        if current_lease.get("held_by_this_server"):
+            current_lease_id = current_lease.get("lease_id")
+            if release_lease_id is None or release_lease_id == current_lease_id:
+                result["watchdog_release"] = release_agent(agent, force=True)
         return result
     if action == "stop":
         return stop_agent(agent, force=False)
@@ -5657,6 +5864,7 @@ def _watchdog_agent_unlocked(
                         agent,
                         action,
                         release_after_interrupt=release_after_interrupt,
+                        release_lease_id=lease.get("lease_id") if release_watchdog_lease else None,
                     )
                     update_watchdog_marker(agent, None)
                 except Exception:
@@ -5714,7 +5922,12 @@ def _watchdog_agent_unlocked(
     release_after_interrupt = action == "interrupt" and (
         (manage_unclaimed and unclaimed_or_expired) or release_watchdog_lease
     )
-    result = watchdog_action(agent, action, release_after_interrupt=release_after_interrupt)
+    result = watchdog_action(
+        agent,
+        action,
+        release_after_interrupt=release_after_interrupt,
+        release_lease_id=lease.get("lease_id") if release_watchdog_lease else None,
+    )
     update_watchdog_marker(agent, None)
     return {
         **base,
@@ -5811,14 +6024,23 @@ def _usage_watchdog_agent_unlocked(agent: str, *, dry_run: bool) -> dict[str, An
             claimed_for_watchdog = claim["status"] in {"claimed", "claimed_expired"}
             base["lease_state"] = lease.get("state")
             base["held_by_this_server"] = bool(lease.get("held_by_this_server"))
-        stop_attempted = False
         try:
             update_codex_usage_watchdog_marker(agent, marker)
-            stop_attempted = True
             result = stop_agent(agent, force=False)
         except Exception:
-            if not stop_attempted and claimed_for_watchdog and agent_lease_status(agent).get("held_by_this_server"):
-                release_agent(agent, force=True)
+            if claimed_for_watchdog:
+                current_lease = agent_lease_status(agent)
+                claimed_lease_id = lease.get("lease_id")
+                current_lease_id = current_lease.get("lease_id")
+                lease_is_current = current_lease.get("held_by_this_server") and (
+                    (claimed_lease_id is None and current_lease_id is None)
+                    or (
+                        isinstance(claimed_lease_id, str)
+                        and claimed_lease_id == current_lease_id
+                    )
+                )
+                if lease_is_current:
+                    release_agent(agent, force=True)
             raise
         return {
             **base,
@@ -6501,8 +6723,8 @@ def _assign_agent_unlocked(
             lease=lease,
             release_lease_on_failure=release_on_failure,
         )
-        remember_agent_routing(agent, routing)
         sent = send_agent(agent, prompt, enter, operation=operation)
+        remember_agent_routing(agent, routing)
     except Exception:
         if release_on_failure and not (isinstance(sent, dict) and sent.get("status") == "sent"):
             release_start_lease_if_safe(agent, lease, True)
@@ -6651,8 +6873,15 @@ def sanitize_assignment_record(record: dict[str, Any]) -> dict[str, Any]:
             "raw_output",
         ),
         "skill": ("requested", "available", "match_count"),
-        "live_data": ("required", "topic_state", "raw_output"),
-        "lease": ("state", "holder", "held_by_this_server", "expires_at_utc", "raw_output"),
+            "live_data": ("required", "topic_state", "raw_output"),
+        "lease": (
+            "state",
+            "holder",
+            "held_by_this_server",
+            "expires_at_utc",
+            "lease_id",
+            "raw_output",
+        ),
     }.items():
         value = sanitized.get(key)
         if not isinstance(value, dict):
@@ -6773,7 +7002,7 @@ def list_assignments(
                 read_private_regular_text(
                     ASSIGNMENT_LOG, MAX_ASSIGNMENT_LOG_BYTES, "could_not_read_assignment_log"
                 ).splitlines()
-                if ASSIGNMENT_LOG.exists()
+                if path_present_no_follow(ASSIGNMENT_LOG)
                 else []
             )
     for line in lines:
@@ -6831,6 +7060,114 @@ def last_assignment_status(agent: str) -> dict[str, Any]:
     }
 
 
+def _is_assignment_report_output_meaningful(output: str, *, running: bool) -> bool:
+    cleaned = strip_ansi(output).strip()
+    if not cleaned:
+        return False
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if not lines:
+        return False
+    tui_context = classify_tui_context(cleaned, running=running)
+    if tui_context.get("state") in {"starter_placeholder", "update_prompt", "not_running"}:
+        return False
+    for line in lines:
+        if not any(pattern.search(line) for pattern in ASSIGNMENT_REPORT_NOISE_TEXT_RE):
+            return True
+    return False
+
+
+def _spark_health_from_assignment_report(
+    agent: str,
+    assignment: dict[str, Any],
+    status: dict[str, Any],
+    *,
+    output: str,
+    has_fresh_output: bool,
+) -> dict[str, Any]:
+    if not has_fresh_output or not _is_assignment_report_output_meaningful(
+        output, running=bool(status.get("running"))
+    ):
+        return {
+            "state": "not_checked",
+            "updated": False,
+            "raw_output": "not_returned",
+        }
+    lease = status.get("lease") if isinstance(status.get("lease"), dict) else None
+    if not isinstance(lease, dict):
+        return {
+            "state": "not_checked",
+            "updated": False,
+            "reason": "lease_not_available",
+            "raw_output": "not_returned",
+        }
+    lease_id = lease.get("lease_id")
+    if not isinstance(lease_id, str) or not LEASE_ID_RE.fullmatch(lease_id):
+        return {
+            "state": "not_checked",
+            "updated": False,
+            "reason": "lease_identity_unavailable",
+            "raw_output": "not_returned",
+        }
+    assignment_lease = assignment.get("lease")
+    if not isinstance(assignment_lease, dict):
+        return {
+            "state": "not_checked",
+            "updated": False,
+            "reason": "assignment_lease_unavailable",
+            "raw_output": "not_returned",
+        }
+    assignment_lease_id = assignment_lease.get("lease_id")
+    if (
+        not isinstance(assignment_lease_id, str)
+        or not LEASE_ID_RE.fullmatch(assignment_lease_id)
+        or assignment_lease_id != lease_id
+    ):
+        return {
+            "state": "not_checked",
+            "updated": False,
+            "reason": "assignment_lease_unbound",
+            "raw_output": "not_returned",
+        }
+    current_assignment = status.get("last_assignment")
+    if not isinstance(current_assignment, dict):
+        return {
+            "state": "not_checked",
+            "updated": False,
+            "reason": "current_assignment_unknown",
+            "raw_output": "not_returned",
+        }
+    if current_assignment.get("assignment_id") != assignment.get("assignment_id"):
+        return {
+            "state": "not_checked",
+            "updated": False,
+            "reason": "assignment_not_current",
+            "raw_output": "not_returned",
+        }
+    if parse_utc_timestamp(current_assignment.get("created_at_utc")) is None:
+        return {
+            "state": "not_checked",
+            "updated": False,
+            "reason": "current_assignment_timestamp_missing",
+            "raw_output": "not_returned",
+        }
+    if (
+        parse_utc_timestamp(current_assignment.get("created_at_utc"))
+        != parse_utc_timestamp(assignment.get("created_at_utc"))
+    ):
+        return {
+            "state": "not_checked",
+            "updated": False,
+            "reason": "assignment_timestamp_mismatch",
+            "raw_output": "not_returned",
+        }
+    return update_agent_spark_health_if_lease_current(
+        agent,
+        lease,
+        state="healthy",
+        reason="spark_turn_assignment_report_output",
+    )
+
+
 def assignment_report(
     agent: str,
     assignment_id: Any,
@@ -6839,6 +7176,10 @@ def assignment_report(
     source: str = "pane",
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
+    lines = normalize_int_field(lines, field="lines", minimum=1, maximum=MAX_TAIL_LINES)
+    chars = normalize_int_field(chars, field="chars", minimum=1, maximum=MAX_TAIL_CHARS)
+    if source not in ("pane", "log"):
+        raise AgentError("source must be 'pane' or 'log'")
     assignment_id = bounded_text(
         assignment_id,
         field="assignment_id",
@@ -6856,14 +7197,165 @@ def assignment_report(
     )
     if assignment is None:
         raise AgentError("assignment report not found")
-    excerpt = safe_tail(agent, lines, chars, source)
-    output = excerpt.get("output") if isinstance(excerpt.get("output"), str) else ""
-    return {
+    assignment_position = next(
+        (
+            index
+            for index, record in enumerate(records)
+            if isinstance(record, dict) and record.get("assignment_id") == assignment_id
+        ),
+        None,
+    )
+    latest_assignment_id = (
+        records[-1].get("assignment_id")
+        if records and isinstance(records[-1], dict)
+        else None
+    )
+    status = status_agent(agent, initialize_state=False)
+    assignment_created_at = parse_utc_timestamp(assignment.get("created_at_utc"))
+    raw_log_updated_at = parse_utc_timestamp(status.get("raw_log_updated_at_utc"))
+    session_started_at = parse_utc_timestamp(status.get("started_at_utc"))
+    latest_assignment_created_at = parse_utc_timestamp(
+        records[-1].get("created_at_utc")
+        if records and isinstance(records[-1], dict)
+        else None
+    )
+    newer_assignment_output_boundary = None
+    if latest_assignment_id != assignment_id:
+        if assignment_created_at is None:
+            newer_assignment_output_boundary = {
+                "status": "report_blocked_unknown_assignment_created_at",
+                "detail": "requested assignment has no parseable created_at_utc",
+            }
+        elif assignment_position is None:
+            newer_assignment_output_boundary = {
+                "status": "report_blocked_unknown_assignment_position",
+                "detail": "requested assignment index was not resolved for boundary check",
+            }
+        else:
+            for candidate in records[assignment_position + 1 :]:
+                if not isinstance(candidate, dict):
+                    continue
+                candidate_id = candidate.get("assignment_id")
+                candidate_created_at = parse_utc_timestamp(candidate.get("created_at_utc"))
+                if candidate_created_at is None:
+                    newer_assignment_output_boundary = {
+                        "status": "report_blocked_unknown_later_assignment",
+                        "detail": f"later assignment {candidate_id} missing parseable created_at_utc",
+                    }
+                    break
+                if (
+                    candidate_created_at >= assignment_created_at
+                    or (latest_assignment_created_at is not None and candidate_created_at >= latest_assignment_created_at)
+                ):
+                    newer_assignment_output_boundary = {
+                        "status": "report_blocked_by_superseded_assignment",
+                        "detail": f"later assignment {candidate_id} at/after requested assignment",
+                    }
+                    break
+    current_time = time.time()
+    lease = status.get("lease") if isinstance(status.get("lease"), dict) else None
+    base_result = {
         "agent": agent,
         "assignment_id": assignment_id,
         "assignment_created_at_utc": assignment.get("created_at_utc"),
         "role": assignment.get("role"),
         "model": assignment.get("model"),
+        "source": source,
+        "lines_limit": lines,
+        "chars_limit": chars,
+        "lease": lease,
+        "report_status_detail": None,
+    }
+    if latest_assignment_id != assignment_id and source != "log":
+        return {
+            **base_result,
+            "report_status": "no_output",
+            "spark_health": {"state": "not_checked", "updated": False, "raw_output": "not_returned"},
+            "redaction_applied": False,
+            "output_chars": 0,
+            "output_lines": 0,
+            "output_truncated": False,
+            "output_truncated_by_lines": False,
+            "output_truncated_by_chars": False,
+            "output": "",
+        }
+    if source == "log" and newer_assignment_output_boundary is not None:
+        return {
+            **base_result,
+            "report_status": newer_assignment_output_boundary["status"],
+            "report_status_detail": newer_assignment_output_boundary["detail"],
+            "spark_health": {"state": "not_checked", "updated": False, "raw_output": "not_returned"},
+            "redaction_applied": False,
+            "output_chars": 0,
+            "output_lines": 0,
+            "output_truncated": False,
+            "output_truncated_by_lines": False,
+            "output_truncated_by_chars": False,
+            "output": "",
+        }
+    has_fresh_output = (
+        assignment_created_at is not None
+        and assignment_created_at <= current_time
+        and (session_started_at is None or assignment_created_at >= session_started_at)
+        and raw_log_updated_at is not None
+        and raw_log_updated_at <= current_time
+        and raw_log_updated_at > assignment_created_at
+    )
+    if not has_fresh_output:
+        return {
+            **base_result,
+            "report_status": "no_output",
+            "spark_health": {"state": "not_checked", "updated": False, "raw_output": "not_returned"},
+            "redaction_applied": False,
+            "output_chars": 0,
+            "output_lines": 0,
+            "output_truncated": False,
+            "output_truncated_by_lines": False,
+            "output_truncated_by_chars": False,
+            "output": "",
+        }
+    if source == "pane" and status.get("running"):
+        visible_pane_text = pane_tail(agent, 24, visible_only=True, verify_identity=True)
+        response_state = (status.get("response_state") or {}).get("state")
+        visible_pane_ready = tui_accepts_input(visible_pane_text)
+        is_active_pane_work = "esc to interrupt" in visible_pane_text.lower()
+        if visible_pane_ready:
+            if (
+                has_fresh_output
+                and response_state == "running_recent_output"
+                and not is_active_pane_work
+            ):
+                source = "log"
+        elif (
+            has_fresh_output
+            and response_state in {"running_recent_output", "running_idle"}
+            and not is_active_pane_work
+        ):
+            source = "log"
+        else:
+            return {
+                **base_result,
+                "report_status": "pending",
+                "spark_health": {"state": "not_checked", "updated": False, "raw_output": "not_returned"},
+                "redaction_applied": False,
+                "output_chars": 0,
+                "output_lines": 0,
+                "output_truncated": False,
+                "output_truncated_by_lines": False,
+                "output_truncated_by_chars": False,
+                "output": "",
+            }
+    excerpt = safe_tail(agent, lines, chars, source)
+    output = excerpt.get("output") if isinstance(excerpt.get("output"), str) else ""
+    spark_health = _spark_health_from_assignment_report(
+        agent,
+        assignment,
+        status,
+        output=output,
+        has_fresh_output=has_fresh_output,
+    )
+    return {
+        **base_result,
         "report_status": "excerpt_available" if output.strip() else "no_output_observed",
         "source": excerpt.get("source"),
         "lines_limit": excerpt.get("lines_limit"),
@@ -6875,6 +7367,7 @@ def assignment_report(
         "output_truncated_by_lines": excerpt.get("output_truncated_by_lines"),
         "output_truncated_by_chars": excerpt.get("output_truncated_by_chars"),
         "output": output,
+        "spark_health": spark_health,
         "lease": excerpt.get("lease"),
     }
 
@@ -7183,6 +7676,7 @@ def replace_install_symlink(
     wrapper: Path,
     *,
     expected_parent_stat: os.stat_result | None = None,
+    expected_existing_stat: os.stat_result | None = None,
     target_text: str | None = None,
 ) -> None:
     tmp_name = f".{install_path.name}.tmp.{now_id()}.{uuid.uuid4().hex}"
@@ -7196,6 +7690,17 @@ def replace_install_symlink(
         )
         os.symlink(str(wrapper) if target_text is None else target_text, tmp_name, dir_fd=parent_fd)
         tmp_created = True
+        try:
+            current = os.lstat(install_path.name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            current = None
+        except OSError as exc:
+            raise AgentError("install path could not be inspected") from exc
+        if expected_existing_stat is None:
+            if current is not None:
+                raise AgentError("install path changed after validation")
+        elif current is None or not source_identity_matches(current, expected_existing_stat):
+            raise AgentError("install path changed after validation")
         os.replace(tmp_name, install_path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         tmp_created = False
     except OSError as exc:
@@ -7216,6 +7721,7 @@ def restore_install_symlink(
     expected_parent_stat: os.stat_result,
 ) -> None:
     try:
+        current_stat = os.lstat(install_path)
         current_target_text = os.readlink(install_path)
     except OSError as exc:
         raise AgentError("install path changed after mutation") from exc
@@ -7234,6 +7740,7 @@ def restore_install_symlink(
         install_path,
         wrapper,
         expected_parent_stat=expected_parent_stat,
+        expected_existing_stat=current_stat,
         target_text=previous_target_text,
     )
 
@@ -7420,6 +7927,38 @@ def normalize_plugin_contract_path(value: Any) -> str | None:
         return None
     normalized = path.as_posix().rstrip("/")
     return normalized or None
+
+
+def plugin_declares_mcp_manifest(root: Path) -> dict[str, Any]:
+    manifest = root / ".codex-plugin" / "plugin.json"
+    status = repo_file_status(manifest)
+    result: dict[str, Any] = {
+        "path": PATH_NOT_RETURNED,
+        "path_state": status["path_state"],
+        "exists": status["exists"],
+        "declared": False,
+        "ok": False,
+        "raw_output": "not_returned",
+    }
+    if not status["regular_file"]:
+        result["reason"] = "plugin_manifest_not_regular_file"
+        return result
+    try:
+        payload = read_repo_json_object(manifest, "plugin manifest")
+    except AgentError as exc:
+        result["reason"] = safe_error_text(exc)
+        return result
+    normalized = normalize_plugin_contract_path(payload.get("mcpServers"))
+    result.update(
+        {
+            "declared": normalized is not None,
+            "target": normalized or "",
+            "ok": normalized == ".mcp.json",
+        }
+    )
+    if not result["ok"]:
+        result["reason"] = "plugin_mcp_manifest_reference_invalid"
+    return result
 
 
 def plugin_declares_app_manifest(root: Path) -> dict[str, Any]:
@@ -7625,6 +8164,17 @@ def source_identity_matches(opened_stat: os.stat_result, expected_stat: os.stat_
     return opened_stat.st_ino == expected_stat.st_ino and opened_stat.st_dev == expected_stat.st_dev
 
 
+def source_identity_with_snapshot_matches(
+    opened_stat: os.stat_result,
+    expected_stat: os.stat_result,
+) -> bool:
+    return (
+        source_identity_matches(opened_stat, expected_stat)
+        and opened_stat.st_size == expected_stat.st_size
+        and opened_stat.st_mtime_ns == expected_stat.st_mtime_ns
+    )
+
+
 def open_directory_no_follow_matching(
     path: Path | str,
     expected_stat: os.stat_result,
@@ -7754,8 +8304,7 @@ def copy_regular_plugin_file_no_follow(src: Path, dst: Path, expected_stat: os.s
         if (
             not stat_module.S_ISREG(opened_stat.st_mode)
             or getattr(opened_stat, "st_nlink", 1) > 1
-            or opened_stat.st_ino != expected_stat.st_ino
-            or opened_stat.st_dev != expected_stat.st_dev
+            or not source_identity_with_snapshot_matches(opened_stat, expected_stat)
         ):
             raise AgentError("plugin source changed during copy")
         mode = stat_module.S_IMODE(opened_stat.st_mode)
@@ -7840,7 +8389,7 @@ def copy_regular_plugin_file_from_dir_no_follow(
         if (
             not stat_module.S_ISREG(opened_stat.st_mode)
             or getattr(opened_stat, "st_nlink", 1) > 1
-            or not source_identity_matches(opened_stat, expected_stat)
+            or not source_identity_with_snapshot_matches(opened_stat, expected_stat)
         ):
             raise AgentError("plugin source changed during copy")
         mode = stat_module.S_IMODE(opened_stat.st_mode)
@@ -7984,7 +8533,7 @@ def copy_plugin_cache_dir_fd(src_fd: int, dst: Path, *, dst_fd: int | None = Non
                             dir_fd=src_fd,
                         )
                         opened_stat = os.fstat(source_child_fd)
-                        if not stat_module.S_ISDIR(opened_stat.st_mode) or not source_identity_matches(
+                        if not stat_module.S_ISDIR(opened_stat.st_mode) or not source_identity_with_snapshot_matches(
                             opened_stat, entry_stat
                         ):
                             raise AgentError("plugin source changed during copy")
@@ -8186,6 +8735,8 @@ def _prune_plugin_cache_versions_unlocked(
         cache_fd_path = Path(f"/proc/self/fd/{cache_fd}")
         entries = [cache_fd_path / name for name in sorted(os.listdir(cache_fd))]
         candidates: list[tuple[float, str, str]] = []
+        keep_entry = cache_fd_path / keep_version
+        current_version_retained = bool(valid_plugin_cache_entry_version(keep_entry))
         for entry in entries:
             version = valid_plugin_cache_entry_version(entry)
             if not version or version == keep_version:
@@ -8208,7 +8759,7 @@ def _prune_plugin_cache_versions_unlocked(
             os.close(cache_fd)
     return {
         "max_versions": max_versions,
-        "current_version_retained": True,
+        "current_version_retained": current_version_retained,
         "retained_old_version_count": retained_old_count,
         "pruned_version_count": len(to_prune),
         "raw_output": "not_returned",
@@ -8326,7 +8877,7 @@ def _sync_plugin_cache_from_repo_unlocked(
                     current_stat = src.lstat()
                 except OSError as exc:
                     raise AgentError("could_not_sync_plugin_cache") from exc
-                if not source_identity_matches(current_stat, source_entry_stats[name]):
+                if not source_identity_with_snapshot_matches(current_stat, source_entry_stats[name]):
                     raise AgentError("plugin source changed during copy")
                 counts = copy_plugin_cache_path(src, tmp_entry / name)
                 copied_files += counts["files"]
@@ -8348,7 +8899,7 @@ def _sync_plugin_cache_from_repo_unlocked(
                     current_stat = src.lstat()
                 except OSError as exc:
                     raise AgentError("could_not_sync_plugin_cache") from exc
-                if not source_identity_matches(current_stat, source_entry_stats[name]):
+                if not source_identity_with_snapshot_matches(current_stat, source_entry_stats[name]):
                     raise AgentError("plugin source changed during copy")
                 counts = copy_plugin_cache_path(src, tmp_entry / name)
                 copied_files += counts["files"]
@@ -8358,7 +8909,7 @@ def _sync_plugin_cache_from_repo_unlocked(
                     current_stat = (source_root / name).lstat()
                 except OSError as exc:
                     raise AgentError("could_not_sync_plugin_cache") from exc
-                if not source_identity_matches(current_stat, expected_stat):
+                if not source_identity_with_snapshot_matches(current_stat, expected_stat):
                     raise AgentError("plugin source changed during copy")
 
         try:
@@ -8488,7 +9039,10 @@ def master_app_bridge_status() -> dict[str, Any]:
         result["reason"] = "connector_id_missing"
         return result
     connector_id = connector_id.strip()
-    id_prefix_ok = connector_id.startswith(APP_BRIDGE_ID_PREFIXES)
+    id_prefix_ok = any(
+        connector_id.startswith(prefix) and len(connector_id) > len(prefix)
+        for prefix in APP_BRIDGE_ID_PREFIXES
+    )
     result.update(
         {
             "connector_id": connector_id,
@@ -8502,12 +9056,47 @@ def master_app_bridge_status() -> dict[str, Any]:
     return result
 
 
+def plugin_mcp_manifest_status(root: Path | None = None) -> dict[str, Any]:
+    manifest = (root or repo_root()) / ".mcp.json"
+    status = repo_file_status(manifest)
+    result: dict[str, Any] = {
+        "path": PATH_NOT_RETURNED,
+        "path_state": status["path_state"],
+        "exists": status["exists"],
+        "regular_file": status["regular_file"],
+        "server_declared": False,
+        "ok": False,
+        "raw_output": "not_returned",
+    }
+    if not status["regular_file"]:
+        result["reason"] = "mcp_manifest_not_regular_file"
+        return result
+    try:
+        payload = read_repo_json_object(manifest, "MCP manifest")
+    except AgentError as exc:
+        result["reason"] = safe_error_text(exc)
+        return result
+    servers = payload.get("mcpServers")
+    server = servers.get(MCP_SERVER_NAME) if isinstance(servers, dict) else None
+    if not isinstance(server, dict):
+        result["reason"] = "mcp_server_declaration_missing"
+        return result
+    result["server_declared"] = True
+    command = server.get("command")
+    if not isinstance(command, str) or not command.strip():
+        result["reason"] = "mcp_server_command_missing"
+        return result
+    result["ok"] = True
+    return result
+
+
 def master_plugin_status() -> dict[str, Any]:
     root = repo_root()
     manifest = root / ".codex-plugin" / "plugin.json"
-    mcp_manifest = root / ".mcp.json"
     app_manifest = root / ".app.json"
     skill = root / "skills" / "codex-master-fleet" / "SKILL.md"
+    mcp_manifest_declaration = plugin_declares_mcp_manifest(root)
+    mcp_manifest_status = plugin_mcp_manifest_status(root)
     app_bridge = master_app_bridge_status()
     mcp_registration = check_mcp_registration(DEFAULT_INSTALL_PATH)
     startup_self_test = mcp_command_startup_self_test(DEFAULT_INSTALL_PATH)
@@ -8520,13 +9109,16 @@ def master_plugin_status() -> dict[str, Any]:
             and bool(startup_self_test.get("ok"))
             and bool(cache_status.get("ok"))
             and bool(client_config.get("ok"))
+            and bool(mcp_manifest_declaration.get("ok"))
+            and bool(mcp_manifest_status.get("ok"))
         ),
         "repo": PATH_NOT_RETURNED,
         "repo_state": "set",
         "plugin_manifest": repo_file_status(manifest),
         "plugin_manifest_version": plugin_manifest_version(root),
+        "plugin_mcp_manifest": mcp_manifest_declaration,
         "plugin_cache": cache_status,
-        "mcp_manifest": repo_file_status(mcp_manifest),
+        "mcp_manifest": mcp_manifest_status,
         "app_manifest": repo_file_status(app_manifest),
         "skill": repo_file_status(skill),
         "app_bridge": app_bridge,
@@ -9009,11 +9601,23 @@ def check_mcp_registration(
 ) -> dict[str, Any]:
     codex_path = shutil.which("codex")
     if not codex_path:
-        return {"registered": False, "ok": False, "reason": "codex command not found"}
+        return {
+            "registered": False,
+            "lookup_status": "unavailable",
+            "ok": False,
+            "reason": "codex command not found",
+        }
     cp = run_command(["codex", "mcp", "get", MCP_SERVER_NAME])
     raw_output = cp.stdout + cp.stderr
     output, redacted = command_excerpt(raw_output)
     registered = cp.returncode == 0
+    lookup_status = (
+        "registered"
+        if registered
+        else "not_registered"
+        if re.search(r"\bno\s+mcp\s+server\s+named\b", raw_output, re.IGNORECASE)
+        else "unavailable"
+    )
     registered_command = mcp_get_field(raw_output, "command") if registered else None
     command_matches = mcp_registration_command_matches(raw_output, command_path) if registered else False
     startup_timeout_sec = mcp_startup_timeout_seconds(raw_output) if registered else None
@@ -9022,6 +9626,7 @@ def check_mcp_registration(
     )
     result = {
         "registered": registered,
+        "lookup_status": lookup_status,
         "command_matches": command_matches,
         "startup_timeout_sec": startup_timeout_sec,
         "startup_timeout_ok": startup_timeout_ok,
@@ -9095,7 +9700,7 @@ def doctor() -> dict[str, Any]:
             [
                 {
                     "name": f"agent_{agent}_home_exists",
-                    "ok": cfg["home"].is_dir(),
+                    "ok": is_real_directory_no_symlink(cfg["home"]),
                     "path": PATH_NOT_RETURNED,
                     "path_state": "set",
                     "home_kind": "managed_agent_home",
@@ -9171,42 +9776,60 @@ def _install_unlocked(
         install_path,
         "install parent directories must be real directories",
     )
-    previous_install_present = install_path.exists() or install_path.is_symlink()
+    try:
+        previous_install_stat = install_path.lstat()
+    except FileNotFoundError:
+        previous_install_stat = None
+    except OSError as exc:
+        raise AgentError("install path could not be inspected") from exc
+    previous_install_present = previous_install_stat is not None
     previous_install_target_text: str | None = None
-    if install_path.is_symlink():
+    if previous_install_stat is not None and stat_module.S_ISLNK(previous_install_stat.st_mode):
         try:
             previous_install_target_text = os.readlink(install_path)
         except OSError as exc:
             raise AgentError("install path could not be inspected") from exc
-    if install_path.exists() or install_path.is_symlink():
-        resolved_install_path = resolve_path_no_throw(install_path) if install_path.is_symlink() else None
-        if install_path.is_symlink() and resolved_install_path == wrapper:
+    if previous_install_stat is not None:
+        resolved_install_path = (
+            resolve_path_no_throw(install_path)
+            if stat_module.S_ISLNK(previous_install_stat.st_mode)
+            else None
+        )
+        if stat_module.S_ISLNK(previous_install_stat.st_mode) and resolved_install_path == wrapper:
             symlink_status = "already_installed"
-        elif force:
+        elif force and stat_module.S_ISLNK(previous_install_stat.st_mode):
             symlink_status = "replaced"
         else:
             raise AgentError("install path exists and is not this wrapper symlink")
     else:
         symlink_status = "created"
 
-    plugin_cache_install = (
-        sync_plugin_cache_from_repo()
-        if sync_plugin_cache
-        else {"requested": False, "status": "skipped", "raw_output": "not_returned"}
-    )
     if symlink_status != "already_installed":
-        replace_install_symlink(install_path, wrapper, expected_parent_stat=expected_parent_stat)
+        replace_install_symlink(
+            install_path,
+            wrapper,
+            expected_parent_stat=expected_parent_stat,
+            expected_existing_stat=previous_install_stat,
+        )
 
+    plugin_cache_install: dict[str, Any] = {
+        "requested": False,
+        "status": "skipped",
+        "raw_output": "not_returned",
+    }
     registration: dict[str, Any] = {"requested": register, "status": "skipped"}
     previous_command: str | None = None
     registration_removed = False
     registration_added = False
+    startup_timeout_snapshot: dict[str, Any] | None = None
     try:
         if register:
             startup_self_test = {"requested": True, **mcp_command_startup_self_test(install_path)}
             if not startup_self_test["ok"]:
                 raise AgentError("install path failed MCP startup self-test")
             current = check_mcp_registration(install_path, include_command=True)
+            if current.get("lookup_status") == "unavailable":
+                raise AgentError("MCP server registration could not be inspected")
             startup_timeout_config = None
             if current.get("ok") or (current.get("registered") and current.get("command_matches")):
                 registration = {"requested": True, "status": "already_registered"}
@@ -9215,6 +9838,10 @@ def _install_unlocked(
                 if not isinstance(previous_command, str) or not previous_command.strip():
                     previous_command = None
                 if current.get("registered") and force:
+                    if previous_command is None:
+                        raise AgentError(
+                            "MCP server registration command could not be inspected; refusing force replacement"
+                        )
                     remove = run_command(["codex", "mcp", "remove", MCP_SERVER_NAME])
                     if remove.returncode != 0:
                         raise AgentError("codex mcp remove failed")
@@ -9227,11 +9854,13 @@ def _install_unlocked(
                 registration_added = True
                 registration = {"requested": True, "status": "registered"}
             if not current.get("startup_timeout_ok"):
-                startup_timeout_config = ensure_mcp_startup_timeout_configured()
+                startup_timeout_config = ensure_mcp_startup_timeout_configured(capture_snapshot=True)
+                startup_timeout_snapshot = startup_timeout_config.pop("_config_snapshot", None)
             else:
                 client_config = codex_client_mcp_config_status(command_path=install_path)
                 if not client_config.get("startup_timeout_ok"):
-                    startup_timeout_config = ensure_mcp_startup_timeout_configured()
+                    startup_timeout_config = ensure_mcp_startup_timeout_configured(capture_snapshot=True)
+                    startup_timeout_snapshot = startup_timeout_config.pop("_config_snapshot", None)
                 else:
                     startup_timeout_config = {
                         "status": "already_configured",
@@ -9241,8 +9870,13 @@ def _install_unlocked(
                         "raw_output": "not_returned",
                     }
             registration["startup_timeout"] = startup_timeout_config
+        if sync_plugin_cache:
+            plugin_cache_install = sync_plugin_cache_from_repo()
+            if not plugin_cache_install.get("ok"):
+                raise AgentError("plugin cache sync incomplete")
     except Exception:
         mcp_restore_error: Exception | None = None
+        config_restore_error: Exception | None = None
         if registration_added or registration_removed:
             try:
                 if registration_added:
@@ -9255,6 +9889,11 @@ def _install_unlocked(
                         raise AgentError("codex mcp add failed")
             except Exception as restore_exc:
                 mcp_restore_error = restore_exc
+        if startup_timeout_snapshot is not None:
+            try:
+                restore_mcp_startup_timeout_snapshot(startup_timeout_snapshot)
+            except Exception as restore_exc:
+                config_restore_error = restore_exc
         rollback_install = symlink_status != "already_installed" and (
             not previous_install_present or previous_install_target_text is not None
         )
@@ -9270,6 +9909,8 @@ def _install_unlocked(
                 raise AgentError("could_not_restore_install_symlink") from restore_exc
         if mcp_restore_error is not None:
             raise AgentError("could_not_restore_mcp_registration") from mcp_restore_error
+        if config_restore_error is not None:
+            raise AgentError("could_not_restore_codex_config") from config_restore_error
         raise
     return {
         "ok": True,
@@ -9313,21 +9954,30 @@ def _uninstall_unlocked(
     wrapper: Path | None = None
     symlink_removed = False
     if remove_symlink:
-        expected_parent_stat = ensure_real_parent(
-            install_path,
-            "install parent directories must be real directories",
-        )
         wrapper = repo_wrapper_path()
-        symlink_status = remove_install_symlink_if_repo_wrapper(
-            install_path,
-            wrapper,
-            expected_parent_stat=expected_parent_stat,
-        )
-        symlink_removed = symlink_status == "removed"
+        try:
+            install_path.parent.lstat()
+        except FileNotFoundError:
+            symlink_status = "missing"
+        except OSError as exc:
+            raise AgentError("install parent directories must be real directories") from exc
+        else:
+            expected_parent_stat = ensure_real_parent(
+                install_path,
+                "install parent directories must be real directories",
+            )
+            symlink_status = remove_install_symlink_if_repo_wrapper(
+                install_path,
+                wrapper,
+                expected_parent_stat=expected_parent_stat,
+            )
+            symlink_removed = symlink_status == "removed"
 
     try:
         if unregister:
             current = check_mcp_registration(install_path)
+            if current.get("lookup_status") == "unavailable":
+                raise AgentError("MCP server registration could not be inspected")
             if current.get("registered"):
                 if current.get("command_matches"):
                     remove = run_command(["codex", "mcp", "remove", MCP_SERVER_NAME])
@@ -9372,13 +10022,30 @@ def tui_accepts_input(text: str) -> bool:
     cleaned = strip_ansi(text)
     if not cleaned.strip():
         return False
-    lowered = cleaned.lower()
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if not lines:
+        return False
+
+    recent_lines = lines[-CODEX_TUI_INPUT_MARKER_WINDOW_LINES:]
+    marker_indices = [
+        idx
+        for idx, line in enumerate(recent_lines)
+        for marker in CODEX_TUI_INPUT_MARKERS
+        if line.startswith(marker)
+    ]
+    prompt_context_start = 0
+    if marker_indices:
+        prompt_context_start = max(0, max(marker_indices) - 1)
+    prompt_context = recent_lines[prompt_context_start:]
+    lowered = "\n".join(prompt_context).lower()
+
     if any(re.search(pattern, lowered) for pattern in CODEX_TUI_BLOCKING_PROMPT_PATTERNS):
         return False
-    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
-    if any(re.match(r"^›\s+\d+\.\s+", line) for line in lines[-CODEX_TUI_INPUT_MARKER_WINDOW_LINES:]):
+    if any("esc to interrupt" in line.lower() for line in prompt_context):
         return False
-    for line in lines[-CODEX_TUI_INPUT_MARKER_WINDOW_LINES:]:
+    if any(re.match(r"^›\s+\d+\.\s+", line) for line in prompt_context):
+        return False
+    for line in prompt_context:
         if any(line.startswith(marker) for marker in CODEX_TUI_INPUT_MARKERS):
             return True
     return False
@@ -9387,6 +10054,25 @@ def tui_accepts_input(text: str) -> bool:
 def codex_update_prompt_visible(text: str) -> bool:
     cleaned = strip_ansi(text).lower()
     return "update available!" in cleaned and "press enter to continue" in cleaned
+
+
+def codex_project_trust_prompt_visible(text: str) -> bool:
+    cleaned = strip_ansi(text).lower()
+    return any(CODEX_PROJECT_TRUST_PROMPT_RE.search(line.strip()) for line in cleaned.splitlines()) and (
+        "press enter to continue" in cleaned
+    )
+
+
+def dismiss_codex_project_trust_prompt(agent: str, text: str) -> bool:
+    """Confirm Codex's trust prompt for the current project directory."""
+    if not codex_project_trust_prompt_visible(text):
+        return False
+    agent = canonical_agent_id(agent)
+    session = AGENTS[agent]["session"]
+    with agent_lifecycle_lock(agent):
+        require_managed_tmux_session(agent)
+        result = run_tmux(["send-keys", "-t", session, CODEX_TUI_TRUST_PROMPT_SUBMIT_KEY], check=False)
+        return result.returncode == 0
 
 
 def dismiss_codex_update_prompt(agent: str, text: str) -> bool:
@@ -9429,6 +10115,8 @@ def wait_agent_input_ready(agent: str, timeout_seconds: float = DEFAULT_SEND_REA
     polls = 0
     update_prompt_dismissed = False
     update_prompt_attempted = False
+    trust_prompt_dismissed = False
+    trust_prompt_attempted = False
     while True:
         polls += 1
         text = pane_tail(agent, 24, visible_only=True, verify_identity=True)
@@ -9438,9 +10126,15 @@ def wait_agent_input_ready(agent: str, timeout_seconds: float = DEFAULT_SEND_REA
                 "poll_count": polls,
                 "timeout_seconds": timeout_seconds,
                 "evidence": "not_returned",
+                "trust_prompt_dismissed": trust_prompt_dismissed,
                 "update_prompt_dismissed": update_prompt_dismissed,
                 "raw_output": "not_returned",
             }
+        if not trust_prompt_attempted and codex_project_trust_prompt_visible(text):
+            trust_prompt_attempted = True
+            trust_prompt_dismissed = dismiss_codex_project_trust_prompt(agent, text)
+            if trust_prompt_dismissed:
+                continue
         if not update_prompt_attempted and codex_update_prompt_visible(text):
             update_prompt_attempted = True
             update_prompt_dismissed = dismiss_codex_update_prompt(agent, text)
@@ -9452,6 +10146,7 @@ def wait_agent_input_ready(agent: str, timeout_seconds: float = DEFAULT_SEND_REA
                 "poll_count": polls,
                 "timeout_seconds": timeout_seconds,
                 "evidence": "not_returned",
+                "trust_prompt_dismissed": trust_prompt_dismissed,
                 "update_prompt_dismissed": update_prompt_dismissed,
                 "raw_output": "not_returned",
             }
@@ -10286,7 +10981,7 @@ def agent_selector_schema(*, default: str | None = None, single: bool = False) -
         if single
         else AGENT_SELECTOR_DESCRIPTION
     )
-    schema = text_schema(32, description=description)
+    schema = text_schema(MAX_AGENT_SELECTOR_TEXT, description=description)
     if default is not None:
         schema["default"] = default
     return schema
@@ -10354,10 +11049,15 @@ def pool_expand_text(value: str) -> str:
 def pool_validate_codex_bin(value: str) -> str:
     if not value:
         raise AgentError("codex_bin must resolve to a non-empty string")
-    if len(value) > MAX_PATH_TEXT:
-        raise AgentError(f"codex_bin exceeds {MAX_PATH_TEXT} characters")
     if any(ord(char) < 32 or ord(char) == 127 for char in value):
         raise AgentError("codex_bin contains unsupported characters")
+    if "/" in value:
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        value = str(path.absolute())
+    if len(value) > MAX_PATH_TEXT:
+        raise AgentError(f"codex_bin exceeds {MAX_PATH_TEXT} characters")
     return value
 
 
@@ -10755,6 +11455,64 @@ def pool_write_private_bytes(path: Path, data: bytes, mode: int) -> None:
     replace_private_bytes(path, data, mode=mode)
 
 
+def write_private_bytes_if_absent_at_dir_fd(
+    directory_fd: int,
+    name: str,
+    data: bytes,
+    mode: int = 0o600,
+    *,
+    error_text: str,
+) -> bool:
+    tmp_name = f".{name}.{now_id()}.{uuid.uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    tmp_created = False
+    linked = False
+    try:
+        try:
+            fd = os.open(tmp_name, flags, mode, dir_fd=directory_fd)
+        except OSError as exc:
+            raise AgentError(error_text) from exc
+        tmp_created = True
+        current = os.fstat(fd)
+        if not stat_module.S_ISREG(current.st_mode) or getattr(current, "st_nlink", 1) != 1:
+            raise AgentError(error_text)
+        try:
+            os.fchmod(fd, mode)
+        except PermissionError:
+            pass
+        with os.fdopen(fd, "wb") as fh:
+            fd = -1
+            fh.write(data)
+        try:
+            os.link(
+                tmp_name,
+                name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            return False
+        except OSError as exc:
+            raise AgentError(error_text) from exc
+        linked = True
+        return True
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if tmp_created:
+            try:
+                os.unlink(tmp_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                if linked:
+                    raise AgentError(error_text) from exc
+
+
 def pool_write_private_bytes_if_absent(path: Path, data: bytes, mode: int = 0o600) -> bool:
     try:
         parent_stat = path.parent.lstat()
@@ -10766,54 +11524,15 @@ def pool_write_private_bytes_if_absent(path: Path, data: bytes, mode: int = 0o60
         error_text="pool auth target changed during copy",
         changed_text="pool auth target changed during copy",
     )
-    tmp_name = f".{path.name}.{now_id()}.{uuid.uuid4().hex}.tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = -1
-    tmp_created = False
-    linked = False
     try:
-        try:
-            fd = os.open(tmp_name, flags, mode, dir_fd=parent_fd)
-        except OSError as exc:
-            raise AgentError("pool auth target changed during copy") from exc
-        tmp_created = True
-        current = os.fstat(fd)
-        if not stat_module.S_ISREG(current.st_mode) or getattr(current, "st_nlink", 1) != 1:
-            raise AgentError("pool auth target changed during copy")
-        try:
-            os.fchmod(fd, mode)
-        except PermissionError:
-            pass
-        with os.fdopen(fd, "wb") as fh:
-            fd = -1
-            fh.write(data)
-        try:
-            os.link(
-                tmp_name,
-                path.name,
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-        except FileExistsError:
-            return False
-        except OSError as exc:
-            raise AgentError("pool auth target changed during copy") from exc
-        linked = True
-        return True
+        return write_private_bytes_if_absent_at_dir_fd(
+            parent_fd,
+            path.name,
+            data,
+            mode=mode,
+            error_text="pool auth target changed during copy",
+        )
     finally:
-        if fd >= 0:
-            os.close(fd)
-        if tmp_created:
-            try:
-                os.unlink(tmp_name, dir_fd=parent_fd)
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                if linked:
-                    raise AgentError("pool auth target changed during copy") from exc
         os.close(parent_fd)
 
 
@@ -10878,14 +11597,23 @@ def pool_private_text_matches(path: Path, expected: str, max_bytes: int) -> bool
         return False
 
 
+def _pool_root_digest_text(path: Path) -> str:
+    try:
+        return str(path.resolve(strict=False))
+    except (OSError, RuntimeError):
+        return str(path.absolute())
+
+
 def pool_marker_payload(normalized: dict[str, Any]) -> dict[str, Any]:
     digest = hashlib.sha256(json.dumps(normalized["raw"], sort_keys=True).encode("utf-8")).hexdigest()
+    pool_root_digest = hashlib.sha256(_pool_root_digest_text(normalized["pool_root"]).encode("utf-8")).hexdigest()
     return {
         "schema_version": normalized["schema_version"],
         "installed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "agent_count": len(normalized["ids"]),
         "series_count": len(normalized["series_ids"]),
         "spec_sha256": digest,
+        "pool_root_sha256": pool_root_digest,
         "codex_bin_state": normalized["codex_bin_state"],
         "pool_root": PATH_NOT_RETURNED,
     }
@@ -10926,6 +11654,8 @@ def pool_marker_matches(path: Path, expected_stat: os.stat_result, normalized: d
         and payload.get("agent_count") == expected["agent_count"]
         and payload.get("series_count") == expected["series_count"]
         and payload.get("spec_sha256") == expected["spec_sha256"]
+        and payload.get("pool_root_sha256") == expected["pool_root_sha256"]
+        and payload.get("codex_bin_state") == expected["codex_bin_state"]
     )
 
 
@@ -10982,6 +11712,7 @@ def agent_pool_status(
             "pool_root_state": root_state,
             "marker_state": "missing" if root_state == "missing" else "not_checked",
             "marker_present": False,
+            "marker_valid": False,
             "expected_agent_count": len(normalized["ids"]),
             "existing_agent_count": 0,
             "missing_agent_count": len(normalized["ids"]),
@@ -11035,6 +11766,13 @@ def _agent_pool_status_at_root(normalized: dict[str, Any], root: Path, root_stat
     missing = len(ids) - existing
     marker = root / POOL_MARKER_FILE
     marker_present = pool_regular_marker_present(marker)
+    marker_valid = False
+    if marker_present:
+        try:
+            marker_stat = marker.lstat()
+        except OSError:
+            marker_stat = None
+        marker_valid = marker_stat is not None and pool_marker_matches(marker, marker_stat, normalized)
     shared_expected = 0
     shared_valid = 0
     shared_invalid = 0
@@ -11095,7 +11833,7 @@ def _agent_pool_status_at_root(normalized: dict[str, Any], root: Path, root_stat
             missing == 0
             and wrappers == len(ids)
             and configs == len(ids)
-            and marker_present
+            and marker_valid
             and shared_missing == 0
             and shared_invalid == 0
             and template_sources_missing == 0
@@ -11104,6 +11842,7 @@ def _agent_pool_status_at_root(normalized: dict[str, Any], root: Path, root_stat
         "pool_root_state": root_state,
         "marker_state": pool_public_path_state(marker),
         "marker_present": marker_present,
+        "marker_valid": marker_valid,
         "expected_agent_count": len(ids),
         "existing_agent_count": existing,
         "missing_agent_count": missing,
@@ -11324,11 +12063,26 @@ def _agent_pool_install_unlocked(
             )
 
         marker = root / POOL_MARKER_FILE
-        pool_write_private_file(
-            marker,
-            json.dumps(pool_marker_payload(normalized), indent=2, sort_keys=True) + "\n",
-            0o600,
-        )
+        marker_is_current = False
+        try:
+            marker_stat = marker.lstat()
+        except FileNotFoundError:
+            marker_stat = None
+        except OSError:
+            marker_stat = None
+        if (
+            marker_stat is not None
+            and stat_module.S_ISREG(marker_stat.st_mode)
+            and getattr(marker_stat, "st_nlink", 1) == 1
+            and stat_module.S_IMODE(marker_stat.st_mode) == 0o600
+        ):
+            marker_is_current = pool_marker_matches(marker, marker_stat, normalized)
+        if not marker_is_current:
+            pool_write_private_file(
+                marker,
+                json.dumps(pool_marker_payload(normalized), indent=2, sort_keys=True) + "\n",
+                0o600,
+            )
 
         return {
             "ok": True,
@@ -11583,6 +12337,17 @@ def _agent_pool_destroy_pool_unlocked(
                 or not source_identity_matches(latest_marker_stat, marker_stat)
             ):
                 raise AgentError("pool marker changed during removal")
+            if marker_bytes is not None:
+                try:
+                    latest_marker_bytes = pool_read_private_bytes(
+                        marker,
+                        MAX_POOL_SPEC_BYTES,
+                        "pool marker changed during removal",
+                    )
+                except AgentError as exc:
+                    raise AgentError("pool marker changed during removal") from exc
+                if latest_marker_bytes != marker_bytes:
+                    raise AgentError("pool marker changed during removal")
 
         with pool_agent_lifecycle_locks(normalized["ids"]):
             for agent in normalized["ids"]:
@@ -11656,12 +12421,14 @@ def _agent_pool_destroy_pool_unlocked(
                     except OSError:
                         root_removed = False
             if remove_root and not root_removed and marker_removed and marker_bytes is not None:
-                try:
-                    marker.lstat()
-                except FileNotFoundError:
-                    pool_write_private_bytes(marker, marker_bytes, 0o600)
-                except OSError as exc:
-                    raise AgentError("pool marker changed during removal") from exc
+                if root_fd < 0 or not write_private_bytes_if_absent_at_dir_fd(
+                    root_fd,
+                    POOL_MARKER_FILE,
+                    marker_bytes,
+                    mode=0o600,
+                    error_text="pool marker changed during removal",
+                ):
+                    raise AgentError("pool marker changed during removal")
     finally:
         if root_fd >= 0:
             os.close(root_fd)

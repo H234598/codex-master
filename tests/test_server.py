@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import io
 import json
 import re
@@ -75,6 +76,7 @@ from codex_master.server import (
     codex_usage_watchdog_status,
     codex_usage_routing_decision,
     codex_usage_spark_health_update,
+    codex_project_trust_prompt_visible,
     dismiss_codex_update_prompt,
     validate_codex_usage_routing_decision,
     DEFAULT_AGENT_MODEL,
@@ -101,7 +103,9 @@ from codex_master.server import (
     main_cli,
     master_timeout_policy,
     master_watchdog_status,
+    ordinal_agent_id,
     parse_selector_series_value,
+    proc_is_codex_like,
     list_assignments,
     prune_assignment_log,
     prune_raw_logs,
@@ -143,6 +147,7 @@ from codex_master.server import (
     wait_agent,
     wait_agent_input_ready,
     wait_terminal_status,
+    wait_terminal_visible_input_status,
     WRITE_AGENT_MODEL,
     WRITE_AGENT_MODEL_EFFORT,
     write_bounded_raw_log,
@@ -156,6 +161,7 @@ from codex_master.server import (
     default_server_instance_id,
     fleet_watchdog,
     fleet_usage_watchdog,
+    watchdog_action,
     mcp_startup_timeout_seconds,
     updated_mcp_startup_timeout_config,
     mcp_command_tools_list_self_test,
@@ -178,6 +184,10 @@ class FakeStdin:
 
 
 class ServerHelpersTest(unittest.TestCase):
+    def test_proc_is_codex_like_recognizes_codex_code_mode_host(self) -> None:
+        self.assertTrue(proc_is_codex_like({"Name": "codex-code-mode-host"}, []))
+        self.assertTrue(proc_is_codex_like({"Name": "codex-code-mode"}, []))
+
     def setUp(self) -> None:
         routing = patch(
             "codex_master.server.codex_usage_routing_decision",
@@ -532,6 +542,24 @@ class ServerHelpersTest(unittest.TestCase):
     def test_tui_accepts_input_requires_visible_tail_prompt_marker_line(self) -> None:
         self.assertTrue(tui_accepts_input("some status\n› Ready"))
         self.assertTrue(tui_accepts_input("\x1b[32m›\x1b[0m Ready"))
+        self.assertTrue(
+            tui_accepts_input(
+                "\n".join(
+                    [
+                        "old report line",
+                        "Press enter to continue",
+                        "older report metadata",
+                        "› Summarize recent commits",
+                    ]
+                )
+            )
+        )
+        self.assertFalse(
+            tui_accepts_input("• Working (2m 11s • esc to interrupt)\n› Summarize recent commits\n")
+        )
+        self.assertFalse(
+            tui_accepts_input("• Searching files (12s • esc to interrupt)\n› Summarize recent commits\n")
+        )
         self.assertFalse(tui_accepts_input("assistant output used › as punctuation\nno prompt"))
         self.assertFalse(tui_accepts_input("Find and fix a bug in @filename\nImprove documentation in @filename"))
         old_prompt = "› old prompt\n" + "\n".join(f"line {index}" for index in range(9))
@@ -858,6 +886,36 @@ class ServerHelpersTest(unittest.TestCase):
         )
         self.assertFalse(redirected_exists)
 
+    def test_ensure_mcp_startup_timeout_rejects_config_swap_before_write(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            config = root / ".codex" / "config.toml"
+            config.parent.mkdir()
+            config.write_text(
+                "[mcp_servers.codex-master-mcp]\nstartup_timeout_sec = 60\n",
+                encoding="utf-8",
+            )
+            real_replace = server_module.replace_private_bytes
+            swapped = False
+
+            def swap_before_replace(path: Path, data: bytes, **kwargs: Any) -> None:
+                nonlocal swapped
+                config.unlink()
+                config.write_text("attacker\n", encoding="utf-8")
+                swapped = True
+                real_replace(path, data, **kwargs)
+
+            with patch.object(server_module, "replace_private_bytes", side_effect=swap_before_replace):
+                with self.assertRaisesRegex(AgentError, "private state path changed unexpectedly"):
+                    server_module.ensure_mcp_startup_timeout_configured(config)
+
+            content = config.read_text(encoding="utf-8")
+
+        self.assertTrue(swapped)
+        self.assertEqual(content, "attacker\n")
+
     def test_codex_client_mcp_config_status_detects_ready_config_without_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = Path(tmpdir) / ".codex" / "config.toml"
@@ -1003,6 +1061,34 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["command_matches"])
         self.assertFalse(result["startup_timeout_ok"])
         self.assertFalse(result["ok"])
+
+    @patch("codex_master.server.run_command")
+    @patch("codex_master.server.shutil.which", return_value="/usr/bin/codex")
+    def test_check_mcp_registration_distinguishes_absent_from_lookup_failure(
+        self, _mock_which, mock_run
+    ) -> None:
+        mock_run.side_effect = [
+            subprocess.CompletedProcess(
+                ["codex", "mcp", "get", MCP_SERVER_NAME],
+                1,
+                "",
+                f"Error: No MCP server named '{MCP_SERVER_NAME}' found.\n",
+            ),
+            subprocess.CompletedProcess(
+                ["codex", "mcp", "get", MCP_SERVER_NAME],
+                1,
+                "",
+                "Error: config unreadable\n",
+            ),
+        ]
+
+        absent = check_mcp_registration(Path("/tmp/codex-master-mcp"))
+        unknown = check_mcp_registration(Path("/tmp/codex-master-mcp"))
+
+        self.assertEqual(absent["lookup_status"], "not_registered")
+        self.assertEqual(unknown["lookup_status"], "unavailable")
+        self.assertFalse(absent["registered"])
+        self.assertFalse(unknown["registered"])
 
     def test_mcp_tools_list(self) -> None:
         response = handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
@@ -1310,6 +1396,10 @@ class ServerHelpersTest(unittest.TestCase):
     def test_selector_policy_rejects_non_string_series_entries(self) -> None:
         with self.assertRaisesRegex(AgentError, "series must contain only string series prefixes"):
             parse_selector_series_value(["a", 7])
+
+    def test_ordinal_selector_rejects_unbounded_integer_text(self) -> None:
+        with self.assertRaisesRegex(AgentError, "ordinal selector is too long"):
+            ordinal_agent_id("9" * 33)
 
     def test_agent_selector_errors_do_not_echo_request_values(self) -> None:
         unknown_agent = handle_rpc(
@@ -1720,6 +1810,26 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["connector_id_format_ok"])
         self.assertTrue(result["plugin_apps"]["ok"])
         self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
+
+    def test_master_app_bridge_status_rejects_empty_connector_id_suffix(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / ".codex-plugin").mkdir()
+            (root / ".codex-plugin" / "plugin.json").write_text(
+                json.dumps({"apps": "./.app.json"}), encoding="utf-8"
+            )
+            (root / ".app.json").write_text(
+                json.dumps({"apps": {"codex-master": {"id": "connector_"}}}), encoding="utf-8"
+            )
+
+            with patch.object(server_module, "repo_root", return_value=root):
+                result = master_app_bridge_status()
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["connector_id_format_ok"])
+        self.assertEqual(result["reason"], "plugin_or_connector_id_not_ready")
 
     def test_plugin_cache_status_detects_installed_repo_version_without_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2267,6 +2377,65 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertTrue(swapped)
             self.assertFalse((cache / version).exists())
 
+    def test_sync_plugin_cache_from_repo_rejects_in_place_source_change_during_copy(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            root = tmp_path / "repo"
+            cache = tmp_path / "cache"
+            (root / ".codex-plugin").mkdir(parents=True)
+            (root / "bin").mkdir()
+            (root / "skills").mkdir()
+            (root / "systemd" / "user").mkdir(parents=True)
+            (root / "src" / "codex_master").mkdir(parents=True)
+            payload = {"name": "codex-master", "version": "0.3.4+codex.test"}
+            (root / ".codex-plugin" / "plugin.json").write_text(json.dumps(payload), encoding="utf-8")
+            (root / ".app.json").write_text("{}", encoding="utf-8")
+            (root / ".mcp.json").write_text("{}", encoding="utf-8")
+            source_readme = root / "README.md"
+            source_readme.write_bytes((("readonly\n" * 3000).encode("utf-8")))
+            source_readme_size = source_readme.stat().st_size
+            readme_payload = b"modified-readme\n" * (source_readme_size // len("modified-readme\n") + 1)
+            (root / "pyproject.toml").write_text("[project]\nname='codex-master'\n", encoding="utf-8")
+            (root / "bin" / "codex-master-mcp").write_text("#!/bin/sh\n", encoding="utf-8")
+            (root / "skills" / "SKILL.md").write_text("skill\n", encoding="utf-8")
+            (root / "src" / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
+            original_readme_stat = source_readme.stat()
+            mutated = False
+
+            real_read = server_module.os.read
+
+            def corrupt_read(fd, n: int) -> bytes:
+                nonlocal mutated
+                data = real_read(fd, n)
+                if mutated:
+                    return data
+                try:
+                    current = server_module.os.fstat(fd)
+                except OSError:
+                    return data
+                if (
+                    current.st_ino == original_readme_stat.st_ino
+                    and current.st_dev == original_readme_stat.st_dev
+                    and data
+                ):
+                    source_readme.write_bytes(readme_payload[:source_readme_size])
+                    mutated = True
+                return data
+
+            with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False), patch(
+                "codex_master.server.os.read", side_effect=corrupt_read
+            ):
+                with self.assertRaisesRegex(AgentError, "plugin source changed during copy"):
+                    sync_plugin_cache_from_repo(root, cache)
+            readme_copy = (cache / "0.3.4+codex.test" / "README.md").exists()
+            temp_entries = list(cache.glob(".*.tmp.*")) if cache.exists() else []
+
+        self.assertTrue(mutated)
+        self.assertFalse(readme_copy)
+        self.assertEqual(temp_entries, [])
+
     def test_sync_plugin_cache_from_repo_prunes_old_valid_versions_without_touching_invalid_entries(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -2323,6 +2492,36 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("0.3.100+codex.symlink", remaining_versions)
         self.assertTrue(symlink_survived)
         self.assertNotIn(str(cache), json.dumps(result, sort_keys=True))
+
+    def test_prune_plugin_cache_versions_reports_invalid_keep_version_as_not_retained(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = Path(tmpdir) / "cache"
+            cache.mkdir()
+            keep_version = "0.3.8+codex.invalid-current"
+            valid_version = "0.3.7+codex.valid"
+            keep_dir = cache / keep_version
+            valid_dir = cache / valid_version
+            keep_dir.mkdir()
+            (keep_dir / ".codex-plugin").mkdir()
+            (keep_dir / ".codex-plugin" / "plugin.json").write_text(
+                json.dumps({"name": "not-codex-master", "version": keep_version}),
+                encoding="utf-8",
+            )
+            valid_dir.mkdir()
+            (valid_dir / ".codex-plugin").mkdir()
+            (valid_dir / ".codex-plugin" / "plugin.json").write_text(
+                json.dumps({"name": "codex-master", "version": valid_version}),
+                encoding="utf-8",
+            )
+
+            with patch.dict("os.environ", {"HOME": str(tmpdir), "CODEX_HOME": ""}, clear=False):
+                result = server_module.prune_plugin_cache_versions(cache, keep_version=keep_version, max_versions=2)
+
+        self.assertFalse(result["current_version_retained"])
+        self.assertEqual(result["retained_old_version_count"], 1)
+        self.assertEqual(result["pruned_version_count"], 0)
 
     def test_sync_plugin_cache_serializes_retention_across_concurrent_syncs(self) -> None:
         from codex_master import server as server_module
@@ -2558,6 +2757,82 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["path"], "not_returned")
         self.assertNotIn(str(root), json.dumps(result, sort_keys=True))
 
+    def test_plugin_declares_mcp_manifest_requires_exact_relative_target(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            manifest = root / ".codex-plugin" / "plugin.json"
+            manifest.parent.mkdir()
+            manifest.write_text(json.dumps({"mcpServers": "./other.json"}), encoding="utf-8")
+
+            invalid = server_module.plugin_declares_mcp_manifest(root)
+
+            manifest.write_text(json.dumps({"mcpServers": "./.mcp.json"}), encoding="utf-8")
+            valid = server_module.plugin_declares_mcp_manifest(root)
+
+        self.assertFalse(invalid["ok"])
+        self.assertEqual(invalid["reason"], "plugin_mcp_manifest_reference_invalid")
+        self.assertTrue(valid["ok"])
+        self.assertEqual(valid["target"], ".mcp.json")
+
+    def test_master_plugin_status_fails_when_mcp_manifest_is_not_a_file(self) -> None:
+        from codex_master import server as server_module
+
+        def repo_status(path: Path) -> dict[str, Any]:
+            regular_file = path.name != ".mcp.json"
+            return {
+                "path": "not_returned",
+                "path_state": "set" if regular_file else "missing",
+                "exists": regular_file,
+                "regular_file": regular_file,
+                "symlink": False,
+            }
+
+        with patch.object(server_module, "repo_file_status", side_effect=repo_status), patch.object(
+            server_module, "plugin_manifest_version", return_value={"ok": True}
+        ), patch.object(server_module, "master_app_bridge_status", return_value={"ok": True}), patch.object(
+            server_module, "check_mcp_registration", return_value={"ok": True}
+        ), patch.object(
+            server_module, "mcp_command_startup_self_test", return_value={"ok": True}
+        ), patch.object(server_module, "plugin_cache_status", return_value={"ok": True}), patch.object(
+            server_module, "codex_client_mcp_config_status", return_value={"ok": True}
+        ), patch.object(
+            server_module, "installed_source_worktree_state", return_value={"ok": True}
+        ), patch.object(server_module, "codex_home_context", return_value={"ok": True}):
+            result = server_module.master_plugin_status()
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["mcp_manifest"]["regular_file"])
+
+    def test_plugin_mcp_manifest_status_requires_master_server_declaration(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / ".mcp.json").write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+
+            result = server_module.plugin_mcp_manifest_status(root)
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["server_declared"])
+        self.assertEqual(result["reason"], "mcp_server_declaration_missing")
+
+    def test_plugin_mcp_manifest_status_requires_server_command(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / ".mcp.json").write_text(
+                json.dumps({"mcpServers": {"codex-master-mcp": {}}}), encoding="utf-8"
+            )
+
+            result = server_module.plugin_mcp_manifest_status(root)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["server_declared"])
+        self.assertEqual(result["reason"], "mcp_server_command_missing")
+
     def test_mcp_tools_list_probe_result_detects_required_tool_without_returning_names(self) -> None:
         payload = {
             "jsonrpc": "2.0",
@@ -2773,21 +3048,22 @@ class ServerHelpersTest(unittest.TestCase):
             write_proc("102", "codex", ["/tmp/codex"], {"CODEX_HOME": str(custom_home)})
             write_proc("103", "python3", ["python3", "-m", "codex_master.server"], {})
             write_proc("104", "bash", ["bash"], {})
+            write_proc("105", "codex-code-mode-host", ["codex-code-mode-host"], {})
 
             with patch.dict("os.environ", {"HOME": str(home)}, clear=False), patch.dict(
                 "codex_master.server.AGENTS", agents, clear=True
             ):
                 result = codex_related_process_summary(root)
 
-        self.assertEqual(result["codex_client_process_count"], 3)
+        self.assertEqual(result["codex_client_process_count"], 4)
         self.assertEqual(result["mcp_server_process_count"], 1)
-        self.assertEqual(result["home_kind_counts"]["unknown"], 1)
+        self.assertEqual(result["home_kind_counts"]["unknown"], 2)
         self.assertEqual(result["home_kind_counts"]["managed_agent_home"], 1)
         self.assertEqual(result["home_kind_counts"]["custom_home"], 1)
         self.assertEqual(result["namespace_visibility"]["main_default_home_clients"], 0)
         self.assertEqual(result["namespace_visibility"]["custom_home_clients"], 1)
         self.assertEqual(result["namespace_visibility"]["managed_agent_home_clients"], 1)
-        self.assertEqual(result["namespace_visibility"]["unknown_home_clients"], 1)
+        self.assertEqual(result["namespace_visibility"]["unknown_home_clients"], 2)
         self.assertTrue(result["namespace_visibility"]["custom_home_clients_need_own_mcp_config"])
         self.assertTrue(result["namespace_visibility"]["managed_agent_home_clients_expect_no_master_mcp"])
         self.assertTrue(result["namespace_visibility"]["unknown_home_clients_need_manual_check"])
@@ -3105,7 +3381,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.45")
+        self.assertEqual(result["expected_tag"], "v0.9.52")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -4203,10 +4479,12 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(mock_lifecycle.call_args.args[0], "a1")
         mock_safe_tail.assert_called_once_with("a1", 40, 4000, "pane")
 
+    @patch("codex_master.server.pane_tail")
     @patch("codex_master.server.safe_tail")
+    @patch("codex_master.server.status_agent")
     @patch("codex_master.server.list_assignments")
     def test_assignment_report_returns_explicit_capped_excerpt_for_known_assignment(
-        self, mock_list_assignments, mock_safe_tail
+        self, mock_list_assignments, mock_status_agent, mock_safe_tail, mock_pane_tail
     ) -> None:
         mock_list_assignments.return_value = {
             "records": [
@@ -4218,6 +4496,12 @@ class ServerHelpersTest(unittest.TestCase):
                 }
             ]
         }
+        mock_status_agent.return_value = {
+            "running": True,
+            "raw_log_updated_at_utc": "2026-07-17T00:00:01+00:00",
+            "lease": {"state": "unclaimed"},
+        }
+        mock_pane_tail.return_value = "› Ready\n"
         mock_safe_tail.return_value = {
             "source": "log",
             "lines_limit": 3,
@@ -4239,12 +4523,444 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["report_status"], "excerpt_available")
         self.assertEqual(result["output"], "report")
         mock_list_assignments.assert_called_once_with("a1", MAX_ASSIGNMENT_RECORDS)
+        mock_status_agent.assert_called_once_with("a1", initialize_state=False)
+        mock_pane_tail.assert_not_called()
         mock_safe_tail.assert_called_once_with("a1", 3, 100, "log")
+
+    @patch("codex_master.server.pane_tail")
+    @patch("codex_master.server.safe_tail")
+    @patch("codex_master.server.status_agent")
+    @patch("codex_master.server.list_assignments")
+    def test_assignment_report_returns_pending_for_running_working_assignment(
+        self, mock_list_assignments, mock_status_agent, mock_safe_tail, mock_pane_tail
+    ) -> None:
+        mock_list_assignments.return_value = {
+            "records": [
+                {
+                    "assignment_id": "assign-1-a1",
+                    "created_at_utc": "2026-07-17T00:00:00+00:00",
+                    "role": "exploriererin",
+                    "model": "gpt-5.4-mini",
+                }
+            ]
+        }
+        mock_status_agent.return_value = {
+            "running": True,
+            "raw_log_updated_at_utc": "2026-07-17T00:00:01+00:00",
+            "lease": {"state": "unclaimed"},
+        }
+        mock_pane_tail.return_value = "• Working (2m 11s • esc to interrupt)\n› Summarize recent commits\n"
+
+        result = assignment_report("a", "assign-1-a1", lines=3, chars=100, source="pane")
+
+        self.assertEqual(result["agent"], "a1")
+        self.assertEqual(result["assignment_id"], "assign-1-a1")
+        self.assertEqual(result["report_status"], "pending")
+        self.assertEqual(result["output"], "")
+        self.assertEqual(result["output_chars"], 0)
+        self.assertEqual(result["output_lines"], 0)
+        mock_list_assignments.assert_called_once_with("a1", MAX_ASSIGNMENT_RECORDS)
+        mock_status_agent.assert_called_once_with("a1", initialize_state=False)
+        mock_pane_tail.assert_called_once_with("a1", 24, visible_only=True, verify_identity=True)
+        mock_safe_tail.assert_not_called()
+
+    @patch("codex_master.server.pane_tail")
+    @patch("codex_master.server.safe_tail")
+    @patch("codex_master.server.status_agent")
+    @patch("codex_master.server.list_assignments")
+    def test_assignment_report_log_source_reads_fresh_output_for_running_assignment_without_tui_gate(
+        self, mock_list_assignments, mock_status_agent, mock_safe_tail, mock_pane_tail
+    ) -> None:
+        mock_list_assignments.return_value = {
+            "records": [
+                {
+                    "assignment_id": "assign-1-a1",
+                    "created_at_utc": "2026-07-17T00:00:00+00:00",
+                    "role": "arbeitsbiene",
+                    "model": "gpt-5.4-mini",
+                }
+            ]
+        }
+        mock_status_agent.return_value = {
+            "running": True,
+            "raw_log_updated_at_utc": "2026-07-17T00:00:01+00:00",
+            "lease": {"state": "unclaimed"},
+        }
+        mock_pane_tail.return_value = "• Working (2m 11s • esc to interrupt)\n› Summarize recent commits\n"
+        mock_safe_tail.return_value = {
+            "source": "log",
+            "lines_limit": 3,
+            "chars_limit": 100,
+            "redaction_applied": False,
+            "output_chars": 10,
+            "output_lines": 1,
+            "output_truncated": False,
+            "output_truncated_by_lines": False,
+            "output_truncated_by_chars": False,
+            "output": "log output",
+            "lease": {"state": "unclaimed"},
+        }
+
+        result = assignment_report("a", "assign-1-a1", lines=3, chars=100, source="log")
+
+        self.assertEqual(result["agent"], "a1")
+        self.assertEqual(result["assignment_id"], "assign-1-a1")
+        self.assertEqual(result["report_status"], "excerpt_available")
+        self.assertEqual(result["output"], "log output")
+        self.assertEqual(result["report_status_detail"], None)
+        mock_list_assignments.assert_called_once_with("a1", MAX_ASSIGNMENT_RECORDS)
+        mock_status_agent.assert_called_once_with("a1", initialize_state=False)
+        mock_pane_tail.assert_not_called()
+        mock_safe_tail.assert_called_once_with("a1", 3, 100, "log")
+
+    @patch("codex_master.server.safe_tail")
+    @patch("codex_master.server.status_agent")
+    @patch("codex_master.server.list_assignments")
+    def test_assignment_report_returns_no_output_for_stale_global_output(
+        self, mock_list_assignments, mock_status_agent, mock_safe_tail
+    ) -> None:
+        mock_list_assignments.return_value = {
+            "records": [
+                {
+                    "assignment_id": "assign-1-a1",
+                    "created_at_utc": "2026-07-17T00:00:00+00:00",
+                    "role": "exploriererin",
+                    "model": "gpt-5.4-mini",
+                }
+            ]
+        }
+        mock_status_agent.return_value = {
+            "raw_log_updated_at_utc": "2026-07-16T23:59:59+00:00",
+            "lease": {"state": "unclaimed"},
+        }
+
+        result = assignment_report("a", "assign-1-a1", lines=3, chars=100, source="pane")
+
+        self.assertEqual(result["agent"], "a1")
+        self.assertEqual(result["assignment_id"], "assign-1-a1")
+        self.assertEqual(result["report_status"], "no_output")
+        self.assertEqual(result["output"], "")
+        self.assertEqual(result["output_chars"], 0)
+        self.assertEqual(result["output_lines"], 0)
+        mock_list_assignments.assert_called_once_with("a1", MAX_ASSIGNMENT_RECORDS)
+        mock_status_agent.assert_called_once_with("a1", initialize_state=False)
+        mock_safe_tail.assert_not_called()
+
+    @patch("codex_master.server.pane_tail")
+    @patch("codex_master.server.safe_tail")
+    @patch("codex_master.server.status_agent")
+    @patch("codex_master.server.list_assignments")
+    def test_assignment_report_prefers_log_source_for_recent_running_output_without_ready_input(
+        self, mock_list_assignments, mock_status_agent, mock_safe_tail, mock_pane_tail
+    ) -> None:
+        mock_list_assignments.return_value = {
+            "records": [
+                {
+                    "assignment_id": "assign-1-a1",
+                    "created_at_utc": "2026-07-17T00:00:00+00:00",
+                    "role": "arbeitsbiene",
+                    "model": "gpt-5.4-mini",
+                }
+            ]
+        }
+        mock_status_agent.return_value = {
+            "running": True,
+            "raw_log_updated_at_utc": "2026-07-17T00:00:01+00:00",
+            "last_assignment": {
+                "assignment_id": "assign-1-a1",
+                "created_at_utc": "2026-07-17T00:00:00+00:00",
+            },
+            "response_state": {"state": "running_recent_output"},
+            "lease": {"state": "held", "held_by_this_server": True, "lease_id": "f" * 32},
+        }
+        mock_pane_tail.return_value = "MCP startup incomplete\nReport generated\n"
+        mock_safe_tail.return_value = {
+            "source": "log",
+            "lines_limit": 3,
+            "chars_limit": 100,
+            "redaction_applied": False,
+            "output_chars": 13,
+            "output_lines": 1,
+            "output_truncated": False,
+            "output_truncated_by_lines": False,
+            "output_truncated_by_chars": False,
+            "output": "log excerpt",
+            "lease": {"state": "held", "held_by_this_server": True, "lease_id": "f" * 32},
+        }
+
+        result = assignment_report("a", "assign-1-a1", lines=3, chars=100, source="pane")
+
+        self.assertEqual(result["report_status"], "excerpt_available")
+        self.assertEqual(result["assignment_id"], "assign-1-a1")
+        self.assertEqual(result["output"], "log excerpt")
+        self.assertEqual(result["source"], "log")
+        mock_list_assignments.assert_called_once_with("a1", MAX_ASSIGNMENT_RECORDS)
+        mock_status_agent.assert_called_once_with("a1", initialize_state=False)
+        mock_pane_tail.assert_called_once_with("a1", 24, visible_only=True, verify_identity=True)
+        mock_safe_tail.assert_called_once_with("a1", 3, 100, "log")
+
+    @patch("codex_master.server.safe_tail")
+    @patch("codex_master.server.status_agent")
+    @patch("codex_master.server.list_assignments")
+    def test_assignment_report_rejects_future_log_timestamp(
+        self, mock_list_assignments, mock_status_agent, mock_safe_tail
+    ) -> None:
+        mock_list_assignments.return_value = {
+            "records": [
+                {
+                    "assignment_id": "assign-1-a1",
+                    "created_at_utc": "1970-01-01T00:15:00+00:00",
+                }
+            ]
+        }
+        mock_status_agent.return_value = {
+            "raw_log_updated_at_utc": "1970-01-01T00:18:20+00:00",
+            "lease": {"state": "unclaimed"},
+        }
+
+        with patch("codex_master.server.time.time", return_value=1000.0):
+            result = assignment_report("a", "assign-1-a1", lines=3, chars=100, source="log")
+
+        self.assertEqual(result["report_status"], "no_output")
+        self.assertEqual(result["output"], "")
+        mock_safe_tail.assert_not_called()
+
+    @patch("codex_master.server.safe_tail")
+    @patch("codex_master.server.status_agent")
+    @patch("codex_master.server.list_assignments")
+    def test_assignment_report_rejects_assignment_from_previous_session(
+        self, mock_list_assignments, mock_status_agent, mock_safe_tail
+    ) -> None:
+        mock_list_assignments.return_value = {
+            "records": [
+                {
+                    "assignment_id": "assign-old-a1",
+                    "created_at_utc": "1970-01-01T00:15:00+00:00",
+                }
+            ]
+        }
+        mock_status_agent.return_value = {
+            "started_at_utc": "1970-01-01T00:16:40+00:00",
+            "raw_log_updated_at_utc": "1970-01-01T00:20:00+00:00",
+            "lease": {"state": "unclaimed"},
+        }
+
+        with patch("codex_master.server.time.time", return_value=1300.0):
+            result = assignment_report("a", "assign-old-a1", lines=3, chars=100, source="log")
+
+        self.assertEqual(result["report_status"], "no_output")
+        self.assertEqual(result["output"], "")
+        mock_safe_tail.assert_not_called()
+
+    @patch("codex_master.server.safe_tail")
+    @patch("codex_master.server.status_agent")
+    @patch("codex_master.server.list_assignments")
+    def test_assignment_report_does_not_misattributed_newer_assignment_output(
+        self, mock_list_assignments, mock_status_agent, mock_safe_tail
+    ) -> None:
+        mock_list_assignments.return_value = {
+            "records": [
+                {
+                    "assignment_id": "assign-old-a1",
+                    "created_at_utc": "2026-07-17T00:00:00+00:00",
+                },
+                {
+                    "assignment_id": "assign-new-a1",
+                    "created_at_utc": "2026-07-17T00:01:00+00:00",
+                },
+            ]
+        }
+        mock_status_agent.return_value = {
+            "raw_log_updated_at_utc": "2026-07-17T00:01:01+00:00",
+            "lease": {"state": "unclaimed"},
+        }
+
+        result = assignment_report("a", "assign-old-a1", lines=3, chars=100, source="log")
+
+        self.assertEqual(result["report_status"], "report_blocked_by_superseded_assignment")
+        self.assertIn("assign-new-a1", result["report_status_detail"])
+        self.assertEqual(result["output"], "")
+        self.assertEqual(result["output_chars"], 0)
+        mock_safe_tail.assert_not_called()
+
+    @patch("codex_master.server.pane_tail")
+    @patch("codex_master.server.update_agent_spark_health")
+    @patch("codex_master.server.safe_tail")
+    @patch("codex_master.server.status_agent")
+    @patch("codex_master.server.agent_lease_status")
+    @patch("codex_master.server.list_assignments")
+    def test_wait_timeout_then_report_rehabilitates_spark_health(
+        self,
+        mock_list_assignments,
+        mock_lease_status,
+        mock_status_agent,
+        mock_safe_tail,
+        mock_health,
+        mock_pane_tail,
+    ) -> None:
+        mock_pane_tail.return_value = "MCP startup incomplete\n"
+        mock_list_assignments.return_value = {
+            "records": [
+                {
+                    "assignment_id": "assign-recover-a1",
+                    "created_at_utc": "2026-07-17T10:00:30+00:00",
+                    "role": "arbeitsbiene",
+                    "model": "gpt-5.3-codex-spark",
+                    "lease": {
+                        "state": "held",
+                        "holder": "owner",
+                        "held_by_this_server": True,
+                        "expires_at_utc": "2026-07-17T10:30:00+00:00",
+                        "lease_id": "f" * 32,
+                    },
+                }
+            ]
+        }
+        mock_status_agent.side_effect = [
+            {
+                "agent": "a",
+                "running": True,
+                "raw_log_bytes": 10,
+                "raw_log_updated_at_utc": "2026-07-17T10:00:31+00:00",
+                "last_assignment": {
+                    "assignment_id": "assign-recover-a1",
+                    "created_at_utc": "2026-07-17T10:00:30+00:00",
+                },
+                "response_state": {"state": "running_tui_starter_context"},
+                "limit_state": {"limited": False},
+                "tui_context": {"state": "starter_placeholder", "evidence": "not_returned"},
+                "lease": {
+                    "state": "held",
+                    "holder": "owner",
+                    "held_by_this_server": True,
+                    "lease_id": "f" * 32,
+                },
+            },
+            {
+                "agent": "a",
+                "running": True,
+                "raw_log_updated_at_utc": "2026-07-17T10:01:00+00:00",
+                "last_assignment": {
+                    "assignment_id": "assign-recover-a1",
+                    "created_at_utc": "2026-07-17T10:00:30+00:00",
+                },
+                "response_state": {"state": "running_recent_output"},
+                "limit_state": {"limited": False},
+                "lease": {
+                    "state": "held",
+                    "holder": "owner",
+                    "held_by_this_server": True,
+                    "lease_id": "f" * 32,
+                },
+            },
+        ]
+        mock_safe_tail.return_value = {
+            "source": "log",
+            "lines_limit": 3,
+            "chars_limit": 200,
+            "redaction_applied": False,
+            "output_chars": 15,
+            "output_lines": 1,
+            "output_truncated": False,
+            "output_truncated_by_lines": False,
+            "output_truncated_by_chars": False,
+            "output": "assignment finished with result",
+            "lease": {"state": "held", "held_by_this_server": True, "lease_id": "f" * 32},
+        }
+        mock_health.side_effect = [
+            {"state": "failed", "updated": True, "raw_output": "not_returned"},
+            {"state": "healthy", "updated": True, "raw_output": "not_returned"},
+        ]
+        mock_lease_status.return_value = {
+            "state": "held",
+            "holder": "owner",
+            "held_by_this_server": True,
+            "lease_id": "f" * 32,
+        }
+
+        wait_result = wait_agent("a", timeout_seconds=0, poll_interval_seconds=1)
+        report_result = assignment_report("a", "assign-recover-a1", lines=3, chars=200, source="log")
+
+        self.assertEqual(wait_result["status"], "timeout")
+        self.assertEqual(wait_result["spark_health"]["state"], "failed")
+        self.assertEqual(report_result["spark_health"]["state"], "healthy")
+        self.assertEqual(report_result["report_status"], "excerpt_available")
+        self.assertEqual(mock_health.call_count, 2)
+        self.assertEqual(
+            mock_health.call_args_list[0],
+            (( "a1",), {"state": "failed", "reason": "spark_turn_timeout"}),
+        )
+        self.assertEqual(
+            mock_health.call_args_list[1],
+            (("a1",), {"state": "healthy", "reason": "spark_turn_assignment_report_output"}),
+        )
+
+    @patch("codex_master.server.safe_tail")
+    @patch("codex_master.server.status_agent")
+    @patch("codex_master.server.list_assignments")
+    @patch("codex_master.server.update_agent_spark_health")
+    def test_superseded_report_does_not_rehabilitate_spark_health(
+        self, mock_health, mock_list_assignments, mock_status_agent, mock_safe_tail
+    ) -> None:
+        mock_list_assignments.return_value = {
+            "records": [
+                {
+                    "assignment_id": "assign-old-a1",
+                    "created_at_utc": "2026-07-17T00:00:00+00:00",
+                    "role": "arbeitsbiene",
+                    "model": "gpt-5.3-codex-spark",
+                    "lease": {"state": "held", "lease_id": "a" * 32},
+                },
+                {
+                    "assignment_id": "assign-new-a1",
+                    "created_at_utc": "2026-07-17T00:01:00+00:00",
+                    "role": "arbeitsbiene",
+                    "model": "gpt-5.3-codex-spark",
+                    "lease": {"state": "held", "lease_id": "b" * 32},
+                },
+            ]
+        }
+        mock_status_agent.return_value = {
+            "running": True,
+            "raw_log_updated_at_utc": "2026-07-17T00:01:01+00:00",
+            "last_assignment": {
+                "assignment_id": "assign-new-a1",
+                "created_at_utc": "2026-07-17T00:01:00+00:00",
+            },
+            "lease": {"state": "held", "held_by_this_server": True, "lease_id": "b" * 32},
+        }
+        mock_safe_tail.return_value = {
+            "source": "log",
+            "lines_limit": 3,
+            "chars_limit": 200,
+            "redaction_applied": False,
+            "output_chars": 15,
+            "output_lines": 1,
+            "output_truncated": False,
+            "output_truncated_by_lines": False,
+            "output_truncated_by_chars": False,
+            "output": "some output for old assignment",
+            "lease": {"state": "held", "held_by_this_server": True, "lease_id": "a" * 32},
+        }
+
+        result = assignment_report("a", "assign-old-a1", lines=3, chars=200, source="log")
+
+        self.assertEqual(result["report_status"], "report_blocked_by_superseded_assignment")
+        self.assertEqual(result["spark_health"]["state"], "not_checked")
+        mock_health.assert_not_called()
 
     @patch("codex_master.server.list_assignments", return_value={"records": []})
     def test_assignment_report_requires_known_assignment(self, _mock_list_assignments) -> None:
         with self.assertRaisesRegex(AgentError, "assignment report not found"):
             assignment_report("a", "unknown-assignment")
+
+    def test_assignment_report_validates_limits_before_stale_output_shortcut(self) -> None:
+        with self.assertRaisesRegex(AgentError, "lines must be >= 1"):
+            assignment_report("a", "known-assignment", lines=0)
+        with self.assertRaisesRegex(AgentError, "chars must be <="):
+            assignment_report("a", "known-assignment", chars=MAX_TAIL_CHARS + 1)
+        with self.assertRaisesRegex(AgentError, "source must be 'pane' or 'log'"):
+            assignment_report("a", "known-assignment", source="invalid")
 
     @patch("codex_master.server.send_agent", return_value={"status": "sent", "raw_output": "not_returned"})
     @patch(
@@ -4992,15 +5708,63 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["response_output"], "not_returned")
         mock_sleep.assert_called_once()
 
+    @patch("codex_master.server.time.sleep")
+    @patch("codex_master.server.status_agent")
+    def test_wait_agent_reports_activity_for_fresh_running_output(self, mock_status_agent, mock_sleep) -> None:
+        initial_status = {
+            "agent": "a",
+            "running": True,
+            "raw_log_bytes": 10,
+            "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
+            "last_assignment": {
+                "assignment_id": "assign-1",
+                "created_at_utc": "2026-06-07T10:00:30+00:00",
+            },
+            "response_state": {"state": "running_recent_output"},
+            "limit_state": {"limited": False},
+            "lease": {"state": "held", "held_by_this_server": True, "lease_id": "a" * 32},
+        }
+        current_status = {
+            "agent": "a",
+            "running": True,
+            "raw_log_bytes": 11,
+            "raw_log_updated_at_utc": "2026-06-07T10:01:00+00:00",
+            "last_assignment": {
+                "assignment_id": "assign-1",
+                "created_at_utc": "2026-06-07T10:00:30+00:00",
+            },
+            "response_state": {"state": "running_recent_output"},
+            "limit_state": {"limited": False},
+            "lease": {"state": "held", "held_by_this_server": True, "lease_id": "a" * 32},
+        }
+        status_sequence = [initial_status, current_status]
+
+        def next_status(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            if not status_sequence:
+                return current_status
+            return status_sequence.pop(0)
+
+        mock_status_agent.side_effect = next_status
+        with patch("codex_master.server.time.time", return_value=1780826500.0):
+            result = wait_agent("a", timeout_seconds=10, poll_interval_seconds=1)
+
+        self.assertEqual(result["status"], "activity_observed")
+        self.assertEqual(result["assignment_id"], "assign-1")
+        self.assertEqual(result["result_tool"], "agent_assignment_report")
+        self.assertEqual(result["poll_count"], 1)
+        mock_sleep.assert_called_once()
+
+    @patch("codex_master.server.pane_tail")
     @patch("codex_master.server.agent_lifecycle_lock")
     @patch("codex_master.server.agent_lease_status", return_value={"held_by_this_server": True})
     @patch("codex_master.server.update_agent_spark_health")
     @patch("codex_master.server.status_agent")
     def test_wait_agent_ignores_preexisting_output_after_assignment(
-        self, mock_status_agent, mock_health, _mock_lease, mock_lifecycle_lock
+        self, mock_status_agent, mock_health, _mock_lease, mock_lifecycle_lock, mock_pane_tail
     ) -> None:
         mock_lifecycle_lock.return_value.__enter__.return_value = None
         _mock_lease.return_value = {"held_by_this_server": True, "lease_id": "a" * 32}
+        mock_pane_tail.return_value = "MCP startup incomplete\n› Summarize recent commits\n"
         mock_status_agent.return_value = {
             "agent": "a",
             "running": True,
@@ -5020,6 +5784,82 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "timeout")
         mock_health.assert_called_once_with("a1", state="failed", reason="spark_turn_timeout")
+        mock_pane_tail.assert_called_once_with("a1", 24, visible_only=True, verify_identity=True)
+
+    @patch("codex_master.server.pane_tail")
+    @patch("codex_master.server.time.sleep")
+    @patch("codex_master.server.status_agent")
+    def test_wait_agent_reports_activity_for_assigned_tui_starter_context_with_ready_input(
+        self, mock_status_agent, mock_sleep, mock_pane_tail
+    ) -> None:
+        mock_status_agent.return_value = {
+            "agent": "a",
+            "running": True,
+            "raw_log_bytes": 20,
+            "raw_log_updated_at_utc": "2026-06-07T10:01:00+00:00",
+            "last_assignment": {
+                "assignment_id": "assign-1",
+                "created_at_utc": "2026-06-07T10:00:30+00:00",
+            },
+            "response_state": {"state": "running_tui_starter_context"},
+            "limit_state": {"limited": False},
+            "tui_context": {"state": "starter_placeholder", "evidence": "not_returned"},
+        }
+        mock_pane_tail.return_value = "› Ready\n"
+
+        result = wait_agent("a", timeout_seconds=0, poll_interval_seconds=1)
+
+        self.assertEqual(result["status"], "activity_observed")
+        self.assertEqual(result["assignment_id"], "assign-1")
+        self.assertEqual(result["result_tool"], "agent_assignment_report")
+        self.assertEqual(result["poll_count"], 0)
+        mock_sleep.assert_not_called()
+        mock_pane_tail.assert_called_once_with("a1", 24, visible_only=True, verify_identity=True)
+
+    @patch("codex_master.server.pane_tail")
+    def test_wait_visible_input_ignores_future_assignment_log(self, mock_pane_tail) -> None:
+        status = {
+            "running": True,
+            "raw_log_updated_at_utc": "2099-01-01T00:01:00+00:00",
+            "last_assignment": {
+                "assignment_id": "assign-1",
+                "created_at_utc": "2026-06-07T10:00:30+00:00",
+            },
+            "response_state": {"state": "running_tui_starter_context"},
+        }
+        initial = {"last_assignment": status["last_assignment"]}
+
+        with patch("codex_master.server.time.time", return_value=1780826400.0):
+            result = wait_terminal_visible_input_status("a", status, initial)
+
+        self.assertIsNone(result)
+        mock_pane_tail.assert_not_called()
+
+    @patch("codex_master.server.time.sleep")
+    @patch("codex_master.server.status_agent")
+    def test_wait_agent_reports_activity_for_completed_assignment_with_fresh_log(
+        self, mock_status_agent, mock_sleep
+    ) -> None:
+        mock_status_agent.return_value = {
+            "agent": "a",
+            "running": True,
+            "raw_log_bytes": 20,
+            "raw_log_updated_at_utc": "2026-06-07T10:01:00+00:00",
+            "last_assignment": {
+                "assignment_id": "assign-1",
+                "created_at_utc": "2026-06-07T10:00:30+00:00",
+            },
+            "response_state": {"state": "running_idle"},
+            "limit_state": {"limited": False},
+        }
+
+        result = wait_agent("a", timeout_seconds=0, poll_interval_seconds=1)
+
+        self.assertEqual(result["status"], "activity_observed")
+        self.assertEqual(result["assignment_id"], "assign-1")
+        self.assertEqual(result["result_tool"], "agent_assignment_report")
+        self.assertEqual(result["poll_count"], 0)
+        mock_sleep.assert_not_called()
 
     @patch("codex_master.server.time.sleep")
     @patch("codex_master.server.status_agent")
@@ -5077,6 +5917,32 @@ class ServerHelpersTest(unittest.TestCase):
         current = {**initial, "raw_log_updated_at_utc": "2099-01-01T00:00:00+00:00"}
 
         self.assertIsNone(wait_terminal_status(current, initial, now=1780826400.0))
+
+    def test_wait_terminal_status_ignores_byte_change_with_future_log_timestamp(self) -> None:
+        initial = {
+            "running": True,
+            "raw_log_bytes": 10,
+            "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
+        }
+        current = {
+            **initial,
+            "raw_log_bytes": 11,
+            "raw_log_updated_at_utc": "2099-01-01T00:00:00+00:00",
+        }
+
+        self.assertIsNone(wait_terminal_status(current, initial, now=1780826400.0))
+
+    def test_wait_terminal_status_does_not_treat_missing_log_as_activity(self) -> None:
+        initial = {
+            "running": True,
+            "raw_log_bytes": 10,
+            "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
+        }
+        current = {**initial, "raw_log_bytes": None, "raw_log_updated_at_utc": None}
+
+        self.assertIsNone(wait_terminal_status(current, initial, now=1780826400.0))
+        recovered = {**initial, "raw_log_updated_at_utc": "2026-06-07T10:00:01+00:00"}
+        self.assertIsNone(wait_terminal_status(recovered, {**initial, "raw_log_updated_at_utc": None}, now=1780826400.0))
 
     def test_wait_terminal_status_stops_on_unverified_identity(self) -> None:
         initial = {
@@ -5269,6 +6135,24 @@ class ServerHelpersTest(unittest.TestCase):
         mock_interrupt.assert_not_called()
         mock_stop.assert_not_called()
 
+    def test_watchdog_action_interrupt_does_not_release_when_lease_renews_between_check_and_release(self) -> None:
+        with patch("codex_master.server.interrupt_agent", return_value={"status": "interrupt_sent", "raw_output": "not_returned"}):
+            with patch("codex_master.server.agent_lease_status", return_value={
+                "state": "held", "held_by_this_server": True, "lease_id": "renewed-lease"
+            }) as mock_lease_status, patch(
+                "codex_master.server.release_agent"
+            ) as mock_release:
+                result = watchdog_action(
+                    "a1",
+                    "interrupt",
+                    release_after_interrupt=True,
+                    release_lease_id="stale-lease",
+                )
+
+        self.assertEqual(result["status"], "interrupt_sent")
+        mock_release.assert_not_called()
+        mock_lease_status.assert_called_once_with("a1")
+
     def test_fleet_watchdog_requests_report_before_interrupt(self) -> None:
         meta_store: dict[str, object] = {}
 
@@ -5443,7 +6327,10 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(payload["report_error"]["error_code"], "agent_input_not_ready")
         self.assertFalse(payload["report_error"]["paste_attempted"])
         mock_claim.assert_called_once_with("a1")
-        mock_action.assert_called_once_with("a1", "stop", release_after_interrupt=False)
+        mock_action.assert_called_once()
+        self.assertEqual(mock_action.call_args.args, ("a1", "stop"))
+        self.assertFalse(mock_action.call_args.kwargs.get("release_after_interrupt"))
+        self.assertIsNone(mock_action.call_args.kwargs.get("release_lease_id"))
         mock_marker.assert_called_once_with("a1", None)
 
     @patch("codex_master.server.update_agent_spark_health")
@@ -5739,7 +6626,10 @@ class ServerHelpersTest(unittest.TestCase):
             result = fleet_watchdog("a")
 
         self.assertEqual(result["results"][0]["watchdog_state"], "action_sent")
-        mock_action.assert_called_once_with("a1", "interrupt", release_after_interrupt=True)
+        mock_action.assert_called_once()
+        self.assertEqual(mock_action.call_args.args, ("a1", "interrupt"))
+        self.assertEqual(mock_action.call_args.kwargs.get("release_after_interrupt"), True)
+        self.assertIsNone(mock_action.call_args.kwargs.get("release_lease_id"))
 
     def test_fleet_watchdog_does_not_reuse_marker_after_lease_changes(self) -> None:
         status = {
@@ -6748,6 +7638,66 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(route["backend_account_id"], "backend-new")
 
+    def test_agent_spark_routing_rejects_stale_decisioned_spark_metadata(self) -> None:
+        with patch(
+            "codex_master.server.read_meta",
+            return_value={
+                "model": WRITE_AGENT_MODEL,
+                "routing": {
+                    "account": "BW_Neu",
+                    "backend_account_id": "backend-stale",
+                    "decision": "spark",
+                },
+            },
+        ), patch(
+            "codex_master.server.list_assignments",
+            return_value={
+                "records": [
+                    {
+                        "routing": {
+                            "account": "BW_Alt",
+                            "decision": "spark",
+                            "backend_account_id": "backend-new",
+                        }
+                    }
+                ]
+            },
+        ):
+            route = agent_spark_routing("a1")
+
+        self.assertIsNone(route)
+
+    def test_agent_spark_routing_prefers_current_spark_assignment(self) -> None:
+        with patch(
+            "codex_master.server.read_meta",
+            return_value={
+                "model": WRITE_AGENT_MODEL,
+                "routing": {
+                    "account": "BW_Neu",
+                    "backend_account_id": "backend-stale",
+                    "decision": "spark",
+                },
+            },
+        ), patch(
+            "codex_master.server.list_assignments",
+            return_value={
+                "records": [
+                    {
+                        "created_at_utc": "2026-07-17T00:00:00+00:00",
+                        "routing": {
+                            "account": "BW_Neu",
+                            "decision": "spark",
+                            "backend_account_id": "backend-current",
+                        },
+                    }
+                ]
+            },
+        ):
+            route = agent_spark_routing("a1")
+
+        self.assertEqual(route["backend_account_id"], "backend-current")
+        self.assertEqual(route["decision"], "spark")
+
     def test_agent_spark_routing_rejects_stale_assignment_account(self) -> None:
         with patch(
             "codex_master.server.read_meta",
@@ -7396,7 +8346,7 @@ class ServerHelpersTest(unittest.TestCase):
         mock_claim.assert_called_once_with("a1")
         mock_stop.assert_called_once_with("a1", force=False)
 
-    def test_usage_watchdog_keeps_claim_when_stop_fails(self) -> None:
+    def test_usage_watchdog_rolls_back_claim_when_stop_fails(self) -> None:
         blocked_status = {
             "agent": "a1",
             "state": "blocked",
@@ -7417,14 +8367,78 @@ class ServerHelpersTest(unittest.TestCase):
             return_value={"process_count": 1, "managed_process_count": 1, "external_process_count": 0},
         ), patch(
             "codex_master.server.agent_lease_status",
-            return_value={"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
+            side_effect=[
+                {"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
+                {
+                    "state": "held",
+                    "held_by_this_server": True,
+                    "lease_id": "watchdog-lease",
+                    "raw_output": "not_returned",
+                },
+            ],
         ), patch("codex_master.server.codex_usage_watchdog_status", return_value=blocked_status), patch(
             "codex_master.server.update_codex_usage_watchdog_marker"
         ), patch(
             "codex_master.server.claim_agent",
             return_value={
                 "status": "claimed",
-                "lease": {"state": "held", "held_by_this_server": True, "raw_output": "not_returned"},
+                "lease": {
+                    "state": "held",
+                    "held_by_this_server": True,
+                    "lease_id": "watchdog-lease",
+                    "raw_output": "not_returned",
+                },
+            },
+        ), patch("codex_master.server.stop_agent", side_effect=AgentError("tmux stop failed")), patch(
+            "codex_master.server.release_agent"
+        ) as mock_release:
+            with self.assertRaisesRegex(AgentError, "tmux stop failed"):
+                usage_watchdog_agent("a1", dry_run=False)
+
+        mock_release.assert_called_once_with("a1", force=True)
+
+    def test_usage_watchdog_does_not_roll_back_renewed_lease_when_stop_fails(self) -> None:
+        blocked_status = {
+            "agent": "a1",
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": "2099-06-08T06:50:00+00:00",
+            "reason": "usage limit reached",
+            "source": "snapshot",
+            "raw_output": "not_returned",
+        }
+        with patch.dict(
+            "codex_master.server.AGENTS",
+            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
+            clear=True,
+        ), patch("codex_master.server.ensure_state"), patch(
+            "codex_master.server.tmux_alive", return_value=True
+        ), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={"process_count": 1, "managed_process_count": 1, "external_process_count": 0},
+        ), patch(
+            "codex_master.server.agent_lease_status",
+            side_effect=[
+                {"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
+                {
+                    "state": "held",
+                    "held_by_this_server": True,
+                    "lease_id": "renewed-lease",
+                    "raw_output": "not_returned",
+                },
+            ],
+        ), patch("codex_master.server.codex_usage_watchdog_status", return_value=blocked_status), patch(
+            "codex_master.server.update_codex_usage_watchdog_marker"
+        ), patch(
+            "codex_master.server.claim_agent",
+            return_value={
+                "status": "claimed",
+                "lease": {
+                    "state": "held",
+                    "held_by_this_server": True,
+                    "lease_id": "watchdog-lease",
+                    "raw_output": "not_returned",
+                },
             },
         ), patch("codex_master.server.stop_agent", side_effect=AgentError("tmux stop failed")), patch(
             "codex_master.server.release_agent"
@@ -7618,6 +8632,70 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["deleted_count"], 0)
         self.assertEqual(external_content, "external-secret\n")
         self.assertTrue(original_exists)
+
+    def test_bound_raw_log_at_dir_fd_rejects_path_swap_before_replace(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "raw"
+            raw_dir.mkdir()
+            target = raw_dir / "agent.log"
+            attacker = raw_dir / "attacker.log"
+            target.write_bytes(b"managed" * 20)
+            attacker.write_bytes(b"attacker\n")
+            raw_stat = raw_dir.lstat()
+            raw_fd = server_module.open_directory_no_follow_matching(
+                raw_dir,
+                raw_stat,
+                error_text="raw log directory unreadable",
+                changed_text="raw log directory changed",
+            )
+            real_fdopen = server_module.os.fdopen
+            swapped = False
+
+            def swap_before_tail_read(path: int, mode: str = "r", *args: Any, **kwargs: Any):
+                nonlocal swapped
+                fh = real_fdopen(path, mode, *args, **kwargs)
+
+                class _ReadSwapFile:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, exc_type, exc, tb):
+                        return fh.__exit__(exc_type, exc, tb)
+
+                    def seek(self, *seek_args: Any, **seek_kwargs: Any):
+                        return fh.seek(*seek_args, **seek_kwargs)
+
+                    def close(self) -> None:
+                        return fh.close()
+
+                    def read(self, length: int = -1) -> bytes:
+                        nonlocal swapped
+                        if not swapped:
+                            swapped = True
+                            server_module.os.rename(
+                                attacker.name,
+                                target.name,
+                                src_dir_fd=raw_fd,
+                                dst_dir_fd=raw_fd,
+                            )
+                        return fh.read(length)
+
+                    def __getattr__(self, name: str) -> Any:
+                        return getattr(fh, name)
+
+                return _ReadSwapFile()
+
+            with patch.object(server_module.os, "fdopen", side_effect=swap_before_tail_read):
+                result = server_module.bound_raw_log_at_dir_fd(raw_fd, target.name, max_bytes=10)
+
+            server_module.os.close(raw_fd)
+
+            self.assertTrue(swapped)
+            self.assertFalse(result)
+            self.assertEqual(target.read_text(encoding="utf-8"), "attacker\n")
 
     def test_cleanup_failed_start_rejects_raw_log_swap_before_unlink(self) -> None:
         from codex_master import server as server_module
@@ -8218,6 +9296,26 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn(str(link), payload_text)
 
     @patch("codex_master.server.ensure_state")
+    def test_list_assignments_refuses_broken_symlink_log(self, _mock_ensure_state) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            link = Path(tmpdir) / "assignments.jsonl"
+            link.symlink_to("missing-assignments.jsonl")
+
+            with patch("codex_master.server.ASSIGNMENT_LOG", link):
+                response = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 49,
+                        "method": "tools/call",
+                        "params": {"name": "agent_assignments", "arguments": {"agent": "all", "limit": 10}},
+                    }
+                )
+
+        self.assertTrue(response["result"]["isError"])
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertEqual(payload["error"], "could_not_read_assignment_log")
+
+    @patch("codex_master.server.ensure_state")
     def test_list_assignments_refuses_oversized_log_without_leaking_path(self, _mock_ensure_state) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             assignment_log = Path(tmpdir) / "assignments.jsonl"
@@ -8266,6 +9364,69 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(summary["external_processes"][0]["pid"], 100)
         self.assertEqual(summary["external_processes"][0]["raw_output"], "not_returned")
         self.assertNotIn(str(home), json.dumps(summary, sort_keys=True))
+
+    def test_agent_home_process_summary_collapses_managed_codex_process_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home = root / "agent-home"
+            home.mkdir()
+            proc_root = root / "proc"
+            wrapper = proc_root / "100"
+            child = proc_root / "101"
+            wrapper.mkdir(parents=True)
+            child.mkdir(parents=True)
+            for process, ppid in ((wrapper, 1), (child, 100)):
+                process.joinpath("environ").write_bytes(
+                    f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0".encode("utf-8")
+                )
+                process.joinpath("status").write_text(
+                    f"Name:\tcodex\nState:\tS (sleeping)\nPPid:\t{ppid}\n",
+                    encoding="utf-8",
+                )
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                summary = agent_home_process_summary("a", proc_root)
+
+        self.assertEqual(summary["process_count"], 2)
+        self.assertEqual(summary["managed_process_count"], 1)
+        self.assertEqual(summary["managed_process_ids"], [100, 101])
+        self.assertEqual(summary["managed_root_process_ids"], [100])
+
+    def test_agent_home_process_summary_ignores_session_helper_children(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home = root / "agent-home"
+            home.mkdir()
+            proc_root = root / "proc"
+            managed = proc_root / "100"
+            helper = proc_root / "101"
+            managed.mkdir(parents=True)
+            helper.mkdir(parents=True)
+            managed.joinpath("environ").write_bytes(
+                f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0".encode("utf-8")
+            )
+            managed.joinpath("status").write_text(
+                "Name:\tcodex\nState:\tS (sleeping)\nPPid:\t1\n", encoding="utf-8"
+            )
+            helper.joinpath("environ").write_bytes(f"CODEX_HOME={home}\0".encode("utf-8"))
+            helper.joinpath("status").write_text(
+                "Name:\tsystemd-inhibit\nState:\tS (sleeping)\nPPid:\t100\n",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                summary = agent_home_process_summary("a", proc_root)
+
+        self.assertEqual(summary["process_count"], 2)
+        self.assertEqual(summary["managed_process_count"], 1)
+        self.assertEqual(summary["external_process_count"], 0)
+        self.assertEqual(summary["external_processes"], [])
 
     def test_agent_home_process_summary_rejects_spoofed_managed_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -9669,6 +10830,23 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["recover_stopped"])
         self.assertEqual(result["stopped_grace_seconds"], DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS)
 
+    @patch("codex_master.server.call_agent_lifecycle")
+    def test_agent_claim_wait_handles_huge_finite_wait_without_float_overflow(self, mock_lifecycle) -> None:
+        mock_lifecycle.return_value = {
+            "agent": "a",
+            "status": "claimed",
+            "lease": {"state": "held", "holder": "this_server", "raw_output": "not_returned"},
+            "previous_lease": {"state": "unclaimed", "raw_output": "not_returned"},
+            "raw_output": "not_returned",
+        }
+
+        wait_seconds = 10**5000
+        result = claim_agent_with_wait("a", wait_seconds=wait_seconds)
+
+        self.assertFalse(result["wait_forever"])
+        self.assertEqual(result["wait_limit_seconds"], wait_seconds)
+        self.assertIsNone(mock_lifecycle.call_args.kwargs["timeout_seconds"])
+
     def test_agent_claim_wait_bounds_lifecycle_lock_contention(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -9730,6 +10908,28 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(
             tui_accepts_input(
                 "Update available! 0.144.4 -> 0.144.5\n› 2. Skip\nPress enter to continue\n"
+            )
+        )
+        self.assertFalse(
+            tui_accepts_input(
+                "Do you trust the contents of this directory?\nPress enter to continue\n"
+            )
+        )
+        self.assertFalse(
+            tui_accepts_input(
+                "A confirmation is required\nPress enter to continue\n"
+            )
+        )
+
+    def test_codex_project_trust_prompt_visible_detects_known_prompt(self) -> None:
+        self.assertTrue(
+            codex_project_trust_prompt_visible(
+                "Do you trust the contents of this directory?\n/tmp/example\nPress enter to continue\n"
+            )
+        )
+        self.assertFalse(
+            codex_project_trust_prompt_visible(
+                "Press enter to continue\n"
             )
         )
 
@@ -9856,6 +11056,64 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertTrue(result["ready"])
         self.assertTrue(result["update_prompt_dismissed"])
+
+    @patch("codex_master.server.run_tmux")
+    @patch("codex_master.server.pane_tail")
+    @patch("codex_master.server.require_managed_tmux_session")
+    def test_wait_agent_input_ready_confirms_project_trust_prompt(
+        self, _mock_identity, mock_pane_tail, mock_run_tmux
+    ) -> None:
+        mock_pane_tail.side_effect = [
+            "Do you trust the contents of this directory?\n/tmp/example\nPress enter to continue\n",
+            "› Ready\n",
+        ]
+        mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "", "")
+
+        result = wait_agent_input_ready("a", timeout_seconds=0)
+
+        self.assertTrue(result["ready"])
+        self.assertTrue(result["trust_prompt_dismissed"])
+        self.assertEqual([call.args[0][-1] for call in mock_run_tmux.call_args_list], ["Enter"])
+
+    @patch("codex_master.server.run_tmux")
+    @patch("codex_master.server.pane_tail")
+    @patch("codex_master.server.require_managed_tmux_session")
+    def test_wait_agent_input_ready_ignores_stale_report_press_enter_prompt(
+        self, _mock_identity, mock_pane_tail, mock_run_tmux
+    ) -> None:
+        mock_pane_tail.return_value = (
+            "old report line\nPress enter to continue\njob complete\n› Continue with next task\n"
+        )
+        mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "", "")
+
+        result = wait_agent_input_ready("a", timeout_seconds=1)
+
+        self.assertTrue(result["ready"])
+        self.assertFalse(result["trust_prompt_dismissed"])
+        self.assertFalse(result["update_prompt_dismissed"])
+        mock_run_tmux.assert_not_called()
+
+    @patch("codex_master.server.run_tmux")
+    @patch("codex_master.server.time.monotonic", side_effect=[0.0, 2.0])
+    @patch("codex_master.server.time.sleep")
+    @patch("codex_master.server.pane_tail")
+    @patch("codex_master.server.require_managed_tmux_session")
+    def test_wait_agent_input_ready_fails_closed_for_unknown_press_enter_prompt(
+        self,
+        _mock_identity,
+        mock_pane_tail,
+        _mock_monotonic,
+        _mock_sleep,
+        mock_run_tmux,
+    ) -> None:
+        mock_pane_tail.return_value = "A confirmation is required\nPress enter to continue\n"
+
+        result = wait_agent_input_ready("a", timeout_seconds=1)
+
+        self.assertFalse(result["ready"])
+        self.assertFalse(result["trust_prompt_dismissed"])
+        self.assertFalse(result["update_prompt_dismissed"])
+        mock_run_tmux.assert_not_called()
 
     @patch(
         "codex_master.server.agent_home_process_summary",
@@ -12443,6 +13701,58 @@ class ServerHelpersTest(unittest.TestCase):
 
         mock_release.assert_not_called()
 
+    @patch("codex_master.server.remember_agent_routing")
+    @patch("codex_master.server.record_assignment")
+    @patch("codex_master.server.send_agent", side_effect=AgentError("send failed"))
+    @patch("codex_master.server.ensure_assignment_session_model")
+    def test_agent_assign_does_not_persist_routing_after_send_failure(
+        self,
+        mock_switch,
+        mock_send,
+        mock_record,
+        mock_remember,
+    ) -> None:
+        mock_switch.return_value = {"status": "unchanged", "previous_model": DEFAULT_AGENT_MODEL}
+
+        with patch.dict(
+            "codex_master.server.AGENTS",
+            {
+                "a1": {
+                    "label": "A1",
+                    "runner": Path("/tmp/codex"),
+                    "home": Path("/tmp/home"),
+                    "session": "session-a1",
+                }
+            },
+            clear=True,
+        ), patch(
+            "codex_master.server.agent_auth_status",
+            return_value={"authenticated": False, "auth_state": "empty"},
+        ), patch(
+            "codex_master.server.claim_for_agent_mutation",
+            return_value=({"state": "held", "held_by_this_server": True}, True),
+        ), patch(
+            "codex_master.server.agent_lease_status",
+            return_value={"held_by_this_server": True},
+        ), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={"process_count": 1},
+        ), patch("codex_master.server.release_agent") as mock_release:
+            with self.assertRaisesRegex(AgentError, "send failed"):
+                assign_agent(
+                    "a1",
+                    role="exploriererin",
+                    task="inspect",
+                    scope=[],
+                    allow_unauthenticated=True,
+                )
+
+        mock_send.assert_called_once()
+        mock_switch.assert_called_once()
+        mock_record.assert_not_called()
+        mock_remember.assert_not_called()
+        mock_release.assert_not_called()
+
     def test_run_with_agent_lease_keeps_fresh_lease_when_home_process_remains(self) -> None:
         lease = {"state": "held", "held_by_this_server": True}
         from codex_master import server as server_module
@@ -12463,6 +13773,38 @@ class ServerHelpersTest(unittest.TestCase):
                 server_module.run_with_agent_lease("a", fail)
 
         mock_release.assert_not_called()
+
+    def test_run_with_agent_lease_does_not_release_renewed_lease_after_stale_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            from codex_master import server as server_module
+
+            first_lease: dict[str, Any] = {}
+
+            def fail(_lease: dict[str, Any]) -> dict[str, Any]:
+                first_lease.update(_lease)
+                claim_agent("a", ttl_seconds=DEFAULT_AGENT_LEASE_SECONDS)
+                raise AgentError("run failed after renewal")
+
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
+                "codex_master.server.ensure_agent_not_blocked_by_codex_usage"
+            ), patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"session": "session-a", "home": root, "runner": root / "codex"}},
+                clear=True,
+            ):
+                with self.assertRaisesRegex(AgentError, "run failed after renewal"):
+                    server_module.run_with_agent_lease("a", fail)
+                final = server_module.agent_lease_status("a")
+
+        self.assertEqual(final["state"], "held")
+        self.assertEqual(final.get("held_by_this_server"), True)
+        self.assertNotEqual(final.get("lease_id"), first_lease.get("lease_id"))
 
     def test_run_with_agent_lease_blocks_usage_before_claim(self) -> None:
         from codex_master import server as server_module
@@ -13619,7 +14961,12 @@ class CliLifecycleTest(unittest.TestCase):
             with patch.dict("os.environ", {"HOME": tmp_home}):
                 with patch("codex_master.server.shutil.which", return_value="/usr/bin/codex"):
                     mock_run.side_effect = [
-                        subprocess.CompletedProcess(["codex", "mcp", "get", "codex-master-mcp"], 1, "not found", ""),
+                        subprocess.CompletedProcess(
+                            ["codex", "mcp", "get", "codex-master-mcp"],
+                            1,
+                            "",
+                            "Error: No MCP server named 'codex-master-mcp' found.\n",
+                        ),
                         subprocess.CompletedProcess(
                             [
                                 "codex",
@@ -13817,6 +15164,188 @@ class CliLifecycleTest(unittest.TestCase):
 
         self.assertEqual(resolved, previous_target)
 
+    @patch("codex_master.server.sync_plugin_cache_from_repo")
+    @patch("codex_master.server.run_command")
+    @patch("codex_master.server.check_mcp_registration")
+    @patch("codex_master.server.mcp_command_startup_self_test")
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_does_not_sync_plugin_cache_after_mcp_failure(
+        self, mock_wrapper_path, mock_self_test, mock_registration, mock_run, mock_sync
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            mock_wrapper_path.return_value = wrapper
+            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
+            mock_registration.return_value = {
+                "registered": False,
+                "lookup_status": "not_registered",
+                "ok": False,
+                "startup_timeout_ok": True,
+            }
+            mock_run.return_value = subprocess.CompletedProcess(["codex", "mcp", "add"], 1, "", "")
+
+            with self.assertRaisesRegex(AgentError, "codex mcp add failed"):
+                install(register=True, install_path=install_link)
+
+        mock_sync.assert_not_called()
+
+    @patch("codex_master.server.sync_plugin_cache_from_repo", side_effect=AgentError("cache failed"))
+    @patch("codex_master.server.run_command")
+    @patch("codex_master.server.check_mcp_registration")
+    @patch("codex_master.server.mcp_command_startup_self_test")
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_cache_failure_restores_startup_timeout_config(
+        self, mock_wrapper_path, mock_self_test, mock_registration, mock_run, _mock_sync
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            config = tmp_path / ".codex" / "config.toml"
+            config.parent.mkdir()
+            config.write_text(
+                "[mcp_servers.codex-master-mcp]\nstartup_timeout_sec = 60\n",
+                encoding="utf-8",
+            )
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            mock_wrapper_path.return_value = wrapper
+            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
+            mock_registration.return_value = {
+                "registered": False,
+                "lookup_status": "not_registered",
+                "ok": False,
+                "startup_timeout_ok": False,
+            }
+            mock_run.side_effect = [
+                subprocess.CompletedProcess(["codex", "mcp", "add"], 0, "", ""),
+                subprocess.CompletedProcess(["codex", "mcp", "remove"], 0, "", ""),
+            ]
+
+            with patch.dict("os.environ", {"HOME": str(tmp_path)}, clear=False):
+                with self.assertRaisesRegex(AgentError, "cache failed"):
+                    install(register=True, install_path=install_link)
+
+            config_content = config.read_text(encoding="utf-8")
+            link_exists = install_link.exists() or install_link.is_symlink()
+
+        self.assertEqual(config_content, "[mcp_servers.codex-master-mcp]\nstartup_timeout_sec = 60\n")
+        self.assertFalse(link_exists)
+
+    @patch("codex_master.server.sync_plugin_cache_from_repo")
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_refuses_incomplete_plugin_cache_before_link_mutation(
+        self, mock_wrapper_path, mock_sync
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            mock_wrapper_path.return_value = wrapper
+            mock_sync.return_value = {
+                "ok": False,
+                "status": "sync_incomplete",
+                "raw_output": "not_returned",
+            }
+
+            with self.assertRaisesRegex(AgentError, "plugin cache sync incomplete"):
+                install(register=False, install_path=install_link)
+
+            link_exists = install_link.exists() or install_link.is_symlink()
+
+        self.assertFalse(link_exists)
+        mock_sync.assert_called_once_with()
+
+    @patch("codex_master.server.run_command")
+    @patch("codex_master.server.check_mcp_registration")
+    @patch("codex_master.server.mcp_command_startup_self_test")
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_force_refuses_uninspectable_mcp_registration(
+        self, mock_wrapper_path, mock_self_test, mock_registration, mock_run
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            previous_target = tmp_path / "previous-target"
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            previous_target.write_text("previous\n", encoding="utf-8")
+            install_link.parent.mkdir()
+            install_link.symlink_to(previous_target)
+            mock_wrapper_path.return_value = wrapper
+            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
+            mock_registration.return_value = {
+                "registered": True,
+                "command_matches": False,
+                "startup_timeout_ok": True,
+            }
+
+            with self.assertRaisesRegex(
+                AgentError,
+                "registration command could not be inspected; refusing force replacement",
+            ):
+                install(register=True, force=True, install_path=install_link, sync_plugin_cache=False)
+
+            resolved = install_link.resolve(strict=False)
+
+        self.assertEqual(resolved, previous_target)
+        mock_run.assert_not_called()
+
+    @patch("codex_master.server.run_command")
+    @patch("codex_master.server.check_mcp_registration")
+    @patch("codex_master.server.mcp_command_startup_self_test")
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_refuses_unknown_mcp_lookup_after_link_rollback(
+        self, mock_wrapper_path, mock_self_test, mock_registration, mock_run
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            mock_wrapper_path.return_value = wrapper
+            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
+            mock_registration.return_value = {
+                "registered": False,
+                "lookup_status": "unavailable",
+                "ok": False,
+            }
+
+            with self.assertRaisesRegex(AgentError, "registration could not be inspected"):
+                install(register=True, install_path=install_link, sync_plugin_cache=False)
+
+            link_exists = install_link.exists() or install_link.is_symlink()
+
+        self.assertFalse(link_exists)
+        mock_run.assert_not_called()
+
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_force_refuses_existing_regular_file_without_overwrite(self, mock_wrapper_path) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            install_path = tmp_path / "bin" / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            install_path.parent.mkdir()
+            install_path.write_text("keep me\n", encoding="utf-8")
+            mock_wrapper_path.return_value = wrapper
+
+            with self.assertRaisesRegex(AgentError, "install path exists and is not this wrapper symlink"):
+                install(register=False, force=True, install_path=install_path, sync_plugin_cache=False)
+
+            content = install_path.read_text(encoding="utf-8")
+
+        self.assertEqual(content, "keep me\n")
+
     @patch("codex_master.server.run_command")
     @patch("codex_master.server.ensure_mcp_startup_timeout_configured", side_effect=AgentError("timeout failed"))
     @patch("codex_master.server.check_mcp_registration")
@@ -13874,7 +15403,12 @@ class CliLifecycleTest(unittest.TestCase):
             install_link = tmp_path / "bin" / "codex-master-mcp"
             mock_wrapper_path.return_value = wrapper
             mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
-            mock_registration.return_value = {"registered": True, "ok": False, "startup_timeout_ok": True}
+            mock_registration.return_value = {
+                "registered": True,
+                "ok": False,
+                "startup_timeout_ok": True,
+                "_registered_command": str(tmp_path / "previous-codex"),
+            }
             mock_run.return_value = subprocess.CompletedProcess(
                 ["codex", "mcp", "remove"],
                 1,
@@ -14230,6 +15764,31 @@ class CliLifecycleTest(unittest.TestCase):
 
         self.assertEqual(restored, wrapper)
 
+    def test_uninstall_unknown_mcp_status_restores_removed_install_link(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            install_link.parent.mkdir()
+            install_link.symlink_to(wrapper)
+
+            with patch.object(server_module, "repo_wrapper_path", return_value=wrapper), patch.object(
+                server_module,
+                "check_mcp_registration",
+                return_value={"registered": False, "lookup_status": "unavailable", "ok": False},
+            ), patch.object(server_module, "run_command") as mock_run:
+                with self.assertRaisesRegex(AgentError, "registration could not be inspected"):
+                    uninstall(unregister=True, remove_symlink=True, install_path=install_link)
+
+            restored = install_link.resolve(strict=False)
+
+        self.assertEqual(restored, wrapper)
+        mock_run.assert_not_called()
+
     @patch("codex_master.server.run_command")
     @patch("codex_master.server.check_mcp_registration")
     def test_uninstall_leaves_different_mcp_registration_in_place(self, mock_registration, mock_run) -> None:
@@ -14381,6 +15940,31 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result["install_path"], "not_returned")
         self.assertEqual(resolved, wrapper)
         self.assertEqual(tmp_links, [])
+
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_refuses_install_path_swap_before_replace(self, mock_wrapper_path) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            install_path = tmp_path / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            mock_wrapper_path.return_value = wrapper
+            real_replace = server_module.replace_install_symlink
+
+            def swap_target_then_replace(path: Path, target: Path, **kwargs: Any) -> None:
+                path.write_text("keep me\n", encoding="utf-8")
+                real_replace(path, target, **kwargs)
+
+            with patch.object(server_module, "replace_install_symlink", side_effect=swap_target_then_replace):
+                with self.assertRaisesRegex(AgentError, "install path changed after validation"):
+                    install(register=False, install_path=install_path, sync_plugin_cache=False)
+
+            content = install_path.read_text(encoding="utf-8")
+
+        self.assertEqual(content, "keep me\n")
 
     @patch("codex_master.server.repo_wrapper_path")
     def test_install_and_uninstall_serialize_link_mutation(self, mock_wrapper_path) -> None:
@@ -14548,6 +16132,18 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result["symlink"], "left_in_place_not_repo_wrapper")
         self.assertTrue(still_symlink)
 
+    def test_uninstall_missing_parent_is_noop_without_creating_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            install_path = Path(tmpdir) / "missing" / "bin" / "codex-master-mcp"
+
+            result = uninstall(unregister=False, remove_symlink=True, install_path=install_path)
+
+            parent_exists = install_path.parent.exists()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["symlink"], "missing")
+        self.assertFalse(parent_exists)
+
     def test_remove_install_symlink_rejects_link_swap_before_unlink(self) -> None:
         from codex_master import server as server_module
 
@@ -14619,6 +16215,10 @@ class CliLifecycleTest(unittest.TestCase):
                 cfg["runner"].write_text("#!/bin/sh\n", encoding="utf-8")
                 cfg["runner"].chmod(cfg["runner"].stat().st_mode | stat.S_IXUSR)
                 cfg["home"].mkdir()
+            outside_home = tmp_path / "outside-home"
+            outside_home.mkdir()
+            agents["a"]["home"].rmdir()
+            agents["a"]["home"].symlink_to(outside_home, target_is_directory=True)
 
             with patch("codex_master.server.DEFAULT_INSTALL_PATH", install_link), patch.dict(
                 "codex_master.server.AGENTS", agents, clear=True
@@ -14636,6 +16236,8 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(installed["path"], "not_returned")
         self.assertEqual(installed["target"], "<unreadable>")
         self.assertEqual(installed["target_state"], "unreadable")
+        home_check = next(item for item in result["checks"] if item["name"] == "agent_a_home_exists")
+        self.assertFalse(home_check["ok"])
         self.assertNotIn(str(install_link), json.dumps(result, sort_keys=True))
 
     @patch("codex_master.server.tmux_alive", return_value=False)
@@ -15489,6 +17091,122 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn(str(tmp), payload)
             self.assertNotIn("outside-marker", payload)
 
+    def test_agent_pool_status_rejects_stale_marker_for_current_spec(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec(tmp, pool)
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+
+            spec = json.loads(spec_path.read_text(encoding="utf-8"))
+            spec["aliases"] = {"fresh": "a1"}
+            spec_path.write_text(json.dumps(spec) + "\n", encoding="utf-8")
+
+            status = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+
+        self.assertFalse(status["ok"])
+        self.assertTrue(status["marker_present"])
+        self.assertFalse(status["marker_valid"])
+        self.assertEqual(status["marker_state"], "file")
+
+    def test_agent_pool_destroy_rejects_in_place_marker_change_before_unlink(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec(tmp, pool)
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+            marker = pool / server_module.POOL_MARKER_FILE
+            real_read = server_module.pool_read_private_bytes
+            changed = False
+
+            def change_after_initial_read(path: Path, max_bytes: int, error_text: str) -> bytes:
+                nonlocal changed
+                data = real_read(path, max_bytes, error_text)
+                if path.name == server_module.POOL_MARKER_FILE and not changed:
+                    marker.write_text("foreign marker\n", encoding="utf-8")
+                    changed = True
+                return data
+
+            with patch.object(server_module, "pool_read_private_bytes", side_effect=change_after_initial_read):
+                with self.assertRaisesRegex(AgentError, "pool marker changed during removal"):
+                    server_module.agent_pool_destroy_pool(
+                        str(spec_path), target_dir=str(pool), codex_bin="/bin/echo", yes=True
+                    )
+
+            self.assertTrue(changed)
+            self.assertTrue((pool / "a1").exists())
+
+    def test_agent_pool_destroy_rejects_marker_copied_to_different_root(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool_a = tmp / "agents-a"
+            pool_b = tmp / "agents-b"
+            spec_path = self._write_spec_payload(
+                tmp,
+                {
+                    "schema_version": 1,
+                    "pool_root": str(pool_a),
+                    "codex_bin": "/bin/echo",
+                    "series": [{"prefix": "x", "count": 1, "template": "x1", "authenticated": []}],
+                    "shared_assets": [],
+                    "runtime_dirs": [],
+                },
+            )
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool_a), codex_bin="/bin/echo")
+            pool_b.mkdir()
+            (pool_b / "x1").mkdir()
+            (pool_b / server_module.POOL_MARKER_FILE).write_bytes(
+                (pool_a / server_module.POOL_MARKER_FILE).read_bytes()
+            )
+
+            with self.assertRaisesRegex(AgentError, "destroy_pool requires an installed pool marker"):
+                server_module.agent_pool_destroy_pool(
+                    str(spec_path), target_dir=str(pool_b), codex_bin="/bin/echo", yes=True
+                )
+
+            self.assertTrue((pool_b / "x1").is_dir())
+
+    def test_agent_pool_install_preserves_current_marker_on_repeat(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec_payload(
+                tmp,
+                {
+                    "schema_version": 1,
+                    "pool_root": str(pool),
+                    "codex_bin": "/bin/echo",
+                    "series": [{"prefix": "x", "count": 1, "template": "x1", "authenticated": []}],
+                    "shared_assets": [],
+                    "runtime_dirs": [],
+                },
+            )
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+            marker = pool / server_module.POOL_MARKER_FILE
+            first_bytes = marker.read_bytes()
+            first_stat = marker.stat()
+
+            result = server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+
+            second_stat = marker.stat()
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["created_agent_homes"], 0)
+            self.assertEqual(result["updated_wrappers"], 0)
+            self.assertEqual(marker.read_bytes(), first_bytes)
+            self.assertEqual(second_stat.st_ino, first_stat.st_ino)
+
+            marker.chmod(0o644)
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+            self.assertEqual(stat.S_IMODE(marker.stat().st_mode), 0o600)
+
     def test_agent_pool_status_detects_invalid_shared_asset_links_without_path_leak(self) -> None:
         from codex_master import server as server_module
 
@@ -15566,6 +17284,47 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(status["shared_asset_valid_link_count"], 1)
             self.assertEqual(status["shared_asset_invalid_link_count"], 0)
             self.assertEqual(status["shared_asset_template_source_missing_count"], 0)
+
+    def test_agent_pool_status_and_destroy_use_canonical_pool_root_identity_for_marker(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool_base = tmp / "pool-base"
+            pool_base.mkdir()
+            canonical_pool = pool_base / "agents"
+            alias_root = pool_base / "pool-alias"
+            alias_root.mkdir()
+            alias_pool = alias_root / ".." / "agents"
+            spec_path = self._write_spec_payload(
+                tmp,
+                {
+                    "schema_version": 1,
+                    "pool_root": str(canonical_pool),
+                    "codex_bin": "/bin/echo",
+                    "series": [{"prefix": "a", "count": 1, "template": "a1", "authenticated": []}],
+                    "shared_assets": [],
+                    "runtime_dirs": [],
+                },
+            )
+
+            server_module.agent_pool_install(str(spec_path), target_dir=str(canonical_pool), codex_bin="/bin/echo")
+            marker_payload = json.loads((canonical_pool / server_module.POOL_MARKER_FILE).read_text(encoding="utf-8"))
+            expected_pool_root_sha256 = hashlib.sha256(str(alias_pool.resolve(strict=False)).encode("utf-8")).hexdigest()
+            self.assertEqual(marker_payload["pool_root_sha256"], expected_pool_root_sha256)
+
+            status = server_module.agent_pool_status(str(spec_path), target_dir=str(alias_pool), codex_bin="/bin/echo")
+            self.assertTrue(status["ok"])
+            self.assertTrue(status["marker_present"])
+            self.assertTrue(status["marker_valid"])
+
+            destroy_result = server_module.agent_pool_destroy_pool(
+                str(spec_path), target_dir=str(alias_pool), codex_bin="/bin/echo", yes=True, remove_root=True
+            )
+            self.assertTrue(destroy_result["ok"])
+            self.assertTrue(destroy_result["root_removed"])
+            self.assertFalse((canonical_pool / "a1").exists())
+            self.assertFalse(canonical_pool.exists())
 
     def test_auth_copy_docs_match_data_sparse_output_contract(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -16049,6 +17808,24 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertIn("AFFINITY:", completed.stdout)
             self.assertIn("4-10", completed.stdout)
             self.assertNotIn("BAD", completed.stdout + completed.stderr)
+
+    def test_agent_pool_normalizes_relative_codex_bin_for_wrapper(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            fake_codex = tmp / "bin" / "codex"
+            fake_codex.parent.mkdir()
+            fake_codex.write_text("#!/bin/sh\n", encoding="utf-8")
+            fake_codex.chmod(0o700)
+            spec_path = self._write_spec(tmp, tmp / "agents")
+
+            with patch.object(server_module.os, "getcwd", return_value=str(tmp)):
+                normalized = server_module.pool_normalize_spec(str(spec_path), codex_bin="./bin/codex")
+                wrapper = server_module.pool_wrapper_text("a1", tmp / "agents" / "a1", normalized["codex_bin"])
+
+        self.assertEqual(normalized["codex_bin"], str(fake_codex))
+        self.assertIn(f"CODEX_AGENT_BIN={fake_codex}", wrapper)
 
     def test_agent_pool_wrapper_treats_command_name_as_data_not_exec_option(self) -> None:
         from codex_master import server as server_module
@@ -16634,6 +18411,42 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertTrue(retry["ok"])
             self.assertTrue(retry["root_removed"])
             self.assertFalse(pool.exists())
+
+    def test_agent_pool_destroy_does_not_overwrite_marker_created_during_restore(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec(tmp, pool)
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+            marker = pool / server_module.POOL_MARKER_FILE
+            (pool / "unexpected-entry").write_text("keep\n", encoding="utf-8")
+            real_link = os.link
+
+            def create_foreign_marker_before_link(src, dst, *args, **kwargs):
+                if dst == server_module.POOL_MARKER_FILE:
+                    marker.write_text("foreign marker\n", encoding="utf-8")
+                return real_link(src, dst, *args, **kwargs)
+
+            state = tmp / "state"
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "LOCK_DIR", state / "locks"
+            ), patch.object(server_module, "LEASE_DIR", state / "leases"), patch.object(
+                server_module, "agent_lease_status", return_value={"state": "unclaimed"}
+            ), patch.object(server_module.os, "link", side_effect=create_foreign_marker_before_link):
+                with self.assertRaisesRegex(AgentError, "pool marker changed during removal"):
+                    server_module.agent_pool_destroy_pool(
+                        str(spec_path),
+                        target_dir=str(pool),
+                        codex_bin="/bin/echo",
+                        yes=True,
+                        remove_root=True,
+                    )
+
+            marker_text = marker.read_text(encoding="utf-8")
+
+        self.assertEqual(marker_text, "foreign marker\n")
 
     def test_agent_pool_tools_are_registered_and_cli_invokes_pool_namespace(self) -> None:
         from codex_master import server as server_module
