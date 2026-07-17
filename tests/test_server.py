@@ -7971,6 +7971,46 @@ class ServerHelpersTest(unittest.TestCase):
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.tmux_alive", return_value=False)
     @patch("codex_master.server.run_tmux")
+    def test_start_agent_rejects_runner_swap_before_launch(
+        self, mock_run_tmux, _mock_tmux_alive, _mock_ensure_state
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            runner = root / "codex"
+            original = root / "codex-original"
+            replacement = root / "codex-replacement"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            replacement.write_text("#!/bin/sh\n", encoding="utf-8")
+            replacement.chmod(replacement.stat().st_mode | stat.S_IXUSR)
+
+            def swap_after_process_scan(_agent):
+                runner.rename(original)
+                replacement.rename(runner)
+                return {
+                    "process_count": 0,
+                    "external_process_count": 0,
+                    "managed_process_count": 0,
+                    "external_processes": [],
+                    "external_processes_truncated": False,
+                    "raw_output": "not_returned",
+                }
+
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": root, "session": "test_session"}},
+                clear=False,
+            ), patch("codex_master.server.agent_home_process_summary", side_effect=swap_after_process_scan):
+                with self.assertRaisesRegex(AgentError, "runner changed unexpectedly"):
+                    start_agent("a", cwd=tmpdir)
+
+            self.assertTrue(original.exists())
+            self.assertTrue(runner.exists())
+            mock_run_tmux.assert_not_called()
+
+    @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("codex_master.server.run_tmux")
     @patch(
         "codex_master.server.agent_home_process_summary",
         return_value={

@@ -393,6 +393,7 @@ def build_agent_config(agent: str) -> dict[str, Any]:
 
 
 AGENTS = {agent: build_agent_config(agent) for agent in AGENT_IDS}
+RUNNER_EXECUTION_FDS: dict[str, int] = {}
 
 
 ANSI_RE = re.compile(
@@ -2273,6 +2274,43 @@ def is_regular_executable_no_symlink(path: Path) -> bool:
     return os.access(path, os.X_OK)
 
 
+def close_runner_execution_fd(agent: str) -> None:
+    fd = RUNNER_EXECUTION_FDS.pop(agent, None)
+    if fd is not None:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def open_runner_execution_path(
+    agent: str,
+    path: Path,
+    expected_stat: os.stat_result,
+) -> Path:
+    flags = getattr(os, "O_PATH", os.O_RDONLY)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise AgentError("runner changed unexpectedly") from exc
+    try:
+        opened_stat = os.fstat(fd)
+        if (
+            not stat_module.S_ISREG(opened_stat.st_mode)
+            or getattr(opened_stat, "st_nlink", 1) > 1
+            or not source_identity_matches(opened_stat, expected_stat)
+            or not os.access(Path(f"/proc/{os.getpid()}/fd/{fd}"), os.X_OK)
+        ):
+            raise AgentError("runner changed unexpectedly")
+        close_runner_execution_fd(agent)
+        RUNNER_EXECUTION_FDS[agent] = fd
+        return Path(f"/proc/{os.getpid()}/fd/{fd}")
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        raise
+
+
 def is_regular_file_no_symlink(path: Path) -> bool:
     try:
         current = path.lstat()
@@ -3259,7 +3297,15 @@ def start_agent(
     cfg = AGENTS[agent]
     runner = cfg["runner"]
     session = cfg["session"]
-    if not is_regular_executable_no_symlink(runner):
+    try:
+        runner_stat = runner.lstat()
+    except OSError as exc:
+        raise AgentError(f"runner for agent {agent} must be a regular executable file") from exc
+    if (
+        not stat_module.S_ISREG(runner_stat.st_mode)
+        or getattr(runner_stat, "st_nlink", 1) > 1
+        or not os.access(runner, os.X_OK)
+    ):
         raise AgentError(f"runner for agent {agent} must be a regular executable file")
     if tmux_alive(session):
         process_summary = agent_home_process_summary(agent)
@@ -3298,6 +3344,7 @@ def start_agent(
             "through codex-master-mcp"
         )
 
+    close_runner_execution_fd(agent)
     cwd = bounded_text(cwd, field="cwd", max_chars=MAX_PATH_TEXT) if cwd is not None else None
     prompt = bounded_text(prompt, field="prompt", max_chars=MAX_SEND_TEXT, strip=False) if prompt is not None else None
     start_cwd = Path(cwd or os.getcwd()).expanduser().resolve()
@@ -3308,25 +3355,42 @@ def start_agent(
     )
     routed_args = agent_base_args(model, reasoning_effort)
 
+    runner_execution_path = open_runner_execution_path(agent, runner, runner_stat)
     run_id = f"{now_id()}-{agent}"
     raw_log = RAW_DIR / f"{run_id}.log"
-    write_private_new_bytes(raw_log, b"")
+    try:
+        write_private_new_bytes(raw_log, b"")
+    except Exception:
+        close_runner_execution_fd(agent)
+        raise
 
-    argv = [str(runner), *routed_args]
+    argv = [str(runner_execution_path), *routed_args]
     if prompt:
         argv.append(prompt)
 
     command = "env CODEX_MASTER_MCP=1 CODEX_AGENT_MCP=1 " + shlex.join(argv)
-    cp = run_tmux(["new-session", "-d", "-s", session, "-c", str(start_cwd), command], check=False)
+    try:
+        cp = run_tmux(["new-session", "-d", "-s", session, "-c", str(start_cwd), command], check=False)
+    except Exception:
+        close_runner_execution_fd(agent)
+        raise
     if cp.returncode != 0:
         cleanup_failed_start(session, raw_log, kill_session=False)
+        close_runner_execution_fd(agent)
         release_start_lease_if_safe(agent, lease, release_lease_on_failure)
         raise AgentError(f"tmux start failed for agent {agent}")
 
-    pipe_command = raw_log_writer_command(raw_log)
-    pipe = run_tmux(["pipe-pane", "-o", "-t", session, pipe_command], check=False)
+    try:
+        pipe_command = raw_log_writer_command(raw_log)
+        pipe = run_tmux(["pipe-pane", "-o", "-t", session, pipe_command], check=False)
+    except Exception:
+        cleanup_failed_start(session, raw_log, kill_session=True)
+        close_runner_execution_fd(agent)
+        release_start_lease_if_safe(agent, lease, release_lease_on_failure)
+        raise
     if pipe.returncode != 0:
         cleanup_failed_start(session, raw_log, kill_session=True)
+        close_runner_execution_fd(agent)
         release_start_lease_if_safe(agent, lease, release_lease_on_failure)
         raise AgentError(f"tmux pipe-pane failed for agent {agent}")
 
@@ -3351,6 +3415,7 @@ def start_agent(
         write_meta(agent, data)
     except Exception:
         cleanup_failed_start(session, raw_log, kill_session=True)
+        close_runner_execution_fd(agent)
         release_start_lease_if_safe(agent, lease, release_lease_on_failure)
         raise
     return {
@@ -3508,6 +3573,7 @@ def _stop_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]:
             release = release_agent(agent, force=True)
         else:
             release = {"status": "skipped", "lease": current_lease, "raw_output": "not_returned"}
+    close_runner_execution_fd(agent)
     return {
         "agent": agent,
         "status": "stopped" if was_running else "not_running",
