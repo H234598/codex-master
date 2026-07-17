@@ -1214,7 +1214,13 @@ def mcp_probe_response_ok(output: str) -> bool:
     return False
 
 
-def mcp_tools_list_probe_result(output: str, required_tool: str) -> dict[str, Any]:
+def mcp_tools_list_probe_result(
+    output: str,
+    required_tool: str,
+    *,
+    required_tools: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    required_names = tuple(dict.fromkeys((required_tool, *required_tools)))
     for payload in iter_mcp_json_messages(output):
         if payload.get("id") != 2 or payload.get("jsonrpc") != "2.0":
             continue
@@ -1225,11 +1231,14 @@ def mcp_tools_list_probe_result(output: str, required_tool: str) -> dict[str, An
         if not isinstance(tools, list):
             break
         names = [tool.get("name") for tool in tools if isinstance(tool, dict) and isinstance(tool.get("name"), str)]
+        required_tools_available = {name: name in names for name in required_names}
         return {
             "response_found": True,
             "tool_count": len(names),
             "required_tool": required_tool,
-            "required_tool_available": required_tool in names,
+            "required_tool_available": required_tools_available[required_tool],
+            "required_tools": list(required_names),
+            "required_tools_available": required_tools_available,
             "raw_output": "not_returned",
         }
     return {
@@ -1237,6 +1246,8 @@ def mcp_tools_list_probe_result(output: str, required_tool: str) -> dict[str, An
         "tool_count": 0,
         "required_tool": required_tool,
         "required_tool_available": False,
+        "required_tools": list(required_names),
+        "required_tools_available": {name: False for name in required_names},
         "raw_output": "not_returned",
     }
 
@@ -1294,6 +1305,7 @@ def mcp_command_tools_list_self_test(
     command_path: Path,
     *,
     required_tool: str = "master_app_bridge_status",
+    required_tools: tuple[str, ...] = (),
     timeout: int = DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     command = [str(command_path)]
@@ -1308,36 +1320,38 @@ def mcp_command_tools_list_self_test(
             timeout=timeout,
         )
     except OSError:
+        tools_result = mcp_tools_list_probe_result("", required_tool, required_tools=required_tools)
         return {
             "ok": False,
             "status": "unavailable",
             "timeout_seconds": timeout,
-            "required_tool": required_tool,
-            "required_tool_available": False,
+            **tools_result,
             "raw_output": "not_returned",
         }
     except subprocess.TimeoutExpired:
+        tools_result = mcp_tools_list_probe_result("", required_tool, required_tools=required_tools)
         return {
             "ok": False,
             "status": "timeout",
             "timeout_seconds": timeout,
-            "required_tool": required_tool,
-            "required_tool_available": False,
+            **tools_result,
             "raw_output": "not_returned",
         }
     except UnicodeDecodeError:
+        tools_result = mcp_tools_list_probe_result("", required_tool, required_tools=required_tools)
         return {
             "ok": False,
             "status": "failed",
             "timeout_seconds": timeout,
-            "required_tool": required_tool,
-            "required_tool_available": False,
+            **tools_result,
             "raw_output": "not_returned",
         }
 
     output = cp.stdout
-    tools_result = mcp_tools_list_probe_result(output, required_tool)
-    ok = cp.returncode == 0 and tools_result["response_found"] and tools_result["required_tool_available"]
+    tools_result = mcp_tools_list_probe_result(output, required_tool, required_tools=required_tools)
+    ok = cp.returncode == 0 and tools_result["response_found"] and all(
+        tools_result["required_tools_available"].values()
+    )
     return {
         "ok": ok,
         "status": "ok" if ok else "failed",
@@ -8214,7 +8228,10 @@ def master_timeout_policy() -> dict[str, Any]:
 def master_namespace_status() -> dict[str, Any]:
     registration = check_mcp_registration(DEFAULT_INSTALL_PATH)
     startup_self_test = mcp_command_startup_self_test(DEFAULT_INSTALL_PATH)
-    tools_list_self_test = mcp_command_tools_list_self_test(DEFAULT_INSTALL_PATH)
+    tools_list_self_test = mcp_command_tools_list_self_test(
+        DEFAULT_INSTALL_PATH,
+        required_tools=("agent_assignment_report",),
+    )
     cache_status = plugin_cache_status(repo_root())
     client_config = codex_client_mcp_config_status(command_path=DEFAULT_INSTALL_PATH)
     home_context = codex_home_context()
@@ -8234,6 +8251,7 @@ def master_namespace_status() -> dict[str, Any]:
         "agent_pool_copy_auth": "agent_pool_copy_auth" in tool_names,
         "agent_pool_destroy_pool": "agent_pool_destroy_pool" in tool_names,
         "agent_assign_live_data": "agent_assign_live_data" in tool_names,
+        "agent_assignment_report": "agent_assignment_report" in tool_names,
         "agent_selector_policy": "agent_selector_policy" in tool_names,
         "agent_selector_preview": "agent_selector_preview" in tool_names,
         "raw_output": "not_returned",
@@ -8268,6 +8286,7 @@ def master_namespace_status() -> dict[str, Any]:
             "agent_pool_copy_auth": local_tool_contract["agent_pool_copy_auth"],
             "agent_pool_destroy_pool": local_tool_contract["agent_pool_destroy_pool"],
             "agent_assign_live_data": local_tool_contract["agent_assign_live_data"],
+            "agent_assignment_report": local_tool_contract["agent_assignment_report"],
             "agent_selector_policy": local_tool_contract["agent_selector_policy"],
             "agent_selector_preview": local_tool_contract["agent_selector_preview"],
         },

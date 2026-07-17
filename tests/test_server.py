@@ -2276,6 +2276,25 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["required_tool_available"])
         self.assertNotIn("agent_status", json.dumps(result, sort_keys=True))
 
+    def test_mcp_tools_list_probe_result_requires_all_report_tools(self) -> None:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"tools": [{"name": "master_app_bridge_status"}]},
+        }
+        encoded = json.dumps(payload, separators=(",", ":"))
+
+        result = mcp_tools_list_probe_result(
+            f"Content-Length: {len(encoded)}\r\n\r\n{encoded}",
+            "master_app_bridge_status",
+            required_tools=("agent_assignment_report",),
+        )
+
+        self.assertTrue(result["response_found"])
+        self.assertTrue(result["required_tool_available"])
+        self.assertFalse(result["required_tools_available"]["agent_assignment_report"])
+        self.assertTrue(result["required_tools_available"]["master_app_bridge_status"])
+
     def test_mcp_tools_list_probe_result_counts_content_length_in_utf8_bytes(self) -> None:
         payload = {
             "jsonrpc": "2.0",
@@ -2374,6 +2393,29 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["tool_count"], 1)
         self.assertTrue(result["required_tool_available"])
+
+    @patch("codex_master.server.subprocess.run")
+    def test_mcp_command_tools_list_self_test_requires_assignment_report(self, mock_run) -> None:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"tools": [{"name": "master_app_bridge_status"}]},
+        }
+        mock_run.return_value = subprocess.CompletedProcess(
+            ["/tmp/codex-master-mcp"],
+            0,
+            json.dumps(payload),
+            "",
+        )
+
+        result = mcp_command_tools_list_self_test(
+            Path("/tmp/codex-master-mcp"),
+            required_tools=("agent_assignment_report",),
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["required_tool_available"])
+        self.assertFalse(result["required_tools_available"]["agent_assignment_report"])
 
     @patch("codex_master.server.subprocess.run")
     def test_mcp_command_tools_list_self_test_rejects_stderr_only_response(self, mock_run) -> None:
@@ -2541,6 +2583,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["expected_tools"]["agent_pool_copy_auth"])
         self.assertTrue(result["expected_tools"]["agent_pool_destroy_pool"])
         self.assertTrue(result["expected_tools"]["agent_assign_live_data"])
+        self.assertTrue(result["expected_tools"]["agent_assignment_report"])
         self.assertFalse(result["tool_search"]["authoritative_for_local_stdio_mcp_tools"])
         self.assertTrue(result["client_refresh"]["existing_sessions_may_need_restart"])
         self.assertTrue(result["mcp_server_ready"])
@@ -2764,7 +2807,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.44")
+        self.assertEqual(result["expected_tag"], "v0.9.45")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
