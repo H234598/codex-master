@@ -4155,17 +4155,18 @@ def watchdog_output_changed_since_marker(
 ) -> bool:
     marker_bytes = marker.get("raw_log_bytes")
     current_bytes = status.get("raw_log_bytes")
+    requested_at = parse_utc_timestamp(marker.get("requested_at_utc"))
+    activity_at = parse_utc_timestamp(status.get("raw_log_updated_at_utc"))
+    current = time.time() if now is None else now
     if (
         isinstance(marker_bytes, int)
         and not isinstance(marker_bytes, bool)
         and isinstance(current_bytes, int)
         and not isinstance(current_bytes, bool)
         and current_bytes > marker_bytes
+        and (activity_at is None or activity_at <= current)
     ):
         return True
-    requested_at = parse_utc_timestamp(marker.get("requested_at_utc"))
-    activity_at = parse_utc_timestamp(status.get("raw_log_updated_at_utc"))
-    current = time.time() if now is None else now
     return bool(
         requested_at is not None
         and activity_at is not None

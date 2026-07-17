@@ -3437,12 +3437,25 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(
             watchdog_output_changed_since_marker(
                 {
-                    "raw_log_bytes": 100,
+                    "raw_log_bytes": 101,
                     "raw_log_updated_at_utc": "2099-01-01T00:00:00+00:00",
                 },
                 {
                     "raw_log_bytes": 100,
                     "requested_at_utc": "2026-06-07T10:00:00+00:00",
+                },
+                now=1780826400.0,
+            )
+        )
+        self.assertTrue(
+            watchdog_output_changed_since_marker(
+                {
+                    "raw_log_bytes": 101,
+                    "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
+                },
+                {
+                    "raw_log_bytes": 100,
+                    "requested_at_utc": "2026-06-07T09:00:00+00:00",
                 },
                 now=1780826400.0,
             )
