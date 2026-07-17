@@ -812,6 +812,50 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertNotIn(str(target), str(raised.exception))
 
+    def test_ensure_mcp_startup_timeout_rejects_parent_swap_before_write(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            managed = root / "managed"
+            outside = root / "outside"
+            backup = root / "managed-original"
+            managed.mkdir()
+            outside.mkdir()
+            config = managed / "config.toml"
+            config.write_text(
+                "[mcp_servers.codex-master-mcp]\nstartup_timeout_sec = 60\n",
+                encoding="utf-8",
+            )
+
+            real_ensure_chain = server_module.ensure_directory_chain_no_symlink
+            swapped = False
+
+            def swap_after_chain(path: Path, error_text: str) -> None:
+                nonlocal swapped
+                real_ensure_chain(path, error_text)
+                if not swapped and Path(path) == managed:
+                    managed.rename(backup)
+                    outside.rename(managed)
+                    swapped = True
+
+            with patch.object(server_module, "ensure_directory_chain_no_symlink", side_effect=swap_after_chain):
+                with self.assertRaisesRegex(
+                    AgentError,
+                    "private state parent directories changed unexpectedly",
+                ):
+                    server_module.ensure_mcp_startup_timeout_configured(config)
+
+            original_content = (backup / "config.toml").read_text(encoding="utf-8")
+            redirected_exists = (managed / "config.toml").exists()
+
+        self.assertTrue(swapped)
+        self.assertEqual(
+            original_content,
+            "[mcp_servers.codex-master-mcp]\nstartup_timeout_sec = 60\n",
+        )
+        self.assertFalse(redirected_exists)
+
     def test_codex_client_mcp_config_status_detects_ready_config_without_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = Path(tmpdir) / ".codex" / "config.toml"

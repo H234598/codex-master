@@ -794,7 +794,10 @@ def ensure_mcp_startup_timeout_configured(config_path: Path | None = None) -> di
     path = path.expanduser()
     if not path.is_absolute():
         path = Path.cwd() / path
-    ensure_directory_chain_no_symlink(path.parent, "codex config parent directories must be real directories")
+    expected_parent_stat = ensure_real_parent(
+        path,
+        "codex config parent directories must be real directories",
+    )
     if path.exists() or path.is_symlink():
         if path.is_symlink():
             raise AgentError("codex config path must be a regular file")
@@ -803,7 +806,11 @@ def ensure_mcp_startup_timeout_configured(config_path: Path | None = None) -> di
         text = ""
     new_text, changed, previous = updated_mcp_startup_timeout_config(text)
     if changed:
-        replace_private_text(path, new_text)
+        replace_private_bytes(
+            path,
+            new_text.encode("utf-8"),
+            expected_parent_stat=expected_parent_stat,
+        )
     return {
         "status": "updated" if changed else "already_configured",
         "startup_timeout_sec": RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
@@ -1668,7 +1675,13 @@ def read_private_regular_text(path: Path, max_bytes: int, error_text: str) -> st
         raise AgentError(error_text) from exc
 
 
-def replace_private_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
+def replace_private_bytes(
+    path: Path,
+    data: bytes,
+    mode: int = 0o600,
+    *,
+    expected_parent_stat: os.stat_result | None = None,
+) -> None:
     parent = path.parent.expanduser()
     if not parent.is_absolute():
         parent = Path.cwd() / parent
@@ -1691,18 +1704,20 @@ def replace_private_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
             os.close(parent_fd)
             raise AgentError("private state parent directories must be real directories")
     else:
-        try:
-            parent_stat = parent.lstat()
-        except FileNotFoundError:
-            parent_stat = None
-        except OSError as exc:
-            raise AgentError("private state parent directories must be real directories") from exc
-        ensure_private_dir(parent)
+        parent_stat = expected_parent_stat
         if parent_stat is None:
             try:
                 parent_stat = parent.lstat()
+            except FileNotFoundError:
+                parent_stat = None
             except OSError as exc:
                 raise AgentError("private state parent directories must be real directories") from exc
+            ensure_private_dir(parent)
+            if parent_stat is None:
+                try:
+                    parent_stat = parent.lstat()
+                except OSError as exc:
+                    raise AgentError("private state parent directories must be real directories") from exc
         parent_fd = open_directory_no_follow_matching(
             parent,
             parent_stat,
