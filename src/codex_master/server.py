@@ -8974,20 +8974,22 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
         raise AgentError("source must be 'pane' or 'log'")
     lease = ensure_agent_lease_available(agent)
     meta = read_meta(agent)
+    session_live = tmux_alive(AGENTS[agent]["session"])
     if source == "pane":
-        if tmux_alive(AGENTS[agent]["session"]):
+        if session_live:
             require_managed_tmux_session(agent)
         raw = pane_tail(agent, lines, verify_identity=True)
     else:
         raw_log = meta.get("raw_log")
         raw_log_identity = allowed_agent_raw_log_identity(agent, raw_log)
         raw_log_path = raw_log_identity[0] if raw_log_identity is not None else None
-        if tmux_alive(AGENTS[agent]["session"]) and (raw_log_path is None or raw_log_identity[1] is None):
+        if session_live:
             require_managed_tmux_session(agent)
-            raw_log_path = latest_managed_raw_log(
-                agent,
-                include_legacy=raw_log_identity_is_legacy(raw_log_identity),
-            )
+            if raw_log_path is None or raw_log_identity[1] is None:
+                raw_log_path = latest_managed_raw_log(
+                    agent,
+                    include_legacy=raw_log_identity_is_legacy(raw_log_identity),
+                )
         if raw_log and raw_log_path is None:
             raise AgentError("raw_log path is outside managed raw log state")
         raw = read_log_tail(raw_log_path, chars * 4) if raw_log_path else ""
