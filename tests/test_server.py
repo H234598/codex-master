@@ -11694,6 +11694,24 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertFalse((backup / "a1").exists())
             self.assertFalse((pool / "a1").exists())
 
+    def test_pool_root_operation_keeps_writes_on_open_directory_after_path_swap(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            backup = tmp / "agents-backup"
+            replacement = tmp / "replacement"
+
+            with server_module.pool_root_operation(pool, ensure=True, error_text="pool root changed") as root:
+                pool.rename(backup)
+                replacement.mkdir()
+                pool.symlink_to(replacement, target_is_directory=True)
+                (root / "sentinel").write_text("protected\n", encoding="utf-8")
+
+            self.assertTrue((backup / "sentinel").is_file())
+            self.assertFalse((replacement / "sentinel").exists())
+
     def test_agent_pool_destroy_requires_regular_marker_without_path_leak(self) -> None:
         from codex_master import server as server_module
 

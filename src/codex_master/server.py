@@ -447,6 +447,15 @@ def ensure_private_dir(path: Path) -> None:
     if not path.is_absolute():
         path = Path.cwd() / path
     path = path.absolute()
+    parts = path.parts
+    if len(parts) == 5 and parts[:4] == ("/", "proc", "self", "fd") and parts[4].isdigit():
+        try:
+            current = os.fstat(int(parts[4]))
+        except OSError as exc:
+            raise AgentError("private state directory must be a real directory") from exc
+        if not stat_module.S_ISDIR(current.st_mode):
+            raise AgentError("private state directory must be a real directory")
+        return
     ensure_directory_chain_no_symlink(path.parent, "private state parent directories must be real directories")
     try:
         current = path.lstat()
@@ -476,8 +485,21 @@ def ensure_private_dir(path: Path) -> None:
 def ensure_directory_chain_no_symlink(path: Path, error_text: str) -> None:
     if not path.is_absolute():
         raise AgentError(error_text)
-    current = Path(path.anchor)
-    for part in path.parts[1:]:
+    parts = path.parts
+    if len(parts) >= 5 and parts[:4] == ("/", "proc", "self", "fd") and parts[4].isdigit():
+        try:
+            fd = int(parts[4])
+            fd_stat = os.fstat(fd)
+        except OSError as exc:
+            raise AgentError(error_text) from exc
+        if not stat_module.S_ISDIR(fd_stat.st_mode):
+            raise AgentError(error_text)
+        current = Path(f"/proc/self/fd/{fd}")
+        remaining_parts = parts[5:]
+    else:
+        current = Path(path.anchor)
+        remaining_parts = parts[1:]
+    for part in remaining_parts:
         current = current / part
         try:
             current_stat = current.lstat()
@@ -8985,10 +9007,7 @@ def pool_root_operation(
             changed_text=error_text,
             dir_fd=parent_fd,
         )
-        try:
-            operation_root = Path(f"/proc/self/fd/{root_fd}").resolve(strict=True)
-        except (OSError, RuntimeError) as exc:
-            raise AgentError(error_text) from exc
+        operation_root = Path(f"/proc/self/fd/{root_fd}")
         yield operation_root
     finally:
         if root_fd >= 0:
