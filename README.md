@@ -54,9 +54,9 @@ errors use generic markers rather than local file paths. Safe-tail log reads
 ignore non-regular raw-log targets. Tmux control errors are redacted and bounded
 before they are returned or raised. MCP tool responses do not return raw output
 by default and expose raw-log presence without returning local raw-log paths.
-Text is pasted into the Codex TUI through tmux and submitted with `S-Enter`.
-Plain `Enter` can leave multi-line or wrapped prompts sitting in the composer
-instead of starting the model response in current Codex CLI builds.
+Text is pasted into the Codex TUI through tmux and submitted with `Enter`.
+This matches the current Codex CLI submit binding; modified Enter sequences are
+terminal-dependent and are not used by the controller.
 Before pasting, `send`, `assign-*`, and `report-request` wait briefly for an
 identifiable Codex TUI input prompt marker in the current visible pane tail. If
 the Agentin is still in startup warnings, only shows starter text, or no input
@@ -106,6 +106,11 @@ Working mutations require a regular per-Agentin `auth.json` by default:
 regular file, unreadable, or too large. Status/skills/capabilities/lease/pool/
 stop/release remain available for diagnosis and cleanup. Use
 `--allow-unauthenticated` only for explicit login/bootstrap flows.
+For ChatGPT auth, status also checks a JWT access-token expiry when present.
+An expired access token is reported as `access_token_expired` and blocks new
+mutations until that Agentin is logged in again. Copying one rotating ChatGPT
+refresh token into multiple Agentinnen is unsupported; each Agentin needs its
+own login.
 `agent_status` classifies bounded pane/log text without returning it, so callers
 can distinguish likely daily, weekly, token, quota, or rate limits from ordinary
 "no response yet" states. The classification keeps default Agentinnen-model
@@ -128,6 +133,11 @@ explicit paths that the Teamleiterin assigned.
 limit without automatically receiving Agentin output. It defaults to 120 seconds
 and is capped at 10 minutes per call. Its poll interval defaults to 30 seconds
 and is capped at 900 seconds.
+Assignments are asynchronous. `agent_wait` and `agent_report_request` expose
+the relevant `assignment_id` at top level. Call `agent_assignment_report` with
+that ID to receive a small ANSI-stripped, redacted terminal excerpt. This is
+the explicit output boundary; assignment metadata and wait results remain
+data-sparse.
 `fleet_watchdog` checks idle Agentinnen without reading raw output. It defaults
 to a 60 second idle threshold and asks the Agentin for a concise report before
 any escalation. The report grace window defaults to 15 seconds, so the next
@@ -185,6 +195,7 @@ blocked Agentin until the codex-usage watchdog releases it again.
 - `agent_assignments`: data-sparse assignment audit log
 - `agent_last_assignment_status`: latest assignment metadata for one Agentin
 - `agent_report_request`: ask one Agentin for a concise report
+- `agent_assignment_report`: read a capped redacted excerpt for a known assignment
 - `agent_selector_policy`: show or set the ordinal selector policy, for example
   `a,b` or `a,b,c`
 - `agent_selector_preview`: preview numeric selector mapping without mutating
@@ -261,6 +272,7 @@ python3 -m codex_master.server assign-live-data a --task "Wie ist das Wetter ger
 python3 -m codex_master.server assign-write b --scope .github/workflows --write-path .github/workflows/ci.yml --task "Haerte nur die CI-Datei."
 python3 -m codex_master.server assignments all --limit 20
 python3 -m codex_master.server last-assignment a
+python3 -m codex_master.server assignment-report a ASSIGNMENT_ID --source pane --lines 40 --chars 4000
 python3 -m codex_master.server integration-status
 python3 -m codex_master.server commit-ready-check
 python3 -m codex_master.server app-bridge-status

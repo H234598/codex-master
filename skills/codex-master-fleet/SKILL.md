@@ -253,6 +253,9 @@ Data minimization:
 - `assignments` and `last-assignment` return only assignment metadata. They
   must not return prompt text, Agentin responses, local audit file paths, or
   absolute local paths from historical `scope`/`write_paths` metadata.
+  `agent_assignment_report` is the explicit exception: after a known
+  assignment, it returns only a capped, ANSI-stripped, redacted terminal
+  excerpt.
 - Assignment audit retention is bounded to the newest 500 valid metadata
   records in a local `0600` JSONL file. Assignment-log reads require regular
   files, are capped, and use generic errors. Private state appends refuse

@@ -3960,9 +3960,15 @@ def wait_agent(agent: str, timeout_seconds: int = DEFAULT_WAIT_SECONDS, poll_int
         )
     else:
         spark_health = {"state": "not_checked", "updated": False, "raw_output": "not_returned"}
+    latest_assignment = current.get("last_assignment") if isinstance(current.get("last_assignment"), dict) else {}
+    assignment_id = latest_assignment.get("assignment_id")
+    if not isinstance(assignment_id, str) or not assignment_id:
+        assignment_id = None
     return {
         "agent": agent,
         "status": status,
+        "assignment_id": assignment_id,
+        "result_tool": "agent_assignment_report" if assignment_id else None,
         "timeout_seconds": timeout_seconds,
         "poll_interval_seconds": poll_interval_seconds,
         "poll_count": polls,
@@ -5730,9 +5736,17 @@ def request_agent_report(
     enter: bool = True,
     lease: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    resolved_assignment_id = None
     if assignment_id:
-        assignment_id = bounded_text(assignment_id, field="assignment_id", max_chars=MAX_ASSIGNMENT_ID) or ""
-        safe_id, _changed = redact(assignment_id)
+        resolved_assignment_id = bounded_text(assignment_id, field="assignment_id", max_chars=MAX_ASSIGNMENT_ID) or ""
+    else:
+        latest = list_assignments(agent, 1).get("records", [])
+        if latest and isinstance(latest[0], dict):
+            candidate = latest[0].get("assignment_id")
+            if isinstance(candidate, str) and candidate:
+                resolved_assignment_id = candidate
+    if resolved_assignment_id:
+        safe_id, _changed = redact(resolved_assignment_id)
         text = (
             "Bitte liefere einen knappen Bericht zum Assignment "
             f"{trim_chars(safe_id, 200)}: Status, relevante Dateien/Zeilen, Tests, offene Risiken. "
@@ -5746,7 +5760,7 @@ def request_agent_report(
         "agent": agent,
         "status": "report_requested",
         "submitted": enter,
-        "assignment_id": assignment_id,
+        "assignment_id": resolved_assignment_id,
         "lease": lease,
         "result_tool": "agent_assignment_report",
         "prompt_output": "not_returned",

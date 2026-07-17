@@ -107,6 +107,7 @@ from codex_master.server import (
     read_meta,
     remember_agent_routing,
     remember_agent_usage_account,
+    request_agent_report,
     safe_tail,
     same_path_text,
     serve_mcp,
@@ -854,6 +855,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("agent_release", names)
         self.assertIn("agent_assign", names)
         self.assertIn("agent_assignments", names)
+        self.assertIn("agent_assignment_report", names)
         self.assertIn("agent_skill_match", names)
         self.assertIn("agent_capabilities", names)
         self.assertIn("agent_scope_check", names)
@@ -882,6 +884,8 @@ class ServerHelpersTest(unittest.TestCase):
         send_props = by_name["agent_send"]["inputSchema"]["properties"]
         interrupt_props = by_name["agent_interrupt"]["inputSchema"]["properties"]
         report_props = by_name["agent_report_request"]["inputSchema"]["properties"]
+        assignment_report = by_name["agent_assignment_report"]
+        assignment_report_props = assignment_report["inputSchema"]["properties"]
         wait_props = by_name["agent_wait"]["inputSchema"]["properties"]
         watchdog_props = by_name["fleet_watchdog"]["inputSchema"]["properties"]
         assign_write_props = by_name["agent_assign_write"]["inputSchema"]["properties"]
@@ -927,6 +931,10 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(assign_live_data_props["allow_unauthenticated"]["default"])
         self.assertFalse(assign_write_props["allow_unauthenticated"]["default"])
         self.assertFalse(report_props["allow_unauthenticated"]["default"])
+        self.assertEqual(assignment_report["inputSchema"]["required"], ["agent", "assignment_id"])
+        self.assertEqual(assignment_report_props["lines"]["maximum"], 80)
+        self.assertEqual(assignment_report_props["chars"]["maximum"], 8192)
+        self.assertIn("returns output", assignment_report["description"])
         self.assertEqual(assign_live_data_props["live_data_topic"]["maxLength"], MAX_LIVE_DATA_TOPIC)
         self.assertEqual(selector_policy_props["series"]["maxLength"], 32)
         self.assertEqual(DEFAULT_WATCHDOG_IDLE_SECONDS, 60)
@@ -1172,6 +1180,35 @@ class ServerHelpersTest(unittest.TestCase):
         payload = json.dumps({"missing": missing, "present": present, "linked": linked}, sort_keys=True)
         self.assertNotIn(tmpdir, payload)
         self.assertNotIn("secret", payload)
+
+    def test_agent_auth_status_marks_expired_chatgpt_access_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            (home / "auth.json").write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {
+                            "access_token": "e30.eyJleHAiOjF9.sig",
+                            "refresh_token": "refresh-token",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                result = agent_auth_status("a")
+
+        self.assertFalse(result["authenticated"])
+        self.assertEqual(result["auth_state"], "access_token_expired")
+        self.assertEqual(result["auth_mode"], "chatgpt")
+        self.assertEqual(result["token_state"], "expired")
 
     def test_agent_auth_status_rejects_regular_file_swap_before_open(self) -> None:
         from codex_master import server as server_module
@@ -3138,6 +3175,63 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(mock_lifecycle.call_args.args[0], "a1")
         mock_safe_tail.assert_called_once_with("a1", 40, 4000, "pane")
 
+    @patch("codex_master.server.safe_tail")
+    @patch("codex_master.server.list_assignments")
+    def test_assignment_report_returns_explicit_capped_excerpt_for_known_assignment(
+        self, mock_list_assignments, mock_safe_tail
+    ) -> None:
+        mock_list_assignments.return_value = {
+            "records": [
+                {
+                    "assignment_id": "assign-1-a1",
+                    "created_at_utc": "2026-07-17T00:00:00+00:00",
+                    "role": "exploriererin",
+                    "model": "gpt-5.4-mini",
+                }
+            ]
+        }
+        mock_safe_tail.return_value = {
+            "source": "log",
+            "lines_limit": 3,
+            "chars_limit": 100,
+            "redaction_applied": True,
+            "output_chars": 6,
+            "output_lines": 1,
+            "output_truncated": False,
+            "output_truncated_by_lines": False,
+            "output_truncated_by_chars": False,
+            "output": "report",
+            "lease": {"state": "unclaimed"},
+        }
+
+        result = assignment_report("a", "assign-1-a1", lines=3, chars=100, source="log")
+
+        self.assertEqual(result["agent"], "a1")
+        self.assertEqual(result["assignment_id"], "assign-1-a1")
+        self.assertEqual(result["report_status"], "excerpt_available")
+        self.assertEqual(result["output"], "report")
+        mock_list_assignments.assert_called_once_with("a1", MAX_ASSIGNMENT_RECORDS)
+        mock_safe_tail.assert_called_once_with("a1", 3, 100, "log")
+
+    @patch("codex_master.server.list_assignments", return_value={"records": []})
+    def test_assignment_report_requires_known_assignment(self, _mock_list_assignments) -> None:
+        with self.assertRaisesRegex(AgentError, "assignment report not found"):
+            assignment_report("a", "unknown-assignment")
+
+    @patch("codex_master.server.send_agent", return_value={"status": "sent", "raw_output": "not_returned"})
+    @patch(
+        "codex_master.server.list_assignments",
+        return_value={"records": [{"assignment_id": "assign-latest"}]},
+    )
+    def test_request_agent_report_resolves_latest_assignment_id(
+        self, _mock_list_assignments, mock_send_agent
+    ) -> None:
+        result = request_agent_report("a", lease={"state": "held"})
+
+        self.assertEqual(result["assignment_id"], "assign-latest")
+        self.assertEqual(result["result_tool"], "agent_assignment_report")
+        self.assertIn("assign-latest", mock_send_agent.call_args.args[1])
+
     @patch("codex_master.server.ensure_agent_lease_available")
     @patch("codex_master.server.ensure_state")
     def test_safe_tail_log_source_reads_caps_and_redacts(self, _mock_ensure_state, mock_lease) -> None:
@@ -3645,6 +3739,8 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "activity_observed")
         self.assertEqual(result["poll_count"], 1)
+        self.assertEqual(result["assignment_id"], "assign-1")
+        self.assertEqual(result["result_tool"], "agent_assignment_report")
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertEqual(result["response_output"], "not_returned")
         mock_sleep.assert_called_once()
@@ -9749,6 +9845,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["status"], "sent")
         self.assertEqual(result["chars"], len("line 1\nline 2"))
         self.assertEqual(result["paste_mode"], "bracketed_paste")
+        self.assertEqual(CODEX_TUI_SUBMIT_KEY, "Enter")
         self.assertEqual(result["submit_key"], CODEX_TUI_SUBMIT_KEY)
         self.assertEqual(result["response_output"], "not_returned")
         load_call = next(call for call in calls if call["args"][0] == "load-buffer")
