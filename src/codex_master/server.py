@@ -6370,12 +6370,8 @@ def _assign_agent_unlocked(
         remember_agent_routing(agent, routing)
         sent = send_agent(agent, prompt, enter, operation=operation)
     except Exception:
-        if release_on_failure:
-            if model_switch is None:
-                if not (isinstance(sent, dict) and sent.get("status") == "sent"):
-                    release_start_lease_if_safe(agent, lease, True)
-            elif not (isinstance(sent, dict) and sent.get("status") == "sent"):
-                release_agent(agent, force=True)
+        if release_on_failure and not (isinstance(sent, dict) and sent.get("status") == "sent"):
+            release_start_lease_if_safe(agent, lease, True)
         raise
     assignment_id = f"{now_id()}-{agent}"
     assignment_record = {
@@ -6423,7 +6419,7 @@ def _assign_agent_unlocked(
         record_assignment(assignment_record)
     except Exception:
         if release_on_failure and not (isinstance(sent, dict) and sent.get("status") == "sent"):
-            release_agent(agent, force=True)
+            release_start_lease_if_safe(agent, lease, True)
         raise
     return {
         "assignment_id": assignment_id,
