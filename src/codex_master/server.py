@@ -6052,6 +6052,14 @@ def remove_install_symlink_if_repo_wrapper(install_path: Path, wrapper: Path) ->
         if resolved_target != wrapper:
             return "left_in_place_not_repo_wrapper"
         try:
+            latest = os.lstat(install_path.name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return "missing"
+        except OSError as exc:
+            raise AgentError("could_not_remove_install_symlink") from exc
+        if not source_identity_matches(latest, current) or not stat_module.S_ISLNK(latest.st_mode):
+            return "left_in_place_not_repo_wrapper"
+        try:
             os.unlink(install_path.name, dir_fd=parent_fd)
         except FileNotFoundError:
             return "missing"

@@ -11096,6 +11096,37 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result["symlink"], "left_in_place_not_repo_wrapper")
         self.assertTrue(still_symlink)
 
+    def test_remove_install_symlink_rejects_link_swap_before_unlink(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            wrapper = root / "wrapper"
+            other = root / "other"
+            install_link = root / "codex-master-mcp"
+            wrapper.write_text("wrapper\n", encoding="utf-8")
+            other.write_text("other\n", encoding="utf-8")
+            install_link.symlink_to(wrapper)
+            swapped = False
+            real_readlink = server_module.os.readlink
+
+            def swap_after_readlink(name, *args, **kwargs):
+                nonlocal swapped
+                target_text = real_readlink(name, *args, **kwargs)
+                if not swapped:
+                    install_link.unlink()
+                    install_link.symlink_to(other)
+                    swapped = True
+                return target_text
+
+            with patch.object(server_module.os, "readlink", side_effect=swap_after_readlink):
+                result = server_module.remove_install_symlink_if_repo_wrapper(install_link, wrapper)
+
+            self.assertTrue(swapped)
+            self.assertEqual(result, "left_in_place_not_repo_wrapper")
+            self.assertTrue(install_link.is_symlink())
+            self.assertEqual(install_link.resolve(), other)
+
     @patch("codex_master.server.agent_home_process_summary")
     @patch("codex_master.server.tmux_alive", return_value=False)
     @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
