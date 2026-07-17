@@ -5256,12 +5256,6 @@ def _usage_watchdog_agent_unlocked(agent: str, *, dry_run: bool) -> dict[str, An
     session = cfg["session"]
     running = tmux_alive(session)
     lease = agent_lease_status(agent, initialize_state=not dry_run)
-    usage_watchdog = codex_usage_status_with_routing(
-        agent,
-        codex_usage_watchdog_status(agent, include_assignment_history=not dry_run),
-        persist_account=not dry_run,
-        include_assignment_history=not dry_run,
-    )
     base = {
         "agent": agent,
         "running": running,
@@ -5269,10 +5263,29 @@ def _usage_watchdog_agent_unlocked(agent: str, *, dry_run: bool) -> dict[str, An
         "lease_state": lease.get("state"),
         "held_by_this_server": bool(lease.get("held_by_this_server")),
         "dry_run": dry_run,
-        "usage_watchdog": usage_watchdog,
         "raw_output": "not_returned",
         "response_output": "not_returned",
     }
+    if running:
+        identity_guard = agent_identity_guard(True, agent_home_process_summary(agent))
+        if not identity_guard["ok"]:
+            base["identity_guard"] = identity_guard
+            base["usage_watchdog"] = codex_usage_watchdog_status(
+                agent,
+                include_assignment_history=not dry_run,
+            )
+            return {
+                **base,
+                "usage_watchdog_state": "skipped_identity_unverified",
+                "action_taken": "none",
+            }
+    usage_watchdog = codex_usage_status_with_routing(
+        agent,
+        codex_usage_watchdog_status(agent, include_assignment_history=not dry_run),
+        persist_account=not dry_run,
+        include_assignment_history=not dry_run,
+    )
+    base["usage_watchdog"] = usage_watchdog
 
     if usage_watchdog.get("blocked"):
         marker = {
@@ -8545,6 +8558,7 @@ def dismiss_codex_update_prompt(agent: str, text: str) -> bool:
     agent = canonical_agent_id(agent)
     session = AGENTS[agent]["session"]
     with agent_lifecycle_lock(agent):
+        require_managed_tmux_session(agent)
         for key in keys:
             result = run_tmux(["send-keys", "-t", session, key], check=False)
             if result.returncode != 0:

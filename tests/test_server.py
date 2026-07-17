@@ -6232,6 +6232,9 @@ class ServerHelpersTest(unittest.TestCase):
         with patch.dict("codex_master.server.AGENTS", {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}}, clear=True), patch(
             "codex_master.server.ensure_state"
         ), patch("codex_master.server.tmux_alive", return_value=True), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={"process_count": 1, "managed_process_count": 1, "external_process_count": 0},
+        ), patch(
             "codex_master.server.agent_lease_status",
             return_value={"state": "held", "held_by_this_server": True, "raw_output": "not_returned"},
         ), patch("codex_master.server.codex_usage_watchdog_status", return_value=blocked_status), patch(
@@ -6243,6 +6246,42 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["action_taken"], "stop")
         self.assertEqual(marker_store[0]["blocked_until_utc"], "2099-06-08T06:50:00+02:00")
         mock_stop.assert_called_once_with("a1", force=False)
+
+    def test_usage_watchdog_skips_unmanaged_tmux_session_before_claiming(self) -> None:
+        blocked_status = {
+            "agent": "a1",
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": "2099-06-08T06:50:00+00:00",
+            "reason": "usage limit reached",
+            "source": "snapshot",
+            "raw_output": "not_returned",
+        }
+        with patch.dict(
+            "codex_master.server.AGENTS",
+            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
+            clear=True,
+        ), patch("codex_master.server.ensure_state"), patch(
+            "codex_master.server.tmux_alive", return_value=True
+        ), patch(
+            "codex_master.server.agent_lease_status",
+            return_value={"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
+        ), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={"process_count": 1, "managed_process_count": 0, "external_process_count": 1},
+        ), patch("codex_master.server.codex_usage_watchdog_status", return_value=blocked_status), patch(
+            "codex_master.server.claim_agent"
+        ) as mock_claim, patch("codex_master.server.update_codex_usage_watchdog_marker") as mock_update, patch(
+            "codex_master.server.stop_agent"
+        ) as mock_stop:
+            result = usage_watchdog_agent("a1", dry_run=False)
+
+        self.assertEqual(result["usage_watchdog_state"], "skipped_identity_unverified")
+        self.assertEqual(result["action_taken"], "none")
+        self.assertEqual(result["identity_guard"]["state"], "blocked_external_home_user")
+        mock_claim.assert_not_called()
+        mock_update.assert_not_called()
+        mock_stop.assert_not_called()
 
     def test_usage_watchdog_claims_unclaimed_agent_before_stop(self) -> None:
         blocked_status = {
@@ -6260,6 +6299,9 @@ class ServerHelpersTest(unittest.TestCase):
             clear=True,
         ), patch("codex_master.server.ensure_state"), patch(
             "codex_master.server.tmux_alive", return_value=True
+        ), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={"process_count": 1, "managed_process_count": 1, "external_process_count": 0},
         ), patch(
             "codex_master.server.agent_lease_status",
             return_value={"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
@@ -6300,6 +6342,9 @@ class ServerHelpersTest(unittest.TestCase):
         ), patch("codex_master.server.ensure_state"), patch(
             "codex_master.server.tmux_alive", return_value=True
         ), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={"process_count": 1, "managed_process_count": 1, "external_process_count": 0},
+        ), patch(
             "codex_master.server.agent_lease_status",
             return_value={"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
         ), patch("codex_master.server.codex_usage_watchdog_status", return_value=blocked_status), patch(
@@ -6334,6 +6379,9 @@ class ServerHelpersTest(unittest.TestCase):
             clear=True,
         ), patch("codex_master.server.ensure_state"), patch(
             "codex_master.server.tmux_alive", return_value=True
+        ), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={"process_count": 1, "managed_process_count": 1, "external_process_count": 0},
         ), patch(
             "codex_master.server.agent_lease_status",
             return_value={"state": "unreadable", "held_by_this_server": False, "raw_output": "not_returned"},
@@ -8359,7 +8407,8 @@ class ServerHelpersTest(unittest.TestCase):
         )
 
     @patch("codex_master.server.run_tmux")
-    def test_dismiss_codex_update_prompt_never_selects_update(self, mock_run_tmux) -> None:
+    @patch("codex_master.server.require_managed_tmux_session")
+    def test_dismiss_codex_update_prompt_never_selects_update(self, _mock_identity, mock_run_tmux) -> None:
         mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "", "")
 
         self.assertTrue(
@@ -8402,7 +8451,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         with patch("codex_master.server.agent_lifecycle_lock", return_value=FakeLock()), patch(
             "codex_master.server.run_tmux", side_effect=fake_run_tmux
-        ):
+        ), patch("codex_master.server.require_managed_tmux_session"):
             result = dismiss_codex_update_prompt(
                 "a",
                 "Update available! 0.144.4 -> 0.144.5\n› 1. Update now\n2. Skip\nPress enter to continue\n",
@@ -8413,7 +8462,10 @@ class ServerHelpersTest(unittest.TestCase):
 
     @patch("codex_master.server.run_tmux")
     @patch("codex_master.server.pane_tail")
-    def test_wait_agent_input_ready_skips_known_update_prompt(self, mock_pane_tail, mock_run_tmux) -> None:
+    @patch("codex_master.server.require_managed_tmux_session")
+    def test_wait_agent_input_ready_skips_known_update_prompt(
+        self, _mock_identity, mock_pane_tail, mock_run_tmux
+    ) -> None:
         mock_pane_tail.side_effect = [
             "Update available! 0.144.4 -> 0.144.5\n› 1. Update now\n2. Skip\nPress enter to continue\n",
             "› Ready\n",
@@ -8430,8 +8482,9 @@ class ServerHelpersTest(unittest.TestCase):
     @patch("codex_master.server.time.monotonic", side_effect=[0.0, 0.0, 0.0])
     @patch("codex_master.server.run_tmux")
     @patch("codex_master.server.pane_tail")
+    @patch("codex_master.server.require_managed_tmux_session")
     def test_wait_agent_input_ready_handles_update_prompt_after_empty_poll(
-        self, mock_pane_tail, mock_run_tmux, _mock_monotonic, _mock_sleep
+        self, _mock_identity, mock_pane_tail, mock_run_tmux, _mock_monotonic, _mock_sleep
     ) -> None:
         mock_pane_tail.side_effect = [
             "",
