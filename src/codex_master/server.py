@@ -1705,6 +1705,9 @@ _LIFECYCLE_LOCK_STACK: contextvars.ContextVar[tuple[str, ...]] = contextvars.Con
 _PLUGIN_CACHE_LOCK_HELD: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "codex_master_plugin_cache_lock_held", default=False
 )
+_POOL_ROOT_LOCK_STACK: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "codex_master_pool_root_lock_stack", default=()
+)
 
 
 @contextlib.contextmanager
@@ -9912,24 +9915,19 @@ def pool_root_operation(
             os.close(parent_fd)
 
 
-def agent_pool_install(
-    spec: str | None = None,
-    target_dir: str | None = None,
-    codex_bin: str | None = None,
+def _agent_pool_install_unlocked(
+    normalized: dict[str, Any],
     *,
     copy_auth_from: str | None = None,
     copy_auth_to: str | None = None,
     yes: bool = False,
     overwrite_auth: bool = False,
 ) -> dict[str, Any]:
-    normalized = pool_normalize_spec(spec, target_dir=target_dir, codex_bin=codex_bin)
     if copy_auth_from or copy_auth_to:
         if not copy_auth_from or not copy_auth_to:
             raise AgentError("copy_auth_from and copy_auth_to must be provided together")
-        agent_pool_copy_auth(
-            spec,
-            target_dir,
-            codex_bin,
+        _agent_pool_copy_auth_unlocked(
+            normalized,
             from_agent=copy_auth_from,
             to=copy_auth_to,
             yes=False,
@@ -10007,10 +10005,8 @@ def agent_pool_install(
 
         auth_result: dict[str, Any] | None = None
         if copy_auth_from or copy_auth_to:
-            auth_result = agent_pool_copy_auth(
-                spec,
-                str(root),
-                codex_bin,
+            auth_result = _agent_pool_copy_auth_unlocked(
+                normalized,
                 from_agent=copy_auth_from,
                 to=copy_auth_to,
                 yes=yes,
@@ -10033,17 +10029,35 @@ def agent_pool_install(
         }
 
 
-def agent_pool_copy_auth(
+def agent_pool_install(
     spec: str | None = None,
     target_dir: str | None = None,
     codex_bin: str | None = None,
+    *,
+    copy_auth_from: str | None = None,
+    copy_auth_to: str | None = None,
+    yes: bool = False,
+    overwrite_auth: bool = False,
+) -> dict[str, Any]:
+    normalized = pool_normalize_spec(spec, target_dir=target_dir, codex_bin=codex_bin)
+    with pool_root_lock(normalized["pool_root"]):
+        return _agent_pool_install_unlocked(
+            normalized,
+            copy_auth_from=copy_auth_from,
+            copy_auth_to=copy_auth_to,
+            yes=yes,
+            overwrite_auth=overwrite_auth,
+        )
+
+
+def _agent_pool_copy_auth_unlocked(
+    normalized: dict[str, Any],
     *,
     from_agent: str,
     to: str,
     yes: bool = False,
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    normalized = pool_normalize_spec(spec, target_dir=target_dir, codex_bin=codex_bin)
     if not isinstance(from_agent, str):
         raise AgentError("from_agent must be a concrete pool Agentin id")
     from_agent = from_agent.strip().lower()
@@ -10111,24 +10125,43 @@ def agent_pool_copy_auth(
         }
 
 
+def agent_pool_copy_auth(
+    spec: str | None = None,
+    target_dir: str | None = None,
+    codex_bin: str | None = None,
+    *,
+    from_agent: str,
+    to: str,
+    yes: bool = False,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    normalized = pool_normalize_spec(spec, target_dir=target_dir, codex_bin=codex_bin)
+    with pool_root_lock(normalized["pool_root"]):
+        return _agent_pool_copy_auth_unlocked(
+            normalized,
+            from_agent=from_agent,
+            to=to,
+            yes=yes,
+            overwrite=overwrite,
+        )
+
+
 @contextlib.contextmanager
 def pool_agent_lifecycle_locks(agents: list[str]) -> Any:
     with contextlib.ExitStack() as stack:
         for agent in sorted(agents):
-            stack.enter_context(agent_lifecycle_lock(agent))
+            if agent in AGENTS:
+                stack.enter_context(agent_lifecycle_lock(agent))
         yield
 
 
-def agent_pool_destroy_pool(
-    spec: str | None = None,
-    target_dir: str | None = None,
-    codex_bin: str | None = None,
+def _agent_pool_destroy_pool_unlocked(
+    normalized: dict[str, Any],
     *,
     yes: bool = False,
     force: bool = False,
     remove_root: bool = False,
 ) -> dict[str, Any]:
-    normalized = pool_normalize_spec(spec, target_dir=target_dir, codex_bin=codex_bin)
     root = normalized["pool_root"]
     pool_guard_root(root)
     if not yes:
@@ -10191,9 +10224,10 @@ def agent_pool_destroy_pool(
             raise AgentError("destroy_pool requires an installed pool marker or force=true")
         with pool_agent_lifecycle_locks(normalized["ids"]):
             for agent in normalized["ids"]:
-                lease = agent_lease_status(agent, initialize_state=False)
-                if lease.get("state") not in {"unclaimed", "expired"}:
-                    raise AgentError("pool Agentin has an active or unreadable lease")
+                if agent in AGENTS:
+                    lease = agent_lease_status(agent, initialize_state=False)
+                    if lease.get("state") not in {"unclaimed", "expired"}:
+                        raise AgentError("pool Agentin has an active or unreadable lease")
                 target = operation_root / agent
                 try:
                     target_stat = target.lstat()
@@ -10271,6 +10305,25 @@ def agent_pool_destroy_pool(
         "root_removed": root_removed,
         "raw_output": "not_returned",
     }
+
+
+def agent_pool_destroy_pool(
+    spec: str | None = None,
+    target_dir: str | None = None,
+    codex_bin: str | None = None,
+    *,
+    yes: bool = False,
+    force: bool = False,
+    remove_root: bool = False,
+) -> dict[str, Any]:
+    normalized = pool_normalize_spec(spec, target_dir=target_dir, codex_bin=codex_bin)
+    with pool_root_lock(normalized["pool_root"]):
+        return _agent_pool_destroy_pool_unlocked(
+            normalized,
+            yes=yes,
+            force=force,
+            remove_root=remove_root,
+        )
 
 
 TOOLS: list[dict[str, Any]] = [

@@ -12366,6 +12366,33 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn("SECRET_COPY_TARGET", payload)
             self.assertNotIn(str(pool), payload)
 
+    def test_agent_pool_destroy_supports_custom_pool_ids(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec_payload(
+                tmp,
+                {
+                    "schema_version": 1,
+                    "pool_root": str(pool),
+                    "codex_bin": "/bin/echo",
+                    "series": [{"prefix": "secretpool", "count": 1, "template": "secretpool1", "authenticated": []}],
+                    "shared_assets": [],
+                    "runtime_dirs": [],
+                },
+            )
+
+            installed = server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+            destroyed = server_module.agent_pool_destroy_pool(
+                str(spec_path), target_dir=str(pool), codex_bin="/bin/echo", yes=True
+            )
+
+        self.assertTrue(installed["ok"])
+        self.assertTrue(destroyed["ok"])
+        self.assertEqual(destroyed["removed_agent_entries"], 1)
+
     def test_agent_pool_copy_auth_does_not_echo_custom_source_agent(self) -> None:
         from codex_master import server as server_module
 
@@ -13219,6 +13246,91 @@ class AgentPoolManagementTest(unittest.TestCase):
 
             self.assertTrue((backup / "sentinel").is_file())
             self.assertFalse((replacement / "sentinel").exists())
+
+    def test_agent_pool_destroy_waits_for_concurrent_install(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            spec_path = self._write_spec_payload(
+                tmp,
+                {
+                    "schema_version": 1,
+                    "pool_root": str(pool),
+                    "codex_bin": "/bin/echo",
+                    "series": [{"prefix": "a", "count": 1, "template": "a1", "authenticated": []}],
+                    "shared_assets": [],
+                    "runtime_dirs": [],
+                },
+            )
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+
+            real_ensure = server_module.ensure_private_dir
+            install_paused = threading.Event()
+            release_install = threading.Event()
+            destroy_started = threading.Event()
+            destroy_finished = threading.Event()
+            install_result: dict[str, Any] = {}
+            destroy_result: dict[str, Any] = {}
+            errors: dict[str, BaseException] = {}
+            paused = False
+
+            def pause_install_home(path: Path) -> None:
+                nonlocal paused
+                real_ensure(path)
+                if path.name == "a1" and not paused:
+                    paused = True
+                    install_paused.set()
+                    if not release_install.wait(5):
+                        raise AssertionError("pool install did not get released")
+
+            def run_install() -> None:
+                try:
+                    install_result.update(
+                        server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+                    )
+                except BaseException as exc:
+                    errors["install"] = exc
+
+            def run_destroy() -> None:
+                destroy_started.set()
+                try:
+                    destroy_result.update(
+                        server_module.agent_pool_destroy_pool(
+                            str(spec_path), target_dir=str(pool), codex_bin="/bin/echo", yes=True
+                        )
+                    )
+                except BaseException as exc:
+                    errors["destroy"] = exc
+                finally:
+                    destroy_finished.set()
+
+            state = tmp / "state"
+            with patch.object(server_module, "ensure_private_dir", side_effect=pause_install_home), patch(
+                "codex_master.server.STATE_ROOT", state
+            ), patch("codex_master.server.LOCK_DIR", state / "locks"), patch(
+                "codex_master.server.LEASE_DIR", state / "leases"
+            ):
+                installer = threading.Thread(target=run_install)
+                destroyer = threading.Thread(target=run_destroy)
+                installer.start()
+                self.assertTrue(install_paused.wait(5))
+                destroyer.start()
+                self.assertTrue(destroy_started.wait(5))
+                self.assertFalse(destroy_finished.wait(0.2))
+                release_install.set()
+                installer.join(5)
+                destroyer.join(5)
+
+            self.assertFalse(installer.is_alive())
+            self.assertFalse(destroyer.is_alive())
+            self.assertEqual(errors, {})
+            self.assertTrue(install_result["ok"])
+            self.assertTrue(destroy_result["ok"])
+            self.assertEqual(destroy_result["removed_agent_entries"], 1)
+            self.assertFalse((pool / "a1").exists())
+            self.assertFalse((pool / server_module.POOL_MARKER_FILE).exists())
 
     def test_remove_agent_pool_entry_rejects_directory_swap_before_rmtree(self) -> None:
         from codex_master import server as server_module
