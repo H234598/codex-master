@@ -3381,7 +3381,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.52")
+        self.assertEqual(result["expected_tag"], "v0.9.53")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -4650,7 +4650,7 @@ class ServerHelpersTest(unittest.TestCase):
     @patch("codex_master.server.safe_tail")
     @patch("codex_master.server.status_agent")
     @patch("codex_master.server.list_assignments")
-    def test_assignment_report_prefers_log_source_for_recent_running_output_without_ready_input(
+    def test_assignment_report_remains_pending_for_recent_running_output_without_ready_input(
         self, mock_list_assignments, mock_status_agent, mock_safe_tail, mock_pane_tail
     ) -> None:
         mock_list_assignments.return_value = {
@@ -4674,30 +4674,16 @@ class ServerHelpersTest(unittest.TestCase):
             "lease": {"state": "held", "held_by_this_server": True, "lease_id": "f" * 32},
         }
         mock_pane_tail.return_value = "MCP startup incomplete\nReport generated\n"
-        mock_safe_tail.return_value = {
-            "source": "log",
-            "lines_limit": 3,
-            "chars_limit": 100,
-            "redaction_applied": False,
-            "output_chars": 13,
-            "output_lines": 1,
-            "output_truncated": False,
-            "output_truncated_by_lines": False,
-            "output_truncated_by_chars": False,
-            "output": "log excerpt",
-            "lease": {"state": "held", "held_by_this_server": True, "lease_id": "f" * 32},
-        }
 
         result = assignment_report("a", "assign-1-a1", lines=3, chars=100, source="pane")
 
-        self.assertEqual(result["report_status"], "excerpt_available")
+        self.assertEqual(result["report_status"], "pending")
         self.assertEqual(result["assignment_id"], "assign-1-a1")
-        self.assertEqual(result["output"], "log excerpt")
-        self.assertEqual(result["source"], "log")
+        self.assertEqual(result["output"], "")
         mock_list_assignments.assert_called_once_with("a1", MAX_ASSIGNMENT_RECORDS)
         mock_status_agent.assert_called_once_with("a1", initialize_state=False)
         mock_pane_tail.assert_called_once_with("a1", 24, visible_only=True, verify_identity=True)
-        mock_safe_tail.assert_called_once_with("a1", 3, 100, "log")
+        mock_safe_tail.assert_not_called()
 
     @patch("codex_master.server.safe_tail")
     @patch("codex_master.server.status_agent")
@@ -16324,6 +16310,14 @@ class CliLifecycleTest(unittest.TestCase):
 
 
 class AgentPoolManagementTest(unittest.TestCase):
+    def setUp(self) -> None:
+        lease_status = patch(
+            "codex_master.server.agent_lease_status",
+            return_value={"state": "unclaimed"},
+        )
+        lease_status.start()
+        self.addCleanup(lease_status.stop)
+
     def _write_spec(self, root: Path, pool: Path) -> Path:
         spec = {
             "schema_version": 1,

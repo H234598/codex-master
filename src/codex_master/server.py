@@ -7326,12 +7326,6 @@ def assignment_report(
                 and not is_active_pane_work
             ):
                 source = "log"
-        elif (
-            has_fresh_output
-            and response_state in {"running_recent_output", "running_idle"}
-            and not is_active_pane_work
-        ):
-            source = "log"
         else:
             return {
                 **base_result,
