@@ -3600,11 +3600,13 @@ def agent_home_process_summary(agent: str, proc_root: Path = Path("/proc")) -> d
             "process_count": None,
             "external_process_count": None,
             "managed_process_count": None,
+            "managed_process_ids": [],
             "external_processes": [],
             "external_processes_truncated": False,
             "raw_output": "not_returned",
         }
     external = [item for item in processes if not item["managed_by_masterjet"]]
+    managed_process_ids = [item["pid"] for item in processes if item["managed_by_masterjet"]]
     return {
         "agent": agent,
         "home": PATH_NOT_RETURNED,
@@ -3612,6 +3614,7 @@ def agent_home_process_summary(agent: str, proc_root: Path = Path("/proc")) -> d
         "process_count": len(processes),
         "external_process_count": len(external),
         "managed_process_count": len(processes) - len(external),
+        "managed_process_ids": managed_process_ids,
         "external_processes": external[:10],
         "external_processes_truncated": len(external) > 10,
         "raw_output": "not_returned",
@@ -3696,7 +3699,12 @@ def pool_home_processes(home: Path, proc_root: Path = Path("/proc")) -> list[dic
     return sorted(processes, key=lambda item: item["pid"])
 
 
-def agent_identity_guard(running: bool, process_summary: dict[str, Any]) -> dict[str, Any]:
+def agent_identity_guard(
+    running: bool,
+    process_summary: dict[str, Any],
+    *,
+    pane_process_id: int | None = None,
+) -> dict[str, Any]:
     process_count = process_summary.get("process_count")
     external_process_count = process_summary.get("external_process_count")
     managed_process_count = process_summary.get("managed_process_count")
@@ -3704,8 +3712,27 @@ def agent_identity_guard(running: bool, process_summary: dict[str, Any]) -> dict
         isinstance(value, int) and not isinstance(value, bool)
         for value in (process_count, external_process_count, managed_process_count)
     )
+    managed_process_ids = process_summary.get("managed_process_ids")
+    pane_process_identity_checked = running and "managed_process_ids" in process_summary
+    pane_process_identity_match: bool | None = None
+    if pane_process_identity_checked:
+        pane_process_identity_match = (
+            isinstance(managed_process_ids, list)
+            and all(isinstance(pid, int) and not isinstance(pid, bool) for pid in managed_process_ids)
+            and isinstance(pane_process_id, int)
+            and not isinstance(pane_process_id, bool)
+            and pane_process_id in managed_process_ids
+        )
     if not counts_available:
         state = "blocked_process_scan_unavailable"
+        ok = False
+    elif (
+        running
+        and managed_process_count == 1
+        and pane_process_identity_checked
+        and not pane_process_identity_match
+    ):
+        state = "blocked_tmux_session_identity_mismatch"
         ok = False
     elif external_process_count > 0:
         state = "blocked_external_home_user"
@@ -3733,6 +3760,8 @@ def agent_identity_guard(running: bool, process_summary: dict[str, Any]) -> dict
         "home_process_count": process_count,
         "home_managed_process_count": managed_process_count,
         "home_external_process_count": external_process_count,
+        "pane_process_identity_checked": pane_process_identity_checked,
+        "pane_process_identity_match": pane_process_identity_match,
         "raw_output": "not_returned",
     }
 
@@ -3740,7 +3769,12 @@ def agent_identity_guard(running: bool, process_summary: dict[str, Any]) -> dict
 def require_managed_tmux_session(agent: str, process_summary: dict[str, Any] | None = None) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     summary = process_summary if process_summary is not None else agent_home_process_summary(agent)
-    guard = agent_identity_guard(True, summary)
+    pane_process_id = (
+        pane_pid(AGENTS[agent]["session"])
+        if "managed_process_ids" in summary
+        else None
+    )
+    guard = agent_identity_guard(True, summary, pane_process_id=pane_process_id)
     if guard["ok"]:
         return guard
     if guard["state"] == "blocked_process_scan_unavailable":
@@ -3751,6 +3785,8 @@ def require_managed_tmux_session(agent: str, process_summary: dict[str, Any] | N
         raise AgentError(
             f"agent {agent} has multiple managed CODEX_HOME processes; stop orphaned processes before using tmux session"
         )
+    if guard["state"] == "blocked_tmux_session_identity_mismatch":
+        raise AgentError(f"agent {agent} tmux session process identity could not be verified")
     raise AgentError(
         f"agent {agent} tmux session identity could not be verified; no managed CODEX_HOME process was detected"
     )
@@ -4860,7 +4896,8 @@ def status_agent(agent: str) -> dict[str, Any]:
     raw_log_path = raw_log_identity[0] if raw_log_identity is not None else None
     process_summary = agent_home_process_summary(agent)
     running = tmux_alive(session)
-    identity_guard = agent_identity_guard(running, process_summary)
+    session_pid = pane_pid(session) if running and "managed_process_ids" in process_summary else None
+    identity_guard = agent_identity_guard(running, process_summary, pane_process_id=session_pid)
     if running and identity_guard["ok"] and (raw_log_identity is None or raw_log_identity[1] is None):
         recovered_path = latest_managed_raw_log(
             agent,
@@ -4900,7 +4937,7 @@ def status_agent(agent: str) -> dict[str, Any]:
         "backend": "tmux",
         "running": running,
         "session": session,
-        "pid": pane_pid(session) if pane_is_managed else None,
+        "pid": session_pid if pane_is_managed else None,
         "home": PATH_NOT_RETURNED,
         "home_kind": "managed_agent_home",
         "runner": PATH_NOT_RETURNED,
@@ -5650,7 +5687,16 @@ def _usage_watchdog_agent_unlocked(agent: str, *, dry_run: bool) -> dict[str, An
         "response_output": "not_returned",
     }
     if running:
-        identity_guard = agent_identity_guard(True, agent_home_process_summary(agent))
+        process_summary = agent_home_process_summary(agent)
+        identity_guard = agent_identity_guard(
+            True,
+            process_summary,
+            pane_process_id=(
+                pane_pid(session)
+                if "managed_process_ids" in process_summary
+                else None
+            ),
+        )
         if not identity_guard["ok"]:
             base["identity_guard"] = identity_guard
             base["usage_watchdog"] = codex_usage_watchdog_status(
@@ -8858,7 +8904,15 @@ def doctor() -> dict[str, Any]:
     for agent, cfg in AGENTS.items():
         process_summary = agent_home_process_summary(agent)
         running = tmux_alive(cfg["session"])
-        identity_guard = agent_identity_guard(running, process_summary)
+        identity_guard = agent_identity_guard(
+            running,
+            process_summary,
+            pane_process_id=(
+                pane_pid(cfg["session"])
+                if running and "managed_process_ids" in process_summary
+                else None
+            ),
+        )
         checks.extend(
             [
                 {
