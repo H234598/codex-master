@@ -5946,6 +5946,19 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(lease["seconds_remaining"], 0)
         self.assertIsNone(lease["expires_at_utc"])
 
+    def test_public_agent_lease_does_not_expose_boolean_ttl_as_integer(self) -> None:
+        lease = public_agent_lease(
+            "a",
+            {
+                "agent": "a1",
+                "owner": "other-server",
+                "expires_at_epoch": 4102444800,
+                "ttl_seconds": True,
+            },
+        )
+
+        self.assertIsNone(lease["ttl_seconds"])
+
     def test_agent_lease_rejects_malformed_identity_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

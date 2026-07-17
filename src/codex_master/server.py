@@ -1726,6 +1726,7 @@ def public_agent_lease(agent: str, record: dict[str, Any] | None = None) -> dict
     if not math.isfinite(expires_at):
         expires_at = 0.0
         valid_expiry = False
+    ttl_seconds = record.get("ttl_seconds")
     active = expires_at > now
     held_by_this_server = active and record.get("owner") == SERVER_INSTANCE_ID
     holder = "this_server" if held_by_this_server else "other_server" if active else "none"
@@ -1736,7 +1737,7 @@ def public_agent_lease(agent: str, record: dict[str, Any] | None = None) -> dict
         "held_by_this_server": held_by_this_server,
         "expires_at_utc": lease_utc(expires_at) if valid_expiry else None,
         "seconds_remaining": max(0, int(expires_at - now)) if active else 0,
-        "ttl_seconds": record.get("ttl_seconds") if isinstance(record.get("ttl_seconds"), int) else None,
+        "ttl_seconds": ttl_seconds if isinstance(ttl_seconds, int) and not isinstance(ttl_seconds, bool) else None,
         "raw_output": "not_returned",
     }
 
