@@ -9137,13 +9137,19 @@ def _install_unlocked(
         if install_path.is_symlink() and resolved_install_path == wrapper:
             symlink_status = "already_installed"
         elif force:
-            replace_install_symlink(install_path, wrapper, expected_parent_stat=expected_parent_stat)
             symlink_status = "replaced"
         else:
             raise AgentError("install path exists and is not this wrapper symlink")
     else:
-        replace_install_symlink(install_path, wrapper, expected_parent_stat=expected_parent_stat)
         symlink_status = "created"
+
+    plugin_cache_install = (
+        sync_plugin_cache_from_repo()
+        if sync_plugin_cache
+        else {"requested": False, "status": "skipped", "raw_output": "not_returned"}
+    )
+    if symlink_status != "already_installed":
+        replace_install_symlink(install_path, wrapper, expected_parent_stat=expected_parent_stat)
 
     registration: dict[str, Any] = {"requested": register, "status": "skipped"}
     if register:
@@ -9180,12 +9186,6 @@ def _install_unlocked(
                     "raw_output": "not_returned",
                 }
         registration["startup_timeout"] = startup_timeout_config
-    plugin_cache_install = (
-        sync_plugin_cache_from_repo()
-        if sync_plugin_cache
-        else {"requested": False, "status": "skipped", "raw_output": "not_returned"}
-    )
-
     return {
         "ok": True,
         "install_path": PATH_NOT_RETURNED,

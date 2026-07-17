@@ -13745,6 +13745,29 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertNotIn(str(tmp_path), error_text)
         self.assertNotIn("SECRET_OUTPUT_SHOULD_NOT_RETURN", error_text)
 
+    def test_install_cache_failure_preserves_existing_install_link(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            previous_target = tmp_path / "previous-target"
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            previous_target.write_text("previous\n", encoding="utf-8")
+            install_link.parent.mkdir()
+            install_link.symlink_to(previous_target)
+
+            with patch("codex_master.server.repo_wrapper_path", return_value=wrapper), patch(
+                "codex_master.server.sync_plugin_cache_from_repo",
+                side_effect=AgentError("injected cache failure"),
+            ):
+                with self.assertRaisesRegex(AgentError, "injected cache failure"):
+                    install(register=False, force=True, install_path=install_link)
+
+            resolved = install_link.resolve(strict=False)
+
+        self.assertEqual(resolved, previous_target)
+
     @patch("codex_master.server.run_command")
     @patch("codex_master.server.check_mcp_registration")
     @patch("codex_master.server.mcp_command_startup_self_test")
