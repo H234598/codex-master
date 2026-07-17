@@ -11995,6 +11995,25 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(mock_model.call_args.kwargs["release_lease_on_failure"])
         mock_release.assert_not_called()
 
+    def test_run_with_agent_lease_keeps_fresh_lease_when_home_process_remains(self) -> None:
+        lease = {"state": "held", "held_by_this_server": True}
+        from codex_master import server as server_module
+
+        def fail(_lease: dict[str, Any]) -> dict[str, Any]:
+            raise AgentError("send failed after paste")
+
+        with patch("codex_master.server.claim_for_agent_mutation", return_value=(lease, True)), patch(
+            "codex_master.server.agent_lease_status",
+            return_value={"held_by_this_server": True},
+        ), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={"process_count": 1},
+        ), patch("codex_master.server.release_agent") as mock_release:
+            with self.assertRaisesRegex(AgentError, "send failed after paste"):
+                server_module.run_with_agent_lease("a", fail)
+
+        mock_release.assert_not_called()
+
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.send_agent")
     def test_agent_assign_live_data_requires_search_without_returning_prompt(self, mock_send_agent, _mock_alive) -> None:

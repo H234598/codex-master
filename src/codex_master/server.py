@@ -4202,7 +4202,7 @@ def run_with_agent_lease(agent: str, fn: Any) -> dict[str, Any]:
         return fn(lease)
     except Exception:
         if release_on_failure:
-            release_agent(agent, force=True)
+            release_start_lease_if_safe(agent, lease, True)
         raise
 
 
