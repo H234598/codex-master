@@ -4345,9 +4345,9 @@ def raw_log_metadata(
     }
 
 
-def latest_assignment_summary(agent: str) -> dict[str, Any] | None:
+def latest_assignment_summary(agent: str, *, initialize_state: bool = True) -> dict[str, Any] | None:
     try:
-        result = list_assignments(agent, 1)
+        result = list_assignments(agent, 1, initialize_state=initialize_state)
     except AgentError:
         return None
     records = result.get("records")
@@ -4943,9 +4943,10 @@ def wait_agent(agent: str, timeout_seconds: int = DEFAULT_WAIT_SECONDS, poll_int
     }
 
 
-def status_agent(agent: str) -> dict[str, Any]:
+def status_agent(agent: str, *, initialize_state: bool = True) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
-    ensure_state()
+    if initialize_state:
+        ensure_state()
     cfg = AGENTS[agent]
     session = cfg["session"]
     meta = read_meta(agent)
@@ -4970,7 +4971,7 @@ def status_agent(agent: str) -> dict[str, Any]:
         raw_log_path = recovered_identity[0] if recovered_identity is not None else None
     raw_log_expected_stat = raw_log_identity[1] if raw_log_identity is not None else None
     raw_log_info = raw_log_metadata(raw_log_path, expected_stat=raw_log_expected_stat)
-    latest_assignment = latest_assignment_summary(agent)
+    latest_assignment = latest_assignment_summary(agent, initialize_state=initialize_state)
     auth = agent_auth_status(agent)
     pane_is_managed = running and identity_guard["ok"]
     pane_text = pane_tail(agent, MAX_TAIL_LINES, verify_identity=True) if pane_is_managed else ""
@@ -4985,7 +4986,7 @@ def status_agent(agent: str) -> dict[str, Any]:
         latest_assignment=latest_assignment,
         pane_text=pane_text,
     )
-    usage_watchdog = codex_usage_watchdog_status(agent)
+    usage_watchdog = codex_usage_watchdog_status(agent, include_assignment_history=initialize_state)
     response_state = agent_response_state(running, limit_state, raw_log_info, tui_context)
     if running and not identity_guard["ok"]:
         response_state = {**response_state, "state": "identity_unverified"}
@@ -5005,7 +5006,7 @@ def status_agent(agent: str) -> dict[str, Any]:
         "cwd_state": public_path_state(meta.get("cwd")),
         "model": meta.get("model") or DEFAULT_AGENT_MODEL,
         "model_reasoning_effort": meta.get("model_reasoning_effort") or DEFAULT_AGENT_MODEL_EFFORT,
-        "lease": agent_lease_status(agent),
+        "lease": agent_lease_status(agent, initialize_state=initialize_state),
         "last_assignment": latest_assignment,
         "tui_context": tui_context,
         "limit_state": limit_state,
@@ -5481,7 +5482,7 @@ def _watchdog_agent_unlocked(
     dry_run: bool,
 ) -> dict[str, Any]:
     now = time.time()
-    status = status_agent(agent)
+    status = status_agent(agent, initialize_state=not dry_run)
     lease = status.get("lease") if isinstance(status.get("lease"), dict) else {}
     response_state = (status.get("response_state") or {}).get("state")
     latest_assignment = status.get("last_assignment") if isinstance(status.get("last_assignment"), dict) else {}
@@ -6743,22 +6744,38 @@ def _prune_assignment_log(
     replace_private_text(ASSIGNMENT_LOG, text)
 
 
-def list_assignments(agent: str = "all", limit: int = 20, *, strict_routing: bool = False) -> dict[str, Any]:
-    ensure_state()
+def list_assignments(
+    agent: str = "all",
+    limit: int = 20,
+    *,
+    strict_routing: bool = False,
+    initialize_state: bool = True,
+) -> dict[str, Any]:
+    if initialize_state:
+        ensure_state()
     selected = agent_ids(agent)
     selected_records = set(selected)
     for selected_agent in selected:
         selected_records.update(agent_record_aliases(selected_agent))
     limit = normalize_int_field(limit, field="limit", minimum=1, maximum=MAX_ASSIGNMENT_RECORDS)
     records: list[dict[str, Any]] = []
-    with assignment_log_lock():
+    if not initialize_state:
         lines = (
             read_private_regular_text(
                 ASSIGNMENT_LOG, MAX_ASSIGNMENT_LOG_BYTES, "could_not_read_assignment_log"
             ).splitlines()
-            if ASSIGNMENT_LOG.exists()
+            if path_present_no_follow(ASSIGNMENT_LOG)
             else []
         )
+    else:
+        with assignment_log_lock():
+            lines = (
+                read_private_regular_text(
+                    ASSIGNMENT_LOG, MAX_ASSIGNMENT_LOG_BYTES, "could_not_read_assignment_log"
+                ).splitlines()
+                if ASSIGNMENT_LOG.exists()
+                else []
+            )
     for line in lines:
         if not line.strip():
             continue

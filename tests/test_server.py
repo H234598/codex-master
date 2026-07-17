@@ -5294,6 +5294,72 @@ class ServerHelpersTest(unittest.TestCase):
         )
         lifecycle.assert_not_called()
 
+    def test_fleet_watchdog_dry_run_does_not_initialize_state(self) -> None:
+        from codex_master import server as server_module
+
+        status = {
+            "agent": "a1",
+            "running": False,
+            "lease": {"state": "unclaimed", "held_by_this_server": False},
+            "response_state": {"state": "not_running"},
+            "last_assignment": None,
+        }
+        with patch("codex_master.server.status_agent", return_value=status) as mock_status, patch(
+            "codex_master.server.ensure_state"
+        ) as ensure_state:
+            result = server_module._watchdog_agent_unlocked(
+                "a1",
+                idle_seconds=DEFAULT_WATCHDOG_IDLE_SECONDS,
+                action="interrupt",
+                report_grace_seconds=DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS,
+                require_lease=True,
+                manage_unclaimed=False,
+                dry_run=True,
+            )
+
+        self.assertEqual(result["watchdog_state"], "skipped_not_running")
+        mock_status.assert_called_once_with("a1", initialize_state=False)
+        ensure_state.assert_not_called()
+
+    def test_status_read_only_does_not_create_state(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state_root = root / "state"
+            agent = {
+                "label": "A1",
+                "runner": root / "codex",
+                "home": root / "home",
+                "session": "session-a1",
+            }
+            summary = {
+                "process_count": 0,
+                "managed_process_count": 0,
+                "external_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            }
+            with patch.dict(server_module.AGENTS, {"a1": agent}, clear=True), patch.object(
+                server_module, "STATE_ROOT", state_root
+            ), patch.object(server_module, "RAW_DIR", state_root / "raw"), patch.object(
+                server_module, "META_DIR", state_root / "meta"
+            ), patch.object(server_module, "LOCK_DIR", state_root / "locks"), patch.object(
+                server_module, "LEASE_DIR", state_root / "leases"
+            ), patch.object(
+                server_module, "ASSIGNMENT_LOG", state_root / "assignments.jsonl"
+            ), patch.object(server_module, "ensure_state") as ensure_state, patch.object(
+                server_module, "agent_home_process_summary", return_value=summary
+            ), patch.object(server_module, "tmux_alive", return_value=False), patch.object(
+                server_module, "agent_auth_status", return_value={}
+            ), patch.object(server_module, "codex_usage_watchdog_status", return_value={}):
+                result = server_module.status_agent("a1", initialize_state=False)
+
+            self.assertEqual(result["agent"], "a1")
+            ensure_state.assert_not_called()
+            self.assertFalse(state_root.exists())
+
     def test_fleet_watchdog_escalates_when_report_input_is_not_ready(self) -> None:
         status = {
             "agent": "a",
