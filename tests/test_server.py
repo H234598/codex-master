@@ -7987,6 +7987,32 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(summary["external_processes"][0]["raw_output"], "not_returned")
         self.assertNotIn(str(home), json.dumps(summary, sort_keys=True))
 
+    def test_agent_home_process_summary_rejects_spoofed_managed_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home = root / "agent-home"
+            home.mkdir()
+            proc_root = root / "proc"
+            process = proc_root / "100"
+            process.mkdir(parents=True)
+            process.joinpath("environ").write_bytes(
+                f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0".encode("utf-8")
+            )
+            process.joinpath("status").write_text(
+                "Name:\tpython3\nState:\tS (sleeping)\nPPid:\t1\n", encoding="utf-8"
+            )
+            process.joinpath("cmdline").write_bytes(b"python3\0untrusted.py\0")
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                summary = agent_home_process_summary("a", proc_root)
+
+        self.assertEqual(summary["process_count"], 1)
+        self.assertEqual(summary["managed_process_count"], 0)
+        self.assertEqual(summary["external_process_count"], 1)
+
     def test_agent_home_process_summary_ignores_zombie_processes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir) / "agent-home"

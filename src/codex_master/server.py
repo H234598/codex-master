@@ -3391,6 +3391,18 @@ def read_proc_cmdline(pid_dir: Path) -> list[str]:
     return [item.decode("utf-8", errors="replace") for item in raw.split(b"\0") if item]
 
 
+def proc_is_codex_like(status: dict[str, str], argv: list[str]) -> bool:
+    name = (status.get("Name") or "").lower()
+    argv_names = {Path(item).name.lower() for item in argv if item}
+    joined = "\0".join(argv).lower()
+    return (
+        name == "codex"
+        or "codex" in argv_names
+        or "@openai/codex" in joined
+        or "node_modules/@openai/codex" in joined
+    )
+
+
 def resolve_proc_cwd(pid_dir: Path) -> tuple[Path | None, bool]:
     try:
         return (pid_dir / "cwd").resolve(strict=True), False
@@ -3447,17 +3459,8 @@ def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[di
         matches_home = False
         managed = False
         if env is None:
-            name = (status.get("Name") or "").lower()
             argv = read_proc_cmdline(pid_dir)
-            argv_names = {Path(item).name.lower() for item in argv if item}
-            joined = "\0".join(argv).lower()
-            codex_like = (
-                name == "codex"
-                or "codex" in argv_names
-                or "@openai/codex" in joined
-                or "node_modules/@openai/codex" in joined
-            )
-            if codex_like:
+            if proc_is_codex_like(status, argv):
                 return None
             current_dir, unavailable = resolve_proc_cwd(pid_dir)
             if not unavailable and current_dir is not None:
@@ -3489,7 +3492,9 @@ def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[di
                         matches_home = current_dir.resolve(strict=False) == home.expanduser().resolve(strict=False)
                     except (OSError, RuntimeError):
                         matches_home = False
-            managed = env.get("CODEX_AGENT_MCP") == "1" or env.get("CODEX_MASTER_MCP") == "1"
+            managed = (
+                env.get("CODEX_AGENT_MCP") == "1" or env.get("CODEX_MASTER_MCP") == "1"
+            ) and proc_is_codex_like(status, read_proc_cmdline(pid_dir))
         if not matches_home:
             continue
         ppid_parts = status.get("PPid", "0").split()
@@ -3564,17 +3569,8 @@ def pool_home_processes(home: Path, proc_root: Path = Path("/proc")) -> list[dic
         managed = False
         current_dir: Path | None = None
         if env is None:
-            name = (status.get("Name") or "").lower()
             argv = read_proc_cmdline(pid_dir)
-            argv_names = {Path(item).name.lower() for item in argv if item}
-            joined = "\0".join(argv).lower()
-            codex_like = (
-                name == "codex"
-                or "codex" in argv_names
-                or "@openai/codex" in joined
-                or "node_modules/@openai/codex" in joined
-            )
-            if codex_like:
+            if proc_is_codex_like(status, argv):
                 return None
         else:
             configured_home = env.get("CODEX_HOME", "")
@@ -3593,7 +3589,9 @@ def pool_home_processes(home: Path, proc_root: Path = Path("/proc")) -> list[dic
                     )
                 except (OSError, RuntimeError, ValueError):
                     matches_home = False
-            managed = env.get("CODEX_AGENT_MCP") == "1" or env.get("CODEX_MASTER_MCP") == "1"
+            managed = (
+                env.get("CODEX_AGENT_MCP") == "1" or env.get("CODEX_MASTER_MCP") == "1"
+            ) and proc_is_codex_like(status, read_proc_cmdline(pid_dir))
         if not matches_home:
             if current_dir is None:
                 current_dir, unavailable = resolve_proc_cwd(pid_dir)
