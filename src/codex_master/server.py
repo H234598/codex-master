@@ -1416,7 +1416,8 @@ def read_codex_usage_snapshot(account: str) -> dict[str, Any]:
         fd = os.open(path, flags)
         opened_stat = os.fstat(fd)
         if (
-            not stat_module.S_ISREG(opened_stat.st_mode)
+            not source_identity_matches(opened_stat, current_stat)
+            or not stat_module.S_ISREG(opened_stat.st_mode)
             or getattr(opened_stat, "st_nlink", 1) > 1
             or opened_stat.st_size > MAX_CODEX_USAGE_SNAPSHOT_BYTES
         ):

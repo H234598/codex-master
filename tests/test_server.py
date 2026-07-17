@@ -5275,6 +5275,38 @@ class ServerHelpersTest(unittest.TestCase):
                 with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
                     codex_usage_watchdog_status("a")
 
+    def test_read_codex_usage_snapshot_rejects_regular_file_swap_before_open(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snapshot_dir = root / "snapshots"
+            snapshot_dir.mkdir()
+            snapshot = snapshot_dir / "acct.json"
+            original = root / "original-snapshot.json"
+            replacement = root / "replacement-snapshot.json"
+            snapshot.write_text('{"status":"expected"}\n', encoding="utf-8")
+            replacement.write_text('{"status":"forged"}\n', encoding="utf-8")
+            real_open = server_module.os.open
+            swapped = False
+
+            def swap_before_snapshot_open(path, flags, *args, **kwargs):
+                nonlocal swapped
+                if not swapped and isinstance(path, (str, bytes, Path)) and Path(path) == snapshot:
+                    snapshot.rename(original)
+                    replacement.rename(snapshot)
+                    swapped = True
+                return real_open(path, flags, *args, **kwargs)
+
+            with patch.dict("os.environ", {"CODEX_USAGE_STATE_ROOT": tmpdir}, clear=False), patch.object(
+                server_module.os, "open", side_effect=swap_before_snapshot_open
+            ):
+                with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
+                    server_module.read_codex_usage_snapshot("acct")
+
+            self.assertTrue(swapped)
+            self.assertEqual(original.read_text(encoding="utf-8"), '{"status":"expected"}\n')
+
     def test_codex_usage_watchdog_rejects_symlinked_snapshot_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
