@@ -58,6 +58,7 @@ from codex_master.server import (
     AGENTS,
     agent_ids,
     allowed_raw_log_path,
+    latest_managed_raw_log,
     append_bounded_raw_log,
     agent_lifecycle_lock,
     agent_identity_guard,
@@ -2763,7 +2764,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.43")
+        self.assertEqual(result["expected_tag"], "v0.9.44")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -2879,6 +2880,68 @@ class ServerHelpersTest(unittest.TestCase):
             result = raw_log_metadata(Path(tmpdir) / "agent.log")
 
         self.assertEqual(result, {"bytes": 12, "updated_at_utc": None, "idle_seconds": None})
+
+    def test_latest_managed_raw_log_selects_newest_unambiguous_agent_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "raw"
+            raw_dir.mkdir()
+            older = raw_dir / "20260717T070000000000Z-a.log"
+            newer = raw_dir / "20260717T070001000000Z-a.log"
+            older.write_text("older\n", encoding="utf-8")
+            newer.write_text("newer\n", encoding="utf-8")
+            os.utime(older, (1000, 1000))
+            os.utime(newer, (1001, 1001))
+
+            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
+                "codex_master.server.LEGACY_STATE_ROOT", root / "legacy"
+            ):
+                result = latest_managed_raw_log("a")
+                self.assertEqual(result, newer)
+
+                os.utime(newer, (1000, 1000))
+                self.assertIsNone(latest_managed_raw_log("a"))
+
+    def test_agent_status_recovers_stale_raw_log_metadata_for_running_agent(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "raw"
+            raw_dir.mkdir()
+            current = raw_dir / "20260717T070001000000Z-a.log"
+            current.write_text("current\n", encoding="utf-8")
+            runner = root / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            agent = {"label": "A", "runner": runner, "home": root, "session": "session-a"}
+            summary = {
+                "process_count": 1,
+                "managed_process_count": 1,
+                "external_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            }
+            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
+                "codex_master.server.RAW_DIR", raw_dir
+            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "codex_master.server.ensure_state"
+            ), patch("codex_master.server.agent_home_process_summary", return_value=summary), patch(
+                "codex_master.server.tmux_alive", return_value=True
+            ), patch("codex_master.server.pane_pid", return_value=123), patch(
+                "codex_master.server.pane_tail", return_value=""
+            ), patch(
+                "codex_master.server.read_meta", return_value={"raw_log": "/tmp/managed-a.log"}
+            ), patch("codex_master.server.latest_assignment_summary", return_value=None), patch(
+                "codex_master.server.agent_auth_status", return_value={}
+            ), patch("codex_master.server.agent_lease_status", return_value={}), patch(
+                "codex_master.server.codex_usage_watchdog_status", return_value={}
+            ):
+                status = server_module.status_agent("a")
+
+        self.assertEqual(status["raw_log_bytes"], len("current\n"))
+        self.assertTrue(status["raw_log_path_valid"])
 
     def test_initialize_rejects_unsupported_protocol(self) -> None:
         response = handle_rpc(

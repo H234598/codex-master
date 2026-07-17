@@ -2796,6 +2796,35 @@ def allowed_raw_log_path(raw_log: Any) -> Path | None:
     return identity[0] if identity is not None else None
 
 
+def latest_managed_raw_log(agent: str) -> Path | None:
+    agent = canonical_agent_id(agent)
+    suffixes = tuple(f"-{alias}.log" for alias in agent_record_aliases(agent))
+    candidates: list[tuple[int, Path]] = []
+    for root in managed_raw_dirs():
+        if not is_real_directory_no_symlink(root):
+            continue
+        try:
+            entries = tuple(root.iterdir())
+        except OSError:
+            continue
+        for path in entries:
+            if not path.name.endswith(suffixes):
+                continue
+            identity = allowed_raw_log_identity(str(path))
+            if (
+                identity is None
+                or identity[1] is None
+                or not stat_module.S_ISREG(identity[1].st_mode)
+            ):
+                continue
+            candidates.append((identity[1].st_mtime_ns, identity[0]))
+    if not candidates:
+        return None
+    newest_mtime = max(item[0] for item in candidates)
+    newest = [path for mtime, path in candidates if mtime == newest_mtime]
+    return newest[0] if len(newest) == 1 else None
+
+
 def protected_raw_log_paths() -> set[Path]:
     protected: set[Path] = set()
     for agent in AGENTS:
@@ -4520,10 +4549,21 @@ def status_agent(agent: str) -> dict[str, Any]:
     session = cfg["session"]
     meta = read_meta(agent)
     raw_log = meta.get("raw_log")
-    raw_log_path = allowed_raw_log_path(raw_log)
+    raw_log_identity = allowed_raw_log_identity(raw_log)
+    raw_log_path = raw_log_identity[0] if raw_log_identity is not None else None
     process_summary = agent_home_process_summary(agent)
     running = tmux_alive(session)
     identity_guard = agent_identity_guard(running, process_summary)
+    if (
+        running
+        and identity_guard["ok"]
+        and isinstance(raw_log, str)
+        and raw_log.strip()
+        and (raw_log_identity is None or raw_log_identity[1] is None)
+    ):
+        recovered_raw_log_path = latest_managed_raw_log(agent)
+        if recovered_raw_log_path is not None:
+            raw_log_path = recovered_raw_log_path
     raw_log_info = raw_log_metadata(raw_log_path)
     latest_assignment = latest_assignment_summary(agent)
     auth = agent_auth_status(agent)
@@ -8862,7 +8902,15 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
         raw = pane_tail(agent, lines)
     else:
         raw_log = meta.get("raw_log")
-        raw_log_path = allowed_raw_log_path(raw_log)
+        raw_log_identity = allowed_raw_log_identity(raw_log)
+        raw_log_path = raw_log_identity[0] if raw_log_identity is not None else None
+        if (
+            tmux_alive(AGENTS[agent]["session"])
+            and isinstance(raw_log, str)
+            and raw_log.strip()
+            and (raw_log_path is None or raw_log_identity[1] is None)
+        ):
+            raw_log_path = latest_managed_raw_log(agent)
         if raw_log and raw_log_path is None:
             raise AgentError("raw_log path is outside managed raw log state")
         raw = read_log_tail(raw_log_path, chars * 4) if raw_log_path else ""
