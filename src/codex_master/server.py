@@ -2595,11 +2595,23 @@ def agent_auth_status(agent: str) -> dict[str, Any]:
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             fd = -1
+            parent_fd = -1
             try:
-                fd = os.open(auth_file, flags)
+                parent_stat = auth_file.parent.lstat()
+                parent_fd = open_directory_no_follow_matching(
+                    auth_file.parent,
+                    parent_stat,
+                    error_text="auth file changed unexpectedly",
+                    changed_text="auth file changed unexpectedly",
+                )
+                current_stat = os.stat(auth_file.name, dir_fd=parent_fd, follow_symlinks=False)
+                if not source_identity_matches(current_stat, auth_stat):
+                    raise OSError("auth file changed unexpectedly")
+                fd = os.open(auth_file.name, flags, dir_fd=parent_fd)
                 opened_stat = os.fstat(fd)
                 if (
-                    not source_identity_matches(opened_stat, auth_stat)
+                    not source_identity_matches(opened_stat, current_stat)
+                    or not source_identity_matches(opened_stat, auth_stat)
                     or not stat_module.S_ISREG(opened_stat.st_mode)
                     or getattr(opened_stat, "st_nlink", 1) > 1
                     or opened_stat.st_size > MAX_CODEX_CONFIG_BYTES
@@ -2633,12 +2645,14 @@ def agent_auth_status(agent: str) -> dict[str, Any]:
                         else:
                             state = "present_regular"
                             authenticated = True
-            except OSError:
+            except (AgentError, OSError):
                 state = "unreadable"
                 authenticated = False
             finally:
                 if fd >= 0:
                     os.close(fd)
+                if parent_fd >= 0:
+                    os.close(parent_fd)
     return {
         "authenticated": authenticated,
         "auth_state": state,
@@ -6856,7 +6870,12 @@ def installed_source_worktree_state(installed_target: Path | None, wrapper: Path
     return repo_worktree_safety()
 
 
-def open_real_directory_fd(path: Path, error_text: str) -> int:
+def open_real_directory_fd(
+    path: Path,
+    error_text: str,
+    *,
+    expected_stat: os.stat_result | None = None,
+) -> int:
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
@@ -6868,7 +6887,9 @@ def open_real_directory_fd(path: Path, error_text: str) -> int:
         raise AgentError(error_text) from exc
     try:
         current = os.fstat(fd)
-        if not stat_module.S_ISDIR(current.st_mode):
+        if not stat_module.S_ISDIR(current.st_mode) or (
+            expected_stat is not None and not source_identity_matches(current, expected_stat)
+        ):
             raise AgentError(error_text)
         return fd
     except Exception:
@@ -6876,12 +6897,21 @@ def open_real_directory_fd(path: Path, error_text: str) -> int:
         raise
 
 
-def replace_install_symlink(install_path: Path, wrapper: Path) -> None:
+def replace_install_symlink(
+    install_path: Path,
+    wrapper: Path,
+    *,
+    expected_parent_stat: os.stat_result | None = None,
+) -> None:
     tmp_name = f".{install_path.name}.tmp.{now_id()}.{uuid.uuid4().hex}"
     parent_fd = -1
     tmp_created = False
     try:
-        parent_fd = open_real_directory_fd(install_path.parent, "could_not_write_install_symlink")
+        parent_fd = open_real_directory_fd(
+            install_path.parent,
+            "could_not_write_install_symlink",
+            expected_stat=expected_parent_stat,
+        )
         os.symlink(wrapper, tmp_name, dir_fd=parent_fd)
         tmp_created = True
         os.replace(tmp_name, install_path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
@@ -6896,10 +6926,19 @@ def replace_install_symlink(install_path: Path, wrapper: Path) -> None:
             os.close(parent_fd)
 
 
-def remove_install_symlink_if_repo_wrapper(install_path: Path, wrapper: Path) -> str:
+def remove_install_symlink_if_repo_wrapper(
+    install_path: Path,
+    wrapper: Path,
+    *,
+    expected_parent_stat: os.stat_result | None = None,
+) -> str:
     parent_fd = -1
     try:
-        parent_fd = open_real_directory_fd(install_path.parent, "could_not_remove_install_symlink")
+        parent_fd = open_real_directory_fd(
+            install_path.parent,
+            "could_not_remove_install_symlink",
+            expected_stat=expected_parent_stat,
+        )
         try:
             current = os.lstat(install_path.name, dir_fd=parent_fd)
         except FileNotFoundError:
@@ -6934,6 +6973,22 @@ def remove_install_symlink_if_repo_wrapper(install_path: Path, wrapper: Path) ->
     finally:
         if parent_fd >= 0:
             os.close(parent_fd)
+
+
+def ensure_real_parent(path: Path, error_text: str) -> os.stat_result:
+    try:
+        parent_stat = path.parent.lstat()
+    except FileNotFoundError:
+        parent_stat = None
+    except OSError as exc:
+        raise AgentError(error_text) from exc
+    ensure_directory_chain_no_symlink(path.parent, error_text)
+    if parent_stat is None:
+        try:
+            parent_stat = path.parent.lstat()
+        except OSError as exc:
+            raise AgentError(error_text) from exc
+    return parent_stat
 
 
 def integration_status() -> dict[str, Any]:
@@ -7784,37 +7839,48 @@ def _sync_plugin_cache_from_repo_unlocked(
         raise AgentError("plugin manifest name or version is invalid")
     version = manifest["version"]
     target_cache = normalize_plugin_cache_root(cache_root)
-    ensure_directory_chain_no_symlink(target_cache.parent, "plugin cache parent directories must be real directories")
+    expected_parent_stat = ensure_real_parent(
+        target_cache,
+        "plugin cache parent directories must be real directories",
+    )
+    parent_fd = -1
+    cache_fd = -1
     try:
-        target_stat = target_cache.lstat()
-    except FileNotFoundError:
+        parent_fd = open_directory_no_follow_matching(
+            target_cache.parent,
+            expected_parent_stat,
+            error_text="could_not_sync_plugin_cache",
+            changed_text="could_not_sync_plugin_cache",
+        )
         try:
-            target_cache.mkdir(mode=0o755)
+            target_stat = os.stat(target_cache.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            try:
+                os.mkdir(target_cache.name, mode=0o755, dir_fd=parent_fd)
+                target_stat = os.stat(target_cache.name, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise AgentError("could_not_sync_plugin_cache") from exc
         except OSError as exc:
             raise AgentError("could_not_sync_plugin_cache") from exc
-        try:
-            target_stat = target_cache.lstat()
-        except OSError as exc:
-            raise AgentError("could_not_sync_plugin_cache") from exc
-    except OSError as exc:
-        raise AgentError("could_not_sync_plugin_cache") from exc
-    else:
         if stat_module.S_ISLNK(target_stat.st_mode) or not stat_module.S_ISDIR(target_stat.st_mode):
             raise AgentError("plugin cache root must be a real directory")
+        cache_fd = open_directory_no_follow_matching(
+            target_cache.name,
+            target_stat,
+            error_text="could_not_sync_plugin_cache",
+            changed_text="plugin cache root changed during sync",
+            dir_fd=parent_fd,
+        )
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
-    cache_fd = -1
     tmp_name = f".{version}.tmp.{now_id()}.{uuid.uuid4().hex}"
     copied_files = 0
     copied_directories = 0
     tmp_entry_created = False
     source_entry_stats: dict[str, os.stat_result] = {}
     try:
-        cache_fd = open_directory_no_follow_matching(
-            target_cache,
-            target_stat,
-            error_text="could_not_sync_plugin_cache",
-            changed_text="plugin cache root changed during sync",
-        )
         cache_fd_path = Path(f"/proc/self/fd/{cache_fd}")
         tmp_entry = cache_fd_path / tmp_name
         try:
@@ -8634,18 +8700,21 @@ def _install_unlocked(
             raise AgentError("repo wrapper failed MCP startup self-test")
 
     install_path = normalize_install_path(install_path)
-    ensure_directory_chain_no_symlink(install_path.parent, "install parent directories must be real directories")
+    expected_parent_stat = ensure_real_parent(
+        install_path,
+        "install parent directories must be real directories",
+    )
     if install_path.exists() or install_path.is_symlink():
         resolved_install_path = resolve_path_no_throw(install_path) if install_path.is_symlink() else None
         if install_path.is_symlink() and resolved_install_path == wrapper:
             symlink_status = "already_installed"
         elif force:
-            replace_install_symlink(install_path, wrapper)
+            replace_install_symlink(install_path, wrapper, expected_parent_stat=expected_parent_stat)
             symlink_status = "replaced"
         else:
             raise AgentError("install path exists and is not this wrapper symlink")
     else:
-        replace_install_symlink(install_path, wrapper)
+        replace_install_symlink(install_path, wrapper, expected_parent_stat=expected_parent_stat)
         symlink_status = "created"
 
     registration: dict[str, Any] = {"requested": register, "status": "skipped"}
@@ -8741,9 +8810,16 @@ def _uninstall_unlocked(
 
     symlink_status = "skipped"
     if remove_symlink:
-        ensure_directory_chain_no_symlink(install_path.parent, "install parent directories must be real directories")
+        expected_parent_stat = ensure_real_parent(
+            install_path,
+            "install parent directories must be real directories",
+        )
         wrapper = repo_wrapper_path()
-        symlink_status = remove_install_symlink_if_repo_wrapper(install_path, wrapper)
+        symlink_status = remove_install_symlink_if_repo_wrapper(
+            install_path,
+            wrapper,
+            expected_parent_stat=expected_parent_stat,
+        )
 
     return {"ok": True, "mcp": mcp_status, "symlink": symlink_status, "raw_output": "not_returned"}
 
@@ -10585,15 +10661,54 @@ def _agent_pool_install_unlocked(
                 source_identity = pool_shared_asset_identity(source, root)
                 if source_identity is None:
                     raise AgentError("pool shared asset source changed during install")
+                try:
+                    parent_stat = target.parent.lstat()
+                except FileNotFoundError:
+                    parent_stat = None
+                except OSError as exc:
+                    raise AgentError("pool shared asset target changed during install") from exc
                 ensure_private_dir(target.parent)
+                if parent_stat is None:
+                    try:
+                        parent_stat = target.parent.lstat()
+                    except OSError as exc:
+                        raise AgentError("pool shared asset target changed during install") from exc
+                parent_fd = open_directory_no_follow_matching(
+                    target.parent,
+                    parent_stat,
+                    error_text="pool shared asset target changed during install",
+                    changed_text="pool shared asset target changed during install",
+                )
                 relative_source = os.path.relpath(source, target.parent)
-                target.symlink_to(relative_source)
-                current_source = pool_shared_asset_identity(source, root)
-                if current_source is None or not source_identity_matches(current_source[1], source_identity[1]):
-                    with contextlib.suppress(OSError):
-                        if target.is_symlink():
-                            target.unlink()
-                    raise AgentError("pool shared asset source changed during install")
+                created_target_stat: os.stat_result | None = None
+                try:
+                    try:
+                        os.lstat(target.name, dir_fd=parent_fd)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        skipped_existing_assets += 1
+                        continue
+                    os.symlink(relative_source, target.name, dir_fd=parent_fd)
+                    created_target_stat = os.lstat(target.name, dir_fd=parent_fd)
+                    current_source = pool_shared_asset_identity(source, root)
+                    if current_source is None or not source_identity_matches(current_source[1], source_identity[1]):
+                        try:
+                            latest_target_stat = os.lstat(target.name, dir_fd=parent_fd)
+                        except OSError:
+                            latest_target_stat = None
+                        if (
+                            latest_target_stat is not None
+                            and source_identity_matches(latest_target_stat, created_target_stat)
+                            and stat_module.S_ISLNK(latest_target_stat.st_mode)
+                        ):
+                            with contextlib.suppress(OSError):
+                                os.unlink(target.name, dir_fd=parent_fd)
+                        raise AgentError("pool shared asset source changed during install")
+                except OSError as exc:
+                    raise AgentError("pool shared asset target changed during install") from exc
+                finally:
+                    os.close(parent_fd)
                 linked_assets += 1
 
         marker = root / POOL_MARKER_FILE

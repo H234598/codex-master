@@ -1397,7 +1397,11 @@ class ServerHelpersTest(unittest.TestCase):
 
             def swap_before_open(path, flags, *args, **kwargs):
                 nonlocal swapped
-                if not swapped and isinstance(path, (str, bytes, Path)) and Path(path) == auth_file:
+                candidate = Path(path) if isinstance(path, (str, bytes, Path)) else None
+                is_auth_open = candidate == auth_file or (
+                    kwargs.get("dir_fd") is not None and candidate == Path(auth_file.name)
+                )
+                if not swapped and is_auth_open:
                     auth_file.rename(original)
                     replacement.rename(auth_file)
                     swapped = True
@@ -1412,6 +1416,40 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertFalse(result["authenticated"])
             self.assertEqual(result["auth_state"], "unreadable")
             self.assertEqual(original.read_text(encoding="utf-8"), "expected\n")
+
+    def test_agent_auth_status_rejects_parent_swap_before_open(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home = root / "home"
+            outside = root / "outside"
+            home.mkdir()
+            outside.mkdir()
+            auth_file = home / "auth.json"
+            auth_file.write_text("expected\n", encoding="utf-8")
+            (outside / auth_file.name).write_text("forged\n", encoding="utf-8")
+            backup_home = root / "home-original"
+            real_open_directory = server_module.open_directory_no_follow_matching
+            swapped = False
+
+            def swap_before_open(path, *args, **kwargs):
+                nonlocal swapped
+                if not swapped and Path(path) == home:
+                    home.rename(backup_home)
+                    outside.rename(home)
+                    swapped = True
+                return real_open_directory(path, *args, **kwargs)
+
+            with patch.dict(server_module.AGENTS, {"a": {"home": home}}, clear=False), patch.object(
+                server_module, "open_directory_no_follow_matching", side_effect=swap_before_open
+            ):
+                result = server_module.agent_auth_status("a")
+
+            self.assertTrue(swapped)
+            self.assertFalse(result["authenticated"])
+            self.assertEqual(result["auth_state"], "unreadable")
+            self.assertEqual((backup_home / "auth.json").read_text(encoding="utf-8"), "expected\n")
 
     def test_master_watchdog_status_reports_hardened_systemd_state_without_paths(self) -> None:
         source_root = Path(__file__).resolve().parents[1]
@@ -1996,7 +2034,11 @@ class ServerHelpersTest(unittest.TestCase):
 
             def swapping_open(path, flags, mode=0o777, *, dir_fd=None):
                 nonlocal swapped
-                if not swapped and dir_fd is None and Path(path) == cache:
+                candidate = Path(path)
+                is_cache_open = candidate == cache or (
+                    dir_fd is not None and candidate == Path(cache.name)
+                )
+                if not swapped and is_cache_open:
                     swapped = True
                     cache.rename(backup_cache)
                     cache.symlink_to(redirected_cache, target_is_directory=True)
@@ -2015,6 +2057,41 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(swapped)
         self.assertEqual(redirected_entries, [])
         self.assertEqual(backup_entries, [])
+
+    def test_sync_plugin_cache_rejects_real_cache_parent_swap_before_root_create(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cache_parent = tmp_path / "cache-parent"
+            replacement_parent = tmp_path / "replacement-parent"
+            backup_parent = tmp_path / "cache-parent-original"
+            cache_parent.mkdir()
+            replacement_parent.mkdir()
+            cache = cache_parent / "cache"
+            real_ensure = server_module.ensure_directory_chain_no_symlink
+            swapped = False
+
+            def swap_parent(path, error_text):
+                nonlocal swapped
+                real_ensure(path, error_text)
+                if not swapped and Path(path) == cache_parent:
+                    cache_parent.rename(backup_parent)
+                    replacement_parent.rename(cache_parent)
+                    swapped = True
+
+            with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False), patch.object(
+                server_module, "ensure_directory_chain_no_symlink", side_effect=swap_parent
+            ):
+                with self.assertRaisesRegex(AgentError, "could_not_sync_plugin_cache"):
+                    sync_plugin_cache_from_repo(Path(__file__).resolve().parents[1], cache)
+
+            created_in_replacement = cache.exists() or cache.is_symlink()
+            created_in_original = (backup_parent / "cache").exists() or (backup_parent / "cache").is_symlink()
+
+        self.assertTrue(swapped)
+        self.assertFalse(created_in_replacement)
+        self.assertFalse(created_in_original)
 
     def test_sync_plugin_cache_rejects_real_source_root_swap_during_copy(self) -> None:
         from codex_master import server as server_module
@@ -13422,6 +13499,39 @@ class CliLifecycleTest(unittest.TestCase):
 
     @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
     @patch("codex_master.server.repo_wrapper_path")
+    @patch("codex_master.server.ensure_directory_chain_no_symlink")
+    def test_install_refuses_real_parent_swap_after_validation(
+        self, mock_ensure_chain, mock_wrapper_path, _mock_registration
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            old_bin = tmp_path / "old-bin"
+            link_bin = tmp_path / "link-bin"
+            replacement_bin = tmp_path / "replacement-bin"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            link_bin.mkdir()
+            replacement_bin.mkdir()
+            mock_wrapper_path.return_value = wrapper
+
+            def swap_parent(path, _error_text):
+                if Path(path) == link_bin:
+                    link_bin.rename(old_bin)
+                    replacement_bin.rename(link_bin)
+
+            mock_ensure_chain.side_effect = swap_parent
+
+            with self.assertRaisesRegex(AgentError, "could_not_write_install_symlink"):
+                install(register=False, install_path=link_bin / "codex-master-mcp", sync_plugin_cache=False)
+
+            replacement_link = link_bin / "codex-master-mcp"
+            replacement_exists = replacement_link.exists() or replacement_link.is_symlink()
+
+        self.assertFalse(replacement_exists)
+
+    @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
+    @patch("codex_master.server.repo_wrapper_path")
     def test_install_force_replaces_mismatched_symlink_atomically(
         self, mock_wrapper_path, _mock_registration
     ) -> None:
@@ -13462,16 +13572,16 @@ class CliLifecycleTest(unittest.TestCase):
             original_replace = replace_install_symlink
             original_remove = remove_install_symlink_if_repo_wrapper
 
-            def blocking_replace(path: Path, target: Path) -> None:
-                original_replace(path, target)
+            def blocking_replace(path: Path, target: Path, **kwargs: Any) -> None:
+                original_replace(path, target, **kwargs)
                 replace_entered.set()
                 self.assertTrue(release_replace.wait(2))
                 replace_released.set()
 
-            def observe_remove(path: Path, target: Path) -> str:
+            def observe_remove(path: Path, target: Path, **kwargs: Any) -> str:
                 if not replace_released.is_set():
                     uninstall_reached_remove.set()
-                return original_remove(path, target)
+                return original_remove(path, target, **kwargs)
 
             with patch("codex_master.server.replace_install_symlink", side_effect=blocking_replace), patch(
                 "codex_master.server.remove_install_symlink_if_repo_wrapper", side_effect=observe_remove
@@ -13559,6 +13669,40 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertTrue(redirected_is_symlink)
         self.assertNotIn(str(link_bin), str(raised.exception))
         self.assertNotIn(str(real_bin), str(raised.exception))
+
+    @patch("codex_master.server.repo_wrapper_path")
+    @patch("codex_master.server.ensure_directory_chain_no_symlink")
+    def test_uninstall_refuses_real_parent_swap_after_validation(
+        self, mock_ensure_chain, mock_wrapper_path
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            old_bin = tmp_path / "old-bin"
+            link_bin = tmp_path / "link-bin"
+            replacement_bin = tmp_path / "replacement-bin"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            link_bin.mkdir()
+            replacement_bin.mkdir()
+            replacement_link = replacement_bin / "codex-master-mcp"
+            replacement_link.symlink_to(wrapper)
+            mock_wrapper_path.return_value = wrapper
+
+            def swap_parent(path, _error_text):
+                if Path(path) == link_bin:
+                    link_bin.rename(old_bin)
+                    replacement_bin.rename(link_bin)
+
+            mock_ensure_chain.side_effect = swap_parent
+
+            with self.assertRaisesRegex(AgentError, "could_not_remove_install_symlink"):
+                uninstall(unregister=False, remove_symlink=True, install_path=link_bin / "codex-master-mcp")
+
+            replacement_link = link_bin / "codex-master-mcp"
+            replacement_is_symlink = replacement_link.is_symlink()
+
+        self.assertTrue(replacement_is_symlink)
 
     @patch("codex_master.server.repo_wrapper_path")
     def test_uninstall_leaves_install_path_symlink_loop_without_crashing(self, mock_wrapper_path) -> None:
@@ -14562,6 +14706,53 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertFalse((pool / "a2" / "skills").is_symlink())
             self.assertFalse((pool / "a2" / "skills").exists())
             self.assertEqual((outside / "secret.txt").read_text(encoding="utf-8"), "external-secret\n")
+
+    def test_agent_pool_install_keeps_shared_asset_link_on_pinned_parent_after_path_swap(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            pool.mkdir()
+            (pool / "a1" / "skills").mkdir(parents=True)
+            replacement = tmp / "replacement-a2"
+            replacement.mkdir()
+            spec = {
+                "schema_version": 1,
+                "pool_root": str(pool),
+                "codex_bin": "/bin/echo",
+                "series": [{"prefix": "a", "count": 2, "template": "a1", "authenticated": []}],
+                "shared_assets": ["skills"],
+                "runtime_dirs": [],
+            }
+            spec_path = self._write_spec_payload(tmp, spec)
+            original_symlink = server_module.os.symlink
+            swapped = False
+
+            def swap_before_symlink(source, link_name, *args, **kwargs):
+                nonlocal swapped
+                if not swapped and link_name == "skills":
+                    home = pool / "a2"
+                    home.rename(tmp / "a2-original")
+                    replacement.rename(home)
+                    swapped = True
+                return original_symlink(source, link_name, *args, **kwargs)
+
+            with patch.object(server_module.os, "symlink", side_effect=swap_before_symlink):
+                result = server_module.agent_pool_install(
+                    str(spec_path),
+                    target_dir=str(pool),
+                    codex_bin="/bin/echo",
+                )
+
+            pinned_home = tmp / "a2-original"
+            replacement_link_exists = (pool / "a2" / "skills").exists() or (pool / "a2" / "skills").is_symlink()
+            pinned_link_is_symlink = (pinned_home / "skills").is_symlink()
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(swapped)
+        self.assertTrue(pinned_link_is_symlink)
+        self.assertFalse(replacement_link_exists)
 
     def test_agent_pool_copy_auth_treats_broken_target_symlink_as_existing(self) -> None:
         from codex_master import server as server_module
