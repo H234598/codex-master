@@ -13171,7 +13171,10 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(install_result["installed_agent_count"], 4)
             self.assertTrue((pool / "a1" / "codex").is_file())
             self.assertTrue(os.access(pool / "a1" / "codex", os.X_OK))
-            self.assertIn('export CODEX_HOME="', (pool / "a1" / "codex").read_text(encoding="utf-8"))
+            wrapper_text = (pool / "a1" / "codex").read_text(encoding="utf-8")
+            self.assertIn(f'export CODEX_HOME="{pool / "a1"}"', wrapper_text)
+            self.assertNotIn("/proc/self/fd/", wrapper_text)
+            self.assertIn(f'[projects."{pool / "a1"}"]', (pool / "a1" / "config.toml").read_text(encoding="utf-8"))
             self.assertTrue((pool / "a2" / "skills").is_symlink())
             self.assertFalse((pool / "a2" / "auth.json").exists())
 

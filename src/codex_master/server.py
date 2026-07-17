@@ -10239,9 +10239,9 @@ def _agent_pool_install_unlocked(
             yes=False,
             overwrite=overwrite_auth,
         )
-    root = normalized["pool_root"]
-    pool_guard_root(root)
-    with pool_root_operation(root, ensure=True, error_text="pool root changed during install") as root:
+    pool_root = normalized["pool_root"]
+    pool_guard_root(pool_root)
+    with pool_root_operation(pool_root, ensure=True, error_text="pool root changed during install") as root:
         created = 0
         updated_wrappers = 0
         created_configs = 0
@@ -10252,12 +10252,13 @@ def _agent_pool_install_unlocked(
 
         for agent in normalized["ids"]:
             home = root / agent
+            logical_home = pool_root / agent
             before = home.exists()
             ensure_private_dir(home)
             if not before:
                 created += 1
 
-            wrapper = pool_wrapper_text(agent, home, normalized["codex_bin"])
+            wrapper = pool_wrapper_text(agent, logical_home, normalized["codex_bin"])
             wrapper_path = home / "codex"
             if not pool_private_text_matches(wrapper_path, wrapper, MAX_CODEX_CONFIG_BYTES):
                 pool_write_private_file(wrapper_path, wrapper, 0o700)
@@ -10265,7 +10266,7 @@ def _agent_pool_install_unlocked(
 
             config_path = home / "config.toml"
             if not is_regular_file_no_symlink(config_path):
-                pool_write_private_file(config_path, pool_minimal_config(home), 0o600)
+                pool_write_private_file(config_path, pool_minimal_config(logical_home), 0o600)
                 created_configs += 1
 
             for runtime_dir in normalized["runtime_dirs"]:
