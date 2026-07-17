@@ -477,10 +477,19 @@ def ensure_private_dir(path: Path) -> None:
         raise AgentError("private state directory disappeared") from exc
     if stat_module.S_ISLNK(current.st_mode) or not stat_module.S_ISDIR(current.st_mode):
         raise AgentError("private state directory changed unexpectedly")
+    directory_fd = open_directory_no_follow_matching(
+        path,
+        current,
+        error_text="private state directory is not readable",
+        changed_text="private state directory changed unexpectedly",
+    )
     try:
-        path.chmod(0o700)
-    except PermissionError:
-        pass
+        try:
+            os.fchmod(directory_fd, 0o700)
+        except PermissionError:
+            pass
+    finally:
+        os.close(directory_fd)
 
 
 def ensure_directory_chain_no_symlink(path: Path, error_text: str) -> None:

@@ -6287,6 +6287,35 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(redirected_state.exists())
         self.assertNotIn(str(real_parent), str(raised.exception))
 
+    def test_ensure_private_dir_does_not_chmod_swapped_symlink_target(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            target = root / "state"
+            outside = root / "outside"
+            target.mkdir()
+            outside.mkdir()
+            outside.chmod(0o755)
+            real_chmod = Path.chmod
+            swapped = False
+
+            def swap_before_chmod(mode, *args, **kwargs):
+                nonlocal swapped
+                if target.exists() and not swapped:
+                    target.rmdir()
+                    target.symlink_to(outside, target_is_directory=True)
+                    swapped = True
+                return real_chmod(target, mode, *args, **kwargs)
+
+            with patch.object(Path, "chmod", side_effect=swap_before_chmod):
+                server_module.ensure_private_dir(target)
+
+            self.assertFalse(swapped)
+            self.assertTrue(target.is_dir())
+            self.assertFalse(target.is_symlink())
+            self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o755)
+
     def test_ensure_state_rejects_file_state_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_root = Path(tmpdir) / "state"
