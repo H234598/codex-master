@@ -8,6 +8,7 @@ explicitly requested, size-limited, redacted excerpts.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import contextvars
 import datetime as _dt
@@ -285,7 +286,7 @@ PLUGIN_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]{0,199}$")
 RELEASE_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+(?:[A-Za-z0-9.+_-]*)?$")
 BRACKETED_PASTE_BEGIN = "\x1b[200~"
 BRACKETED_PASTE_END = "\x1b[201~"
-CODEX_TUI_SUBMIT_KEY = "S-Enter"
+CODEX_TUI_SUBMIT_KEY = "Enter"
 CODEX_TUI_INPUT_MARKERS = ("›",)
 CODEX_TUI_INPUT_MARKER_WINDOW_LINES = 8
 PATH_NOT_RETURNED = "not_returned"
@@ -2207,9 +2208,32 @@ def is_regular_file_no_symlink(path: Path) -> bool:
     return stat_module.S_ISREG(current.st_mode) and getattr(current, "st_nlink", 1) == 1
 
 
+def auth_access_token_state(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        return "missing"
+    parts = value.split(".")
+    if len(parts) != 3:
+        return "opaque"
+    payload = parts[1].replace("-", "+").replace("_", "/")
+    payload += "=" * (-len(payload) % 4)
+    try:
+        decoded = base64.b64decode(payload, validate=True)
+        claims = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return "opaque"
+    if not isinstance(claims, dict):
+        return "opaque"
+    expiry = claims.get("exp")
+    if isinstance(expiry, bool) or not isinstance(expiry, (int, float)) or not math.isfinite(expiry):
+        return "opaque"
+    return "expired" if expiry <= time.time() else "unexpired"
+
+
 def agent_auth_status(agent: str) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     auth_file = AGENTS[agent]["home"] / "auth.json"
+    token_state = "unknown"
+    auth_mode = "unknown"
     try:
         auth_stat = auth_file.lstat()
     except FileNotFoundError:
@@ -2240,17 +2264,40 @@ def agent_auth_status(agent: str) -> dict[str, Any]:
                 fd = os.open(auth_file, flags)
                 opened_stat = os.fstat(fd)
                 if (
-                    not stat_module.S_ISREG(opened_stat.st_mode)
+                    not source_identity_matches(opened_stat, auth_stat)
+                    or not stat_module.S_ISREG(opened_stat.st_mode)
                     or getattr(opened_stat, "st_nlink", 1) > 1
                     or opened_stat.st_size > MAX_CODEX_CONFIG_BYTES
                 ):
                     raise OSError("auth file changed unexpectedly")
-                if not os.read(fd, 1):
+                raw = os.read(fd, MAX_CODEX_CONFIG_BYTES + 1)
+                if len(raw) > MAX_CODEX_CONFIG_BYTES:
+                    state = "too_large"
+                    authenticated = False
+                elif not raw:
                     state = "empty"
                     authenticated = False
                 else:
-                    state = "present_regular"
-                    authenticated = True
+                    try:
+                        document = json.loads(raw.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        document = None
+                    if not isinstance(document, dict):
+                        state = "invalid_json"
+                        authenticated = False
+                    else:
+                        auth_mode_value = document.get("auth_mode")
+                        if isinstance(auth_mode_value, str) and auth_mode_value.strip():
+                            auth_mode = auth_mode_value.strip()
+                        tokens = document.get("tokens")
+                        access_token = tokens.get("access_token") if isinstance(tokens, dict) else None
+                        token_state = auth_access_token_state(access_token)
+                        if token_state == "expired":
+                            state = "access_token_expired"
+                            authenticated = False
+                        else:
+                            state = "present_regular"
+                            authenticated = True
             except OSError:
                 state = "unreadable"
                 authenticated = False
@@ -2260,6 +2307,8 @@ def agent_auth_status(agent: str) -> dict[str, Any]:
     return {
         "authenticated": authenticated,
         "auth_state": state,
+        "auth_mode": auth_mode,
+        "token_state": token_state,
         "auth_file": PATH_NOT_RETURNED,
         "raw_output": "not_returned",
     }
@@ -5374,6 +5423,7 @@ def assign_agent(
         "auth_gate": auth_gate,
         "lease": lease,
         "prompt_chars": len(prompt),
+        "result_tool": "agent_assignment_report",
         "prompt_output": "not_returned",
         "response_output": "not_returned",
         "send": sent,
@@ -5606,6 +5656,54 @@ def last_assignment_status(agent: str) -> dict[str, Any]:
     }
 
 
+def assignment_report(
+    agent: str,
+    assignment_id: Any,
+    lines: int = 40,
+    chars: int = 4000,
+    source: str = "pane",
+) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
+    assignment_id = bounded_text(
+        assignment_id,
+        field="assignment_id",
+        max_chars=MAX_ASSIGNMENT_ID,
+        required=True,
+    ) or ""
+    records = list_assignments(agent, MAX_ASSIGNMENT_RECORDS).get("records", [])
+    assignment = next(
+        (
+            record
+            for record in records
+            if isinstance(record, dict) and record.get("assignment_id") == assignment_id
+        ),
+        None,
+    )
+    if assignment is None:
+        raise AgentError("assignment report not found")
+    excerpt = safe_tail(agent, lines, chars, source)
+    output = excerpt.get("output") if isinstance(excerpt.get("output"), str) else ""
+    return {
+        "agent": agent,
+        "assignment_id": assignment_id,
+        "assignment_created_at_utc": assignment.get("created_at_utc"),
+        "role": assignment.get("role"),
+        "model": assignment.get("model"),
+        "report_status": "excerpt_available" if output.strip() else "no_output_observed",
+        "source": excerpt.get("source"),
+        "lines_limit": excerpt.get("lines_limit"),
+        "chars_limit": excerpt.get("chars_limit"),
+        "redaction_applied": excerpt.get("redaction_applied"),
+        "output_chars": excerpt.get("output_chars"),
+        "output_lines": excerpt.get("output_lines"),
+        "output_truncated": excerpt.get("output_truncated"),
+        "output_truncated_by_lines": excerpt.get("output_truncated_by_lines"),
+        "output_truncated_by_chars": excerpt.get("output_truncated_by_chars"),
+        "output": output,
+        "lease": excerpt.get("lease"),
+    }
+
+
 def request_agent_report(
     agent: str,
     assignment_id: Any = None,
@@ -5630,6 +5728,7 @@ def request_agent_report(
         "submitted": enter,
         "assignment_id": assignment_id,
         "lease": lease,
+        "result_tool": "agent_assignment_report",
         "prompt_output": "not_returned",
         "response_output": "not_returned",
         "send": sent,
@@ -8224,6 +8323,18 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                         lease=lease,
                     ),
                 ),
+            ),
+        )
+    if name == "agent_assignment_report":
+        selected_agent = single_agent_id(str(args.get("agent", "")), "agent_assignment_report")
+        return call_agent_lifecycle(
+            selected_agent,
+            lambda: assignment_report(
+                selected_agent,
+                args.get("assignment_id"),
+                int_arg(args, "lines", 40),
+                int_arg(args, "chars", 4000),
+                str(args.get("source", "pane")),
             ),
         )
     if name == "worktree_create_for_agent":

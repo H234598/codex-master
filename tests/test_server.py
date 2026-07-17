@@ -1079,6 +1079,39 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn(tmpdir, payload)
         self.assertNotIn("secret", payload)
 
+    def test_agent_auth_status_rejects_regular_file_swap_before_open(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home = root / "home"
+            home.mkdir()
+            auth_file = home / "auth.json"
+            original = root / "original-auth.json"
+            replacement = root / "replacement-auth.json"
+            auth_file.write_text("expected\n", encoding="utf-8")
+            replacement.write_text("forged\n", encoding="utf-8")
+            real_open = server_module.os.open
+            swapped = False
+
+            def swap_before_open(path, flags, *args, **kwargs):
+                nonlocal swapped
+                if not swapped and isinstance(path, (str, bytes, Path)) and Path(path) == auth_file:
+                    auth_file.rename(original)
+                    replacement.rename(auth_file)
+                    swapped = True
+                return real_open(path, flags, *args, **kwargs)
+
+            with patch.dict(server_module.AGENTS, {"a": {"home": home}}, clear=False), patch.object(
+                server_module.os, "open", side_effect=swap_before_open
+            ):
+                result = server_module.agent_auth_status("a")
+
+            self.assertTrue(swapped)
+            self.assertFalse(result["authenticated"])
+            self.assertEqual(result["auth_state"], "unreadable")
+            self.assertEqual(original.read_text(encoding="utf-8"), "expected\n")
+
     def test_master_watchdog_status_reports_hardened_systemd_state_without_paths(self) -> None:
         source_root = Path(__file__).resolve().parents[1]
         service_text = (source_root / "systemd" / "user" / "codex-master-watchdog.service").read_text(encoding="utf-8")
