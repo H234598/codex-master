@@ -352,6 +352,42 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(original.read_text(encoding="utf-8"), "original-secret-data\n")
             self.assertEqual(path.read_text(encoding="utf-8"), "external-secret-data\n")
 
+    def test_write_bounded_raw_log_rejects_regular_file_swap_after_validation(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "raw"
+            raw_dir.mkdir()
+            path = raw_dir / "run.log"
+            original = root / "original-run.log"
+            replacement = root / "replacement-run.log"
+            path.write_text("original-secret-data\n", encoding="utf-8")
+            replacement.write_text("external-secret-data\n", encoding="utf-8")
+            real_identity = server_module.allowed_raw_log_identity
+            swapped = False
+
+            def swap_after_validation(raw_log):
+                nonlocal swapped
+                identity = real_identity(raw_log)
+                if identity is not None and not swapped:
+                    path.rename(original)
+                    replacement.rename(path)
+                    swapped = True
+                return identity
+
+            with patch.object(server_module, "RAW_DIR", raw_dir), patch.object(
+                server_module, "LEGACY_STATE_ROOT", root / "legacy"
+            ), patch.object(server_module, "ensure_state"), patch.object(
+                server_module, "allowed_raw_log_identity", side_effect=swap_after_validation
+            ), patch.object(server_module.sys, "stdin", FakeStdin(b"new-data\n")):
+                with self.assertRaisesRegex(AgentError, "raw log path changed unexpectedly"):
+                    server_module.write_bounded_raw_log(path, max_bytes=128)
+
+            self.assertTrue(swapped)
+            self.assertEqual(original.read_text(encoding="utf-8"), "original-secret-data\n")
+            self.assertEqual(path.read_text(encoding="utf-8"), "external-secret-data\n")
+
     def test_github_ci_smokes_agent_pool_installer(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")

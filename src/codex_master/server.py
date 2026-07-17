@@ -2510,7 +2510,7 @@ def managed_raw_dirs() -> tuple[Path, ...]:
     return tuple(dirs)
 
 
-def allowed_raw_log_path(raw_log: Any) -> Path | None:
+def allowed_raw_log_identity(raw_log: Any) -> tuple[Path, os.stat_result | None] | None:
     if not isinstance(raw_log, str) or not raw_log.strip():
         return None
     raw_path = Path(raw_log).expanduser()
@@ -2519,6 +2519,7 @@ def allowed_raw_log_path(raw_log: Any) -> Path | None:
     raw_path = raw_path.absolute()
     if not directory_chain_is_real_no_symlink(raw_path.parent):
         return None
+    current_stat: os.stat_result | None = None
     try:
         current_stat = raw_path.lstat()
     except FileNotFoundError:
@@ -2539,10 +2540,15 @@ def allowed_raw_log_path(raw_log: Any) -> Path | None:
             continue
         try:
             candidate.relative_to(root.resolve(strict=False))
-            return candidate
+            return candidate, current_stat
         except (OSError, ValueError):
             continue
     return None
+
+
+def allowed_raw_log_path(raw_log: Any) -> Path | None:
+    identity = allowed_raw_log_identity(raw_log)
+    return identity[0] if identity is not None else None
 
 
 def protected_raw_log_paths() -> set[Path]:
@@ -2659,12 +2665,21 @@ def bound_raw_log_at_dir_fd(directory_fd: int, name: str, max_bytes: int = MAX_R
     return True
 
 
-def append_bounded_raw_log(path: Path, chunk: bytes, max_bytes: int = MAX_RAW_LOG_BYTES) -> None:
+def append_bounded_raw_log(
+    path: Path,
+    chunk: bytes,
+    max_bytes: int = MAX_RAW_LOG_BYTES,
+    *,
+    expected_stat: os.stat_result | None = None,
+) -> None:
     max_bytes = max(1, int(max_bytes))
     if not chunk:
         return
     with open_private_regular_update(path) as fh:
-        if getattr(os.fstat(fh.fileno()), "st_nlink", 1) > 1:
+        opened_stat = os.fstat(fh.fileno())
+        if expected_stat is not None and not source_identity_matches(opened_stat, expected_stat):
+            raise AgentError("raw log path changed unexpectedly")
+        if getattr(opened_stat, "st_nlink", 1) > 1:
             raise RuntimeError("raw log path must not be a hardlink")
         fh.seek(0, os.SEEK_END)
         size = fh.tell()
@@ -2701,14 +2716,15 @@ def validate_raw_log_writer_max_bytes(max_bytes: Any) -> int:
 def write_bounded_raw_log(path: Path, max_bytes: int = MAX_RAW_LOG_BYTES) -> int:
     max_bytes = validate_raw_log_writer_max_bytes(max_bytes)
     ensure_state()
-    allowed = allowed_raw_log_path(str(path))
-    if allowed is None:
+    allowed_identity = allowed_raw_log_identity(str(path))
+    if allowed_identity is None:
         raise AgentError("raw log path is outside managed raw log state")
+    allowed, expected_stat = allowed_identity
     while True:
         chunk = sys.stdin.buffer.read(RAW_LOG_CHUNK_BYTES)
         if not chunk:
             return 0
-        append_bounded_raw_log(allowed, chunk, max_bytes)
+        append_bounded_raw_log(allowed, chunk, max_bytes, expected_stat=expected_stat)
 
 
 def prune_raw_logs(max_files: int = MAX_RAW_LOG_FILES, max_bytes: int = MAX_RAW_LOG_BYTES) -> dict[str, Any]:
