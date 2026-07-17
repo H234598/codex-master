@@ -1970,6 +1970,87 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(symlink_survived)
         self.assertNotIn(str(cache), json.dumps(result, sort_keys=True))
 
+    def test_sync_plugin_cache_serializes_retention_across_concurrent_syncs(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            cache = tmp_path / "cache"
+            root_a = tmp_path / "repo-a"
+            root_b = tmp_path / "repo-b"
+
+            for root, version in ((root_a, "0.3.4+codex.race-a"), (root_b, "0.3.5+codex.race-b")):
+                for relative in (".codex-plugin", "bin", "skills", "src", "systemd"):
+                    (root / relative).mkdir(parents=True)
+                (root / ".codex-plugin" / "plugin.json").write_text(
+                    json.dumps({"name": "codex-master", "version": version}), encoding="utf-8"
+                )
+                for relative, content in {
+                    ".app.json": "{}",
+                    ".mcp.json": "{}",
+                    "README.md": "readme\n",
+                    "pyproject.toml": "[project]\nname='codex-master'\n",
+                    "bin/codex-master-mcp": "#!/bin/sh\n",
+                }.items():
+                    (root / relative).write_text(content, encoding="utf-8")
+
+            first_prune_entered = threading.Event()
+            second_prune_entered = threading.Event()
+            release_first_prune = threading.Event()
+            call_count = 0
+            call_count_lock = threading.Lock()
+            real_prune = server_module.prune_plugin_cache_versions
+
+            def block_first_prune(cache_root: Path, *, keep_version: str, max_versions: int) -> dict[str, Any]:
+                nonlocal call_count
+                with call_count_lock:
+                    call_count += 1
+                    current_call = call_count
+                if current_call == 1:
+                    first_prune_entered.set()
+                    if not release_first_prune.wait(5):
+                        raise AssertionError("first plugin-cache prune did not get released")
+                else:
+                    second_prune_entered.set()
+                return real_prune(cache_root, keep_version=keep_version, max_versions=max_versions)
+
+            results: dict[str, dict[str, Any]] = {}
+            errors: dict[str, BaseException] = {}
+
+            def run_sync(name: str, root: Path) -> None:
+                try:
+                    results[name] = sync_plugin_cache_from_repo(root, cache, retained_versions=1)
+                except BaseException as exc:
+                    errors[name] = exc
+
+            state = tmp_path / "state"
+            with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False), patch(
+                "codex_master.server.STATE_ROOT", state
+            ), patch("codex_master.server.LOCK_DIR", state / "locks"), patch.object(
+                server_module, "prune_plugin_cache_versions", side_effect=block_first_prune
+            ):
+                first = threading.Thread(target=run_sync, args=("a", root_a))
+                second = threading.Thread(target=run_sync, args=("b", root_b))
+                first.start()
+                self.assertTrue(first_prune_entered.wait(5))
+                second.start()
+                self.assertFalse(second_prune_entered.wait(0.2))
+                release_first_prune.set()
+                first.join(5)
+                second.join(5)
+
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(errors, {})
+            self.assertEqual(call_count, 2)
+            self.assertTrue(all(result["ok"] for result in results.values()))
+            remaining_versions = [
+                path.name
+                for path in cache.iterdir()
+                if path.is_dir() and not path.name.startswith(".")
+            ]
+            self.assertEqual(len(remaining_versions), 1)
+
     def test_sync_plugin_cache_rejects_cache_root_swap_before_retention(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -11204,6 +11285,22 @@ class CliLifecycleTest(unittest.TestCase):
             wrapper.parent.mkdir(parents=True)
             wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
             wrapper.chmod(0o600)
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            mock_wrapper_path.return_value = wrapper
+
+            with self.assertRaisesRegex(AgentError, "repo wrapper is not executable") as raised:
+                install(register=False, install_path=install_link, sync_plugin_cache=False)
+
+        self.assertNotIn(str(tmp_path), str(raised.exception))
+        self.assertNotIn("secret-repo", str(raised.exception))
+
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_rejects_executable_directory_as_repo_wrapper(self, mock_wrapper_path) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "secret-repo" / "bin" / "codex-master-mcp"
+            wrapper.mkdir(parents=True)
+            wrapper.chmod(0o700)
             install_link = tmp_path / "bin" / "codex-master-mcp"
             mock_wrapper_path.return_value = wrapper
 

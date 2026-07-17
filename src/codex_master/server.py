@@ -1702,6 +1702,9 @@ def open_private_regular_update(path: Path) -> Any:
 _LIFECYCLE_LOCK_STACK: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
     "codex_master_lifecycle_lock_stack", default=()
 )
+_PLUGIN_CACHE_LOCK_HELD: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "codex_master_plugin_cache_lock_held", default=False
+)
 
 
 @contextlib.contextmanager
@@ -1771,6 +1774,30 @@ def assignment_log_lock() -> Any:
         except OSError as exc:
             raise AgentError("could not acquire assignment log lock") from exc
         finally:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+
+
+@contextlib.contextmanager
+def plugin_cache_lock() -> Any:
+    if _PLUGIN_CACHE_LOCK_HELD.get():
+        yield
+        return
+    ensure_private_dir(STATE_ROOT)
+    ensure_private_dir(LOCK_DIR)
+    lock_path = LOCK_DIR / "plugin-cache.lock"
+    with open_private_regular_update(lock_path) as fh:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        except OSError as exc:
+            raise AgentError("could not acquire plugin cache lock") from exc
+        token = _PLUGIN_CACHE_LOCK_HELD.set(True)
+        try:
+            yield
+        finally:
+            _PLUGIN_CACHE_LOCK_HELD.reset(token)
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
             except OSError:
@@ -7184,7 +7211,7 @@ def valid_plugin_cache_entry_version(entry: Path) -> str | None:
     return entry_version
 
 
-def prune_plugin_cache_versions(
+def _prune_plugin_cache_versions_unlocked(
     cache_root: Path,
     *,
     keep_version: str,
@@ -7238,7 +7265,21 @@ def prune_plugin_cache_versions(
     }
 
 
-def sync_plugin_cache_from_repo(
+def prune_plugin_cache_versions(
+    cache_root: Path,
+    *,
+    keep_version: str,
+    max_versions: int = MAX_PLUGIN_CACHE_RETAINED_VERSIONS,
+) -> dict[str, Any]:
+    with plugin_cache_lock():
+        return _prune_plugin_cache_versions_unlocked(
+            cache_root,
+            keep_version=keep_version,
+            max_versions=max_versions,
+        )
+
+
+def _sync_plugin_cache_from_repo_unlocked(
     root: Path | None = None,
     cache_root: Path | None = None,
     retained_versions: int = MAX_PLUGIN_CACHE_RETAINED_VERSIONS,
@@ -7398,6 +7439,15 @@ def sync_plugin_cache_from_repo(
         "plugin_cache": status,
         "raw_output": "not_returned",
     }
+
+
+def sync_plugin_cache_from_repo(
+    root: Path | None = None,
+    cache_root: Path | None = None,
+    retained_versions: int = MAX_PLUGIN_CACHE_RETAINED_VERSIONS,
+) -> dict[str, Any]:
+    with plugin_cache_lock():
+        return _sync_plugin_cache_from_repo_unlocked(root, cache_root, retained_versions)
 
 
 def app_id_kind(app_id: str) -> str:
@@ -8090,9 +8140,9 @@ def install(
     if register:
         assert_install_context_allows_master_registration()
     wrapper = repo_wrapper_path()
-    if not wrapper.exists():
+    if not path_present_no_follow(wrapper):
         raise AgentError("repo wrapper missing")
-    if not os.access(wrapper, os.X_OK):
+    if not is_regular_executable_no_symlink(wrapper):
         raise AgentError("repo wrapper is not executable")
     startup_self_test: dict[str, Any] = {"requested": register, "status": "skipped", "raw_output": "not_returned"}
     if register:
