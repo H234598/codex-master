@@ -3918,7 +3918,8 @@ def _start_agent_with_lease_unlocked(
         except Exception:
             if isinstance(result, dict) and result.get("status") == "started":
                 raw_log = read_meta(agent).get("raw_log")
-                raw_log_path = allowed_raw_log_path(raw_log)
+                raw_log_identity = allowed_agent_raw_log_identity(agent, raw_log)
+                raw_log_path = raw_log_identity[0] if raw_log_identity is not None else None
                 if raw_log_path is not None:
                     cleanup_failed_start(AGENTS[agent]["session"], raw_log_path, kill_session=True)
                 else:
@@ -3960,7 +3961,8 @@ def _start_agent_with_lease_unlocked(
     except Exception:
         if isinstance(result, dict) and result.get("status") == "started":
             raw_log = read_meta(agent).get("raw_log")
-            raw_log_path = allowed_raw_log_path(raw_log)
+            raw_log_identity = allowed_agent_raw_log_identity(agent, raw_log)
+            raw_log_path = raw_log_identity[0] if raw_log_identity is not None else None
             if raw_log_path is not None:
                 cleanup_failed_start(AGENTS[agent]["session"], raw_log_path, kill_session=True)
             else:

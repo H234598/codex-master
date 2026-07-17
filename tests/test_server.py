@@ -8545,7 +8545,10 @@ class ServerHelpersTest(unittest.TestCase):
 
     @patch("codex_master.server.release_agent")
     @patch("codex_master.server.cleanup_failed_start")
-    @patch("codex_master.server.allowed_raw_log_path", return_value=Path("/tmp/managed-a.log"))
+    @patch(
+        "codex_master.server.allowed_agent_raw_log_identity",
+        return_value=(Path("/tmp/managed-a.log"), None),
+    )
     @patch("codex_master.server.read_meta", return_value={"raw_log": "/tmp/managed-a.log"})
     @patch("codex_master.server.remember_agent_routing", side_effect=AgentError("routing failed"))
     @patch("codex_master.server.start_agent", return_value={"agent": "a", "status": "started"})
@@ -8558,7 +8561,7 @@ class ServerHelpersTest(unittest.TestCase):
         _mock_start,
         _mock_remember,
         _mock_read_meta,
-        _mock_allowed_raw_log,
+        _mock_allowed_raw_log_identity,
         mock_cleanup,
         mock_release,
     ) -> None:
@@ -8574,6 +8577,38 @@ class ServerHelpersTest(unittest.TestCase):
         mock_cleanup.assert_called_once_with(
             AGENTS["a1"]["session"], Path("/tmp/managed-a.log"), kill_session=True
         )
+        mock_release.assert_called_once_with("a1", force=True)
+
+    @patch("codex_master.server.release_agent")
+    @patch("codex_master.server.cleanup_failed_start")
+    @patch("codex_master.server.read_meta", return_value={"raw_log": "/tmp/foreign-b1.log"})
+    @patch("codex_master.server.remember_agent_routing", side_effect=AgentError("routing failed"))
+    @patch("codex_master.server.start_agent", return_value={"agent": "a", "status": "started"})
+    @patch("codex_master.server.claim_agent")
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    def test_start_agent_with_lease_rejects_foreign_raw_log_cleanup(
+        self,
+        _mock_alive,
+        mock_claim,
+        _mock_start,
+        _mock_remember,
+        _mock_read_meta,
+        mock_cleanup,
+        mock_release,
+    ) -> None:
+        mock_claim.return_value = {
+            "status": "claimed",
+            "lease": {"held_by_this_server": True},
+        }
+
+        with patch("codex_master.server.RAW_DIR", Path("/tmp")), patch(
+            "codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}
+        ), patch("codex_master.server.run_tmux") as mock_run_tmux:
+            with self.assertRaisesRegex(AgentError, "routing failed"):
+                start_agent_with_lease("a", allow_unauthenticated=True)
+
+        mock_cleanup.assert_not_called()
+        self.assertTrue(mock_run_tmux.called)
         mock_release.assert_called_once_with("a1", force=True)
 
     @patch("codex_master.server.release_agent")
