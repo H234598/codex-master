@@ -2748,7 +2748,12 @@ def agent_auth_status(agent: str) -> dict[str, Any]:
                     else:
                         auth_mode_value = document.get("auth_mode")
                         if isinstance(auth_mode_value, str) and auth_mode_value.strip():
-                            auth_mode = auth_mode_value.strip()
+                            normalized_auth_mode = auth_mode_value.strip().lower()
+                            auth_mode = (
+                                normalized_auth_mode
+                                if normalized_auth_mode in {"api", "chatgpt", "oauth"}
+                                else "other"
+                            )
                         tokens = document.get("tokens")
                         access_token = tokens.get("access_token") if isinstance(tokens, dict) else None
                         token_state = auth_access_token_state(access_token)

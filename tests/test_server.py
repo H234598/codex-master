@@ -1424,6 +1424,22 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["auth_mode"], "chatgpt")
         self.assertEqual(result["token_state"], "expired")
 
+    def test_agent_auth_status_does_not_return_unknown_auth_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            secret = "SECRET_AUTH_MODE_" + ("x" * 500)
+            (home / "auth.json").write_text(json.dumps({"auth_mode": secret}) + "\n", encoding="utf-8")
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                result = agent_auth_status("a")
+
+        self.assertEqual(result["auth_mode"], "other")
+        self.assertNotIn(secret, json.dumps(result, sort_keys=True))
+
     def test_agent_auth_status_rejects_regular_file_swap_before_open(self) -> None:
         from codex_master import server as server_module
 
