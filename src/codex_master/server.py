@@ -159,6 +159,7 @@ POOL_AUTH_POLICIES = ("preserve_existing_only", "copy_explicit_only")
 POOL_PREFIX_RE = re.compile(r"^[a-z][a-z0-9_-]{0,15}$")
 POOL_SAFE_RELATIVE_RE = re.compile(r"^[A-Za-z0-9._-][A-Za-z0-9._/-]{0,199}$")
 GIT_BASE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@{}~^+-]{0,199}$")
+GIT_BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9@][A-Za-z0-9@._+-]{0,199}$")
 ROUTING_CONTEXT_ID_RE = re.compile(r"^[A-Za-z0-9_.:@+-]{1,128}$")
 CODEX_USAGE_ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 MAX_POOL_AGENTS = 1000
@@ -944,10 +945,11 @@ def selector_policy_status() -> dict[str, Any]:
 
 def set_selector_policy(series: Any) -> dict[str, Any]:
     selected_series = parse_selector_series_value(series, field="series")
-    ensure_state()
-    payload = {"series": list(selected_series), "updated_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat()}
-    replace_private_text(selector_policy_path(), json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    return selector_policy_status()
+    with selector_policy_lock():
+        ensure_state()
+        payload = {"series": list(selected_series), "updated_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat()}
+        replace_private_text(selector_policy_path(), json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        return selector_policy_status()
 
 
 def ordinal_mapping_preview(series: tuple[str, ...] | None = None, *, limit: int = 8) -> list[dict[str, Any]]:
@@ -1801,6 +1803,74 @@ def plugin_cache_lock() -> Any:
             yield
         finally:
             _PLUGIN_CACHE_LOCK_HELD.reset(token)
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+
+
+@contextlib.contextmanager
+def install_lock() -> Any:
+    ensure_private_dir(STATE_ROOT)
+    ensure_private_dir(LOCK_DIR)
+    lock_path = LOCK_DIR / "install.lock"
+    with open_private_regular_update(lock_path) as fh:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        except OSError as exc:
+            raise AgentError("could not acquire install lock") from exc
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+
+
+@contextlib.contextmanager
+def selector_policy_lock() -> Any:
+    ensure_private_dir(STATE_ROOT)
+    ensure_private_dir(LOCK_DIR)
+    lock_path = LOCK_DIR / "selector-policy.lock"
+    with open_private_regular_update(lock_path) as fh:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        except OSError as exc:
+            raise AgentError("could not acquire selector policy lock") from exc
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+
+
+@contextlib.contextmanager
+def pool_root_lock(root: Path) -> Any:
+    try:
+        root_key = str(root.resolve(strict=False))
+    except (OSError, RuntimeError):
+        root_key = str(root.absolute())
+    held_locks = _POOL_ROOT_LOCK_STACK.get()
+    if root_key in held_locks:
+        yield
+        return
+    ensure_private_dir(STATE_ROOT)
+    ensure_private_dir(LOCK_DIR)
+    lock_name = hashlib.sha256(root_key.encode("utf-8")).hexdigest()
+    lock_path = LOCK_DIR / f"pool-root-{lock_name}.lock"
+    with open_private_regular_update(lock_path) as fh:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        except OSError as exc:
+            raise AgentError("could not acquire pool root lock") from exc
+        token = _POOL_ROOT_LOCK_STACK.set((*held_locks, root_key))
+        try:
+            yield
+        finally:
+            _POOL_ROOT_LOCK_STACK.reset(token)
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
             except OSError:
@@ -6203,6 +6273,18 @@ def normalize_git_base_ref(value: Any) -> str | None:
     return ref
 
 
+def normalize_git_branch_name(value: str) -> str:
+    if (
+        not GIT_BRANCH_NAME_RE.fullmatch(value)
+        or ".." in value
+        or value.endswith(".")
+        or value.endswith(".lock")
+        or "@{" in value
+    ):
+        raise AgentError("worktree path basename is not a supported git branch name")
+    return value
+
+
 def worktree_create_for_agent(agent: str, path: Any = None, base_ref: Any = None) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     path = bounded_text(path, field="path", max_chars=MAX_PATH_TEXT) if path is not None else None
@@ -6215,6 +6297,7 @@ def worktree_create_for_agent(agent: str, path: Any = None, base_ref: Any = None
     scoped_target = target.resolve(strict=False)
     if not path_is_within(scoped_target, repo):
         raise AgentError("worktree path must stay inside repo")
+    branch_name = normalize_git_branch_name(target.name) if base_ref is None else None
     if path_present_no_follow(target):
         raise AgentError("worktree path already exists")
     try:
@@ -6266,13 +6349,13 @@ def worktree_create_for_agent(agent: str, path: Any = None, base_ref: Any = None
             args = ["worktree", "add", ".", base_ref]
         else:
             branch_check = run_command(
-                ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{target.name}"],
+                ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"],
                 cwd=operation_cwd,
             )
             args = (
-                ["worktree", "add", ".", target.name]
+                ["worktree", "add", ".", branch_name]
                 if branch_check.returncode == 0
-                else ["worktree", "add", "-b", target.name, "."]
+                else ["worktree", "add", "-b", branch_name, "."]
             )
         cp = run_command(["git", *args], cwd=operation_cwd)
         if cp.returncode != 0:
@@ -8134,7 +8217,7 @@ def doctor() -> dict[str, Any]:
     return {"ok": all(check["ok"] for check in checks), "checks": checks, "raw_output": "not_returned"}
 
 
-def install(
+def _install_unlocked(
     register: bool = True,
     force: bool = False,
     install_path: Path = DEFAULT_INSTALL_PATH,
@@ -8224,7 +8307,26 @@ def install(
     }
 
 
-def uninstall(unregister: bool = True, remove_symlink: bool = False, install_path: Path = DEFAULT_INSTALL_PATH) -> dict[str, Any]:
+def install(
+    register: bool = True,
+    force: bool = False,
+    install_path: Path = DEFAULT_INSTALL_PATH,
+    sync_plugin_cache: bool = True,
+) -> dict[str, Any]:
+    with install_lock():
+        return _install_unlocked(
+            register=register,
+            force=force,
+            install_path=install_path,
+            sync_plugin_cache=sync_plugin_cache,
+        )
+
+
+def _uninstall_unlocked(
+    unregister: bool = True,
+    remove_symlink: bool = False,
+    install_path: Path = DEFAULT_INSTALL_PATH,
+) -> dict[str, Any]:
     install_path = normalize_install_path(install_path)
     mcp_status = "skipped"
     if unregister:
@@ -8247,6 +8349,19 @@ def uninstall(unregister: bool = True, remove_symlink: bool = False, install_pat
         symlink_status = remove_install_symlink_if_repo_wrapper(install_path, wrapper)
 
     return {"ok": True, "mcp": mcp_status, "symlink": symlink_status, "raw_output": "not_returned"}
+
+
+def uninstall(
+    unregister: bool = True,
+    remove_symlink: bool = False,
+    install_path: Path = DEFAULT_INSTALL_PATH,
+) -> dict[str, Any]:
+    with install_lock():
+        return _uninstall_unlocked(
+            unregister=unregister,
+            remove_symlink=remove_symlink,
+            install_path=install_path,
+        )
 
 
 def tui_accepts_input(text: str) -> bool:

@@ -117,6 +117,8 @@ from codex_master.server import (
     redact,
     paged_mapping,
     release_agent,
+    remove_install_symlink_if_repo_wrapper,
+    replace_install_symlink,
     replace_private_text,
     resolve_path_no_throw,
     run_command,
@@ -1109,6 +1111,59 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(persisted_status["series"], ["a", "b", "c"])
         self.assertEqual(selected, ["a1", "b1", "c1", "a2", "b2", "c2"])
         self.assertNotIn(tmpdir, json.dumps(changed, sort_keys=True))
+
+    def test_agent_selector_policy_serializes_write_and_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            first_write = threading.Event()
+            release_first_write = threading.Event()
+            second_write = threading.Event()
+            write_count = 0
+            write_count_lock = threading.Lock()
+            results: dict[str, dict[str, Any]] = {}
+            errors: list[BaseException] = []
+            original_replace = replace_private_text
+
+            def blocking_replace(path: Path, text: str) -> None:
+                nonlocal write_count
+                original_replace(path, text)
+                with write_count_lock:
+                    write_count += 1
+                    current_write = write_count
+                if current_write == 1:
+                    first_write.set()
+                    self.assertTrue(release_first_write.wait(2))
+                else:
+                    second_write.set()
+
+            def set_policy(name: str, series: str) -> None:
+                try:
+                    results[name] = call_tool("agent_selector_policy", {"series": series})
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with patch.dict("os.environ", {}, clear=True), patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
+                "codex_master.server.SELECTOR_POLICY_FILE", state / "selector-policy.json"
+            ), patch("codex_master.server.replace_private_text", side_effect=blocking_replace):
+                first = threading.Thread(target=set_policy, args=("first", "a,b"))
+                second = threading.Thread(target=set_policy, args=("second", "a,b,c"))
+                first.start()
+                self.assertTrue(first_write.wait(2))
+                second.start()
+                self.assertFalse(second_write.wait(0.1))
+                release_first_write.set()
+                first.join(2)
+                second.join(2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results["first"]["series"], ["a", "b"])
+        self.assertEqual(results["second"]["series"], ["a", "b", "c"])
 
     def test_selector_policy_rejects_non_string_series_entries(self) -> None:
         with self.assertRaisesRegex(AgentError, "series must contain only string series prefixes"):
@@ -9286,6 +9341,21 @@ class ServerHelpersTest(unittest.TestCase):
         mock_run_command.assert_not_called()
 
     @patch("codex_master.server.run_command")
+    def test_worktree_create_rejects_path_basename_that_git_parses_as_option(self, mock_run_command) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            target = repo / ".codex-master-worktrees" / "--detach"
+
+            with patch("codex_master.server.repo_root", return_value=repo):
+                with self.assertRaisesRegex(
+                    AgentError, "worktree path basename is not a supported git branch name"
+                ):
+                    worktree_create_for_agent("a", path=str(target))
+
+        mock_run_command.assert_not_called()
+        self.assertFalse(target.exists())
+
+    @patch("codex_master.server.run_command")
     def test_worktree_create_git_failure_is_data_sparse(self, mock_run_command) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
@@ -11783,6 +11853,58 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result["install_path"], "not_returned")
         self.assertEqual(resolved, wrapper)
         self.assertEqual(tmp_links, [])
+
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_and_uninstall_serialize_link_mutation(self, mock_wrapper_path) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            mock_wrapper_path.return_value = wrapper
+
+            replace_entered = threading.Event()
+            release_replace = threading.Event()
+            replace_released = threading.Event()
+            uninstall_reached_remove = threading.Event()
+            original_replace = replace_install_symlink
+            original_remove = remove_install_symlink_if_repo_wrapper
+
+            def blocking_replace(path: Path, target: Path) -> None:
+                original_replace(path, target)
+                replace_entered.set()
+                self.assertTrue(release_replace.wait(2))
+                replace_released.set()
+
+            def observe_remove(path: Path, target: Path) -> str:
+                if not replace_released.is_set():
+                    uninstall_reached_remove.set()
+                return original_remove(path, target)
+
+            with patch("codex_master.server.replace_install_symlink", side_effect=blocking_replace), patch(
+                "codex_master.server.remove_install_symlink_if_repo_wrapper", side_effect=observe_remove
+            ):
+                install_thread = threading.Thread(
+                    target=lambda: install(register=False, install_path=install_link, sync_plugin_cache=False)
+                )
+                install_thread.start()
+                self.assertTrue(replace_entered.wait(2))
+
+                uninstall_thread = threading.Thread(
+                    target=lambda: uninstall(unregister=False, remove_symlink=True, install_path=install_link)
+                )
+                uninstall_thread.start()
+                self.assertFalse(uninstall_reached_remove.wait(0.1))
+
+                release_replace.set()
+                install_thread.join(2)
+                uninstall_thread.join(2)
+
+        self.assertFalse(install_thread.is_alive())
+        self.assertFalse(uninstall_thread.is_alive())
+        self.assertTrue(replace_released.is_set())
+        self.assertFalse(uninstall_reached_remove.is_set())
 
     @patch("codex_master.server.check_mcp_registration", return_value={"registered": False, "ok": False})
     @patch("codex_master.server.repo_wrapper_path")
