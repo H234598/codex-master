@@ -4566,12 +4566,28 @@ def update_wait_agent_spark_health(
             "reason": "lease_not_held_by_this_server",
             "raw_output": "not_returned",
         }
+    lease_id = lease.get("lease_id")
+    if not isinstance(lease_id, str) or not LEASE_ID_RE.fullmatch(lease_id):
+        return {
+            "state": "not_checked",
+            "updated": False,
+            "reason": "lease_identity_unavailable",
+            "raw_output": "not_returned",
+        }
     with agent_lifecycle_lock(agent):
-        if agent_lease_status(agent).get("held_by_this_server") is not True:
+        fresh_lease = agent_lease_status(agent)
+        if fresh_lease.get("held_by_this_server") is not True:
             return {
                 "state": "not_checked",
                 "updated": False,
                 "reason": "lease_not_held_by_this_server",
+                "raw_output": "not_returned",
+            }
+        if fresh_lease.get("lease_id") != lease_id:
+            return {
+                "state": "not_checked",
+                "updated": False,
+                "reason": "lease_changed",
                 "raw_output": "not_returned",
             }
         return update_agent_spark_health(agent, state=state, reason=reason)

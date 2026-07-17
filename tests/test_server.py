@@ -4953,6 +4953,7 @@ class ServerHelpersTest(unittest.TestCase):
         self, mock_status_agent, mock_health, _mock_lease, mock_lifecycle_lock
     ) -> None:
         mock_lifecycle_lock.return_value.__enter__.return_value = None
+        _mock_lease.return_value = {"held_by_this_server": True, "lease_id": "a" * 32}
         mock_status_agent.return_value = {
             "agent": "a",
             "running": True,
@@ -4965,7 +4966,7 @@ class ServerHelpersTest(unittest.TestCase):
             "response_state": {"state": "running_tui_starter_context"},
             "limit_state": {"limited": False},
             "tui_context": {"state": "starter_placeholder", "evidence": "not_returned"},
-            "lease": {"state": "held", "held_by_this_server": True},
+            "lease": {"state": "held", "held_by_this_server": True, "lease_id": "a" * 32},
         }
 
         result = wait_agent("a", timeout_seconds=0, poll_interval_seconds=1)
@@ -11908,6 +11909,7 @@ class ServerHelpersTest(unittest.TestCase):
         self, mock_status_agent, _mock_sleep, mock_health, _mock_lease, mock_lifecycle_lock
     ) -> None:
         mock_lifecycle_lock.return_value.__enter__.return_value = None
+        _mock_lease.return_value = {"held_by_this_server": True, "lease_id": "b" * 32}
         mock_status_agent.side_effect = [
             {
                 "agent": "a",
@@ -11916,7 +11918,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
                 "response_state": {"state": "running_idle"},
                 "limit_state": {"limited": False},
-                "lease": {"state": "held", "held_by_this_server": True},
+                "lease": {"state": "held", "held_by_this_server": True, "lease_id": "b" * 32},
             },
             {
                 "agent": "a",
@@ -11925,7 +11927,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "raw_log_updated_at_utc": "2026-06-07T10:00:01+00:00",
                 "response_state": {"state": "running_recent_output"},
                 "limit_state": {"limited": False},
-                "lease": {"state": "held", "held_by_this_server": True},
+                "lease": {"state": "held", "held_by_this_server": True, "lease_id": "b" * 32},
             },
         ]
         mock_health.return_value = {"state": "healthy", "updated": True, "raw_output": "not_returned"}
@@ -11946,6 +11948,7 @@ class ServerHelpersTest(unittest.TestCase):
         self, mock_status_agent, mock_health, _mock_lease, mock_lifecycle_lock
     ) -> None:
         mock_lifecycle_lock.return_value.__enter__.return_value = None
+        _mock_lease.return_value = {"held_by_this_server": True, "lease_id": "c" * 32}
         mock_status_agent.return_value = {
             "agent": "a",
             "running": True,
@@ -11958,7 +11961,7 @@ class ServerHelpersTest(unittest.TestCase):
             "response_state": {"state": "running_tui_starter_context"},
             "limit_state": {"limited": False},
             "tui_context": {"state": "starter_placeholder", "evidence": "not_returned"},
-            "lease": {"state": "held", "held_by_this_server": True},
+            "lease": {"state": "held", "held_by_this_server": True, "lease_id": "c" * 32},
         }
         mock_health.return_value = {"state": "failed", "updated": True, "raw_output": "not_returned"}
 
@@ -11994,6 +11997,34 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["status"], "timeout")
         self.assertEqual(result["spark_health"]["state"], "not_checked")
         self.assertEqual(result["spark_health"]["reason"], "lease_not_held_by_this_server")
+        mock_health.assert_not_called()
+
+    @patch("codex_master.server.agent_lifecycle_lock")
+    @patch(
+        "codex_master.server.agent_lease_status",
+        return_value={"held_by_this_server": True, "lease_id": "d" * 32},
+    )
+    @patch("codex_master.server.update_agent_spark_health")
+    @patch("codex_master.server.status_agent")
+    def test_wait_does_not_update_spark_health_after_lease_replacement(
+        self, mock_status_agent, mock_health, _mock_lease, mock_lifecycle_lock
+    ) -> None:
+        mock_lifecycle_lock.return_value.__enter__.return_value = None
+        mock_status_agent.return_value = {
+            "agent": "a",
+            "running": True,
+            "raw_log_bytes": 10,
+            "raw_log_updated_at_utc": "2026-06-07T10:00:00+00:00",
+            "response_state": {"state": "running_idle"},
+            "limit_state": {"limited": False},
+            "lease": {"state": "held", "held_by_this_server": True, "lease_id": "e" * 32},
+        }
+
+        result = wait_agent("a", timeout_seconds=0, poll_interval_seconds=1)
+
+        self.assertEqual(result["status"], "timeout")
+        self.assertEqual(result["spark_health"]["state"], "not_checked")
+        self.assertEqual(result["spark_health"]["reason"], "lease_changed")
         mock_health.assert_not_called()
 
     def test_routing_decision_tool_is_prompt_free(self) -> None:
