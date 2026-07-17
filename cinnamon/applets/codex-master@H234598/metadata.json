@@ -1,0 +1,9 @@
+{
+  "uuid": "codex-master@H234598",
+  "name": "Flottenmanagement",
+  "description": "Steuert und überwacht die Codex-Master-Agentinnenflotte.",
+  "version": "1.0.0",
+  "icon": "network-workgroup",
+  "author": "H234598",
+  "max-instances": 1
+}
