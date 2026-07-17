@@ -8542,15 +8542,21 @@ def pool_public_path_state(path: Path) -> str:
 
 
 def pool_shared_asset_source(path: Path, root: Path) -> bool:
+    return pool_shared_asset_identity(path, root) is not None
+
+
+def pool_shared_asset_identity(path: Path, root: Path) -> tuple[Path, os.stat_result] | None:
     try:
         resolved = path.resolve(strict=True)
         resolved.relative_to(root.resolve(strict=False))
         source_stat = resolved.lstat()
     except (OSError, RuntimeError, ValueError):
-        return False
-    return (stat_module.S_ISREG(source_stat.st_mode) and getattr(source_stat, "st_nlink", 1) == 1) or stat_module.S_ISDIR(
+        return None
+    if (stat_module.S_ISREG(source_stat.st_mode) and getattr(source_stat, "st_nlink", 1) == 1) or stat_module.S_ISDIR(
         source_stat.st_mode
-    )
+    ):
+        return resolved, source_stat
+    return None
 
 
 def pool_regular_marker_present(path: Path) -> bool:
@@ -9224,9 +9230,18 @@ def agent_pool_install(
                 if not pool_shared_asset_source(source, root):
                     missing_asset_sources += 1
                     continue
+                source_identity = pool_shared_asset_identity(source, root)
+                if source_identity is None:
+                    raise AgentError("pool shared asset source changed during install")
                 ensure_private_dir(target.parent)
                 relative_source = os.path.relpath(source, target.parent)
                 target.symlink_to(relative_source)
+                current_source = pool_shared_asset_identity(source, root)
+                if current_source is None or not source_identity_matches(current_source[1], source_identity[1]):
+                    with contextlib.suppress(OSError):
+                        if target.is_symlink():
+                            target.unlink()
+                    raise AgentError("pool shared asset source changed during install")
                 linked_assets += 1
 
         marker = root / POOL_MARKER_FILE

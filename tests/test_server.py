@@ -11520,6 +11520,55 @@ class AgentPoolManagementTest(unittest.TestCase):
         self.assertTrue(status["shared_asset_template_source_missing_count"] >= 1)
         self.assertFalse(status["ok"])
 
+    def test_agent_pool_install_rejects_shared_asset_source_swap_during_link(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            pool.mkdir()
+            (pool / "a1" / "skills").mkdir(parents=True)
+            outside = tmp / "outside-shared-assets"
+            outside.mkdir()
+            (outside / "secret.txt").write_text("external-secret\n", encoding="utf-8")
+            spec = {
+                "schema_version": 1,
+                "pool_root": str(pool),
+                "codex_bin": "/bin/echo",
+                "series": [{"prefix": "a", "count": 2, "template": "a1", "authenticated": []}],
+                "shared_assets": ["skills"],
+                "runtime_dirs": [],
+            }
+            spec_path = self._write_spec_payload(tmp, spec)
+            real_source_check = server_module.pool_shared_asset_source
+            swapped = False
+
+            def swap_after_source_check(source: Path, root: Path) -> bool:
+                nonlocal swapped
+                result = real_source_check(source, root)
+                if source.name == "skills" and not swapped:
+                    source.rename(tmp / "original-skills")
+                    source.symlink_to(outside, target_is_directory=True)
+                    swapped = True
+                return result
+
+            with patch.object(
+                server_module,
+                "pool_shared_asset_source",
+                side_effect=swap_after_source_check,
+            ):
+                with self.assertRaisesRegex(AgentError, "pool shared asset source changed during install"):
+                    server_module.agent_pool_install(
+                        str(spec_path),
+                        target_dir=str(pool),
+                        codex_bin="/bin/echo",
+                    )
+
+            self.assertTrue(swapped)
+            self.assertFalse((pool / "a2" / "skills").is_symlink())
+            self.assertFalse((pool / "a2" / "skills").exists())
+            self.assertEqual((outside / "secret.txt").read_text(encoding="utf-8"), "external-secret\n")
+
     def test_agent_pool_copy_auth_treats_broken_target_symlink_as_existing(self) -> None:
         from codex_master import server as server_module
 
