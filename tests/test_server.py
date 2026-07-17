@@ -4150,6 +4150,40 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(mock_report.call_args.kwargs["lease"], lease)
         self.assertTrue(meta_store["watchdog"]["release_lease_after_action"])
 
+    def test_fleet_watchdog_keeps_fresh_lease_when_marker_write_fails_after_report_send(self) -> None:
+        meta_store: dict[str, object] = {}
+        status = {
+            "agent": "a",
+            "running": True,
+            "lease": {"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
+            "response_state": {"state": "running_recent_output"},
+            "raw_log_idle_seconds": 90,
+            "raw_log_bytes": 100,
+            "raw_log_updated_at_utc": "1970-01-01T00:15:00+00:00",
+            "started_at_utc": "2026-07-17T09:00:00+00:00",
+            "last_assignment": {"assignment_id": "assign-1", "created_at_utc": "2026-07-17T09:58:00+00:00"},
+        }
+        lease = {"state": "held", "holder": "this_server", "held_by_this_server": True}
+        report = {
+            "status": "report_requested",
+            "submitted": True,
+            "assignment_id": "assign-1",
+            "send": {"status": "sent"},
+        }
+        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "codex_master.server.status_agent", return_value=status
+        ), patch("codex_master.server.read_meta", return_value=meta_store), patch(
+            "codex_master.server.claim_agent", return_value={"status": "claimed", "lease": lease}
+        ), patch("codex_master.server.request_agent_report", return_value=report), patch(
+            "codex_master.server.update_watchdog_marker", side_effect=AgentError("marker write failed")
+        ), patch("codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}), patch(
+            "codex_master.server.release_agent"
+        ) as mock_release:
+            result = fleet_watchdog("a", manage_unclaimed=True)
+
+        self.assertEqual(result["results"][0]["error"], "marker write failed")
+        mock_release.assert_not_called()
+
     def test_fleet_watchdog_releases_claim_when_require_lease_is_disabled(self) -> None:
         meta_store: dict[str, object] = {}
         status = {

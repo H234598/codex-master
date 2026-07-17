@@ -4854,6 +4854,7 @@ def watchdog_agent(
             release_watchdog_lease = report_lease_claimed
             base["lease_state"] = lease.get("state")
             base["held_by_this_server"] = bool(lease.get("held_by_this_server"))
+        report: dict[str, Any] | None = None
         try:
             report = request_agent_report(agent, assignment_id=assignment_id, lease=lease)
             requested_at_utc = _dt.datetime.now(_dt.timezone.utc).isoformat()
@@ -4874,7 +4875,12 @@ def watchdog_agent(
                 },
             )
         except Exception:
-            if report_lease_claimed and agent_lease_status(agent).get("held_by_this_server"):
+            report_sent = (
+                isinstance(report, dict)
+                and isinstance(report.get("send"), dict)
+                and report["send"].get("status") == "sent"
+            )
+            if report_lease_claimed and not report_sent and agent_lease_status(agent).get("held_by_this_server"):
                 release_agent(agent, force=True)
             raise
         return {
