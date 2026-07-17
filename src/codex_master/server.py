@@ -1567,10 +1567,6 @@ def replace_private_bytes(path: Path, data: bytes) -> None:
         tmp_created = True
         tmp_path.replace(path)
         tmp_created = False
-        try:
-            path.chmod(0o600)
-        except PermissionError:
-            pass
     finally:
         if tmp_created:
             try:

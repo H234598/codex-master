@@ -6092,6 +6092,35 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(payload, {"safe": True})
         self.assertEqual(mode, 0o600)
 
+    def test_replace_private_bytes_does_not_chmod_swapped_symlink_target(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            target = root / "state.json"
+            outside = root / "outside-secret"
+            outside.write_text("secret\n", encoding="utf-8")
+            outside.chmod(0o644)
+            real_chmod = Path.chmod
+            swapped = False
+
+            def swap_before_target_chmod(mode, *args, **kwargs):
+                nonlocal swapped
+                if target.exists():
+                    target.unlink()
+                    target.symlink_to(outside)
+                    swapped = True
+                    return real_chmod(target, mode, *args, **kwargs)
+                return real_chmod(root, mode, *args, **kwargs)
+
+            with patch.object(Path, "chmod", side_effect=swap_before_target_chmod):
+                server_module.replace_private_bytes(target, b"managed\n")
+
+            self.assertFalse(swapped)
+            self.assertFalse(target.is_symlink())
+            self.assertEqual(target.read_text(encoding="utf-8"), "managed\n")
+            self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o644)
+
     def test_read_meta_refuses_symlink_and_oversized_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             meta_dir = Path(tmpdir) / "meta"
