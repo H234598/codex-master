@@ -7502,7 +7502,7 @@ def send_agent(
         )
     paste_mode = "bracketed_paste" if "\n" in text else "plain_paste"
     payload = f"{BRACKETED_PASTE_BEGIN}{text}{BRACKETED_PASTE_END}" if paste_mode == "bracketed_paste" else text
-    buffer_name = f"codex-master-mcp-{agent}-{int(time.time() * 1000)}"
+    buffer_name = f"codex-master-mcp-{agent}-{uuid.uuid4().hex}"
     cp = run_tmux(["load-buffer", "-b", buffer_name, "-"], input_text=payload, check=False)
     if cp.returncode != 0:
         raise AgentError(f"tmux load-buffer failed for agent {agent}")

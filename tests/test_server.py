@@ -9166,6 +9166,74 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(load_call["input_text"], "single line")
         self.assertFalse(any(call["args"][-1] == CODEX_TUI_SUBMIT_KEY for call in calls))
 
+    def test_send_agent_uses_distinct_tmux_buffers_for_parallel_sends(self) -> None:
+        first_loaded = threading.Event()
+        second_loaded = threading.Event()
+        load_lock = threading.Lock()
+        buffers = {}
+        load_names = []
+        pasted = []
+        results = []
+        load_count = 0
+
+        def fake_run_tmux(args, *, input_text=None, check=True, timeout=10):
+            nonlocal load_count
+            command = args[0]
+            if command == "load-buffer":
+                name = args[args.index("-b") + 1]
+                buffers[name] = input_text
+                with load_lock:
+                    load_count += 1
+                    count = load_count
+                    load_names.append(name)
+                if count == 1:
+                    first_loaded.set()
+                    if not second_loaded.wait(2):
+                        raise AssertionError("second load did not happen")
+                elif count == 2:
+                    second_loaded.set()
+                return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
+            if command == "paste-buffer":
+                name = args[args.index("-b") + 1]
+                payload = buffers.pop(name, None)
+                if payload is None:
+                    return subprocess.CompletedProcess(["tmux", *args], 1, "", "missing buffer")
+                pasted.append(payload)
+            elif command == "delete-buffer":
+                name = args[args.index("-b") + 1]
+                buffers.pop(name, None)
+            return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
+
+        def send(text):
+            try:
+                results.append((text, send_agent("a", text, enter=False)))
+            except Exception as exc:  # noqa: BLE001 - capture worker result for assertion
+                results.append((text, exc))
+
+        with patch("codex_master.server.tmux_alive", return_value=True), patch(
+            "codex_master.server.wait_agent_input_ready", return_value={"ready": True}
+        ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux), patch(
+            "codex_master.server.time.time", return_value=1234.0
+        ):
+            first = threading.Thread(target=send, args=("first",))
+            second = threading.Thread(target=send, args=("second",))
+            first.start()
+            self.assertTrue(first_loaded.wait(2))
+            second.start()
+            first.join(3)
+            second.join(3)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(len(results), 2)
+        for text, result in results:
+            with self.subTest(text=text):
+                self.assertIsInstance(result, dict)
+                self.assertEqual(result["status"], "sent")
+        self.assertEqual(len(load_names), 2)
+        self.assertEqual(len(set(load_names)), 2)
+        self.assertCountEqual(pasted, ["first", "second"])
+
     def test_send_agent_fails_when_tui_input_is_not_ready(self) -> None:
         calls = []
 
