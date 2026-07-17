@@ -10583,8 +10583,9 @@ def _agent_pool_status_at_root(normalized: dict[str, Any], root: Path, root_stat
     shared_symlinks = 0
     for agent in ids:
         home = root / agent
-        if is_real_directory_no_symlink(home):
-            existing += 1
+        if not is_real_directory_no_symlink(home):
+            continue
+        existing += 1
         if is_regular_executable_no_symlink(home / "codex"):
             wrappers += 1
         if is_regular_file_no_symlink(home / "config.toml"):
@@ -10608,15 +10609,23 @@ def _agent_pool_status_at_root(normalized: dict[str, Any], root: Path, root_stat
     for agent in ids:
         template = normalized["templates"][agent]
         home = root / agent
+        home_is_real = is_real_directory_no_symlink(home)
         for asset in normalized["shared_assets"]:
             target = home / asset
             if template == agent:
+                if not home_is_real:
+                    if agent in templates_with_consumers:
+                        template_sources_missing += 1
+                    continue
                 if pool_shared_asset_source(target, root):
                     template_sources += 1
                 elif agent in templates_with_consumers:
                     template_sources_missing += 1
                 continue
             shared_expected += 1
+            if not home_is_real:
+                shared_missing += 1
+                continue
             try:
                 mode = target.lstat().st_mode
             except FileNotFoundError:

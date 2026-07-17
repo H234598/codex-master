@@ -14565,6 +14565,40 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertNotIn(custom_prefix, payload)
             self.assertNotIn(str(pool), payload)
 
+    def test_agent_pool_status_does_not_count_files_through_symlinked_home(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            outside = tmp / "outside"
+            pool.mkdir()
+            outside.mkdir()
+            (outside / "codex").write_text("#!/bin/sh\n", encoding="utf-8")
+            (outside / "codex").chmod(0o700)
+            (outside / "config.toml").write_text("outside\n", encoding="utf-8")
+            (outside / "auth.json").write_text('{"token":"outside"}\n', encoding="utf-8")
+            (pool / "late1").symlink_to(outside, target_is_directory=True)
+            spec_path = self._write_spec_payload(
+                tmp,
+                {
+                    "schema_version": 1,
+                    "pool_root": str(pool),
+                    "codex_bin": "/bin/echo",
+                    "series": [{"prefix": "late", "count": 1, "template": "late1", "authenticated": []}],
+                    "shared_assets": [],
+                    "runtime_dirs": [],
+                },
+            )
+
+            result = server_module.agent_pool_status(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["existing_agent_count"], 0)
+        self.assertEqual(result["wrapper_executable_count"], 0)
+        self.assertEqual(result["config_count"], 0)
+        self.assertEqual(result["auth_count"], 0)
+
     def test_agent_pool_status_does_not_follow_symlinked_pool_root(self) -> None:
         from codex_master import server as server_module
 
