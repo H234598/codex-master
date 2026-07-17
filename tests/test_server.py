@@ -8897,6 +8897,17 @@ class ServerHelpersTest(unittest.TestCase):
             )
         )
 
+    @patch("codex_master.server.require_managed_tmux_session")
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("codex_master.server.run_tmux")
+    def test_pane_tail_can_recheck_identity_before_capture(self, mock_run_tmux, _mock_alive, mock_identity) -> None:
+        mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux", "capture-pane"], 0, "› Ready\n", "")
+
+        from codex_master.server import pane_tail
+
+        self.assertEqual(pane_tail("a", 24, verify_identity=True), "› Ready\n")
+        mock_identity.assert_called_once_with("a1")
+
     @patch("codex_master.server.run_tmux")
     @patch("codex_master.server.require_managed_tmux_session")
     def test_dismiss_codex_update_prompt_never_selects_update(self, _mock_identity, mock_run_tmux) -> None:

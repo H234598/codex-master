@@ -4637,8 +4637,8 @@ def status_agent(agent: str) -> dict[str, Any]:
     latest_assignment = latest_assignment_summary(agent)
     auth = agent_auth_status(agent)
     pane_is_managed = running and identity_guard["ok"]
-    pane_text = pane_tail(agent, MAX_TAIL_LINES) if pane_is_managed else ""
-    visible_pane_text = pane_tail(agent, 24, visible_only=True) if pane_is_managed else ""
+    pane_text = pane_tail(agent, MAX_TAIL_LINES, verify_identity=True) if pane_is_managed else ""
+    visible_pane_text = pane_tail(agent, 24, visible_only=True, verify_identity=True) if pane_is_managed else ""
     tui_context = classify_tui_context(visible_pane_text, running)
     limit_state = agent_limit_state(
         agent,
@@ -8727,7 +8727,7 @@ def wait_agent_input_ready(agent: str, timeout_seconds: float = DEFAULT_SEND_REA
     update_prompt_attempted = False
     while True:
         polls += 1
-        text = pane_tail(agent, 24, visible_only=True)
+        text = pane_tail(agent, 24, visible_only=True, verify_identity=True)
         if tui_accepts_input(text):
             return {
                 "ready": True,
@@ -8948,12 +8948,14 @@ def read_log_tail(path: Path, approx_bytes: int) -> str:
             os.close(fd)
 
 
-def pane_tail(agent: str, lines: int, *, visible_only: bool = False) -> str:
+def pane_tail(agent: str, lines: int, *, visible_only: bool = False, verify_identity: bool = False) -> str:
     agent = canonical_agent_id(agent)
     cfg = AGENTS[agent]
     session = cfg["session"]
     if not tmux_alive(session):
         return ""
+    if verify_identity:
+        require_managed_tmux_session(agent)
     args = ["capture-pane", "-p", "-t", session]
     if not visible_only:
         args.extend(["-S", f"-{lines}"])
@@ -8975,7 +8977,7 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
     if source == "pane":
         if tmux_alive(AGENTS[agent]["session"]):
             require_managed_tmux_session(agent)
-        raw = pane_tail(agent, lines)
+        raw = pane_tail(agent, lines, verify_identity=True)
     else:
         raw_log = meta.get("raw_log")
         raw_log_identity = allowed_agent_raw_log_identity(agent, raw_log)
