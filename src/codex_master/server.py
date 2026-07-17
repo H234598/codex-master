@@ -2870,7 +2870,11 @@ def protected_raw_log_paths() -> set[Path]:
             record_agent = agent
         raw_log = read_meta(record_agent).get("raw_log")
         identity = allowed_agent_raw_log_identity(record_agent, raw_log)
-        if identity is not None and identity[1] is not None:
+        if (
+            identity is not None
+            and identity[1] is not None
+            and stat_module.S_ISREG(identity[1].st_mode)
+        ):
             protected.add(identity[0])
             continue
         recovered = latest_managed_raw_log(record_agent, include_legacy=bool(raw_log))

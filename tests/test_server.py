@@ -3094,6 +3094,36 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIsNone(status["raw_log_bytes"])
         self.assertFalse(status["raw_log_path_valid"])
 
+    def test_prune_raw_logs_recovers_from_nonregular_raw_log_metadata(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "raw"
+            raw_dir.mkdir()
+            invalid = raw_dir / "stale.log"
+            invalid.mkdir()
+            active = raw_dir / "20260717T070000000000Z-a.log"
+            newer = raw_dir / "20260717T070001000000Z-b.log"
+            active.write_text("active\n", encoding="utf-8")
+            newer.write_text("newer\n", encoding="utf-8")
+            os.utime(active, (1000, 1000))
+            os.utime(newer, (1001, 1001))
+            agent = {"label": "A", "runner": root / "codex", "home": root, "session": "session-a"}
+            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=True), patch(
+                "codex_master.server.RAW_DIR", raw_dir
+            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "codex_master.server.META_DIR", root / "meta"
+            ), patch("codex_master.server.read_meta", return_value={"raw_log": str(invalid)}), patch(
+                "codex_master.server.tmux_alive", return_value=True
+            ):
+                server_module.prune_raw_logs(max_files=1)
+            active_exists = active.is_file()
+            newer_exists = newer.is_file()
+
+        self.assertTrue(active_exists)
+        self.assertTrue(newer_exists)
+
     def test_prune_raw_logs_preserves_recoverable_live_agent_log(self) -> None:
         from codex_master import server as server_module
 
