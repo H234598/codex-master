@@ -6020,6 +6020,42 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(external_content, "external-secret\n")
         self.assertTrue(original_exists)
 
+    def test_cleanup_failed_start_rejects_raw_log_swap_before_unlink(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "raw"
+            raw_dir.mkdir()
+            raw_log = raw_dir / "agent.log"
+            backup_log = root / "agent-original.log"
+            outside_log = root / "outside.log"
+            raw_log.write_text("managed\n", encoding="utf-8")
+            outside_log.write_text("external\n", encoding="utf-8")
+            real_lstat = Path.lstat
+            swapped = False
+
+            def swap_after_lstat(path):
+                nonlocal swapped
+                result = real_lstat(path)
+                if path == raw_log and not swapped:
+                    swapped = True
+                    raw_log.rename(backup_log)
+                    outside_log.rename(raw_log)
+                return result
+
+            with patch.object(server_module, "tmux_alive", return_value=False), patch.object(
+                Path, "lstat", autospec=True, side_effect=swap_after_lstat
+            ):
+                server_module.cleanup_failed_start("session", raw_log, kill_session=False)
+
+            external_content = raw_log.read_text(encoding="utf-8")
+            original_exists = backup_log.exists()
+
+        self.assertTrue(swapped)
+        self.assertEqual(external_content, "external\n")
+        self.assertTrue(original_exists)
+
     def test_legacy_raw_symlink_is_not_traversed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             raw_dir = Path(tmpdir) / "raw"

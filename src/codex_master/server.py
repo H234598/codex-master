@@ -3218,6 +3218,16 @@ def cleanup_failed_start(session: str, raw_log: Path, *, kill_session: bool) -> 
     if kill_session and tmux_alive(session):
         run_tmux(["kill-session", "-t", session], check=False)
     try:
+        current = raw_log.lstat()
+    except FileNotFoundError:
+        return
+    try:
+        latest = raw_log.lstat()
+    except FileNotFoundError:
+        return
+    if not source_identity_matches(latest, current):
+        return
+    try:
         raw_log.unlink()
     except FileNotFoundError:
         pass
