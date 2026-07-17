@@ -73,6 +73,7 @@ from codex_master.server import (
     codex_usage_watchdog_status,
     codex_usage_routing_decision,
     codex_usage_spark_health_update,
+    dismiss_codex_update_prompt,
     validate_codex_usage_routing_decision,
     DEFAULT_AGENT_MODEL,
     DEFAULT_AGENT_MODEL_EFFORT,
@@ -6680,6 +6681,25 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIsNone(summary["external_process_count"])
         self.assertIsNone(summary["managed_process_count"])
 
+    def test_pool_home_processes_detects_process_cwd_inside_home(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home = root / "pool" / "a1"
+            home.mkdir(parents=True)
+            proc_root = root / "proc"
+            process = proc_root / "100"
+            process.mkdir(parents=True)
+            (process / "environ").write_bytes(b"")
+            (process / "status").write_text("Name:\tsleep\nState:\tS (sleeping)\nPPid:\t1\n", encoding="utf-8")
+            (process / "cwd").symlink_to(home, target_is_directory=True)
+
+            processes = server_module.pool_home_processes(home, proc_root)
+
+        self.assertIsNotNone(processes)
+        self.assertEqual([item["pid"] for item in processes], [100])
+
     def test_agent_identity_guard_blocks_unavailable_process_scan(self) -> None:
         result = agent_identity_guard(
             False,
@@ -7696,6 +7716,66 @@ class ServerHelpersTest(unittest.TestCase):
                 "› Summarize recent commits\n"
             )
         )
+
+    @patch("codex_master.server.run_tmux")
+    def test_dismiss_codex_update_prompt_never_selects_update(self, mock_run_tmux) -> None:
+        mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "", "")
+
+        self.assertTrue(
+            dismiss_codex_update_prompt(
+                "a",
+                "Update available! 0.144.4 -> 0.144.5\n› 1. Update now\n2. Skip\nPress enter to continue\n",
+            )
+        )
+        self.assertEqual(
+            [call.args[0][-1] for call in mock_run_tmux.call_args_list],
+            ["Down", "Enter"],
+        )
+
+        mock_run_tmux.reset_mock()
+        self.assertTrue(
+            dismiss_codex_update_prompt(
+                "a",
+                "Update available! 0.144.4 -> 0.144.5\n› 2. Skip\nPress enter to continue\n",
+            )
+        )
+        mock_run_tmux.assert_called_once_with(
+            ["send-keys", "-t", "codex_agent_a1_mcp", "Enter"], check=False
+        )
+
+    @patch("codex_master.server.run_tmux")
+    @patch("codex_master.server.pane_tail")
+    def test_wait_agent_input_ready_skips_known_update_prompt(self, mock_pane_tail, mock_run_tmux) -> None:
+        mock_pane_tail.side_effect = [
+            "Update available! 0.144.4 -> 0.144.5\n› 1. Update now\n2. Skip\nPress enter to continue\n",
+            "› Ready\n",
+        ]
+        mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "", "")
+
+        result = wait_agent_input_ready("a", timeout_seconds=0)
+
+        self.assertTrue(result["ready"])
+        self.assertTrue(result["update_prompt_dismissed"])
+        self.assertEqual([call.args[0][-1] for call in mock_run_tmux.call_args_list], ["Down", "Enter"])
+
+    @patch("codex_master.server.time.sleep")
+    @patch("codex_master.server.time.monotonic", side_effect=[0.0, 0.0, 0.0])
+    @patch("codex_master.server.run_tmux")
+    @patch("codex_master.server.pane_tail")
+    def test_wait_agent_input_ready_handles_update_prompt_after_empty_poll(
+        self, mock_pane_tail, mock_run_tmux, _mock_monotonic, _mock_sleep
+    ) -> None:
+        mock_pane_tail.side_effect = [
+            "",
+            "Update available! 0.144.4 -> 0.144.5\n› 1. Update now\n2. Skip\nPress enter to continue\n",
+            "› Ready\n",
+        ]
+        mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "", "")
+
+        result = wait_agent_input_ready("a", timeout_seconds=1)
+
+        self.assertTrue(result["ready"])
+        self.assertTrue(result["update_prompt_dismissed"])
 
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.run_tmux")
@@ -12888,6 +12968,65 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(marker_lstat_count, 2)
             self.assertTrue(original_marker.is_file())
             self.assertEqual(marker.read_text(encoding="utf-8"), "foreign marker\n")
+
+    def test_agent_pool_destroy_rejects_pool_home_process_before_removal(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            state = tmp / "state"
+            spec_path = self._write_spec(tmp, pool)
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "LOCK_DIR", state / "locks"
+            ), patch.object(server_module, "LEASE_DIR", state / "leases"), patch.object(
+                server_module,
+                "agent_lease_status",
+                return_value={"state": "unclaimed"},
+            ), patch.object(
+                server_module,
+                "pool_home_processes",
+                return_value=[{"pid": 100, "raw_output": "not_returned"}],
+            ) as scan:
+                with self.assertRaisesRegex(AgentError, "pool Agentin home is in use"):
+                    server_module.agent_pool_destroy_pool(
+                        str(spec_path),
+                        target_dir=str(pool),
+                        codex_bin="/bin/echo",
+                        yes=True,
+                    )
+
+            scan.assert_called_once()
+            self.assertTrue((pool / "a1").is_dir())
+            self.assertTrue((pool / server_module.POOL_MARKER_FILE).is_file())
+
+    def test_agent_pool_destroy_rejects_active_lease_before_removal(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            state = tmp / "state"
+            spec_path = self._write_spec(tmp, pool)
+            server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin="/bin/echo")
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "LOCK_DIR", state / "locks"
+            ), patch.object(server_module, "LEASE_DIR", state / "leases"), patch.object(
+                server_module,
+                "agent_lease_status",
+                return_value={"state": "held"},
+            ), patch.object(server_module, "pool_home_processes") as scan:
+                with self.assertRaisesRegex(AgentError, "active or unreadable lease"):
+                    server_module.agent_pool_destroy_pool(
+                        str(spec_path),
+                        target_dir=str(pool),
+                        codex_bin="/bin/echo",
+                        yes=True,
+                    )
+
+            scan.assert_not_called()
+            self.assertTrue((pool / "a1").is_dir())
 
     def test_agent_pool_destroy_rejects_symlinked_pool_root_without_removing_external_entries(self) -> None:
         from codex_master import server as server_module

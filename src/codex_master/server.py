@@ -295,6 +295,7 @@ CODEX_TUI_BLOCKING_PROMPT_PATTERNS = (
     r"\bmcp startup incomplete\b",
     r"\byour access token could not be refreshed\b",
 )
+CODEX_TUI_UPDATE_SELECTION_PATTERN = re.compile(r"^›\s+([123])\.\s+", re.IGNORECASE)
 PATH_NOT_RETURNED = "not_returned"
 
 
@@ -3137,6 +3138,80 @@ def agent_home_process_summary(agent: str, proc_root: Path = Path("/proc")) -> d
         "external_processes_truncated": len(external) > 10,
         "raw_output": "not_returned",
     }
+
+
+def pool_home_processes(home: Path, proc_root: Path = Path("/proc")) -> list[dict[str, Any]] | None:
+    if not proc_root.exists():
+        return None
+    try:
+        resolved_home = home.expanduser().resolve(strict=False)
+        pid_dirs = list(proc_root.iterdir())
+    except (OSError, RuntimeError):
+        return None
+    processes: list[dict[str, Any]] = []
+    for pid_dir in pid_dirs:
+        if not pid_dir.name.isdigit():
+            continue
+        status = read_proc_status(pid_dir)
+        if status.get("State", "").startswith("Z"):
+            continue
+        uid_parts = status.get("Uid", "").split()
+        if uid_parts and uid_parts[0].isdigit() and int(uid_parts[0]) != os.getuid():
+            continue
+        env = read_proc_environ(pid_dir)
+        matches_home = False
+        managed = False
+        if env is None:
+            name = (status.get("Name") or "").lower()
+            argv = read_proc_cmdline(pid_dir)
+            argv_names = {Path(item).name.lower() for item in argv if item}
+            joined = "\0".join(argv).lower()
+            codex_like = (
+                name == "codex"
+                or "codex" in argv_names
+                or "@openai/codex" in joined
+                or "node_modules/@openai/codex" in joined
+            )
+            if codex_like:
+                return None
+            continue
+        if env is not None:
+            configured_home = env.get("CODEX_HOME", "")
+            if configured_home:
+                try:
+                    matches_home = path_is_within(
+                        Path(configured_home).expanduser().resolve(strict=False), resolved_home
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    matches_home = False
+            managed = env.get("CODEX_AGENT_MCP") == "1" or env.get("CODEX_MASTER_MCP") == "1"
+        if not matches_home:
+            try:
+                current_dir = (pid_dir / "cwd").resolve(strict=True)
+            except FileNotFoundError:
+                continue
+            except (OSError, RuntimeError):
+                return None
+            matches_home = path_is_within(current_dir, resolved_home)
+        if not matches_home:
+            continue
+        try:
+            pid = int(pid_dir.name)
+        except ValueError:
+            continue
+        ppid_parts = status.get("PPid", "0").split()
+        ppid = int(ppid_parts[0]) if ppid_parts and ppid_parts[0].isdigit() else None
+        processes.append(
+            {
+                "pid": pid,
+                "ppid": ppid,
+                "name": status.get("Name") or "unknown",
+                "state": status.get("State") or "unknown",
+                "managed_by_masterjet": managed,
+                "raw_output": "not_returned",
+            }
+        )
+    return sorted(processes, key=lambda item: item["pid"])
 
 
 def agent_identity_guard(running: bool, process_summary: dict[str, Any]) -> dict[str, Any]:
@@ -8018,6 +8093,35 @@ def tui_accepts_input(text: str) -> bool:
     return False
 
 
+def codex_update_prompt_visible(text: str) -> bool:
+    cleaned = strip_ansi(text).lower()
+    return "update available!" in cleaned and "press enter to continue" in cleaned
+
+
+def dismiss_codex_update_prompt(agent: str, text: str) -> bool:
+    """Select a non-updating option in Codex's blocking update dialog."""
+    cleaned = strip_ansi(text)
+    if not codex_update_prompt_visible(cleaned):
+        return False
+    selected = next(
+        (
+            match.group(1)
+            for line in cleaned.splitlines()
+            if (match := CODEX_TUI_UPDATE_SELECTION_PATTERN.match(line.strip()))
+        ),
+        None,
+    )
+    if selected is None:
+        return False
+    keys = ("Down", "Enter") if selected == "1" else ("Enter",)
+    session = AGENTS[canonical_agent_id(agent)]["session"]
+    for key in keys:
+        result = run_tmux(["send-keys", "-t", session, key], check=False)
+        if result.returncode != 0:
+            return False
+    return True
+
+
 def wait_agent_input_ready(agent: str, timeout_seconds: float = DEFAULT_SEND_READY_TIMEOUT_SECONDS) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     try:
@@ -8029,6 +8133,8 @@ def wait_agent_input_ready(agent: str, timeout_seconds: float = DEFAULT_SEND_REA
     timeout_seconds = max(0.0, timeout_seconds)
     deadline = time.monotonic() + timeout_seconds
     polls = 0
+    update_prompt_dismissed = False
+    update_prompt_attempted = False
     while True:
         polls += 1
         text = pane_tail(agent, 24, visible_only=True)
@@ -8038,14 +8144,21 @@ def wait_agent_input_ready(agent: str, timeout_seconds: float = DEFAULT_SEND_REA
                 "poll_count": polls,
                 "timeout_seconds": timeout_seconds,
                 "evidence": "not_returned",
+                "update_prompt_dismissed": update_prompt_dismissed,
                 "raw_output": "not_returned",
             }
+        if not update_prompt_attempted and codex_update_prompt_visible(text):
+            update_prompt_attempted = True
+            update_prompt_dismissed = dismiss_codex_update_prompt(agent, text)
+            if update_prompt_dismissed:
+                continue
         if time.monotonic() >= deadline:
             return {
                 "ready": False,
                 "poll_count": polls,
                 "timeout_seconds": timeout_seconds,
                 "evidence": "not_returned",
+                "update_prompt_dismissed": update_prompt_dismissed,
                 "raw_output": "not_returned",
             }
         time.sleep(min(SEND_READY_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
@@ -9826,6 +9939,14 @@ def agent_pool_copy_auth(
         }
 
 
+@contextlib.contextmanager
+def pool_agent_lifecycle_locks(agents: list[str]) -> Any:
+    with contextlib.ExitStack() as stack:
+        for agent in sorted(agents):
+            stack.enter_context(agent_lifecycle_lock(agent))
+        yield
+
+
 def agent_pool_destroy_pool(
     spec: str | None = None,
     target_dir: str | None = None,
@@ -9896,54 +10017,73 @@ def agent_pool_destroy_pool(
         )
         if not marker_valid and not force:
             raise AgentError("destroy_pool requires an installed pool marker or force=true")
-        for agent in normalized["ids"]:
-            target = operation_root / agent
-            removal_state = remove_agent_pool_entry(target)
-            if removal_state == "missing":
-                missing += 1
-            elif removal_state == "removed":
-                removed += 1
-            else:
-                skipped += 1
-
-        if marker_valid:
-            try:
-                latest_marker_stat = marker.lstat()
-            except FileNotFoundError:
-                latest_marker_stat = None
-            except OSError as exc:
-                raise AgentError("pool marker changed during removal") from exc
-            if latest_marker_stat is not None:
-                if (
-                    not stat_module.S_ISREG(latest_marker_stat.st_mode)
-                    or getattr(latest_marker_stat, "st_nlink", 1) != 1
-                    or not source_identity_matches(latest_marker_stat, marker_stat)
-                ):
-                    raise AgentError("pool marker changed during removal")
+        with pool_agent_lifecycle_locks(normalized["ids"]):
+            for agent in normalized["ids"]:
+                lease = agent_lease_status(agent, initialize_state=False)
+                if lease.get("state") not in {"unclaimed", "expired"}:
+                    raise AgentError("pool Agentin has an active or unreadable lease")
+                target = operation_root / agent
                 try:
-                    if root_fd >= 0:
-                        os.unlink(POOL_MARKER_FILE, dir_fd=root_fd)
-                    else:
-                        marker.unlink()
+                    target_stat = target.lstat()
                 except FileNotFoundError:
-                    pass
-        if remove_root:
-            if root_fd >= 0:
+                    continue
+                except OSError as exc:
+                    raise AgentError("pool Agentin home could not be inspected") from exc
+                if stat_module.S_ISDIR(target_stat.st_mode) and not stat_module.S_ISLNK(target_stat.st_mode):
+                    processes = pool_home_processes(target)
+                    if processes is None:
+                        raise AgentError("pool Agentin home process scan unavailable")
+                    if processes:
+                        raise AgentError("pool Agentin home is in use")
+
+            for agent in normalized["ids"]:
+                target = operation_root / agent
+                removal_state = remove_agent_pool_entry(target)
+                if removal_state == "missing":
+                    missing += 1
+                elif removal_state == "removed":
+                    removed += 1
+                else:
+                    skipped += 1
+
+            if marker_valid:
                 try:
-                    current_root = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
-                    if stat_module.S_ISDIR(current_root.st_mode) and source_identity_matches(
-                        current_root, root_stat_before
+                    latest_marker_stat = marker.lstat()
+                except FileNotFoundError:
+                    latest_marker_stat = None
+                except OSError as exc:
+                    raise AgentError("pool marker changed during removal") from exc
+                if latest_marker_stat is not None:
+                    if (
+                        not stat_module.S_ISREG(latest_marker_stat.st_mode)
+                        or getattr(latest_marker_stat, "st_nlink", 1) != 1
+                        or not source_identity_matches(latest_marker_stat, marker_stat)
                     ):
-                        os.rmdir(root.name, dir_fd=parent_fd)
+                        raise AgentError("pool marker changed during removal")
+                    try:
+                        if root_fd >= 0:
+                            os.unlink(POOL_MARKER_FILE, dir_fd=root_fd)
+                        else:
+                            marker.unlink()
+                    except FileNotFoundError:
+                        pass
+            if remove_root:
+                if root_fd >= 0:
+                    try:
+                        current_root = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+                        if stat_module.S_ISDIR(current_root.st_mode) and source_identity_matches(
+                            current_root, root_stat_before
+                        ):
+                            os.rmdir(root.name, dir_fd=parent_fd)
+                            root_removed = True
+                    except OSError:
+                        root_removed = False
+                else:
+                    try:
+                        root.rmdir()
                         root_removed = True
-                except OSError:
-                    root_removed = False
-            else:
-                try:
-                    root.rmdir()
-                    root_removed = True
-                except OSError:
-                    root_removed = False
+                    except OSError:
+                        root_removed = False
     finally:
         if root_fd >= 0:
             os.close(root_fd)
