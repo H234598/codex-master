@@ -3668,6 +3668,31 @@ class ServerHelpersTest(unittest.TestCase):
                 with self.assertRaisesRegex(AgentError, "names_offset must be >= 0"):
                     skills_agent("a", names_offset=-1)
 
+    def test_skill_scans_do_not_follow_symlinked_agent_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home = root / "home"
+            outside = root / "outside"
+            (outside / "skills" / ".system" / "secret-skill").mkdir(parents=True)
+            (outside / "skills" / ".system" / "secret-skill" / "SKILL.md").write_text(
+                "secret skill\n",
+                encoding="utf-8",
+            )
+            home.symlink_to(outside, target_is_directory=True)
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": root / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                inventory = skills_agent("a", include_names=True)
+                match = skill_match_agent("a", "secret-skill")
+
+        self.assertEqual(inventory["total"], 0)
+        self.assertEqual(inventory["system_skills"], [])
+        self.assertEqual(inventory["names"], [])
+        self.assertFalse(match["available"])
+        self.assertEqual(match["matches"], [])
+
     def test_skill_match_agent_rejects_invalid_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)

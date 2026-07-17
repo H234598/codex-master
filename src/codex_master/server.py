@@ -5795,17 +5795,18 @@ def skills_agent(
         minimum=0,
         maximum=MAX_SKILL_NAMES,
     )
+    home_is_real = is_real_directory_no_symlink(home)
 
     all_paths: list[Path] = []
     roots: list[dict[str, Any]] = []
     for kind, root in skill_scan_roots(home):
-        paths = list_skill_files(root)
+        paths = list_skill_files(root) if home_is_real else []
         roots.append(
             {
                 "kind": kind,
                 "path": PATH_NOT_RETURNED,
                 "path_state": "configured",
-                "exists": is_real_directory_no_symlink(root),
+                "exists": home_is_real and is_real_directory_no_symlink(root),
                 "skill_count": len(paths),
             }
         )
@@ -5920,6 +5921,8 @@ def skill_matches(agent: str, skill_ref: str, limit: int = 8) -> list[dict[str, 
     home = cfg["home"]
     wanted = skill_ref.strip().lower()
     matches: list[dict[str, str]] = []
+    if not is_real_directory_no_symlink(home):
+        return matches
 
     for _kind, root in skill_scan_roots(home):
         for path in list_skill_files(root):
