@@ -289,6 +289,12 @@ BRACKETED_PASTE_END = "\x1b[201~"
 CODEX_TUI_SUBMIT_KEY = "S-Enter"
 CODEX_TUI_INPUT_MARKERS = ("›",)
 CODEX_TUI_INPUT_MARKER_WINDOW_LINES = 8
+CODEX_TUI_BLOCKING_PROMPT_PATTERNS = (
+    r"\bupdate available!\b",
+    r"\bpress enter to continue\b",
+    r"\bmcp startup incomplete\b",
+    r"\byour access token could not be refreshed\b",
+)
 PATH_NOT_RETURNED = "not_returned"
 
 
@@ -6764,6 +6770,10 @@ def plugin_cache_name_excluded(name: str) -> bool:
 
 
 def remove_real_plugin_cache_dir(path: Path) -> None:
+    path = path.expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path = path.absolute()
     try:
         current = path.lstat()
     except FileNotFoundError:
@@ -6774,10 +6784,61 @@ def remove_real_plugin_cache_dir(path: Path) -> None:
         raise AgentError("plugin cache entry is not a real directory")
     if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
         raise AgentError("safe plugin cache removal is unavailable")
+    parent_fd = -1
+    entry_fd = -1
     try:
-        shutil.rmtree(path)
+        try:
+            parent_stat = path.parent.lstat()
+        except OSError as exc:
+            raise AgentError("plugin cache entry changed during removal") from exc
+        parent_parts = path.parent.parts
+        if len(parent_parts) == 5 and parent_parts[:4] == ("/", "proc", "self", "fd") and parent_parts[4].isdigit():
+            try:
+                parent_fd = os.dup(int(parent_parts[4]))
+                opened_parent = os.fstat(parent_fd)
+            except OSError as exc:
+                if parent_fd >= 0:
+                    os.close(parent_fd)
+                raise AgentError("plugin cache entry changed during removal") from exc
+            if not stat_module.S_ISDIR(opened_parent.st_mode):
+                raise AgentError("plugin cache entry changed during removal")
+        else:
+            parent_fd = open_directory_no_follow_matching(
+                path.parent,
+                parent_stat,
+                error_text="could_not_sync_plugin_cache",
+                changed_text="plugin cache entry changed during removal",
+            )
+        latest = os.lstat(path.name, dir_fd=parent_fd)
+        if not source_identity_matches(latest, current) or not stat_module.S_ISDIR(latest.st_mode):
+            raise AgentError("plugin cache entry changed during removal")
+        entry_fd = open_directory_no_follow_matching(
+            path.name,
+            current,
+            error_text="could_not_sync_plugin_cache",
+            changed_text="plugin cache entry changed during removal",
+            dir_fd=parent_fd,
+        )
+
+        def ignore_top_rmdir(func: Any, error_path: Any, exc_info: Any) -> None:
+            if func is os.rmdir and error_path in {".", b"."}:
+                return
+            raise exc_info[1]
+
+        shutil.rmtree(".", dir_fd=entry_fd, onerror=ignore_top_rmdir)
+        latest = os.lstat(path.name, dir_fd=parent_fd)
+        if not source_identity_matches(latest, current) or not stat_module.S_ISDIR(latest.st_mode):
+            raise AgentError("plugin cache entry changed during removal")
+        os.rmdir(path.name, dir_fd=parent_fd)
+    except AgentError:
+        raise
     except OSError as exc:
         raise AgentError("could_not_sync_plugin_cache") from exc
+    finally:
+        if entry_fd >= 0:
+            os.close(entry_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
 
 def valid_plugin_cache_entry_version(entry: Path) -> str | None:
@@ -7823,7 +7884,12 @@ def tui_accepts_input(text: str) -> bool:
     cleaned = strip_ansi(text)
     if not cleaned.strip():
         return False
+    lowered = cleaned.lower()
+    if any(re.search(pattern, lowered) for pattern in CODEX_TUI_BLOCKING_PROMPT_PATTERNS):
+        return False
     lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    if any(re.match(r"^›\s+\d+\.\s+", line) for line in lines[-CODEX_TUI_INPUT_MARKER_WINDOW_LINES:]):
+        return False
     for line in lines[-CODEX_TUI_INPUT_MARKER_WINDOW_LINES:]:
         if any(line.startswith(marker) for marker in CODEX_TUI_INPUT_MARKERS):
             return True
@@ -7843,7 +7909,7 @@ def wait_agent_input_ready(agent: str, timeout_seconds: float = DEFAULT_SEND_REA
     polls = 0
     while True:
         polls += 1
-        text = pane_tail(agent, 24)
+        text = pane_tail(agent, 24, visible_only=True)
         if tui_accepts_input(text):
             return {
                 "ready": True,
@@ -8052,13 +8118,16 @@ def read_log_tail(path: Path, approx_bytes: int) -> str:
             os.close(fd)
 
 
-def pane_tail(agent: str, lines: int) -> str:
+def pane_tail(agent: str, lines: int, *, visible_only: bool = False) -> str:
     agent = canonical_agent_id(agent)
     cfg = AGENTS[agent]
     session = cfg["session"]
     if not tmux_alive(session):
         return ""
-    cp = run_tmux(["capture-pane", "-p", "-t", session, "-S", f"-{lines}"], check=False)
+    args = ["capture-pane", "-p", "-t", session]
+    if not visible_only:
+        args.extend(["-S", f"-{lines}"])
+    cp = run_tmux(args, check=False)
     if cp.returncode != 0:
         return ""
     return cp.stdout

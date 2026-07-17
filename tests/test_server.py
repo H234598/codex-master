@@ -1999,6 +1999,33 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertTrue((redirected_cache / old_version).is_dir())
             self.assertTrue(cache.is_symlink())
 
+    def test_remove_real_plugin_cache_dir_rejects_directory_swap_before_recursive_delete(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            entry = root / "entry"
+            backup = root / "entry-original"
+            outside = root / "outside"
+            entry.mkdir()
+            (entry / "managed-cache").write_text("managed\n", encoding="utf-8")
+            outside.mkdir()
+            (outside / "secret").write_text("external\n", encoding="utf-8")
+            real_rmtree = server_module.shutil.rmtree
+
+            def swap_before_rmtree(path, **kwargs):
+                entry.rename(backup)
+                outside.rename(entry)
+                return real_rmtree(path, **kwargs)
+
+            swap_before_rmtree.avoids_symlink_attacks = True
+            with patch.object(server_module.shutil, "rmtree", swap_before_rmtree):
+                with self.assertRaisesRegex(AgentError, "plugin cache entry changed during removal"):
+                    server_module.remove_real_plugin_cache_dir(entry)
+
+            self.assertTrue((entry / "secret").exists())
+            self.assertFalse((backup / "managed-cache").exists())
+
     def test_plugin_manifest_version_is_path_sparse(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
