@@ -266,6 +266,34 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(result, {"meta_error": "could_not_read"})
             self.assertEqual(original.read_text(encoding="utf-8"), '{"owner":"expected"}\n')
 
+    def test_read_private_regular_text_rejects_regular_file_swap_before_open(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            path = tmp / "config.toml"
+            original = tmp / "original-config.toml"
+            replacement = tmp / "replacement-config.toml"
+            path.write_text("expected = true\n", encoding="utf-8")
+            replacement.write_text("forged = true\n", encoding="utf-8")
+            real_open = server_module.os.open
+            swapped = False
+
+            def swap_before_open(candidate, flags, *args, **kwargs):
+                nonlocal swapped
+                if not swapped and isinstance(candidate, (str, bytes, Path)) and Path(candidate) == path:
+                    path.rename(original)
+                    replacement.rename(path)
+                    swapped = True
+                return real_open(candidate, flags, *args, **kwargs)
+
+            with patch.object(server_module.os, "open", side_effect=swap_before_open):
+                with self.assertRaisesRegex(AgentError, "read failed"):
+                    server_module.read_private_regular_text(path, 1024, "read failed")
+
+            self.assertTrue(swapped)
+            self.assertEqual(original.read_text(encoding="utf-8"), "expected = true\n")
+
     def test_github_ci_smokes_agent_pool_installer(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")

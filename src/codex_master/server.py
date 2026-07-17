@@ -1533,7 +1533,8 @@ def read_private_regular_text(path: Path, max_bytes: int, error_text: str) -> st
         fd = os.open(path, flags)
         opened_stat = os.fstat(fd)
         if (
-            not stat_module.S_ISREG(opened_stat.st_mode)
+            not source_identity_matches(opened_stat, current_stat)
+            or not stat_module.S_ISREG(opened_stat.st_mode)
             or getattr(opened_stat, "st_nlink", 1) > 1
             or opened_stat.st_size > max_bytes
         ):
