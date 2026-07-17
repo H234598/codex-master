@@ -3942,6 +3942,25 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(record.call_args.args[0]["model"], DEFAULT_AGENT_MODEL)
         self.assertNotIn("routing", record.call_args.args[0])
 
+    def test_unauthenticated_assignment_still_honors_usage_block(self) -> None:
+        with patch(
+            "codex_master.server.agent_auth_status",
+            return_value={"authenticated": False, "auth_state": "missing"},
+        ), patch(
+            "codex_master.server.ensure_agent_not_blocked_by_codex_usage",
+            side_effect=AgentError("agent blocked by codex-usage watchdog"),
+        ), patch("codex_master.server.claim_for_agent_mutation") as mock_claim:
+            with self.assertRaisesRegex(AgentError, "blocked by codex-usage watchdog"):
+                assign_agent(
+                    "a",
+                    role="exploriererin",
+                    task="login",
+                    scope=["src"],
+                    allow_unauthenticated=True,
+                )
+
+        mock_claim.assert_not_called()
+
     @patch("codex_master.server.record_assignment", side_effect=AgentError("record failed"))
     @patch("codex_master.server.remember_agent_routing")
     @patch("codex_master.server.send_agent", return_value={"status": "sent", "raw_output": "not_returned"})

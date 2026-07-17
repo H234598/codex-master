@@ -6364,6 +6364,8 @@ def _assign_agent_unlocked(
         if not matches and not allow_missing_skill:
             raise AgentError(f"skill not found for agent {agent}")
 
+    if allow_unauthenticated:
+        ensure_agent_not_blocked_by_codex_usage(agent)
     routing = (
         None
         if allow_unauthenticated
