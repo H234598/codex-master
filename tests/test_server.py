@@ -450,6 +450,19 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(content, b"short-report\n")
 
+    def test_write_bounded_raw_log_requires_existing_regular_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw"
+            raw_dir.mkdir()
+            path = raw_dir / "missing.log"
+            with patch("codex_master.server.RAW_DIR", raw_dir), patch(
+                "codex_master.server.LEGACY_STATE_ROOT", Path(tmpdir) / "legacy"
+            ), patch("codex_master.server.ensure_state"):
+                with self.assertRaisesRegex(AgentError, "outside managed raw log state"):
+                    write_bounded_raw_log(path, max_bytes=128)
+
+        self.assertFalse(path.exists())
+
     def test_github_ci_smokes_agent_pool_installer(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")

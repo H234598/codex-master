@@ -3072,7 +3072,11 @@ def write_bounded_raw_log(path: Path, max_bytes: int = MAX_RAW_LOG_BYTES) -> int
     max_bytes = validate_raw_log_writer_max_bytes(max_bytes)
     ensure_state()
     allowed_identity = allowed_raw_log_identity(str(path))
-    if allowed_identity is None:
+    if (
+        allowed_identity is None
+        or allowed_identity[1] is None
+        or not stat_module.S_ISREG(allowed_identity[1].st_mode)
+    ):
         raise AgentError("raw log path is outside managed raw log state")
     allowed, expected_stat = allowed_identity
     stream = sys.stdin.buffer
