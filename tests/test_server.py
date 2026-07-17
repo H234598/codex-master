@@ -6135,6 +6135,38 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(external_content, "external\n")
         self.assertTrue(original_exists)
 
+    def test_cleanup_failed_start_keeps_pinned_raw_log_parent_after_swap(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "raw"
+            raw_dir.mkdir()
+            raw_log = raw_dir / "agent.log"
+            original_dir = root / "raw-original"
+            raw_log.write_text("managed\n", encoding="utf-8")
+            swapped = False
+            real_unlink = server_module.os.unlink
+
+            def swap_before_unlink(path, *args, **kwargs):
+                nonlocal swapped
+                if not swapped:
+                    raw_dir.rename(original_dir)
+                    raw_dir.mkdir()
+                    (raw_dir / "agent.log").write_text("external\n", encoding="utf-8")
+                    swapped = True
+                return real_unlink(path, *args, **kwargs)
+
+            with patch.object(server_module.os, "unlink", side_effect=swap_before_unlink):
+                server_module.cleanup_failed_start("session", raw_log, kill_session=False)
+
+            original_exists = (original_dir / "agent.log").exists()
+            external_content = (raw_dir / "agent.log").read_text(encoding="utf-8")
+
+        self.assertTrue(swapped)
+        self.assertFalse(original_exists)
+        self.assertEqual(external_content, "external\n")
+
     def test_legacy_raw_symlink_is_not_traversed(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             raw_dir = Path(tmpdir) / "raw"

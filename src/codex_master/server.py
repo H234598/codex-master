@@ -3353,12 +3353,35 @@ def cleanup_failed_start(session: str, raw_log: Path, *, kill_session: bool) -> 
         latest = raw_log.lstat()
     except FileNotFoundError:
         return
-    if not source_identity_matches(latest, current):
+    if (
+        not stat_module.S_ISREG(current.st_mode)
+        or getattr(current, "st_nlink", 1) > 1
+        or not source_identity_matches(latest, current)
+    ):
         return
     try:
-        raw_log.unlink()
+        parent_stat = raw_log.parent.lstat()
+    except FileNotFoundError:
+        return
+    parent_fd = open_directory_no_follow_matching(
+        raw_log.parent,
+        parent_stat,
+        error_text="raw log parent changed unexpectedly",
+        changed_text="raw log parent changed unexpectedly",
+    )
+    try:
+        latest = os.stat(raw_log.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat_module.S_ISREG(latest.st_mode)
+            or getattr(latest, "st_nlink", 1) > 1
+            or not source_identity_matches(latest, current)
+        ):
+            return
+        os.unlink(raw_log.name, dir_fd=parent_fd)
     except FileNotFoundError:
         pass
+    finally:
+        os.close(parent_fd)
 
 
 def release_start_lease_if_safe(agent: str, lease: dict[str, Any] | None, enabled: bool) -> None:
