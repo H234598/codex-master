@@ -4316,10 +4316,17 @@ def watchdog_agent(
                 assignment_id=assignment_id,
                 session_started_at=status.get("started_at_utc"),
             )
+            home_process_count = status.get("home_process_count")
+            home_processes_clear = (
+                isinstance(home_process_count, int)
+                and not isinstance(home_process_count, bool)
+                and home_process_count == 0
+            )
             if marker:
                 if (
                     marker.get("release_lease_after_action") is True
                     and marker_lease_matches
+                    and home_processes_clear
                     and agent_lease_status(agent).get("held_by_this_server")
                 ):
                     released = release_agent(agent, force=True)
@@ -4517,11 +4524,13 @@ def usage_watchdog_agent(agent: str, *, dry_run: bool) -> dict[str, Any]:
             claimed_for_watchdog = claim["status"] in {"claimed", "claimed_expired"}
             base["lease_state"] = lease.get("state")
             base["held_by_this_server"] = bool(lease.get("held_by_this_server"))
+        stop_attempted = False
         try:
             update_codex_usage_watchdog_marker(agent, marker)
+            stop_attempted = True
             result = stop_agent(agent, force=False)
         except Exception:
-            if claimed_for_watchdog and agent_lease_status(agent).get("held_by_this_server"):
+            if not stop_attempted and claimed_for_watchdog and agent_lease_status(agent).get("held_by_this_server"):
                 release_agent(agent, force=True)
             raise
         return {
