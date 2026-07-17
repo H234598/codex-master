@@ -6053,6 +6053,65 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(claim_errors, [])
         self.assertEqual(lease["state"], "held")
 
+    def test_direct_interrupt_serializes_lease_during_tmux_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            claim_finished = threading.Event()
+            release_attempted = threading.Event()
+            release_finished = threading.Event()
+            release_before_send: list[bool] = []
+            errors: list[BaseException] = []
+
+            def fake_claim(_agent: str) -> dict[str, Any]:
+                claim_finished.set()
+                return {
+                    "status": "claimed",
+                    "lease": {"state": "held", "held_by_this_server": True},
+                }
+
+            def fake_interrupt(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+                if not release_attempted.wait(1):
+                    errors.append(AssertionError("release did not start during interrupt"))
+                release_before_send.append(release_finished.is_set())
+                return subprocess.CompletedProcess(argv, 0, "", "")
+
+            from codex_master import server as server_module
+
+            real_release_agent = server_module.release_agent
+
+            def concurrent_release(agent: str, force: bool = False) -> dict[str, Any]:
+                if not claim_finished.wait(1):
+                    errors.append(AssertionError("interrupt did not claim lease"))
+                release_attempted.set()
+                try:
+                    return real_release_agent(agent, force=force)
+                finally:
+                    release_finished.set()
+
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"session": "session-a", "home": root, "runner": root / "codex"}},
+                clear=True,
+            ), patch("codex_master.server.tmux_alive", return_value=True), patch(
+                "codex_master.server.claim_agent", side_effect=fake_claim
+            ), patch("codex_master.server.run_tmux", side_effect=fake_interrupt), patch(
+                "codex_master.server.release_agent", side_effect=concurrent_release
+            ):
+                worker = threading.Thread(target=lambda: server_module.release_agent("a", force=True))
+                worker.start()
+                result = interrupt_agent("a")
+                worker.join(2)
+
+        self.assertEqual(result["status"], "interrupt_sent")
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(release_before_send, [False])
+
     def test_agent_lease_blocks_other_client_with_retry_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

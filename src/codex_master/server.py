@@ -7473,6 +7473,11 @@ def send_agent(
 
 
 def interrupt_agent(agent: str, force: bool = False) -> dict[str, Any]:
+    with agent_lifecycle_lock(agent):
+        return _interrupt_agent_unlocked(agent, force=force)
+
+
+def _interrupt_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     cfg = AGENTS[agent]
     session = cfg["session"]
