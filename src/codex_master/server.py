@@ -9223,20 +9223,10 @@ def _uninstall_unlocked(
 ) -> dict[str, Any]:
     install_path = normalize_install_path(install_path)
     mcp_status = "skipped"
-    if unregister:
-        current = check_mcp_registration(install_path)
-        if current.get("registered"):
-            if current.get("command_matches"):
-                remove = run_command(["codex", "mcp", "remove", MCP_SERVER_NAME])
-                if remove.returncode != 0:
-                    raise AgentError("codex mcp remove failed")
-                mcp_status = "removed"
-            else:
-                mcp_status = "left_in_place_different_command"
-        else:
-            mcp_status = "not_registered"
-
     symlink_status = "skipped"
+    expected_parent_stat: os.stat_result | None = None
+    wrapper: Path | None = None
+    symlink_removed = False
     if remove_symlink:
         expected_parent_stat = ensure_real_parent(
             install_path,
@@ -9248,6 +9238,34 @@ def _uninstall_unlocked(
             wrapper,
             expected_parent_stat=expected_parent_stat,
         )
+        symlink_removed = symlink_status == "removed"
+
+    try:
+        if unregister:
+            current = check_mcp_registration(install_path)
+            if current.get("registered"):
+                if current.get("command_matches"):
+                    remove = run_command(["codex", "mcp", "remove", MCP_SERVER_NAME])
+                    if remove.returncode != 0:
+                        raise AgentError("codex mcp remove failed")
+                    mcp_status = "removed"
+                else:
+                    mcp_status = "left_in_place_different_command"
+            else:
+                mcp_status = "not_registered"
+    except Exception:
+        if symlink_removed and wrapper is not None and expected_parent_stat is not None:
+            try:
+                if install_path.exists() or install_path.is_symlink():
+                    raise AgentError("install path changed before symlink restore")
+                replace_install_symlink(
+                    install_path,
+                    wrapper,
+                    expected_parent_stat=expected_parent_stat,
+                )
+            except Exception as restore_exc:
+                raise AgentError("could_not_restore_install_symlink") from restore_exc
+        raise
 
     return {"ok": True, "mcp": mcp_status, "symlink": symlink_status, "raw_output": "not_returned"}
 

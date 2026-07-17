@@ -14092,6 +14092,54 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertNotIn(str(tmp_path), error_text)
         self.assertNotIn("SECRET_OUTPUT_SHOULD_NOT_RETURN", error_text)
 
+    def test_uninstall_symlink_failure_does_not_unregister_mcp(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            install_link = Path(tmpdir) / "bin" / "codex-master-mcp"
+            install_link.parent.mkdir()
+
+            with patch.object(
+                server_module,
+                "remove_install_symlink_if_repo_wrapper",
+                side_effect=AgentError("injected symlink removal failure"),
+            ), patch.object(server_module, "check_mcp_registration") as mock_registration, patch.object(
+                server_module, "run_command"
+            ) as mock_run:
+                with self.assertRaisesRegex(AgentError, "injected symlink removal failure"):
+                    uninstall(unregister=True, remove_symlink=True, install_path=install_link)
+
+        mock_registration.assert_not_called()
+        mock_run.assert_not_called()
+
+    def test_uninstall_mcp_failure_restores_removed_install_link(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            install_link.parent.mkdir()
+            install_link.symlink_to(wrapper)
+
+            with patch.object(server_module, "repo_wrapper_path", return_value=wrapper), patch.object(
+                server_module,
+                "check_mcp_registration",
+                return_value={"registered": True, "command_matches": True},
+            ), patch.object(
+                server_module,
+                "run_command",
+                return_value=subprocess.CompletedProcess(["codex", "mcp", "remove"], 1, "", ""),
+            ):
+                with self.assertRaisesRegex(AgentError, "codex mcp remove failed"):
+                    uninstall(unregister=True, remove_symlink=True, install_path=install_link)
+
+            restored = install_link.resolve(strict=False)
+
+        self.assertEqual(restored, wrapper)
+
     @patch("codex_master.server.run_command")
     @patch("codex_master.server.check_mcp_registration")
     def test_uninstall_leaves_different_mcp_registration_in_place(self, mock_registration, mock_run) -> None:
