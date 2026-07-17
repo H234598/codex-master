@@ -10592,6 +10592,20 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertIn("alias conflicts with a pool selector", shadowing_error)
             self.assertNotIn(str(pool), shadowing_error)
 
+            dot_path_spec = self._write_spec_payload(
+                tmp,
+                {
+                    "schema_version": 1,
+                    "pool_root": str(pool),
+                    "codex_bin": "/bin/echo",
+                    "series": [{"prefix": "a", "count": 1, "template": "a1", "authenticated": []}],
+                    "shared_assets": ["."],
+                },
+            )
+            dot_path_error = self._pool_validate_error_text(dot_path_spec, pool, 71)
+            self.assertIn("shared_assets[] must stay inside the Agentin home", dot_path_error)
+            self.assertNotIn("IndexError", dot_path_error)
+
     def test_agent_pool_install_status_copy_auth_and_destroy_are_data_sparse(self) -> None:
         from codex_master import server as server_module
 

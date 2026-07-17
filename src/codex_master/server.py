@@ -8406,7 +8406,7 @@ def pool_safe_relative_path(value: Any, *, field: str) -> Path:
     if len(value) > 200 or not POOL_SAFE_RELATIVE_RE.fullmatch(value):
         raise AgentError(f"{field} contains unsupported characters")
     path = Path(value)
-    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+    if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
         raise AgentError(f"{field} must stay inside the Agentin home")
     if path.parts[0] in {"auth.json", "codex", "config.toml"}:
         raise AgentError(f"{field} must not target protected Agentin files")
