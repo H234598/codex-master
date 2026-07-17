@@ -9198,6 +9198,9 @@ def _install_unlocked(
         replace_install_symlink(install_path, wrapper, expected_parent_stat=expected_parent_stat)
 
     registration: dict[str, Any] = {"requested": register, "status": "skipped"}
+    previous_command: str | None = None
+    registration_removed = False
+    registration_added = False
     try:
         if register:
             startup_self_test = {"requested": True, **mcp_command_startup_self_test(install_path)}
@@ -9215,15 +9218,13 @@ def _install_unlocked(
                     remove = run_command(["codex", "mcp", "remove", MCP_SERVER_NAME])
                     if remove.returncode != 0:
                         raise AgentError("codex mcp remove failed")
+                    registration_removed = True
                 elif current.get("registered"):
                     raise AgentError("MCP server is registered with a different command; rerun install with --force")
                 add = run_command(["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(install_path)])
                 if add.returncode != 0:
-                    if previous_command is not None:
-                        restore = run_command(["codex", "mcp", "add", MCP_SERVER_NAME, "--", previous_command])
-                        if restore.returncode != 0:
-                            raise AgentError("codex mcp add failed")
                     raise AgentError("codex mcp add failed")
+                registration_added = True
                 registration = {"requested": True, "status": "registered"}
             if not current.get("startup_timeout_ok"):
                 startup_timeout_config = ensure_mcp_startup_timeout_configured()
@@ -9241,6 +9242,19 @@ def _install_unlocked(
                     }
             registration["startup_timeout"] = startup_timeout_config
     except Exception:
+        mcp_restore_error: Exception | None = None
+        if registration_added or registration_removed:
+            try:
+                if registration_added:
+                    remove = run_command(["codex", "mcp", "remove", MCP_SERVER_NAME])
+                    if remove.returncode != 0:
+                        raise AgentError("codex mcp remove failed")
+                if previous_command is not None:
+                    restore = run_command(["codex", "mcp", "add", MCP_SERVER_NAME, "--", previous_command])
+                    if restore.returncode != 0:
+                        raise AgentError("codex mcp add failed")
+            except Exception as restore_exc:
+                mcp_restore_error = restore_exc
         rollback_install = symlink_status != "already_installed" and (
             not previous_install_present or previous_install_target_text is not None
         )
@@ -9254,6 +9268,8 @@ def _install_unlocked(
                 )
             except Exception as restore_exc:
                 raise AgentError("could_not_restore_install_symlink") from restore_exc
+        if mcp_restore_error is not None:
+            raise AgentError("could_not_restore_mcp_registration") from mcp_restore_error
         raise
     return {
         "ok": True,

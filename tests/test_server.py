@@ -13818,6 +13818,47 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(resolved, previous_target)
 
     @patch("codex_master.server.run_command")
+    @patch("codex_master.server.ensure_mcp_startup_timeout_configured", side_effect=AgentError("timeout failed"))
+    @patch("codex_master.server.check_mcp_registration")
+    @patch("codex_master.server.mcp_command_startup_self_test")
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_timeout_failure_removes_new_mcp_registration(
+        self, mock_wrapper_path, mock_self_test, mock_registration, _mock_timeout, mock_run
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            mock_wrapper_path.return_value = wrapper
+            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
+            mock_registration.return_value = {
+                "registered": False,
+                "ok": False,
+                "startup_timeout_ok": False,
+            }
+            mock_run.side_effect = [
+                subprocess.CompletedProcess(["codex", "mcp", "add"], 0, "", ""),
+                subprocess.CompletedProcess(["codex", "mcp", "remove"], 0, "", ""),
+            ]
+
+            with self.assertRaisesRegex(AgentError, "timeout failed"):
+                install(register=True, install_path=install_link, sync_plugin_cache=False)
+
+            commands = [call.args[0] for call in mock_run.call_args_list]
+            link_exists = install_link.exists() or install_link.is_symlink()
+
+        self.assertEqual(
+            commands,
+            [
+                ["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(install_link)],
+                ["codex", "mcp", "remove", MCP_SERVER_NAME],
+            ],
+        )
+        self.assertFalse(link_exists)
+
+    @patch("codex_master.server.run_command")
     @patch("codex_master.server.check_mcp_registration")
     @patch("codex_master.server.mcp_command_startup_self_test")
     @patch("codex_master.server.repo_wrapper_path")
