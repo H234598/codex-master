@@ -5629,6 +5629,7 @@ def assign_agent(
     if lease is None:
         lease, release_on_failure = claim_for_agent_mutation(agent)
     model_switch: dict[str, Any] | None = None
+    sent: dict[str, Any] | None = None
     try:
         model_switch = ensure_assignment_session_model(
             agent,
@@ -5642,8 +5643,9 @@ def assign_agent(
     except Exception:
         if release_on_failure:
             if model_switch is None:
-                release_start_lease_if_safe(agent, lease, True)
-            else:
+                if not (isinstance(sent, dict) and sent.get("status") == "sent"):
+                    release_start_lease_if_safe(agent, lease, True)
+            elif not (isinstance(sent, dict) and sent.get("status") == "sent"):
                 release_agent(agent, force=True)
         raise
     assignment_id = f"{now_id()}-{agent}"
@@ -5691,7 +5693,7 @@ def assign_agent(
     try:
         record_assignment(assignment_record)
     except Exception:
-        if release_on_failure:
+        if release_on_failure and not (isinstance(sent, dict) and sent.get("status") == "sent"):
             release_agent(agent, force=True)
         raise
     return {

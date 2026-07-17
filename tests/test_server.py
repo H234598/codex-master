@@ -3079,7 +3079,7 @@ class ServerHelpersTest(unittest.TestCase):
     @patch("codex_master.server.record_assignment", side_effect=AgentError("record failed"))
     @patch("codex_master.server.remember_agent_routing")
     @patch("codex_master.server.send_agent", return_value={"status": "sent", "raw_output": "not_returned"})
-    def test_agent_assign_releases_fresh_lease_when_recording_fails(
+    def test_agent_assign_keeps_fresh_lease_when_recording_fails_after_send(
         self, _mock_send, _mock_routing, _mock_record
     ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3105,7 +3105,8 @@ class ServerHelpersTest(unittest.TestCase):
 
                 lease = agent_lease_status("a")
 
-        self.assertEqual(lease["state"], "unclaimed")
+        self.assertEqual(lease["state"], "held")
+        self.assertTrue(lease["held_by_this_server"])
 
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.pane_tail")
