@@ -3204,6 +3204,8 @@ def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[di
         if uid_parts and uid_parts[0].isdigit() and int(uid_parts[0]) != os.getuid():
             continue
         env = read_proc_environ(pid_dir)
+        matches_home = False
+        managed = False
         if env is None:
             name = (status.get("Name") or "").lower()
             argv = read_proc_cmdline(pid_dir)
@@ -3217,27 +3219,39 @@ def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[di
             )
             if codex_like:
                 return None
-            # ponytail: opaque non-Codex processes skipped; privileged proc access needed to detect arbitrary same-home users.
-            continue
-        configured_home = env.get("CODEX_HOME", "")
-        if configured_home:
-            try:
-                configured_path = Path(configured_home).expanduser()
-                if not configured_path.is_absolute():
-                    current_dir, unavailable = resolve_proc_cwd(pid_dir)
-                    if unavailable:
-                        return None
-                    if current_dir is None:
-                        continue
-                    configured_path = current_dir / configured_path
-                matches_home = configured_path.resolve(strict=False) == home.expanduser().resolve(strict=False)
-            except (OSError, RuntimeError):
-                matches_home = False
+            current_dir, unavailable = resolve_proc_cwd(pid_dir)
+            if not unavailable and current_dir is not None:
+                try:
+                    matches_home = current_dir.resolve(strict=False) == home.expanduser().resolve(strict=False)
+                except (OSError, RuntimeError):
+                    matches_home = False
         else:
-            matches_home = False
+            configured_home = env.get("CODEX_HOME", "")
+            if configured_home:
+                try:
+                    configured_path = Path(configured_home).expanduser()
+                    if not configured_path.is_absolute():
+                        current_dir, unavailable = resolve_proc_cwd(pid_dir)
+                        if unavailable:
+                            return None
+                        if current_dir is None:
+                            continue
+                        configured_path = current_dir / configured_path
+                    matches_home = configured_path.resolve(strict=False) == home.expanduser().resolve(strict=False)
+                except (OSError, RuntimeError):
+                    matches_home = False
+            else:
+                current_dir, unavailable = resolve_proc_cwd(pid_dir)
+                if unavailable:
+                    return None
+                if current_dir is not None:
+                    try:
+                        matches_home = current_dir.resolve(strict=False) == home.expanduser().resolve(strict=False)
+                    except (OSError, RuntimeError):
+                        matches_home = False
+            managed = env.get("CODEX_AGENT_MCP") == "1" or env.get("CODEX_MASTER_MCP") == "1"
         if not matches_home:
             continue
-        managed = env.get("CODEX_AGENT_MCP") == "1" or env.get("CODEX_MASTER_MCP") == "1"
         ppid_parts = status.get("PPid", "0").split()
         ppid = int(ppid_parts[0]) if ppid_parts and ppid_parts[0].isdigit() else None
         try:

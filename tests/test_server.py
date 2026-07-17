@@ -7280,6 +7280,32 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIsNone(summary["external_process_count"])
         self.assertIsNone(summary["managed_process_count"])
 
+    @patch("codex_master.server.read_proc_environ", return_value={})
+    def test_agent_home_process_summary_uses_cwd_without_codex_home(
+        self, _mock_read_proc_environ
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home = root / "agent-home"
+            home.mkdir()
+            proc_root = root / "proc"
+            process = proc_root / "100"
+            process.mkdir(parents=True)
+            process.joinpath("status").write_text(
+                "Name:\tsleep\nState:\tS (sleeping)\nPPid:\t1\n", encoding="utf-8"
+            )
+            process.joinpath("cwd").symlink_to(home, target_is_directory=True)
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                summary = agent_home_process_summary("a", proc_root)
+
+        self.assertEqual(summary["process_count"], 1)
+        self.assertEqual(summary["managed_process_count"], 0)
+        self.assertEqual(summary["external_process_count"], 1)
+
     def test_pool_home_processes_detects_process_cwd_inside_home(self) -> None:
         from codex_master import server as server_module
 
