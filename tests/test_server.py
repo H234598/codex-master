@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import re
@@ -1439,6 +1440,31 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(result["auth_mode"], "other")
         self.assertNotIn(secret, json.dumps(result, sort_keys=True))
+
+    def test_agent_auth_status_handles_huge_jwt_expiry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            home.mkdir()
+            payload = base64.urlsafe_b64encode(json.dumps({"exp": 10**1000}).encode()).decode().rstrip("=")
+            (home / "auth.json").write_text(
+                json.dumps(
+                    {
+                        "auth_mode": "chatgpt",
+                        "tokens": {"access_token": f"e30.{payload}.sig"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                result = agent_auth_status("a")
+
+        self.assertTrue(result["authenticated"])
+        self.assertEqual(result["token_state"], "unexpired")
 
     def test_agent_auth_status_rejects_regular_file_swap_before_open(self) -> None:
         from codex_master import server as server_module

@@ -2667,12 +2667,14 @@ def auth_access_token_state(value: Any) -> str:
     try:
         decoded = base64.b64decode(payload, validate=True)
         claims = json.loads(decoded.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return "opaque"
     if not isinstance(claims, dict):
         return "opaque"
     expiry = claims.get("exp")
-    if isinstance(expiry, bool) or not isinstance(expiry, (int, float)) or not math.isfinite(expiry):
+    if isinstance(expiry, bool) or not isinstance(expiry, (int, float)):
+        return "opaque"
+    if isinstance(expiry, float) and not math.isfinite(expiry):
         return "opaque"
     return "expired" if expiry <= time.time() else "unexpired"
 
@@ -2740,7 +2742,7 @@ def agent_auth_status(agent: str) -> dict[str, Any]:
                 else:
                     try:
                         document = json.loads(raw.decode("utf-8"))
-                    except (UnicodeDecodeError, json.JSONDecodeError):
+                    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
                         document = None
                     if not isinstance(document, dict):
                         state = "invalid_json"
