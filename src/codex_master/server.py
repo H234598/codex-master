@@ -12373,10 +12373,16 @@ def read_message() -> dict[str, Any] | None:
         body = sys.stdin.buffer.read(length)
         if len(body) != length:
             raise AgentError("incomplete RPC message body")
-        return json.loads(body.decode("utf-8"))
+        message = json.loads(body.decode("utf-8"))
+        if message is None:
+            raise AgentError("RPC message must be an object")
+        return message
     stripped = first.strip()
     if stripped:
-        return json.loads(stripped.decode("utf-8"))
+        message = json.loads(stripped.decode("utf-8"))
+        if message is None:
+            raise AgentError("RPC message must be an object")
+        return message
     return None
 
 

@@ -3582,6 +3582,13 @@ class ServerHelpersTest(unittest.TestCase):
             with self.assertRaisesRegex(AgentError, "incomplete RPC message body"):
                 read_message()
 
+    def test_read_message_rejects_json_null_messages(self) -> None:
+        messages = (b"null\n", b"Content-Length: 4\r\n\r\nnull")
+        for data in messages:
+            with self.subTest(data=data), patch("sys.stdin", FakeStdin(data)):
+                with self.assertRaisesRegex(AgentError, "RPC message must be an object"):
+                    read_message()
+
     def test_read_message_skips_blank_lines_before_json_message(self) -> None:
         message = {"jsonrpc": "2.0", "id": 1, "method": "resources/list"}
         data = b"\n  \n" + json.dumps(message).encode("utf-8") + b"\n"
