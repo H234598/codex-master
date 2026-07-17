@@ -7778,6 +7778,33 @@ class ServerHelpersTest(unittest.TestCase):
             ["send-keys", "-t", "codex_agent_a1_mcp", "Enter"], check=False
         )
 
+    def test_dismiss_codex_update_prompt_serializes_selection_keys(self) -> None:
+        events = []
+
+        class FakeLock:
+            def __enter__(self):
+                events.append("lock")
+
+            def __exit__(self, exc_type, exc, tb):
+                events.append("unlock")
+                return False
+
+        def fake_run_tmux(args, *, input_text=None, check=True, timeout=10):
+            del input_text, check, timeout
+            events.append(args[-1])
+            return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
+
+        with patch("codex_master.server.agent_lifecycle_lock", return_value=FakeLock()), patch(
+            "codex_master.server.run_tmux", side_effect=fake_run_tmux
+        ):
+            result = dismiss_codex_update_prompt(
+                "a",
+                "Update available! 0.144.4 -> 0.144.5\n› 1. Update now\n2. Skip\nPress enter to continue\n",
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(events, ["lock", "Down", "Enter", "unlock"])
+
     @patch("codex_master.server.run_tmux")
     @patch("codex_master.server.pane_tail")
     def test_wait_agent_input_ready_skips_known_update_prompt(self, mock_pane_tail, mock_run_tmux) -> None:

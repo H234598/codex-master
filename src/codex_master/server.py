@@ -8156,11 +8156,13 @@ def dismiss_codex_update_prompt(agent: str, text: str) -> bool:
     if selected is None:
         return False
     keys = ("Down", "Enter") if selected == "1" else ("Enter",)
-    session = AGENTS[canonical_agent_id(agent)]["session"]
-    for key in keys:
-        result = run_tmux(["send-keys", "-t", session, key], check=False)
-        if result.returncode != 0:
-            return False
+    agent = canonical_agent_id(agent)
+    session = AGENTS[agent]["session"]
+    with agent_lifecycle_lock(agent):
+        for key in keys:
+            result = run_tmux(["send-keys", "-t", session, key], check=False)
+            if result.returncode != 0:
+                return False
     return True
 
 
