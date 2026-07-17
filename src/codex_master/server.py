@@ -6581,6 +6581,7 @@ def copy_regular_plugin_file_no_follow(src: Path, dst: Path, expected_stat: os.s
     src_fd = -1
     dst_fd = -1
     dst_created = False
+    dst_stat: os.stat_result | None = None
     try:
         src_fd = os.open(src, source_flags)
         opened_stat = os.fstat(src_fd)
@@ -6597,6 +6598,7 @@ def copy_regular_plugin_file_no_follow(src: Path, dst: Path, expected_stat: os.s
             target_flags |= os.O_NOFOLLOW
         dst_fd = os.open(dst, target_flags, mode)
         dst_created = True
+        dst_stat = os.fstat(dst_fd)
         while True:
             chunk = os.read(src_fd, RAW_LOG_CHUNK_BYTES)
             if not chunk:
@@ -6620,8 +6622,21 @@ def copy_regular_plugin_file_no_follow(src: Path, dst: Path, expected_stat: os.s
         if dst_fd >= 0:
             os.close(dst_fd)
         if dst_created:
-            with contextlib.suppress(OSError):
-                dst.unlink()
+            remove_created_plugin_file_if_same(dst, dst_stat)
+
+
+def remove_created_plugin_file_if_same(path: Path, expected_stat: os.stat_result | None) -> None:
+    if expected_stat is None:
+        return
+    try:
+        current = path.lstat()
+    except OSError:
+        return
+    if not source_identity_matches(current, expected_stat):
+        return
+    with contextlib.suppress(OSError):
+        path.unlink()
+
 
 def open_plugin_source_dir_no_follow(src: Path, expected_stat: os.stat_result) -> int:
     return open_directory_no_follow_matching(
@@ -6652,6 +6667,7 @@ def copy_regular_plugin_file_from_dir_no_follow(
     src_fd = -1
     dst_fd = -1
     dst_created = False
+    dst_stat: os.stat_result | None = None
     try:
         src_fd = os.open(name, source_flags, dir_fd=src_dir_fd)
         opened_stat = os.fstat(src_fd)
@@ -6667,6 +6683,7 @@ def copy_regular_plugin_file_from_dir_no_follow(
             target_flags |= os.O_NOFOLLOW
         dst_fd = os.open(dst, target_flags, mode)
         dst_created = True
+        dst_stat = os.fstat(dst_fd)
         while True:
             chunk = os.read(src_fd, RAW_LOG_CHUNK_BYTES)
             if not chunk:
@@ -6690,8 +6707,7 @@ def copy_regular_plugin_file_from_dir_no_follow(
         if dst_fd >= 0:
             os.close(dst_fd)
         if dst_created:
-            with contextlib.suppress(OSError):
-                dst.unlink()
+            remove_created_plugin_file_if_same(dst, dst_stat)
 
 
 def copy_plugin_cache_dir_fd(src_fd: int, dst: Path) -> dict[str, int]:

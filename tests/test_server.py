@@ -2026,6 +2026,31 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertTrue((entry / "secret").exists())
             self.assertFalse((backup / "managed-cache").exists())
 
+    def test_plugin_copy_cleanup_rejects_destination_swap(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "source.py"
+            destination = root / "destination.py"
+            destination_backup = root / "destination-original.py"
+            outside = root / "outside.py"
+            source.write_text("source\n", encoding="utf-8")
+            outside.write_text("external\n", encoding="utf-8")
+            expected_source = source.lstat()
+
+            def fail_after_destination_swap(_fd, **_kwargs):
+                destination.rename(destination_backup)
+                outside.rename(destination)
+                raise OSError("injected copy failure")
+
+            with patch.object(server_module.os, "utime", side_effect=fail_after_destination_swap):
+                with self.assertRaisesRegex(AgentError, "could_not_sync_plugin_cache"):
+                    server_module.copy_regular_plugin_file_no_follow(source, destination, expected_source)
+
+            self.assertEqual(destination.read_text(encoding="utf-8"), "external\n")
+            self.assertTrue(destination_backup.exists())
+
     def test_plugin_manifest_version_is_path_sparse(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
