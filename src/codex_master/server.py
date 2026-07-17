@@ -617,6 +617,41 @@ def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | floa
     previous: int | float | None = None
     section_start: int | None = None
     section_end = len(lines)
+    numeric_token = (
+        r"[+-]?(?:"
+        r"0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f])*|"
+        r"0[oO][0-7](?:_?[0-7])*|"
+        r"0[bB][01](?:_?[01])*|"
+        r"[0-9](?:_?[0-9])*(?:\.[0-9](?:_?[0-9])*)?(?:[eE][+-]?[0-9](?:_?[0-9])*)?|"
+        r"inf|nan"
+        r")"
+    )
+    timeout_key = r'''(?:startup_timeout_sec|"startup_timeout_sec"|'startup_timeout_sec')'''
+    server_key = rf'''(?:{re.escape(MCP_SERVER_NAME)}|"{re.escape(MCP_SERVER_NAME)}"|'{re.escape(MCP_SERVER_NAME)}')'''
+    timeout_line_re = re.compile(rf"^(\s*{timeout_key}\s*=\s*)({numeric_token})(\s*(?:#.*)?)$")
+    timeout_key_re = re.compile(rf"^(\s*{timeout_key}\s*=\s*)")
+    dotted_timeout_line_re = re.compile(
+        rf"^(\s*mcp_servers\s*\.\s*{server_key}\s*\.\s*{timeout_key}\s*=\s*)"
+        rf"({numeric_token})(\s*(?:#.*)?)$"
+    )
+    inline_timeout_re = re.compile(
+        rf"(mcp_servers\s*=\s*\{{.*?{server_key}\s*=\s*\{{(?:\s*|.*?,\s*){timeout_key}\s*=\s*)"
+        rf"({numeric_token})(?=\s*(?:,|\}}))",
+        re.DOTALL,
+    )
+
+    def numeric_timeout_value(numeric_text: str) -> int | float:
+        numeric_text = numeric_text.replace("_", "")
+        if numeric_text.lstrip("+-").lower().startswith(("0x", "0o", "0b")):
+            return int(numeric_text, 0)
+        return float(numeric_text)
+
+    def timeout_state(numeric_text: str) -> tuple[int | float | None, bool]:
+        numeric = numeric_timeout_value(numeric_text)
+        if not math.isfinite(numeric):
+            return None, True
+        previous_value = numeric if isinstance(numeric, int) else int(numeric) if numeric.is_integer() else numeric
+        return previous_value, previous_value < RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS
 
     for index, line in enumerate(lines):
         header = line.split("#", 1)[0].strip()
@@ -628,6 +663,24 @@ def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | floa
             break
 
     if section_start is None:
+        for index, line in enumerate(lines):
+            match = dotted_timeout_line_re.match(line)
+            if not match:
+                continue
+            previous, should_update = timeout_state(match.group(2))
+            if not should_update:
+                return text if text.endswith("\n") else text + "\n", False, previous
+            lines[index] = f"{match.group(1)}{RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS}{match.group(3)}"
+            return "\n".join(lines) + "\n", True, previous
+
+        inline_match = inline_timeout_re.search(text)
+        if inline_match:
+            previous, should_update = timeout_state(inline_match.group(2))
+            if not should_update:
+                return text if text.endswith("\n") else text + "\n", False, previous
+            updated = text[: inline_match.start(2)] + str(RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS) + text[inline_match.end(2) :]
+            return updated if updated.endswith("\n") else updated + "\n", True, previous
+
         prefix = lines[:]
         if prefix and prefix[-1].strip():
             prefix.append("")
@@ -640,19 +693,6 @@ def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | floa
             section_end = index
             break
 
-    numeric_token = (
-        r"[+-]?(?:"
-        r"0[xX][0-9A-Fa-f](?:_?[0-9A-Fa-f])*|"
-        r"0[oO][0-7](?:_?[0-7])*|"
-        r"0[bB][01](?:_?[01])*|"
-        r"[0-9](?:_?[0-9])*(?:\.[0-9](?:_?[0-9])*)?(?:[eE][+-]?[0-9](?:_?[0-9])*)?|"
-        r"inf|nan"
-        r")"
-    )
-    timeout_line_re = re.compile(
-        rf"^(\s*(?:startup_timeout_sec|\"startup_timeout_sec\")\s*=\s*)({numeric_token})(\s*(?:#.*)?)$"
-    )
-    timeout_key_re = re.compile(r"^(\s*(?:startup_timeout_sec|\"startup_timeout_sec\")\s*=\s*)")
     for index in range(section_start + 1, section_end):
         match = timeout_line_re.match(lines[index])
         if not match:
@@ -676,17 +716,12 @@ def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | floa
                 ]
                 return "\n".join(lines) + "\n", True, None
             continue
-        numeric_text = match.group(2).replace("_", "")
-        if numeric_text.lstrip("+-").lower().startswith(("0x", "0o", "0b")):
-            numeric: int | float = int(numeric_text, 0)
-        else:
-            numeric = float(numeric_text)
-        if not math.isfinite(numeric):
+        previous, should_update = timeout_state(match.group(2))
+        if not should_update:
+            return text if text.endswith("\n") else text + "\n", False, previous
+        if previous is None:
             lines[index] = f"{match.group(1)}{RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS}{match.group(3)}"
             return "\n".join(lines) + "\n", True, None
-        previous = numeric if isinstance(numeric, int) else int(numeric) if numeric.is_integer() else numeric
-        if previous >= RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS:
-            return text if text.endswith("\n") else text + "\n", False, previous
         lines[index] = f"{match.group(1)}{RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS}{match.group(3)}"
         return "\n".join(lines) + "\n", True, previous
 

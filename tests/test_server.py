@@ -459,6 +459,24 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(spaced_changed)
         self.assertEqual(loads(spaced_updated)["mcp_servers"]["codex-master-mcp"]["startup_timeout_sec"], 120)
 
+        dotted_config = (
+            'mcp_servers."codex-master-mcp".command = "/tmp/codex-master-mcp"\n'
+            'mcp_servers."codex-master-mcp".startup_timeout_sec = 30\n'
+        )
+        dotted_updated, dotted_changed, dotted_previous = updated_mcp_startup_timeout_config(dotted_config)
+        self.assertTrue(dotted_changed)
+        self.assertEqual(dotted_previous, 30)
+        self.assertEqual(loads(dotted_updated)["mcp_servers"]["codex-master-mcp"]["startup_timeout_sec"], 120)
+
+        inline_config = (
+            'mcp_servers = { "codex-master-mcp" = '
+            '{ command = "/tmp/codex-master-mcp", startup_timeout_sec = 30 } }\n'
+        )
+        inline_updated, inline_changed, inline_previous = updated_mcp_startup_timeout_config(inline_config)
+        self.assertTrue(inline_changed)
+        self.assertEqual(inline_previous, 30)
+        self.assertEqual(loads(inline_updated)["mcp_servers"]["codex-master-mcp"]["startup_timeout_sec"], 120)
+
         for literal, expected_changed, expected_previous in (
             ("0x78", False, 120),
             ("0o170", False, 120),
