@@ -7971,6 +7971,43 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(events, ["lock", "unlock"])
         mock_unlocked.assert_called_once_with("a1", None, None, allow_unauthenticated=True)
 
+    @patch("codex_master.server._start_agent_unlocked", return_value={"status": "started"})
+    @patch("codex_master.server.agent_lifecycle_lock")
+    def test_direct_start_agent_acquires_lifecycle_lock(self, mock_lock, mock_unlocked) -> None:
+        events = []
+
+        class FakeLock:
+            def __enter__(self):
+                events.append("lock")
+
+            def __exit__(self, exc_type, exc, tb):
+                events.append("unlock")
+                return False
+
+        mock_lock.side_effect = lambda agent: FakeLock()
+
+        result = start_agent(
+            "a",
+            "/tmp/work",
+            "hi",
+            lease={"state": "held"},
+            release_lease_on_failure=True,
+            model=WRITE_AGENT_MODEL,
+            model_reasoning_effort="low",
+        )
+
+        self.assertEqual(result["status"], "started")
+        self.assertEqual(events, ["lock", "unlock"])
+        mock_unlocked.assert_called_once_with(
+            "a1",
+            "/tmp/work",
+            "hi",
+            {"state": "held"},
+            True,
+            WRITE_AGENT_MODEL,
+            "low",
+        )
+
     @patch("codex_master.server._assign_agent_unlocked", return_value={"status": "assigned"})
     @patch("codex_master.server.agent_lifecycle_lock")
     def test_direct_assign_agent_acquires_lifecycle_lock(self, mock_lock, mock_unlocked) -> None:

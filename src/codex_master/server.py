@@ -3382,6 +3382,28 @@ def start_agent(
     model_reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
+    with agent_lifecycle_lock(agent):
+        return _start_agent_unlocked(
+            agent,
+            cwd,
+            prompt,
+            lease,
+            release_lease_on_failure,
+            model,
+            model_reasoning_effort,
+        )
+
+
+def _start_agent_unlocked(
+    agent: str,
+    cwd: str | None = None,
+    prompt: str | None = None,
+    lease: dict[str, Any] | None = None,
+    release_lease_on_failure: bool = False,
+    model: str = DEFAULT_AGENT_MODEL,
+    model_reasoning_effort: str | None = None,
+) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     ensure_state()
     cfg = AGENTS[agent]
     runner = cfg["runner"]
