@@ -6021,6 +6021,17 @@ def request_agent_report(
     enter: bool = True,
     lease: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
+    with agent_lifecycle_lock(agent):
+        return _request_agent_report_unlocked(agent, assignment_id, enter, lease=lease)
+
+
+def _request_agent_report_unlocked(
+    agent: str,
+    assignment_id: Any = None,
+    enter: bool = True,
+    lease: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     resolved_assignment_id = None
     if assignment_id:
         resolved_assignment_id = bounded_text(assignment_id, field="assignment_id", max_chars=MAX_ASSIGNMENT_ID) or ""

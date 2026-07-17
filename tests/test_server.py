@@ -7977,6 +7977,37 @@ class ServerHelpersTest(unittest.TestCase):
             allow_unauthenticated=True,
         )
 
+    @patch("codex_master.server._request_agent_report_unlocked", return_value={"status": "report_requested"})
+    @patch("codex_master.server.agent_lifecycle_lock")
+    def test_direct_request_agent_report_acquires_lifecycle_lock(self, mock_lock, mock_unlocked) -> None:
+        events = []
+
+        class FakeLock:
+            def __enter__(self):
+                events.append("lock")
+
+            def __exit__(self, exc_type, exc, tb):
+                events.append("unlock")
+                return False
+
+        mock_lock.side_effect = lambda agent: FakeLock()
+
+        result = request_agent_report(
+            "a",
+            assignment_id="assign-1",
+            enter=False,
+            lease={"state": "held"},
+        )
+
+        self.assertEqual(result["status"], "report_requested")
+        self.assertEqual(events, ["lock", "unlock"])
+        mock_unlocked.assert_called_once_with(
+            "a1",
+            "assign-1",
+            False,
+            lease={"state": "held"},
+        )
+
     @patch("codex_master.server.claim_agent_with_wait")
     def test_mutating_tools_require_auth_by_default_and_allow_bootstrap_override(self, mock_claim_with_wait) -> None:
         mock_claim_with_wait.return_value = {
