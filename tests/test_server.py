@@ -5314,6 +5314,53 @@ class ServerHelpersTest(unittest.TestCase):
         mock_action.assert_called_once_with("a1", "stop", release_after_interrupt=False)
         mock_marker.assert_called_once_with("a1", None)
 
+    @patch("codex_master.server.update_agent_spark_health")
+    def test_fleet_watchdog_does_not_update_spark_health_after_lease_expiry(self, mock_health) -> None:
+        status = {
+            "agent": "a",
+            "running": True,
+            "lease": {"state": "expired", "held_by_this_server": False, "raw_output": "not_returned"},
+            "response_state": {"state": "running_idle"},
+            "raw_log_idle_seconds": 600,
+            "raw_log_bytes": 0,
+            "raw_log_updated_at_utc": "1970-01-01T00:15:00+00:00",
+            "started_at_utc": "2026-06-07T09:00:00+00:00",
+            "last_assignment": {"assignment_id": "assign-1", "created_at_utc": "2026-06-07T09:58:00+00:00"},
+        }
+        lease = {
+            "state": "held",
+            "holder": "this_server",
+            "held_by_this_server": True,
+            "lease_id": "a" * 32,
+        }
+        report_error = AgentInputNotReadyError(
+            "agent input is not ready",
+            {
+                "error_code": "agent_input_not_ready",
+                "operation": "agent_report_request",
+                "retryable": True,
+                "paste_attempted": False,
+                "raw_output": "not_returned",
+                "response_output": "not_returned",
+            },
+        )
+        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "codex_master.server.status_agent", return_value=status
+        ), patch("codex_master.server.read_meta", return_value={}), patch(
+            "codex_master.server.claim_agent", return_value={"status": "claimed_expired", "lease": lease}
+        ), patch("codex_master.server.request_agent_report", side_effect=report_error), patch(
+            "codex_master.server.agent_lease_status",
+            return_value={"state": "expired", "held_by_this_server": False, "lease_id": lease["lease_id"]},
+        ), patch("codex_master.server.watchdog_action", return_value={"status": "stopped"}), patch(
+            "codex_master.server.update_watchdog_marker"
+        ):
+            result = fleet_watchdog("a", action="stop", manage_unclaimed=True)
+
+        payload = result["results"][0]
+        self.assertEqual(payload["spark_health"]["state"], "not_checked")
+        self.assertEqual(payload["spark_health"]["reason"], "lease_not_held_by_this_server")
+        mock_health.assert_not_called()
+
     def test_fleet_watchdog_does_not_reuse_release_flag_after_session_restart(self) -> None:
         meta_store: dict[str, object] = {
             "watchdog": {

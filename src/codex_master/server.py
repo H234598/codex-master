@@ -4551,14 +4551,13 @@ def update_agent_spark_health(agent: str, *, state: str, reason: str) -> dict[st
     return {**result, "account_state": "spark_routed", "raw_output": "not_returned"}
 
 
-def update_wait_agent_spark_health(
+def update_agent_spark_health_if_lease_current(
     agent: str,
-    status: dict[str, Any],
+    lease: Any,
     *,
     state: str,
     reason: str,
 ) -> dict[str, Any]:
-    lease = status.get("lease")
     if not isinstance(lease, dict) or lease.get("held_by_this_server") is not True:
         return {
             "state": "not_checked",
@@ -4591,6 +4590,21 @@ def update_wait_agent_spark_health(
                 "raw_output": "not_returned",
             }
         return update_agent_spark_health(agent, state=state, reason=reason)
+
+
+def update_wait_agent_spark_health(
+    agent: str,
+    status: dict[str, Any],
+    *,
+    state: str,
+    reason: str,
+) -> dict[str, Any]:
+    return update_agent_spark_health_if_lease_current(
+        agent,
+        status.get("lease"),
+        state=state,
+        reason=reason,
+    )
 
 
 def limit_model_pool(model: Any) -> str:
@@ -5628,8 +5642,9 @@ def _watchdog_agent_unlocked(
                 release_agent(agent, force=True)
             if isinstance(exc, AgentInputNotReadyError):
                 report_error = public_error_payload(exc)
-                spark_health = update_agent_spark_health(
+                spark_health = update_agent_spark_health_if_lease_current(
                     agent,
+                    lease,
                     state="failed",
                     reason="spark_turn_watchdog_report_unavailable",
                 )
@@ -5685,11 +5700,16 @@ def _watchdog_agent_unlocked(
         if isinstance(released_lease, dict):
             base["lease_state"] = released_lease.get("state")
             base["held_by_this_server"] = bool(released_lease.get("held_by_this_server"))
-    spark_health = update_agent_spark_health(
-        agent,
-        state="failed",
-        reason="spark_turn_watchdog_timeout",
-    ) if action != "none" else {"state": "not_checked", "updated": False, "raw_output": "not_returned"}
+    spark_health = (
+        update_agent_spark_health_if_lease_current(
+            agent,
+            lease,
+            state="failed",
+            reason="spark_turn_watchdog_timeout",
+        )
+        if action != "none"
+        else {"state": "not_checked", "updated": False, "raw_output": "not_returned"}
+    )
     release_after_interrupt = action == "interrupt" and (
         (manage_unclaimed and unclaimed_or_expired) or release_watchdog_lease
     )
