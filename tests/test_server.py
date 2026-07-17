@@ -5946,7 +5946,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(lease["seconds_remaining"], 0)
         self.assertIsNone(lease["expires_at_utc"])
 
-    def test_agent_lease_rejects_empty_owner_metadata(self) -> None:
+    def test_agent_lease_rejects_malformed_identity_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             state = root / "state"
@@ -5956,22 +5956,25 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.LOCK_DIR", state / "locks"
             ), patch("codex_master.server.LEASE_DIR", state / "leases"):
                 ensure_state()
-                (state / "leases" / "a1.json").write_text(
-                    json.dumps(
-                        {
-                            "agent": "a1",
-                            "owner": "",
-                            "expires_at_epoch": 4102444800,
-                            "ttl_seconds": DEFAULT_AGENT_LEASE_SECONDS,
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-
-                status = agent_lease_status("a1")
-                self.assertEqual(status["state"], "unreadable")
-                with self.assertRaisesRegex(AgentError, "could_not_read_agent_lease"):
-                    claim_agent("a1")
+                for record in (
+                    {
+                        "agent": "a1",
+                        "owner": "",
+                        "expires_at_epoch": 4102444800,
+                        "ttl_seconds": DEFAULT_AGENT_LEASE_SECONDS,
+                    },
+                    {
+                        "agent": [],
+                        "owner": "owner-two",
+                        "expires_at_epoch": 4102444800,
+                        "ttl_seconds": DEFAULT_AGENT_LEASE_SECONDS,
+                    },
+                ):
+                    (state / "leases" / "a1.json").write_text(json.dumps(record), encoding="utf-8")
+                    status = agent_lease_status("a1")
+                    self.assertEqual(status["state"], "unreadable")
+                    with self.assertRaisesRegex(AgentError, "could_not_read_agent_lease"):
+                        claim_agent("a1")
 
     def test_agent_release_does_not_delete_newly_claimed_lease(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

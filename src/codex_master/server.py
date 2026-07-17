@@ -1689,8 +1689,14 @@ def read_agent_lease_record(agent: str) -> dict[str, Any] | None:
         data = read_json_file(path)
         if data.get("meta_error"):
             raise AgentError("could_not_read_agent_lease")
+        record_agent = data.get("agent")
         owner = data.get("owner")
-        if data.get("agent") not in agent_record_aliases(agent) or not isinstance(owner, str) or not owner.strip():
+        if (
+            not isinstance(record_agent, str)
+            or record_agent not in agent_record_aliases(agent)
+            or not isinstance(owner, str)
+            or not owner.strip()
+        ):
             raise AgentError("could_not_read_agent_lease")
         data["agent"] = agent
         return data
