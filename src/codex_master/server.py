@@ -286,7 +286,7 @@ PLUGIN_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]{0,199}$")
 RELEASE_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+(?:[A-Za-z0-9.+_-]*)?$")
 BRACKETED_PASTE_BEGIN = "\x1b[200~"
 BRACKETED_PASTE_END = "\x1b[201~"
-CODEX_TUI_SUBMIT_KEY = "Enter"
+CODEX_TUI_SUBMIT_KEY = "S-Enter"
 CODEX_TUI_INPUT_MARKERS = ("›",)
 CODEX_TUI_INPUT_MARKER_WINDOW_LINES = 8
 PATH_NOT_RETURNED = "not_returned"
@@ -1568,29 +1568,80 @@ def read_private_regular_text(path: Path, max_bytes: int, error_text: str) -> st
 
 
 def replace_private_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
-    ensure_private_dir(path.parent)
-    tmp_path = path.with_name(f".{path.name}.{now_id()}.{uuid.uuid4().hex}.tmp")
+    parent = path.parent.expanduser()
+    if not parent.is_absolute():
+        parent = Path.cwd() / parent
+    parent = parent.absolute()
+    parent_parts = parent.parts
+    proc_parent_fd = None
+    if len(parent_parts) == 5 and parent_parts[:4] == ("/", "proc", "self", "fd") and parent_parts[4].isdigit():
+        proc_parent_fd = int(parent_parts[4])
+
+    parent_fd = -1
+    if proc_parent_fd is not None:
+        try:
+            parent_fd = os.dup(proc_parent_fd)
+            parent_stat = os.fstat(parent_fd)
+        except OSError as exc:
+            if parent_fd >= 0:
+                os.close(parent_fd)
+            raise AgentError("private state parent directories must be real directories") from exc
+        if not stat_module.S_ISDIR(parent_stat.st_mode):
+            os.close(parent_fd)
+            raise AgentError("private state parent directories must be real directories")
+    else:
+        try:
+            parent_stat = parent.lstat()
+        except FileNotFoundError:
+            parent_stat = None
+        except OSError as exc:
+            raise AgentError("private state parent directories must be real directories") from exc
+        ensure_private_dir(parent)
+        if parent_stat is None:
+            try:
+                parent_stat = parent.lstat()
+            except OSError as exc:
+                raise AgentError("private state parent directories must be real directories") from exc
+        parent_fd = open_directory_no_follow_matching(
+            parent,
+            parent_stat,
+            error_text="private state parent directories must be real directories",
+            changed_text="private state parent directories changed unexpectedly",
+        )
+
+    tmp_name = f".{path.name}.{now_id()}.{uuid.uuid4().hex}.tmp"
+    tmp_path = parent / tmp_name
     tmp_created = False
     try:
-        write_private_new_bytes(tmp_path, data, mode=mode)
+        write_private_new_bytes(tmp_path, data, mode=mode, dir_fd=parent_fd)
         tmp_created = True
-        tmp_path.replace(path)
+        os.replace(tmp_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         tmp_created = False
     finally:
         if tmp_created:
-            try:
-                tmp_path.unlink()
-            except FileNotFoundError:
-                pass
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name, dir_fd=parent_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
 
-def write_private_new_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
-    ensure_private_dir(path.parent)
+def write_private_new_bytes(
+    path: Path,
+    data: bytes,
+    mode: int = 0o600,
+    *,
+    dir_fd: int | None = None,
+) -> None:
+    if dir_fd is None:
+        ensure_private_dir(path.parent)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        fd = os.open(path, flags, 0o600)
+        if dir_fd is None:
+            fd = os.open(path, flags, 0o600)
+        else:
+            fd = os.open(path.name, flags, 0o600, dir_fd=dir_fd)
     except OSError as exc:
         raise AgentError("could not create private state temp file without following symlinks") from exc
     try:
@@ -1608,7 +1659,10 @@ def write_private_new_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
         if fd >= 0:
             os.close(fd)
         try:
-            path.unlink()
+            if dir_fd is None:
+                path.unlink()
+            else:
+                os.unlink(path.name, dir_fd=dir_fd)
         except FileNotFoundError:
             pass
         raise

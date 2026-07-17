@@ -6121,6 +6121,35 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(target.read_text(encoding="utf-8"), "managed\n")
             self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o644)
 
+    def test_replace_private_bytes_rejects_parent_swap_before_temp_write(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            managed = root / "managed"
+            outside = root / "outside"
+            managed.mkdir()
+            outside.mkdir()
+            target = managed / "state.json"
+            real_ensure = server_module.ensure_private_dir
+            ensure_calls = 0
+
+            def swap_after_parent_check(path):
+                nonlocal ensure_calls
+                ensure_calls += 1
+                result = real_ensure(path)
+                if path == managed and ensure_calls == 1:
+                    managed.rename(root / "managed-original")
+                    outside.rename(managed)
+                return result
+
+            with patch.object(server_module, "ensure_private_dir", side_effect=swap_after_parent_check):
+                with self.assertRaisesRegex(AgentError, "parent directories changed unexpectedly"):
+                    server_module.replace_private_bytes(target, b"secret-state\n")
+
+            self.assertFalse((managed / "state.json").exists())
+            self.assertFalse((root / "managed-original" / "state.json").exists())
+
     def test_pool_write_private_file_does_not_chmod_swapped_symlink_target(self) -> None:
         from codex_master import server as server_module
 
