@@ -620,11 +620,10 @@ def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | floa
 
     for index, line in enumerate(lines):
         header = line.split("#", 1)[0].strip()
-        if header in {
-            MCP_SERVER_TABLE_HEADER,
-            f'[mcp_servers."{MCP_SERVER_NAME}"]',
-            f"[mcp_servers.'{MCP_SERVER_NAME}']",
-        }:
+        if re.fullmatch(
+            rf"\[\s*mcp_servers\s*\.\s*(?:{re.escape(MCP_SERVER_NAME)}|\"{re.escape(MCP_SERVER_NAME)}\"|'{re.escape(MCP_SERVER_NAME)}')\s*\]",
+            header,
+        ):
             section_start = index
             break
 

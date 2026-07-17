@@ -452,6 +452,13 @@ class ServerHelpersTest(unittest.TestCase):
             120,
         )
 
+        spaced_header = array_table.replace(
+            "[mcp_servers.codex-master-mcp]", "[ mcp_servers . 'codex-master-mcp' ]"
+        )
+        spaced_updated, spaced_changed, _spaced_previous = updated_mcp_startup_timeout_config(spaced_header)
+        self.assertTrue(spaced_changed)
+        self.assertEqual(loads(spaced_updated)["mcp_servers"]["codex-master-mcp"]["startup_timeout_sec"], 120)
+
     def test_ensure_mcp_startup_timeout_configured_is_path_sparse_and_no_follow(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = Path(tmpdir) / ".codex" / "config.toml"
