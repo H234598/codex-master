@@ -527,36 +527,52 @@ def ensure_directory_chain_no_symlink(path: Path, error_text: str) -> None:
     if not path.is_absolute():
         raise AgentError(error_text)
     parts = path.parts
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    directory_fd = -1
     if len(parts) >= 5 and parts[:4] == ("/", "proc", "self", "fd") and parts[4].isdigit():
         try:
-            fd = int(parts[4])
-            fd_stat = os.fstat(fd)
+            directory_fd = os.dup(int(parts[4]))
+            fd_stat = os.fstat(directory_fd)
         except OSError as exc:
+            if directory_fd >= 0:
+                os.close(directory_fd)
             raise AgentError(error_text) from exc
         if not stat_module.S_ISDIR(fd_stat.st_mode):
+            os.close(directory_fd)
             raise AgentError(error_text)
-        current = Path(f"/proc/self/fd/{fd}")
         remaining_parts = parts[5:]
     else:
-        current = Path(path.anchor)
-        remaining_parts = parts[1:]
-    for part in remaining_parts:
-        current = current / part
         try:
-            current_stat = current.lstat()
-        except FileNotFoundError:
-            try:
-                current.mkdir()
-            except FileExistsError:
-                current_stat = current.lstat()
-            except OSError as exc:
-                raise AgentError(error_text) from exc
-            else:
-                current_stat = current.lstat()
+            directory_fd = os.open(path.anchor, flags)
         except OSError as exc:
             raise AgentError(error_text) from exc
-        if stat_module.S_ISLNK(current_stat.st_mode) or not stat_module.S_ISDIR(current_stat.st_mode):
-            raise AgentError(error_text)
+        remaining_parts = parts[1:]
+    try:
+        for part in remaining_parts:
+            try:
+                child_fd = os.open(part, flags, dir_fd=directory_fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, 0o777, dir_fd=directory_fd)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise AgentError(error_text) from exc
+                try:
+                    child_fd = os.open(part, flags, dir_fd=directory_fd)
+                except OSError as exc:
+                    raise AgentError(error_text) from exc
+            except OSError as exc:
+                raise AgentError(error_text) from exc
+            os.close(directory_fd)
+            directory_fd = child_fd
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
 
 
 def directory_chain_is_real_no_symlink(path: Path) -> bool:
