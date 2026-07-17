@@ -8127,6 +8127,37 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertTrue(swapped)
 
+    def test_pool_private_bytes_read_fails_closed_after_parent_swap(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            managed = root / "managed"
+            outside = root / "outside"
+            managed.mkdir()
+            outside.mkdir()
+            path = managed / "auth.json"
+            path.write_bytes(b"managed")
+            (outside / path.name).write_bytes(b"outside")
+            real_open = server_module.open_directory_no_follow_matching
+            swapped = False
+
+            def swap_before_open(candidate: Path, *args: Any, **kwargs: Any) -> int:
+                nonlocal swapped
+                if not swapped:
+                    managed.rename(root / "managed-original")
+                    outside.rename(managed)
+                    swapped = True
+                return real_open(candidate, *args, **kwargs)
+
+            with patch.object(
+                server_module, "open_directory_no_follow_matching", side_effect=swap_before_open
+            ):
+                with self.assertRaisesRegex(AgentError, "read failed"):
+                    server_module.pool_read_private_bytes(path, 1024, "read failed")
+
+        self.assertTrue(swapped)
+
     def test_remove_agent_lease_path_rejects_regular_file_swap_before_unlink(self) -> None:
         from codex_master import server as server_module
 

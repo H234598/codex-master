@@ -10124,9 +10124,19 @@ def pool_write_private_bytes(path: Path, data: bytes, mode: int) -> None:
 
 
 def pool_read_private_bytes(path: Path, max_bytes: int, error_text: str) -> bytes:
+    parent_fd = -1
     try:
-        current = path.lstat()
-    except OSError as exc:
+        parent_stat = path.parent.lstat()
+        parent_fd = open_directory_no_follow_matching(
+            path.parent,
+            parent_stat,
+            error_text=error_text,
+            changed_text=error_text,
+        )
+        current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+    except (AgentError, OSError) as exc:
+        if parent_fd >= 0:
+            os.close(parent_fd)
         raise AgentError(error_text) from exc
     if (
         stat_module.S_ISLNK(current.st_mode)
@@ -10140,7 +10150,7 @@ def pool_read_private_bytes(path: Path, max_bytes: int, error_text: str) -> byte
         flags |= os.O_NOFOLLOW
     fd = -1
     try:
-        fd = os.open(path, flags)
+        fd = os.open(path.name, flags, dir_fd=parent_fd)
         opened = os.fstat(fd)
         if (
             not source_identity_matches(opened, current)
@@ -10160,6 +10170,8 @@ def pool_read_private_bytes(path: Path, max_bytes: int, error_text: str) -> byte
     finally:
         if fd >= 0:
             os.close(fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
     if len(data) > max_bytes:
         raise AgentError(error_text)
     return data
