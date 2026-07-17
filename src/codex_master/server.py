@@ -1403,6 +1403,9 @@ def read_json_file(path: Path) -> dict[str, Any]:
 def read_codex_usage_snapshot(account: str) -> dict[str, Any]:
     path = codex_usage_snapshot_path(account)
     snapshot_dir = path.parent
+    if not snapshot_dir.is_absolute():
+        snapshot_dir = Path.cwd() / snapshot_dir
+    path = snapshot_dir / path.name
     try:
         snapshot_dir_stat = snapshot_dir.lstat()
     except FileNotFoundError:
@@ -1415,25 +1418,32 @@ def read_codex_usage_snapshot(account: str) -> dict[str, Any]:
         or not directory_chain_is_real_no_symlink(snapshot_dir)
     ):
         raise AgentError("could_not_read_codex_usage_snapshot")
-    try:
-        current_stat = path.lstat()
-    except FileNotFoundError:
-        return {}
-    except OSError as exc:
-        raise AgentError("could_not_read_codex_usage_snapshot") from exc
-    if (
-        not stat_module.S_ISREG(current_stat.st_mode)
-        or getattr(current_stat, "st_nlink", 1) > 1
-        or current_stat.st_size > MAX_CODEX_USAGE_SNAPSHOT_BYTES
-    ):
-        raise AgentError("could_not_read_codex_usage_snapshot")
-
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    snapshot_fd = -1
     fd = -1
     try:
-        fd = os.open(path, flags)
+        snapshot_fd = open_directory_chain_no_follow_matching(
+            snapshot_dir,
+            snapshot_dir_stat,
+            error_text="could_not_read_codex_usage_snapshot",
+            changed_text="could_not_read_codex_usage_snapshot",
+        )
+        try:
+            current_stat = os.stat(path.name, dir_fd=snapshot_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return {}
+        except OSError as exc:
+            raise AgentError("could_not_read_codex_usage_snapshot") from exc
+        if (
+            not stat_module.S_ISREG(current_stat.st_mode)
+            or getattr(current_stat, "st_nlink", 1) > 1
+            or current_stat.st_size > MAX_CODEX_USAGE_SNAPSHOT_BYTES
+        ):
+            raise AgentError("could_not_read_codex_usage_snapshot")
+
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path.name, flags, dir_fd=snapshot_fd)
         opened_stat = os.fstat(fd)
         if (
             not source_identity_matches(opened_stat, current_stat)
@@ -1450,6 +1460,8 @@ def read_codex_usage_snapshot(account: str) -> dict[str, Any]:
     finally:
         if fd >= 0:
             os.close(fd)
+        if snapshot_fd >= 0:
+            os.close(snapshot_fd)
 
     if len(raw) > MAX_CODEX_USAGE_SNAPSHOT_BYTES:
         raise AgentError("could_not_read_codex_usage_snapshot")

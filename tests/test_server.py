@@ -271,6 +271,45 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(result, {"meta_error": "could_not_read"})
             self.assertEqual(original.read_text(encoding="utf-8"), '{"owner":"expected"}\n')
 
+    def test_read_codex_usage_snapshot_rejects_parent_swap_before_open(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snapshot_dir = root / "snapshots"
+            original_dir = root / "original-snapshots"
+            outside_dir = root / "outside-snapshots"
+            snapshot_dir.mkdir()
+            outside_dir.mkdir()
+            (snapshot_dir / "a1.json").write_text('{"account":"a1","status":"clear"}\n', encoding="utf-8")
+            (outside_dir / "a1.json").write_text(
+                '{"account":"outside","status":"blocked"}\n', encoding="utf-8"
+            )
+            real_open_directory = server_module.open_directory_chain_no_follow_matching
+            swapped = False
+
+            def swap_before_parent_open(path, *args, **kwargs):
+                nonlocal swapped
+                if not swapped and Path(path) == snapshot_dir:
+                    snapshot_dir.rename(original_dir)
+                    snapshot_dir.symlink_to(outside_dir, target_is_directory=True)
+                    swapped = True
+                return real_open_directory(path, *args, **kwargs)
+
+            with patch.dict("os.environ", {"CODEX_USAGE_STATE_ROOT": str(root)}, clear=False), patch.object(
+                server_module,
+                "open_directory_chain_no_follow_matching",
+                side_effect=swap_before_parent_open,
+            ):
+                with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
+                    server_module.read_codex_usage_snapshot("a1")
+
+            self.assertTrue(swapped)
+            self.assertEqual(
+                (original_dir / "a1.json").read_text(encoding="utf-8"),
+                '{"account":"a1","status":"clear"}\n',
+            )
+
     def test_read_private_regular_text_rejects_regular_file_swap_before_open(self) -> None:
         from codex_master import server as server_module
 
@@ -5785,7 +5824,9 @@ class ServerHelpersTest(unittest.TestCase):
 
             def swap_before_snapshot_open(path, flags, *args, **kwargs):
                 nonlocal swapped
-                if not swapped and isinstance(path, (str, bytes, Path)) and Path(path) == snapshot:
+                relative_snapshot_open = path == snapshot.name and kwargs.get("dir_fd") is not None
+                absolute_snapshot_open = isinstance(path, (str, bytes, Path)) and Path(path) == snapshot
+                if not swapped and (relative_snapshot_open or absolute_snapshot_open):
                     snapshot.rename(original)
                     replacement.rename(snapshot)
                     swapped = True
