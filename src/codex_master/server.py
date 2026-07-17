@@ -1372,39 +1372,53 @@ def meta_path(agent: str) -> Path:
 
 def read_json_file(path: Path) -> dict[str, Any]:
     error = {"meta_error": "could_not_read"}
+    parent_fd = -1
     try:
-        current_stat = path.lstat()
-    except OSError:
+        parent_stat = path.parent.lstat()
+        parent_fd = open_directory_no_follow_matching(
+            path.parent,
+            parent_stat,
+            error_text="could_not_read",
+            changed_text="could_not_read",
+        )
+        current_stat = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+    except (AgentError, OSError):
+        if parent_fd >= 0:
+            os.close(parent_fd)
         return error
-    if (
-        not stat_module.S_ISREG(current_stat.st_mode)
-        or getattr(current_stat, "st_nlink", 1) > 1
-        or current_stat.st_size > MAX_META_BYTES
-    ):
-        return error
-
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = -1
     try:
-        fd = os.open(path, flags)
-        opened_stat = os.fstat(fd)
         if (
-            not source_identity_matches(opened_stat, current_stat)
-            or not stat_module.S_ISREG(opened_stat.st_mode)
-            or getattr(opened_stat, "st_nlink", 1) > 1
-            or opened_stat.st_size > MAX_META_BYTES
+            not stat_module.S_ISREG(current_stat.st_mode)
+            or getattr(current_stat, "st_nlink", 1) > 1
+            or current_stat.st_size > MAX_META_BYTES
         ):
             return error
-        with os.fdopen(fd, "rb") as fh:
-            fd = -1
-            raw = fh.read(MAX_META_BYTES + 1)
-    except OSError:
-        return error
+
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = -1
+        try:
+            fd = os.open(path.name, flags, dir_fd=parent_fd)
+            opened_stat = os.fstat(fd)
+            if (
+                not source_identity_matches(opened_stat, current_stat)
+                or not stat_module.S_ISREG(opened_stat.st_mode)
+                or getattr(opened_stat, "st_nlink", 1) > 1
+                or opened_stat.st_size > MAX_META_BYTES
+            ):
+                return error
+            with os.fdopen(fd, "rb") as fh:
+                fd = -1
+                raw = fh.read(MAX_META_BYTES + 1)
+        except OSError:
+            return error
+        finally:
+            if fd >= 0:
+                os.close(fd)
     finally:
-        if fd >= 0:
-            os.close(fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
     if len(raw) > MAX_META_BYTES:
         return error

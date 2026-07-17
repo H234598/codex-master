@@ -259,7 +259,11 @@ class ServerHelpersTest(unittest.TestCase):
 
             def swap_before_record_open(path, flags, *args, **kwargs):
                 nonlocal swapped
-                if not swapped and isinstance(path, (str, bytes, Path)) and Path(path) == record:
+                target_open = isinstance(path, (str, bytes, Path)) and (
+                    Path(path) == record
+                    or (kwargs.get("dir_fd") is not None and Path(path) == Path(record.name))
+                )
+                if not swapped and target_open:
                     record.rename(original)
                     replacement.rename(record)
                     swapped = True
@@ -4072,7 +4076,9 @@ class ServerHelpersTest(unittest.TestCase):
     @patch("codex_master.server.ensure_state")
     def test_safe_tail_log_source_rejects_unmanaged_meta_path(self, _mock_ensure_state, mock_lease) -> None:
         mock_lease.return_value = {"state": "unclaimed", "holder": "none", "raw_output": "not_returned"}
-        with patch("codex_master.server.read_meta", return_value={"raw_log": "/etc/passwd"}):
+        with patch("codex_master.server.tmux_alive", return_value=False), patch(
+            "codex_master.server.read_meta", return_value={"raw_log": "/etc/passwd"}
+        ):
             response = handle_rpc(
                 {
                     "jsonrpc": "2.0",
@@ -8019,6 +8025,39 @@ class ServerHelpersTest(unittest.TestCase):
                     self.assertEqual(status["state"], "unreadable")
                     with self.assertRaisesRegex(AgentError, "could_not_read_agent_lease"):
                         claim_agent("a1")
+
+    def test_agent_lease_read_fails_closed_after_parent_swap(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            managed = root / "managed"
+            outside = root / "outside"
+            managed.mkdir()
+            outside.mkdir()
+            target = managed / "lease.json"
+            target.write_text(json.dumps({"agent": "a1", "owner": "managed"}), encoding="utf-8")
+            (outside / target.name).write_text(
+                json.dumps({"agent": "a1", "owner": "outside"}), encoding="utf-8"
+            )
+            real_open = server_module.open_directory_no_follow_matching
+            swapped = False
+
+            def swap_before_open(path: Path, *args: Any, **kwargs: Any) -> int:
+                nonlocal swapped
+                if not swapped:
+                    managed.rename(root / "managed-original")
+                    outside.rename(managed)
+                    swapped = True
+                return real_open(path, *args, **kwargs)
+
+            with patch.object(
+                server_module, "open_directory_no_follow_matching", side_effect=swap_before_open
+            ):
+                result = server_module.read_json_file(target)
+
+        self.assertTrue(swapped)
+        self.assertEqual(result, {"meta_error": "could_not_read"})
 
     def test_remove_agent_lease_path_rejects_regular_file_swap_before_unlink(self) -> None:
         from codex_master import server as server_module
