@@ -8931,7 +8931,12 @@ def remove_agent_pool_entry(path: Path) -> str:
             return "skipped"
         if not source_identity_matches(latest, current):
             return "skipped"
-        shutil.rmtree(path)
+        try:
+            remove_real_plugin_cache_dir(path)
+        except AgentError as exc:
+            if str(exc) in {"plugin cache entry changed during removal", "plugin cache entry is not a real directory"}:
+                return "skipped"
+            raise AgentError("safe pool removal is unavailable") from exc
         return "removed"
     return "skipped"
 

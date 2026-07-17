@@ -12639,6 +12639,33 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual((target / "secret.txt").read_text(encoding="utf-8"), "external-secret\n")
             self.assertEqual((original / "keep.txt").read_text(encoding="utf-8"), "managed\n")
 
+    def test_remove_agent_pool_entry_rejects_directory_swap_during_rmtree(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            target = root / "a1"
+            original = root / "original-a1"
+            outside = root / "outside"
+            target.mkdir()
+            (target / "keep.txt").write_text("managed\n", encoding="utf-8")
+            outside.mkdir()
+            (outside / "secret.txt").write_text("external-secret\n", encoding="utf-8")
+            real_rmtree = server_module.shutil.rmtree
+
+            def swap_during_rmtree(path, **kwargs):
+                target.rename(original)
+                outside.rename(target)
+                return real_rmtree(path, **kwargs)
+
+            swap_during_rmtree.avoids_symlink_attacks = True
+            with patch.object(server_module.shutil, "rmtree", swap_during_rmtree):
+                result = server_module.remove_agent_pool_entry(target)
+
+            self.assertEqual(result, "skipped")
+            self.assertTrue((target / "secret.txt").exists())
+            self.assertFalse((original / "keep.txt").exists())
+
     def test_agent_pool_destroy_requires_regular_marker_without_path_leak(self) -> None:
         from codex_master import server as server_module
 
