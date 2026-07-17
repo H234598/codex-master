@@ -2810,6 +2810,21 @@ def allowed_raw_log_path(raw_log: Any) -> Path | None:
     return identity[0] if identity is not None else None
 
 
+def allowed_agent_raw_log_identity(agent: str, raw_log: Any) -> tuple[Path, os.stat_result | None] | None:
+    agent = canonical_agent_id(agent)
+    identity = allowed_raw_log_identity(raw_log)
+    if identity is None:
+        return None
+    name = identity[0].name
+    if not name.endswith(".log"):
+        return None
+    _prefix, separator, suffix = name[:-4].rpartition("-")
+    known_suffixes = set(AGENT_IDS) | set(LEGACY_AGENT_ALIASES)
+    if separator and suffix in known_suffixes and suffix not in agent_record_aliases(agent):
+        return None
+    return identity
+
+
 def latest_managed_raw_log(agent: str, *, include_legacy: bool = True) -> Path | None:
     agent = canonical_agent_id(agent)
     suffixes = tuple(f"-{alias}.log" for alias in agent_record_aliases(agent))
@@ -2854,7 +2869,7 @@ def protected_raw_log_paths() -> set[Path]:
         if record_agent not in AGENTS:
             record_agent = agent
         raw_log = read_meta(record_agent).get("raw_log")
-        identity = allowed_raw_log_identity(raw_log)
+        identity = allowed_agent_raw_log_identity(record_agent, raw_log)
         if identity is not None and identity[1] is not None:
             protected.add(identity[0])
             continue
@@ -4580,7 +4595,7 @@ def status_agent(agent: str) -> dict[str, Any]:
     session = cfg["session"]
     meta = read_meta(agent)
     raw_log = meta.get("raw_log")
-    raw_log_identity = allowed_raw_log_identity(raw_log)
+    raw_log_identity = allowed_agent_raw_log_identity(agent, raw_log)
     raw_log_path = raw_log_identity[0] if raw_log_identity is not None else None
     process_summary = agent_home_process_summary(agent)
     running = tmux_alive(session)
@@ -8932,7 +8947,7 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
         raw = pane_tail(agent, lines)
     else:
         raw_log = meta.get("raw_log")
-        raw_log_identity = allowed_raw_log_identity(raw_log)
+        raw_log_identity = allowed_agent_raw_log_identity(agent, raw_log)
         raw_log_path = raw_log_identity[0] if raw_log_identity is not None else None
         if tmux_alive(AGENTS[agent]["session"]) and (raw_log_path is None or raw_log_identity[1] is None):
             require_managed_tmux_session(agent)
