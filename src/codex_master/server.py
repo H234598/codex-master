@@ -8545,32 +8545,32 @@ def send_agent(
     text = bounded_text(text, field="text", max_chars=MAX_SEND_TEXT, required=True, strip=False) or ""
     cfg = AGENTS[agent]
     session = cfg["session"]
-    if not tmux_alive(session):
-        raise AgentError(f"agent {agent} is not running")
-    readiness = wait_agent_input_ready(agent, ready_timeout_seconds)
-    if not readiness["ready"]:
-        raise AgentInputNotReadyError(
-            "agent input is not ready; retry after Codex TUI startup completes",
-            {
-                "agent": agent,
-                "error_code": "agent_input_not_ready",
-                "operation": operation,
-                "retryable": True,
-                "retry_after_seconds": 1,
-                "paste_attempted": False,
-                "input_ready": readiness,
-                "raw_output": "not_returned",
-                "response_output": "not_returned",
-            },
-        )
-    paste_mode = "bracketed_paste" if "\n" in text else "plain_paste"
-    payload = f"{BRACKETED_PASTE_BEGIN}{text}{BRACKETED_PASTE_END}" if paste_mode == "bracketed_paste" else text
-    buffer_name = f"codex-master-mcp-{agent}-{uuid.uuid4().hex}"
-    cp = run_tmux(["load-buffer", "-b", buffer_name, "-"], input_text=payload, check=False)
-    if cp.returncode != 0:
-        raise AgentError(f"tmux load-buffer failed for agent {agent}")
-    try:
-        with agent_lifecycle_lock(agent):
+    with agent_lifecycle_lock(agent):
+        if not tmux_alive(session):
+            raise AgentError(f"agent {agent} is not running")
+        readiness = wait_agent_input_ready(agent, ready_timeout_seconds)
+        if not readiness["ready"]:
+            raise AgentInputNotReadyError(
+                "agent input is not ready; retry after Codex TUI startup completes",
+                {
+                    "agent": agent,
+                    "error_code": "agent_input_not_ready",
+                    "operation": operation,
+                    "retryable": True,
+                    "retry_after_seconds": 1,
+                    "paste_attempted": False,
+                    "input_ready": readiness,
+                    "raw_output": "not_returned",
+                    "response_output": "not_returned",
+                },
+            )
+        paste_mode = "bracketed_paste" if "\n" in text else "plain_paste"
+        payload = f"{BRACKETED_PASTE_BEGIN}{text}{BRACKETED_PASTE_END}" if paste_mode == "bracketed_paste" else text
+        buffer_name = f"codex-master-mcp-{agent}-{uuid.uuid4().hex}"
+        cp = run_tmux(["load-buffer", "-b", buffer_name, "-"], input_text=payload, check=False)
+        if cp.returncode != 0:
+            raise AgentError(f"tmux load-buffer failed for agent {agent}")
+        try:
             cp = run_tmux(["paste-buffer", "-d", "-b", buffer_name, "-t", session], check=False)
             if cp.returncode != 0:
                 raise AgentError(f"tmux paste-buffer failed for agent {agent}")
@@ -8578,9 +8578,9 @@ def send_agent(
                 cp = run_tmux(["send-keys", "-t", session, CODEX_TUI_SUBMIT_KEY], check=False)
                 if cp.returncode != 0:
                     raise AgentError(f"tmux send submit key failed for agent {agent}")
-    except Exception:
-        run_tmux(["delete-buffer", "-b", buffer_name], check=False)
-        raise
+        except Exception:
+            run_tmux(["delete-buffer", "-b", buffer_name], check=False)
+            raise
     return {
         "agent": agent,
         "status": "sent",

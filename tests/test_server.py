@@ -11013,32 +11013,54 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["status"], "sent")
         self.assertEqual(events, ["lock", "paste-buffer", "send-keys", "unlock"])
 
-    def test_send_agent_uses_distinct_tmux_buffers_for_parallel_sends(self) -> None:
-        first_loaded = threading.Event()
-        second_loaded = threading.Event()
-        load_lock = threading.Lock()
+    def test_send_agent_checks_readiness_and_loads_buffer_under_lifecycle_lock(self) -> None:
+        events = []
+        locked = False
+
+        class FakeLock:
+            def __enter__(self):
+                nonlocal locked
+                locked = True
+                events.append("lock")
+                return self
+
+            def __exit__(self, _exc_type, _exc_value, _traceback):
+                nonlocal locked
+                events.append("unlock")
+                locked = False
+
+        def fake_ready(*_args, **_kwargs):
+            self.assertTrue(locked)
+            events.append("ready")
+            return {"ready": True}
+
+        def fake_run_tmux(args, *, input_text=None, check=True, timeout=10):
+            del input_text, check, timeout
+            self.assertTrue(locked)
+            events.append(args[0])
+            return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
+
+        with patch("codex_master.server.tmux_alive", return_value=True), patch(
+            "codex_master.server.wait_agent_input_ready", side_effect=fake_ready
+        ), patch("codex_master.server.agent_lifecycle_lock", return_value=FakeLock()), patch(
+            "codex_master.server.run_tmux", side_effect=fake_run_tmux
+        ):
+            result = send_agent("a", "single line", enter=True)
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(events, ["lock", "ready", "load-buffer", "paste-buffer", "send-keys", "unlock"])
+
+    def test_send_agent_uses_distinct_tmux_buffers_for_sequential_sends(self) -> None:
         buffers = {}
         load_names = []
         pasted = []
-        results = []
-        load_count = 0
 
         def fake_run_tmux(args, *, input_text=None, check=True, timeout=10):
-            nonlocal load_count
             command = args[0]
             if command == "load-buffer":
                 name = args[args.index("-b") + 1]
                 buffers[name] = input_text
-                with load_lock:
-                    load_count += 1
-                    count = load_count
-                    load_names.append(name)
-                if count == 1:
-                    first_loaded.set()
-                    if not second_loaded.wait(2):
-                        raise AssertionError("second load did not happen")
-                elif count == 2:
-                    second_loaded.set()
+                load_names.append(name)
                 return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
             if command == "paste-buffer":
                 name = args[args.index("-b") + 1]
@@ -11051,32 +11073,16 @@ class ServerHelpersTest(unittest.TestCase):
                 buffers.pop(name, None)
             return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
-        def send(text):
-            try:
-                results.append((text, send_agent("a", text, enter=False)))
-            except Exception as exc:  # noqa: BLE001 - capture worker result for assertion
-                results.append((text, exc))
-
         with patch("codex_master.server.tmux_alive", return_value=True), patch(
             "codex_master.server.wait_agent_input_ready", return_value={"ready": True}
         ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux), patch(
             "codex_master.server.time.time", return_value=1234.0
         ):
-            first = threading.Thread(target=send, args=("first",))
-            second = threading.Thread(target=send, args=("second",))
-            first.start()
-            self.assertTrue(first_loaded.wait(2))
-            second.start()
-            first.join(3)
-            second.join(3)
+            first = send_agent("a", "first", enter=False)
+            second = send_agent("a", "second", enter=False)
 
-        self.assertFalse(first.is_alive())
-        self.assertFalse(second.is_alive())
-        self.assertEqual(len(results), 2)
-        for text, result in results:
-            with self.subTest(text=text):
-                self.assertIsInstance(result, dict)
-                self.assertEqual(result["status"], "sent")
+        self.assertEqual(first["status"], "sent")
+        self.assertEqual(second["status"], "sent")
         self.assertEqual(len(load_names), 2)
         self.assertEqual(len(set(load_names)), 2)
         self.assertCountEqual(pasted, ["first", "second"])
