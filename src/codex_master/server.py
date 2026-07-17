@@ -467,39 +467,60 @@ def ensure_private_dir(path: Path) -> None:
         if not stat_module.S_ISDIR(current.st_mode):
             raise AgentError("private state directory must be a real directory")
         return
-    ensure_directory_chain_no_symlink(path.parent, "private state parent directories must be real directories")
     try:
-        current = path.lstat()
+        parent_stat = path.parent.lstat()
     except FileNotFoundError:
+        parent_stat = None
+    except OSError as exc:
+        raise AgentError("private state parent directories must be real directories") from exc
+    ensure_directory_chain_no_symlink(path.parent, "private state parent directories must be real directories")
+    if parent_stat is None:
         try:
-            path.mkdir(parents=True, exist_ok=False)
-        except FileExistsError:
-            current = path.lstat()
-        else:
-            current = path.lstat()
-    if stat_module.S_ISLNK(current.st_mode):
-        raise AgentError("private state directory must not be a symlink")
-    if not stat_module.S_ISDIR(current.st_mode):
-        raise AgentError("private state path is not a directory")
+            parent_stat = path.parent.lstat()
+        except OSError as exc:
+            raise AgentError("private state parent directories must be real directories") from exc
+
+    parent_fd = -1
+    directory_fd = -1
     try:
-        current = path.lstat()
-    except FileNotFoundError as exc:
-        raise AgentError("private state directory disappeared") from exc
-    if stat_module.S_ISLNK(current.st_mode) or not stat_module.S_ISDIR(current.st_mode):
-        raise AgentError("private state directory changed unexpectedly")
-    directory_fd = open_directory_no_follow_matching(
-        path,
-        current,
-        error_text="private state directory is not readable",
-        changed_text="private state directory changed unexpectedly",
-    )
-    try:
+        parent_fd = open_directory_no_follow_matching(
+            path.parent,
+            parent_stat,
+            error_text="private state parent directories must be real directories",
+            changed_text="private state parent directories changed unexpectedly",
+        )
+        try:
+            current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            try:
+                os.mkdir(path.name, 0o777, dir_fd=parent_fd)
+                current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileExistsError:
+                current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise AgentError("private state directory could not be created") from exc
+        except OSError as exc:
+            raise AgentError("private state directory could not be read") from exc
+        if stat_module.S_ISLNK(current.st_mode):
+            raise AgentError("private state directory must not be a symlink")
+        if not stat_module.S_ISDIR(current.st_mode):
+            raise AgentError("private state path is not a directory")
+        directory_fd = open_directory_no_follow_matching(
+            path.name,
+            current,
+            error_text="private state directory is not readable",
+            changed_text="private state directory changed unexpectedly",
+            dir_fd=parent_fd,
+        )
         try:
             os.fchmod(directory_fd, 0o700)
         except PermissionError:
             pass
     finally:
-        os.close(directory_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
 
 def ensure_directory_chain_no_symlink(path: Path, error_text: str) -> None:
@@ -7326,13 +7347,29 @@ def open_directory_no_follow_matching(
         flags |= os.O_DIRECTORY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    proc_fd_number: int | None = None
     try:
-        fd = os.open(path, flags) if dir_fd is None else os.open(path, flags, dir_fd=dir_fd)
+        path_parts = Path(path).parts
+        if (
+            dir_fd is None
+            and len(path_parts) == 5
+            and path_parts[:4] == ("/", "proc", "self", "fd")
+            and path_parts[4].isdigit()
+        ):
+            proc_fd_number = int(path_parts[4])
+            fd = os.dup(proc_fd_number)
+        else:
+            fd = os.open(path, flags) if dir_fd is None else os.open(path, flags, dir_fd=dir_fd)
     except OSError as exc:
         raise AgentError(error_text) from exc
     try:
         opened_stat = os.fstat(fd)
-        if not stat_module.S_ISDIR(opened_stat.st_mode) or not source_identity_matches(opened_stat, expected_stat):
+        expected_for_compare = expected_stat
+        if proc_fd_number is not None and stat_module.S_ISLNK(expected_stat.st_mode):
+            expected_for_compare = os.fstat(proc_fd_number)
+        if not stat_module.S_ISDIR(opened_stat.st_mode) or not source_identity_matches(
+            opened_stat, expected_for_compare
+        ):
             raise AgentError(changed_text)
         return fd
     except Exception:
@@ -7548,60 +7585,147 @@ def copy_regular_plugin_file_from_dir_no_follow(
             remove_created_plugin_file_if_same(dst, dst_stat)
 
 
-def copy_plugin_cache_dir_fd(src_fd: int, dst: Path) -> dict[str, int]:
+def open_plugin_destination_parent(path: Path) -> int:
+    try:
+        parent_stat = path.parent.lstat()
+    except OSError as exc:
+        raise AgentError("could_not_sync_plugin_cache") from exc
+    return open_directory_no_follow_matching(
+        path.parent,
+        parent_stat,
+        error_text="could_not_sync_plugin_cache",
+        changed_text="could_not_sync_plugin_cache",
+    )
+
+
+def open_plugin_destination_directory(path: Path, *, create: bool) -> int:
+    parent_fd = -1
+    directory_fd = -1
+    try:
+        parent_fd = open_plugin_destination_parent(path)
+        if create:
+            try:
+                os.mkdir(path.name, 0o755, dir_fd=parent_fd)
+            except OSError as exc:
+                raise AgentError("could_not_sync_plugin_cache") from exc
+        try:
+            current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise AgentError("could_not_sync_plugin_cache") from exc
+        if stat_module.S_ISLNK(current.st_mode) or not stat_module.S_ISDIR(current.st_mode):
+            raise AgentError("could_not_sync_plugin_cache")
+        directory_fd = open_directory_no_follow_matching(
+            path.name,
+            current,
+            error_text="could_not_sync_plugin_cache",
+            changed_text="could_not_sync_plugin_cache",
+            dir_fd=parent_fd,
+        )
+        result = directory_fd
+        directory_fd = -1
+        return result
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def open_plugin_destination_directory_at(parent_fd: int, name: str) -> int:
+    directory_fd = -1
+    try:
+        try:
+            os.mkdir(name, 0o755, dir_fd=parent_fd)
+            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise AgentError("could_not_sync_plugin_cache") from exc
+        if stat_module.S_ISLNK(current.st_mode) or not stat_module.S_ISDIR(current.st_mode):
+            raise AgentError("could_not_sync_plugin_cache")
+        directory_fd = open_directory_no_follow_matching(
+            name,
+            current,
+            error_text="could_not_sync_plugin_cache",
+            changed_text="could_not_sync_plugin_cache",
+            dir_fd=parent_fd,
+        )
+        result = directory_fd
+        directory_fd = -1
+        return result
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+
+
+def copy_plugin_cache_dir_fd(src_fd: int, dst: Path, *, dst_fd: int | None = None) -> dict[str, int]:
+    owned_dst_fd = dst_fd is None
+    if dst_fd is None:
+        dst_fd = open_plugin_destination_directory(dst, create=False)
+    dst_view = Path(f"/proc/self/fd/{dst_fd}")
     try:
         entry_names = sorted(os.listdir(src_fd))
     except OSError as exc:
+        if owned_dst_fd:
+            os.close(dst_fd)
         raise AgentError("could_not_sync_plugin_cache") from exc
     counts = {"files": 0, "directories": 0}
-    for name in entry_names:
-        if plugin_cache_name_excluded(name):
-            continue
-        try:
-            entry_stat = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
-        except OSError as exc:
-            raise AgentError("could_not_sync_plugin_cache") from exc
-        if stat_module.S_ISLNK(entry_stat.st_mode):
-            raise AgentError("plugin source contains unsupported symlink")
-        child_dst = dst / name
-        if stat_module.S_ISDIR(entry_stat.st_mode):
+    try:
+        for name in entry_names:
+            if plugin_cache_name_excluded(name):
+                continue
             try:
-                child_dst.mkdir(mode=0o755, exist_ok=False)
+                entry_stat = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
             except OSError as exc:
                 raise AgentError("could_not_sync_plugin_cache") from exc
-            child_fd = -1
-            try:
-                child_fd = os.open(
-                    name,
-                    os.O_RDONLY
-                    | (os.O_DIRECTORY if hasattr(os, "O_DIRECTORY") else 0)
-                    | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0),
-                    dir_fd=src_fd,
-                )
-                opened_stat = os.fstat(child_fd)
-                if not stat_module.S_ISDIR(opened_stat.st_mode) or not source_identity_matches(
-                    opened_stat, entry_stat
-                ):
-                    raise AgentError("plugin source changed during copy")
-                child_counts = copy_plugin_cache_dir_fd(child_fd, child_dst)
-            except AgentError:
-                raise
-            except OSError as exc:
-                raise AgentError("could_not_sync_plugin_cache") from exc
-            finally:
-                if child_fd >= 0:
-                    os.close(child_fd)
-            counts["directories"] += 1 + child_counts["directories"]
-            counts["files"] += child_counts["files"]
-            continue
-        if stat_module.S_ISREG(entry_stat.st_mode):
-            if getattr(entry_stat, "st_nlink", 1) > 1:
-                raise AgentError("plugin source contains unsupported hardlink")
-            copy_regular_plugin_file_from_dir_no_follow(src_fd, name, child_dst, entry_stat)
-            counts["files"] += 1
-            continue
-        raise AgentError("plugin source contains unsupported file type")
-    return counts
+            if stat_module.S_ISLNK(entry_stat.st_mode):
+                raise AgentError("plugin source contains unsupported symlink")
+            child_dst = dst_view / name
+            if stat_module.S_ISDIR(entry_stat.st_mode):
+                child_fd = -1
+                try:
+                    child_fd = open_plugin_destination_directory_at(dst_fd, name)
+                    source_child_fd = -1
+                    try:
+                        source_child_fd = os.open(
+                            name,
+                            os.O_RDONLY
+                            | (os.O_DIRECTORY if hasattr(os, "O_DIRECTORY") else 0)
+                            | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0),
+                            dir_fd=src_fd,
+                        )
+                        opened_stat = os.fstat(source_child_fd)
+                        if not stat_module.S_ISDIR(opened_stat.st_mode) or not source_identity_matches(
+                            opened_stat, entry_stat
+                        ):
+                            raise AgentError("plugin source changed during copy")
+                        child_counts = copy_plugin_cache_dir_fd(
+                            source_child_fd,
+                            child_dst,
+                            dst_fd=child_fd,
+                        )
+                    finally:
+                        if source_child_fd >= 0:
+                            os.close(source_child_fd)
+                except AgentError:
+                    raise
+                except OSError as exc:
+                    raise AgentError("could_not_sync_plugin_cache") from exc
+                finally:
+                    if child_fd >= 0:
+                        os.close(child_fd)
+                counts["directories"] += 1 + child_counts["directories"]
+                counts["files"] += child_counts["files"]
+                continue
+            if stat_module.S_ISREG(entry_stat.st_mode):
+                if getattr(entry_stat, "st_nlink", 1) > 1:
+                    raise AgentError("plugin source contains unsupported hardlink")
+                copy_regular_plugin_file_from_dir_no_follow(src_fd, name, child_dst, entry_stat)
+                counts["files"] += 1
+                continue
+            raise AgentError("plugin source contains unsupported file type")
+        return counts
+    finally:
+        if owned_dst_fd:
+            os.close(dst_fd)
 
 
 def copy_plugin_cache_path(src: Path, dst: Path) -> dict[str, int]:
@@ -7612,25 +7736,27 @@ def copy_plugin_cache_path(src: Path, dst: Path) -> dict[str, int]:
     if stat_module.S_ISLNK(src_stat.st_mode):
         raise AgentError("plugin source contains unsupported symlink")
     if stat_module.S_ISDIR(src_stat.st_mode):
-        try:
-            dst.mkdir(mode=0o755, exist_ok=False)
-        except OSError as exc:
-            raise AgentError("could_not_sync_plugin_cache") from exc
+        dst_fd = open_plugin_destination_directory(dst, create=True)
         counts = {"files": 0, "directories": 1}
         src_fd = -1
         try:
             src_fd = open_plugin_source_dir_no_follow(src, src_stat)
-            child_counts = copy_plugin_cache_dir_fd(src_fd, dst)
+            child_counts = copy_plugin_cache_dir_fd(src_fd, dst, dst_fd=dst_fd)
         finally:
             if src_fd >= 0:
                 os.close(src_fd)
+            os.close(dst_fd)
         counts["files"] += child_counts["files"]
         counts["directories"] += child_counts["directories"]
         return counts
     if stat_module.S_ISREG(src_stat.st_mode):
         if getattr(src_stat, "st_nlink", 1) > 1:
             raise AgentError("plugin source contains unsupported hardlink")
-        copy_regular_plugin_file_no_follow(src, dst, src_stat)
+        parent_fd = open_plugin_destination_parent(dst)
+        try:
+            copy_regular_plugin_file_no_follow(src, Path(f"/proc/self/fd/{parent_fd}") / dst.name, src_stat)
+        finally:
+            os.close(parent_fd)
         return {"files": 1, "directories": 0}
     raise AgentError("plugin source contains unsupported file type")
 

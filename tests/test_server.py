@@ -2379,6 +2379,45 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(destination.read_text(encoding="utf-8"), "external\n")
             self.assertTrue(destination_backup.exists())
 
+    def test_plugin_copy_keeps_recursive_destination_on_pinned_directory(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "source"
+            destination = root / "destination"
+            destination_backup = root / "destination-original"
+            outside = root / "outside"
+            source.mkdir()
+            (source / "managed.txt").write_text("managed\n", encoding="utf-8")
+            outside.mkdir()
+            real_open_source = server_module.open_plugin_source_dir_no_follow
+            swapped = False
+
+            def swap_after_destination_open(path, expected_stat):
+                nonlocal swapped
+                result = real_open_source(path, expected_stat)
+                if not swapped:
+                    destination.rename(destination_backup)
+                    outside.rename(destination)
+                    swapped = True
+                return result
+
+            with patch.object(
+                server_module,
+                "open_plugin_source_dir_no_follow",
+                side_effect=swap_after_destination_open,
+            ):
+                result = server_module.copy_plugin_cache_path(source, destination)
+
+            pinned_file_exists = (destination_backup / "managed.txt").is_file()
+            redirected_file_exists = (destination / "managed.txt").exists()
+
+        self.assertEqual(result["files"], 1)
+        self.assertTrue(swapped)
+        self.assertTrue(pinned_file_exists)
+        self.assertFalse(redirected_file_exists)
+
     def test_plugin_manifest_version_is_path_sparse(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -7686,6 +7725,43 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(redirected_state.exists())
         self.assertNotIn(str(real_parent), str(raised.exception))
+
+    def test_ensure_private_dir_rejects_real_parent_swap_before_create(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            managed = root / "managed"
+            outside = root / "outside"
+            backup = root / "managed-original"
+            managed.mkdir()
+            outside.mkdir()
+            target = managed / "state"
+            real_ensure_chain = server_module.ensure_directory_chain_no_symlink
+            swapped = False
+
+            def swap_after_chain(path, error_text):
+                nonlocal swapped
+                real_ensure_chain(path, error_text)
+                if not swapped and Path(path) == managed:
+                    managed.rename(backup)
+                    outside.rename(managed)
+                    swapped = True
+
+            with patch.object(
+                server_module,
+                "ensure_directory_chain_no_symlink",
+                side_effect=swap_after_chain,
+            ):
+                with self.assertRaisesRegex(AgentError, "parent directories changed unexpectedly"):
+                    server_module.ensure_private_dir(target)
+
+            outside_target_exists = (managed / "state").exists()
+            original_target_exists = (backup / "state").exists()
+
+        self.assertTrue(swapped)
+        self.assertFalse(outside_target_exists)
+        self.assertFalse(original_target_exists)
 
     def test_ensure_private_dir_does_not_chmod_swapped_symlink_target(self) -> None:
         from codex_master import server as server_module
