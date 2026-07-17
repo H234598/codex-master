@@ -7183,6 +7183,7 @@ def replace_install_symlink(
     wrapper: Path,
     *,
     expected_parent_stat: os.stat_result | None = None,
+    target_text: str | None = None,
 ) -> None:
     tmp_name = f".{install_path.name}.tmp.{now_id()}.{uuid.uuid4().hex}"
     parent_fd = -1
@@ -7193,7 +7194,7 @@ def replace_install_symlink(
             "could_not_write_install_symlink",
             expected_stat=expected_parent_stat,
         )
-        os.symlink(wrapper, tmp_name, dir_fd=parent_fd)
+        os.symlink(str(wrapper) if target_text is None else target_text, tmp_name, dir_fd=parent_fd)
         tmp_created = True
         os.replace(tmp_name, install_path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         tmp_created = False
@@ -7205,6 +7206,36 @@ def replace_install_symlink(
                 os.unlink(tmp_name, dir_fd=parent_fd)
         if parent_fd >= 0:
             os.close(parent_fd)
+
+
+def restore_install_symlink(
+    install_path: Path,
+    wrapper: Path,
+    *,
+    previous_target_text: str | None,
+    expected_parent_stat: os.stat_result,
+) -> None:
+    try:
+        current_target_text = os.readlink(install_path)
+    except OSError as exc:
+        raise AgentError("install path changed after mutation") from exc
+    if current_target_text != str(wrapper):
+        raise AgentError("install path changed after mutation")
+    if previous_target_text is None:
+        status = remove_install_symlink_if_repo_wrapper(
+            install_path,
+            wrapper,
+            expected_parent_stat=expected_parent_stat,
+        )
+        if status not in {"removed", "missing"}:
+            raise AgentError("install path changed after mutation")
+        return
+    replace_install_symlink(
+        install_path,
+        wrapper,
+        expected_parent_stat=expected_parent_stat,
+        target_text=previous_target_text,
+    )
 
 
 def remove_install_symlink_if_repo_wrapper(
@@ -9140,6 +9171,13 @@ def _install_unlocked(
         install_path,
         "install parent directories must be real directories",
     )
+    previous_install_present = install_path.exists() or install_path.is_symlink()
+    previous_install_target_text: str | None = None
+    if install_path.is_symlink():
+        try:
+            previous_install_target_text = os.readlink(install_path)
+        except OSError as exc:
+            raise AgentError("install path could not be inspected") from exc
     if install_path.exists() or install_path.is_symlink():
         resolved_install_path = resolve_path_no_throw(install_path) if install_path.is_symlink() else None
         if install_path.is_symlink() and resolved_install_path == wrapper:
@@ -9160,47 +9198,63 @@ def _install_unlocked(
         replace_install_symlink(install_path, wrapper, expected_parent_stat=expected_parent_stat)
 
     registration: dict[str, Any] = {"requested": register, "status": "skipped"}
-    if register:
-        startup_self_test = {"requested": True, **mcp_command_startup_self_test(install_path)}
-        if not startup_self_test["ok"]:
-            raise AgentError("install path failed MCP startup self-test")
-        current = check_mcp_registration(install_path, include_command=True)
-        startup_timeout_config = None
-        if current.get("ok") or (current.get("registered") and current.get("command_matches")):
-            registration = {"requested": True, "status": "already_registered"}
-        else:
-            previous_command = current.get("_registered_command")
-            if not isinstance(previous_command, str) or not previous_command.strip():
-                previous_command = None
-            if current.get("registered") and force:
-                remove = run_command(["codex", "mcp", "remove", MCP_SERVER_NAME])
-                if remove.returncode != 0:
-                    raise AgentError("codex mcp remove failed")
-            elif current.get("registered"):
-                raise AgentError("MCP server is registered with a different command; rerun install with --force")
-            add = run_command(["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(install_path)])
-            if add.returncode != 0:
-                if previous_command is not None:
-                    restore = run_command(["codex", "mcp", "add", MCP_SERVER_NAME, "--", previous_command])
-                    if restore.returncode != 0:
-                        raise AgentError("codex mcp add failed")
-                raise AgentError("codex mcp add failed")
-            registration = {"requested": True, "status": "registered"}
-        if not current.get("startup_timeout_ok"):
-            startup_timeout_config = ensure_mcp_startup_timeout_configured()
-        else:
-            client_config = codex_client_mcp_config_status(command_path=install_path)
-            if not client_config.get("startup_timeout_ok"):
+    try:
+        if register:
+            startup_self_test = {"requested": True, **mcp_command_startup_self_test(install_path)}
+            if not startup_self_test["ok"]:
+                raise AgentError("install path failed MCP startup self-test")
+            current = check_mcp_registration(install_path, include_command=True)
+            startup_timeout_config = None
+            if current.get("ok") or (current.get("registered") and current.get("command_matches")):
+                registration = {"requested": True, "status": "already_registered"}
+            else:
+                previous_command = current.get("_registered_command")
+                if not isinstance(previous_command, str) or not previous_command.strip():
+                    previous_command = None
+                if current.get("registered") and force:
+                    remove = run_command(["codex", "mcp", "remove", MCP_SERVER_NAME])
+                    if remove.returncode != 0:
+                        raise AgentError("codex mcp remove failed")
+                elif current.get("registered"):
+                    raise AgentError("MCP server is registered with a different command; rerun install with --force")
+                add = run_command(["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(install_path)])
+                if add.returncode != 0:
+                    if previous_command is not None:
+                        restore = run_command(["codex", "mcp", "add", MCP_SERVER_NAME, "--", previous_command])
+                        if restore.returncode != 0:
+                            raise AgentError("codex mcp add failed")
+                    raise AgentError("codex mcp add failed")
+                registration = {"requested": True, "status": "registered"}
+            if not current.get("startup_timeout_ok"):
                 startup_timeout_config = ensure_mcp_startup_timeout_configured()
             else:
-                startup_timeout_config = {
-                    "status": "already_configured",
-                    "startup_timeout_sec": RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
-                    "previous_startup_timeout_sec": RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
-                    "config_path": "not_returned",
-                    "raw_output": "not_returned",
-                }
-        registration["startup_timeout"] = startup_timeout_config
+                client_config = codex_client_mcp_config_status(command_path=install_path)
+                if not client_config.get("startup_timeout_ok"):
+                    startup_timeout_config = ensure_mcp_startup_timeout_configured()
+                else:
+                    startup_timeout_config = {
+                        "status": "already_configured",
+                        "startup_timeout_sec": RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
+                        "previous_startup_timeout_sec": RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
+                        "config_path": "not_returned",
+                        "raw_output": "not_returned",
+                    }
+            registration["startup_timeout"] = startup_timeout_config
+    except Exception:
+        rollback_install = symlink_status != "already_installed" and (
+            not previous_install_present or previous_install_target_text is not None
+        )
+        if rollback_install:
+            try:
+                restore_install_symlink(
+                    install_path,
+                    wrapper,
+                    previous_target_text=previous_install_target_text,
+                    expected_parent_stat=expected_parent_stat,
+                )
+            except Exception as restore_exc:
+                raise AgentError("could_not_restore_install_symlink") from restore_exc
+        raise
     return {
         "ok": True,
         "install_path": PATH_NOT_RETURNED,

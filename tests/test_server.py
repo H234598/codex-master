@@ -13762,6 +13762,8 @@ class CliLifecycleTest(unittest.TestCase):
             wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
             previous_command.write_text("#!/bin/sh\n", encoding="utf-8")
             install_link = tmp_path / "bin" / "codex-master-mcp"
+            install_link.parent.mkdir()
+            install_link.symlink_to(previous_command)
             mock_wrapper_path.return_value = wrapper
             mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
             mock_registration.return_value = {
@@ -13780,6 +13782,7 @@ class CliLifecycleTest(unittest.TestCase):
                 install(register=True, force=True, install_path=install_link, sync_plugin_cache=False)
 
             commands = [call.args[0] for call in mock_run.call_args_list]
+            restored_link = install_link.resolve(strict=False)
 
         self.assertEqual(
             commands,
@@ -13789,6 +13792,7 @@ class CliLifecycleTest(unittest.TestCase):
                 ["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(previous_command)],
             ],
         )
+        self.assertEqual(restored_link, previous_command)
 
     def test_install_cache_failure_preserves_existing_install_link(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
