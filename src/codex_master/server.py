@@ -409,6 +409,10 @@ class AgentError(RuntimeError):
     """Raised for expected agent-control failures."""
 
 
+class AgentLifecycleLockBusyError(AgentError):
+    """Raised when a bounded lifecycle-lock acquisition reaches its deadline."""
+
+
 class AgentBusyError(AgentError):
     """Raised when an Agentin is leased by a different MCP client."""
 
@@ -1527,33 +1531,58 @@ _LIFECYCLE_LOCK_STACK: contextvars.ContextVar[tuple[str, ...]] = contextvars.Con
 
 
 @contextlib.contextmanager
-def agent_lifecycle_lock(agent: str) -> Any:
+def agent_lifecycle_lock(agent: str, *, timeout_seconds: float | None = None) -> Any:
     agent = canonical_agent_id(agent)
     held_locks = _LIFECYCLE_LOCK_STACK.get()
     if agent in held_locks:
         yield
         return
+    deadline = None
+    if timeout_seconds is not None:
+        try:
+            timeout_seconds = float(timeout_seconds)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise AgentError("lifecycle lock timeout must be a finite number") from exc
+        if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
+            raise AgentError("lifecycle lock timeout must be a finite number")
+        deadline = time.monotonic() + timeout_seconds
     ensure_private_dir(STATE_ROOT)
     ensure_private_dir(LOCK_DIR)
     lock_path = LOCK_DIR / f"agent-{agent}.lock"
     with open_private_regular_update(lock_path) as fh:
         token = None
+        lock_acquired = False
         try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            if deadline is None:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            else:
+                while True:
+                    try:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise AgentLifecycleLockBusyError(agent)
+                        time.sleep(min(0.01, remaining))
+            lock_acquired = True
             token = _LIFECYCLE_LOCK_STACK.set((*held_locks, agent))
             try:
                 yield
             except OSError as exc:
                 raise AgentError("could not acquire agent lifecycle lock") from exc
+        except AgentLifecycleLockBusyError:
+            raise
         except OSError as exc:
             raise AgentError("could not acquire agent lifecycle lock") from exc
         finally:
             if token is not None:
                 _LIFECYCLE_LOCK_STACK.reset(token)
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
+            if lock_acquired:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
 
 
 @contextlib.contextmanager
@@ -1826,6 +1855,23 @@ def agent_lease_status(agent: str, *, initialize_state: bool = True) -> dict[str
         }
 
 
+def agent_lifecycle_lock_busy_error(agent: str) -> AgentBusyError:
+    agent = canonical_agent_id(agent)
+    lease = agent_lease_status(agent)
+    return AgentBusyError(
+        f"agent {agent} lifecycle lock is busy",
+        {
+            "error_code": "agent_lifecycle_lock_busy",
+            "agent": agent,
+            "retryable": True,
+            "retry_after_seconds": 1,
+            "lease_seconds_remaining": int(lease.get("seconds_remaining") or 0),
+            "lease": lease,
+            "raw_output": "not_returned",
+        },
+    )
+
+
 def write_agent_lease(agent: str, ttl_seconds: int) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     now = time.time()
@@ -2006,8 +2052,9 @@ def claim_agent_with_wait(
         )
 
     while True:
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         try:
-            result = call_agent_lifecycle(agent, claim_once)
+            result = call_agent_lifecycle(agent, claim_once, timeout_seconds=remaining)
             result["waited_seconds"] = max(0, int(time.monotonic() - started))
             result["poll_count"] = polls
             result["wait_forever"] = wait_forever
@@ -2015,9 +2062,11 @@ def claim_agent_with_wait(
             result["recover_stopped"] = recover_stopped
             result["stopped_grace_seconds"] = stopped_grace_seconds
             return result
-        except AgentBusyError:
+        except (AgentBusyError, AgentLifecycleLockBusyError) as exc:
+            if isinstance(exc, AgentLifecycleLockBusyError):
+                exc = agent_lifecycle_lock_busy_error(agent)
             if deadline is not None and time.monotonic() >= deadline:
-                raise
+                raise exc
             sleep_seconds = float(poll_interval_seconds)
             if deadline is not None:
                 remaining = max(0.0, deadline - time.monotonic())
@@ -7745,8 +7794,16 @@ def require_broad_mutation_confirmation(
     }
 
 
-def call_agent_lifecycle(agent: str, fn: Any) -> dict[str, Any]:
-    with agent_lifecycle_lock(agent):
+def call_agent_lifecycle(
+    agent: str,
+    fn: Any,
+    *,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    if timeout_seconds is None:
+        with agent_lifecycle_lock(agent):
+            return fn()
+    with agent_lifecycle_lock(agent, timeout_seconds=timeout_seconds):
         return fn()
 
 

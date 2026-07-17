@@ -6719,6 +6719,49 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["recover_stopped"])
         self.assertEqual(result["stopped_grace_seconds"], DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS)
 
+    def test_agent_claim_wait_bounds_lifecycle_lock_contention(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            lock_held = threading.Event()
+            release_lock = threading.Event()
+            claim_done = threading.Event()
+            result: dict[str, Any] = {}
+
+            def hold_lifecycle_lock() -> None:
+                with agent_lifecycle_lock("a"):
+                    lock_held.set()
+                    release_lock.wait(2)
+
+            def bounded_claim() -> None:
+                try:
+                    result["value"] = claim_agent_with_wait("a", wait_seconds=0)
+                except BaseException as exc:
+                    result["error"] = exc
+                finally:
+                    claim_done.set()
+
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"):
+                holder = threading.Thread(target=hold_lifecycle_lock)
+                holder.start()
+                self.assertTrue(lock_held.wait(1))
+                worker = threading.Thread(target=bounded_claim)
+                worker.start()
+                try:
+                    self.assertTrue(claim_done.wait(1))
+                    self.assertIsInstance(result.get("error"), AgentBusyError)
+                    error = result["error"]
+                    self.assertEqual(error.payload["error_code"], "agent_lifecycle_lock_busy")
+                    self.assertEqual(error.payload["lease"]["state"], "unclaimed")
+                finally:
+                    release_lock.set()
+                    holder.join(2)
+                    worker.join(2)
+
     def test_wait_agent_rejects_invalid_direct_interval_values(self) -> None:
         with self.assertRaisesRegex(AgentError, "timeout_seconds must be an integer"):
             wait_agent("a", timeout_seconds=None)
@@ -6916,7 +6959,7 @@ class ServerHelpersTest(unittest.TestCase):
     )
     @patch("codex_master.server.call_agent_lifecycle")
     def test_claim_wait_refuses_codex_usage_block_before_lease(self, mock_lifecycle, _mock_usage) -> None:
-        mock_lifecycle.side_effect = lambda _agent, fn: fn()
+        mock_lifecycle.side_effect = lambda _agent, fn, **_kwargs: fn()
 
         with self.assertRaisesRegex(AgentError, "blocked by codex-usage watchdog"):
             claim_agent_with_wait("a", wait_seconds=0)
@@ -6926,7 +6969,7 @@ class ServerHelpersTest(unittest.TestCase):
     def test_claim_wait_rechecks_codex_usage_block_inside_lifecycle_lock(self) -> None:
         blocked_after_lock = False
 
-        def fake_lifecycle(_agent: str, fn: Any) -> dict[str, Any]:
+        def fake_lifecycle(_agent: str, fn: Any, **_kwargs: Any) -> dict[str, Any]:
             nonlocal blocked_after_lock
             blocked_after_lock = True
             return fn()
