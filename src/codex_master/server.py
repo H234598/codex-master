@@ -3496,14 +3496,21 @@ def cleanup_failed_start(session: str, raw_log: Path, *, kill_session: bool) -> 
         os.close(parent_fd)
 
 
-def release_start_lease_if_safe(agent: str, lease: dict[str, Any] | None, enabled: bool) -> None:
+def release_start_lease_if_safe(
+    agent: str,
+    lease: dict[str, Any] | None,
+    enabled: bool,
+    *,
+    existing_session: bool = False,
+) -> None:
     if not enabled or not lease or not lease.get("held_by_this_server"):
         return
     if not agent_lease_status(agent).get("held_by_this_server"):
         return
-    process_count = agent_home_process_summary(agent).get("process_count")
-    if not isinstance(process_count, int) or isinstance(process_count, bool) or process_count != 0:
-        return
+    if not existing_session:
+        process_count = agent_home_process_summary(agent).get("process_count")
+        if not isinstance(process_count, int) or isinstance(process_count, bool) or process_count != 0:
+            return
     release_agent(agent, force=True)
 
 
@@ -3764,7 +3771,12 @@ def _start_agent_with_lease_unlocked(
                     cleanup_failed_start(AGENTS[agent]["session"], raw_log_path, kill_session=True)
                 else:
                     run_tmux(["kill-session", "-t", AGENTS[agent]["session"]], check=False)
-            release_start_lease_if_safe(agent, lease, release_on_completion)
+            release_start_lease_if_safe(
+                agent,
+                lease,
+                release_on_completion,
+                existing_session=isinstance(result, dict) and result.get("status") == "already_running",
+            )
             raise
         if release_on_completion and agent_lease_status(agent).get("held_by_this_server"):
             release = release_agent(agent, force=True)
@@ -3783,7 +3795,12 @@ def _start_agent_with_lease_unlocked(
             model_reasoning_effort=selected_effort,
         )
     except Exception:
-        release_start_lease_if_safe(agent, lease, release_on_completion)
+        release_start_lease_if_safe(
+            agent,
+            lease,
+            release_on_completion,
+            existing_session=isinstance(result, dict) and result.get("status") == "already_running",
+        )
         raise
     try:
         validate_existing_session(result)
