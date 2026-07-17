@@ -8232,13 +8232,14 @@ def send_agent(
     if cp.returncode != 0:
         raise AgentError(f"tmux load-buffer failed for agent {agent}")
     try:
-        cp = run_tmux(["paste-buffer", "-d", "-b", buffer_name, "-t", session], check=False)
-        if cp.returncode != 0:
-            raise AgentError(f"tmux paste-buffer failed for agent {agent}")
-        if enter:
-            cp = run_tmux(["send-keys", "-t", session, CODEX_TUI_SUBMIT_KEY], check=False)
+        with agent_lifecycle_lock(agent):
+            cp = run_tmux(["paste-buffer", "-d", "-b", buffer_name, "-t", session], check=False)
             if cp.returncode != 0:
-                raise AgentError(f"tmux send submit key failed for agent {agent}")
+                raise AgentError(f"tmux paste-buffer failed for agent {agent}")
+            if enter:
+                cp = run_tmux(["send-keys", "-t", session, CODEX_TUI_SUBMIT_KEY], check=False)
+                if cp.returncode != 0:
+                    raise AgentError(f"tmux send submit key failed for agent {agent}")
     except Exception:
         run_tmux(["delete-buffer", "-b", buffer_name], check=False)
         raise

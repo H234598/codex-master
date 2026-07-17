@@ -10431,6 +10431,33 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(load_call["input_text"], "single line")
         self.assertFalse(any(call["args"][-1] == CODEX_TUI_SUBMIT_KEY for call in calls))
 
+    def test_send_agent_serializes_paste_and_submit_under_lifecycle_lock(self) -> None:
+        events = []
+
+        class FakeLock:
+            def __enter__(self):
+                events.append("lock")
+
+            def __exit__(self, exc_type, exc, tb):
+                events.append("unlock")
+                return False
+
+        def fake_run_tmux(args, *, input_text=None, check=True, timeout=10):
+            del input_text, check, timeout
+            if args[0] in {"paste-buffer", "send-keys"}:
+                events.append(args[0])
+            return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
+
+        with patch("codex_master.server.tmux_alive", return_value=True), patch(
+            "codex_master.server.pane_tail", return_value="› Ready"
+        ), patch("codex_master.server.agent_lifecycle_lock", return_value=FakeLock()), patch(
+            "codex_master.server.run_tmux", side_effect=fake_run_tmux
+        ):
+            result = send_agent("a", "single line", enter=True)
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(events, ["lock", "paste-buffer", "send-keys", "unlock"])
+
     def test_send_agent_uses_distinct_tmux_buffers_for_parallel_sends(self) -> None:
         first_loaded = threading.Event()
         second_loaded = threading.Event()
