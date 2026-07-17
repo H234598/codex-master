@@ -5268,6 +5268,25 @@ class ServerHelpersTest(unittest.TestCase):
         mock_report.assert_called_once()
         mock_interrupt.assert_not_called()
 
+    def test_fleet_watchdog_dry_run_skips_lifecycle_lock(self) -> None:
+        with patch("codex_master.server.agent_ids", return_value=["a1"]), patch(
+            "codex_master.server._watchdog_agent_unlocked",
+            return_value={"agent": "a1", "watchdog_state": "would_request_report"},
+        ) as run_agent, patch("codex_master.server.call_agent_lifecycle") as lifecycle:
+            result = fleet_watchdog("a", dry_run=True)
+
+        self.assertEqual(len(result["results"]), 1)
+        run_agent.assert_called_once_with(
+            "a1",
+            idle_seconds=DEFAULT_WATCHDOG_IDLE_SECONDS,
+            action="interrupt",
+            report_grace_seconds=DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS,
+            require_lease=True,
+            manage_unclaimed=False,
+            dry_run=True,
+        )
+        lifecycle.assert_not_called()
+
     def test_fleet_watchdog_escalates_when_report_input_is_not_ready(self) -> None:
         status = {
             "agent": "a",

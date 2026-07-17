@@ -5879,20 +5879,37 @@ def fleet_watchdog(
     report_grace_seconds = normalize_watchdog_report_grace_seconds(report_grace_seconds)
     if action not in {"interrupt", "stop", "release", "none"}:
         raise AgentError("watchdog action must be interrupt, stop, release, or none")
-    results = multi_agent_result(
-        selected,
-        lambda item: call_agent_lifecycle(
-            item,
-            lambda: _watchdog_agent_unlocked(
+    run_agent = (
+        (
+            lambda item: _watchdog_agent_unlocked(
                 item,
                 idle_seconds=idle_seconds,
                 action=action,
                 report_grace_seconds=report_grace_seconds,
                 require_lease=require_lease,
                 manage_unclaimed=manage_unclaimed,
-                dry_run=dry_run,
-            ),
-        ),
+                dry_run=True,
+            )
+        )
+        if dry_run
+        else (
+            lambda item: call_agent_lifecycle(
+                item,
+                lambda: _watchdog_agent_unlocked(
+                    item,
+                    idle_seconds=idle_seconds,
+                    action=action,
+                    report_grace_seconds=report_grace_seconds,
+                    require_lease=require_lease,
+                    manage_unclaimed=manage_unclaimed,
+                    dry_run=False,
+                ),
+            )
+        )
+    )
+    results = multi_agent_result(
+        selected,
+        run_agent,
     )["results"]
     return {
         "status": "ok",
