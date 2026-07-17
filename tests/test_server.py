@@ -3876,6 +3876,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(status["identity_guard"]["state"], "blocked_external_home_user")
         self.assertIsNone(status["pid"])
         self.assertEqual(status["tui_context"]["state"], "no_pane_text")
+        self.assertEqual(status["response_state"]["state"], "identity_unverified")
         mock_pane_tail.assert_not_called()
         mock_pane_pid.assert_not_called()
 
@@ -4175,6 +4176,20 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertIsNone(wait_terminal_status(current, initial, now=1780826400.0))
 
+    def test_wait_terminal_status_stops_on_unverified_identity(self) -> None:
+        initial = {
+            "running": True,
+            "raw_log_bytes": 10,
+            "limit_state": {"limited": False},
+        }
+        current = {
+            **initial,
+            "identity_guard": {"ok": False, "state": "blocked_external_home_user"},
+            "raw_log_bytes": 11,
+        }
+
+        self.assertEqual(wait_terminal_status(current, initial), "identity_unverified")
+
     @patch("codex_master.server.update_agent_spark_health")
     @patch("codex_master.server.status_agent")
     def test_wait_agent_prefers_not_running_over_stale_limit(self, mock_status_agent, mock_health) -> None:
@@ -4329,6 +4344,28 @@ class ServerHelpersTest(unittest.TestCase):
                 now=1780826400.0,
             )
         )
+
+    def test_fleet_watchdog_skips_unmanaged_tmux_session_before_report(self) -> None:
+        status = {
+            "agent": "a",
+            "running": True,
+            "identity_guard": {"ok": False, "state": "blocked_external_home_user"},
+            "lease": {"state": "held", "held_by_this_server": True, "raw_output": "not_returned"},
+            "response_state": {"state": "identity_unverified"},
+        }
+        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
+            "codex_master.server.status_agent", return_value=status
+        ), patch("codex_master.server.request_agent_report") as mock_report, patch(
+            "codex_master.server.interrupt_agent"
+        ) as mock_interrupt, patch("codex_master.server.stop_agent") as mock_stop:
+            result = fleet_watchdog("a")
+
+        payload = result["results"][0]
+        self.assertEqual(payload["watchdog_state"], "skipped_identity_unverified")
+        self.assertEqual(payload["action_taken"], "none")
+        mock_report.assert_not_called()
+        mock_interrupt.assert_not_called()
+        mock_stop.assert_not_called()
 
     def test_fleet_watchdog_requests_report_before_interrupt(self) -> None:
         meta_store: dict[str, object] = {}

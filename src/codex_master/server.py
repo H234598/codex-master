@@ -4399,6 +4399,9 @@ def wait_terminal_status(
 ) -> str | None:
     if not status.get("running"):
         return "not_running"
+    identity_guard = status.get("identity_guard")
+    if isinstance(identity_guard, dict) and identity_guard.get("ok") is False:
+        return "identity_unverified"
     if (status.get("limit_state") or {}).get("limited"):
         return "blocked_by_limit"
     latest_assignment = status.get("last_assignment") if isinstance(status.get("last_assignment"), dict) else {}
@@ -4523,6 +4526,9 @@ def status_agent(agent: str) -> dict[str, Any]:
         pane_text=pane_text,
     )
     usage_watchdog = codex_usage_watchdog_status(agent)
+    response_state = agent_response_state(running, limit_state, raw_log_info, tui_context)
+    if running and not identity_guard["ok"]:
+        response_state = {**response_state, "state": "identity_unverified"}
     return {
         "agent": agent,
         "label": cfg["label"],
@@ -4544,7 +4550,7 @@ def status_agent(agent: str) -> dict[str, Any]:
         "tui_context": tui_context,
         "limit_state": limit_state,
         "usage_watchdog": usage_watchdog,
-        "response_state": agent_response_state(running, limit_state, raw_log_info, tui_context),
+        "response_state": response_state,
         "raw_log": "not_returned" if raw_log else None,
         "raw_log_bytes": raw_log_info["bytes"],
         "raw_log_updated_at_utc": raw_log_info["updated_at_utc"],
@@ -5041,6 +5047,18 @@ def _watchdog_agent_unlocked(
         "raw_output": "not_returned",
         "response_output": "not_returned",
     }
+    identity_guard = status.get("identity_guard")
+    if (
+        status.get("running")
+        and isinstance(identity_guard, dict)
+        and identity_guard.get("ok") is False
+    ):
+        return {
+            **base,
+            "identity_guard": identity_guard,
+            "watchdog_state": "skipped_identity_unverified",
+            "action_taken": "none",
+        }
     if not status.get("running"):
         if not dry_run:
             marker = watchdog_marker(read_meta(agent))
