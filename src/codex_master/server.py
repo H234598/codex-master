@@ -652,9 +652,14 @@ def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | floa
     timeout_line_re = re.compile(
         rf"^(\s*(?:startup_timeout_sec|\"startup_timeout_sec\")\s*=\s*)({numeric_token})(\s*(?:#.*)?)$"
     )
+    timeout_key_re = re.compile(r"^(\s*(?:startup_timeout_sec|\"startup_timeout_sec\")\s*=\s*)")
     for index in range(section_start + 1, section_end):
         match = timeout_line_re.match(lines[index])
         if not match:
+            key_match = timeout_key_re.match(lines[index])
+            if key_match:
+                lines[index] = f"{key_match.group(1)}{RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS}"
+                return "\n".join(lines) + "\n", True, None
             continue
         numeric_text = match.group(2).replace("_", "")
         if numeric_text.lstrip("+-").lower().startswith(("0x", "0o", "0b")):
