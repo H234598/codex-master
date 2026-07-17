@@ -6364,19 +6364,23 @@ def _assign_agent_unlocked(
         if not matches and not allow_missing_skill:
             raise AgentError(f"skill not found for agent {agent}")
 
-    routing = codex_usage_routing_decision(
-        agent,
-        role=role,
-        group_id=group_id,
-        job_id=job_id,
+    routing = (
+        None
+        if allow_unauthenticated
+        else codex_usage_routing_decision(
+            agent,
+            role=role,
+            group_id=group_id,
+            job_id=job_id,
+        )
     )
-    if routing["decision"] == "blocked" or routing["model"] is None:
+    if routing is not None and (routing["decision"] == "blocked" or routing["model"] is None):
         raise AgentError(
             "codex-usage blocked assignment before prompt send: "
             f"reason={routing.get('reason') or 'unknown'}; "
             f"policy_source={routing.get('policy_source') or 'unknown'}"
         )
-    model = routing["model"]
+    model = routing["model"] if routing is not None else DEFAULT_AGENT_MODEL
     reasoning_effort = (
         WRITE_AGENT_MODEL_EFFORT
         if model == WRITE_AGENT_MODEL
@@ -6429,7 +6433,6 @@ def _assign_agent_unlocked(
         "model": model,
         "model_reasoning_effort": reasoning_effort,
         "model_switch": model_switch,
-        "routing": routing,
         "group_id": group_id,
         "job_id": job_id,
         "skill": {
@@ -6461,6 +6464,8 @@ def _assign_agent_unlocked(
         "prompt_output": "not_returned",
         "response_output": "not_returned",
     }
+    if routing is not None:
+        assignment_record["routing"] = routing
     try:
         record_assignment(assignment_record)
     except Exception:

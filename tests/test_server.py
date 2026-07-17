@@ -3909,6 +3909,39 @@ class ServerHelpersTest(unittest.TestCase):
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertEqual(payload["error"], f"timeout_seconds must be <= {MAX_WAIT_SECONDS}")
 
+    def test_unauthenticated_assignment_skips_usage_routing(self) -> None:
+        lease = {"state": "held", "held_by_this_server": True, "raw_output": "not_returned"}
+        with patch(
+            "codex_master.server.agent_auth_status",
+            return_value={"authenticated": False, "auth_state": "missing"},
+        ), patch(
+            "codex_master.server.codex_usage_routing_decision",
+            side_effect=AssertionError("unauthenticated assignment must not route"),
+        ) as mock_route, patch(
+            "codex_master.server.claim_for_agent_mutation",
+            return_value=(lease, True),
+        ), patch(
+            "codex_master.server.ensure_assignment_session_model",
+            return_value={"status": "unchanged", "raw_output": "not_returned"},
+        ), patch(
+            "codex_master.server.remember_agent_routing"
+        ), patch(
+            "codex_master.server.send_agent",
+            return_value={"status": "sent", "raw_output": "not_returned"},
+        ), patch("codex_master.server.record_assignment") as record:
+            result = assign_agent(
+                "a",
+                role="exploriererin",
+                task="login",
+                scope=["src"],
+                allow_unauthenticated=True,
+            )
+
+        mock_route.assert_not_called()
+        self.assertIsNone(result["routing"])
+        self.assertEqual(record.call_args.args[0]["model"], DEFAULT_AGENT_MODEL)
+        self.assertNotIn("routing", record.call_args.args[0])
+
     @patch("codex_master.server.record_assignment", side_effect=AgentError("record failed"))
     @patch("codex_master.server.remember_agent_routing")
     @patch("codex_master.server.send_agent", return_value={"status": "sent", "raw_output": "not_returned"})
