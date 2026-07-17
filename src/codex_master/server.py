@@ -3532,6 +3532,23 @@ def start_agent_with_lease(
     allow_unauthenticated: bool = False,
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
+    with agent_lifecycle_lock(agent):
+        return _start_agent_with_lease_unlocked(
+            agent,
+            cwd,
+            prompt,
+            allow_unauthenticated=allow_unauthenticated,
+        )
+
+
+def _start_agent_with_lease_unlocked(
+    agent: str,
+    cwd: Any = None,
+    prompt: Any = None,
+    *,
+    allow_unauthenticated: bool = False,
+) -> dict[str, Any]:
+    agent = canonical_agent_id(agent)
     auth_gate = require_authenticated_agent_for_mutation(
         agent,
         operation="agent_start",
@@ -8538,7 +8555,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             selected,
             lambda agent: call_agent_lifecycle(
                 agent,
-                lambda: start_agent_with_lease(
+                lambda: _start_agent_with_lease_unlocked(
                     agent,
                     args.get("cwd"),
                     args.get("prompt"),
