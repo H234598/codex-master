@@ -10377,6 +10377,7 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
     lease = ensure_agent_lease_available(agent)
     meta = read_meta(agent)
     session_live = tmux_alive(AGENTS[agent]["session"])
+    raw_log_path: Path | None = None
     if source == "pane":
         if session_live:
             require_managed_tmux_session(agent)
