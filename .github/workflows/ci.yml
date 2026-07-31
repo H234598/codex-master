@@ -77,6 +77,11 @@ jobs:
       - name: Compile Python sources
         run: python -m compileall -q src tests
 
+      - name: Check Cinnamon applet lifecycle
+        run: |
+          node --check cinnamon/applets/codex-master@H234598/applet.js
+          node --test tests/test_cinnamon_applet.mjs
+
       - name: Run unit tests
         run: PYTHONPATH=src python -m unittest discover -s tests -v
 
