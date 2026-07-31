@@ -15,6 +15,10 @@ FlottenmanagementApplet.prototype = {
 
     _init(metadata, orientation, panel_height, instance_id) {
         Applet.TextApplet.prototype._init.call(this, orientation, panel_height, instance_id);
+        this._removed = false;
+        this._signalConnections = [];
+        this.menu = null;
+        this.menuManager = null;
 
         if (!metadata || metadata.uuid !== UUID) {
             this.set_applet_label("Applet-Fehler");
@@ -30,7 +34,10 @@ FlottenmanagementApplet.prototype = {
         this.menuManager.addMenu(this.menu);
 
         const statusItem = new PopupMenu.PopupMenuItem("Flottenstatus im Terminal");
-        statusItem.connect("activate", () => {
+        this._connectTracked(statusItem, "activate", () => {
+            if (this._removed) {
+                return;
+            }
             Util.spawn([
                 "x-terminal-emulator",
                 "-e",
@@ -42,22 +49,86 @@ FlottenmanagementApplet.prototype = {
         this.menu.addMenuItem(statusItem);
 
         const settingsItem = new PopupMenu.PopupMenuItem("Applet-Verwaltung öffnen");
-        settingsItem.connect("activate", () => {
+        this._connectTracked(settingsItem, "activate", () => {
+            if (this._removed) {
+                return;
+            }
             Util.spawn(["cinnamon-settings", "applets"]);
         });
         this.menu.addMenuItem(settingsItem);
     },
 
+    _connectTracked(target, signal, callback) {
+        if (this._removed || !target || typeof target.connect !== "function") {
+            return 0;
+        }
+        const id = target.connect(signal, callback);
+        if (id) {
+            this._signalConnections.push({ target, id });
+        }
+        return id;
+    },
+
+    _logCleanupError(error) {
+        if (typeof global !== "undefined" && global && typeof global.logError === "function") {
+            global.logError(error);
+        }
+    },
+
+    _disconnectTrackedSignals() {
+        const connections = this._signalConnections;
+        this._signalConnections = [];
+        for (const connection of connections) {
+            try {
+                if (connection.target && typeof connection.target.disconnect === "function") {
+                    connection.target.disconnect(connection.id);
+                }
+            } catch (error) {
+                this._logCleanupError(error);
+            }
+        }
+    },
+
     on_applet_clicked() {
+        if (this._removed || !this.menu || typeof this.menu.toggle !== "function") {
+            return;
+        }
+        if (this.menu.actor && typeof this.menu.actor.is_finalized === "function" && this.menu.actor.is_finalized()) {
+            return;
+        }
         this.menu.toggle();
     },
 
     on_applet_removed_from_panel() {
-        if (this.menu && this.menu.isOpen) {
-            this.menu.close();
+        if (this._removed) {
+            return;
         }
-        if (this.menuManager) {
-            this.menuManager.removeMenu(this.menu);
+        this._removed = true;
+        this._disconnectTrackedSignals();
+        const menu = this.menu;
+        const manager = this.menuManager;
+        this.menu = null;
+        this.menuManager = null;
+        try {
+            if (menu && menu.isOpen && typeof menu.close === "function") {
+                menu.close();
+            }
+        } catch (error) {
+            this._logCleanupError(error);
+        }
+        try {
+            if (manager && menu && typeof manager.removeMenu === "function") {
+                manager.removeMenu(menu);
+            }
+        } catch (error) {
+            this._logCleanupError(error);
+        }
+        try {
+            if (menu && typeof menu.destroy === "function") {
+                menu.destroy();
+            }
+        } catch (error) {
+            this._logCleanupError(error);
         }
     }
 };
