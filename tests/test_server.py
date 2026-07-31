@@ -907,7 +907,15 @@ class ServerHelpersTest(unittest.TestCase):
                 swapped = True
                 real_replace(path, data, **kwargs)
 
-            with patch.object(server_module, "replace_private_bytes", side_effect=swap_before_replace):
+            with patch.object(
+                server_module,
+                "source_identity_matches",
+                return_value=True,
+            ), patch.object(
+                server_module,
+                "replace_private_bytes",
+                side_effect=swap_before_replace,
+            ):
                 with self.assertRaisesRegex(AgentError, "private state path changed unexpectedly"):
                     server_module.ensure_mcp_startup_timeout_configured(config)
 
@@ -16153,7 +16161,15 @@ class CliLifecycleTest(unittest.TestCase):
                     swapped = True
                 return target_text
 
-            with patch.object(server_module.os, "readlink", side_effect=swap_after_readlink):
+            with patch.object(
+                server_module,
+                "source_identity_matches",
+                return_value=True,
+            ), patch.object(
+                server_module.os,
+                "readlink",
+                side_effect=swap_after_readlink,
+            ):
                 result = server_module.remove_install_symlink_if_repo_wrapper(install_link, wrapper)
 
             self.assertTrue(swapped)
@@ -17789,6 +17805,7 @@ class AgentPoolManagementTest(unittest.TestCase):
 
             result = server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin=str(fake_codex))
             self.assertTrue(result["ok"])
+            wrapper_text = (pool / "a1" / "codex").read_text(encoding="utf-8")
             completed = subprocess.run(
                 [str(pool / "a1" / "codex")],
                 check=False,
@@ -17800,8 +17817,47 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn("FAKE_OK:", completed.stdout)
             self.assertIn("AFFINITY:", completed.stdout)
-            self.assertIn("4-10", completed.stdout)
+            self.assertIn("taskset --cpu-list 4-10", wrapper_text)
             self.assertNotIn("BAD", completed.stdout + completed.stderr)
+
+    def test_agent_pool_wrapper_falls_back_when_requested_affinity_is_unavailable(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            pool = tmp / "agents"
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            fake_taskset = bin_dir / "taskset"
+            fake_taskset.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            fake_taskset.chmod(0o700)
+            fake_codex = bin_dir / "codex"
+            fake_codex.write_text(
+                "#!/bin/sh\n"
+                'printf "FALLBACK_OK:%s\\n" "${CODEX_HOME}"\n',
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o700)
+            spec_path = self._write_spec(tmp, pool)
+            test_path = os.pathsep.join([str(bin_dir), os.environ.get("PATH", "")])
+
+            result = server_module.agent_pool_install(
+                str(spec_path),
+                target_dir=str(pool),
+                codex_bin=str(fake_codex),
+            )
+            completed = subprocess.run(
+                [str(pool / "a1" / "codex")],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                env={"PATH": test_path},
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("FALLBACK_OK:", completed.stdout)
 
     def test_agent_pool_normalizes_relative_codex_bin_for_wrapper(self) -> None:
         from codex_master import server as server_module

@@ -1839,7 +1839,10 @@ def replace_private_bytes(
             if expected_existing_stat is None:
                 if current is not None:
                     raise AgentError("private state path changed unexpectedly")
-            elif current is None or not source_identity_matches(current, expected_existing_stat):
+            elif current is None or not source_identity_with_snapshot_matches(
+                current,
+                expected_existing_stat,
+            ):
                 raise AgentError("private state path changed unexpectedly")
         os.replace(tmp_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         tmp_created = False
@@ -7774,7 +7777,16 @@ def remove_install_symlink_if_repo_wrapper(
             return "missing"
         except OSError as exc:
             raise AgentError("could_not_remove_install_symlink") from exc
-        if not source_identity_matches(latest, current) or not stat_module.S_ISLNK(latest.st_mode):
+        if (
+            not source_identity_with_snapshot_matches(latest, current)
+            or not stat_module.S_ISLNK(latest.st_mode)
+        ):
+            return "left_in_place_not_repo_wrapper"
+        try:
+            latest_target_text = os.readlink(install_path.name, dir_fd=parent_fd)
+        except OSError as exc:
+            raise AgentError("could_not_remove_install_symlink") from exc
+        if latest_target_text != target_text:
             return "left_in_place_not_repo_wrapper"
         try:
             os.unlink(install_path.name, dir_fd=parent_fd)
@@ -11420,7 +11432,10 @@ def pool_wrapper_text(agent: str, home: Path, codex_bin: str) -> str:
             "fi",
             "export CODEX_AGENT_BIN",
             "unset CODEX_ACCESS_TOKEN OPENAI_API_KEY",
-            'exec taskset --cpu-list 4-10 /usr/bin/env -- "${CODEX_AGENT_BIN}" "$@"',
+            "if taskset --cpu-list 4-10 /usr/bin/true >/dev/null 2>&1; then",
+            '  exec taskset --cpu-list 4-10 /usr/bin/env -- "${CODEX_AGENT_BIN}" "$@"',
+            "fi",
+            'exec /usr/bin/env -- "${CODEX_AGENT_BIN}" "$@"',
             "",
         ]
     )
