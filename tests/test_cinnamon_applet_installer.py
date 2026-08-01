@@ -344,19 +344,20 @@ else:
             results.append(module.main(["install", "--no-reload"]))
 
         with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
-            with mock.patch.object(module, "install", side_effect=fake_install):
-                first = threading.Thread(target=invoke)
-                second = threading.Thread(target=invoke)
-                first.start()
-                self.assertTrue(first_entered.wait(timeout=2))
-                second.start()
-                try:
-                    time.sleep(0.2)
-                    self.assertEqual(entered, 1, "second mutator entered before first released lock")
-                finally:
-                    release_first.set()
-                    first.join(timeout=5)
-                    second.join(timeout=5)
+            with mock.patch.object(module.os, "umask"):
+                with mock.patch.object(module, "install", side_effect=fake_install):
+                    first = threading.Thread(target=invoke)
+                    second = threading.Thread(target=invoke)
+                    first.start()
+                    self.assertTrue(first_entered.wait(timeout=2))
+                    second.start()
+                    try:
+                        time.sleep(0.2)
+                        self.assertEqual(entered, 1, "second mutator entered before first released lock")
+                    finally:
+                        release_first.set()
+                        first.join(timeout=5)
+                        second.join(timeout=5)
 
         self.assertFalse(first.is_alive())
         self.assertFalse(second.is_alive())
