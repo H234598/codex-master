@@ -70,9 +70,13 @@ with log.open("a", encoding="utf-8") as handle:
     handle.write(json.dumps(sys.argv[1:]) + "\\n")
 mode = os.environ.get("FAKE_GDBUS_MODE", "ok")
 method = sys.argv[sys.argv.index("--method") + 1]
-if method.endswith("ReloadXlet") and mode == "reload-fail":
-    print("reload failed", file=sys.stderr)
-    raise SystemExit(7)
+if method.endswith("ReloadXlet"):
+    if sys.argv[-1] != "APPLET":
+        print("type is undefined", file=sys.stderr)
+        raise SystemExit(8)
+    if mode == "reload-fail":
+        print("reload failed", file=sys.stderr)
+        raise SystemExit(7)
 if method.endswith("GetRunningXletUUIDs"):
     if mode == "missing":
         print("(@as [],)")
@@ -134,7 +138,7 @@ else:
         self.assertEqual(backups, [self.backup])
         calls = [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
         joined = "\n".join(" ".join(call) for call in calls)
-        self.assertIn(f"org.Cinnamon.ReloadXlet {UUID} applet", joined)
+        self.assertIn(f"org.Cinnamon.ReloadXlet {UUID} APPLET", joined)
         self.assertIn("org.Cinnamon.GetRunningXletUUIDs applet", joined)
         self.assertNotIn("RestartCinnamon", joined)
         self.assertNotIn("Eval", joined)

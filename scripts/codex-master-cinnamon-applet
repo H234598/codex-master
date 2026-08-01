@@ -306,7 +306,7 @@ def cinnamon_call(method: str, *arguments: str) -> str:
 
 
 def reload_xlet() -> None:
-    cinnamon_call("ReloadXlet", UUID, "applet")
+    cinnamon_call("ReloadXlet", UUID, "APPLET")
 
 
 def verify_running() -> None:
