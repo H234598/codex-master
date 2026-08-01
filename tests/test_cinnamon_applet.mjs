@@ -1489,12 +1489,12 @@ test("timeout contains force_exit failure and removal retries it", () => {
   assert.equal(applet._cleanupComplete, true);
 });
 
-test("100 completed refreshes leave no active resources", async () => {
+test("500 completed refreshes leave no active resources", async () => {
   const fixture = loadApplet();
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
   const statusItem = applet.menu.items[0];
 
-  for (let cycle = 0; cycle < 100; cycle += 1) {
+  for (let cycle = 0; cycle < 500; cycle += 1) {
     queuePayloadProcess(fixture, samplePayload());
     statusItem.activate();
     const process = fixture.subprocesses.at(-1);
@@ -1511,13 +1511,13 @@ test("100 completed refreshes leave no active resources", async () => {
     assert.equal(process.stderr._holdCallbacks.length, 0, `cycle ${cycle}: stderr callback`);
   }
 
-  assert.equal(fixture.subprocesses.length, 100);
+  assert.equal(fixture.subprocesses.length, 500);
 });
 
-test("50 injected add-remove cycles release processes streams signals timers and grabs", () => {
+test("100 injected add-remove cycles release processes streams signals timers and grabs", () => {
   const failures = ["close", "remove", "menu-destroy", "manager-destroy"];
 
-  for (let cycle = 0; cycle < 50; cycle += 1) {
+  for (let cycle = 0; cycle < 100; cycle += 1) {
     const fixture = loadApplet();
     queuePayloadProcess(fixture, samplePayload(), { holdEof: true });
     const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, cycle + 1);
