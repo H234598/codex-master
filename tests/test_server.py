@@ -189,6 +189,13 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(proc_is_codex_like({"Name": "codex-code-mode"}, []))
 
     def setUp(self) -> None:
+        dedicated_scan_test = self._testMethodName.startswith(
+            (
+                "test_codex_related_process_summary_",
+                "test_agent_home_process_summary_",
+                "test_pool_home_processes_",
+            )
+        )
         routing = patch(
             "codex_master.server.codex_usage_routing_decision",
             side_effect=lambda agent, *, role, group_id=None, job_id=None: {
@@ -218,6 +225,24 @@ class ServerHelpersTest(unittest.TestCase):
         session_model.start()
         self.addCleanup(routing.stop)
         self.addCleanup(session_model.stop)
+        if not dedicated_scan_test:
+            process_summary = patch(
+                "codex_master.server.agent_home_process_summary",
+                return_value={
+                    "home": "not_returned",
+                    "home_kind": "unknown",
+                    "process_count": 0,
+                    "managed_process_count": 0,
+                    "external_process_count": 0,
+                    "managed_process_ids": [],
+                    "managed_root_process_ids": [],
+                    "external_processes": [],
+                    "external_processes_truncated": False,
+                    "raw_output": "not_returned",
+                },
+            )
+            process_summary.start()
+            self.addCleanup(process_summary.stop)
 
     def test_github_ci_pins_external_actions_to_full_shas(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -16333,6 +16358,9 @@ class AgentPoolManagementTest(unittest.TestCase):
         )
         lease_status.start()
         self.addCleanup(lease_status.stop)
+        pool_scan = patch("codex_master.server.pool_home_processes", return_value=[])
+        pool_scan.start()
+        self.addCleanup(pool_scan.stop)
 
     def _write_spec(self, root: Path, pool: Path) -> Path:
         spec = {
