@@ -2,9 +2,48 @@
 const Applet = imports.ui.applet;
 const PopupMenu = imports.ui.popupMenu;
 const Util = imports.misc.util;
+const Gio = imports.gi.Gio;
+const GLib = imports.gi.GLib;
+const ByteArray = imports.byteArray;
 
 const LABEL = "Flottenmanagement";
 const UUID = "codex-master@H234598";
+const APPLET_STATUS_TIMEOUT_MILLISECONDS = 10 * 1000;
+const APPLET_STDOUT_LIMIT_BYTES = 64 * 1024;
+const APPLET_STDERR_LIMIT_BYTES = 8 * 1024;
+const APPLET_STATUS_CHUNK_BYTES = 1024;
+const APPLET_STATUS_AGENTS = ["a1", "b1"];
+const APPLET_STATUS_COMMAND = "applet-status";
+const APPLET_STATUS_REQUIRED_FIELDS = [
+    "schema_version", "mode", "activity_state", "backend_state", "control_state", "counts", "agents", "raw_output",
+];
+const APPLET_STATUS_REQUIRED_ROW_FIELDS = [
+    "agent", "activity_state", "backend_state", "control_state", "auth_state", "identity_state", "lease_state",
+];
+const APPLET_STATUS_REQUIRED_COUNTS = ["tracked", "running", "sleeping", "ready", "blocked", "issues"];
+const APPLET_STATUS_RAW_OUTPUT = "not_returned";
+const APPLET_STATUS_VALID_STRINGS = {
+    snapshot: {
+        activity_state: new Set(["running", "sleeping", "unknown", "mixed"]),
+        backend_state: new Set(["ok", "degraded", "unavailable"]),
+        control_state: new Set(["ready", "blocked", "unknown", "mixed"]),
+    },
+    row: {
+        activity_state: new Set(["running", "sleeping", "unknown"]),
+        backend_state: new Set(["ok", "degraded", "error"]),
+        control_state: new Set(["ready", "blocked", "unknown"]),
+        auth_state: new Set(["ready", "blocked", "unknown"]),
+        identity_state: new Set(["verified", "unverified", "stopped", "unknown"]),
+        lease_state: new Set(["unclaimed", "held", "expired", "unreadable"]),
+    },
+};
+const APPLET_INVALID_ENV_VARS = [
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "GJS_PATH",
+];
 
 function FlottenmanagementApplet(metadata, orientation, panel_height, instance_id) {
     this._init(metadata, orientation, panel_height, instance_id);
@@ -17,6 +56,12 @@ FlottenmanagementApplet.prototype = {
         Applet.TextApplet.prototype._init.call(this, orientation, panel_height, instance_id);
         this._removed = false;
         this._cleanupComplete = false;
+        this._statusInFlight = false;
+        this._statusPendingRefresh = false;
+        this._statusGeneration = 0;
+        this._statusActiveGeneration = 0;
+        this._statusLastGood = null;
+        this._statusActiveState = null;
         this._menuCleanupState = {};
         this._signalConnections = [];
         this.menu = null;
@@ -37,33 +82,313 @@ FlottenmanagementApplet.prototype = {
 
         const statusItem = new PopupMenu.PopupMenuItem("Flottenstatus im Terminal");
         this._connectTracked(statusItem, "activate", () => {
-            if (this._removed) {
-                return;
-            }
-            Util.spawn([
-                "x-terminal-emulator",
-                "-e",
-                "bash",
-                "-lc",
-                "codex-master-mcp status; printf '\\n'; exec bash"
-            ]);
+            if (this._removed) return;
+            this._refreshStatus();
         });
         this.menu.addMenuItem(statusItem);
 
         const settingsItem = new PopupMenu.PopupMenuItem("Applet-Verwaltung öffnen");
         this._connectTracked(settingsItem, "activate", () => {
-            if (this._removed) {
-                return;
-            }
+            if (this._removed) return;
             Util.spawn(["cinnamon-settings", "applets"]);
         });
         this.menu.addMenuItem(settingsItem);
     },
 
-    _connectTracked(target, signal, callback) {
-        if (this._removed || !target || typeof target.connect !== "function") {
-            return 0;
+    _trackedStatusArgv() {
+        const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
+        return [home + "/.local/bin/codex-master-mcp", APPLET_STATUS_COMMAND, ...APPLET_STATUS_AGENTS];
+    },
+
+    _refreshStatus() {
+        if (this._statusInFlight) {
+            this._statusPendingRefresh = true;
+            return;
         }
+        this._startStatusRefresh();
+    },
+
+    _startStatusRefresh() {
+        if (this._removed) return;
+
+        const generation = ++this._statusGeneration;
+        const argv = this._trackedStatusArgv();
+        const launcher = Gio.SubprocessLauncher.new(
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+        );
+        this._sanitizeLauncherEnvironment(launcher);
+
+        let process;
+        try {
+            process = launcher.spawnv(argv);
+        } catch (_error) {
+            this._statusInFlight = false;
+            return;
+        }
+
+        const state = {
+            generation,
+            process,
+            timeoutSource: 0,
+            finalizing: false,
+            streamFailed: false,
+            waitDone: false,
+            stdoutDone: false,
+            stderrDone: false,
+            stdoutBytes: [],
+            stderrBytes: [],
+            waitFailed: false,
+            forceExitCalled: false,
+            timedOut: false,
+            stdoutLimitExceeded: false,
+            stderrLimitExceeded: false,
+        };
+
+        this._activeStatusProcess = process;
+        this._statusActiveState = state;
+        this._statusActiveGeneration = generation;
+        this._statusInFlight = true;
+
+        const requestForceExit = (stateArg) => {
+            if (stateArg.forceExitCalled || !stateArg.process) return;
+            stateArg.forceExitCalled = true;
+            if (typeof stateArg.process.force_exit === "function") {
+                stateArg.process.force_exit();
+            }
+        };
+
+        const attemptFinalize = (stateArg) => {
+            if (stateArg.finalizing) return;
+            if (!(stateArg.waitDone && stateArg.stdoutDone && stateArg.stderrDone)) {
+                return;
+            }
+            stateArg.finalizing = true;
+            if (stateArg.timeoutSource) {
+                GLib.source_remove(stateArg.timeoutSource);
+                stateArg.timeoutSource = 0;
+            }
+            this._finalizeStatusProcess(stateArg);
+        };
+
+        const readStream = (stateArg, key, stream, limit) => {
+            if (!stream || typeof stream.read_bytes_async !== "function") {
+                stateArg[`${key}Done`] = true;
+                attemptFinalize(stateArg);
+                return;
+            }
+
+            const bytesKey = `${key}Bytes`;
+            const doneKey = `${key}Done`;
+            const finishKey = key === "stdout" ? "stdoutLimitExceeded" : "stderrLimitExceeded";
+
+            const readChunk = () => {
+                try {
+                    stream.read_bytes_async(
+                        APPLET_STATUS_CHUNK_BYTES,
+                        GLib.PRIORITY_DEFAULT,
+                        null,
+                        (reader, result) => {
+                            let packet;
+                            try {
+                                packet = reader.read_bytes_finish(result);
+                            } catch (_error) {
+                                stateArg.streamFailed = true;
+                                stateArg[doneKey] = true;
+                                requestForceExit(stateArg);
+                                attemptFinalize(stateArg);
+                                return;
+                            }
+
+                            if (!packet) {
+                                stateArg[doneKey] = true;
+                                attemptFinalize(stateArg);
+                                return;
+                            }
+
+                            const data = packet.get_data ? packet.get_data() : null;
+                            const size = packet.get_size ? packet.get_size() : (data ? data.length : 0);
+                            if (!data || size <= 0) {
+                                stateArg[doneKey] = true;
+                                attemptFinalize(stateArg);
+                                return;
+                            }
+
+                            const bytes = data instanceof Uint8Array ? data : Uint8Array.from(data);
+                            const take = Math.max(0, limit - stateArg[bytesKey].length);
+                            const exceedsLimit = bytes.length > take;
+                            if (take > 0) {
+                                for (let i = 0; i < Math.min(bytes.length, take); i += 1) {
+                                    stateArg[bytesKey].push(bytes[i]);
+                                }
+                            }
+
+                            if (exceedsLimit) {
+                                stateArg[finishKey] = true;
+                                requestForceExit(stateArg);
+                                stateArg[doneKey] = true;
+                                attemptFinalize(stateArg);
+                                return;
+                            }
+
+                            readChunk();
+                        }
+                    );
+                } catch (_error) {
+                    stateArg.streamFailed = true;
+                    stateArg[doneKey] = true;
+                    requestForceExit(stateArg);
+                    attemptFinalize(stateArg);
+                }
+            };
+
+            readChunk();
+        };
+
+        state.timeoutSource = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT,
+            APPLET_STATUS_TIMEOUT_MILLISECONDS,
+            () => {
+                state.timedOut = true;
+                requestForceExit(state);
+                attemptFinalize(state);
+                return GLib.SOURCE_REMOVE;
+            }
+        );
+
+        readStream(state, "stdout", process.get_stdout_pipe(), APPLET_STDOUT_LIMIT_BYTES);
+        readStream(state, "stderr", process.get_stderr_pipe(), APPLET_STDERR_LIMIT_BYTES);
+
+        process.wait_async(null, (_proc, result) => {
+            try {
+                if (typeof process.wait_finish === "function") {
+                    process.wait_finish(result);
+                }
+            } catch (_error) {
+                state.waitFailed = true;
+            }
+            state.waitDone = true;
+            attemptFinalize(state);
+        });
+    },
+
+    _sanitizeLauncherEnvironment(launcher) {
+        for (const key of APPLET_INVALID_ENV_VARS) {
+            if (typeof launcher.unsetenv === "function") {
+                launcher.unsetenv(key);
+            }
+        }
+    },
+
+    _finalizeStatusProcess(state) {
+        const generation = state.generation;
+        if (generation !== this._statusActiveGeneration) return;
+
+        this._statusInFlight = false;
+        this._statusActiveGeneration = 0;
+        this._statusActiveState = null;
+        this._activeStatusProcess = null;
+
+        if (!state.timedOut && !state.waitFailed && !state.streamFailed && !state.stdoutLimitExceeded && !state.stderrLimitExceeded) {
+            const payload = state.process ? this._collectProcessPayload(state) : null;
+            if (payload && state.process.get_successful()) {
+                this._maybeApplyStatusPayload(payload);
+            }
+        }
+
+        if (state.timeoutSource) {
+            GLib.source_remove(state.timeoutSource);
+            state.timeoutSource = 0;
+        }
+
+        if (this._statusPendingRefresh) {
+            this._statusPendingRefresh = false;
+            this._startStatusRefresh();
+        }
+    },
+
+    _collectProcessPayload(state) {
+        try {
+            const stdoutText = ByteArray.toString(Uint8Array.from(state.stdoutBytes));
+            if (typeof stdoutText !== "string" || stdoutText.length === 0) {
+                return null;
+            }
+            if (stdoutText.includes("\uFFFD")) {
+                return null;
+            }
+            return JSON.parse(stdoutText);
+        } catch (_error) {
+            return null;
+        }
+    },
+
+    _maybeApplyStatusPayload(payload) {
+        if (!this._isValidAppletStatusPayload(payload)) {
+            return;
+        }
+        this._statusLastGood = payload;
+        this._updateStatusText(payload);
+    },
+
+    _isValidAppletStatusPayload(payload) {
+        if (!payload || typeof payload !== "object") return false;
+        if (!this._hasExactFields(payload, APPLET_STATUS_REQUIRED_FIELDS)) return false;
+        if (payload.schema_version !== 1) return false;
+        if (payload.mode !== "read_only") return false;
+        if (payload.raw_output !== APPLET_STATUS_RAW_OUTPUT) return false;
+
+        for (const field of ["activity_state", "backend_state", "control_state"]) {
+            if (typeof payload[field] !== "string") return false;
+            if (!this._isValidStateSet("snapshot", field, payload[field])) return false;
+        }
+
+        if (!Array.isArray(payload.agents) || payload.agents.length !== APPLET_STATUS_AGENTS.length) return false;
+        const agents = new Set();
+        for (const row of payload.agents) {
+            if (!row || typeof row !== "object") return false;
+            if (!this._hasExactFields(row, APPLET_STATUS_REQUIRED_ROW_FIELDS)) return false;
+            for (const field of APPLET_STATUS_REQUIRED_ROW_FIELDS) {
+                if (typeof row[field] !== "string" || row[field].length === 0) return false;
+            }
+            if (APPLET_STATUS_AGENTS.indexOf(row.agent) === -1) return false;
+            agents.add(row.agent);
+            if (!this._isValidStateSet("row", "activity_state", row.activity_state)) return false;
+            if (!this._isValidStateSet("row", "backend_state", row.backend_state)) return false;
+            if (!this._isValidStateSet("row", "control_state", row.control_state)) return false;
+            if (!this._isValidStateSet("row", "auth_state", row.auth_state)) return false;
+            if (!this._isValidStateSet("row", "identity_state", row.identity_state)) return false;
+            if (!this._isValidStateSet("row", "lease_state", row.lease_state)) return false;
+        }
+        if (agents.size !== APPLET_STATUS_AGENTS.length) return false;
+
+        if (typeof payload.counts !== "object" || payload.counts === null) return false;
+        if (!this._hasExactFields(payload.counts, APPLET_STATUS_REQUIRED_COUNTS)) return false;
+        for (const key of APPLET_STATUS_REQUIRED_COUNTS) {
+            const value = payload.counts[key];
+            if (!Number.isInteger(value) || value < 0) return false;
+        }
+        if (payload.counts.tracked !== payload.agents.length) return false;
+        if (payload.counts.running + payload.counts.sleeping > payload.counts.tracked) return false;
+        if (payload.counts.ready + payload.counts.blocked > payload.counts.tracked) return false;
+        if (payload.counts.issues > payload.counts.tracked) return false;
+        return true;
+    },
+
+    _hasExactFields(value, requiredFields) {
+        const keys = Object.keys(value);
+        return keys.length === requiredFields.length
+            && requiredFields.every((field) => Object.prototype.hasOwnProperty.call(value, field));
+    },
+
+    _isValidStateSet(scope, name, value) {
+        return APPLET_STATUS_VALID_STRINGS[scope]?.[name]?.has(value);
+    },
+
+    _updateStatusText(_payload) {
+        return;
+    },
+
+    _connectTracked(target, signal, callback) {
+        if (this._removed || !target || typeof target.connect !== "function") return 0;
         const id = target.connect(signal, callback);
         if (id) {
             this._signalConnections.push({ target, id });
@@ -97,27 +422,22 @@ FlottenmanagementApplet.prototype = {
     _cleanupMenuResource(menuProperty, managerProperty) {
         const menu = this[menuProperty];
         const manager = this[managerProperty];
-        if (!menu && !manager) {
-            return true;
-        }
+        if (!menu && !manager) return true;
+
         const stateKey = menuProperty + ":" + managerProperty;
         const state = this._menuCleanupState[stateKey] || {
             managerReleased: !manager,
             managerNeedsDestroy: false,
-            menuDestroyed: !menu
+            menuDestroyed: !menu,
         };
         this._menuCleanupState[stateKey] = state;
 
         let success = true;
         if (menu && menu.isOpen === true) {
             try {
-                if (typeof menu.close !== "function") {
-                    throw new Error("Menu close operation is unavailable");
-                }
+                if (typeof menu.close !== "function") throw new Error("Menu close operation is unavailable");
                 menu.close(false);
-                if (menu.isOpen === true) {
-                    throw new Error("Menu remained open after cleanup");
-                }
+                if (menu.isOpen === true) throw new Error("Menu remained open after cleanup");
             } catch (error) {
                 this._logCleanupError(error);
                 success = false;
@@ -126,13 +446,9 @@ FlottenmanagementApplet.prototype = {
 
         if (manager && manager.grabbed === true) {
             try {
-                if (typeof manager._ungrab !== "function") {
-                    throw new Error("Menu manager ungrab operation is unavailable");
-                }
+                if (typeof manager._ungrab !== "function") throw new Error("Menu manager ungrab operation is unavailable");
                 manager._ungrab();
-                if (manager.grabbed === true) {
-                    throw new Error("Menu manager retained its modal grab");
-                }
+                if (manager.grabbed === true) throw new Error("Menu manager retained its modal grab");
             } catch (error) {
                 this._logCleanupError(error);
                 success = false;
@@ -141,9 +457,7 @@ FlottenmanagementApplet.prototype = {
 
         if (success && manager && !state.managerReleased && state.managerNeedsDestroy) {
             try {
-                if (typeof manager.destroy !== "function") {
-                    throw new Error("Menu manager destroy operation is unavailable");
-                }
+                if (typeof manager.destroy !== "function") throw new Error("Menu manager destroy operation is unavailable");
                 manager.destroy();
                 state.managerNeedsDestroy = false;
                 state.managerReleased = true;
@@ -153,9 +467,7 @@ FlottenmanagementApplet.prototype = {
             }
         } else if (success && manager && menu && !state.managerReleased) {
             try {
-                if (typeof manager.removeMenu !== "function") {
-                    throw new Error("Menu manager removal operation is unavailable");
-                }
+                if (typeof manager.removeMenu !== "function") throw new Error("Menu manager removal operation is unavailable");
                 manager.removeMenu(menu);
                 const managedMenus = Array.isArray(manager._menus)
                     ? manager._menus
@@ -182,9 +494,7 @@ FlottenmanagementApplet.prototype = {
             }
         } else if (success && manager && !menu && !state.managerReleased) {
             try {
-                if (typeof manager.destroy !== "function") {
-                    throw new Error("Menu manager destroy operation is unavailable");
-                }
+                if (typeof manager.destroy !== "function") throw new Error("Menu manager destroy operation is unavailable");
                 manager.destroy();
                 state.managerReleased = true;
             } catch (error) {
@@ -195,9 +505,7 @@ FlottenmanagementApplet.prototype = {
 
         if (success && menu && !state.menuDestroyed) {
             try {
-                if (typeof menu.destroy !== "function") {
-                    throw new Error("Menu destroy operation is unavailable");
-                }
+                if (typeof menu.destroy !== "function") throw new Error("Menu destroy operation is unavailable");
                 menu.destroy();
                 state.menuDestroyed = true;
             } catch (error) {
@@ -216,25 +524,19 @@ FlottenmanagementApplet.prototype = {
     },
 
     on_applet_clicked() {
-        if (this._removed || !this.menu || typeof this.menu.toggle !== "function") {
-            return;
-        }
-        if (this.menu.actor && typeof this.menu.actor.is_finalized === "function" && this.menu.actor.is_finalized()) {
-            return;
-        }
+        if (this._removed || !this.menu || typeof this.menu.toggle !== "function") return;
+        if (this.menu.actor && typeof this.menu.actor.is_finalized === "function" && this.menu.actor.is_finalized()) return;
         this.menu.toggle();
     },
 
     on_applet_removed_from_panel() {
-        if (this._cleanupComplete) {
-            return;
-        }
+        if (this._cleanupComplete) return;
         this._removed = true;
         const signalsClean = this._disconnectTrackedSignals();
         const appletMenuClean = this._cleanupMenuResource("menu", "menuManager");
         const contextMenuClean = this._cleanupMenuResource("_applet_context_menu", "_menuManager");
         this._cleanupComplete = signalsClean && appletMenuClean && contextMenuClean;
-    }
+    },
 };
 
 function main(metadata, orientation, panel_height, instance_id) {
