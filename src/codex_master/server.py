@@ -4093,11 +4093,21 @@ def agent_identity_guard(
     pane_process_identity_checked = running
     pane_process_identity_match: bool | None = None
     if pane_process_identity_checked:
+        managed_process_ids_valid = (
+            counts_available
+            and isinstance(managed_process_ids, list)
+            and managed_process_count <= len(managed_process_ids) <= process_count
+            and all(
+                isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+                for pid in managed_process_ids
+            )
+            and len(managed_process_ids) == len(set(managed_process_ids))
+        )
         pane_process_identity_match = (
-            isinstance(managed_process_ids, list)
-            and all(isinstance(pid, int) and not isinstance(pid, bool) for pid in managed_process_ids)
+            managed_process_ids_valid
             and isinstance(pane_process_id, int)
             and not isinstance(pane_process_id, bool)
+            and pane_process_id > 0
             and pane_process_id in managed_process_ids
         )
     if not counts_available:

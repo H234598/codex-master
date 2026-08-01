@@ -9965,6 +9965,65 @@ class ServerHelpersTest(unittest.TestCase):
                 self.assertTrue(result["ok"])
                 self.assertEqual(result["state"], "managed_session_running")
 
+    def test_agent_identity_guard_rejects_unsupported_managed_process_id_multiplicity(self) -> None:
+        for total, managed_process_ids, pane_process_id in (
+            (1, [123, 456], 123),
+            (2, [123, 123], 123),
+        ):
+            with self.subTest(managed_process_ids=managed_process_ids, pane_process_id=pane_process_id):
+                result = agent_identity_guard(
+                    True,
+                    {
+                        "process_count": total,
+                        "managed_process_count": 1,
+                        "external_process_count": 0,
+                        "managed_process_ids": managed_process_ids,
+                        "raw_output": "not_returned",
+                    },
+                    pane_process_id=pane_process_id,
+                )
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["state"], "blocked_tmux_session_identity_mismatch")
+                self.assertTrue(result["pane_process_identity_checked"])
+                self.assertFalse(result["pane_process_identity_match"])
+
+    def test_agent_identity_guard_rejects_invalid_pane_pid_evidence(self) -> None:
+        for managed_process_ids, pane_process_id in (([0], 0), ([True], True)):
+            with self.subTest(managed_process_ids=managed_process_ids, pane_process_id=pane_process_id):
+                result = agent_identity_guard(
+                    True,
+                    {
+                        "process_count": 1,
+                        "managed_process_count": 1,
+                        "external_process_count": 0,
+                        "managed_process_ids": managed_process_ids,
+                        "raw_output": "not_returned",
+                    },
+                    pane_process_id=pane_process_id,
+                )
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["state"], "blocked_tmux_session_identity_mismatch")
+                self.assertTrue(result["pane_process_identity_checked"])
+                self.assertFalse(result["pane_process_identity_match"])
+
+    def test_agent_identity_guard_allows_valid_managed_root_and_child_pid(self) -> None:
+        result = agent_identity_guard(
+            True,
+            {
+                "process_count": 2,
+                "managed_process_count": 1,
+                "external_process_count": 0,
+                "managed_process_ids": [123, 456],
+                "raw_output": "not_returned",
+            },
+            pane_process_id=456,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["state"], "managed_session_running")
+
     def test_agent_identity_guard_rejects_missing_managed_process_ids(self) -> None:
         result = agent_identity_guard(
             True,
