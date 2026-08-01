@@ -58,6 +58,8 @@ from codex_master.server import (
     DEFAULT_TMUX_TIMEOUT_SECONDS,
     SEND_READY_POLL_SECONDS,
     AGENTS,
+    applet_agent_observation,
+    applet_status,
     agent_ids,
     allowed_raw_log_path,
     latest_managed_raw_log,
@@ -14614,6 +14616,27 @@ class ServerHelpersTest(unittest.TestCase):
 
 
 class AppletStatusContractTest(unittest.TestCase):
+    @staticmethod
+    def _row(
+        agent: str,
+        *,
+        activity: str = "sleeping",
+        backend: str = "ok",
+        control: str = "ready",
+        auth: str = "ready",
+        identity: str = "stopped",
+        lease: str = "unclaimed",
+    ) -> dict[str, Any]:
+        return {
+            "agent": agent,
+            "activity_state": activity,
+            "backend_state": backend,
+            "control_state": control,
+            "auth_state": auth,
+            "identity_state": identity,
+            "lease_state": lease,
+        }
+
     def test_normalize_applet_agents_keeps_order(self) -> None:
         result = normalize_applet_agents(["a1", "b2"])
 
@@ -14663,6 +14686,323 @@ class AppletStatusContractTest(unittest.TestCase):
     def test_normalize_applet_agents_rejects_duplicates(self) -> None:
         with self.assertRaisesRegex(AgentError, "duplicates"):
             normalize_applet_agents(["a1", "a1"])
+
+    @patch("codex_master.server.applet_agent_observation")
+    def test_applet_status_keeps_sleeping_agents_healthy(self, mock_observation) -> None:
+        mock_observation.return_value = self._row("a1")
+
+        result = applet_status(["a1"])
+
+        self.assertEqual(
+            result,
+            {
+                "schema_version": 1,
+                "mode": "read_only",
+                "activity_state": "sleeping",
+                "backend_state": "ok",
+                "control_state": "ready",
+                "counts": {
+                    "tracked": 1,
+                    "running": 0,
+                    "sleeping": 1,
+                    "ready": 1,
+                    "blocked": 0,
+                    "issues": 0,
+                },
+                "agents": [self._row("a1")],
+                "raw_output": "not_returned",
+            },
+        )
+
+    @patch("codex_master.server.applet_agent_observation")
+    def test_applet_status_aggregates_independent_state_axes(self, mock_observation) -> None:
+        mock_observation.side_effect = [
+            self._row(
+                "a1",
+                activity="running",
+                identity="verified",
+            ),
+            self._row(
+                "b1",
+                control="blocked",
+                auth="blocked",
+                lease="held",
+            ),
+        ]
+
+        result = applet_status(["a1", "b1"])
+
+        self.assertEqual(result["activity_state"], "mixed")
+        self.assertEqual(result["backend_state"], "ok")
+        self.assertEqual(result["control_state"], "mixed")
+        self.assertEqual(
+            result["counts"],
+            {"tracked": 2, "running": 1, "sleeping": 1, "ready": 1, "blocked": 1, "issues": 1},
+        )
+
+    @patch("codex_master.server.applet_agent_observation")
+    def test_applet_status_contains_fixed_error_rows_without_error_text(self, mock_observation) -> None:
+        mock_observation.side_effect = [self._row("a1"), AgentError("SECRET /home/private prompt lease-owner")]
+
+        result = applet_status(["a1", "b1"])
+
+        self.assertEqual(result["backend_state"], "degraded")
+        self.assertEqual(
+            result["agents"][1],
+            self._row(
+                "b1",
+                activity="unknown",
+                backend="error",
+                control="unknown",
+                auth="unknown",
+                identity="unknown",
+                lease="unreadable",
+            ),
+        )
+        self.assertNotIn("SECRET", json.dumps(result, sort_keys=True))
+        self.assertNotIn("/home/private", json.dumps(result, sort_keys=True))
+
+    @patch("codex_master.server.applet_agent_observation", side_effect=AgentError("SECRET"))
+    def test_applet_status_is_unavailable_when_every_observation_fails(self, _mock_observation) -> None:
+        result = applet_status(["a1", "b1"])
+
+        self.assertEqual(result["activity_state"], "unknown")
+        self.assertEqual(result["backend_state"], "unavailable")
+        self.assertEqual(result["control_state"], "unknown")
+        self.assertEqual(result["counts"]["issues"], 2)
+
+    @patch("codex_master.server.applet_agent_observation")
+    @patch("codex_master.server.time.monotonic", side_effect=[0.0, 0.0, 9.0])
+    def test_applet_status_stops_observing_after_soft_deadline(self, _mock_monotonic, mock_observation) -> None:
+        mock_observation.return_value = self._row("a1")
+
+        result = applet_status(["a1", "b1"])
+
+        mock_observation.assert_called_once()
+        self.assertEqual(result["agents"][0]["backend_state"], "ok")
+        self.assertEqual(result["agents"][1]["backend_state"], "error")
+
+    @patch("codex_master.server.applet_agent_observation")
+    def test_applet_status_six_agent_response_is_small_and_has_exact_fields(self, mock_observation) -> None:
+        agents = ["a1", "a2", "a3", "a4", "a5", "a6"]
+        mock_observation.side_effect = [self._row(agent) for agent in agents]
+
+        result = applet_status(agents)
+
+        self.assertEqual(
+            set(result),
+            {
+                "schema_version",
+                "mode",
+                "activity_state",
+                "backend_state",
+                "control_state",
+                "counts",
+                "agents",
+                "raw_output",
+            },
+        )
+        self.assertTrue(all(set(row) == {
+            "agent",
+            "activity_state",
+            "backend_state",
+            "control_state",
+            "auth_state",
+            "identity_state",
+            "lease_state",
+        } for row in result["agents"]))
+        encoded = json.dumps(result, sort_keys=True).encode("utf-8")
+        self.assertLess(len(encoded), 32 * 1024)
+        self.assertLess(len(encoded), 64 * 1024)
+
+    @patch("codex_master.server.agent_lifecycle_lock")
+    @patch("codex_master.server.status_agent")
+    @patch("codex_master.server.replace_private_text")
+    @patch("codex_master.server.ensure_state")
+    @patch(
+        "codex_master.server.agent_lease_status",
+        return_value={
+            "state": "unclaimed",
+            "holder": "SECRET_OWNER",
+            "lease_id": "SECRET_LEASE_ID",
+            "prompt": "SECRET_PROMPT",
+            "raw_output": "not_returned",
+        },
+    )
+    @patch(
+        "codex_master.server.agent_auth_status",
+        return_value={
+            "authenticated": True,
+            "auth_state": "present_regular",
+            "auth_mode": "SECRET_AUTH_MODE",
+            "raw_output": "not_returned",
+        },
+    )
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 1,
+            "managed_process_count": 1,
+            "external_process_count": 0,
+            "managed_process_ids": [123],
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "log_path": "/home/private/SECRET_RAW_LOG",
+            "raw_output": "not_returned",
+        },
+    )
+    @patch("codex_master.server.run_tmux")
+    def test_applet_agent_observation_is_read_only_and_data_sparse(
+        self,
+        mock_run_tmux,
+        _mock_process_summary,
+        _mock_auth,
+        mock_lease,
+        mock_ensure_state,
+        mock_replace_private_text,
+        mock_status_agent,
+        mock_lifecycle_lock,
+    ) -> None:
+        mock_run_tmux.side_effect = [
+            subprocess.CompletedProcess(["tmux"], 0, "", ""),
+            subprocess.CompletedProcess(["tmux"], 0, "123\n", ""),
+        ]
+
+        row = applet_agent_observation("a1", deadline=10**12)
+
+        self.assertEqual(
+            row,
+            self._row("a1", activity="running", identity="verified"),
+        )
+        self.assertTrue(all(0 < call.kwargs["timeout"] <= 1.0 for call in mock_run_tmux.call_args_list))
+        mock_lease.assert_called_once_with("a1", initialize_state=False)
+        mock_ensure_state.assert_not_called()
+        mock_replace_private_text.assert_not_called()
+        mock_status_agent.assert_not_called()
+        mock_lifecycle_lock.assert_not_called()
+        payload = json.dumps(row, sort_keys=True)
+        for private_value in (
+            "SECRET_OWNER",
+            "SECRET_LEASE_ID",
+            "SECRET_PROMPT",
+            "SECRET_AUTH_MODE",
+            "SECRET_RAW_LOG",
+            "/home/private",
+            "123",
+            AGENTS["a1"]["session"],
+        ):
+            self.assertNotIn(private_value, payload)
+
+    @patch(
+        "codex_master.server.agent_lease_status",
+        return_value={"state": "held", "raw_output": "not_returned"},
+    )
+    @patch(
+        "codex_master.server.agent_auth_status",
+        return_value={"authenticated": False, "auth_state": "missing", "raw_output": "not_returned"},
+    )
+    @patch("codex_master.server.agent_home_process_summary")
+    @patch(
+        "codex_master.server.run_tmux",
+        return_value=subprocess.CompletedProcess(["tmux"], 1, "", ""),
+    )
+    def test_applet_agent_observation_keeps_sleeping_separate_from_blocked_control(
+        self, mock_run_tmux, mock_process_summary, _mock_auth, _mock_lease
+    ) -> None:
+        row = applet_agent_observation("a1", deadline=10**12)
+
+        self.assertEqual(
+            row,
+            self._row("a1", control="blocked", auth="blocked", lease="held"),
+        )
+        mock_run_tmux.assert_called_once()
+        mock_process_summary.assert_not_called()
+
+    @patch(
+        "codex_master.server.agent_lease_status",
+        return_value={"state": "unclaimed", "raw_output": "not_returned"},
+    )
+    @patch(
+        "codex_master.server.agent_auth_status",
+        return_value={"authenticated": False, "auth_state": "unreadable", "raw_output": "not_returned"},
+    )
+    @patch(
+        "codex_master.server.run_tmux",
+        return_value=subprocess.CompletedProcess(["tmux"], 1, "", ""),
+    )
+    def test_applet_agent_observation_marks_unreadable_control_unknown(
+        self, _mock_run_tmux, _mock_auth, _mock_lease
+    ) -> None:
+        row = applet_agent_observation("a1", deadline=10**12)
+
+        self.assertEqual(row, self._row("a1", control="unknown", auth="unknown"))
+
+    @patch(
+        "codex_master.server.agent_lease_status",
+        return_value={"state": "unclaimed", "raw_output": "not_returned"},
+    )
+    @patch(
+        "codex_master.server.agent_auth_status",
+        return_value={"authenticated": True, "auth_state": "present_regular", "raw_output": "not_returned"},
+    )
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": None,
+            "managed_process_count": None,
+            "external_process_count": None,
+            "managed_process_ids": [],
+            "raw_output": "not_returned",
+        },
+    )
+    @patch("codex_master.server.run_tmux")
+    def test_applet_agent_observation_degrades_unverified_running_identity(
+        self, mock_run_tmux, _mock_process_summary, _mock_auth, _mock_lease
+    ) -> None:
+        mock_run_tmux.side_effect = [
+            subprocess.CompletedProcess(["tmux"], 0, "", ""),
+            subprocess.CompletedProcess(["tmux"], 0, "123\n", ""),
+        ]
+
+        row = applet_agent_observation("a1", deadline=10**12)
+
+        self.assertEqual(
+            row,
+            self._row(
+                "a1",
+                activity="running",
+                backend="degraded",
+                control="blocked",
+                identity="unverified",
+            ),
+        )
+
+    @patch(
+        "codex_master.server.agent_lease_status",
+        return_value={"state": "unclaimed", "raw_output": "not_returned"},
+    )
+    @patch(
+        "codex_master.server.agent_auth_status",
+        return_value={"authenticated": True, "auth_state": "present_regular", "raw_output": "not_returned"},
+    )
+    @patch(
+        "codex_master.server.run_tmux",
+        return_value=subprocess.CompletedProcess(["tmux"], 1, "", ""),
+    )
+    @patch("codex_master.server.time.monotonic", side_effect=[0.0, 0.0, 0.0, 9.0])
+    def test_applet_agent_observation_checks_deadline_after_lease_read(
+        self, _mock_monotonic, _mock_run_tmux, _mock_auth, _mock_lease
+    ) -> None:
+        with self.assertRaisesRegex(AgentError, "deadline"):
+            applet_agent_observation("a1", deadline=8.0)
+
+    @patch("codex_master.server.run_tmux")
+    @patch("codex_master.server.time.monotonic", return_value=5.0)
+    def test_applet_agent_observation_rejects_expired_deadline(self, _mock_monotonic, mock_run_tmux) -> None:
+        with self.assertRaisesRegex(AgentError, "deadline"):
+            applet_agent_observation("a1", deadline=5.0)
+
+        mock_run_tmux.assert_not_called()
 
 
 class CliLifecycleTest(unittest.TestCase):

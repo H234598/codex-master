@@ -169,6 +169,8 @@ MAX_POOL_SERIES = 26
 MAX_POOL_SHARED_ASSETS = 40
 MAX_POOL_RUNTIME_DIRS = 40
 MAX_APPLET_AGENTS = 6
+APPLET_STATUS_TIMEOUT_SECONDS = 8.0
+APPLET_TMUX_TIMEOUT_SECONDS = 1.0
 AGENT_SERIES = ("a", "b", "c")
 AGENTS_PER_SERIES = 100
 DEFAULT_ORDINAL_AGENT_SERIES = ("a", "b")
@@ -1166,6 +1168,163 @@ def normalize_applet_agents(agents: Any) -> list[str]:
         normalized.append(value)
         seen.add(value)
     return normalized
+
+
+def applet_remaining_timeout(deadline: float) -> float:
+    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(deadline):
+        raise AgentError("applet status deadline is invalid")
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        raise AgentError("applet status deadline exceeded")
+    return min(APPLET_TMUX_TIMEOUT_SECONDS, remaining)
+
+
+def applet_agent_observation(agent: str, *, deadline: float) -> dict[str, Any]:
+    agent = normalize_applet_agents([agent])[0]
+    cfg = AGENTS[agent]
+    session = cfg["session"]
+    session_check = run_tmux(
+        ["has-session", "-t", session],
+        check=False,
+        timeout=applet_remaining_timeout(deadline),
+    )
+    if session_check.returncode in {COMMAND_TIMEOUT_RETURN_CODE, COMMAND_UNAVAILABLE_RETURN_CODE}:
+        raise AgentError("applet status backend unavailable")
+    running = session_check.returncode == 0
+
+    if running:
+        applet_remaining_timeout(deadline)
+        process_summary = agent_home_process_summary(agent)
+        pane_check = run_tmux(
+            ["display-message", "-p", "-t", session, "#{pane_pid}"],
+            check=False,
+            timeout=applet_remaining_timeout(deadline),
+        )
+        if pane_check.returncode in {COMMAND_TIMEOUT_RETURN_CODE, COMMAND_UNAVAILABLE_RETURN_CODE}:
+            raise AgentError("applet status backend unavailable")
+        pane_text = pane_check.stdout.strip()
+        pane_process_id = int(pane_text) if pane_check.returncode == 0 and pane_text.isdigit() else None
+        identity_guard = agent_identity_guard(True, process_summary, pane_process_id=pane_process_id)
+        identity_state = "verified" if identity_guard.get("ok") is True else "unverified"
+        backend_state = "ok" if identity_state == "verified" else "degraded"
+        activity_state = "running"
+    else:
+        identity_state = "stopped"
+        backend_state = "ok"
+        activity_state = "sleeping"
+
+    applet_remaining_timeout(deadline)
+    auth = agent_auth_status(agent)
+    if auth.get("authenticated") is True:
+        auth_state = "ready"
+    elif auth.get("auth_state") == "unreadable":
+        auth_state = "unknown"
+    else:
+        auth_state = "blocked"
+
+    applet_remaining_timeout(deadline)
+    lease = agent_lease_status(agent, initialize_state=False)
+    applet_remaining_timeout(deadline)
+    raw_lease_state = lease.get("state")
+    lease_state = (
+        raw_lease_state
+        if raw_lease_state in {"unclaimed", "held", "expired", "unreadable"}
+        else "unreadable"
+    )
+
+    if auth_state == "blocked" or identity_state == "unverified" or lease_state == "held":
+        control_state = "blocked"
+    elif auth_state == "unknown" or identity_state == "unknown" or lease_state == "unreadable":
+        control_state = "unknown"
+    elif auth_state == "ready" and identity_state in {"verified", "stopped"}:
+        control_state = "ready"
+    else:
+        control_state = "unknown"
+
+    return {
+        "agent": agent,
+        "activity_state": activity_state,
+        "backend_state": backend_state,
+        "control_state": control_state,
+        "auth_state": auth_state,
+        "identity_state": identity_state,
+        "lease_state": lease_state,
+    }
+
+
+def applet_error_row(agent: str) -> dict[str, Any]:
+    return {
+        "agent": agent,
+        "activity_state": "unknown",
+        "backend_state": "error",
+        "control_state": "unknown",
+        "auth_state": "unknown",
+        "identity_state": "unknown",
+        "lease_state": "unreadable",
+    }
+
+
+def applet_status(agents: Any) -> dict[str, Any]:
+    selected = normalize_applet_agents(agents)
+    deadline = time.monotonic() + APPLET_STATUS_TIMEOUT_SECONDS
+    rows: list[dict[str, Any]] = []
+    for agent in selected:
+        if time.monotonic() >= deadline:
+            rows.append(applet_error_row(agent))
+            continue
+        try:
+            rows.append(applet_agent_observation(agent, deadline=deadline))
+        except AgentError:
+            rows.append(applet_error_row(agent))
+
+    activity_states = [row["activity_state"] for row in rows]
+    if all(state == "running" for state in activity_states):
+        activity_state = "running"
+    elif all(state == "sleeping" for state in activity_states):
+        activity_state = "sleeping"
+    elif all(state == "unknown" for state in activity_states):
+        activity_state = "unknown"
+    else:
+        activity_state = "mixed"
+
+    backend_states = [row["backend_state"] for row in rows]
+    if all(state == "ok" for state in backend_states):
+        backend_state = "ok"
+    elif all(state == "error" for state in backend_states):
+        backend_state = "unavailable"
+    else:
+        backend_state = "degraded"
+
+    control_states = [row["control_state"] for row in rows]
+    if all(state == "ready" for state in control_states):
+        control_state = "ready"
+    elif all(state == "blocked" for state in control_states):
+        control_state = "blocked"
+    elif all(state == "unknown" for state in control_states):
+        control_state = "unknown"
+    else:
+        control_state = "mixed"
+
+    counts = {
+        "tracked": len(rows),
+        "running": activity_states.count("running"),
+        "sleeping": activity_states.count("sleeping"),
+        "ready": control_states.count("ready"),
+        "blocked": control_states.count("blocked"),
+        "issues": sum(
+            row["backend_state"] != "ok" or row["control_state"] != "ready" for row in rows
+        ),
+    }
+    return {
+        "schema_version": 1,
+        "mode": "read_only",
+        "activity_state": activity_state,
+        "backend_state": backend_state,
+        "control_state": control_state,
+        "counts": counts,
+        "agents": rows,
+        "raw_output": "not_returned",
+    }
 
 
 def single_agent_id(agent: str, tool_name: str) -> str:
