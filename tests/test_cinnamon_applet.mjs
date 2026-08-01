@@ -54,24 +54,49 @@ function samplePayload() {
       {
         agent: "a1",
         activity_state: "running",
-        backend_state: "ok",
-        control_state: "ready",
+        backend_state: "degraded",
+        control_state: "blocked",
         auth_state: "ready",
-        identity_state: "verified",
+        identity_state: "unverified",
         lease_state: "unclaimed",
       },
       {
         agent: "b1",
         activity_state: "sleeping",
-        backend_state: "error",
-        control_state: "blocked",
-        auth_state: "blocked",
+        backend_state: "ok",
+        control_state: "ready",
+        auth_state: "ready",
         identity_state: "stopped",
-        lease_state: "held",
+        lease_state: "unclaimed",
       },
     ],
     raw_output: "not_returned",
   };
+}
+
+function realignCounts(payload) {
+  const activityStates = payload.agents.map((row) => row.activity_state);
+  const controlStates = payload.agents.map((row) => row.control_state);
+  const backendStates = payload.agents.map((row) => row.backend_state);
+  payload.counts.running = activityStates.filter((state) => state === "running").length;
+  payload.counts.sleeping = activityStates.filter((state) => state === "sleeping").length;
+  payload.counts.ready = controlStates.filter((state) => state === "ready").length;
+  payload.counts.blocked = controlStates.filter((state) => state === "blocked").length;
+  payload.counts.issues = payload.agents.filter(
+    (row) => row.backend_state !== "ok" || row.control_state !== "ready",
+  ).length;
+  payload.counts.tracked = payload.agents.length;
+  if (activityStates.every((state) => state === "running")) payload.activity_state = "running";
+  else if (activityStates.every((state) => state === "sleeping")) payload.activity_state = "sleeping";
+  else if (activityStates.every((state) => state === "unknown")) payload.activity_state = "unknown";
+  else payload.activity_state = "mixed";
+  if (backendStates.every((state) => state === "ok")) payload.backend_state = "ok";
+  else if (backendStates.every((state) => state === "error")) payload.backend_state = "unavailable";
+  else payload.backend_state = "degraded";
+  if (controlStates.every((state) => state === "ready")) payload.control_state = "ready";
+  else if (controlStates.every((state) => state === "blocked")) payload.control_state = "blocked";
+  else if (controlStates.every((state) => state === "unknown")) payload.control_state = "unknown";
+  else payload.control_state = "mixed";
 }
 
 function loadApplet() {
@@ -901,12 +926,16 @@ test("real backend payload with sleeping and expired states is accepted", async 
   const payload = samplePayload();
   payload.activity_state = "sleeping";
   payload.backend_state = "ok";
-  payload.counts.running = 0;
-  payload.counts.sleeping = 2;
   payload.agents[0].activity_state = "sleeping";
+  payload.agents[0].control_state = "ready";
+  payload.agents[0].auth_state = "ready";
   payload.agents[0].identity_state = "stopped";
+  payload.agents[0].backend_state = "ok";
   payload.agents[1].backend_state = "ok";
   payload.agents[1].lease_state = "expired";
+  payload.agents[1].control_state = "ready";
+  payload.agents[1].auth_state = "ready";
+  realignCounts(payload);
   fixture.setProcessFactory(() => ({
     forceExitCount: 0,
     waitCallbacks: [],
@@ -1102,6 +1131,176 @@ test("validator rejects missing snapshot state fields", async () => {
   await Promise.resolve();
 
   assert.equal(applet._statusLastGood, null);
+});
+
+test("exact python error row is accepted and aggregates to python unavailable snapshot", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const payload = {
+    schema_version: 1,
+    mode: "read_only",
+    activity_state: "unknown",
+    backend_state: "unavailable",
+    control_state: "unknown",
+    counts: {
+      tracked: 2,
+      running: 0,
+      sleeping: 0,
+      ready: 0,
+      blocked: 0,
+      issues: 2,
+    },
+    agents: [
+      {
+        agent: "a1",
+        activity_state: "unknown",
+        backend_state: "error",
+        control_state: "unknown",
+        auth_state: "unknown",
+        identity_state: "unknown",
+        lease_state: "unreadable",
+      },
+      {
+        agent: "b1",
+        activity_state: "unknown",
+        backend_state: "error",
+        control_state: "unknown",
+        auth_state: "unknown",
+        identity_state: "unknown",
+        lease_state: "unreadable",
+      },
+    ],
+    raw_output: "not_returned",
+  };
+
+  assert.equal(applet._maybeApplyStatusPayload(payload), true);
+  assert.equal(applet._statusLastGood.activity_state, "unknown");
+  assert.equal(applet._statusLastGood.backend_state, "unavailable");
+  assert.equal(applet._statusLastGood.control_state, "unknown");
+  assert.equal(applet._statusLastGood.counts.issues, 2);
+});
+
+test("exact python error row mixed with a normal row is accepted", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const payload = {
+    schema_version: 1,
+    mode: "read_only",
+    activity_state: "mixed",
+    backend_state: "degraded",
+    control_state: "mixed",
+    counts: {
+      tracked: 2,
+      running: 0,
+      sleeping: 1,
+      ready: 1,
+      blocked: 0,
+      issues: 1,
+    },
+    agents: [
+      {
+        agent: "a1",
+        activity_state: "unknown",
+        backend_state: "error",
+        control_state: "unknown",
+        auth_state: "unknown",
+        identity_state: "unknown",
+        lease_state: "unreadable",
+      },
+      {
+        agent: "b1",
+        activity_state: "sleeping",
+        backend_state: "ok",
+        control_state: "ready",
+        auth_state: "ready",
+        identity_state: "stopped",
+        lease_state: "unclaimed",
+      },
+    ],
+    raw_output: "not_returned",
+  };
+
+  assert.equal(applet._maybeApplyStatusPayload(payload), true);
+  assert.deepEqual(
+    {
+      activity_state: applet._statusLastGood.activity_state,
+      backend_state: applet._statusLastGood.backend_state,
+      control_state: applet._statusLastGood.control_state,
+      counts: applet._statusLastGood.counts,
+    },
+    {
+      activity_state: "mixed",
+      backend_state: "degraded",
+      control_state: "mixed",
+      counts: {
+        tracked: 2,
+        running: 0,
+        sleeping: 1,
+        ready: 1,
+        blocked: 0,
+        issues: 1,
+      },
+    },
+  );
+});
+
+test("validator rejects syntactically valid but backend-impossible row combinations", async () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const base = samplePayload();
+  const valid = JSON.parse(JSON.stringify(base));
+  assert.equal(applet._maybeApplyStatusPayload(valid), true);
+
+  const stale = JSON.parse(JSON.stringify(base));
+  stale.agents[0].activity_state = "running";
+  stale.agents[0].identity_state = "stopped";
+  stale.agents[0].backend_state = "degraded";
+  stale.agents[0].control_state = "ready";
+  stale.agents[0].auth_state = "ready";
+  stale.agents[1].control_state = "ready";
+  stale.agents[1].auth_state = "ready";
+  realignCounts(stale);
+
+  const mixedRow = JSON.parse(JSON.stringify(base));
+  mixedRow.agents[1].activity_state = "sleeping";
+  mixedRow.agents[1].identity_state = "verified";
+  mixedRow.agents[1].backend_state = "ok";
+  mixedRow.agents[1].control_state = "blocked";
+  mixedRow.agents[1].auth_state = "blocked";
+  mixedRow.agents[1].lease_state = "unclaimed";
+  mixedRow.agents[1].control_state = "blocked";
+  realignCounts(mixedRow);
+
+  const backendError = JSON.parse(JSON.stringify(base));
+  backendError.agents[1].backend_state = "error";
+  realignCounts(backendError);
+
+  const wrongControl = JSON.parse(JSON.stringify(base));
+  wrongControl.agents[0].identity_state = "unverified";
+  wrongControl.agents[0].control_state = "ready";
+  realignCounts(wrongControl);
+
+  const invalidErrorShape = JSON.parse(JSON.stringify(base));
+  invalidErrorShape.agents[0].activity_state = "unknown";
+  invalidErrorShape.agents[0].backend_state = "error";
+  invalidErrorShape.agents[0].control_state = "ready";
+  invalidErrorShape.agents[0].lease_state = "held";
+  invalidErrorShape.agents[0].identity_state = "unknown";
+  invalidErrorShape.agents[0].auth_state = "ready";
+  realignCounts(invalidErrorShape);
+
+  const cases = [
+    { name: "running with stopped identity", payload: stale },
+    { name: "sleeping with verified identity", payload: mixedRow },
+    { name: "backend error with non-error shape", payload: backendError },
+    { name: "running unverified not blocked", payload: wrongControl },
+    { name: "non-exact error row", payload: invalidErrorShape },
+  ];
+
+  for (const { name, payload } of cases) {
+    assert.equal(applet._maybeApplyStatusPayload(payload), false, name);
+    assert.equal(applet._statusLastGood?.schema_version, 1);
+  }
 });
 
 test("validator rejects missing/invalid counts, raw_output and duplicate/foreign agents", async () => {

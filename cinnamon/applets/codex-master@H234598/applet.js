@@ -30,6 +30,14 @@ const APPLET_STATUS_REQUIRED_ROW_FIELDS = [
 ];
 const APPLET_STATUS_REQUIRED_COUNTS = ["tracked", "running", "sleeping", "ready", "blocked", "issues"];
 const APPLET_STATUS_RAW_OUTPUT = "not_returned";
+const APPLET_STATUS_ERROR_ROW = {
+    activity_state: "unknown",
+    backend_state: "error",
+    control_state: "unknown",
+    auth_state: "unknown",
+    identity_state: "unknown",
+    lease_state: "unreadable",
+};
 const APPLET_STATUS_VALID_STRINGS = {
     snapshot: {
         activity_state: new Set(["running", "sleeping", "unknown", "mixed"]),
@@ -522,6 +530,7 @@ FlottenmanagementApplet.prototype = {
             if (!this._isValidStateSet("row", "auth_state", row.auth_state)) return false;
             if (!this._isValidStateSet("row", "identity_state", row.identity_state)) return false;
             if (!this._isValidStateSet("row", "lease_state", row.lease_state)) return false;
+            if (!this._isValidAppletStatusRow(row)) return false;
         }
         if (agents.size !== this._trackedAgents.length) return false;
 
@@ -568,6 +577,47 @@ FlottenmanagementApplet.prototype = {
         if (payload.backend_state !== expectedBackend) return false;
         if (payload.control_state !== expectedControl) return false;
         return true;
+    },
+
+    _isValidAppletStatusRow(row) {
+        const isErrorRow = (
+            row.activity_state === APPLET_STATUS_ERROR_ROW.activity_state
+            && row.backend_state === APPLET_STATUS_ERROR_ROW.backend_state
+            && row.control_state === APPLET_STATUS_ERROR_ROW.control_state
+            && row.auth_state === APPLET_STATUS_ERROR_ROW.auth_state
+            && row.identity_state === APPLET_STATUS_ERROR_ROW.identity_state
+            && row.lease_state === APPLET_STATUS_ERROR_ROW.lease_state
+        );
+        if (isErrorRow) return true;
+
+        if (row.backend_state === "error") return false;
+
+        if (row.activity_state === "running" && row.identity_state === "verified") {
+            if (row.backend_state !== "ok") return false;
+        } else if (row.activity_state === "running" && row.identity_state === "unverified") {
+            if (row.backend_state !== "degraded") return false;
+        } else if (row.activity_state === "sleeping") {
+            if (row.identity_state !== "stopped") return false;
+            if (row.backend_state !== "ok") return false;
+        } else {
+            return false;
+        }
+
+        const expectedControlState = this._deriveControlStateForAppletRow(row);
+        return row.control_state === expectedControlState;
+    },
+
+    _deriveControlStateForAppletRow(row) {
+        if (row.auth_state === "blocked" || row.identity_state === "unverified" || row.lease_state === "held") {
+            return "blocked";
+        }
+        if (row.auth_state === "unknown" || row.identity_state === "unknown" || row.lease_state === "unreadable") {
+            return "unknown";
+        }
+        if (row.auth_state === "ready" && (row.identity_state === "verified" || row.identity_state === "stopped")) {
+            return "ready";
+        }
+        return "unknown";
     },
 
     _hasExactFields(value, requiredFields) {
