@@ -289,13 +289,15 @@ FlottenmanagementApplet.prototype = {
         this._renderStatus();
 
         const requestForceExit = (stateArg) => {
-            if (stateArg.forceExitCalled || !stateArg.process) return;
-            if (typeof stateArg.process.force_exit !== "function") return;
+            if (stateArg.forceExitCalled || !stateArg.process) return true;
+            if (typeof stateArg.process.force_exit !== "function") return false;
             try {
                 stateArg.process.force_exit();
                 stateArg.forceExitCalled = true;
+                return true;
             } catch (error) {
                 this._logCleanupError(error);
+                return false;
             }
         };
 
@@ -397,10 +399,10 @@ FlottenmanagementApplet.prototype = {
             APPLET_STATUS_TIMEOUT_MILLISECONDS,
             () => {
                 state.timedOut = true;
-                requestForceExit(state);
+                const forceExitRequested = requestForceExit(state);
                 this._markRefreshFailed();
                 attemptFinalize(state);
-                return GLib.SOURCE_REMOVE;
+                return forceExitRequested ? GLib.SOURCE_REMOVE : GLib.SOURCE_CONTINUE;
             }
         );
 

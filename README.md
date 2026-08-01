@@ -368,10 +368,11 @@ The four applet settings are:
 - `background-refresh`: opt-in periodic refresh; default off;
 - `refresh-interval-seconds`: 15–3600 seconds; default 60.
 
-Invalid settings show a configuration error, fall back to `a1,b1`, disable
-background work, and never reach the process argv. The menu contains a manual
-refresh, applet administration, one summary, and at most six non-reactive
-Agentinnen rows.
+Malformed agent, switch, or interval values show a configuration error, fall
+back to safe defaults, disable background work, and never reach the process
+argv. Finite refresh intervals outside the allowed range are clamped to
+15–3600 seconds. The menu contains a manual refresh, applet administration,
+one summary, and at most six non-reactive Agentinnen rows.
 
 Install and verify with the repository-owned atomic installer:
 
@@ -384,10 +385,12 @@ scripts/codex-master-cinnamon-applet rollback
 
 `install` stages and hashes regular non-hardlinked source files, rejects
 symlinked source/target paths, reloads only this UUID through Cinnamon's
-`ReloadXlet`, and restores the previous tree if reload or verification fails.
+`ReloadXlet`, and restores and reloads the previous tree if deployment fails.
 `verify` requires byte-identical installed files and a running UUID from
-`GetRunningXletUUIDs applet`. `rollback` requires a validated rollback tree and
-fails closed when it is missing or unexpected. `--no-reload` is available for
+`GetRunningXletUUIDs applet`. `rollback` requires validated installed and
+rollback trees, but not an intact repository source. It fails closed when a
+required tree is missing or unexpected. Install, verify, and rollback are
+serialized by a private per-UUID lock. `--no-reload` is available for
 controlled offline install/rollback tests. No command uses `Eval` or restarts
 Cinnamon globally.
 

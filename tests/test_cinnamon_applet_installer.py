@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -168,6 +170,7 @@ else:
     def test_reload_or_running_verification_failure_restores_previous_tree(self) -> None:
         for mode in ("reload-fail", "missing"):
             with self.subTest(mode=mode):
+                self.log.unlink(missing_ok=True)
                 if self.target.exists():
                     shutil.rmtree(self.target)
                 if self.backup.exists():
@@ -179,6 +182,8 @@ else:
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(f"old-{mode}", (self.target / "applet.js").read_text(encoding="utf-8"))
                 self.assertFalse(self.backup.exists())
+                calls = self.log.read_text(encoding="utf-8").count("org.Cinnamon.ReloadXlet")
+                self.assertEqual(calls, 2, "restored applet must be reloaded after failed deployment")
 
     def test_verify_rejects_byte_difference_and_unbounded_dbus_output(self) -> None:
         shutil.copytree(self.source, self.target)
@@ -303,6 +308,67 @@ else:
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("current", (self.target / "applet.js").read_text(encoding="utf-8"))
         self.assertIn("previous", (self.backup / "applet.js").read_text(encoding="utf-8"))
+        calls = self.log.read_text(encoding="utf-8").count("org.Cinnamon.ReloadXlet")
+        self.assertEqual(calls, 2, "restored current applet must be reloaded after failed rollback")
+
+    def test_rollback_works_without_repository_source(self) -> None:
+        self._write_tree(self.target, "current")
+        self._write_tree(self.backup, "previous")
+        shutil.rmtree(self.source)
+
+        result = self._run("rollback", "--no-reload")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("previous", (self.target / "applet.js").read_text(encoding="utf-8"))
+        self.assertIn("current", (self.backup / "applet.js").read_text(encoding="utf-8"))
+
+    def test_mutating_commands_are_serialized_by_uuid_lock(self) -> None:
+        module = self._load_tool_module()
+        entered = 0
+        entered_lock = threading.Lock()
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        results: list[int] = []
+
+        def fake_install(*, dry_run, no_reload):
+            nonlocal entered
+            with entered_lock:
+                entered += 1
+                current = entered
+            if current == 1:
+                first_entered.set()
+                release_first.wait(timeout=5)
+            return {"ok": True, "action": "install"}
+
+        def invoke() -> None:
+            results.append(module.main(["install", "--no-reload"]))
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            with mock.patch.object(module, "install", side_effect=fake_install):
+                first = threading.Thread(target=invoke)
+                second = threading.Thread(target=invoke)
+                first.start()
+                self.assertTrue(first_entered.wait(timeout=2))
+                second.start()
+                try:
+                    time.sleep(0.2)
+                    self.assertEqual(entered, 1, "second mutator entered before first released lock")
+                finally:
+                    release_first.set()
+                    first.join(timeout=5)
+                    second.join(timeout=5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(sorted(results), [0, 0])
+
+    def test_uuid_lock_does_not_reclassify_operation_oserror(self) -> None:
+        module = self._load_tool_module()
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            with self.assertRaisesRegex(OSError, "injected operation failure"):
+                with module.operation_lock(create_parent=True):
+                    raise OSError("injected operation failure")
 
 
 if __name__ == "__main__":

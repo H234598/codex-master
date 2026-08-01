@@ -1461,32 +1461,56 @@ test("removal retries a failed force_exit without losing process state", () => {
   assert.equal(applet._cleanupComplete, true);
 });
 
-test("timeout contains force_exit failure and removal retries it", () => {
+test("timeout retries force_exit failure and refresh recovers", () => {
   const fixture = loadApplet();
-  fixture.setProcessFactory(() => ({
-    forceExitCount: 0,
-    waitCallbacks: [],
-    get_stdout_pipe() { return fixture.makeStream([], true); },
-    get_stderr_pipe() { return fixture.makeStream([], true); },
-    get_successful: () => false,
-    force_exit() {
-      this.forceExitCount += 1;
-      if (this.forceExitCount === 1) throw new Error("injected timeout force failure");
-    },
-    wait_async(_cancellable, callback) { this.waitCallbacks.push(callback); },
-    wait_finish() {},
-  }));
+  fixture.setProcessFactory(() => {
+    const stdout = fixture.makeStream([], true);
+    const stderr = fixture.makeStream([], true);
+    return {
+      forceExitCount: 0,
+      waitCallbacks: [],
+      stdout,
+      stderr,
+      get_stdout_pipe() { return stdout; },
+      get_stderr_pipe() { return stderr; },
+      get_successful: () => false,
+      force_exit() {
+        this.forceExitCount += 1;
+        if (this.forceExitCount === 1) throw new Error("injected timeout force failure");
+      },
+      wait_async(_cancellable, callback) { this.waitCallbacks.push(callback); },
+      wait_finish() {},
+      emitDone() {
+        const callbacks = [...this.waitCallbacks];
+        this.waitCallbacks = [];
+        for (const callback of callbacks) callback(this, null);
+      },
+    };
+  });
+  queuePayloadProcess(fixture, samplePayload());
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
-  applet.menu.items[0].activate();
+  const statusItem = applet.menu.items[0];
+  statusItem.activate();
   const process = fixture.subprocesses[0];
 
   assert.doesNotThrow(() => fixture.runTimeouts());
   assert.equal(process.forceExitCount, 1);
   assert.equal(applet._statusActiveState.forceExitCalled, false);
+  assert.equal(fixture.activeTimers("timeout").length, 1, "failed force_exit keeps retry timer");
 
-  applet.on_applet_removed_from_panel();
+  statusItem.activate();
+  assert.equal(applet._statusPendingRefresh, true);
+  fixture.runTimeouts();
   assert.equal(process.forceExitCount, 2);
-  assert.equal(applet._cleanupComplete, true);
+  assert.equal(applet._statusActiveState.forceExitCalled, true);
+  assert.equal(fixture.activeTimers("timeout").length, 0);
+
+  process.stdout.releaseEof();
+  process.stderr.releaseEof();
+  process.emitDone();
+  assert.equal(fixture.subprocesses.length, 2, "pending refresh starts after recovered timeout cleanup");
+  fixture.subprocesses[1].emitDone();
+  assert.equal(applet._statusInFlight, false);
 });
 
 test("500 completed refreshes leave no active resources", async () => {

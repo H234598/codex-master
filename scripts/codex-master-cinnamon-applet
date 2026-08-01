@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -57,6 +59,36 @@ def target_directory() -> Path:
 
 def rollback_directory(target: Path) -> Path:
     return target.with_name(f"{UUID}.rollback")
+
+
+@contextmanager
+def operation_lock(*, create_parent: bool):
+    parent = target_directory().parent
+    ensure_real_directory_chain(parent, create=create_parent)
+    lock_path = parent / f".{UUID}.lock"
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise InstallerError("installer lock must be a non-hardlinked regular file")
+        validate_owner_and_mode(opened, "installer lock")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise InstallerError("installer lock is unavailable") from exc
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    try:
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def ensure_real_directory_chain(path: Path, *, create: bool) -> None:
@@ -382,6 +414,14 @@ def install(*, dry_run: bool, no_reload: bool) -> dict[str, Any]:
                 verify_running()
         except Exception:
             restore_previous(target, backup, had_previous)
+            if had_previous and not no_reload:
+                try:
+                    reload_xlet()
+                    verify_running()
+                except Exception as recovery_error:
+                    raise InstallerError(
+                        "installation failed; previous applet was restored but could not be reloaded"
+                    ) from recovery_error
             raise
     finally:
         if stage != Path() and lexical_exists(stage):
@@ -407,8 +447,6 @@ def swap_directories(first: Path, second: Path) -> None:
 
 
 def rollback(*, no_reload: bool) -> dict[str, Any]:
-    source = source_directory()
-    validate_source(source)
     target = target_directory()
     backup = rollback_directory(target)
     ensure_real_directory_chain(target.parent, create=False)
@@ -425,6 +463,14 @@ def rollback(*, no_reload: bool) -> dict[str, Any]:
             verify_running()
     except Exception:
         swap_directories(target, backup)
+        if not no_reload:
+            try:
+                reload_xlet()
+                verify_running()
+            except Exception as recovery_error:
+                raise InstallerError(
+                    "rollback failed; current applet was restored but could not be reloaded"
+                ) from recovery_error
         raise
     return {"ok": True, "action": "rollback", "uuid": UUID}
 
@@ -454,12 +500,16 @@ def main(argv: list[str]) -> int:
     os.umask(0o077)
     args = parse_args(argv)
     try:
-        if args.command == "install":
-            result = install(dry_run=args.dry_run, no_reload=args.no_reload)
-        elif args.command == "verify":
-            result = verify()
+        if args.command == "install" and args.dry_run:
+            result = install(dry_run=True, no_reload=args.no_reload)
         else:
-            result = rollback(no_reload=args.no_reload)
+            with operation_lock(create_parent=args.command == "install"):
+                if args.command == "install":
+                    result = install(dry_run=False, no_reload=args.no_reload)
+                elif args.command == "verify":
+                    result = verify()
+                else:
+                    result = rollback(no_reload=args.no_reload)
     except (InstallerError, OSError) as exc:
         print(json.dumps({"ok": False, "error": str(exc)[:500]}, sort_keys=True), file=sys.stderr)
         return 1
