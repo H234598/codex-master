@@ -80,6 +80,13 @@ function loadApplet() {
   const subprocesses = [];
   const pendingFactories = [];
   const timeouts = [];
+  const settingsInstances = [];
+  const settingsValues = {
+    "tracked-agents": "a1,b1",
+    "refresh-on-open": true,
+    "background-refresh": false,
+    "refresh-interval-seconds": 60,
+  };
   let home = "/home/tester";
   let timeoutId = 1;
 
@@ -100,8 +107,14 @@ function loadApplet() {
   };
 
   class PopupMenuItem {
-    constructor(label) {
+    constructor(label, options = {}) {
       this.label = label;
+      this.reactive = options.reactive !== false;
+      this.actor = {
+        visible: true,
+        show: () => { this.actor.visible = true; },
+        hide: () => { this.actor.visible = false; },
+      };
       this.handlers = new Map();
       this.nextHandlerId = 1;
     }
@@ -316,12 +329,47 @@ function loadApplet() {
     }
   }
 
+  class FakeAppletSettings {
+    constructor(target, uuid, instanceId) {
+      this.target = target;
+      this.uuid = uuid;
+      this.instanceId = instanceId;
+      this.bindings = new Map();
+      this.finalizeCount = 0;
+      settingsInstances.push(this);
+    }
+    bindProperty(_direction, key, property, callback) {
+      this.target[property] = settingsValues[key];
+      this.bindings.set(key, { property, callback });
+    }
+    finalize() { this.finalizeCount += 1; }
+    set(key, value) {
+      settingsValues[key] = value;
+      const binding = this.bindings.get(key);
+      if (!binding) return;
+      this.target[binding.property] = value;
+      if (binding.callback) binding.callback();
+    }
+  }
+
+  class FakeCancellable {
+    constructor() { this.cancelCount = 0; }
+    cancel() { this.cancelCount += 1; }
+  }
+
   const GLib = {
     PRIORITY_DEFAULT: 0,
+    SOURCE_REMOVE: false,
+    SOURCE_CONTINUE: true,
     get_home_dir() { return home; },
     timeout_add(_priority, _ms, callback) {
       const id = timeoutId += 1;
-      timeouts.push({ id, callback, cancelled: false });
+      timeouts.push({ id, callback, cancelled: false, kind: "timeout" });
+      return id;
+    },
+    timeout_add_seconds(_priority, seconds, callback) {
+      const id = timeoutId += 1;
+      timeouts.push({ id, callback, cancelled: false, kind: "background", seconds });
       return id;
     },
     source_remove(id) {
@@ -362,6 +410,12 @@ function loadApplet() {
       STDOUT_PIPE: 1,
       STDERR_PIPE: 2,
     },
+    Cancellable: FakeCancellable,
+  };
+
+  const Settings = {
+    AppletSettings: FakeAppletSettings,
+    BindingDirection: { IN: 1 },
   };
 
   const context = {
@@ -371,6 +425,7 @@ function loadApplet() {
       ui: {
         applet: { TextApplet, AppletPopupMenu },
         popupMenu: { PopupMenuItem, PopupMenuManager },
+        settings: Settings,
       },
       misc: { util: { spawn(args) { spawned.push(args); } } },
       byteArray: {
@@ -391,16 +446,50 @@ function loadApplet() {
     subprocesses,
     pendingFactories,
     timeouts,
+    settingsInstances,
     runTimeouts() { return Mainloop.runTimeouts(); },
     setHome(value) { home = value; },
     setProcessFactory(factory) { pendingFactories.push(factory); },
     resetFactories() { pendingFactories.length = 0; },
+    setSetting(key, value) {
+      const settings = settingsInstances.at(-1);
+      if (settings) settings.set(key, value);
+      else settingsValues[key] = value;
+    },
+    activeTimers(kind) {
+      return timeouts.filter((entry) => !entry.cancelled && (!kind || entry.kind === kind));
+    },
     makeStream(chunks, holdEof = false) {
       const stream = new FakeInputStream(chunks);
       stream.holdEof = holdEof;
       return stream;
     },
   };
+}
+
+function queuePayloadProcess(fixture, payload, { exitCode = 0, holdEof = false } = {}) {
+  fixture.setProcessFactory(() => {
+    const stdout = fixture.makeStream([makeBytes(JSON.stringify(payload))], holdEof);
+    const stderr = fixture.makeStream([], holdEof);
+    return {
+      forceExitCount: 0,
+      waitCallbacks: [],
+      stdout,
+      stderr,
+      get_stdout_pipe() { return stdout; },
+      get_stderr_pipe() { return stderr; },
+      get_successful: () => exitCode === 0,
+      get_exit_status: () => exitCode,
+      force_exit() { this.forceExitCount += 1; },
+      wait_async(_cancellable, callback) { this.waitCallbacks.push(callback); },
+      wait_finish() {},
+      emitDone() {
+        const callbacks = [...this.waitCallbacks];
+        this.waitCallbacks = [];
+        for (const callback of callbacks) callback(this, null);
+      },
+    };
+  });
 }
 
 test("metadata failure is safe", () => {
@@ -1189,4 +1278,213 @@ test("reader exceptions set streamFailed, force_exit once, and finalize", async 
 
   assert.equal(fixture.subprocesses[0].forceExitCount, 1);
   assert.equal(applet._statusLastGood, null);
+});
+
+test("task 5 settings schema contains exactly four bounded settings", () => {
+  const schemaPath = path.join(root, "cinnamon/applets/codex-master@H234598/settings-schema.json");
+  const schema = JSON.parse(fs.readFileSync(schemaPath, "utf8"));
+
+  assert.deepEqual(Object.keys(schema).sort(), [
+    "background-refresh",
+    "refresh-interval-seconds",
+    "refresh-on-open",
+    "tracked-agents",
+  ]);
+  assert.equal(schema["tracked-agents"].default, "a1,b1");
+  assert.equal(schema["refresh-on-open"].default, true);
+  assert.equal(schema["background-refresh"].default, false);
+  assert.deepEqual(
+    {
+      default: schema["refresh-interval-seconds"].default,
+      min: schema["refresh-interval-seconds"].min,
+      max: schema["refresh-interval-seconds"].max,
+    },
+    { default: 60, min: 15, max: 3600 },
+  );
+});
+
+test("settings parser canonicalizes bounded concrete ids and never launches attacker text", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+
+  assert.equal(fixture.settingsInstances.length, 1);
+  assert.deepEqual(Array.from(applet._trackedAgents), ["a1", "b1"]);
+
+  fixture.setSetting("tracked-agents", " A2, b3, a2, C100 ");
+  assert.deepEqual(Array.from(applet._trackedAgents), ["a2", "b3", "c100"]);
+  applet.menu.items[0].activate();
+  assert.deepEqual(Array.from(fixture.launcherSpawns.at(-1).argv.slice(2)), ["a2", "b3", "c100"]);
+
+  fixture.setSetting("tracked-agents", "a1;--force /tmp/owned");
+  assert.deepEqual(Array.from(applet._trackedAgents), ["a1", "b1"]);
+  assert.equal(applet._settingsValid, false);
+  assert.match(applet._statusSummaryItem.label, /Konfiguration/);
+  applet.menu.items[0].activate();
+  fixture.subprocesses[0].emitDone();
+  const argv = fixture.launcherSpawns.at(-1).argv;
+  assert.deepEqual(Array.from(argv.slice(2)), ["a1", "b1"]);
+  assert.ok(!argv.join(" ").includes("--force"));
+  assert.ok(!argv.join(" ").includes("/tmp/owned"));
+  fixture.setSetting("background-refresh", true);
+  assert.equal(fixture.activeTimers("background").length, 0, "invalid settings disable background work");
+});
+
+test("read-only UI keeps title and separates activity backend and stale state", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const payload = samplePayload();
+
+  assert.equal(applet._maybeApplyStatusPayload(payload), true);
+  assert.equal(applet.labels.at(-1), "Flottenmanagement");
+  assert.match(applet.tooltips.at(-1), /Aktivität/);
+  assert.match(applet.tooltips.at(-1), /Backend/);
+  assert.match(applet.tooltips.at(-1), /Nur Lesen/);
+  assert.match(applet._statusSummaryItem.label, /Nur Lesen/);
+  assert.equal(applet._statusRowItems.filter((item) => item.actor.visible).length, 2);
+  assert.ok(applet._statusRowItems[0].label.startsWith("a1:"));
+  assert.ok(applet._statusRowItems[1].label.startsWith("b1:"));
+  assert.ok(!applet.menu.items.some((item) => /Start|Stop|Interrupt/.test(item.label)));
+
+  applet._markRefreshFailed();
+  assert.match(applet._statusSummaryItem.label, /veraltet/i);
+  assert.equal(applet.labels.at(-1), "Flottenmanagement");
+
+  fixture.setSetting("tracked-agents", "a2");
+  assert.equal(applet._statusLastGood, null, "fleet change clears old fleet snapshot");
+  assert.equal(applet._statusRowItems.filter((item) => item.actor.visible).length, 1);
+  assert.ok(applet._statusRowItems[0].label.startsWith("a2:"));
+});
+
+test("refresh-on-open and bounded opt-in background timer preserve single-flight", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+
+  applet.on_applet_clicked();
+  assert.equal(fixture.subprocesses.length, 1, "default refresh-on-open starts one refresh");
+
+  fixture.setSetting("refresh-interval-seconds", 5);
+  fixture.setSetting("background-refresh", true);
+  const background = fixture.activeTimers("background");
+  assert.equal(background.length, 1);
+  assert.equal(background[0].seconds, 15);
+  background[0].callback();
+  assert.equal(fixture.subprocesses.length, 1, "timer cannot overlap active refresh");
+  assert.equal(applet._statusPendingRefresh, true);
+
+  fixture.subprocesses[0].emitDone();
+  assert.equal(fixture.subprocesses.length, 2, "pending refresh is coalesced once");
+  fixture.setSetting("background-refresh", false);
+  assert.equal(fixture.activeTimers("background").length, 0);
+});
+
+test("failed refresh keeps last-good visibly stale", () => {
+  const fixture = loadApplet();
+  const payload = samplePayload();
+  queuePayloadProcess(fixture, payload);
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const statusItem = applet.menu.items[0];
+
+  statusItem.activate();
+  fixture.subprocesses[0].emitDone();
+  assert.equal(applet._statusLastGood.activity_state, payload.activity_state);
+  assert.doesNotMatch(applet._statusSummaryItem.label, /veraltet/i);
+
+  queuePayloadProcess(fixture, payload, { exitCode: 1 });
+  statusItem.activate();
+  fixture.subprocesses[1].emitDone();
+  assert.equal(applet._statusLastGood.activity_state, payload.activity_state);
+  assert.match(applet._statusSummaryItem.label, /veraltet/i);
+});
+
+test("removal during stream timeout and pending refresh tears down once", () => {
+  const fixture = loadApplet();
+  queuePayloadProcess(fixture, samplePayload(), { holdEof: true });
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  fixture.setSetting("background-refresh", true);
+  const statusItem = applet.menu.items[0];
+
+  statusItem.activate();
+  statusItem.activate();
+  const process = fixture.subprocesses[0];
+  const cancellable = applet._statusActiveState.cancellable;
+  assert.equal(applet._statusPendingRefresh, true);
+
+  applet.on_applet_removed_from_panel();
+  applet.on_applet_removed_from_panel();
+
+  assert.equal(process.forceExitCount, 1);
+  assert.equal(cancellable.cancelCount, 1);
+  assert.equal(fixture.activeTimers().length, 0);
+  assert.equal(applet._statusPendingRefresh, false);
+  assert.equal(fixture.settingsInstances[0].finalizeCount, 1);
+  assert.equal(applet.menu, null);
+
+  process.stdout.releaseEof();
+  process.stderr.releaseEof();
+  process.emitDone();
+  assert.equal(fixture.subprocesses.length, 1, "stale callbacks start no follow-up process");
+  assert.equal(process.forceExitCount, 1);
+  assert.equal(fixture.settingsInstances[0].finalizeCount, 1);
+});
+
+test("removal retries a failed force_exit without losing process state", () => {
+  const fixture = loadApplet();
+  fixture.setProcessFactory(() => {
+    const stdout = fixture.makeStream([], true);
+    const stderr = fixture.makeStream([], true);
+    return {
+      forceExitCount: 0,
+      waitCallbacks: [],
+      get_stdout_pipe() { return stdout; },
+      get_stderr_pipe() { return stderr; },
+      get_successful: () => false,
+      force_exit() {
+        this.forceExitCount += 1;
+        if (this.forceExitCount === 1) throw new Error("injected force_exit failure");
+      },
+      wait_async(_cancellable, callback) { this.waitCallbacks.push(callback); },
+      wait_finish() {},
+    };
+  });
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  applet.menu.items[0].activate();
+  const process = fixture.subprocesses[0];
+
+  applet.on_applet_removed_from_panel();
+  assert.equal(process.forceExitCount, 1);
+  assert.notEqual(applet._statusActiveState, null);
+  assert.equal(applet._cleanupComplete, false);
+
+  applet.on_applet_removed_from_panel();
+  assert.equal(process.forceExitCount, 2);
+  assert.equal(applet._statusActiveState, null);
+  assert.equal(applet._cleanupComplete, true);
+});
+
+test("timeout contains force_exit failure and removal retries it", () => {
+  const fixture = loadApplet();
+  fixture.setProcessFactory(() => ({
+    forceExitCount: 0,
+    waitCallbacks: [],
+    get_stdout_pipe() { return fixture.makeStream([], true); },
+    get_stderr_pipe() { return fixture.makeStream([], true); },
+    get_successful: () => false,
+    force_exit() {
+      this.forceExitCount += 1;
+      if (this.forceExitCount === 1) throw new Error("injected timeout force failure");
+    },
+    wait_async(_cancellable, callback) { this.waitCallbacks.push(callback); },
+    wait_finish() {},
+  }));
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  applet.menu.items[0].activate();
+  const process = fixture.subprocesses[0];
+
+  assert.doesNotThrow(() => fixture.runTimeouts());
+  assert.equal(process.forceExitCount, 1);
+  assert.equal(applet._statusActiveState.forceExitCalled, false);
+
+  applet.on_applet_removed_from_panel();
+  assert.equal(process.forceExitCount, 2);
+  assert.equal(applet._cleanupComplete, true);
 });

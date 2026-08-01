@@ -1,6 +1,7 @@
 /* -*- mode: js2; js2-basic-offset: 4; indent-tabs-mode: nil -*- */
 const Applet = imports.ui.applet;
 const PopupMenu = imports.ui.popupMenu;
+const Settings = imports.ui.settings;
 const Util = imports.misc.util;
 const Gio = imports.gi.Gio;
 const GLib = imports.gi.GLib;
@@ -13,6 +14,13 @@ const APPLET_STDOUT_LIMIT_BYTES = 64 * 1024;
 const APPLET_STDERR_LIMIT_BYTES = 8 * 1024;
 const APPLET_STATUS_CHUNK_BYTES = 1024;
 const APPLET_STATUS_AGENTS = ["a1", "b1"];
+const DEFAULT_TRACKED_AGENTS_TEXT = "a1,b1";
+const DEFAULT_REFRESH_ON_OPEN = true;
+const DEFAULT_BACKGROUND_REFRESH = false;
+const DEFAULT_REFRESH_INTERVAL_SECONDS = 60;
+const MIN_REFRESH_INTERVAL_SECONDS = 15;
+const MAX_REFRESH_INTERVAL_SECONDS = 3600;
+const MAX_TRACKED_AGENTS = 6;
 const APPLET_STATUS_COMMAND = "applet-status";
 const APPLET_STATUS_REQUIRED_FIELDS = [
     "schema_version", "mode", "activity_state", "backend_state", "control_state", "counts", "agents", "raw_output",
@@ -62,6 +70,18 @@ FlottenmanagementApplet.prototype = {
         this._statusActiveGeneration = 0;
         this._statusLastGood = null;
         this._statusActiveState = null;
+        this._statusViewState = "initializing";
+        this._backgroundRefreshSource = 0;
+        this._trackedAgents = APPLET_STATUS_AGENTS.slice();
+        this.trackedAgentsSetting = DEFAULT_TRACKED_AGENTS_TEXT;
+        this.refreshOnOpen = DEFAULT_REFRESH_ON_OPEN;
+        this.backgroundRefresh = DEFAULT_BACKGROUND_REFRESH;
+        this.refreshIntervalSeconds = DEFAULT_REFRESH_INTERVAL_SECONDS;
+        this._settingsValid = true;
+        this._settingsInitializing = false;
+        this.settings = null;
+        this._statusSummaryItem = null;
+        this._statusRowItems = [];
         this._menuCleanupState = {};
         this._signalConnections = [];
         this.menu = null;
@@ -80,7 +100,7 @@ FlottenmanagementApplet.prototype = {
         this.menuManager = new PopupMenu.PopupMenuManager(this);
         this.menuManager.addMenu(this.menu);
 
-        const statusItem = new PopupMenu.PopupMenuItem("Flottenstatus im Terminal");
+        const statusItem = new PopupMenu.PopupMenuItem("Jetzt aktualisieren");
         this._connectTracked(statusItem, "activate", () => {
             if (this._removed) return;
             this._refreshStatus();
@@ -93,11 +113,126 @@ FlottenmanagementApplet.prototype = {
             Util.spawn(["cinnamon-settings", "applets"]);
         });
         this.menu.addMenuItem(settingsItem);
+
+        this._statusSummaryItem = new PopupMenu.PopupMenuItem("", { reactive: false });
+        this.menu.addMenuItem(this._statusSummaryItem);
+        for (let index = 0; index < MAX_TRACKED_AGENTS; index += 1) {
+            const rowItem = new PopupMenu.PopupMenuItem("", { reactive: false });
+            this._statusRowItems.push(rowItem);
+            this.menu.addMenuItem(rowItem);
+        }
+
+        this._initializeSettings(instance_id);
+        this._applySettings();
+    },
+
+    _initializeSettings(instanceId) {
+        this._settingsInitializing = true;
+        try {
+            this.settings = new Settings.AppletSettings(this, UUID, instanceId);
+            const bind = (key, property) => {
+                this.settings.bindProperty(
+                    Settings.BindingDirection.IN,
+                    key,
+                    property,
+                    () => this._onSettingsChanged(),
+                    null
+                );
+            };
+            bind("tracked-agents", "trackedAgentsSetting");
+            bind("refresh-on-open", "refreshOnOpen");
+            bind("background-refresh", "backgroundRefresh");
+            bind("refresh-interval-seconds", "refreshIntervalSeconds");
+        } catch (_error) {
+            if (this.settings && typeof this.settings.finalize === "function") {
+                try {
+                    this.settings.finalize();
+                } catch (error) {
+                    this._logCleanupError(error);
+                }
+            }
+            this.settings = null;
+            this._settingsValid = false;
+        } finally {
+            this._settingsInitializing = false;
+        }
+    },
+
+    _normalizeTrackedAgents(value) {
+        if (typeof value !== "string") return null;
+        const entries = value.split(",").map((entry) => entry.trim().toLowerCase());
+        if (entries.length < 1 || entries.length > MAX_TRACKED_AGENTS) return null;
+        const normalized = [];
+        const seen = new Set();
+        for (const entry of entries) {
+            if (!/^[abc](?:[1-9]|[1-9][0-9]|100)$/.test(entry)) return null;
+            if (seen.has(entry)) continue;
+            seen.add(entry);
+            normalized.push(entry);
+        }
+        return normalized.length > 0 && normalized.length <= MAX_TRACKED_AGENTS ? normalized : null;
+    },
+
+    _applySettings() {
+        let valid = this.settings !== null;
+        const previousAgents = this._trackedAgents.join(",");
+        const agents = this._normalizeTrackedAgents(this.trackedAgentsSetting);
+        this._trackedAgents = agents || APPLET_STATUS_AGENTS.slice();
+        if (!agents) valid = false;
+
+        if (typeof this.refreshOnOpen !== "boolean") {
+            this.refreshOnOpen = DEFAULT_REFRESH_ON_OPEN;
+            valid = false;
+        }
+        if (typeof this.backgroundRefresh !== "boolean") {
+            this.backgroundRefresh = DEFAULT_BACKGROUND_REFRESH;
+            valid = false;
+        }
+        if (!Number.isFinite(this.refreshIntervalSeconds)) {
+            this.refreshIntervalSeconds = DEFAULT_REFRESH_INTERVAL_SECONDS;
+            valid = false;
+        } else {
+            this.refreshIntervalSeconds = Math.min(
+                MAX_REFRESH_INTERVAL_SECONDS,
+                Math.max(MIN_REFRESH_INTERVAL_SECONDS, Math.trunc(this.refreshIntervalSeconds))
+            );
+        }
+
+        this._settingsValid = valid;
+        if (previousAgents !== this._trackedAgents.join(",")) {
+            this._statusLastGood = null;
+            this._statusViewState = "initializing";
+            if (this._statusInFlight) this._statusPendingRefresh = true;
+        }
+        this._restartBackgroundRefresh();
+        this._renderStatus();
+    },
+
+    _onSettingsChanged() {
+        if (this._removed || this._settingsInitializing) return;
+        this._applySettings();
+    },
+
+    _restartBackgroundRefresh() {
+        if (this._backgroundRefreshSource) {
+            GLib.source_remove(this._backgroundRefreshSource);
+            this._backgroundRefreshSource = 0;
+        }
+        if (this._removed || !this._settingsValid || !this.backgroundRefresh) return;
+        this._backgroundRefreshSource = GLib.timeout_add_seconds(
+            GLib.PRIORITY_DEFAULT,
+            this.refreshIntervalSeconds,
+            () => {
+                if (this._removed) return GLib.SOURCE_REMOVE;
+                this._refreshStatus();
+                return GLib.SOURCE_CONTINUE;
+            }
+        );
     },
 
     _trackedStatusArgv() {
         const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
-        return [home + "/.local/bin/codex-master-mcp", APPLET_STATUS_COMMAND, ...APPLET_STATUS_AGENTS];
+        return [home + "/.local/bin/codex-master-mcp", APPLET_STATUS_COMMAND, ...this._trackedAgents];
     },
 
     _refreshStatus() {
@@ -113,22 +248,24 @@ FlottenmanagementApplet.prototype = {
 
         const generation = ++this._statusGeneration;
         const argv = this._trackedStatusArgv();
-        const launcher = Gio.SubprocessLauncher.new(
-            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
-        );
-        this._sanitizeLauncherEnvironment(launcher);
-
         let process;
         try {
+            const launcher = Gio.SubprocessLauncher.new(
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
+            this._sanitizeLauncherEnvironment(launcher);
             process = launcher.spawnv(argv);
         } catch (_error) {
             this._statusInFlight = false;
+            this._markRefreshFailed();
             return;
         }
 
         const state = {
             generation,
             process,
+            cancellable: Gio.Cancellable ? new Gio.Cancellable() : null,
+            cancellableCancelled: false,
             timeoutSource: 0,
             finalizing: false,
             streamFailed: false,
@@ -148,12 +285,17 @@ FlottenmanagementApplet.prototype = {
         this._statusActiveState = state;
         this._statusActiveGeneration = generation;
         this._statusInFlight = true;
+        this._statusViewState = this._statusLastGood ? "refreshing" : "initializing";
+        this._renderStatus();
 
         const requestForceExit = (stateArg) => {
             if (stateArg.forceExitCalled || !stateArg.process) return;
-            stateArg.forceExitCalled = true;
-            if (typeof stateArg.process.force_exit === "function") {
+            if (typeof stateArg.process.force_exit !== "function") return;
+            try {
                 stateArg.process.force_exit();
+                stateArg.forceExitCalled = true;
+            } catch (error) {
+                this._logCleanupError(error);
             }
         };
 
@@ -172,7 +314,10 @@ FlottenmanagementApplet.prototype = {
 
         const readStream = (stateArg, key, stream, limit) => {
             if (!stream || typeof stream.read_bytes_async !== "function") {
+                stateArg.streamFailed = true;
                 stateArg[`${key}Done`] = true;
+                requestForceExit(stateArg);
+                this._markRefreshFailed();
                 attemptFinalize(stateArg);
                 return;
             }
@@ -186,7 +331,7 @@ FlottenmanagementApplet.prototype = {
                     stream.read_bytes_async(
                         APPLET_STATUS_CHUNK_BYTES,
                         GLib.PRIORITY_DEFAULT,
-                        null,
+                        stateArg.cancellable,
                         (reader, result) => {
                             let packet;
                             try {
@@ -195,6 +340,7 @@ FlottenmanagementApplet.prototype = {
                                 stateArg.streamFailed = true;
                                 stateArg[doneKey] = true;
                                 requestForceExit(stateArg);
+                                this._markRefreshFailed();
                                 attemptFinalize(stateArg);
                                 return;
                             }
@@ -225,6 +371,7 @@ FlottenmanagementApplet.prototype = {
                             if (exceedsLimit) {
                                 stateArg[finishKey] = true;
                                 requestForceExit(stateArg);
+                                this._markRefreshFailed();
                                 stateArg[doneKey] = true;
                                 attemptFinalize(stateArg);
                                 return;
@@ -237,6 +384,7 @@ FlottenmanagementApplet.prototype = {
                     stateArg.streamFailed = true;
                     stateArg[doneKey] = true;
                     requestForceExit(stateArg);
+                    this._markRefreshFailed();
                     attemptFinalize(stateArg);
                 }
             };
@@ -250,6 +398,7 @@ FlottenmanagementApplet.prototype = {
             () => {
                 state.timedOut = true;
                 requestForceExit(state);
+                this._markRefreshFailed();
                 attemptFinalize(state);
                 return GLib.SOURCE_REMOVE;
             }
@@ -258,17 +407,26 @@ FlottenmanagementApplet.prototype = {
         readStream(state, "stdout", process.get_stdout_pipe(), APPLET_STDOUT_LIMIT_BYTES);
         readStream(state, "stderr", process.get_stderr_pipe(), APPLET_STDERR_LIMIT_BYTES);
 
-        process.wait_async(null, (_proc, result) => {
-            try {
-                if (typeof process.wait_finish === "function") {
-                    process.wait_finish(result);
+        try {
+            process.wait_async(state.cancellable, (_proc, result) => {
+                try {
+                    if (typeof process.wait_finish === "function") {
+                        process.wait_finish(result);
+                    }
+                } catch (_error) {
+                    state.waitFailed = true;
+                    this._markRefreshFailed();
                 }
-            } catch (_error) {
-                state.waitFailed = true;
-            }
+                state.waitDone = true;
+                attemptFinalize(state);
+            });
+        } catch (_error) {
+            state.waitFailed = true;
             state.waitDone = true;
+            requestForceExit(state);
+            this._markRefreshFailed();
             attemptFinalize(state);
-        });
+        }
     },
 
     _sanitizeLauncherEnvironment(launcher) {
@@ -288,12 +446,14 @@ FlottenmanagementApplet.prototype = {
         this._statusActiveState = null;
         this._activeStatusProcess = null;
 
+        let applied = false;
         if (!state.timedOut && !state.waitFailed && !state.streamFailed && !state.stdoutLimitExceeded && !state.stderrLimitExceeded) {
             const payload = state.process ? this._collectProcessPayload(state) : null;
             if (payload && state.process.get_successful()) {
-                this._maybeApplyStatusPayload(payload);
+                applied = this._maybeApplyStatusPayload(payload);
             }
         }
+        if (!applied) this._markRefreshFailed();
 
         if (state.timeoutSource) {
             GLib.source_remove(state.timeoutSource);
@@ -323,10 +483,12 @@ FlottenmanagementApplet.prototype = {
 
     _maybeApplyStatusPayload(payload) {
         if (!this._isValidAppletStatusPayload(payload)) {
-            return;
+            return false;
         }
         this._statusLastGood = payload;
-        this._updateStatusText(payload);
+        this._statusViewState = "ready";
+        this._renderStatus();
+        return true;
     },
 
     _isValidAppletStatusPayload(payload) {
@@ -341,7 +503,7 @@ FlottenmanagementApplet.prototype = {
             if (!this._isValidStateSet("snapshot", field, payload[field])) return false;
         }
 
-        if (!Array.isArray(payload.agents) || payload.agents.length !== APPLET_STATUS_AGENTS.length) return false;
+        if (!Array.isArray(payload.agents) || payload.agents.length !== this._trackedAgents.length) return false;
         const agents = new Set();
         for (const row of payload.agents) {
             if (!row || typeof row !== "object") return false;
@@ -349,7 +511,7 @@ FlottenmanagementApplet.prototype = {
             for (const field of APPLET_STATUS_REQUIRED_ROW_FIELDS) {
                 if (typeof row[field] !== "string" || row[field].length === 0) return false;
             }
-            if (APPLET_STATUS_AGENTS.indexOf(row.agent) === -1) return false;
+            if (this._trackedAgents.indexOf(row.agent) === -1) return false;
             agents.add(row.agent);
             if (!this._isValidStateSet("row", "activity_state", row.activity_state)) return false;
             if (!this._isValidStateSet("row", "backend_state", row.backend_state)) return false;
@@ -358,7 +520,7 @@ FlottenmanagementApplet.prototype = {
             if (!this._isValidStateSet("row", "identity_state", row.identity_state)) return false;
             if (!this._isValidStateSet("row", "lease_state", row.lease_state)) return false;
         }
-        if (agents.size !== APPLET_STATUS_AGENTS.length) return false;
+        if (agents.size !== this._trackedAgents.length) return false;
 
         if (typeof payload.counts !== "object" || payload.counts === null) return false;
         if (!this._hasExactFields(payload.counts, APPLET_STATUS_REQUIRED_COUNTS)) return false;
@@ -383,8 +545,80 @@ FlottenmanagementApplet.prototype = {
         return APPLET_STATUS_VALID_STRINGS[scope]?.[name]?.has(value);
     },
 
-    _updateStatusText(_payload) {
-        return;
+    _markRefreshFailed() {
+        if (this._removed) return;
+        this._statusViewState = this._statusLastGood ? "stale" : "unavailable";
+        this._renderStatus();
+    },
+
+    _stateLabel(scope, value) {
+        const labels = {
+            activity: {
+                running: "laufend",
+                sleeping: "schlafend",
+                mixed: "gemischt",
+                unknown: "unbekannt",
+            },
+            backend: {
+                ok: "ok",
+                degraded: "eingeschränkt",
+                unavailable: "nicht verfügbar",
+                error: "Fehler",
+            },
+            control: {
+                ready: "bereit",
+                blocked: "blockiert",
+                mixed: "gemischt",
+                unknown: "unbekannt",
+            },
+        };
+        return labels[scope]?.[value] || "unbekannt";
+    },
+
+    _setMenuItemText(item, text) {
+        if (!item) return;
+        if (item.label && typeof item.label.set_text === "function") item.label.set_text(text);
+        else item.label = text;
+    },
+
+    _setMenuItemVisible(item, visible) {
+        if (!item) return;
+        const actor = item.actor || item;
+        if (visible && typeof actor.show === "function") actor.show();
+        else if (!visible && typeof actor.hide === "function") actor.hide();
+        else actor.visible = visible;
+    },
+
+    _renderStatus() {
+        if (this._removed) return;
+        this.set_applet_label(LABEL);
+        const payload = this._statusLastGood;
+        const activity = this._stateLabel("activity", payload ? payload.activity_state : "unknown");
+        const backend = this._stateLabel("backend", payload ? payload.backend_state : "unavailable");
+        const stale = this._statusViewState === "stale" ? " · veraltet" : "";
+        const unavailable = this._statusViewState === "unavailable" ? " · nicht verfügbar" : "";
+        const configuration = this._settingsValid ? "" : "Konfigurationsfehler · ";
+        const summary = `${configuration}Aktivität: ${activity} · Backend: ${backend} · Modus: Nur Lesen${stale}${unavailable}`;
+        this.set_applet_tooltip(summary);
+        this._setMenuItemText(this._statusSummaryItem, summary);
+
+        const rows = payload ? payload.agents : this._trackedAgents.map((agent) => ({
+            agent,
+            activity_state: "unknown",
+            backend_state: "error",
+            control_state: "unknown",
+        }));
+        for (let index = 0; index < this._statusRowItems.length; index += 1) {
+            const item = this._statusRowItems[index];
+            const row = rows[index];
+            if (!row) {
+                this._setMenuItemVisible(item, false);
+                continue;
+            }
+            const text = `${row.agent}: ${this._stateLabel("activity", row.activity_state)} · Backend ${this._stateLabel("backend", row.backend_state)} · Steuerung ${this._stateLabel("control", row.control_state)}`;
+            this._setMenuItemText(item, text);
+            this._setMenuItemVisible(item, true);
+        }
     },
 
     _connectTracked(target, signal, callback) {
@@ -523,19 +757,89 @@ FlottenmanagementApplet.prototype = {
         return false;
     },
 
+    _cleanupStatusResources() {
+        let success = true;
+        if (this._backgroundRefreshSource) {
+            try {
+                GLib.source_remove(this._backgroundRefreshSource);
+                this._backgroundRefreshSource = 0;
+            } catch (error) {
+                this._logCleanupError(error);
+                success = false;
+            }
+        }
+
+        this._statusPendingRefresh = false;
+        this._statusGeneration += 1;
+        this._statusActiveGeneration = 0;
+        const state = this._statusActiveState;
+        if (state) {
+            state.finalizing = true;
+            if (state.timeoutSource) {
+                try {
+                    GLib.source_remove(state.timeoutSource);
+                    state.timeoutSource = 0;
+                } catch (error) {
+                    this._logCleanupError(error);
+                    success = false;
+                }
+            }
+            if (state.cancellable && !state.cancellableCancelled) {
+                try {
+                    state.cancellable.cancel();
+                    state.cancellableCancelled = true;
+                } catch (error) {
+                    this._logCleanupError(error);
+                    success = false;
+                }
+            }
+            if (!state.forceExitCalled && state.process && typeof state.process.force_exit === "function") {
+                try {
+                    state.process.force_exit();
+                    state.forceExitCalled = true;
+                } catch (error) {
+                    this._logCleanupError(error);
+                    success = false;
+                }
+            }
+            if (success) {
+                this._statusActiveState = null;
+                this._activeStatusProcess = null;
+            }
+        }
+        this._statusInFlight = false;
+        return success;
+    },
+
+    _cleanupSettings() {
+        if (!this.settings) return true;
+        try {
+            this.settings.finalize();
+            this.settings = null;
+            return true;
+        } catch (error) {
+            this._logCleanupError(error);
+            return false;
+        }
+    },
+
     on_applet_clicked() {
         if (this._removed || !this.menu || typeof this.menu.toggle !== "function") return;
         if (this.menu.actor && typeof this.menu.actor.is_finalized === "function" && this.menu.actor.is_finalized()) return;
+        const wasOpen = this.menu.isOpen === true;
         this.menu.toggle();
+        if (!wasOpen && this.menu.isOpen === true && this.refreshOnOpen) this._refreshStatus();
     },
 
     on_applet_removed_from_panel() {
         if (this._cleanupComplete) return;
         this._removed = true;
+        const statusClean = this._cleanupStatusResources();
+        const settingsClean = this._cleanupSettings();
         const signalsClean = this._disconnectTrackedSignals();
         const appletMenuClean = this._cleanupMenuResource("menu", "menuManager");
         const contextMenuClean = this._cleanupMenuResource("_applet_context_menu", "_menuManager");
-        this._cleanupComplete = signalsClean && appletMenuClean && contextMenuClean;
+        this._cleanupComplete = statusClean && settingsClean && signalsClean && appletMenuClean && contextMenuClean;
     },
 };
 
