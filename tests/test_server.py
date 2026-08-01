@@ -5728,9 +5728,12 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["response_output"], "not_returned")
         mock_sleep.assert_called_once()
 
+    @patch("codex_master.server.update_wait_agent_spark_health")
     @patch("codex_master.server.time.sleep")
     @patch("codex_master.server.status_agent")
-    def test_wait_agent_reports_activity_for_fresh_running_output(self, mock_status_agent, mock_sleep) -> None:
+    def test_wait_agent_reports_activity_for_fresh_running_output(
+        self, mock_status_agent, mock_sleep, mock_health
+    ) -> None:
         initial_status = {
             "agent": "a",
             "running": True,
@@ -5765,6 +5768,7 @@ class ServerHelpersTest(unittest.TestCase):
             return status_sequence.pop(0)
 
         mock_status_agent.side_effect = next_status
+        mock_health.return_value = {"state": "not_checked", "updated": False, "raw_output": "not_returned"}
         with patch("codex_master.server.time.time", return_value=1780826500.0):
             result = wait_agent("a", timeout_seconds=10, poll_interval_seconds=1)
 
