@@ -26,6 +26,13 @@ class InstallerError(RuntimeError):
     pass
 
 
+def validate_owner_and_mode(value: os.stat_result, label: str) -> None:
+    if value.st_uid != os.geteuid():
+        raise InstallerError(f"{label} must be owned by the current user")
+    if value.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise InstallerError(f"{label} must not be group- or world-writable")
+
+
 def lexical_exists(path: Path) -> bool:
     return os.path.lexists(path)
 
@@ -89,8 +96,10 @@ def hash_regular_file(path: Path, expected: os.stat_result) -> str:
             not stat.S_ISREG(opened.st_mode)
             or opened.st_nlink != 1
             or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)
+            or stat.S_IMODE(opened.st_mode) != stat.S_IMODE(expected.st_mode)
         ):
             raise InstallerError("file identity changed or is not a private regular file")
+        validate_owner_and_mode(opened, "opened file")
         while True:
             chunk = os.read(descriptor, 64 * 1024)
             if not chunk:
@@ -111,6 +120,7 @@ def scan_tree(root: Path, label: str) -> tuple[list[Path], dict[str, tuple[str, 
         raise InstallerError(f"{label} is missing or unreadable") from exc
     if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
         raise InstallerError(f"{label} must be a real directory")
+    validate_owner_and_mode(root_stat, label)
 
     directories: list[Path] = []
     files: dict[str, tuple[str, int]] = {}
@@ -130,11 +140,13 @@ def scan_tree(root: Path, label: str) -> tuple[list[Path], dict[str, tuple[str, 
             if stat.S_ISLNK(entry_stat.st_mode):
                 raise InstallerError(f"{label} must not contain symlinks")
             if stat.S_ISDIR(entry_stat.st_mode):
+                validate_owner_and_mode(entry_stat, f"{label} directory")
                 directories.append(entry_relative)
                 visit(entry_path, entry_relative)
                 continue
             if not stat.S_ISREG(entry_stat.st_mode) or entry_stat.st_nlink != 1:
                 raise InstallerError(f"{label} must contain only non-hardlinked regular files")
+            validate_owner_and_mode(entry_stat, f"{label} file")
             files[str(entry_relative)] = (hash_regular_file(entry_path, entry_stat), stat.S_IMODE(entry_stat.st_mode))
 
     visit(root, Path())
@@ -154,6 +166,7 @@ def copy_file_checked(source: Path, destination: Path, expected_hash: str, mode:
     source_stat = source.lstat()
     if not stat.S_ISREG(source_stat.st_mode) or source_stat.st_nlink != 1:
         raise InstallerError("source file changed before staging")
+    validate_owner_and_mode(source_stat, "source file")
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -162,8 +175,12 @@ def copy_file_checked(source: Path, destination: Path, expected_hash: str, mode:
     digest = hashlib.sha256()
     try:
         opened = os.fstat(source_fd)
-        if (opened.st_dev, opened.st_ino) != (source_stat.st_dev, source_stat.st_ino):
+        if (
+            (opened.st_dev, opened.st_ino) != (source_stat.st_dev, source_stat.st_ino)
+            or stat.S_IMODE(opened.st_mode) != mode
+        ):
             raise InstallerError("source file identity changed before staging")
+        validate_owner_and_mode(opened, "opened source file")
         destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         while True:
             chunk = os.read(source_fd, 64 * 1024)

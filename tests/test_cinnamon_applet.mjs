@@ -1488,3 +1488,155 @@ test("timeout contains force_exit failure and removal retries it", () => {
   assert.equal(process.forceExitCount, 2);
   assert.equal(applet._cleanupComplete, true);
 });
+
+test("100 completed refreshes leave no active resources", async () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const statusItem = applet.menu.items[0];
+
+  for (let cycle = 0; cycle < 100; cycle += 1) {
+    queuePayloadProcess(fixture, samplePayload());
+    statusItem.activate();
+    const process = fixture.subprocesses.at(-1);
+    process.emitDone();
+    await Promise.resolve();
+
+    assert.equal(applet._statusInFlight, false, `cycle ${cycle}: in-flight`);
+    assert.equal(applet._statusPendingRefresh, false, `cycle ${cycle}: pending`);
+    assert.equal(applet._statusActiveState, null, `cycle ${cycle}: active state`);
+    assert.equal(applet._activeStatusProcess, null, `cycle ${cycle}: active process`);
+    assert.equal(fixture.activeTimers().length, 0, `cycle ${cycle}: timer`);
+    assert.equal(process.waitCallbacks.length, 0, `cycle ${cycle}: wait callback`);
+    assert.equal(process.stdout._holdCallbacks.length, 0, `cycle ${cycle}: stdout callback`);
+    assert.equal(process.stderr._holdCallbacks.length, 0, `cycle ${cycle}: stderr callback`);
+  }
+
+  assert.equal(fixture.subprocesses.length, 100);
+});
+
+test("50 injected add-remove cycles release processes streams signals timers and grabs", () => {
+  const failures = ["close", "remove", "menu-destroy", "manager-destroy"];
+
+  for (let cycle = 0; cycle < 50; cycle += 1) {
+    const fixture = loadApplet();
+    queuePayloadProcess(fixture, samplePayload(), { holdEof: true });
+    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, cycle + 1);
+    const menu = applet.menu;
+    const manager = applet.menuManager;
+    const contextMenu = applet._applet_context_menu;
+    const contextManager = applet._menuManager;
+    const failure = failures[cycle % failures.length];
+
+    fixture.setSetting("background-refresh", true);
+    applet.on_applet_clicked();
+    contextMenu.toggle();
+    manager.grabbed = true;
+    manager._activeMenu = menu;
+    contextManager.grabbed = true;
+    contextManager._activeMenu = contextMenu;
+    if (failure === "close") menu.failCloseCount = 1;
+    if (failure === "remove") manager.failRemoveCount = 1;
+    if (failure === "menu-destroy") menu.failDestroyCount = 1;
+    if (failure === "manager-destroy") manager.failDestroyCount = 1;
+
+    const process = fixture.subprocesses[0];
+    const cancellable = applet._statusActiveState.cancellable;
+    applet.on_applet_removed_from_panel();
+    applet.on_applet_removed_from_panel();
+    process.stdout.releaseEof();
+    process.stderr.releaseEof();
+    process.emitDone();
+
+    assert.equal(applet._cleanupComplete, true, `cycle ${cycle}: cleanup`);
+    assert.equal(process.forceExitCount, 1, `cycle ${cycle}: process`);
+    assert.equal(cancellable.cancelCount, 1, `cycle ${cycle}: cancellable`);
+    assert.equal(process.waitCallbacks.length, 0, `cycle ${cycle}: wait callback`);
+    assert.equal(process.stdout._holdCallbacks.length, 0, `cycle ${cycle}: stdout callback`);
+    assert.equal(process.stderr._holdCallbacks.length, 0, `cycle ${cycle}: stderr callback`);
+    assert.equal(fixture.activeTimers().length, 0, `cycle ${cycle}: timer`);
+    assert.equal(applet._signalConnections.length, 0, `cycle ${cycle}: signal`);
+    assert.equal(fixture.settingsInstances[0].finalizeCount, 1, `cycle ${cycle}: settings`);
+    assert.equal(applet.menu, null, `cycle ${cycle}: applet menu`);
+    assert.equal(applet._applet_context_menu, null, `cycle ${cycle}: context menu`);
+    assert.equal(manager.grabbed, false, `cycle ${cycle}: applet grab`);
+    assert.equal(contextManager.grabbed, false, `cycle ${cycle}: context grab`);
+  }
+});
+
+test("hostile settings matrix never reaches argv or background work", () => {
+  const hostileValues = [
+    "   ",
+    "a1\u0000,b1",
+    "--flag",
+    "/tmp/a1",
+    "a1;touch /tmp/owned",
+    "a１",
+    "a1,a2,a3,a4,a5,a6,a7",
+    "all",
+    "a-series",
+  ];
+
+  for (const value of hostileValues) {
+    const fixture = loadApplet();
+    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+    fixture.setSetting("tracked-agents", value);
+    fixture.setSetting("background-refresh", true);
+    applet.menu.items[0].activate();
+
+    assert.equal(applet._settingsValid, false, JSON.stringify(value));
+    assert.deepEqual(Array.from(applet._trackedAgents), ["a1", "b1"], JSON.stringify(value));
+    assert.deepEqual(
+      Array.from(fixture.launcherSpawns.at(-1).argv.slice(2)),
+      ["a1", "b1"],
+      JSON.stringify(value),
+    );
+    assert.equal(fixture.activeTimers("background").length, 0, JSON.stringify(value));
+  }
+});
+
+test("hostile backend matrix is rejected without retaining attacker data", async () => {
+  const good = samplePayload();
+  const deep = JSON.stringify(good).slice(0, -1) + `,"nested":${"[".repeat(2000)}0${"]".repeat(2000)}}`;
+  const unknownField = { ...good, prompt: "SECRET_PROMPT" };
+  const unknownEnum = { ...good, backend_state: "super_ok" };
+  const wrongType = { ...good, agents: [{ ...good.agents[0], auth_state: 1 }, good.agents[1]] };
+  const payloads = [
+    makeBytes("A".repeat(64 * 1024 + 1)),
+    makeBytes(deep),
+    makeInvalidUtf8PayloadBytes(good),
+    makeBytes("{"),
+    makeBytes(JSON.stringify(unknownField)),
+    makeBytes(JSON.stringify(unknownEnum)),
+    makeBytes(JSON.stringify(wrongType)),
+  ];
+
+  for (const payload of payloads) {
+    const fixture = loadApplet();
+    fixture.setProcessFactory(() => ({
+      forceExitCount: 0,
+      waitCallbacks: [],
+      get_stdout_pipe() { return fixture.makeStream([payload]); },
+      get_stderr_pipe() { return fixture.makeStream([new Uint8Array()]); },
+      get_successful: () => true,
+      get_exit_status: () => 0,
+      force_exit() { this.forceExitCount += 1; },
+      wait_async(_cancellable, callback) { this.waitCallbacks.push(callback); },
+      wait_finish() {},
+      emitDone() {
+        const callbacks = [...this.waitCallbacks];
+        this.waitCallbacks = [];
+        for (const callback of callbacks) callback(this, null);
+      },
+    }));
+    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+    applet.menu.items[0].activate();
+    fixture.subprocesses[0].emitDone();
+    await Promise.resolve();
+
+    assert.equal(applet._statusLastGood, null);
+    assert.ok(!JSON.stringify({
+      lastGood: applet._statusLastGood,
+      summary: applet._statusSummaryItem.label,
+    }).includes("SECRET_PROMPT"));
+  }
+});

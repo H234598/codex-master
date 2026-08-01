@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.util
+from importlib.machinery import SourceFileLoader
 import json
 import os
 from pathlib import Path
@@ -8,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -119,6 +122,16 @@ else:
             if path.is_file()
         }
 
+    def _load_tool_module(self):
+        name = f"codex_master_cinnamon_installer_{id(self)}"
+        loader = SourceFileLoader(name, str(self.tool))
+        spec = importlib.util.spec_from_loader(name, loader)
+        if spec is None or spec.loader is None:
+            self.fail("installer module could not be loaded")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
     def test_dry_run_changes_nothing_and_calls_no_dbus(self) -> None:
         result = self._run("install", "--dry-run")
 
@@ -196,6 +209,59 @@ else:
 
                 path.unlink()
                 path.write_text("// new\n", encoding="utf-8")
+
+    def test_source_wrong_owner_or_group_writable_mode_is_rejected(self) -> None:
+        source_file = self.source / "applet.js"
+        source_file.chmod(0o664)
+
+        wrong_mode = self._run("install", "--dry-run")
+
+        self.assertNotEqual(wrong_mode.returncode, 0)
+        source_file.chmod(0o644)
+        module = self._load_tool_module()
+        with mock.patch.object(module.os, "geteuid", return_value=os.geteuid() + 1):
+            with self.assertRaises(module.InstallerError):
+                module.validate_source(self.source)
+
+    def test_source_swap_during_staging_fails_without_touching_installed_tree(self) -> None:
+        self._write_tree(self.target, "old")
+        module = self._load_tool_module()
+        original = module.copy_file_checked
+        swapped = False
+
+        def swap_before_copy(source, destination, expected_hash, mode):
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                source.write_text("raced\n", encoding="utf-8")
+            return original(source, destination, expected_hash, mode)
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            with mock.patch.object(module, "copy_file_checked", side_effect=swap_before_copy):
+                with self.assertRaises(module.InstallerError):
+                    module.install(dry_run=False, no_reload=True)
+
+        self.assertIn("old", (self.target / "applet.js").read_text(encoding="utf-8"))
+        self.assertFalse(self.backup.exists())
+        self.assertEqual(list(self.target.parent.glob(f".{UUID}.staging-*")), [])
+
+    def test_source_mode_change_between_stat_and_open_is_rejected(self) -> None:
+        module = self._load_tool_module()
+        source_file = self.source / "applet.js"
+        expected = source_file.lstat()
+        real_open = module.os.open
+
+        def change_mode_then_open(path, flags, *args):
+            if Path(path) == source_file:
+                source_file.chmod(0o666)
+            return real_open(path, flags, *args)
+
+        try:
+            with mock.patch.object(module.os, "open", side_effect=change_mode_then_open):
+                with self.assertRaises(module.InstallerError):
+                    module.hash_regular_file(source_file, expected)
+        finally:
+            source_file.chmod(0o644)
 
     def test_target_parent_and_target_symlinks_are_rejected(self) -> None:
         outside = self.root / "outside"
