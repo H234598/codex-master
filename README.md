@@ -216,6 +216,8 @@ flows refuse to use a blocked Agentin until the codex-usage watchdog releases it
 - `master_timeout_policy`: report effective timeout and polling policy for MCP
   startup, Agentin claim retry, Agentin wait, watchdog supervision, and
   hidden CLI lease identity source
+- `master_applet_status`: bounded read-only snapshot for 1–6 concrete Agentinnen;
+  used by the Cinnamon applet and available as `applet-status` in the CLI
 - `agent_pool_validate`: validate a machine-readable Agentinnen pool spec
 - `agent_pool_install`: install or refresh sleeping Agentinnen homes from a spec
 - `agent_pool_status`: inspect data-sparse pool installation counts
@@ -338,6 +340,69 @@ Agentinnen.
 
 See `docs/agent-pool.md` for the full command set and `docs/auth-copy.md` for
 the auth-copy safety model.
+
+## Cinnamon Applet: Flottenmanagement
+
+`codex-master@H234598` is a read-only Cinnamon panel view for up to six concrete
+Agentinnen. Its visible panel title is always `Flottenmanagement`. The applet
+starts at most one bounded `codex-master-mcp applet-status` child process,
+never invokes a shell, and exposes no start, stop, interrupt, auth, or lease
+mutation.
+
+The status model keeps three concerns separate:
+
+- `activity_state`: running, sleeping, mixed, or unknown;
+- `backend_state`: ok, degraded, or unavailable;
+- `control_state`: ready, blocked, mixed, or unknown.
+
+A sleeping Agentin is normal and does not by itself degrade backend health.
+Failed refreshes retain the last valid snapshot and mark it as stale. Responses
+contain fixed state fields and counts only; prompts, logs, process IDs, paths,
+lease owners, lease IDs, and raw output are not returned.
+
+The four applet settings are:
+
+- `tracked-agents`: comma-separated `a1` through `c100`; 1–6 concrete IDs,
+  case-normalized and deduplicated; default `a1,b1`;
+- `refresh-on-open`: refresh when opening the menu; default on;
+- `background-refresh`: opt-in periodic refresh; default off;
+- `refresh-interval-seconds`: 15–3600 seconds; default 60.
+
+Invalid settings show a configuration error, fall back to `a1,b1`, disable
+background work, and never reach the process argv. The menu contains a manual
+refresh, applet administration, one summary, and at most six non-reactive
+Agentinnen rows.
+
+Install and verify with the repository-owned atomic installer:
+
+```sh
+scripts/codex-master-cinnamon-applet install --dry-run
+scripts/codex-master-cinnamon-applet install
+scripts/codex-master-cinnamon-applet verify
+scripts/codex-master-cinnamon-applet rollback
+```
+
+`install` stages and hashes regular non-hardlinked source files, rejects
+symlinked source/target paths, reloads only this UUID through Cinnamon's
+`ReloadXlet`, and restores the previous tree if reload or verification fails.
+`verify` requires byte-identical installed files and a running UUID from
+`GetRunningXletUUIDs applet`. `rollback` requires a validated rollback tree and
+fails closed when it is missing or unexpected. `--no-reload` is available for
+controlled offline install/rollback tests. No command uses `Eval` or restarts
+Cinnamon globally.
+
+Useful diagnostics:
+
+```sh
+./bin/codex-master-mcp applet-status a1 b1
+gdbus call --session --dest org.Cinnamon --object-path /org/Cinnamon \
+  --method org.Cinnamon.GetRunningXletUUIDs applet
+journalctl --user -b | grep -F codex-master@H234598
+```
+
+An `unavailable` or stale applet state means the bounded read-only refresh
+failed. Verify the installed files and CLI first; do not interpret ordinary
+`sleeping` activity as a backend failure.
 
 ## Install-Contract (CLI)
 
