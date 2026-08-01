@@ -168,6 +168,7 @@ MAX_POOL_AGENTS = 1000
 MAX_POOL_SERIES = 26
 MAX_POOL_SHARED_ASSETS = 40
 MAX_POOL_RUNTIME_DIRS = 40
+MAX_APPLET_AGENTS = 6
 AGENT_SERIES = ("a", "b", "c")
 AGENTS_PER_SERIES = 100
 DEFAULT_ORDINAL_AGENT_SERIES = ("a", "b")
@@ -1142,6 +1143,32 @@ def agent_ids(agent: str) -> list[str]:
     if normalized in SERIES_AGENT_IDS:
         return [item for item in SERIES_AGENT_IDS[normalized] if item in AGENTS]
     return [canonical_agent_id(normalized)]
+
+
+def normalize_applet_agents(agents: Any) -> list[str]:
+    if isinstance(agents, str):
+        normalized_agents = [agents]
+    elif isinstance(agents, list):
+        normalized_agents = agents
+    else:
+        raise AgentError("applet_agents must be a list or a string")
+    if not normalized_agents:
+        raise AgentError("applet_agents must contain 1 to 6 entries")
+    if len(normalized_agents) > MAX_APPLET_AGENTS:
+        raise AgentError("applet_agents list has at most 6 entries")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for agent in normalized_agents:
+        if not isinstance(agent, str):
+            raise AgentError("applet_agents entries must be strings")
+        value = normalize_agent_selector_text(agent)
+        if value in seen:
+            raise AgentError("applet_agents must not contain duplicates")
+        if value not in AGENTS:
+            raise AgentError("applet_agents only accepts concrete tracked agent ids")
+        normalized.append(value)
+        seen.add(value)
+    return normalized
 
 
 def single_agent_id(agent: str, tool_name: str) -> str:

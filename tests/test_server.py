@@ -38,6 +38,7 @@ from codex_master.server import (
     MAX_TAIL_CHARS,
     MAX_SKILL_NAMES,
     MAX_TASK_TEXT,
+    MAX_APPLET_AGENTS,
     MAX_WAIT_POLL_SECONDS,
     MAX_WAIT_SECONDS,
     MAX_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
@@ -148,6 +149,7 @@ from codex_master.server import (
     wait_agent_input_ready,
     wait_terminal_status,
     wait_terminal_visible_input_status,
+    normalize_applet_agents,
     WRITE_AGENT_MODEL,
     WRITE_AGENT_MODEL_EFFORT,
     write_bounded_raw_log,
@@ -14606,6 +14608,59 @@ class ServerHelpersTest(unittest.TestCase):
                     self.assertNotIn(tmpdir, error_text)
                     if failing_step == "paste-buffer":
                         self.assertTrue(any(call["args"][0] == "delete-buffer" for call in calls))
+
+
+class AppletStatusContractTest(unittest.TestCase):
+    def test_normalize_applet_agents_keeps_order(self) -> None:
+        result = normalize_applet_agents(["a1", "b2"])
+
+        self.assertEqual(result, ["a1", "b2"])
+
+    def test_normalize_applet_agents_normalizes_whitespace_and_case(self) -> None:
+        result = normalize_applet_agents(["  A1", "b2  "])
+
+        self.assertEqual(result, ["a1", "b2"])
+
+    def test_normalize_applet_agents_accepts_single_string_input(self) -> None:
+        result = normalize_applet_agents("a1")
+
+        self.assertEqual(result, ["a1"])
+
+    def test_normalize_applet_agents_rejects_empty_list(self) -> None:
+        with self.assertRaisesRegex(AgentError, "must contain 1 to 6"):
+            normalize_applet_agents([])
+
+    def test_normalize_applet_agents_rejects_excessive_length(self) -> None:
+        with self.assertRaisesRegex(AgentError, "at most 6"):
+            normalize_applet_agents(["a1", "a2", "a3", "a4", "a5", "a6", "a7"])
+
+    def test_normalize_applet_agents_rejects_non_list_value(self) -> None:
+        with self.assertRaisesRegex(AgentError, "must be a list or a string"):
+            normalize_applet_agents(1)
+
+    def test_normalize_applet_agents_rejects_non_string_items(self) -> None:
+        with self.assertRaisesRegex(AgentError, "must be strings"):
+            normalize_applet_agents([1])
+        with self.assertRaisesRegex(AgentError, "must be strings"):
+            normalize_applet_agents([True])
+
+    def test_normalize_applet_agents_rejects_non_concrete_agent_ids(self) -> None:
+        with self.assertRaisesRegex(AgentError, "concrete"):
+            normalize_applet_agents(["a"])
+        with self.assertRaisesRegex(AgentError, "concrete"):
+            normalize_applet_agents(["both"])
+        with self.assertRaisesRegex(AgentError, "concrete"):
+            normalize_applet_agents(["1"])
+        with self.assertRaisesRegex(AgentError, "concrete"):
+            normalize_applet_agents(["a-series"])
+        with self.assertRaisesRegex(AgentError, "concrete"):
+            normalize_applet_agents(["all"])
+        with self.assertRaisesRegex(AgentError, "concrete"):
+            normalize_applet_agents(["x1"])
+
+    def test_normalize_applet_agents_rejects_duplicates(self) -> None:
+        with self.assertRaisesRegex(AgentError, "duplicates"):
+            normalize_applet_agents(["a1", "a1"])
 
 
 class CliLifecycleTest(unittest.TestCase):
