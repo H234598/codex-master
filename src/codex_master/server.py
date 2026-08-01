@@ -1146,12 +1146,9 @@ def agent_ids(agent: str) -> list[str]:
 
 
 def normalize_applet_agents(agents: Any) -> list[str]:
-    if isinstance(agents, str):
-        normalized_agents = [agents]
-    elif isinstance(agents, list):
-        normalized_agents = agents
-    else:
-        raise AgentError("applet_agents must be a list or a string")
+    if not isinstance(agents, list):
+        raise AgentError("applet_agents must be a list")
+    normalized_agents = agents
     if not normalized_agents:
         raise AgentError("applet_agents must contain 1 to 6 entries")
     if len(normalized_agents) > MAX_APPLET_AGENTS:

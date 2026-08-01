@@ -38,7 +38,6 @@ from codex_master.server import (
     MAX_TAIL_CHARS,
     MAX_SKILL_NAMES,
     MAX_TASK_TEXT,
-    MAX_APPLET_AGENTS,
     MAX_WAIT_POLL_SECONDS,
     MAX_WAIT_SECONDS,
     MAX_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
@@ -14621,10 +14620,9 @@ class AppletStatusContractTest(unittest.TestCase):
 
         self.assertEqual(result, ["a1", "b2"])
 
-    def test_normalize_applet_agents_accepts_single_string_input(self) -> None:
-        result = normalize_applet_agents("a1")
-
-        self.assertEqual(result, ["a1"])
+    def test_normalize_applet_agents_rejects_single_string_input(self) -> None:
+        with self.assertRaisesRegex(AgentError, "must be a list"):
+            normalize_applet_agents("a1")
 
     def test_normalize_applet_agents_rejects_empty_list(self) -> None:
         with self.assertRaisesRegex(AgentError, "must contain 1 to 6"):
@@ -14635,7 +14633,7 @@ class AppletStatusContractTest(unittest.TestCase):
             normalize_applet_agents(["a1", "a2", "a3", "a4", "a5", "a6", "a7"])
 
     def test_normalize_applet_agents_rejects_non_list_value(self) -> None:
-        with self.assertRaisesRegex(AgentError, "must be a list or a string"):
+        with self.assertRaisesRegex(AgentError, "must be a list"):
             normalize_applet_agents(1)
 
     def test_normalize_applet_agents_rejects_non_string_items(self) -> None:
