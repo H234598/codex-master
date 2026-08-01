@@ -10993,6 +10993,8 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return master_watchdog_status()
     if name == "master_timeout_policy":
         return master_timeout_policy()
+    if name == "master_applet_status":
+        return applet_status(args.get("agents"))
     if name == "agent_selector_policy":
         series = args.get("series")
         if series is None:
@@ -13215,6 +13217,23 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
+        "name": "master_applet_status",
+        "description": "Return bounded, read-only applet status for concrete applet agent ids.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["agents"],
+            "properties": {
+                "agents": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_APPLET_AGENTS,
+                    "items": text_schema(MAX_AGENT_SELECTOR_TEXT),
+                }
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "agent_pool_validate",
         "description": "Validate a machine-readable Codex Agentinnen pool spec and return data-sparse counts only.",
         "inputSchema": {
@@ -13806,6 +13825,8 @@ def main_cli(argv: list[str]) -> int:
     sub.add_parser("release-status")
     sub.add_parser("watchdog-status")
     sub.add_parser("timeout-policy")
+    p_applet_status = sub.add_parser("applet-status")
+    p_applet_status.add_argument("agents", nargs="+")
 
     p_pool = sub.add_parser("pool")
     pool_sub = p_pool.add_subparsers(dest="pool_command", required=True)
@@ -14208,6 +14229,8 @@ def main_cli(argv: list[str]) -> int:
             )
         if args.command == "timeout-policy":
             return print_json(call_validated_tool("master_timeout_policy", {}))
+        if args.command == "applet-status":
+            return print_json(call_validated_tool("master_applet_status", {"agents": args.agents}))
         if args.command == "pool":
             common = {"spec": args.spec, "target_dir": args.target_dir, "codex_bin": args.codex_bin}
             if args.pool_command == "validate":

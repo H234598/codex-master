@@ -26,6 +26,8 @@ from codex_master.server import (
     MAX_ASSIGNMENT_RECORDS,
     MAX_CAPABILITY_PLUGINS,
     MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID,
+    MAX_AGENT_SELECTOR_TEXT,
+    MAX_APPLET_AGENTS,
     MAX_ERROR_CHARS,
     MAX_GIT_REF_TEXT,
     MAX_LIVE_DATA_TOPIC,
@@ -1158,6 +1160,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("master_release_status", names)
         self.assertIn("master_watchdog_status", names)
         self.assertIn("master_timeout_policy", names)
+        self.assertIn("master_applet_status", names)
         self.assertIn("usage_watchdog", names)
         by_name = {tool["name"]: tool for tool in response["result"]["tools"]}
         assign_props = by_name["agent_assign"]["inputSchema"]["properties"]
@@ -1178,12 +1181,21 @@ class ServerHelpersTest(unittest.TestCase):
         assign_live_data_props = by_name["agent_assign_live_data"]["inputSchema"]["properties"]
         selector_policy_props = by_name["agent_selector_policy"]["inputSchema"]["properties"]
         worktree_create_props = by_name["worktree_create_for_agent"]["inputSchema"]["properties"]
+        master_applet_status_schema = by_name["master_applet_status"]["inputSchema"]
+        master_applet_status_props = master_applet_status_schema["properties"]
         skill_props = by_name["agent_skills"]["inputSchema"]["properties"]
         skill_match_props = by_name["agent_skill_match"]["inputSchema"]["properties"]
         capability_props = by_name["agent_capabilities"]["inputSchema"]["properties"]
         tail_description = by_name["agent_safe_tail"]["description"]
         self.assertIn("held by other clients", tail_description)
         self.assertIn("before reading pane or log output", tail_description)
+        self.assertEqual(master_applet_status_schema["required"], ["agents"])
+        self.assertTrue(master_applet_status_schema["additionalProperties"] is False)
+        self.assertEqual(master_applet_status_props["agents"]["type"], "array")
+        self.assertEqual(master_applet_status_props["agents"]["minItems"], 1)
+        self.assertEqual(master_applet_status_props["agents"]["maxItems"], MAX_APPLET_AGENTS)
+        self.assertEqual(master_applet_status_props["agents"]["items"]["type"], "string")
+        self.assertEqual(master_applet_status_props["agents"]["items"]["maxLength"], MAX_AGENT_SELECTOR_TEXT)
         self.assertEqual(assign_props["task"]["maxLength"], MAX_TASK_TEXT)
         self.assertEqual(assign_props["context"]["maxItems"], MAX_ASSIGNMENT_LIST_ITEMS)
         self.assertEqual(worktree_create_props["base_ref"]["maxLength"], MAX_GIT_REF_TEXT)
@@ -11286,6 +11298,15 @@ class ServerHelpersTest(unittest.TestCase):
             model_reasoning_effort="low",
         )
 
+    @patch("codex_master.server.applet_status")
+    def test_call_tool_delegates_to_master_applet_status(self, mock_applet_status) -> None:
+        mock_applet_status.return_value = {"schema_version": 1, "mode": "read_only"}
+
+        result = call_tool("master_applet_status", {"agents": ["a1", "b1"]})
+
+        self.assertEqual(result["schema_version"], 1)
+        mock_applet_status.assert_called_once_with(["a1", "b1"])
+
     @patch("codex_master.server._start_agent_with_lease_unlocked", return_value={"status": "started"})
     @patch("codex_master.server.agent_lifecycle_lock")
     def test_direct_start_agent_with_lease_acquires_lifecycle_lock(self, mock_lock, mock_unlocked) -> None:
@@ -15058,6 +15079,29 @@ class CliLifecycleTest(unittest.TestCase):
             "agent_status",
             {"agent": "all", "agents_offset": 30, "agents_limit": 10},
         )
+
+    @patch("codex_master.server.print_json")
+    @patch("codex_master.server.call_tool", return_value={"schema_version": 1, "agents": []})
+    def test_cli_applet_status_routes_to_master_applet_tool(self, mock_call_tool, mock_print_json) -> None:
+        mock_print_json.return_value = 0
+
+        result = main_cli(["applet-status", "a1", "b1"])
+
+        self.assertEqual(result, 0)
+        mock_call_tool.assert_called_once_with("master_applet_status", {"agents": ["a1", "b1"]})
+
+    @patch("builtins.print")
+    @patch("codex_master.server.call_tool")
+    def test_cli_applet_status_errors_publicly_and_exit_1(self, mock_call_tool, mock_print) -> None:
+        mock_call_tool.side_effect = AgentError("sk-verysecret-token-1234")
+
+        result = main_cli(["applet-status", "a1"])
+
+        self.assertEqual(result, 1)
+        mock_print.assert_called_once()
+        payload = json.loads(mock_print.call_args.args[0])
+        self.assertIn("error", payload)
+        self.assertNotIn("sk-verysecret-token-1234", mock_print.call_args.args[0])
 
     @patch("codex_master.server.print_json")
     @patch("codex_master.server.call_tool", return_value={"results": [], "raw_output": "not_returned"})
