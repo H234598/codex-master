@@ -273,7 +273,10 @@ def kill_and_wait(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=1)
     except subprocess.TimeoutExpired:
         process.kill()
-        process.wait()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            return
 
 
 def run_bounded(argv: list[str]) -> str:

@@ -896,13 +896,16 @@ test("finalize waits for wait + both stream EOFs", async () => {
   assert.equal(applet._statusLastGood.schema_version, 1);
 });
 
-test("real backend payload with sleep/available states is accepted", async () => {
+test("real backend payload with sleeping and expired states is accepted", async () => {
   const fixture = loadApplet();
   const payload = samplePayload();
   payload.activity_state = "sleeping";
-  payload.backend_state = "unavailable";
-  payload.agents[0].backend_state = "error";
-  payload.agents[0].identity_state = "unverified";
+  payload.backend_state = "ok";
+  payload.counts.running = 0;
+  payload.counts.sleeping = 2;
+  payload.agents[0].activity_state = "sleeping";
+  payload.agents[0].identity_state = "stopped";
+  payload.agents[1].backend_state = "ok";
   payload.agents[1].lease_state = "expired";
   fixture.setProcessFactory(() => ({
     forceExitCount: 0,
@@ -1138,6 +1141,21 @@ test("validator rejects missing/invalid counts, raw_output and duplicate/foreign
   const badTrackedCount = JSON.parse(JSON.stringify(good));
   badTrackedCount.counts.tracked = 1;
 
+  const badRunningCount = JSON.parse(JSON.stringify(good));
+  badRunningCount.counts.running = 0;
+
+  const badIssueCount = JSON.parse(JSON.stringify(good));
+  badIssueCount.counts.issues = 0;
+
+  const badActivityAggregate = JSON.parse(JSON.stringify(good));
+  badActivityAggregate.activity_state = "running";
+
+  const badBackendAggregate = JSON.parse(JSON.stringify(good));
+  badBackendAggregate.backend_state = "ok";
+
+  const badControlAggregate = JSON.parse(JSON.stringify(good));
+  badControlAggregate.control_state = "ready";
+
   const { main } = fixture;
   const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
   const [statusItem] = applet.menu.items;
@@ -1154,6 +1172,11 @@ test("validator rejects missing/invalid counts, raw_output and duplicate/foreign
     { name: "row aggregate state", payload: badRowAggregateState },
     { name: "missing requested agent", payload: badMissingAgent },
     { name: "tracked count mismatch", payload: badTrackedCount },
+    { name: "running count mismatch", payload: badRunningCount },
+    { name: "issue count mismatch", payload: badIssueCount },
+    { name: "activity aggregate mismatch", payload: badActivityAggregate },
+    { name: "backend aggregate mismatch", payload: badBackendAggregate },
+    { name: "control aggregate mismatch", payload: badControlAggregate },
   ];
 
   for (const invalid of bads) {
@@ -1503,6 +1526,7 @@ test("timeout retries force_exit failure and refresh recovers", () => {
   fixture.runTimeouts();
   assert.equal(process.forceExitCount, 2);
   assert.equal(applet._statusActiveState.forceExitCalled, true);
+  assert.equal(applet._statusActiveState.timeoutSource, 0);
   assert.equal(fixture.activeTimers("timeout").length, 0);
 
   process.stdout.releaseEof();

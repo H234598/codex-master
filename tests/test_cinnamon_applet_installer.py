@@ -349,15 +349,16 @@ else:
                     first = threading.Thread(target=invoke)
                     second = threading.Thread(target=invoke)
                     first.start()
-                    self.assertTrue(first_entered.wait(timeout=2))
-                    second.start()
                     try:
+                        self.assertTrue(first_entered.wait(timeout=2))
+                        second.start()
                         time.sleep(0.2)
                         self.assertEqual(entered, 1, "second mutator entered before first released lock")
                     finally:
                         release_first.set()
                         first.join(timeout=5)
-                        second.join(timeout=5)
+                        if second.ident is not None:
+                            second.join(timeout=5)
 
         self.assertFalse(first.is_alive())
         self.assertFalse(second.is_alive())
@@ -370,6 +371,33 @@ else:
             with self.assertRaisesRegex(OSError, "injected operation failure"):
                 with module.operation_lock(create_parent=True):
                     raise OSError("injected operation failure")
+
+    def test_kill_and_wait_remains_bounded_when_process_cannot_be_reaped(self) -> None:
+        module = self._load_tool_module()
+
+        class StubbornProcess:
+            def __init__(self):
+                self.kill_count = 0
+                self.wait_timeouts = []
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                self.kill_count += 1
+
+            def wait(self, timeout=None):
+                self.wait_timeouts.append(timeout)
+                if timeout is None:
+                    raise AssertionError("unbounded wait")
+                raise subprocess.TimeoutExpired("gdbus", timeout)
+
+        process = StubbornProcess()
+
+        module.kill_and_wait(process)
+
+        self.assertEqual(process.kill_count, 2)
+        self.assertEqual(process.wait_timeouts, [1, 1])
 
 
 if __name__ == "__main__":

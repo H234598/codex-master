@@ -400,6 +400,7 @@ FlottenmanagementApplet.prototype = {
             () => {
                 state.timedOut = true;
                 const forceExitRequested = requestForceExit(state);
+                if (forceExitRequested) state.timeoutSource = 0;
                 this._markRefreshFailed();
                 attemptFinalize(state);
                 return forceExitRequested ? GLib.SOURCE_REMOVE : GLib.SOURCE_CONTINUE;
@@ -534,6 +535,38 @@ FlottenmanagementApplet.prototype = {
         if (payload.counts.running + payload.counts.sleeping > payload.counts.tracked) return false;
         if (payload.counts.ready + payload.counts.blocked > payload.counts.tracked) return false;
         if (payload.counts.issues > payload.counts.tracked) return false;
+
+        const activityStates = payload.agents.map((row) => row.activity_state);
+        const backendStates = payload.agents.map((row) => row.backend_state);
+        const controlStates = payload.agents.map((row) => row.control_state);
+        const expectedCounts = {
+            tracked: payload.agents.length,
+            running: activityStates.filter((state) => state === "running").length,
+            sleeping: activityStates.filter((state) => state === "sleeping").length,
+            ready: controlStates.filter((state) => state === "ready").length,
+            blocked: controlStates.filter((state) => state === "blocked").length,
+            issues: payload.agents.filter(
+                (row) => row.backend_state !== "ok" || row.control_state !== "ready"
+            ).length,
+        };
+        if (APPLET_STATUS_REQUIRED_COUNTS.some((key) => payload.counts[key] !== expectedCounts[key])) return false;
+
+        const expectedActivity = activityStates.every((state) => state === "running")
+            ? "running"
+            : activityStates.every((state) => state === "sleeping")
+                ? "sleeping"
+                : activityStates.every((state) => state === "unknown") ? "unknown" : "mixed";
+        const expectedBackend = backendStates.every((state) => state === "ok")
+            ? "ok"
+            : backendStates.every((state) => state === "error") ? "unavailable" : "degraded";
+        const expectedControl = controlStates.every((state) => state === "ready")
+            ? "ready"
+            : controlStates.every((state) => state === "blocked")
+                ? "blocked"
+                : controlStates.every((state) => state === "unknown") ? "unknown" : "mixed";
+        if (payload.activity_state !== expectedActivity) return false;
+        if (payload.backend_state !== expectedBackend) return false;
+        if (payload.control_state !== expectedControl) return false;
         return true;
     },
 
