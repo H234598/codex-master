@@ -193,6 +193,29 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(proc_is_codex_like({"Name": "codex-code-mode-host"}, []))
         self.assertTrue(proc_is_codex_like({"Name": "codex-code-mode"}, []))
 
+    def test_proc_is_codex_like_rejects_sudo_wrapper_pointing_to_codex_binary(self) -> None:
+        self.assertFalse(
+            proc_is_codex_like(
+                {"Name": "sudo"},
+                ["/usr/bin/sudo", "/beliebig/codex"],
+            )
+        )
+
+    def test_proc_is_codex_like_recognizes_direct_codex_name_or_argv0(self) -> None:
+        self.assertTrue(proc_is_codex_like({"Name": "codex"}, []))
+        self.assertTrue(
+            proc_is_codex_like(
+                {"Name": "sleep"},
+                ["/usr/bin/codex", "--version"],
+            )
+        )
+        self.assertTrue(
+            proc_is_codex_like(
+                {"Name": "sleep"},
+                ["/usr/local/bin/node", "/x/node_modules/@openai/codex/bin/codex.js"],
+            )
+        )
+
     def setUp(self) -> None:
         dedicated_scan_test = self._testMethodName.startswith(
             (

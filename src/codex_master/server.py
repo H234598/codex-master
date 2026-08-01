@@ -3774,13 +3774,13 @@ def read_proc_cmdline(pid_dir: Path) -> list[str]:
 
 def proc_is_codex_like(status: dict[str, str], argv: list[str]) -> bool:
     name = (status.get("Name") or "").lower()
-    argv_names = {Path(item).name.lower() for item in argv if item}
+    argv0_name = Path(argv[0]).name.lower() if argv else ""
     joined = "\0".join(argv).lower()
     return (
         name == "codex"
         or name == "codex-code-mode-host"
         or name == "codex-code-mode"
-        or "codex" in argv_names
+        or argv0_name == "codex"
         or "@openai/codex" in joined
         or "node_modules/@openai/codex" in joined
     )
