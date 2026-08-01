@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import selectors
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+UUID = "codex-master@H234598"
+DBUS_TIMEOUT_SECONDS = 10.0
+DBUS_OUTPUT_LIMIT_BYTES = 64 * 1024
+REQUIRED_SOURCE_FILES = {"applet.js", "metadata.json", "settings-schema.json"}
+
+
+class InstallerError(RuntimeError):
+    pass
+
+
+def lexical_exists(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+def private_home() -> Path:
+    value = os.environ.get("HOME")
+    if not value:
+        raise InstallerError("HOME is required")
+    home = Path(value)
+    if not home.is_absolute():
+        raise InstallerError("HOME must be absolute")
+    return home
+
+
+def source_directory() -> Path:
+    return Path(__file__).resolve().parents[1] / "cinnamon" / "applets" / UUID
+
+
+def target_directory() -> Path:
+    return private_home() / ".local" / "share" / "cinnamon" / "applets" / UUID
+
+
+def rollback_directory(target: Path) -> Path:
+    return target.with_name(f"{UUID}.rollback")
+
+
+def ensure_real_directory_chain(path: Path, *, create: bool) -> None:
+    if not path.is_absolute():
+        raise InstallerError("directory chain must be absolute")
+    current = Path(path.anchor)
+    missing = False
+    for part in path.parts[1:]:
+        current /= part
+        if missing:
+            if create:
+                os.mkdir(current, 0o700)
+            continue
+        try:
+            current_stat = current.lstat()
+        except FileNotFoundError:
+            missing = True
+            if create:
+                os.mkdir(current, 0o700)
+            continue
+        except OSError as exc:
+            raise InstallerError("directory chain is unreadable") from exc
+        if stat.S_ISLNK(current_stat.st_mode) or not stat.S_ISDIR(current_stat.st_mode):
+            raise InstallerError("directory chain must contain only real directories")
+
+
+def hash_regular_file(path: Path, expected: os.stat_result) -> str:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    digest = hashlib.sha256()
+    try:
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)
+        ):
+            raise InstallerError("file identity changed or is not a private regular file")
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    except OSError as exc:
+        raise InstallerError("regular file could not be read safely") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return digest.hexdigest()
+
+
+def scan_tree(root: Path, label: str) -> tuple[list[Path], dict[str, tuple[str, int]]]:
+    try:
+        root_stat = root.lstat()
+    except OSError as exc:
+        raise InstallerError(f"{label} is missing or unreadable") from exc
+    if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+        raise InstallerError(f"{label} must be a real directory")
+
+    directories: list[Path] = []
+    files: dict[str, tuple[str, int]] = {}
+
+    def visit(directory: Path, relative: Path) -> None:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as exc:
+            raise InstallerError(f"{label} contains an unreadable directory") from exc
+        for entry in entries:
+            entry_path = directory / entry.name
+            entry_relative = relative / entry.name
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise InstallerError(f"{label} entry is unreadable") from exc
+            if stat.S_ISLNK(entry_stat.st_mode):
+                raise InstallerError(f"{label} must not contain symlinks")
+            if stat.S_ISDIR(entry_stat.st_mode):
+                directories.append(entry_relative)
+                visit(entry_path, entry_relative)
+                continue
+            if not stat.S_ISREG(entry_stat.st_mode) or entry_stat.st_nlink != 1:
+                raise InstallerError(f"{label} must contain only non-hardlinked regular files")
+            files[str(entry_relative)] = (hash_regular_file(entry_path, entry_stat), stat.S_IMODE(entry_stat.st_mode))
+
+    visit(root, Path())
+    if not files:
+        raise InstallerError(f"{label} must not be empty")
+    return directories, files
+
+
+def validate_source(source: Path) -> tuple[list[Path], dict[str, tuple[str, int]]]:
+    directories, manifest = scan_tree(source, "source applet")
+    if not REQUIRED_SOURCE_FILES.issubset(manifest):
+        raise InstallerError("source applet is incomplete")
+    return directories, manifest
+
+
+def copy_file_checked(source: Path, destination: Path, expected_hash: str, mode: int) -> None:
+    source_stat = source.lstat()
+    if not stat.S_ISREG(source_stat.st_mode) or source_stat.st_nlink != 1:
+        raise InstallerError("source file changed before staging")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    source_fd = os.open(source, flags)
+    destination_fd = -1
+    digest = hashlib.sha256()
+    try:
+        opened = os.fstat(source_fd)
+        if (opened.st_dev, opened.st_ino) != (source_stat.st_dev, source_stat.st_ino):
+            raise InstallerError("source file identity changed before staging")
+        destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        while True:
+            chunk = os.read(source_fd, 64 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                view = view[written:]
+        os.fsync(destination_fd)
+        os.fchmod(destination_fd, mode & 0o777)
+    except OSError as exc:
+        raise InstallerError("source file could not be staged safely") from exc
+    finally:
+        if destination_fd >= 0:
+            os.close(destination_fd)
+        os.close(source_fd)
+    if digest.hexdigest() != expected_hash:
+        raise InstallerError("source file changed while staging")
+
+
+def stage_source(
+    source: Path,
+    parent: Path,
+    directories: list[Path],
+    manifest: dict[str, tuple[str, int]],
+) -> Path:
+    stage = Path(tempfile.mkdtemp(prefix=f".{UUID}.staging-", dir=parent))
+    os.chmod(stage, 0o700)
+    try:
+        for relative in directories:
+            (stage / relative).mkdir(mode=0o700)
+        for relative, (expected_hash, mode) in manifest.items():
+            copy_file_checked(source / relative, stage / relative, expected_hash, mode)
+        _directories, staged_manifest = scan_tree(stage, "staged applet")
+        if staged_manifest != manifest:
+            raise InstallerError("staged applet hash verification failed")
+        _directories, current_source = validate_source(source)
+        if current_source != manifest:
+            raise InstallerError("source applet changed during staging")
+        return stage
+    except Exception:
+        if lexical_exists(stage):
+            shutil.rmtree(stage)
+        raise
+
+
+def remove_validated_tree(path: Path, label: str) -> None:
+    scan_tree(path, label)
+    shutil.rmtree(path)
+
+
+def kill_and_wait(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        process.kill()
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+
+
+def run_bounded(argv: list[str]) -> str:
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+        )
+    except OSError as exc:
+        raise InstallerError("gdbus is unavailable") from exc
+    if process.stdout is None or process.stderr is None:
+        kill_and_wait(process)
+        raise InstallerError("gdbus pipes are unavailable")
+
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
+    total = 0
+    deadline = time.monotonic() + DBUS_TIMEOUT_SECONDS
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                kill_and_wait(process)
+                raise InstallerError("gdbus timed out")
+            events = selector.select(min(remaining, 0.25))
+            if not events and process.poll() is not None:
+                events = [(key, selectors.EVENT_READ) for key in selector.get_map().values()]
+            for key, _mask in events:
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 4096)
+                except OSError as exc:
+                    kill_and_wait(process)
+                    raise InstallerError("gdbus output could not be read") from exc
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                total += len(chunk)
+                if total > DBUS_OUTPUT_LIMIT_BYTES:
+                    kill_and_wait(process)
+                    raise InstallerError("gdbus output exceeded limit")
+                chunks[key.data].append(chunk)
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            kill_and_wait(process)
+            raise InstallerError("gdbus timed out") from exc
+    finally:
+        selector.close()
+
+    stdout = b"".join(chunks["stdout"]).decode("utf-8", errors="replace")
+    stderr = b"".join(chunks["stderr"]).decode("utf-8", errors="replace")
+    if returncode != 0:
+        detail = stderr.strip()[:300] or "gdbus failed"
+        raise InstallerError(detail)
+    return stdout
+
+
+def cinnamon_call(method: str, *arguments: str) -> str:
+    argv = [
+        "gdbus",
+        "call",
+        "--session",
+        "--dest",
+        "org.Cinnamon",
+        "--object-path",
+        "/org/Cinnamon",
+        "--method",
+        f"org.Cinnamon.{method}",
+        *arguments,
+    ]
+    return run_bounded(argv)
+
+
+def reload_xlet() -> None:
+    cinnamon_call("ReloadXlet", UUID, "applet")
+
+
+def verify_running() -> None:
+    output = cinnamon_call("GetRunningXletUUIDs", "applet")
+    if f"'{UUID}'" not in output and f'"{UUID}"' not in output:
+        raise InstallerError("Cinnamon does not report the applet as running")
+
+
+def verify_files(source: Path, target: Path) -> None:
+    _source_dirs, source_manifest = validate_source(source)
+    _target_dirs, target_manifest = scan_tree(target, "installed applet")
+    if target_manifest != source_manifest:
+        raise InstallerError("installed applet differs from repository source")
+
+
+def restore_previous(target: Path, backup: Path, had_previous: bool) -> None:
+    if lexical_exists(target):
+        remove_validated_tree(target, "failed installed applet")
+    if had_previous:
+        scan_tree(backup, "rollback applet")
+        os.replace(backup, target)
+
+
+def install(*, dry_run: bool, no_reload: bool) -> dict[str, Any]:
+    source = source_directory()
+    directories, manifest = validate_source(source)
+    target = target_directory()
+    backup = rollback_directory(target)
+    ensure_real_directory_chain(target.parent, create=False)
+    if lexical_exists(target):
+        scan_tree(target, "installed applet")
+    if lexical_exists(backup):
+        scan_tree(backup, "rollback applet")
+    if dry_run:
+        return {"ok": True, "action": "install", "dry_run": True, "uuid": UUID}
+
+    ensure_real_directory_chain(target.parent, create=True)
+    stage = stage_source(source, target.parent, directories, manifest)
+    had_previous = lexical_exists(target)
+    try:
+        if lexical_exists(backup):
+            remove_validated_tree(backup, "rollback applet")
+        if had_previous:
+            os.replace(target, backup)
+        try:
+            os.replace(stage, target)
+            stage = Path()
+        except Exception:
+            if had_previous and lexical_exists(backup) and not lexical_exists(target):
+                os.replace(backup, target)
+            raise
+        try:
+            verify_files(source, target)
+            if not no_reload:
+                reload_xlet()
+                verify_running()
+        except Exception:
+            restore_previous(target, backup, had_previous)
+            raise
+    finally:
+        if stage != Path() and lexical_exists(stage):
+            remove_validated_tree(stage, "staged applet")
+    return {"ok": True, "action": "install", "dry_run": False, "uuid": UUID, "rollback": had_previous}
+
+
+def swap_directories(first: Path, second: Path) -> None:
+    parent = first.parent
+    temporary = parent / f".{UUID}.swap-{os.getpid()}-{time.time_ns()}"
+    if lexical_exists(temporary):
+        raise InstallerError("rollback swap path already exists")
+    os.replace(first, temporary)
+    try:
+        os.replace(second, first)
+        os.replace(temporary, second)
+    except Exception:
+        if lexical_exists(first) and not lexical_exists(second):
+            os.replace(first, second)
+        if lexical_exists(temporary) and not lexical_exists(first):
+            os.replace(temporary, first)
+        raise
+
+
+def rollback(*, no_reload: bool) -> dict[str, Any]:
+    source = source_directory()
+    validate_source(source)
+    target = target_directory()
+    backup = rollback_directory(target)
+    ensure_real_directory_chain(target.parent, create=False)
+    if not lexical_exists(target):
+        raise InstallerError("installed applet is missing")
+    if not lexical_exists(backup):
+        raise InstallerError("rollback applet is missing")
+    scan_tree(target, "installed applet")
+    scan_tree(backup, "rollback applet")
+    swap_directories(target, backup)
+    try:
+        if not no_reload:
+            reload_xlet()
+            verify_running()
+    except Exception:
+        swap_directories(target, backup)
+        raise
+    return {"ok": True, "action": "rollback", "uuid": UUID}
+
+
+def verify() -> dict[str, Any]:
+    source = source_directory()
+    target = target_directory()
+    ensure_real_directory_chain(target.parent, create=False)
+    verify_files(source, target)
+    verify_running()
+    return {"ok": True, "action": "verify", "uuid": UUID}
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Install and verify the codex-master Cinnamon applet.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    install_parser = commands.add_parser("install")
+    install_parser.add_argument("--dry-run", action="store_true")
+    install_parser.add_argument("--no-reload", action="store_true")
+    commands.add_parser("verify")
+    rollback_parser = commands.add_parser("rollback")
+    rollback_parser.add_argument("--no-reload", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    os.umask(0o077)
+    args = parse_args(argv)
+    try:
+        if args.command == "install":
+            result = install(dry_run=args.dry_run, no_reload=args.no_reload)
+        elif args.command == "verify":
+            result = verify()
+        else:
+            result = rollback(no_reload=args.no_reload)
+    except (InstallerError, OSError) as exc:
+        print(json.dumps({"ok": False, "error": str(exc)[:500]}, sort_keys=True), file=sys.stderr)
+        return 1
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
