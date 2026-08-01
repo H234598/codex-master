@@ -10041,6 +10041,30 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["pane_process_identity_checked"])
         self.assertFalse(result["pane_process_identity_match"])
 
+    def test_agent_identity_guard_validates_partition_without_managed_processes(self) -> None:
+        for total, external, running, expected_ok, expected_state in (
+            (1, 0, False, False, "blocked_process_scan_unavailable"),
+            (1, 0, True, False, "blocked_process_scan_unavailable"),
+            (2, 1, False, False, "blocked_process_scan_unavailable"),
+            (2, 1, True, False, "blocked_process_scan_unavailable"),
+            (0, 0, False, True, "clear"),
+            (2, 2, False, False, "blocked_external_home_user"),
+        ):
+            with self.subTest(total=total, external=external, running=running):
+                result = agent_identity_guard(
+                    running,
+                    {
+                        "process_count": total,
+                        "managed_process_count": 0,
+                        "external_process_count": external,
+                        "managed_process_ids": [],
+                        "raw_output": "not_returned",
+                    },
+                )
+
+                self.assertEqual(result["ok"], expected_ok)
+                self.assertEqual(result["state"], expected_state)
+
     def test_same_path_text_handles_resolution_runtime_error(self) -> None:
         with patch("pathlib.Path.resolve", side_effect=RuntimeError("loop")):
             result = same_path_text("/tmp/loop", Path("/tmp/loop"))
