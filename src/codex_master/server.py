@@ -4086,7 +4086,7 @@ def agent_identity_guard(
         for value in (process_count, external_process_count, managed_process_count)
     )
     managed_process_ids = process_summary.get("managed_process_ids")
-    pane_process_identity_checked = running and "managed_process_ids" in process_summary
+    pane_process_identity_checked = running
     pane_process_identity_match: bool | None = None
     if pane_process_identity_checked:
         pane_process_identity_match = (
