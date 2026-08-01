@@ -9967,6 +9967,27 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["home_managed_process_count"], 1)
         self.assertEqual(result["raw_output"], "not_returned")
 
+    def test_agent_identity_guard_blocks_invalid_process_counts(self) -> None:
+        for field, value in (
+            ("process_count", -1),
+            ("managed_process_count", -1),
+            ("external_process_count", -1),
+            ("process_count", True),
+            ("external_process_count", "1"),
+        ):
+            with self.subTest(field=field, value=value):
+                summary = {
+                    "process_count": 0,
+                    "managed_process_count": 0,
+                    "external_process_count": 0,
+                    field: value,
+                    "raw_output": "not_returned",
+                }
+                result = agent_identity_guard(False, summary)
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["state"], "blocked_process_scan_unavailable")
+
     def test_agent_lifecycle_lock_refuses_symlink_lock_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)

@@ -4082,7 +4082,9 @@ def agent_identity_guard(
     external_process_count = process_summary.get("external_process_count")
     managed_process_count = process_summary.get("managed_process_count")
     counts_available = all(
-        isinstance(value, int) and not isinstance(value, bool)
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 0
         for value in (process_count, external_process_count, managed_process_count)
     )
     managed_process_ids = process_summary.get("managed_process_ids")
