@@ -9925,6 +9925,46 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["pane_process_identity_checked"])
         self.assertFalse(result["pane_process_identity_match"])
 
+    def test_agent_identity_guard_blocks_when_process_counts_are_inconsistent(self) -> None:
+        for total, managed, external in (
+            (0, 1, 0),
+            (0, 0, 1),
+            (1, 1, 1),
+        ):
+            with self.subTest(total=total, managed=managed, external=external):
+                result = agent_identity_guard(
+                    True,
+                    {
+                        "process_count": total,
+                        "managed_process_count": managed,
+                        "external_process_count": external,
+                        "managed_process_ids": [123],
+                        "raw_output": "not_returned",
+                    },
+                    pane_process_id=123,
+                )
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["state"], "blocked_process_scan_unavailable")
+
+    def test_agent_identity_guard_managed_session_still_running(self) -> None:
+        for total in (1, 2):
+            with self.subTest(total=total):
+                result = agent_identity_guard(
+                    True,
+                    {
+                        "process_count": total,
+                        "managed_process_count": 1,
+                        "external_process_count": 0,
+                        "managed_process_ids": [123],
+                        "raw_output": "not_returned",
+                    },
+                    pane_process_id=123,
+                )
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["state"], "managed_session_running")
+
     def test_agent_identity_guard_rejects_missing_managed_process_ids(self) -> None:
         result = agent_identity_guard(
             True,
