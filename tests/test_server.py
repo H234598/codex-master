@@ -201,6 +201,122 @@ class ServerHelpersTest(unittest.TestCase):
             )
         )
 
+    def test_proc_is_codex_like_rejects_sudo_wrapper_with_late_codex_marker(self) -> None:
+        self.assertFalse(
+            proc_is_codex_like(
+                {"Name": "sudo"},
+                ["/usr/bin/sudo", "/usr/bin/echo", "@openai/codex"],
+            )
+        )
+
+    def test_proc_is_codex_like_rejects_node_with_late_codex_marker(self) -> None:
+        self.assertFalse(
+            proc_is_codex_like(
+                {"Name": "node"},
+                ["/usr/bin/node", "/usr/bin/echo", "@openai/codex"],
+            )
+        )
+
+    def test_proc_is_codex_like_accepts_node_with_leading_options(self) -> None:
+        self.assertTrue(
+            proc_is_codex_like(
+                {"Name": "node"},
+                ["/usr/bin/node", "--enable-source-maps", "/x/node_modules/@openai/codex/bin/codex.js"],
+            )
+        )
+
+    def test_proc_is_codex_like_accepts_node_options_terminator(self) -> None:
+        self.assertTrue(
+            proc_is_codex_like(
+                {"Name": "node"},
+                ["/usr/bin/node", "--", "/x/node_modules/@openai/codex/bin/codex.js"],
+            )
+        )
+
+    def test_proc_is_codex_like_rejects_node_preload_without_entrypoint(self) -> None:
+        self.assertFalse(
+            proc_is_codex_like(
+                {"Name": "node"},
+                [
+                    "/usr/bin/node",
+                    "-r",
+                    "/tmp/node_modules/@openai/codex/register.js",
+                    "/tmp/tool.js",
+                ],
+            )
+        )
+
+    def test_proc_is_codex_like_requires_known_value_flags(self) -> None:
+        value_flags = (
+            "-r",
+            "--require",
+            "--loader",
+            "--experimental-loader",
+            "--import",
+            "-C",
+            "--conditions",
+        )
+        for flag in value_flags:
+            with self.subTest(flag=flag):
+                self.assertTrue(
+                    proc_is_codex_like(
+                        {"Name": "node"},
+                        [
+                            "/usr/bin/node",
+                            flag,
+                            "/tmp/tool.js",
+                            "/x/node_modules/@openai/codex/bin/codex.js",
+                        ],
+                    )
+                )
+                self.assertFalse(
+                    proc_is_codex_like(
+                        {"Name": "node"},
+                        [
+                            "/usr/bin/node",
+                            flag,
+                            "/tmp/node_modules/@openai/codex/register.js",
+                            "/tmp/tool.js",
+                        ],
+                    )
+                )
+
+    def test_proc_is_codex_like_handles_long_equals_value_flag(self) -> None:
+        self.assertFalse(
+            proc_is_codex_like(
+                {"Name": "node"},
+                ["/usr/bin/node", "--require=/tmp/node_modules/@openai/codex/register.js", "/tmp/tool.js"],
+            )
+        )
+        self.assertTrue(
+            proc_is_codex_like(
+                {"Name": "node"},
+                ["/usr/bin/node", "--conditions=production", "/x/node_modules/@openai/codex/bin/codex.js"],
+            )
+        )
+
+    def test_proc_is_codex_like_rejects_unknown_leading_option(self) -> None:
+        self.assertFalse(
+            proc_is_codex_like(
+                {"Name": "node"},
+                ["/usr/bin/node", "--not-a-real-node-option", "/tmp/node_modules/@openai/codex/bin/codex.js"],
+            )
+        )
+        self.assertFalse(
+            proc_is_codex_like(
+                {"Name": "node"},
+                ["/usr/bin/node", "--enable-source-maps=unexpected", "/x/node_modules/@openai/codex/bin/codex.js"],
+            )
+        )
+
+    def test_proc_is_codex_like_rejects_node_options_terminator_late_entrypoint(self) -> None:
+        self.assertFalse(
+            proc_is_codex_like(
+                {"Name": "node"},
+                ["/usr/bin/node", "--", "/tmp/tool.js", "/x/node_modules/@openai/codex/bin/codex.js"],
+            )
+        )
+
     def test_proc_is_codex_like_recognizes_direct_codex_name_or_argv0(self) -> None:
         self.assertTrue(proc_is_codex_like({"Name": "codex"}, []))
         self.assertTrue(
@@ -213,6 +329,18 @@ class ServerHelpersTest(unittest.TestCase):
             proc_is_codex_like(
                 {"Name": "sleep"},
                 ["/usr/local/bin/node", "/x/node_modules/@openai/codex/bin/codex.js"],
+            )
+        )
+        self.assertTrue(
+            proc_is_codex_like(
+                {"Name": "sleep"},
+                ["/usr/bin/nodejs", "/x/node_modules/@openai/codex/bin/codex.js"],
+            )
+        )
+        self.assertFalse(
+            proc_is_codex_like(
+                {"Name": "sleep"},
+                ["/usr/bin/node", "--enable-source-maps", "/tmp/not-@openai/codexish/tool.js"],
             )
         )
 

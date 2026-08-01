@@ -3775,15 +3775,51 @@ def read_proc_cmdline(pid_dir: Path) -> list[str]:
 def proc_is_codex_like(status: dict[str, str], argv: list[str]) -> bool:
     name = (status.get("Name") or "").lower()
     argv0_name = Path(argv[0]).name.lower() if argv else ""
-    joined = "\0".join(argv).lower()
-    return (
+    if (
         name == "codex"
         or name == "codex-code-mode-host"
         or name == "codex-code-mode"
         or argv0_name == "codex"
-        or "@openai/codex" in joined
-        or "node_modules/@openai/codex" in joined
+    ):
+        return True
+    if argv0_name not in {"node", "nodejs"} or len(argv) < 2:
+        return False
+    value_flags = (
+        "-r",
+        "--require",
+        "--loader",
+        "--experimental-loader",
+        "--import",
+        "-C",
+        "--conditions",
     )
+    entrypoint: str | None = None
+    skip_next = False
+    for index, arg in enumerate(argv[1:], start=1):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--":
+            entrypoint = argv[index + 1] if index + 1 < len(argv) else None
+            break
+        if arg.startswith("--") and "=" in arg:
+            flag, _ = arg.split("=", 1)
+            if flag not in value_flags:
+                return False
+            continue
+        if arg in value_flags:
+            skip_next = True
+            continue
+        if arg == "--enable-source-maps":
+            continue
+        if arg.startswith("-"):
+            return False
+        entrypoint = arg
+        break
+    if not entrypoint:
+        return False
+    parts = Path(entrypoint.lower()).parts
+    return any(left == "@openai" and right == "codex" for left, right in zip(parts, parts[1:]))
 
 
 def resolve_proc_cwd(pid_dir: Path) -> tuple[Path | None, bool]:
