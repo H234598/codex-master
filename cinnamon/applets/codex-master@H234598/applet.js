@@ -384,6 +384,7 @@ FlottenmanagementApplet.prototype = {
             if (!(stateArg.waitDone && stateArg.stdoutDone && stateArg.stderrDone)) {
                 return;
             }
+            if (stateArg.timedOut && stateArg.process && !stateArg.forceExitCalled) return;
             stateArg.finalizing = true;
             if (stateArg.timeoutSource) {
                 try {

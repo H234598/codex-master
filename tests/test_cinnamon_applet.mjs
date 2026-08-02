@@ -2389,15 +2389,18 @@ test("timeout retries force_exit failure and refresh recovers", () => {
 
   statusItem.activate();
   assert.equal(applet._statusPendingRefresh, true);
-  fixture.runTimeouts();
-  assert.equal(process.forceExitCount, 2);
-  assert.equal(applet._statusActiveState.forceExitCalled, true);
-  assert.equal(applet._statusActiveState.timeoutSource, 0);
-  assert.equal(fixture.activeTimers("timeout").length, 0);
-
+  const timedOutState = applet._statusActiveState;
   process.stdout.releaseEof();
   process.stderr.releaseEof();
   process.emitDone();
+  assert.equal(fixture.subprocesses.length, 1, "cancel callbacks cannot bypass the kill retry");
+  assert.equal(applet._statusActiveState, timedOutState);
+  assert.equal(fixture.activeTimers("timeout").length, 1);
+
+  fixture.runTimeouts();
+  assert.equal(process.forceExitCount, 2);
+  assert.equal(timedOutState.forceExitCalled, true);
+  assert.equal(timedOutState.timeoutSource, 0);
   assert.equal(fixture.subprocesses.length, 2, "pending refresh starts after recovered timeout cleanup");
   fixture.subprocesses[1].emitDone();
   assert.equal(applet._statusInFlight, false);
