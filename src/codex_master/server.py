@@ -2267,9 +2267,10 @@ def spawn_admission_lock() -> Any:
     with open_private_regular_update(lock_path) as fh:
         try:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-            yield
         except OSError as exc:
             raise AgentError("could not acquire spawn admission lock") from exc
+        try:
+            yield
         finally:
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
@@ -2464,7 +2465,20 @@ def _managed_tmux_session_count() -> int | None:
     try:
         completed = run_tmux(["list-sessions", "-F", "#{session_name}"], check=False)
         if completed.returncode != 0:
-            return None
+            if not (
+                type(completed.returncode) is int
+                and completed.returncode == 1
+                and isinstance(completed.stdout, str)
+                and completed.stdout == ""
+                and isinstance(completed.stderr, str)
+                and re.fullmatch(
+                    r"(?:no sessions|no server running on [^\r\n]+|"
+                    r"error connecting to [^\r\n]+ \(No such file or directory\))\n?",
+                    completed.stderr,
+                )
+            ):
+                return None
+            return 0
         configured_sessions = {
             config.get("session")
             for config in AGENTS.values()
@@ -2667,16 +2681,28 @@ def agent_spawn_offers(required_slots: int = 1) -> dict[str, Any]:
     routes = _spawn_priority_routes()
     allowed = admission.get("allowed") is True
     offers = [{"route": route} for route in routes if allowed and route == "mcp_host"]
+    offered_routes = {offer["route"] for offer in offers}
+    internal_reason_codes = admission.get("reason_codes")
+    reason_codes: list[str] = []
+    if not allowed and isinstance(internal_reason_codes, list):
+        reason_codes = [
+            reason
+            for reason in internal_reason_codes
+            if isinstance(reason, str) and reason in RESOURCE_REASON_CODES
+        ]
+    if not allowed and not reason_codes:
+        reason_codes = ["session_metrics_unavailable"]
     retryable = not allowed
     return {
         "ok": allowed,
         "offers": offers,
         "offer_count": len(offers),
-        "unavailable_route_count": sum(route != "mcp_host" for route in routes),
+        "unavailable_route_count": sum(route not in offered_routes for route in routes),
         "ttl_seconds": SPAWN_OFFER_TTL_SECONDS,
         "reservation": "none",
         "retryable": retryable,
         "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS if retryable else None,
+        "reason_codes": reason_codes,
         "raw_output": "not_returned",
     }
 
@@ -7101,8 +7127,9 @@ def assignment_prompt(
     if subagents_permitted:
         subagent_lines.extend(
             [
-                "Vor jedem weiteren Spawn CPU- und RAM-Druck frisch pruefen.",
-                "Bei Messfehler nicht spawnen.",
+                "Vor jedem Spawn frisch pruefen: load1 / logical_cpu_count <= 0.85.",
+                "Linux MemAvailable muss >= 20 % und >= 1024 MiB sein.",
+                "Fehlende oder ungueltige Messung bedeutet: nicht spawnen.",
             ]
         )
     elif allow_subagents and subagent_reason_codes:

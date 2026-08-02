@@ -291,8 +291,9 @@ keine Remote-Ausfuehrung in dieser Version.
 Ein Offer erzeugt keine Lease, keine Meta-Datei und keinen Assignment-Audit-
 Eintrag. Auth-, Scope-, Routing-, Modell-, Nutzungs- und bestehende Admission-
 Gates bleiben beim eigentlichen Start beziehungsweise bei Assignments wirksam.
-Messfehler, `/proc`-Fehler und tmux-Fehler fail-closed; ihre oeffentlichen
-Fehler bleiben begrenzt und redigiert.
+Ein sauberer tmux-Zustand ohne Server oder Sessions zaehlt als null laufende
+Agentinnen. Messfehler, `/proc`-Fehler und alle anderen tmux-Fehler fail-closed;
+ihre oeffentlichen Fehler bleiben begrenzt und redigiert.
 
 Native Subagentinnen sind davon getrennt: deren Steuerung ist Assignment-
 Prompt-Policy (inklusive frischem Ressourcencheck vor weiterem Spawn). Sie ist

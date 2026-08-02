@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -257,12 +258,17 @@ class ServerHelpersTest(unittest.TestCase):
     def test_spawn_offer_is_advisory_and_short_lived(self) -> None:
         with patch(
             "codex_master.server.spawn_admission_decision",
-            return_value={"allowed": True, "available_slots": 3, "reason_codes": []},
+            return_value={
+                "allowed": True,
+                "available_slots": 3,
+                "reason_codes": ["memory_pressure_high", "PRIVATE_REASON_MUST_NOT_RETURN"],
+            },
         ):
             result = agent_spawn_offers()
 
         self.assertEqual(result["ttl_seconds"], 5)
         self.assertEqual(result["reservation"], "none")
+        self.assertEqual(result["reason_codes"], [])
 
     def test_spawn_offer_schema_is_strict_and_bounded(self) -> None:
         response = handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
@@ -338,8 +344,41 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["offer_count"], 0)
         self.assertTrue(result["retryable"])
         self.assertEqual(result["retry_after_seconds"], 15)
+        self.assertEqual(result["reason_codes"], ["memory_pressure_high"])
         self.assertEqual(result["reservation"], "none")
         ensure_state.assert_not_called()
+
+    def test_spawn_offer_denial_filters_malformed_reasons_without_echo(self) -> None:
+        secret = "PRIVATE_REASON_MUST_NOT_RETURN"
+        for reasons in (None, secret, [secret], [None, 7, secret]):
+            with self.subTest(reasons=reasons):
+                with patch(
+                    "codex_master.server.spawn_admission_decision",
+                    return_value={"allowed": False, "available_slots": None, "reason_codes": reasons},
+                ):
+                    result = agent_spawn_offers()
+
+                self.assertEqual(result["reason_codes"], ["session_metrics_unavailable"])
+                self.assertNotIn(secret, json.dumps(result))
+
+    def test_spawn_offer_counts_denied_configured_routes_as_unavailable(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"CODEX_MASTER_SPAWN_PRIORITY": "mcp_host,mcp_host,developer_vm"},
+        ), patch(
+            "codex_master.server.spawn_admission_decision",
+            return_value={
+                "allowed": False,
+                "available_slots": 0,
+                "reason_codes": ["running_agent_limit"],
+            },
+        ):
+            result = agent_spawn_offers()
+
+        self.assertEqual(result["offers"], [])
+        self.assertEqual(result["unavailable_route_count"], 2)
+        self.assertNotIn("mcp_host", json.dumps(result))
+        self.assertNotIn("developer_vm", json.dumps(result))
 
     def test_spawn_offer_treats_priority_env_as_data_without_execution_or_echo(self) -> None:
         secret = "PRIORITY_SECRET_MUST_NOT_RETURN"
@@ -375,15 +414,29 @@ class ServerHelpersTest(unittest.TestCase):
         record_assignment.assert_not_called()
 
     def test_spawn_offer_cli_matches_mcp_semantic_contract(self) -> None:
-        admission = {"allowed": True, "available_slots": 3, "reason_codes": []}
-        with patch.dict(os.environ, {"CODEX_MASTER_SPAWN_PRIORITY": "mcp_host"}), patch(
-            "codex_master.server.spawn_admission_decision", return_value=admission
-        ):
-            mcp_result = agent_spawn_offers(2)
-            with patch("codex_master.server.print_json", return_value=0) as print_json:
-                self.assertEqual(main_cli(["spawn-offers", "--required-slots", "2"]), 0)
+        cases = (
+            ({"allowed": True, "available_slots": 3, "reason_codes": []}, []),
+            (
+                {
+                    "allowed": False,
+                    "available_slots": 0,
+                    "reason_codes": ["memory_pressure_high"],
+                },
+                ["memory_pressure_high"],
+            ),
+        )
+        for admission, expected_reasons in cases:
+            with self.subTest(allowed=admission["allowed"]), patch.dict(
+                os.environ, {"CODEX_MASTER_SPAWN_PRIORITY": "mcp_host"}
+            ), patch(
+                "codex_master.server.spawn_admission_decision", return_value=admission
+            ):
+                mcp_result = call_tool("agent_spawn_offers", {"required_slots": 2})
+                with patch("codex_master.server.print_json", return_value=0) as print_json:
+                    self.assertEqual(main_cli(["spawn-offers", "--required-slots", "2"]), 0)
 
-        self.assertEqual(print_json.call_args.args[0], mcp_result)
+            self.assertEqual(print_json.call_args.args[0], mcp_result)
+            self.assertEqual(mcp_result["reason_codes"], expected_reasons)
 
 
     def test_spawn_admission_allows_healthy_host(self) -> None:
@@ -478,6 +531,71 @@ class ServerHelpersTest(unittest.TestCase):
         payload = json.dumps(snapshot)
         self.assertNotIn("foreign-session", payload)
         self.assertNotIn("/proc/meminfo", payload)
+
+    def test_managed_tmux_session_count_accepts_only_known_clean_empty_exits(self) -> None:
+        clean_errors = (
+            "no server running on /tmp/tmux-1000/default\n",
+            "no sessions\n",
+            "error connecting to /tmp/tmux-1000/default (No such file or directory)\n",
+        )
+        for stderr in clean_errors:
+            with self.subTest(stderr=stderr), patch(
+                "codex_master.server.run_tmux",
+                return_value=subprocess.CompletedProcess(["tmux"], 1, "", stderr),
+            ):
+                self.assertEqual(server_module._managed_tmux_session_count(), 0)
+
+    def test_managed_tmux_session_count_rejects_unknown_or_malformed_failures(self) -> None:
+        secret = "PRIVATE_TMUX_ERROR_MUST_NOT_RETURN"
+        failures = (
+            subprocess.CompletedProcess(["tmux"], 1, "", secret),
+            subprocess.CompletedProcess(["tmux"], 1, "managed-session\n", "no sessions\n"),
+            subprocess.CompletedProcess(["tmux"], 1, "", f"no sessions\n{secret}"),
+            subprocess.CompletedProcess(["tmux"], 2, "", "no sessions\n"),
+            subprocess.CompletedProcess(["tmux"], COMMAND_TIMEOUT_RETURN_CODE, "", "no sessions\n"),
+            subprocess.CompletedProcess(["tmux"], True, "", "no sessions\n"),
+            subprocess.CompletedProcess(["tmux"], 1, None, "no sessions\n"),
+            subprocess.CompletedProcess(["tmux"], 1, "", None),
+        )
+        for completed in failures:
+            with self.subTest(returncode=completed.returncode, stderr=completed.stderr), patch(
+                "codex_master.server.run_tmux", return_value=completed
+            ):
+                snapshot = server_module.system_resource_snapshot()
+
+            self.assertIsNone(snapshot["running_agents"])
+            self.assertIn("session_metrics_unavailable", snapshot["reason_codes"])
+            self.assertNotIn(secret, json.dumps(snapshot))
+
+    @unittest.skipUnless(shutil.which("tmux"), "tmux is not installed")
+    def test_managed_tmux_session_count_accepts_real_isolated_socket_without_server(self) -> None:
+        socket_name = f"codex-master-zero-session-{os.getpid()}"
+        subprocess.run(
+            ["tmux", "-L", socket_name, "kill-server"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        def isolated_tmux(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["tmux", "-L", socket_name, *args],
+                check=kwargs.get("check", False),
+                capture_output=True,
+                text=True,
+                timeout=kwargs.get("timeout", 10),
+            )
+
+        try:
+            with patch("codex_master.server.run_tmux", side_effect=isolated_tmux):
+                self.assertEqual(server_module._managed_tmux_session_count(), 0)
+        finally:
+            subprocess.run(
+                ["tmux", "-L", socket_name, "kill-server"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
 
     def test_system_resource_snapshot_fails_closed_for_missing_memory_evidence(self) -> None:
         with patch("codex_master.server.os.cpu_count", return_value=4), patch(
@@ -752,6 +870,19 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(second_thread.is_alive())
         self.assertEqual(failures, [])
         self.assertEqual(order, ["first", "second"])
+
+    def test_spawn_admission_lock_preserves_body_oserror(self) -> None:
+        body_error = OSError("protected body failed")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ):
+                with self.assertRaises(OSError) as raised:
+                    with server_module.spawn_admission_lock():
+                        raise body_error
+
+        self.assertIs(raised.exception, body_error)
 
 
     def test_proc_is_codex_like_recognizes_codex_code_mode_host(self) -> None:
@@ -5080,8 +5211,9 @@ class ServerHelpersTest(unittest.TestCase):
             subagent_admission={"allowed": True, "reason_codes": []},
         )
 
-        self.assertIn("Vor jedem weiteren Spawn CPU- und RAM-Druck frisch pruefen", prompt)
-        self.assertIn("Bei Messfehler nicht spawnen", prompt)
+        self.assertIn("Vor jedem Spawn frisch pruefen: load1 / logical_cpu_count <= 0.85.", prompt)
+        self.assertIn("Linux MemAvailable muss >= 20 % und >= 1024 MiB sein.", prompt)
+        self.assertIn("Fehlende oder ungueltige Messung bedeutet: nicht spawnen.", prompt)
 
     def test_subagent_admission_deny_still_sends_and_audits_effective_permission(self) -> None:
         decision = {
