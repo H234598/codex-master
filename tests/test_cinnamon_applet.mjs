@@ -2581,6 +2581,33 @@ test("successful stream callback after removal starts no further read", () => {
   assert.equal(fixture.activeTimers().length, 0);
 });
 
+test("status timeout self-removes after removal cleanup cannot remove its source", () => {
+  const fixture = loadApplet();
+  queuePayloadProcess(fixture, samplePayload(), { holdEof: true });
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  applet.menu.items[0].activate();
+  const process = fixture.subprocesses[0];
+  const statusId = fixture.activeTimers("timeout")[0].id;
+  const realSourceRemove = fixture.GLib.source_remove;
+  fixture.GLib.source_remove = (id) => {
+    if (id === statusId) throw new Error("injected persistent status source removal failure");
+    return realSourceRemove(id);
+  };
+
+  applet.on_applet_removed_from_panel();
+
+  assert.equal(applet._cleanupComplete, false);
+  assert.equal(applet._statusActiveState !== null, true);
+  assert.equal(process.forceExitCount, 1);
+  assert.equal(fixture.activeTimers("timeout").length, 1);
+  fixture.runTimeouts();
+  assert.equal(fixture.activeTimers("timeout").length, 0, "callback removes its own failed source");
+  assert.equal(applet._statusActiveState, null, "callback retries removal cleanup without source recursion");
+  assert.equal(applet._activeStatusProcess, null);
+  assert.equal(applet._cleanupComplete, true);
+  assert.equal(process.forceExitCount, 1);
+});
+
 test("background cleanup failure does not retain cleaned status process", () => {
   const fixture = loadApplet();
   queuePayloadProcess(fixture, samplePayload(), { holdEof: true });

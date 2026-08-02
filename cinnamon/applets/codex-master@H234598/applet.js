@@ -574,6 +574,11 @@ FlottenmanagementApplet.prototype = {
                 GLib.PRIORITY_DEFAULT,
                 APPLET_STATUS_TIMEOUT_MILLISECONDS,
                 () => {
+                    if (state.finalizing || this._removed) {
+                        state.timeoutSource = 0;
+                        this.on_applet_removed_from_panel();
+                        return GLib.SOURCE_REMOVE;
+                    }
                     if (!state.exitConfirmed) {
                         state.timedOut = true;
                         requestForceExit(state);
