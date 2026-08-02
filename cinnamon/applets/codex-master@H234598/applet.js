@@ -58,6 +58,26 @@ const APPLET_STATUS_VALID_STRINGS = {
         lease_state: new Set(["unclaimed", "held", "expired", "unreadable"]),
     },
 };
+const APPLET_STATUS_LABELS = {
+    activity: {
+        running: "laufend",
+        sleeping: "schlafend",
+        mixed: "gemischt",
+        unknown: "unbekannt",
+    },
+    backend: {
+        ok: "ok",
+        degraded: "eingeschränkt",
+        unavailable: "nicht verfügbar",
+        error: "Fehler",
+    },
+    control: {
+        ready: "bereit",
+        blocked: "blockiert",
+        mixed: "gemischt",
+        unknown: "unbekannt",
+    },
+};
 const APPLET_INVALID_ENV_VARS = [
     "BASH_ENV",
     "LD_PRELOAD",
@@ -880,27 +900,7 @@ FlottenmanagementApplet.prototype = {
     },
 
     _stateLabel(scope, value) {
-        const labels = {
-            activity: {
-                running: "laufend",
-                sleeping: "schlafend",
-                mixed: "gemischt",
-                unknown: "unbekannt",
-            },
-            backend: {
-                ok: "ok",
-                degraded: "eingeschränkt",
-                unavailable: "nicht verfügbar",
-                error: "Fehler",
-            },
-            control: {
-                ready: "bereit",
-                blocked: "blockiert",
-                mixed: "gemischt",
-                unknown: "unbekannt",
-            },
-        };
-        return labels[scope]?.[value] || "unbekannt";
+        return APPLET_STATUS_LABELS[scope]?.[value] || "unbekannt";
     },
 
     _setMenuItemText(item, text) {
