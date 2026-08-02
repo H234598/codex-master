@@ -916,6 +916,7 @@ FlottenmanagementApplet.prototype = {
 
     _cleanupStatusResources() {
         let success = true;
+        let statusClean = true;
         if (this._backgroundRefreshSource) {
             try {
                 GLib.source_remove(this._backgroundRefreshSource);
@@ -939,6 +940,7 @@ FlottenmanagementApplet.prototype = {
                 } catch (error) {
                     this._logCleanupError(error);
                     success = false;
+                    statusClean = false;
                 }
             }
             if (state.cancellable && !state.cancellableCancelled) {
@@ -948,6 +950,7 @@ FlottenmanagementApplet.prototype = {
                 } catch (error) {
                     this._logCleanupError(error);
                     success = false;
+                    statusClean = false;
                 }
             }
             if (!state.forceExitCalled && state.process && typeof state.process.force_exit === "function") {
@@ -957,9 +960,10 @@ FlottenmanagementApplet.prototype = {
                 } catch (error) {
                     this._logCleanupError(error);
                     success = false;
+                    statusClean = false;
                 }
             }
-            if (success) {
+            if (statusClean) {
                 this._statusActiveState = null;
                 this._activeStatusProcess = null;
             }

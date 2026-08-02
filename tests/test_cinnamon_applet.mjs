@@ -1888,6 +1888,33 @@ test("removal during stream timeout and pending refresh tears down once", () => 
   assert.equal(fixture.settingsInstances[0].finalizeCount, 1);
 });
 
+test("background cleanup failure does not retain cleaned status process", () => {
+  const fixture = loadApplet();
+  queuePayloadProcess(fixture, samplePayload(), { holdEof: true });
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  fixture.setSetting("background-refresh", true);
+  applet.menu.items[0].activate();
+  const process = fixture.subprocesses[0];
+  const cancellable = applet._statusActiveState.cancellable;
+  const backgroundId = fixture.activeTimers("background")[0].id;
+  const realSourceRemove = fixture.GLib.source_remove;
+  fixture.GLib.source_remove = (id) => {
+    if (id === backgroundId) throw new Error("injected background cleanup failure");
+    return realSourceRemove(id);
+  };
+
+  applet.on_applet_removed_from_panel();
+
+  assert.equal(applet._cleanupComplete, false);
+  assert.equal(process.forceExitCount, 1);
+  assert.equal(cancellable.cancelCount, 1);
+  assert.equal(applet._statusActiveState, null);
+  assert.equal(applet._activeStatusProcess, null);
+  fixture.runTimeouts();
+  assert.equal(applet._backgroundRefreshSource, 0);
+  assert.equal(fixture.activeTimers().length, 0);
+});
+
 test("removal retries a failed force_exit without losing process state", () => {
   const fixture = loadApplet();
   fixture.setProcessFactory(() => {
