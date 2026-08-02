@@ -1799,6 +1799,24 @@ test("background timer registration failure does not prevent applet load", () =>
   assert.match(applet._statusSummaryItem.label, /Konfigurationsfehler/);
 });
 
+test("background timer removal failure cannot keep disabled refresh running", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  fixture.setSetting("background-refresh", true);
+  assert.equal(fixture.activeTimers("background").length, 1);
+  fixture.GLib.source_remove = () => { throw new Error("injected background removal failure"); };
+
+  assert.doesNotThrow(() => fixture.setSetting("background-refresh", false));
+
+  assert.equal(applet._settingsValid, false);
+  assert.equal(applet._backgroundRefreshSource > 0, true);
+  assert.equal(fixture.subprocesses.length, 0);
+  fixture.runTimeouts();
+  assert.equal(applet._backgroundRefreshSource, 0);
+  assert.equal(fixture.activeTimers("background").length, 0);
+  assert.equal(fixture.subprocesses.length, 0);
+});
+
 test("failed refresh keeps last-good visibly stale", () => {
   const fixture = loadApplet();
   const payload = samplePayload();

@@ -225,7 +225,13 @@ FlottenmanagementApplet.prototype = {
 
     _restartBackgroundRefresh() {
         if (this._backgroundRefreshSource) {
-            GLib.source_remove(this._backgroundRefreshSource);
+            try {
+                GLib.source_remove(this._backgroundRefreshSource);
+            } catch (error) {
+                this._settingsValid = false;
+                this._logCleanupError(error);
+                return;
+            }
             this._backgroundRefreshSource = 0;
         }
         if (this._removed || !this._settingsValid || !this.backgroundRefresh) return;
@@ -234,7 +240,10 @@ FlottenmanagementApplet.prototype = {
                 GLib.PRIORITY_DEFAULT,
                 this.refreshIntervalSeconds,
                 () => {
-                    if (this._removed) return GLib.SOURCE_REMOVE;
+                    if (this._removed || !this._settingsValid || !this.backgroundRefresh) {
+                        this._backgroundRefreshSource = 0;
+                        return GLib.SOURCE_REMOVE;
+                    }
                     this._refreshStatus();
                     return GLib.SOURCE_CONTINUE;
                 }
