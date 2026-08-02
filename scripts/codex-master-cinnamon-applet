@@ -398,20 +398,30 @@ def install(*, dry_run: bool, no_reload: bool) -> dict[str, Any]:
     directories, manifest = validate_source(source)
     target = target_directory()
     backup = rollback_directory(target)
+    retired_backup = target.parent / f".{UUID}.retired"
     ensure_real_directory_chain(target.parent, create=False)
     if lexical_exists(target):
         scan_tree(target, "installed applet")
     if lexical_exists(backup):
         scan_tree(backup, "rollback applet")
+    if lexical_exists(retired_backup):
+        scan_tree(retired_backup, "unfinished rollback rotation")
+        raise InstallerError("unfinished rollback rotation exists")
     if dry_run:
         return {"ok": True, "action": "install", "dry_run": True, "uuid": UUID}
 
     ensure_real_directory_chain(target.parent, create=True)
     stage = stage_source(source, target.parent, directories, manifest)
     had_previous = lexical_exists(target)
+    retired_backup_active = False
+    deployment_succeeded = False
+    install_error: Exception | None = None
     try:
         if lexical_exists(backup):
-            remove_validated_tree(backup, "rollback applet")
+            if lexical_exists(retired_backup):
+                raise InstallerError("retired rollback path already exists")
+            retired_backup_active = True
+            os.replace(backup, retired_backup)
         if had_previous:
             os.replace(target, backup)
         try:
@@ -437,9 +447,30 @@ def install(*, dry_run: bool, no_reload: bool) -> dict[str, Any]:
                         "installation failed; previous applet was restored but could not be reloaded"
                     ) from recovery_error
             raise
+        deployment_succeeded = True
+    except Exception as exc:
+        install_error = exc
+        raise
     finally:
-        if stage != Path() and lexical_exists(stage):
-            remove_validated_tree(stage, "staged applet")
+        cleanup_errors: list[Exception] = []
+        try:
+            if stage != Path() and lexical_exists(stage):
+                remove_validated_tree(stage, "staged applet")
+        except Exception as exc:
+            cleanup_errors.append(exc)
+        try:
+            if retired_backup_active and lexical_exists(retired_backup):
+                if deployment_succeeded:
+                    remove_validated_tree(retired_backup, "retired rollback applet")
+                elif not lexical_exists(backup):
+                    os.replace(retired_backup, backup)
+        except Exception as exc:
+            cleanup_errors.append(exc)
+        if cleanup_errors:
+            if install_error is None:
+                raise cleanup_errors[0]
+            for cleanup_error in cleanup_errors:
+                install_error.add_note(f"installer cleanup also failed: {cleanup_error}")
     return {"ok": True, "action": "install", "dry_run": False, "uuid": UUID, "rollback": had_previous}
 
 

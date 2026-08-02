@@ -145,6 +145,7 @@ else:
 
     def test_install_stages_exact_tree_keeps_one_backup_and_uses_fixed_dbus(self) -> None:
         self._write_tree(self.target, "old")
+        self._write_tree(self.backup, "older")
 
         result = self._run("install")
 
@@ -153,12 +154,123 @@ else:
         self.assertIn(b"old", (self.backup / "applet.js").read_bytes())
         backups = list(self.target.parent.glob(f"{UUID}.rollback*"))
         self.assertEqual(backups, [self.backup])
+        self.assertEqual(list(self.target.parent.glob(f".{UUID}.retired*")), [])
         calls = [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
         joined = "\n".join(" ".join(call) for call in calls)
         self.assertIn(f"org.Cinnamon.ReloadXlet {UUID} APPLET", joined)
         self.assertIn("org.Cinnamon.GetRunningXletUUIDs applet", joined)
         self.assertNotIn("RestartCinnamon", joined)
         self.assertNotIn("Eval", joined)
+
+    def test_failed_backup_rotation_preserves_existing_rollback(self) -> None:
+        self._write_tree(self.target, "current")
+        self._write_tree(self.backup, "known-good")
+        module = self._load_tool_module()
+        real_replace = module.os.replace
+
+        def fail_rotation(source, destination):
+            if Path(source) == self.target and Path(destination) == self.backup:
+                raise OSError("injected rename failure")
+            return real_replace(source, destination)
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            with mock.patch.object(module.os, "replace", side_effect=fail_rotation):
+                with self.assertRaises(OSError):
+                    module.install(dry_run=False, no_reload=True)
+
+        self.assertIn("current", (self.target / "applet.js").read_text(encoding="utf-8"))
+        self.assertIn("known-good", (self.backup / "applet.js").read_text(encoding="utf-8"))
+        self.assertEqual(list(self.target.parent.glob(f".{UUID}.*")), [])
+
+    def test_cleanup_failure_does_not_mask_install_error(self) -> None:
+        self._write_tree(self.target, "current")
+        self._write_tree(self.backup, "known-good")
+        retired = self.target.parent / f".{UUID}.retired"
+        module = self._load_tool_module()
+        real_replace = module.os.replace
+
+        def fail_rotation_and_restore(source, destination):
+            source = Path(source)
+            destination = Path(destination)
+            if source == self.target and destination == self.backup:
+                raise OSError("primary rotation failure")
+            if source == retired and destination == self.backup:
+                raise OSError("cleanup restore failure")
+            return real_replace(source, destination)
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            with mock.patch.object(module.os, "replace", side_effect=fail_rotation_and_restore):
+                with self.assertRaisesRegex(OSError, "primary rotation failure") as caught:
+                    module.install(dry_run=False, no_reload=True)
+
+        self.assertIn("cleanup restore failure", "\n".join(caught.exception.__notes__))
+        self.assertIn("current", (self.target / "applet.js").read_text(encoding="utf-8"))
+        self.assertIn("known-good", (retired / "applet.js").read_text(encoding="utf-8"))
+        self.assertFalse(self.backup.exists())
+
+    def test_failed_stage_promotion_preserves_existing_rollback(self) -> None:
+        self._write_tree(self.target, "current")
+        self._write_tree(self.backup, "known-good")
+        module = self._load_tool_module()
+        real_replace = module.os.replace
+
+        def fail_promotion(source, destination):
+            source = Path(source)
+            if Path(destination) == self.target and source.name.startswith(f".{UUID}.staging-"):
+                raise OSError("injected promotion failure")
+            return real_replace(source, destination)
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            with mock.patch.object(module.os, "replace", side_effect=fail_promotion):
+                with self.assertRaises(OSError):
+                    module.install(dry_run=False, no_reload=True)
+
+        self.assertIn("current", (self.target / "applet.js").read_text(encoding="utf-8"))
+        self.assertIn("known-good", (self.backup / "applet.js").read_text(encoding="utf-8"))
+        self.assertEqual(list(self.target.parent.glob(f".{UUID}.*")), [])
+
+    def test_failed_deployment_preserves_existing_rollback(self) -> None:
+        self._write_tree(self.target, "current")
+        self._write_tree(self.backup, "known-good")
+
+        result = self._run("install", mode="reload-fail")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("current", (self.target / "applet.js").read_text(encoding="utf-8"))
+        self.assertIn("known-good", (self.backup / "applet.js").read_text(encoding="utf-8"))
+        self.assertEqual(list(self.target.parent.glob(f".{UUID}.retired*")), [])
+
+    def test_restore_failure_preserves_retired_rollback_for_recovery(self) -> None:
+        self._write_tree(self.target, "current")
+        self._write_tree(self.backup, "known-good")
+        module = self._load_tool_module()
+        real_remove = module.remove_validated_tree
+
+        def fail_failed_target_removal(path, label):
+            if label == "failed installed applet":
+                raise module.InstallerError("injected restore failure")
+            return real_remove(path, label)
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            with mock.patch.object(module, "verify_files", side_effect=module.InstallerError("injected")):
+                with mock.patch.object(module, "remove_validated_tree", side_effect=fail_failed_target_removal):
+                    with self.assertRaises(module.InstallerError):
+                        module.install(dry_run=False, no_reload=True)
+
+        self.assertIn("new", (self.target / "applet.js").read_text(encoding="utf-8"))
+        self.assertIn("current", (self.backup / "applet.js").read_text(encoding="utf-8"))
+        retired = self.target.parent / f".{UUID}.retired"
+        self.assertIn("known-good", (retired / "applet.js").read_text(encoding="utf-8"))
+
+    def test_unfinished_rollback_rotation_fails_closed(self) -> None:
+        retired = self.target.parent / f".{UUID}.retired"
+        self._write_tree(retired, "unfinished")
+
+        result = self._run("install", "--dry-run")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unfinished", (retired / "applet.js").read_text(encoding="utf-8"))
+        self.assertFalse(self.target.exists())
 
     def test_no_reload_install_and_verify_behave_separately(self) -> None:
         install = self._run("install", "--no-reload")
