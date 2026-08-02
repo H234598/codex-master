@@ -479,8 +479,16 @@ FlottenmanagementApplet.prototype = {
         let applied = false;
         if (!state.timedOut && !state.waitFailed && !state.streamFailed && !state.stdoutLimitExceeded && !state.stderrLimitExceeded) {
             const payload = state.process ? this._collectProcessPayload(state) : null;
-            if (payload && state.process.get_successful()) {
-                applied = this._maybeApplyStatusPayload(payload);
+            if (payload) {
+                let processSuccessful = false;
+                try {
+                    processSuccessful = state.process.get_successful();
+                } catch (_error) {
+                    processSuccessful = false;
+                }
+                if (processSuccessful) {
+                    applied = this._maybeApplyStatusPayload(payload);
+                }
             }
         }
         if (!applied) this._markRefreshFailed();

@@ -1505,6 +1505,44 @@ test("pipe accessor exceptions fail closed and refresh recovers", async () => {
   assert.equal(applet._statusLastGood.schema_version, 1);
 });
 
+test("process success accessor exceptions fail closed and pending refresh recovers", async () => {
+  const fixture = loadApplet();
+  fixture.setProcessFactory(() => ({
+    forceExitCount: 0,
+    waitCallbacks: [],
+    get_stdout_pipe() {
+      return fixture.makeStream([makeBytes(JSON.stringify(samplePayload()))]);
+    },
+    get_stderr_pipe() { return fixture.makeStream([new Uint8Array()]); },
+    get_successful() { throw new Error("injected process success failure"); },
+    force_exit() { this.forceExitCount += 1; },
+    wait_async(_, cb) { this.waitCallbacks.push(cb); },
+    wait_finish() {},
+    emitDone() {
+      const callbacks = [...this.waitCallbacks];
+      this.waitCallbacks = [];
+      for (const callback of callbacks) callback(this, null);
+    },
+  }));
+
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const statusItem = applet.menu.items[0];
+  statusItem.activate();
+  const failedProcess = fixture.subprocesses[0];
+  queuePayloadProcess(fixture, samplePayload());
+  statusItem.activate();
+
+  assert.doesNotThrow(() => failedProcess.emitDone());
+  await Promise.resolve();
+  assert.equal(fixture.subprocesses.length, 2);
+  assert.equal(applet._statusViewState, "initializing");
+
+  fixture.subprocesses[1].emitDone();
+  await Promise.resolve();
+  assert.equal(applet._statusLastGood.schema_version, 1);
+  assert.equal(applet._statusViewState, "ready");
+});
+
 test("reader exceptions set streamFailed, force_exit once, and finalize", async () => {
   const fixture = loadApplet();
   const payload = makeBytes(JSON.stringify(samplePayload()));
