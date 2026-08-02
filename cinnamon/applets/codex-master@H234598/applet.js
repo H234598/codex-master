@@ -228,7 +228,7 @@ FlottenmanagementApplet.prototype = {
             if (this._statusInFlight) this._statusPendingRefresh = true;
         }
         this._restartBackgroundRefresh();
-        this._renderStatus();
+        this._renderStatusSafely();
     },
 
     _onSettingsChanged() {
@@ -327,7 +327,7 @@ FlottenmanagementApplet.prototype = {
         this._statusActiveGeneration = generation;
         this._statusInFlight = true;
         this._statusViewState = this._statusLastGood ? "refreshing" : "initializing";
-        this._renderStatus();
+        this._renderStatusSafely();
 
         const requestForceExit = (stateArg) => {
             if (stateArg.forceExitCalled || !stateArg.process) return true;
@@ -629,8 +629,7 @@ FlottenmanagementApplet.prototype = {
         }
         this._statusLastGood = payload;
         this._statusViewState = "ready";
-        this._renderStatus();
-        return true;
+        return this._renderStatusSafely();
     },
 
     _isValidAppletStatusPayload(payload) {
@@ -765,7 +764,7 @@ FlottenmanagementApplet.prototype = {
     _markRefreshFailed() {
         if (this._removed) return;
         this._statusViewState = this._statusLastGood ? "stale" : "unavailable";
-        this._renderStatus();
+        this._renderStatusSafely();
     },
 
     _stateLabel(scope, value) {
@@ -804,6 +803,16 @@ FlottenmanagementApplet.prototype = {
         if (visible && typeof actor.show === "function") actor.show();
         else if (!visible && typeof actor.hide === "function") actor.hide();
         else actor.visible = visible;
+    },
+
+    _renderStatusSafely() {
+        try {
+            this._renderStatus();
+            return true;
+        } catch (error) {
+            this._logCleanupError(error);
+            return false;
+        }
     },
 
     _renderStatus() {
