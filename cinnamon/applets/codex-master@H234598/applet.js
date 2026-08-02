@@ -363,15 +363,29 @@ FlottenmanagementApplet.prototype = {
                                 return;
                             }
 
-                            const data = packet.get_data ? packet.get_data() : null;
-                            const size = packet.get_size ? packet.get_size() : (data ? data.length : 0);
+                            let data = null;
+                            let size = 0;
+                            let bytes = null;
+                            try {
+                                data = packet.get_data ? packet.get_data() : null;
+                                size = packet.get_size ? packet.get_size() : (data ? data.length : 0);
+                                bytes = data && size > 0
+                                    ? (data instanceof Uint8Array ? data : Uint8Array.from(data))
+                                    : null;
+                            } catch (_error) {
+                                stateArg.streamFailed = true;
+                                stateArg[doneKey] = true;
+                                requestForceExit(stateArg);
+                                this._markRefreshFailed();
+                                attemptFinalize(stateArg);
+                                return;
+                            }
                             if (!data || size <= 0) {
                                 stateArg[doneKey] = true;
                                 attemptFinalize(stateArg);
                                 return;
                             }
 
-                            const bytes = data instanceof Uint8Array ? data : Uint8Array.from(data);
                             const take = Math.max(0, limit - stateArg[bytesKey].length);
                             const exceedsLimit = bytes.length > take;
                             if (take > 0) {

@@ -1468,6 +1468,59 @@ test("invalid utf8 byte in stdout is rejected even if JSON shape stays parseable
   assert.equal(applet._statusLastGood, null);
 });
 
+test("packet accessor exceptions fail closed and refresh recovers", async () => {
+  const fixture = loadApplet();
+  const brokenStream = {
+    callback: null,
+    read_bytes_async(_size, _priority, _cancellable, callback) {
+      this.callback = callback;
+    },
+    read_bytes_finish() {
+      return {
+        get_data() { throw new Error("injected packet data failure"); },
+        get_size() { return 1; },
+      };
+    },
+    emitPacket() {
+      const callback = this.callback;
+      this.callback = null;
+      callback(this, {});
+    },
+  };
+  fixture.setProcessFactory(() => ({
+    forceExitCount: 0,
+    waitCallbacks: [],
+    get_stdout_pipe() { return brokenStream; },
+    get_stderr_pipe() { return fixture.makeStream([new Uint8Array()]); },
+    get_successful: () => false,
+    force_exit() { this.forceExitCount += 1; },
+    wait_async(_, cb) { this.waitCallbacks.push(cb); },
+    wait_finish() {},
+    emitDone() {
+      const callbacks = [...this.waitCallbacks];
+      this.waitCallbacks = [];
+      for (const callback of callbacks) callback(this, null);
+    },
+  }));
+
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const statusItem = applet.menu.items[0];
+
+  assert.doesNotThrow(() => statusItem.activate());
+  assert.doesNotThrow(() => brokenStream.emitPacket());
+  fixture.subprocesses[0].emitDone();
+  await Promise.resolve();
+  assert.equal(fixture.subprocesses[0].forceExitCount, 1);
+  assert.equal(applet._statusActiveState, null);
+  assert.equal(applet._statusInFlight, false);
+
+  queuePayloadProcess(fixture, samplePayload());
+  statusItem.activate();
+  fixture.subprocesses[1].emitDone();
+  await Promise.resolve();
+  assert.equal(applet._statusLastGood.schema_version, 1);
+});
+
 test("pipe accessor exceptions fail closed and refresh recovers", async () => {
   const fixture = loadApplet();
   fixture.setProcessFactory(() => ({
