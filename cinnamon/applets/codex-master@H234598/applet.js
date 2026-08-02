@@ -292,9 +292,9 @@ FlottenmanagementApplet.prototype = {
         if (this._removed) return;
 
         const generation = ++this._statusGeneration;
-        const argv = this._trackedStatusArgv();
         let process;
         try {
+            const argv = this._trackedStatusArgv();
             const launcher = Gio.SubprocessLauncher.new(
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
             );

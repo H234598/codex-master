@@ -712,6 +712,20 @@ test("builds fixed mcp argv and validierte ids", async () => {
   }
 });
 
+test("argv preparation failure stays inside refresh callback", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  fixture.GLib.get_home_dir = () => { throw new Error("injected home lookup failure"); };
+
+  assert.doesNotThrow(() => applet.menu.items[0].activate());
+
+  assert.equal(fixture.launcherSpawns.length, 0);
+  assert.equal(fixture.subprocesses.length, 0);
+  assert.equal(applet._statusInFlight, false);
+  assert.equal(applet._statusActiveState, null);
+  assert.equal(applet._statusViewState, "unavailable");
+});
+
 test("single-flight keeps one pending refresh", async () => {
   const fixture = loadApplet();
   fixture.setHome("/tmp/home");
