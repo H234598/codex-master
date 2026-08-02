@@ -297,11 +297,16 @@ Fehler bleiben begrenzt und redigiert.
 Native Subagentinnen sind davon getrennt: deren Steuerung ist Assignment-
 Prompt-Policy (inklusive frischem Ressourcencheck vor weiterem Spawn). Sie ist
 nicht technisch erzwungen. Der Masterjet kann eine native Codex-Delegation
-nicht intercepten. Ein zukuenftiges VM-Backend braucht vor einem Angebot mindestens
-einen versionierten Backend-Vertrag, gegenseitige Authentisierung, explizite
-Netzwerk- und Identity-Grenzen, attestierte fail-closed Telemetrie,
-reservierungsfaehige Leases sowie begrenztes und redigiertes Audit-Logging.
-Bis dahin bleibt es vollstaendig weggelassen.
+nicht intercepten. `developer_vm` darf erst offerable werden, wenn alle
+folgenden Voraussetzungen erfuellt sind:
+
+- real reachability/health probe against the actual VM
+- authenticated transport and host-key verification/pinning
+- distributed leases/reservations across hosts
+- bounded remote execution (timeouts and bounded output)
+- end-to-end integration testing against the real target
+
+Bis dahin bleibt ein VM-Backend vollstaendig weggelassen.
 
 ```sh
 cd /home/teladi/codex-master

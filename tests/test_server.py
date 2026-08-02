@@ -230,6 +230,16 @@ class ServerHelpersTest(unittest.TestCase):
             with self.subTest(term=term):
                 self.assertIn(term, readme)
 
+        for prerequisite in (
+            "real reachability/health probe against the actual VM",
+            "authenticated transport and host-key verification/pinning",
+            "distributed leases/reservations across hosts",
+            "bounded remote execution (timeouts and bounded output)",
+            "end-to-end integration testing against the real target",
+        ):
+            with self.subTest(vm_prerequisite=prerequisite):
+                self.assertIn(prerequisite, readme)
+
     def test_spawn_offers_omit_unimplemented_routes(self) -> None:
         with patch.dict(
             os.environ,
