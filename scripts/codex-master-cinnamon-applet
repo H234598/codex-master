@@ -293,8 +293,8 @@ def kill_and_wait(process: subprocess.Popen[bytes]) -> None:
         process.kill()
         try:
             process.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            return
+        except subprocess.TimeoutExpired as exc:
+            raise InstallerError("gdbus process could not be reaped") from exc
 
 
 def cleanup_process(

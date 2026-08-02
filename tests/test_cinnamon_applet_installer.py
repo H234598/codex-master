@@ -714,7 +714,8 @@ else:
 
         process = StubbornProcess()
 
-        module.kill_and_wait(process)
+        with self.assertRaisesRegex(module.InstallerError, "gdbus process could not be reaped"):
+            module.kill_and_wait(process)
 
         self.assertEqual(process.kill_count, 2)
         self.assertEqual(process.wait_timeouts, [1, 1])
