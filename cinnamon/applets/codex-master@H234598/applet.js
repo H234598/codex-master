@@ -330,6 +330,8 @@ FlottenmanagementApplet.prototype = {
             exitConfirmed: false,
             exitWaitInFlight: false,
             exitWaitAttempts: 0,
+            exitWaitCancellable: null,
+            exitWaitCancellableCancelled: false,
             stdoutDone: false,
             stderrDone: false,
             stdoutChunks: [],
@@ -406,10 +408,19 @@ FlottenmanagementApplet.prototype = {
         const ensureExitWait = (stateArg) => {
             if (stateArg.finalizing || stateArg.exitConfirmed || stateArg.exitWaitInFlight || !stateArg.process) return;
             if (typeof stateArg.process.wait_async !== "function") return;
+            if (!stateArg.exitWaitCancellable) {
+                try {
+                    stateArg.exitWaitCancellable = Gio.Cancellable ? new Gio.Cancellable() : null;
+                } catch (error) {
+                    this._logCleanupError(error);
+                    return;
+                }
+            }
+            if (!stateArg.exitWaitCancellable || stateArg.exitWaitCancellableCancelled) return;
             stateArg.exitWaitInFlight = true;
             stateArg.exitWaitAttempts += 1;
             try {
-                stateArg.process.wait_async(null, (_proc, result) => {
+                stateArg.process.wait_async(stateArg.exitWaitCancellable, (_proc, result) => {
                     try {
                         if (typeof stateArg.process.wait_finish === "function") {
                             stateArg.process.wait_finish(result);
@@ -420,6 +431,11 @@ FlottenmanagementApplet.prototype = {
                         stateArg.waitFailed = true;
                     }
                     stateArg.exitWaitInFlight = false;
+                    if (stateArg.finalizing) {
+                        stateArg.exitWaitCancellable = null;
+                        return;
+                    }
+                    if (stateArg.exitConfirmed) stateArg.exitWaitCancellable = null;
                     if (
                         !stateArg.exitConfirmed
                         && !stateArg.timeoutSource
@@ -1100,6 +1116,16 @@ FlottenmanagementApplet.prototype = {
                 try {
                     state.cancellable.cancel();
                     state.cancellableCancelled = true;
+                } catch (error) {
+                    this._logCleanupError(error);
+                    success = false;
+                    statusClean = false;
+                }
+            }
+            if (state.exitWaitCancellable && !state.exitWaitCancellableCancelled) {
+                try {
+                    state.exitWaitCancellable.cancel();
+                    state.exitWaitCancellableCancelled = true;
                 } catch (error) {
                     this._logCleanupError(error);
                     success = false;

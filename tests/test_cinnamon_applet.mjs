@@ -2118,6 +2118,52 @@ test("cancelled stream failure waits for a successful kill retry", () => {
   assert.equal(fixture.activeTimers("timeout").length, 0);
 });
 
+test("removal cancels an in-flight replacement wait", () => {
+  const fixture = loadApplet();
+  fixture.setProcessFactory(() => {
+    const stdout = fixture.makeStream([], true);
+    const stderr = fixture.makeStream([], true);
+    return {
+      waitCallbacks: [],
+      waitCancellables: [],
+      stdout,
+      stderr,
+      get_stdout_pipe() { return stdout; },
+      get_stderr_pipe() { return stderr; },
+      get_successful: () => false,
+      force_exit() {},
+      wait_async(cancellable, callback) {
+        this.waitCancellables.push(cancellable);
+        this.waitCallbacks.push(callback);
+      },
+      wait_finish() {
+        throw new Error("injected cancelled wait");
+      },
+      emitOneWait() {
+        const callback = this.waitCallbacks.shift();
+        callback(this, null);
+      },
+    };
+  });
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  applet.menu.items[0].activate();
+  const process = fixture.subprocesses[0];
+
+  process.emitOneWait();
+  assert.equal(process.waitCallbacks.length, 1, "replacement wait remains in flight");
+  const replacementCancellable = process.waitCancellables[1];
+  assert.ok(replacementCancellable, "replacement wait must be cancellable");
+
+  applet.on_applet_removed_from_panel();
+
+  assert.equal(replacementCancellable.cancelCount, 1);
+  assert.equal(applet._statusActiveState, null);
+  assert.equal(fixture.activeTimers().length, 0);
+  process.emitOneWait();
+  assert.equal(process.waitCallbacks.length, 0, "cancel callback starts no replacement wait");
+  assert.equal(fixture.subprocesses.length, 1, "cancel callback starts no refresh");
+});
+
 test("task 5 settings schema contains exactly four bounded settings", () => {
   const schemaPath = path.join(root, "cinnamon/applets/codex-master@H234598/settings-schema.json");
   const schema = JSON.parse(fs.readFileSync(schemaPath, "utf8"));
