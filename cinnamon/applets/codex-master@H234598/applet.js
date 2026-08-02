@@ -21,6 +21,7 @@ const DEFAULT_REFRESH_INTERVAL_SECONDS = 60;
 const MIN_REFRESH_INTERVAL_SECONDS = 15;
 const MAX_REFRESH_INTERVAL_SECONDS = 3600;
 const MAX_TRACKED_AGENTS = 6;
+const APPLET_SAFE_PATH = "/usr/bin:/bin";
 const APPLET_STATUS_COMMAND = "applet-status";
 const APPLET_STATUS_REQUIRED_FIELDS = [
     "schema_version", "mode", "activity_state", "backend_state", "control_state", "counts", "agents", "raw_output",
@@ -54,6 +55,7 @@ const APPLET_STATUS_VALID_STRINGS = {
     },
 };
 const APPLET_INVALID_ENV_VARS = [
+    "BASH_ENV",
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
     "PYTHONPATH",
@@ -441,6 +443,7 @@ FlottenmanagementApplet.prototype = {
     },
 
     _sanitizeLauncherEnvironment(launcher) {
+        launcher.setenv("PATH", APPLET_SAFE_PATH, true);
         for (const key of APPLET_INVALID_ENV_VARS) {
             if (typeof launcher.unsetenv === "function") {
                 launcher.unsetenv(key);

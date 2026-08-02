@@ -347,7 +347,12 @@ function loadApplet() {
       const process = factory
         ? factory(argv)
         : new FakeSubprocess({ argv, stdout: [], stderr: [] });
-      this.spawnRequests.push({ argv, unsetCalls: [...this.unsetCalls], process });
+      this.spawnRequests.push({
+        argv,
+        envCalls: [...this.envCalls],
+        unsetCalls: [...this.unsetCalls],
+        process,
+      });
       launcherSpawns.push(this.spawnRequests.at(-1));
       subprocesses.push(process);
       return process;
@@ -632,7 +637,10 @@ test("builds fixed mcp argv and validierte ids", async () => {
   assert.equal(launch.argv[1], "applet-status");
   assert.equal(launch.argv[2], "a1");
   assert.equal(launch.argv[3], "b1");
-  for (const key of ["LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONHOME", "GJS_PATH"]) {
+  assert.deepEqual(Array.from(launch.envCalls), [
+    { key: "PATH", value: "/usr/bin:/bin", overwrite: true },
+  ]);
+  for (const key of ["BASH_ENV", "LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONHOME", "GJS_PATH"]) {
     assert.ok(launch.unsetCalls.includes(key), `strips ${key}`);
   }
 });
