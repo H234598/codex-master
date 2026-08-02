@@ -1106,6 +1106,7 @@ FlottenmanagementApplet.prototype = {
     _cleanupStatusResources() {
         let success = true;
         let statusClean = true;
+        this._statusLastGood = null;
         if (this._backgroundRefreshSource) {
             try {
                 GLib.source_remove(this._backgroundRefreshSource);
