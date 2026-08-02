@@ -7062,6 +7062,7 @@ def assignment_prompt(
     name: str | None,
     model: str,
     allow_subagents: bool,
+    subagent_admission: dict[str, Any] | None,
     requires_search: bool = False,
     live_data_topic: str | None = None,
 ) -> str:
@@ -7078,6 +7079,34 @@ def assignment_prompt(
             "Wenn aktuelle Daten nicht verfuegbar sind, nicht raten; als Tooling-/Zugriffslimit berichten.",
         ]
     search_block = bullet_block(search_lines)
+    subagents_permitted = bool(
+        allow_subagents
+        and isinstance(subagent_admission, dict)
+        and subagent_admission.get("allowed") is True
+    )
+    subagent_reason_codes = (
+        [
+            reason
+            for reason in subagent_admission.get("reason_codes", [])
+            if isinstance(reason, str) and reason in RESOURCE_REASON_CODES
+        ]
+        if isinstance(subagent_admission, dict) and isinstance(subagent_admission.get("reason_codes"), list)
+        else []
+    )
+    subagent_permission = "Darf eigene Subagentinnen starten: nein"
+    if subagents_permitted:
+        scope_limit = "nur lesend im Scope" if role == "exploriererin" else "nur innerhalb Scope und Schreibpfaden"
+        subagent_permission = f"Darf eigene Subagentinnen starten: ja, {scope_limit}"
+    subagent_lines = [subagent_permission]
+    if subagents_permitted:
+        subagent_lines.extend(
+            [
+                "Vor jedem weiteren Spawn CPU- und RAM-Druck frisch pruefen.",
+                "Bei Messfehler nicht spawnen.",
+            ]
+        )
+    elif allow_subagents and subagent_reason_codes:
+        subagent_lines.append(f"Ressourcenfreigabe: {', '.join(subagent_reason_codes)}")
 
     if role == "exploriererin":
         return "\n".join(
@@ -7089,7 +7118,7 @@ def assignment_prompt(
                 f"Skill: {skill_line}",
                 f"Scope:\n{bullet_block(scope)}",
                 "Darf schreiben: nein",
-                f"Darf eigene Subagentinnen starten: {'ja, nur lesend im Scope' if allow_subagents else 'nein'}",
+                *subagent_lines,
                 f"Web-/Live-Daten:\n{search_block}",
                 f"Stabiler Kontext:\n{bullet_block(context)}",
                 f"Aufgabe: {task}",
@@ -7107,7 +7136,7 @@ def assignment_prompt(
             f"Skill: {skill_line}",
             f"Scope:\n{bullet_block(scope)}",
             f"Darf schreiben: ja, nur:\n{bullet_block(write_paths)}",
-            f"Darf eigene Subagentinnen starten: {'ja, nur innerhalb Scope und Schreibpfaden' if allow_subagents else 'nein'}",
+            *subagent_lines,
             f"Web-/Live-Daten:\n{search_block}",
             f"Stabiler Kontext:\n{bullet_block(context)}",
             f"Aktuelle Aufgabe: {task}",
@@ -7264,6 +7293,21 @@ def _assign_agent_unlocked(
         if model == WRITE_AGENT_MODEL
         else DEFAULT_AGENT_MODEL_EFFORT
     )
+    subagent_admission = spawn_admission_decision(1) if allow_subagents else None
+    subagents_permitted = bool(
+        allow_subagents
+        and isinstance(subagent_admission, dict)
+        and subagent_admission.get("allowed") is True
+    )
+    subagent_reason_codes = (
+        [
+            reason
+            for reason in subagent_admission.get("reason_codes", [])
+            if isinstance(reason, str) and reason in RESOURCE_REASON_CODES
+        ]
+        if isinstance(subagent_admission, dict) and isinstance(subagent_admission.get("reason_codes"), list)
+        else []
+    )
     prompt = assignment_prompt(
         agent=agent,
         role=role,
@@ -7276,6 +7320,7 @@ def _assign_agent_unlocked(
         name=name,
         model=model,
         allow_subagents=allow_subagents,
+        subagent_admission=subagent_admission,
         requires_search=requires_search,
         live_data_topic=live_data_topic,
     )
@@ -7323,7 +7368,13 @@ def _assign_agent_unlocked(
         "context_count": len(context),
         "forbidden_count": len(forbidden),
         "write_policy": "read_only" if role == "exploriererin" else "explicit_paths_only",
-        "allow_subagents": allow_subagents,
+        "allow_subagents": subagents_permitted,
+        "subagents": {
+            "requested": allow_subagents,
+            "permitted": subagents_permitted,
+            "policy": "resource_and_assignment_gated",
+            "reason_codes": subagent_reason_codes,
+        },
         "requires_search": requires_search,
         "live_data": {
             "required": requires_search,
@@ -7366,7 +7417,7 @@ def _assign_agent_unlocked(
         "scope_count": len(scope),
         "write_policy": "read_only" if role == "exploriererin" else "explicit_paths_only",
         "write_path_count": len(write_paths),
-        "subagents_allowed": allow_subagents,
+        "subagents_allowed": subagents_permitted,
         "requires_search": requires_search,
         "live_data": {
             "required": requires_search,
@@ -7413,6 +7464,7 @@ def sanitize_assignment_record(record: dict[str, Any]) -> dict[str, Any]:
             "forbidden_count",
             "write_policy",
             "allow_subagents",
+            "subagents",
             "requires_search",
             "live_data",
             "lease",
@@ -7445,7 +7497,8 @@ def sanitize_assignment_record(record: dict[str, Any]) -> dict[str, Any]:
             "raw_output",
         ),
         "skill": ("requested", "available", "match_count"),
-            "live_data": ("required", "topic_state", "raw_output"),
+        "subagents": ("requested", "permitted", "policy", "reason_codes"),
+        "live_data": ("required", "topic_state", "raw_output"),
         "lease": (
             "state",
             "holder",
@@ -7468,6 +7521,12 @@ def sanitize_assignment_record(record: dict[str, Any]) -> dict[str, Any]:
                 safe_value[nested_key] = "not_returned"
             elif isinstance(nested_value, str):
                 safe_value[nested_key] = redact(nested_value)[0]
+            elif nested_key == "reason_codes" and isinstance(nested_value, list):
+                safe_value[nested_key] = [
+                    reason
+                    for reason in nested_value
+                    if isinstance(reason, str) and reason in RESOURCE_REASON_CODES
+                ]
             elif nested_value is None or isinstance(nested_value, (bool, int)):
                 safe_value[nested_key] = nested_value
         sanitized[key] = safe_value

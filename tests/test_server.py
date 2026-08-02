@@ -101,6 +101,7 @@ from codex_master.server import (
     public_error_payload,
     agent_auth_status,
     assignment_report,
+    assignment_prompt,
     assign_agent,
     interrupt_agent,
     mcp_command_startup_self_test,
@@ -4972,6 +4973,102 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIsNone(result["routing"])
         self.assertEqual(record.call_args.args[0]["model"], DEFAULT_AGENT_MODEL)
         self.assertNotIn("routing", record.call_args.args[0])
+
+    def test_subagent_admission_denies_requested_subagents_in_prompt(self) -> None:
+        prompt = assignment_prompt(
+            agent="a1",
+            role="exploriererin",
+            task="Inspect src",
+            scope=["src"],
+            skill=None,
+            write_paths=[],
+            context=[],
+            forbidden=[],
+            name="Mila",
+            model=DEFAULT_AGENT_MODEL,
+            allow_subagents=True,
+            subagent_admission={
+                "allowed": False,
+                "reason_codes": ["memory_pressure_high", "private_snapshot=1024"],
+                "available_memory_mib": 1024,
+            },
+        )
+
+        self.assertIn("Darf eigene Subagentinnen starten: nein", prompt)
+        self.assertIn("memory_pressure_high", prompt)
+        self.assertNotIn("private_snapshot=1024", prompt)
+        self.assertNotIn("available_memory_mib", prompt)
+
+    def test_subagent_admission_allows_fresh_checks_in_prompt(self) -> None:
+        prompt = assignment_prompt(
+            agent="a1",
+            role="exploriererin",
+            task="Inspect src",
+            scope=["src"],
+            skill=None,
+            write_paths=[],
+            context=[],
+            forbidden=[],
+            name="Mila",
+            model=DEFAULT_AGENT_MODEL,
+            allow_subagents=True,
+            subagent_admission={"allowed": True, "reason_codes": []},
+        )
+
+        self.assertIn("Vor jedem weiteren Spawn CPU- und RAM-Druck frisch pruefen", prompt)
+        self.assertIn("Bei Messfehler nicht spawnen", prompt)
+
+    def test_subagent_admission_deny_still_sends_and_audits_effective_permission(self) -> None:
+        decision = {
+            "allowed": False,
+            "reason_codes": ["memory_pressure_high", "private_snapshot=1024"],
+            "available_memory_mib": 1024,
+        }
+        lease = {"state": "held", "held_by_this_server": True, "raw_output": "not_returned"}
+        with patch(
+            "codex_master.server.agent_auth_status",
+            return_value={"authenticated": False, "auth_state": "missing"},
+        ), patch(
+            "codex_master.server.ensure_agent_not_blocked_by_codex_usage"
+        ), patch(
+            "codex_master.server.spawn_admission_decision", return_value=decision
+        ) as admission, patch(
+            "codex_master.server.claim_for_agent_mutation", return_value=(lease, True)
+        ), patch(
+            "codex_master.server.ensure_assignment_session_model",
+            return_value={"status": "unchanged", "raw_output": "not_returned"},
+        ), patch("codex_master.server.remember_agent_routing"), patch(
+            "codex_master.server.send_agent",
+            return_value={"status": "sent", "raw_output": "not_returned"},
+        ) as send, patch("codex_master.server.record_assignment") as record:
+            result = assign_agent(
+                "a",
+                role="exploriererin",
+                task="Inspect src",
+                scope=["src"],
+                allow_subagents=True,
+                allow_unauthenticated=True,
+            )
+
+        admission.assert_called_once_with(1)
+        send.assert_called_once()
+        self.assertIn("Darf eigene Subagentinnen starten: nein", send.call_args.args[1])
+        self.assertFalse(result["subagents_allowed"])
+        assignment = record.call_args.args[0]
+        self.assertFalse(assignment["allow_subagents"])
+        self.assertEqual(
+            assignment["subagents"],
+            {
+                "requested": True,
+                "permitted": False,
+                "policy": "resource_and_assignment_gated",
+                "reason_codes": ["memory_pressure_high"],
+            },
+        )
+        audit_text = json.dumps(assignment, sort_keys=True)
+        self.assertNotIn("available_memory_mib", audit_text)
+        self.assertNotIn("private_snapshot=1024", audit_text)
+        self.assertNotIn("[EXPLORER_BEE_TASK]", audit_text)
 
     def test_unauthenticated_assignment_still_honors_usage_block(self) -> None:
         with patch(
@@ -15221,9 +15318,15 @@ class ServerHelpersTest(unittest.TestCase):
         ledger_text = json.dumps(ledger, sort_keys=True)
         self.assertNotIn("Pruefe nur lesend", ledger_text)
 
+    @patch(
+        "codex_master.server.spawn_admission_decision",
+        return_value={"allowed": True, "reason_codes": []},
+    )
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.send_agent")
-    def test_agent_assign_allows_nested_subagents_only_when_explicit(self, mock_send_agent, _mock_alive) -> None:
+    def test_agent_assign_allows_nested_subagents_only_when_explicit(
+        self, mock_send_agent, _mock_alive, _mock_admission
+    ) -> None:
         mock_send_agent.return_value = {"agent": "b", "status": "sent", "response_output": "not_returned"}
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
