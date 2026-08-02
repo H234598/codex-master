@@ -13,6 +13,8 @@ import os
 from typing import Any
 from unittest.mock import Mock, patch
 
+import codex_master.server as server_module
+
 from codex_master.server import (
     AgentError,
     AgentCapacityError,
@@ -551,6 +553,130 @@ class ServerHelpersTest(unittest.TestCase):
                 "reason_codes": ["memory_pressure_high"],
             },
         )
+
+    def test_require_spawn_capacity_returns_decision_or_data_sparse_error(self) -> None:
+        self.assertTrue(hasattr(server_module, "require_spawn_capacity"))
+        allowed = {
+            "allowed": True,
+            "required_slots": 1,
+            "available_slots": 2,
+            "reason_codes": [],
+            "raw_output": "not_returned",
+        }
+        denied = {
+            "allowed": False,
+            "required_slots": 1,
+            "available_slots": 0,
+            "reason_codes": ["running_agent_limit"],
+            "raw_output": "not_returned",
+        }
+
+        with patch("codex_master.server.spawn_admission_decision", return_value=allowed):
+            self.assertEqual(server_module.require_spawn_capacity(), allowed)
+
+        with patch("codex_master.server.spawn_admission_decision", return_value=denied):
+            with self.assertRaises(AgentCapacityError) as raised:
+                server_module.require_spawn_capacity()
+
+        self.assertEqual(
+            raised.exception.payload,
+            {
+                "error_code": "spawn_capacity_unavailable",
+                "retryable": True,
+                "retry_after_seconds": 15,
+                "reason_codes": ["running_agent_limit"],
+            },
+        )
+        self.assertEqual(
+            public_error_payload(raised.exception),
+            {
+                "error": "capacity unavailable",
+                "error_code": "spawn_capacity_unavailable",
+                "retryable": True,
+                "retry_after_seconds": 15,
+                "reason_codes": ["running_agent_limit"],
+            },
+        )
+
+    def test_spawn_admission_lock_rejects_unsafe_lock_paths(self) -> None:
+        self.assertTrue(hasattr(server_module, "spawn_admission_lock"))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            locks = state / "locks"
+            locks.mkdir(parents=True)
+            target = root / "outside.lock"
+            target.write_text("outside", encoding="utf-8")
+            lock_path = locks / "spawn-admission.lock"
+
+            for path_kind in ("symlink", "directory"):
+                with self.subTest(path_kind=path_kind):
+                    if path_kind == "symlink":
+                        lock_path.symlink_to(target)
+                    else:
+                        lock_path.mkdir()
+                    with patch("codex_master.server.STATE_ROOT", state), patch(
+                        "codex_master.server.LOCK_DIR", locks
+                    ):
+                        with self.assertRaises(AgentError):
+                            with server_module.spawn_admission_lock():
+                                pass
+                    if lock_path.is_symlink() or lock_path.is_dir():
+                        if lock_path.is_dir():
+                            lock_path.rmdir()
+                        else:
+                            lock_path.unlink()
+
+    def test_spawn_admission_lock_serializes_parallel_entries(self) -> None:
+        self.assertTrue(hasattr(server_module, "spawn_admission_lock"))
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_attempted = threading.Event()
+        second_entered = threading.Event()
+        order: list[str] = []
+        failures: list[BaseException] = []
+
+        def first() -> None:
+            try:
+                with server_module.spawn_admission_lock():
+                    order.append("first")
+                    first_entered.set()
+                    if not release_first.wait(2):
+                        raise AssertionError("first admission lock was not released")
+            except BaseException as exc:
+                failures.append(exc)
+
+        def second() -> None:
+            try:
+                if not first_entered.wait(2):
+                    raise AssertionError("first admission lock was not acquired")
+                second_attempted.set()
+                with server_module.spawn_admission_lock():
+                    order.append("second")
+                    second_entered.set()
+            except BaseException as exc:
+                failures.append(exc)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ):
+                first_thread = threading.Thread(target=first)
+                second_thread = threading.Thread(target=second)
+                first_thread.start()
+                self.assertTrue(first_entered.wait(2))
+                second_thread.start()
+                self.assertTrue(second_attempted.wait(2))
+                self.assertFalse(second_entered.is_set())
+                release_first.set()
+                first_thread.join(2)
+                second_thread.join(2)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(order, ["first", "second"])
 
 
     def test_proc_is_codex_like_recognizes_codex_code_mode_host(self) -> None:
@@ -12350,6 +12476,214 @@ class ServerHelpersTest(unittest.TestCase):
                 claim_agent_with_wait("a", wait_seconds=0)
 
         mock_claim.assert_not_called()
+
+    def test_new_agent_start_rechecks_capacity_before_tmux_spawn(self) -> None:
+        capacity_error = AgentCapacityError(
+            "capacity unavailable",
+            {
+                "error_code": "spawn_capacity_unavailable",
+                "retryable": True,
+                "retry_after_seconds": 15,
+                "reason_codes": ["running_agent_limit"],
+            },
+        )
+        process_summary = {
+            "process_count": 0,
+            "external_process_count": 0,
+            "managed_process_count": 0,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            runner = root / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            state = root / "state"
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": root, "session": "test-session"}},
+                clear=False,
+            ), patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
+                "codex_master.server.tmux_alive", return_value=False
+            ), patch(
+                "codex_master.server.agent_home_process_summary", return_value=process_summary
+            ), patch(
+                "codex_master.server.require_spawn_capacity", side_effect=capacity_error, create=True
+            ) as require_capacity, patch("codex_master.server.run_tmux") as run_tmux_mock:
+                with self.assertRaises(AgentError) as raised:
+                    start_agent("a", cwd=tmpdir)
+
+        self.assertIs(raised.exception, capacity_error)
+        require_capacity.assert_called_once_with(1)
+        run_tmux_mock.assert_not_called()
+
+    def test_parallel_new_starts_serialize_admission_and_second_rechecks_capacity(self) -> None:
+        lifecycle_barrier = threading.Barrier(2)
+        admission_mutex = threading.Lock()
+        state_mutex = threading.Lock()
+        running_agents = 0
+        admission_entries = 0
+        admission_depths_at_spawn: list[int] = []
+        capacity_seen_running_agents: list[int] = []
+        new_session_agents: list[str] = []
+        results: dict[str, dict[str, Any]] = {}
+        failures: list[BaseException] = []
+
+        class LifecycleLock:
+            def __enter__(self) -> None:
+                try:
+                    lifecycle_barrier.wait(2)
+                except threading.BrokenBarrierError as exc:
+                    raise AssertionError("parallel starts did not reach lifecycle locks") from exc
+
+            def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+                return False
+
+        class AdmissionLock:
+            def __enter__(self) -> None:
+                nonlocal admission_entries
+                admission_mutex.acquire()
+                with state_mutex:
+                    admission_entries += 1
+
+            def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+                nonlocal admission_entries
+                with state_mutex:
+                    admission_entries -= 1
+                admission_mutex.release()
+                return False
+
+        def require_capacity(required_slots: int = 1) -> dict[str, Any]:
+            nonlocal running_agents
+            with state_mutex:
+                capacity_seen_running_agents.append(running_agents)
+                if running_agents:
+                    raise AgentCapacityError(
+                        "capacity unavailable",
+                        {
+                            "error_code": "spawn_capacity_unavailable",
+                            "retryable": True,
+                            "retry_after_seconds": 15,
+                            "reason_codes": ["running_agent_limit"],
+                        },
+                    )
+            return {
+                "allowed": True,
+                "required_slots": required_slots,
+                "available_slots": 1,
+                "reason_codes": [],
+                "raw_output": "not_returned",
+            }
+
+        def fake_run_tmux(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+            nonlocal running_agents
+            if args[0] == "new-session":
+                with state_mutex:
+                    admission_depths_at_spawn.append(admission_entries)
+                    running_agents += 1
+                    new_session_agents.append(args[args.index("-s") + 1])
+            return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
+
+        def run(agent: str, cwd: str) -> None:
+            try:
+                results[agent] = start_agent(agent, cwd=cwd)
+            except BaseException as exc:
+                failures.append(exc)
+
+        process_summary = {
+            "process_count": 0,
+            "external_process_count": 0,
+            "managed_process_count": 0,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            runners: dict[str, Path] = {}
+            for agent in ("a1", "b1"):
+                runner = root / f"{agent}-codex"
+                runner.write_text("#!/bin/sh\n", encoding="utf-8")
+                runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+                runners[agent] = runner
+            state = root / "state"
+            agents = {
+                agent: {"label": agent.upper(), "runner": runner, "home": root, "session": f"session-{agent}"}
+                for agent, runner in runners.items()
+            }
+            with patch.dict("codex_master.server.AGENTS", agents, clear=True), patch(
+                "codex_master.server.STATE_ROOT", state
+            ), patch("codex_master.server.RAW_DIR", state / "raw"), patch(
+                "codex_master.server.META_DIR", state / "meta"
+            ), patch("codex_master.server.LOCK_DIR", state / "locks"), patch(
+                "codex_master.server.LEASE_DIR", state / "leases"
+            ), patch(
+                "codex_master.server.agent_lifecycle_lock", side_effect=lambda *_args, **_kwargs: LifecycleLock()
+            ), patch(
+                "codex_master.server.spawn_admission_lock", side_effect=lambda: AdmissionLock(), create=True
+            ) as admission_lock, patch(
+                "codex_master.server.require_spawn_capacity", side_effect=require_capacity, create=True
+            ) as capacity_gate, patch("codex_master.server.tmux_alive", return_value=False), patch(
+                "codex_master.server.agent_home_process_summary", return_value=process_summary
+            ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux), patch(
+                "codex_master.server.pane_pid", return_value=123
+            ), patch("codex_master.server.write_meta"):
+                first = threading.Thread(target=run, args=("a1", tmpdir))
+                second = threading.Thread(target=run, args=("b1", tmpdir))
+                first.start()
+                second.start()
+                first.join(2)
+                second.join(2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(admission_lock.call_count, 2)
+        self.assertEqual(capacity_gate.call_count, 2)
+        self.assertEqual(capacity_seen_running_agents, [0, 1])
+        self.assertEqual(admission_depths_at_spawn, [1])
+        self.assertEqual(len(new_session_agents), 1)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(next(iter(results.values()))["status"], "started")
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], AgentCapacityError)
+
+    def test_already_running_agent_does_not_consume_spawn_capacity(self) -> None:
+        process_summary = {
+            "process_count": 1,
+            "managed_process_count": 1,
+            "managed_process_ids": [321],
+            "managed_root_process_ids": [321],
+            "external_process_count": 0,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            runner = root / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": root, "session": "test-session"}},
+                clear=False,
+            ), patch("codex_master.server.ensure_state"), patch(
+                "codex_master.server.tmux_alive", return_value=True
+            ), patch("codex_master.server.agent_home_process_summary", return_value=process_summary), patch(
+                "codex_master.server.pane_pid", return_value=321
+            ), patch("codex_master.server.read_meta", return_value={}), patch(
+                "codex_master.server.require_spawn_capacity", create=True
+            ) as require_capacity:
+                result = start_agent("a", cwd=tmpdir)
+
+        self.assertEqual(result["status"], "already_running")
+        require_capacity.assert_not_called()
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.tmux_alive", return_value=False)

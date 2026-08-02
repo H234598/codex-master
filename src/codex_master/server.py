@@ -2260,6 +2260,24 @@ def agent_lifecycle_lock(agent: str, *, timeout_seconds: float | None = None) ->
 
 
 @contextlib.contextmanager
+def spawn_admission_lock() -> Any:
+    ensure_private_dir(STATE_ROOT)
+    ensure_private_dir(LOCK_DIR)
+    lock_path = LOCK_DIR / "spawn-admission.lock"
+    with open_private_regular_update(lock_path) as fh:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            yield
+        except OSError as exc:
+            raise AgentError("could not acquire spawn admission lock") from exc
+        finally:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+
+
+@contextlib.contextmanager
 def assignment_log_lock() -> Any:
     ensure_private_dir(STATE_ROOT)
     ensure_private_dir(LOCK_DIR)
@@ -2604,6 +2622,28 @@ def spawn_admission_decision(required_slots: int = 1) -> dict[str, Any]:
         allowed=not reasons,
         available_slots=available_slots,
         reason_codes=reasons,
+    )
+
+
+def require_spawn_capacity(required_slots: int = 1) -> dict[str, Any]:
+    admission = spawn_admission_decision(required_slots)
+    if admission.get("allowed") is True:
+        return admission
+    reason_codes = [
+        reason
+        for reason in admission.get("reason_codes", [])
+        if isinstance(reason, str) and reason in RESOURCE_REASON_CODES
+    ]
+    if not reason_codes:
+        reason_codes = ["session_metrics_unavailable"]
+    raise AgentCapacityError(
+        "capacity unavailable",
+        {
+            "error_code": "spawn_capacity_unavailable",
+            "retryable": True,
+            "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS,
+            "reason_codes": reason_codes,
+        },
     )
 
 
@@ -4691,52 +4731,54 @@ def _start_agent_unlocked(
             "raw_output": "not_returned",
         }
 
-    process_summary = agent_home_process_summary(agent)
-    identity_guard = agent_identity_guard(False, process_summary)
-    if process_summary["external_process_count"] is None:
-        raise AgentError(f"agent {agent} CODEX_HOME process scan is unavailable; retry before starting")
-    if process_summary["external_process_count"]:
-        raise AgentError(
-            f"agent {agent} CODEX_HOME is already used by {process_summary['external_process_count']} external process(es); "
-            "stop them or use a separate CODEX_HOME before starting through codex-master-mcp"
-        )
-    if not identity_guard["ok"]:
-        raise AgentError(
-            f"agent {agent} CODEX_HOME is already used by {process_summary['managed_process_count']} "
-            "managed process(es) without the managed tmux session; stop the orphaned process(es) before starting "
-            "through codex-master-mcp"
-        )
+    with spawn_admission_lock():
+        require_spawn_capacity(1)
+        process_summary = agent_home_process_summary(agent)
+        identity_guard = agent_identity_guard(False, process_summary)
+        if process_summary["external_process_count"] is None:
+            raise AgentError(f"agent {agent} CODEX_HOME process scan is unavailable; retry before starting")
+        if process_summary["external_process_count"]:
+            raise AgentError(
+                f"agent {agent} CODEX_HOME is already used by {process_summary['external_process_count']} external process(es); "
+                "stop them or use a separate CODEX_HOME before starting through codex-master-mcp"
+            )
+        if not identity_guard["ok"]:
+            raise AgentError(
+                f"agent {agent} CODEX_HOME is already used by {process_summary['managed_process_count']} "
+                "managed process(es) without the managed tmux session; stop the orphaned process(es) before starting "
+                "through codex-master-mcp"
+            )
 
-    close_runner_execution_fd(agent)
-    cwd = bounded_text(cwd, field="cwd", max_chars=MAX_PATH_TEXT) if cwd is not None else None
-    prompt = bounded_text(prompt, field="prompt", max_chars=MAX_SEND_TEXT, strip=False) if prompt is not None else None
-    start_cwd = Path(cwd or os.getcwd()).expanduser().resolve()
-    if not start_cwd.exists() or not start_cwd.is_dir():
-        raise AgentError("cwd is not a directory")
-    reasoning_effort = model_reasoning_effort or (
-        WRITE_AGENT_MODEL_EFFORT if model == WRITE_AGENT_MODEL else DEFAULT_AGENT_MODEL_EFFORT
-    )
-    routed_args = agent_base_args(model, reasoning_effort)
-
-    runner_execution_path = open_runner_execution_path(agent, runner, runner_stat)
-    run_id = f"{now_id()}-{agent}"
-    raw_log = RAW_DIR / f"{run_id}.log"
-    try:
-        write_private_new_bytes(raw_log, b"")
-    except Exception:
         close_runner_execution_fd(agent)
-        raise
+        cwd = bounded_text(cwd, field="cwd", max_chars=MAX_PATH_TEXT) if cwd is not None else None
+        prompt = bounded_text(prompt, field="prompt", max_chars=MAX_SEND_TEXT, strip=False) if prompt is not None else None
+        start_cwd = Path(cwd or os.getcwd()).expanduser().resolve()
+        if not start_cwd.exists() or not start_cwd.is_dir():
+            raise AgentError("cwd is not a directory")
+        reasoning_effort = model_reasoning_effort or (
+            WRITE_AGENT_MODEL_EFFORT if model == WRITE_AGENT_MODEL else DEFAULT_AGENT_MODEL_EFFORT
+        )
+        routed_args = agent_base_args(model, reasoning_effort)
 
-    argv = [str(runner_execution_path), *routed_args]
-    if prompt:
-        argv.append(prompt)
+        runner_execution_path = open_runner_execution_path(agent, runner, runner_stat)
+        run_id = f"{now_id()}-{agent}"
+        raw_log = RAW_DIR / f"{run_id}.log"
+        try:
+            write_private_new_bytes(raw_log, b"")
+        except Exception:
+            close_runner_execution_fd(agent)
+            raise
 
-    command = "env CODEX_MASTER_MCP=1 CODEX_AGENT_MCP=1 " + shlex.join(argv)
-    try:
-        cp = run_tmux(["new-session", "-d", "-s", session, "-c", str(start_cwd), command], check=False)
-    except Exception:
-        close_runner_execution_fd(agent)
-        raise
+        argv = [str(runner_execution_path), *routed_args]
+        if prompt:
+            argv.append(prompt)
+
+        command = "env CODEX_MASTER_MCP=1 CODEX_AGENT_MCP=1 " + shlex.join(argv)
+        try:
+            cp = run_tmux(["new-session", "-d", "-s", session, "-c", str(start_cwd), command], check=False)
+        except Exception:
+            close_runner_execution_fd(agent)
+            raise
     if cp.returncode != 0:
         cleanup_failed_start(session, raw_log, kill_session=False)
         close_runner_execution_fd(agent)
