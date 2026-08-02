@@ -208,6 +208,28 @@ ADMITTED_SPAWN_DECISION = {
 
 
 class ServerHelpersTest(unittest.TestCase):
+    def test_spawn_offer_docs_cover_operation_and_security_contract(self) -> None:
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+
+        for term in (
+            "agent_spawn_offers",
+            "spawn-offers",
+            "0.85",
+            "20 %",
+            "1024 MiB",
+            "6",
+            "5 Sekunden",
+            "15 Sekunden",
+            "advisory",
+            "mcp_host",
+            "developer_vm",
+            "sandbox",
+            "native Subagentinnen",
+            "nicht technisch erzwungen",
+        ):
+            with self.subTest(term=term):
+                self.assertIn(term, readme)
+
     def test_spawn_offers_omit_unimplemented_routes(self) -> None:
         with patch.dict(
             os.environ,
@@ -308,6 +330,39 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["retry_after_seconds"], 15)
         self.assertEqual(result["reservation"], "none")
         ensure_state.assert_not_called()
+
+    def test_spawn_offer_treats_priority_env_as_data_without_execution_or_echo(self) -> None:
+        secret = "PRIORITY_SECRET_MUST_NOT_RETURN"
+        with patch.dict(
+            os.environ,
+            {"CODEX_MASTER_SPAWN_PRIORITY": f"mcp_host;echo {secret},developer_vm,sandbox"},
+        ), patch(
+            "codex_master.server.spawn_admission_decision",
+            return_value={"allowed": True, "available_slots": 3, "reason_codes": []},
+        ), patch("codex_master.server.subprocess.run") as run:
+            result = agent_spawn_offers()
+
+        self.assertEqual(result["offers"], [])
+        self.assertNotIn(secret, json.dumps(result))
+        run.assert_not_called()
+
+    def test_spawn_offer_creates_no_lease_meta_or_assignment_audit(self) -> None:
+        with patch(
+            "codex_master.server.spawn_admission_decision",
+            return_value={"allowed": True, "available_slots": 3, "reason_codes": []},
+        ), patch("codex_master.server.ensure_state") as ensure_state, patch(
+            "codex_master.server.agent_lease_status"
+        ) as lease_status, patch("codex_master.server.write_meta") as write_meta, patch(
+            "codex_master.server.record_assignment"
+        ) as record_assignment:
+            result = agent_spawn_offers()
+
+        self.assertEqual(result["reservation"], "none")
+        self.assertEqual([offer["route"] for offer in result["offers"]], ["mcp_host"])
+        ensure_state.assert_not_called()
+        lease_status.assert_not_called()
+        write_meta.assert_not_called()
+        record_assignment.assert_not_called()
 
     def test_spawn_offer_cli_matches_mcp_semantic_contract(self) -> None:
         admission = {"allowed": True, "available_slots": 3, "reason_codes": []}

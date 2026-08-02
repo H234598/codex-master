@@ -247,6 +247,62 @@ Master MCP tools.
 
 ## Local CLI
 
+### Ressourcenbewusste Spawn-Angebote
+
+`agent_spawn_offers` ist ein read-only MCP-Hinweis fuer eine moegliche lokale
+Kapazitaet. Beispiel fuer einen MCP-`tools/call`:
+
+```json
+{"name":"agent_spawn_offers","arguments":{"required_slots":1}}
+```
+
+Gleiches CLI-Kommando aus diesem Worktree:
+
+```sh
+PYTHONPATH=src python -m codex_master.server spawn-offers --required-slots 1
+./bin/codex-master-mcp spawn-offers --required-slots 1
+```
+
+`PYTHONPATH=src` ist fuer Python-Aufrufe dieses Worktrees erforderlich: eine
+lokale editable Installation kann auf einen anderen Quellstand zeigen.
+
+Ein Offer ist advisory, gilt 5 Sekunden und reserviert nichts
+(`reservation: "none"`). `start` prueft CPU, Speicher und Slots vor einem
+neuen tmux-Start unter dem Admission-Lock erneut. Bei verweigerter oder
+unvollstaendiger Messung bleiben Offers leer; die data-sparse Antwort enthaelt
+nur Reason-Codes, keine `/proc`-Inhalte, tmux-Ausgabe, lokalen Pfade oder
+Environment-Text. Sie ist retryable mit 15 Sekunden Wartehinweis.
+
+Default-Grenzen fuer einen neuen Start:
+
+- Last pro CPU hoechstens `0.85`
+- verfuegbarer Speicher mindestens `20 %` und `1024 MiB`
+- hoechstens `6` laufende verwaltete tmux-Agentinnen
+- `required_slots` liegt zwischen 1 und 6
+
+`CODEX_MASTER_SPAWN_PRIORITY` ist einzige Spawn-Environment-Konfiguration.
+Sie ist eine kommagetrennte Prioritaetsliste (Default `mcp_host`), wird nur als
+Daten gelesen, dedupliziert und niemals als Shell-Befehl oder Netzwerkziel
+ausgefuehrt. Ihr Text wird nicht in Antworten gespiegelt. Aktuell kann nur der
+exakte lokale Route-Wert `mcp_host` ein Offer erzeugen. `developer_vm` und
+`sandbox` sind nicht angeboten, selbst wenn sie in dieser Liste stehen; es gibt
+keine Remote-Ausfuehrung in dieser Version.
+
+Ein Offer erzeugt keine Lease, keine Meta-Datei und keinen Assignment-Audit-
+Eintrag. Auth-, Scope-, Routing-, Modell-, Nutzungs- und bestehende Admission-
+Gates bleiben beim eigentlichen Start beziehungsweise bei Assignments wirksam.
+Messfehler, `/proc`-Fehler und tmux-Fehler fail-closed; ihre oeffentlichen
+Fehler bleiben begrenzt und redigiert.
+
+Native Subagentinnen sind davon getrennt: deren Steuerung ist Assignment-
+Prompt-Policy (inklusive frischem Ressourcencheck vor weiterem Spawn). Sie ist
+nicht technisch erzwungen. Der Masterjet kann eine native Codex-Delegation
+nicht intercepten. Ein zukuenftiges VM-Backend braucht vor einem Angebot mindestens
+einen versionierten Backend-Vertrag, gegenseitige Authentisierung, explizite
+Netzwerk- und Identity-Grenzen, attestierte fail-closed Telemetrie,
+reservierungsfaehige Leases sowie begrenztes und redigiertes Audit-Logging.
+Bis dahin bleibt es vollstaendig weggelassen.
+
 ```sh
 cd /home/teladi/codex-master
 python3 -m codex_master.server install          # create ~/.local/bin/codex-master-mcp + codex mcp add
