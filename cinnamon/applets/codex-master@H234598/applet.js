@@ -1088,11 +1088,16 @@ FlottenmanagementApplet.prototype = {
     },
 
     on_applet_clicked() {
-        if (this._removed || !this.menu || typeof this.menu.toggle !== "function") return;
-        if (this.menu.actor && typeof this.menu.actor.is_finalized === "function" && this.menu.actor.is_finalized()) return;
-        const wasOpen = this.menu.isOpen === true;
-        this.menu.toggle();
-        if (!wasOpen && this.menu.isOpen === true && this.refreshOnOpen) this._refreshStatus();
+        if (this._removed) return;
+        try {
+            if (!this.menu || typeof this.menu.toggle !== "function") return;
+            if (this.menu.actor && typeof this.menu.actor.is_finalized === "function" && this.menu.actor.is_finalized()) return;
+            const wasOpen = this.menu.isOpen === true;
+            this.menu.toggle();
+            if (!wasOpen && this.menu.isOpen === true && this.refreshOnOpen) this._refreshStatus();
+        } catch (error) {
+            this._logCleanupError(error);
+        }
     },
 
     on_applet_removed_from_panel() {

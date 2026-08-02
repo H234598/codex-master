@@ -169,11 +169,18 @@ function loadApplet() {
       this.actor = { is_finalized: () => this.destroyed };
       this.failCloseCount = 0;
       this.failDestroyCount = 0;
+      this.failToggleCount = 0;
       this.closeCount = 0;
       this.destroyCount = 0;
     }
     addMenuItem(item) { this.items.push(item); }
-    toggle() { this.isOpen = !this.isOpen; }
+    toggle() {
+      if (this.failToggleCount > 0) {
+        this.failToggleCount -= 1;
+        throw new Error("injected toggle failure");
+      }
+      this.isOpen = !this.isOpen;
+    }
     close() {
       this.closeCount += 1;
       if (this.failCloseCount > 0) {
@@ -619,6 +626,23 @@ test("status click still uses menu cleanup cleanup paths", () => {
   assert.equal(applet._applet_context_menu, null);
   assert.equal(applet._menuManager, null);
   assert.doesNotThrow(() => applet.on_applet_clicked());
+});
+
+test("applet click actor and toggle failures stay inside the UI callback", () => {
+  for (const failure of ["actor", "toggle"]) {
+    const fixture = loadApplet();
+    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+    if (failure === "actor") {
+      applet.menu.actor.is_finalized = () => { throw new Error("injected actor state failure"); };
+    } else {
+      applet.menu.failToggleCount = 1;
+    }
+
+    assert.doesNotThrow(() => applet.on_applet_clicked());
+    assert.equal(applet.menu.isOpen, false);
+    assert.equal(applet.menuManager.grabbed, false);
+    assert.equal(fixture.subprocesses.length, 0);
+  }
 });
 
 test("settings launcher failure stays inside menu callback", () => {
