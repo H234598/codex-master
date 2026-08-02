@@ -15479,6 +15479,64 @@ class AppletStatusContractTest(unittest.TestCase):
 
         self.assertIsNone(pane_pid("a1"))
 
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("codex_master.server.run_tmux")
+    def test_pane_pid_returns_none_for_unicode_digits(self, mock_run_tmux, _mock_tmux_alive) -> None:
+        mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "１２３\n", "")
+
+        self.assertIsNone(pane_pid("a1"))
+
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("codex_master.server.run_tmux")
+    def test_pane_pid_returns_none_for_zero(self, mock_run_tmux, _mock_tmux_alive) -> None:
+        mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "0\n", "")
+
+        self.assertIsNone(pane_pid("a1"))
+
+    @patch(
+        "codex_master.server.agent_lease_status",
+        return_value={"state": "unclaimed", "raw_output": "not_returned"},
+    )
+    @patch(
+        "codex_master.server.agent_auth_status",
+        return_value={"authenticated": True, "auth_state": "present_regular", "raw_output": "not_returned"},
+    )
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 1,
+            "managed_process_count": 1,
+            "external_process_count": 0,
+            "managed_process_ids": [123],
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
+    @patch(
+        "codex_master.server.run_tmux",
+        side_effect=[
+            subprocess.CompletedProcess(["tmux"], 0, "", ""),
+            subprocess.CompletedProcess(["tmux"], 0, "１２３\n", ""),
+        ],
+    )
+    @patch("codex_master.server.time.monotonic", return_value=1.0)
+    def test_applet_agent_observation_rejects_unicode_pane_pid_for_identity(
+        self, _mock_monotonic, _mock_run_tmux, _mock_process_summary, _mock_auth, _mock_lease
+    ) -> None:
+        row = applet_agent_observation("a1", deadline=10**12)
+
+        self.assertEqual(
+            row,
+            self._row(
+                "a1",
+                activity="running",
+                backend="degraded",
+                control="blocked",
+                identity="unverified",
+            ),
+        )
+
     @patch(
         "codex_master.server.agent_lease_status",
         return_value={"state": "unclaimed", "raw_output": "not_returned"},

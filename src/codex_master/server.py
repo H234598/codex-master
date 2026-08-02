@@ -1180,12 +1180,13 @@ def applet_remaining_timeout(deadline: float) -> float:
 
 
 def pane_pid_from_text(text: str) -> int | None:
-    if not text.isdigit():
+    if not text.isascii() or not text.isdigit():
         return None
     try:
-        return int(text)
+        value = int(text)
     except ValueError:
         return None
+    return value if value > 0 else None
 
 
 def applet_agent_observation(agent: str, *, deadline: float) -> dict[str, Any]:
