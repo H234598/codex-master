@@ -614,13 +614,13 @@ FlottenmanagementApplet.prototype = {
                         state.timeoutSource = 0;
                         return GLib.SOURCE_REMOVE;
                     }
-                    if (!state.exitConfirmed) {
+                    if (!state.exitConfirmed || !state.stdoutDone || !state.stderrDone) {
                         state.timedOut = true;
-                        requestForceExit(state);
+                        if (!state.exitConfirmed) requestForceExit(state);
                         failRefresh(state);
                         if (state.waitFailed) ensureExitWait(state);
                     }
-                    if (!state.exitConfirmed) {
+                    if (!state.exitConfirmed || !state.stdoutDone || !state.stderrDone) {
                         attemptFinalize(state);
                         return GLib.SOURCE_CONTINUE;
                     }

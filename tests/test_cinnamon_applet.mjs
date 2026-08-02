@@ -1354,6 +1354,31 @@ test("finalize waits for wait + both stream EOFs", async () => {
   assert.equal(applet._statusLastGood.schema_version, 1);
 });
 
+test("timeout cancels inherited pipes that outlive a confirmed process exit", () => {
+  const fixture = loadApplet();
+  queuePayloadProcess(fixture, samplePayload(), { holdEof: true });
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  applet.menu.items[0].activate();
+  const process = fixture.subprocesses[0];
+  const state = applet._statusActiveState;
+
+  process.emitDone();
+  assert.equal(state.exitConfirmed, true);
+  assert.equal(state.stdoutDone, false);
+  assert.equal(state.stderrDone, false);
+
+  fixture.runTimeouts();
+
+  assert.equal(state.timedOut, true);
+  assert.equal(state.cancellable.cancelCount, 1);
+  assert.equal(fixture.activeTimers("timeout").length, 1, "timer stays until inherited pipes close");
+  process.stdout.releaseEof();
+  process.stderr.releaseEof();
+  assert.equal(applet._statusActiveState, null);
+  assert.equal(applet._statusLastGood, null);
+  assert.equal(fixture.activeTimers("timeout").length, 0);
+});
+
 test("timeout removal failure defers finalization to timer without wedging", () => {
   const fixture = loadApplet();
   queuePayloadProcess(fixture, samplePayload());
