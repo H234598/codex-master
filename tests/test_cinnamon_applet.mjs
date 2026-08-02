@@ -752,6 +752,91 @@ test("stdout cap, stderr cap, and timeout each force_exit exactly once", () => {
   }
 });
 
+test("status buffering retains chunks instead of one JS array element per byte", () => {
+  const fixture = loadApplet();
+  const stdout = fixture.makeStream(
+    Array.from({ length: 32 }, () => makeBytes("A".repeat(1024))),
+    true
+  );
+  const stderr = fixture.makeStream([], true);
+  fixture.setProcessFactory(() => ({
+    forceExitCount: 0,
+    waitCallbacks: [],
+    get_stdout_pipe() { return stdout; },
+    get_stderr_pipe() { return stderr; },
+    get_successful: () => true,
+    get_exit_status: () => 0,
+    force_exit() { this.forceExitCount += 1; },
+    wait_async(_, callback) { this.waitCallbacks.push(callback); },
+  }));
+
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  applet.menu.items[0].activate();
+
+  const state = applet._statusActiveState;
+  assert.equal(state.stdoutByteCount, 32 * 1024);
+  assert.equal(state.stdoutChunks.length, 32);
+  assert.ok(state.stdoutChunks.every((chunk) => chunk.byteLength === 1024));
+});
+
+test("stdout overflow releases accumulated status data before process exit", () => {
+  const fixture = loadApplet();
+  fixture.setProcessFactory(() => ({
+    forceExitCount: 0,
+    waitCallbacks: [],
+    get_stdout_pipe() {
+      return fixture.makeStream([makeBytes("A".repeat(64 * 1024 + 1))], true);
+    },
+    get_stderr_pipe() { return fixture.makeStream([], true); },
+    get_successful: () => true,
+    get_exit_status: () => 0,
+    force_exit() { this.forceExitCount += 1; },
+    wait_async(_, callback) { this.waitCallbacks.push(callback); },
+  }));
+
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  applet.menu.items[0].activate();
+
+  const state = applet._statusActiveState;
+  assert.equal(state.stdoutLimitExceeded, true);
+  assert.equal(state.stdoutByteCount, 0);
+  assert.equal(state.stdoutChunks.length, 0);
+});
+
+test("late stdout after timeout is drained without rebuilding the status buffer", () => {
+  const fixture = loadApplet();
+  let delayedStdoutCallback = null;
+  const stdout = {
+    read_bytes_async(_size, _priority, _cancellable, callback) {
+      delayedStdoutCallback = callback;
+    },
+    read_bytes_finish(packet) { return packet; },
+  };
+  fixture.setProcessFactory(() => ({
+    forceExitCount: 0,
+    waitCallbacks: [],
+    get_stdout_pipe() { return stdout; },
+    get_stderr_pipe() { return fixture.makeStream([], true); },
+    get_successful: () => true,
+    get_exit_status: () => 0,
+    force_exit() { this.forceExitCount += 1; },
+    wait_async(_, callback) { this.waitCallbacks.push(callback); },
+  }));
+
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  applet.menu.items[0].activate();
+  fixture.runTimeouts();
+
+  const data = makeBytes("A".repeat(1024));
+  delayedStdoutCallback(stdout, {
+    get_data: () => data,
+    get_size: () => data.length,
+  });
+
+  assert.equal(applet._statusActiveState.stdoutByteCount, 0);
+  assert.equal(applet._statusActiveState.stdoutChunks.length, 0);
+});
+
 test("status timeout registration failure fails closed without leaking process state", () => {
   const fixture = loadApplet();
   queuePayloadProcess(fixture, samplePayload(), { holdEof: true });

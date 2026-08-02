@@ -301,8 +301,11 @@ FlottenmanagementApplet.prototype = {
             waitDone: false,
             stdoutDone: false,
             stderrDone: false,
-            stdoutBytes: [],
-            stderrBytes: [],
+            stdoutChunks: [],
+            stderrChunks: [],
+            stdoutByteCount: 0,
+            stderrByteCount: 0,
+            discardOutput: false,
             waitFailed: false,
             forceExitCalled: false,
             timedOut: false,
@@ -330,6 +333,12 @@ FlottenmanagementApplet.prototype = {
             }
         };
 
+        const failRefresh = (stateArg) => {
+            stateArg.discardOutput = true;
+            this._clearStatusBuffers(stateArg);
+            this._markRefreshFailed();
+        };
+
         const attemptFinalize = (stateArg) => {
             if (stateArg.finalizing) return;
             if (!(stateArg.waitDone && stateArg.stdoutDone && stateArg.stderrDone)) {
@@ -354,12 +363,13 @@ FlottenmanagementApplet.prototype = {
                 stateArg.streamFailed = true;
                 stateArg[`${key}Done`] = true;
                 requestForceExit(stateArg);
-                this._markRefreshFailed();
+                failRefresh(stateArg);
                 attemptFinalize(stateArg);
                 return;
             }
 
-            const bytesKey = `${key}Bytes`;
+            const chunksKey = `${key}Chunks`;
+            const byteCountKey = `${key}ByteCount`;
             const doneKey = `${key}Done`;
             const finishKey = key === "stdout" ? "stdoutLimitExceeded" : "stderrLimitExceeded";
 
@@ -377,7 +387,7 @@ FlottenmanagementApplet.prototype = {
                                 stateArg.streamFailed = true;
                                 stateArg[doneKey] = true;
                                 requestForceExit(stateArg);
-                                this._markRefreshFailed();
+                                failRefresh(stateArg);
                                 attemptFinalize(stateArg);
                                 return;
                             }
@@ -401,7 +411,7 @@ FlottenmanagementApplet.prototype = {
                                 stateArg.streamFailed = true;
                                 stateArg[doneKey] = true;
                                 requestForceExit(stateArg);
-                                this._markRefreshFailed();
+                                failRefresh(stateArg);
                                 attemptFinalize(stateArg);
                                 return;
                             }
@@ -411,18 +421,24 @@ FlottenmanagementApplet.prototype = {
                                 return;
                             }
 
-                            const take = Math.max(0, limit - stateArg[bytesKey].length);
+                            if (stateArg.discardOutput) {
+                                readChunk();
+                                return;
+                            }
+
+                            const take = Math.max(0, limit - stateArg[byteCountKey]);
                             const exceedsLimit = bytes.length > take;
                             if (take > 0) {
-                                for (let i = 0; i < Math.min(bytes.length, take); i += 1) {
-                                    stateArg[bytesKey].push(bytes[i]);
-                                }
+                                const chunk = new Uint8Array(Math.min(bytes.length, take));
+                                chunk.set(bytes.subarray(0, chunk.length));
+                                stateArg[chunksKey].push(chunk);
+                                stateArg[byteCountKey] += chunk.length;
                             }
 
                             if (exceedsLimit) {
                                 stateArg[finishKey] = true;
                                 requestForceExit(stateArg);
-                                this._markRefreshFailed();
+                                failRefresh(stateArg);
                                 stateArg[doneKey] = true;
                                 attemptFinalize(stateArg);
                                 return;
@@ -435,7 +451,7 @@ FlottenmanagementApplet.prototype = {
                     stateArg.streamFailed = true;
                     stateArg[doneKey] = true;
                     requestForceExit(stateArg);
-                    this._markRefreshFailed();
+                    failRefresh(stateArg);
                     attemptFinalize(stateArg);
                 }
             };
@@ -451,7 +467,7 @@ FlottenmanagementApplet.prototype = {
                     state.timedOut = true;
                     const forceExitRequested = requestForceExit(state);
                     if (forceExitRequested) state.timeoutSource = 0;
-                    this._markRefreshFailed();
+                    failRefresh(state);
                     attemptFinalize(state);
                     return forceExitRequested ? GLib.SOURCE_REMOVE : GLib.SOURCE_CONTINUE;
                 }
@@ -460,7 +476,7 @@ FlottenmanagementApplet.prototype = {
             state.timedOut = true;
             requestForceExit(state);
             this._logCleanupError(error);
-            this._markRefreshFailed();
+            failRefresh(state);
         }
 
         let stdoutStream = null;
@@ -473,7 +489,7 @@ FlottenmanagementApplet.prototype = {
             state.stdoutDone = true;
             state.stderrDone = true;
             requestForceExit(state);
-            this._markRefreshFailed();
+            failRefresh(state);
         }
         if (!state.stdoutDone) {
             readStream(state, "stdout", stdoutStream, APPLET_STDOUT_LIMIT_BYTES);
@@ -490,7 +506,7 @@ FlottenmanagementApplet.prototype = {
                     }
                 } catch (_error) {
                     state.waitFailed = true;
-                    this._markRefreshFailed();
+                    failRefresh(state);
                 }
                 state.waitDone = true;
                 attemptFinalize(state);
@@ -499,7 +515,7 @@ FlottenmanagementApplet.prototype = {
             state.waitFailed = true;
             state.waitDone = true;
             requestForceExit(state);
-            this._markRefreshFailed();
+            failRefresh(state);
             attemptFinalize(state);
         }
     },
@@ -513,6 +529,14 @@ FlottenmanagementApplet.prototype = {
                 launcher.unsetenv(key);
             }
         }
+    },
+
+    _clearStatusBuffers(state) {
+        if (!state) return;
+        state.stdoutChunks = [];
+        state.stderrChunks = [];
+        state.stdoutByteCount = 0;
+        state.stderrByteCount = 0;
     },
 
     _finalizeStatusProcess(state) {
@@ -539,6 +563,7 @@ FlottenmanagementApplet.prototype = {
                 }
             }
         }
+        this._clearStatusBuffers(state);
         if (!applied) this._markRefreshFailed();
 
         if (state.timeoutSource) {
@@ -553,8 +578,17 @@ FlottenmanagementApplet.prototype = {
     },
 
     _collectProcessPayload(state) {
+        const stdoutChunks = state.stdoutChunks;
+        const stdoutByteCount = state.stdoutByteCount;
+        this._clearStatusBuffers(state);
         try {
-            const stdoutText = ByteArray.toString(Uint8Array.from(state.stdoutBytes));
+            const stdoutBytes = new Uint8Array(stdoutByteCount);
+            let offset = 0;
+            for (const chunk of stdoutChunks) {
+                stdoutBytes.set(chunk, offset);
+                offset += chunk.length;
+            }
+            const stdoutText = ByteArray.toString(stdoutBytes);
             if (typeof stdoutText !== "string" || stdoutText.length === 0) {
                 return null;
             }
@@ -937,6 +971,8 @@ FlottenmanagementApplet.prototype = {
         const state = this._statusActiveState;
         if (state) {
             state.finalizing = true;
+            state.discardOutput = true;
+            this._clearStatusBuffers(state);
             if (state.timeoutSource) {
                 try {
                     GLib.source_remove(state.timeoutSource);
