@@ -120,7 +120,11 @@ FlottenmanagementApplet.prototype = {
         const settingsItem = new PopupMenu.PopupMenuItem("Applet-Verwaltung öffnen");
         this._connectTracked(settingsItem, "activate", () => {
             if (this._removed) return;
-            Util.spawn(["cinnamon-settings", "applets"]);
+            try {
+                Util.spawn(["cinnamon-settings", "applets"]);
+            } catch (error) {
+                this._logCleanupError(error);
+            }
         });
         this.menu.addMenuItem(settingsItem);
 

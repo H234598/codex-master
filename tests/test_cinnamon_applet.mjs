@@ -101,6 +101,7 @@ function realignCounts(payload) {
 
 function loadApplet() {
   const spawned = [];
+  let spawnError = null;
   const launcherSpawns = [];
   const subprocesses = [];
   const pendingFactories = [];
@@ -457,7 +458,10 @@ function loadApplet() {
         popupMenu: { PopupMenuItem, PopupMenuManager },
         settings: Settings,
       },
-      misc: { util: { spawn(args) { spawned.push(args); } } },
+      misc: { util: { spawn(args) {
+        if (spawnError) throw spawnError;
+        spawned.push(args);
+      } } },
       byteArray: {
         toString(data) {
           return new TextDecoder("utf-8").decode(data);
@@ -479,6 +483,7 @@ function loadApplet() {
     timeouts,
     settingsInstances,
     runTimeouts() { return Mainloop.runTimeouts(); },
+    setSpawnError(message) { spawnError = new Error(message); },
     setHome(value) { home = value; },
     setProcessFactory(factory) { pendingFactories.push(factory); },
     resetFactories() { pendingFactories.length = 0; },
@@ -569,6 +574,16 @@ test("status click still uses menu cleanup cleanup paths", () => {
   assert.equal(applet._applet_context_menu, null);
   assert.equal(applet._menuManager, null);
   assert.doesNotThrow(() => applet.on_applet_clicked());
+});
+
+test("settings launcher failure stays inside menu callback", () => {
+  const fixture = loadApplet();
+  fixture.setSpawnError("injected cinnamon-settings spawn failure");
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+
+  assert.doesNotThrow(() => applet.menu.items[1].activate());
+  assert.equal(fixture.spawned.length, 0);
+  assert.equal(applet.labels.at(-1), "Flottenmanagement");
 });
 
 test("menu cleanup failures are retried and not lost", () => {
