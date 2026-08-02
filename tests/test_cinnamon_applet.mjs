@@ -1354,6 +1354,34 @@ test("timeout removal failure defers finalization to timer without wedging", () 
   assert.equal(fixture.activeTimers("timeout").length, 0);
 });
 
+test("reentrant timeout callback during finalization cannot remove a live applet", () => {
+  const fixture = loadApplet();
+  queuePayloadProcess(fixture, samplePayload());
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  applet.menu.items[0].activate();
+  const process = fixture.subprocesses[0];
+  const statusTimer = fixture.activeTimers("timeout")[0];
+  const realSourceRemove = fixture.GLib.source_remove;
+  let reentrant = false;
+  fixture.GLib.source_remove = (id) => {
+    if (id === statusTimer.id && !reentrant) {
+      reentrant = true;
+      if (statusTimer.callback() !== fixture.GLib.SOURCE_CONTINUE) statusTimer.cancelled = true;
+      return true;
+    }
+    return realSourceRemove(id);
+  };
+
+  process.emitDone();
+
+  assert.equal(applet._removed, false);
+  assert.equal(applet._cleanupComplete, false);
+  assert.notEqual(applet.menu, null);
+  assert.equal(applet._statusActiveState, null);
+  assert.equal(applet._statusLastGood.schema_version, 1);
+  assert.equal(fixture.activeTimers("timeout").length, 0);
+});
+
 test("real backend payload with sleeping and expired states is accepted", async () => {
   const fixture = loadApplet();
   const payload = samplePayload();
