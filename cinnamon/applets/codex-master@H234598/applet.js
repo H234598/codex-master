@@ -418,18 +418,25 @@ FlottenmanagementApplet.prototype = {
             readChunk();
         };
 
-        state.timeoutSource = GLib.timeout_add(
-            GLib.PRIORITY_DEFAULT,
-            APPLET_STATUS_TIMEOUT_MILLISECONDS,
-            () => {
-                state.timedOut = true;
-                const forceExitRequested = requestForceExit(state);
-                if (forceExitRequested) state.timeoutSource = 0;
-                this._markRefreshFailed();
-                attemptFinalize(state);
-                return forceExitRequested ? GLib.SOURCE_REMOVE : GLib.SOURCE_CONTINUE;
-            }
-        );
+        try {
+            state.timeoutSource = GLib.timeout_add(
+                GLib.PRIORITY_DEFAULT,
+                APPLET_STATUS_TIMEOUT_MILLISECONDS,
+                () => {
+                    state.timedOut = true;
+                    const forceExitRequested = requestForceExit(state);
+                    if (forceExitRequested) state.timeoutSource = 0;
+                    this._markRefreshFailed();
+                    attemptFinalize(state);
+                    return forceExitRequested ? GLib.SOURCE_REMOVE : GLib.SOURCE_CONTINUE;
+                }
+            );
+        } catch (error) {
+            state.timedOut = true;
+            requestForceExit(state);
+            this._logCleanupError(error);
+            this._markRefreshFailed();
+        }
 
         let stdoutStream = null;
         let stderrStream = null;

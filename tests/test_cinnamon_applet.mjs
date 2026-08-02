@@ -471,6 +471,7 @@ function loadApplet() {
 
   return {
     main: context.main,
+    GLib,
     spawned,
     launcherSpawns,
     subprocesses,
@@ -734,6 +735,26 @@ test("stdout cap, stderr cap, and timeout each force_exit exactly once", () => {
 
     assert.equal(subprocesses[0].forceExitCount, 1, `${failure}: exactly once`);
   }
+});
+
+test("status timeout registration failure fails closed without leaking process state", () => {
+  const fixture = loadApplet();
+  queuePayloadProcess(fixture, samplePayload(), { holdEof: true });
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  fixture.GLib.timeout_add = () => { throw new Error("injected timeout registration failure"); };
+
+  assert.doesNotThrow(() => applet.menu.items[0].activate());
+
+  const process = fixture.subprocesses[0];
+  assert.equal(process.forceExitCount, 1);
+  assert.equal(fixture.activeTimers("timeout").length, 0);
+  assert.equal(applet._statusLastGood, null);
+
+  process.stdout.releaseEof();
+  process.stderr.releaseEof();
+  process.emitDone();
+  assert.equal(applet._statusInFlight, false);
+  assert.equal(applet._statusActiveState, null);
 });
 
 test("invalid utf8/json/schema/types do not overwrite last-good", async () => {
