@@ -69,11 +69,36 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 log = Path(os.environ["FAKE_GDBUS_LOG"])
 with log.open("a", encoding="utf-8") as handle:
     handle.write(json.dumps(sys.argv[1:]) + "\\n")
 mode = os.environ.get("FAKE_GDBUS_MODE", "ok")
+if sys.argv[1] == "monitor":
+    if mode == "stale-signal":
+        os.write(
+            sys.stdout.fileno(),
+            b"Monitoring signals on object /org/Cinnamon owned by org.Cinnamon\\n"
+            b"/org/Cinnamon: org.Cinnamon.XletAddedComplete "
+            b"(true, 'codex-master@H234598')\\n",
+        )
+    else:
+        print("Monitoring signals on object /org/Cinnamon owned by org.Cinnamon", flush=True)
+    baseline = log.read_text(encoding="utf-8").count("org.Cinnamon.ReloadXlet")
+    for _attempt in range(500):
+        calls = log.read_text(encoding="utf-8").count("org.Cinnamon.ReloadXlet")
+        if calls > baseline:
+            if mode == "stale-signal":
+                raise SystemExit(9)
+            success = "false" if mode == "signal-fail" else "true"
+            print(
+                f"/org/Cinnamon: org.Cinnamon.XletAddedComplete ({success}, 'codex-master@H234598')",
+                flush=True,
+            )
+            raise SystemExit
+        time.sleep(0.01)
+    raise SystemExit(9)
 method = sys.argv[sys.argv.index("--method") + 1]
 if method.endswith("ReloadXlet"):
     if sys.argv[-1] != "APPLET":
@@ -92,7 +117,7 @@ if method.endswith("GetRunningXletUUIDs"):
     else:
         print("(['codex-master@H234598'],)")
 else:
-    print("(true,)")
+    print("()" if method.endswith("ReloadXlet") else "(true,)")
 """,
             encoding="utf-8",
         )
@@ -157,6 +182,7 @@ else:
         self.assertEqual(list(self.target.parent.glob(f".{UUID}.retired*")), [])
         calls = [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
         joined = "\n".join(" ".join(call) for call in calls)
+        self.assertEqual(calls[0][0], "monitor")
         self.assertIn(f"org.Cinnamon.ReloadXlet {UUID} APPLET", joined)
         self.assertIn("org.Cinnamon.GetRunningXletUUIDs applet", joined)
         self.assertNotIn("RestartCinnamon", joined)
@@ -280,6 +306,24 @@ else:
         verify = self._run("verify")
         self.assertEqual(verify.returncode, 0, verify.stderr)
         self.assertIn("GetRunningXletUUIDs", self.log.read_text(encoding="utf-8"))
+
+    def test_install_requires_successful_reload_signal(self) -> None:
+        self._write_tree(self.target, "old")
+
+        result = self._run("install", mode="signal-fail")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("old", (self.target / "applet.js").read_text(encoding="utf-8"))
+        self.assertFalse(self.backup.exists())
+
+    def test_install_rejects_reload_signal_buffered_before_call(self) -> None:
+        self._write_tree(self.target, "old")
+
+        result = self._run("install", mode="stale-signal")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("old", (self.target / "applet.js").read_text(encoding="utf-8"))
+        self.assertFalse(self.backup.exists())
 
     def test_reload_or_running_verification_failure_restores_previous_tree(self) -> None:
         for mode in ("reload-fail", "missing", "spoofed"):

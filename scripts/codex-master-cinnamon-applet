@@ -22,6 +22,7 @@ from typing import Any
 UUID = "codex-master@H234598"
 DBUS_TIMEOUT_SECONDS = 10.0
 DBUS_OUTPUT_LIMIT_BYTES = 64 * 1024
+RELOAD_SIGNAL_TIMEOUT_SECONDS = 5.0
 REQUIRED_SOURCE_FILES = {"applet.js", "metadata.json", "settings-schema.json"}
 
 
@@ -363,13 +364,119 @@ def cinnamon_call(method: str, *arguments: str) -> str:
 
 
 def reload_xlet() -> None:
-    cinnamon_call("ReloadXlet", UUID, "APPLET")
+    argv = [
+        "gdbus",
+        "monitor",
+        "--session",
+        "--dest",
+        "org.Cinnamon",
+        "--object-path",
+        "/org/Cinnamon",
+    ]
+    try:
+        monitor_environment = os.environ.copy()
+        monitor_environment["LC_ALL"] = "C"
+        monitor = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            env=monitor_environment,
+        )
+    except OSError as exc:
+        raise InstallerError("gdbus monitor is unavailable") from exc
+    if monitor.stdout is None or monitor.stderr is None:
+        kill_and_wait(monitor)
+        raise InstallerError("gdbus monitor pipes are unavailable")
+
+    selector = selectors.DefaultSelector()
+    selector.register(monitor.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(monitor.stderr, selectors.EVENT_READ, "stderr")
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+    total = 0
+
+    def read_events(events: list[tuple[selectors.SelectorKey, int]]) -> None:
+        nonlocal total
+        for key, _mask in events:
+            try:
+                chunk = os.read(key.fileobj.fileno(), 4096)
+            except OSError as exc:
+                raise InstallerError("gdbus reload monitor output could not be read") from exc
+            if not chunk:
+                selector.unregister(key.fileobj)
+                key.fileobj.close()
+                continue
+            total += len(chunk)
+            if total > DBUS_OUTPUT_LIMIT_BYTES:
+                raise InstallerError("gdbus reload monitor output exceeded limit")
+            if key.data == "stdout":
+                stdout_buffer.extend(chunk)
+            else:
+                stderr_buffer.extend(chunk)
+
+    def next_stdout_line(deadline: float) -> str:
+        while True:
+            newline = stdout_buffer.find(b"\n")
+            if newline >= 0:
+                line = bytes(stdout_buffer[:newline])
+                del stdout_buffer[: newline + 1]
+                return line.decode("utf-8", errors="replace")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise InstallerError("gdbus reload monitor timed out")
+            events = selector.select(min(remaining, 0.25))
+            if not events and monitor.poll() is not None:
+                events = [(key, selectors.EVENT_READ) for key in selector.get_map().values()]
+            read_events(events)
+            stdout_open = any(key.data == "stdout" for key in selector.get_map().values())
+            if not stdout_open and b"\n" not in stdout_buffer:
+                detail = stderr_buffer.decode("utf-8", errors="replace").strip()[:300]
+                raise InstallerError(detail or "gdbus reload monitor ended unexpectedly")
+
+    try:
+        ready_deadline = time.monotonic() + RELOAD_SIGNAL_TIMEOUT_SECONDS
+        while True:
+            line = next_stdout_line(ready_deadline)
+            if line == "Monitoring signals on object /org/Cinnamon owned by org.Cinnamon":
+                break
+
+        # ponytail: Cinnamon has no reload request ID; only a future nonce-bearing API can
+        # correlate a concurrent third-party reload of the same UUID.
+        stdout_buffer.clear()
+        while pending := selector.select(0):
+            read_events(pending)
+            stdout_buffer.clear()
+
+        cinnamon_call("ReloadXlet", UUID, "APPLET")
+        signal_deadline = time.monotonic() + RELOAD_SIGNAL_TIMEOUT_SECONDS
+        signal_prefix = "/org/Cinnamon: org.Cinnamon.XletAddedComplete "
+        success_payloads = {f"(true, '{UUID}')", f'(true, "{UUID}")'}
+        failure_payloads = {f"(false, '{UUID}')", f'(false, "{UUID}")'}
+        while True:
+            line = next_stdout_line(signal_deadline)
+            if not line.startswith(signal_prefix):
+                continue
+            payload = line[len(signal_prefix) :]
+            if payload in success_payloads:
+                return
+            if payload in failure_payloads:
+                raise InstallerError("Cinnamon reported that the applet failed to load")
+            if UUID in payload:
+                raise InstallerError("Cinnamon returned an invalid applet-load signal")
+    finally:
+        selector.close()
+        kill_and_wait(monitor)
+        for pipe in (monitor.stdout, monitor.stderr):
+            if not pipe.closed:
+                pipe.close()
 
 
 def verify_running() -> None:
-    output = cinnamon_call("GetRunningXletUUIDs", "applet")
+    output = cinnamon_call("GetRunningXletUUIDs", "applet").strip()
     try:
-        reply = ast.literal_eval(output.strip())
+        reply = ([],) if output == "(@as [],)" else ast.literal_eval(output)
     except (MemoryError, RecursionError, SyntaxError, TypeError, ValueError) as exc:
         raise InstallerError("Cinnamon returned an invalid running-applet response") from exc
     if (
@@ -377,8 +484,9 @@ def verify_running() -> None:
         or len(reply) != 1
         or not isinstance(reply[0], list)
         or not all(isinstance(item, str) for item in reply[0])
-        or UUID not in reply[0]
     ):
+        raise InstallerError("Cinnamon returned an invalid running-applet response")
+    if UUID not in reply[0]:
         raise InstallerError("Cinnamon does not report the applet as running")
 
 
