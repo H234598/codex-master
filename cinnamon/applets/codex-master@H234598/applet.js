@@ -23,6 +23,7 @@ const MAX_REFRESH_INTERVAL_SECONDS = 3600;
 const MAX_TRACKED_AGENTS = 6;
 const MAX_TRACKED_AGENTS_SETTING_CHARS = 128;
 const APPLET_ERROR_LOG_LIMIT = 8;
+const APPLET_IMMEDIATE_EXIT_WAIT_LIMIT = 2;
 const APPLET_SAFE_PATH = "/usr/bin:/bin";
 const APPLET_STATUS_COMMAND = "applet-status";
 let appletErrorLogCount = 0;
@@ -326,6 +327,9 @@ FlottenmanagementApplet.prototype = {
             finalizing: false,
             streamFailed: false,
             waitDone: false,
+            exitConfirmed: false,
+            exitWaitInFlight: false,
+            exitWaitAttempts: 0,
             stdoutDone: false,
             stderrDone: false,
             stdoutChunks: [],
@@ -384,7 +388,7 @@ FlottenmanagementApplet.prototype = {
             if (!(stateArg.waitDone && stateArg.stdoutDone && stateArg.stderrDone)) {
                 return;
             }
-            if (stateArg.timedOut && stateArg.process && !stateArg.forceExitCalled && stateArg.waitFailed) return;
+            if (stateArg.process && !stateArg.exitConfirmed) return;
             stateArg.finalizing = true;
             if (stateArg.timeoutSource) {
                 try {
@@ -397,6 +401,42 @@ FlottenmanagementApplet.prototype = {
                 stateArg.timeoutSource = 0;
             }
             this._finalizeStatusProcess(stateArg);
+        };
+
+        const ensureExitWait = (stateArg) => {
+            if (stateArg.finalizing || stateArg.exitConfirmed || stateArg.exitWaitInFlight || !stateArg.process) return;
+            if (typeof stateArg.process.wait_async !== "function") return;
+            stateArg.exitWaitInFlight = true;
+            stateArg.exitWaitAttempts += 1;
+            try {
+                stateArg.process.wait_async(null, (_proc, result) => {
+                    try {
+                        if (typeof stateArg.process.wait_finish === "function") {
+                            stateArg.process.wait_finish(result);
+                        }
+                        stateArg.exitConfirmed = true;
+                        stateArg.waitFailed = false;
+                    } catch (_error) {
+                        stateArg.waitFailed = true;
+                    }
+                    stateArg.exitWaitInFlight = false;
+                    if (
+                        !stateArg.exitConfirmed
+                        && !stateArg.timeoutSource
+                        && stateArg.exitWaitAttempts < APPLET_IMMEDIATE_EXIT_WAIT_LIMIT
+                    ) {
+                        ensureExitWait(stateArg);
+                    }
+                    attemptFinalize(stateArg);
+                });
+            } catch (error) {
+                stateArg.exitWaitInFlight = false;
+                stateArg.waitFailed = true;
+                this._logCleanupError(error);
+                if (!stateArg.timeoutSource && stateArg.exitWaitAttempts < APPLET_IMMEDIATE_EXIT_WAIT_LIMIT) {
+                    ensureExitWait(stateArg);
+                }
+            }
         };
 
         const readStream = (stateArg, key, stream, limit) => {
@@ -505,12 +545,19 @@ FlottenmanagementApplet.prototype = {
                 GLib.PRIORITY_DEFAULT,
                 APPLET_STATUS_TIMEOUT_MILLISECONDS,
                 () => {
-                    state.timedOut = true;
-                    const forceExitRequested = requestForceExit(state);
-                    if (forceExitRequested) state.timeoutSource = 0;
-                    failRefresh(state);
+                    if (!state.exitConfirmed) {
+                        state.timedOut = true;
+                        requestForceExit(state);
+                        failRefresh(state);
+                        if (state.waitFailed) ensureExitWait(state);
+                    }
+                    if (!state.exitConfirmed) {
+                        attemptFinalize(state);
+                        return GLib.SOURCE_CONTINUE;
+                    }
+                    state.timeoutSource = 0;
                     attemptFinalize(state);
-                    return forceExitRequested ? GLib.SOURCE_REMOVE : GLib.SOURCE_CONTINUE;
+                    return GLib.SOURCE_REMOVE;
                 }
             );
             if (!Number.isSafeInteger(timeoutSource) || timeoutSource <= 0) {
@@ -551,8 +598,11 @@ FlottenmanagementApplet.prototype = {
                     }
                 } catch (_error) {
                     state.waitFailed = true;
+                    requestForceExit(state);
                     failRefresh(state);
+                    ensureExitWait(state);
                 }
+                if (!state.waitFailed) state.exitConfirmed = true;
                 state.waitDone = true;
                 attemptFinalize(state);
             });
@@ -561,6 +611,7 @@ FlottenmanagementApplet.prototype = {
             state.waitDone = true;
             requestForceExit(state);
             failRefresh(state);
+            ensureExitWait(state);
             attemptFinalize(state);
         }
     },

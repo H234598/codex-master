@@ -976,6 +976,56 @@ test("invalid timeout source id fails closed without an unbounded process", () =
   assert.equal(applet._statusActiveState, null);
 });
 
+test("invalid timeout handle retries a failed replacement wait once", () => {
+  const fixture = loadApplet();
+  fixture.setProcessFactory(() => {
+    const stdout = fixture.makeStream([], true);
+    const stderr = fixture.makeStream([], true);
+    return {
+      forceExitCount: 0,
+      waitAsyncCount: 0,
+      waitFinishCount: 0,
+      waitCallbacks: [],
+      stdout,
+      stderr,
+      get_stdout_pipe() { return stdout; },
+      get_stderr_pipe() { return stderr; },
+      get_successful: () => false,
+      force_exit() { this.forceExitCount += 1; },
+      wait_async(_cancellable, callback) {
+        this.waitAsyncCount += 1;
+        this.waitCallbacks.push(callback);
+      },
+      wait_finish() {
+        this.waitFinishCount += 1;
+        if (this.waitFinishCount <= 2) throw new Error("injected wait failure");
+      },
+      emitDone() {
+        const callbacks = [...this.waitCallbacks];
+        this.waitCallbacks = [];
+        for (const callback of callbacks) callback(this, null);
+      },
+    };
+  });
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  fixture.GLib.timeout_add = () => 0;
+  applet.menu.items[0].activate();
+  const process = fixture.subprocesses[0];
+
+  process.stdout.releaseEof();
+  process.stderr.releaseEof();
+  process.emitDone();
+  process.emitDone();
+  assert.equal(process.waitCallbacks.length, 1, "failed replacement wait is retried once");
+  process.emitDone();
+
+  assert.equal(process.waitAsyncCount, 3);
+  assert.equal(process.forceExitCount, 1);
+  assert.equal(applet._statusInFlight, false);
+  assert.equal(applet._statusActiveState, null);
+  assert.equal(fixture.activeTimers("timeout").length, 0);
+});
+
 test("cancellable construction failure keeps the process managed", () => {
   const fixture = loadApplet();
   queuePayloadProcess(fixture, samplePayload());
@@ -1203,10 +1253,10 @@ test("timeout removal failure defers finalization to timer without wedging", () 
   assert.equal(applet._statusActiveState.finalizing, false);
   assert.equal(fixture.activeTimers("timeout").length, 1);
   fixture.runTimeouts();
-  assert.equal(process.forceExitCount, 1);
+  assert.equal(process.forceExitCount, 0);
   assert.equal(applet._statusInFlight, false);
   assert.equal(applet._statusActiveState, null);
-  assert.equal(applet._statusLastGood, null);
+  assert.equal(applet._statusLastGood.schema_version, 1);
   assert.equal(fixture.activeTimers("timeout").length, 0);
 });
 
@@ -2017,6 +2067,57 @@ test("reader exceptions set streamFailed, force_exit once, and finalize", async 
   assert.equal(applet._statusLastGood, null);
 });
 
+test("cancelled stream failure waits for a successful kill retry", () => {
+  const fixture = loadApplet();
+  fixture.setProcessFactory(() => {
+    const stdout = fixture.makeStream([makeBytes("broken")]);
+    stdout.throwFinish = true;
+    const stderr = fixture.makeStream([], true);
+    return {
+      forceExitAttempts: 0,
+      waitFinishAttempts: 0,
+      waitCallbacks: [],
+      stdout,
+      stderr,
+      get_stdout_pipe() { return stdout; },
+      get_stderr_pipe() { return stderr; },
+      get_successful: () => false,
+      force_exit() {
+        this.forceExitAttempts += 1;
+        if (this.forceExitAttempts <= 2) throw new Error("injected stream kill failure");
+      },
+      wait_async(_cancellable, callback) { this.waitCallbacks.push(callback); },
+      wait_finish() {
+        this.waitFinishAttempts += 1;
+        if (this.waitFinishAttempts === 1) throw new Error("injected cancelled wait");
+      },
+      emitDone() {
+        const callbacks = [...this.waitCallbacks];
+        this.waitCallbacks = [];
+        for (const callback of callbacks) callback(this, null);
+      },
+    };
+  });
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  applet.menu.items[0].activate();
+  const process = fixture.subprocesses[0];
+  const failedState = applet._statusActiveState;
+
+  assert.equal(process.forceExitAttempts, 1);
+  process.stderr.releaseEof();
+  process.emitDone();
+
+  assert.equal(applet._statusActiveState, failedState);
+  assert.equal(fixture.activeTimers("timeout").length, 1);
+  fixture.runTimeouts();
+  assert.equal(process.forceExitAttempts, 3);
+  assert.equal(applet._statusActiveState, failedState);
+  assert.equal(fixture.activeTimers("timeout").length, 1);
+  process.emitDone();
+  assert.equal(applet._statusActiveState, null);
+  assert.equal(fixture.activeTimers("timeout").length, 0);
+});
+
 test("task 5 settings schema contains exactly four bounded settings", () => {
   const schemaPath = path.join(root, "cinnamon/applets/codex-master@H234598/settings-schema.json");
   const schema = JSON.parse(fs.readFileSync(schemaPath, "utf8"));
@@ -2357,6 +2458,7 @@ test("timeout retries force_exit failure and refresh recovers", () => {
     const stderr = fixture.makeStream([], true);
     return {
       forceExitCount: 0,
+      waitFinishAttempts: 0,
       waitCallbacks: [],
       stdout,
       stderr,
@@ -2365,10 +2467,13 @@ test("timeout retries force_exit failure and refresh recovers", () => {
       get_successful: () => false,
       force_exit() {
         this.forceExitCount += 1;
-        if (this.forceExitCount === 1) throw new Error("injected timeout force failure");
+        if (this.forceExitCount <= 2) throw new Error("injected timeout force failure");
       },
       wait_async(_cancellable, callback) { this.waitCallbacks.push(callback); },
-      wait_finish() { throw new Error("injected cancelled wait"); },
+      wait_finish() {
+        this.waitFinishAttempts += 1;
+        if (this.waitFinishAttempts === 1) throw new Error("injected cancelled wait");
+      },
       emitDone() {
         const callbacks = [...this.waitCallbacks];
         this.waitCallbacks = [];
@@ -2398,8 +2503,12 @@ test("timeout retries force_exit failure and refresh recovers", () => {
   assert.equal(fixture.activeTimers("timeout").length, 1);
 
   fixture.runTimeouts();
-  assert.equal(process.forceExitCount, 2);
+  assert.equal(process.forceExitCount, 3);
   assert.equal(timedOutState.forceExitCalled, true);
+  assert.equal(applet._statusActiveState, timedOutState);
+  assert.equal(fixture.activeTimers("timeout").length, 1);
+  assert.equal(fixture.subprocesses.length, 1);
+  process.emitDone();
   assert.equal(timedOutState.timeoutSource, 0);
   assert.equal(fixture.subprocesses.length, 2, "pending refresh starts after recovered timeout cleanup");
   fixture.subprocesses[1].emitDone();
