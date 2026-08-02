@@ -496,7 +496,7 @@ FlottenmanagementApplet.prototype = {
         };
 
         try {
-            state.timeoutSource = GLib.timeout_add(
+            const timeoutSource = GLib.timeout_add(
                 GLib.PRIORITY_DEFAULT,
                 APPLET_STATUS_TIMEOUT_MILLISECONDS,
                 () => {
@@ -508,9 +508,13 @@ FlottenmanagementApplet.prototype = {
                     return forceExitRequested ? GLib.SOURCE_REMOVE : GLib.SOURCE_CONTINUE;
                 }
             );
+            if (!Number.isSafeInteger(timeoutSource) || timeoutSource <= 0) {
+                throw new Error("Invalid status timeout source id");
+            }
+            state.timeoutSource = timeoutSource;
         } catch (error) {
             state.timedOut = true;
-            requestForceExit(state);
+            if (!requestForceExit(state)) requestForceExit(state);
             this._logCleanupError(error);
             failRefresh(state);
         }

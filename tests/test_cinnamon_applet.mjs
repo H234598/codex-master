@@ -543,12 +543,13 @@ function loadApplet() {
   };
 }
 
-function queuePayloadProcess(fixture, payload, { exitCode = 0, holdEof = false } = {}) {
+function queuePayloadProcess(fixture, payload, { exitCode = 0, holdEof = false, forceExitFailures = 0 } = {}) {
   fixture.setProcessFactory(() => {
     const stdout = fixture.makeStream([makeBytes(JSON.stringify(payload))], holdEof);
     const stderr = fixture.makeStream([], holdEof);
     return {
       forceExitCount: 0,
+      forceExitAttempts: 0,
       waitCallbacks: [],
       stdout,
       stderr,
@@ -556,7 +557,11 @@ function queuePayloadProcess(fixture, payload, { exitCode = 0, holdEof = false }
       get_stderr_pipe() { return stderr; },
       get_successful: () => exitCode === 0,
       get_exit_status: () => exitCode,
-      force_exit() { this.forceExitCount += 1; },
+      force_exit() {
+        this.forceExitAttempts += 1;
+        if (this.forceExitAttempts <= forceExitFailures) throw new Error("injected force_exit failure");
+        this.forceExitCount += 1;
+      },
       wait_async(_cancellable, callback) { this.waitCallbacks.push(callback); },
       wait_finish() {},
       emitDone() {
@@ -915,6 +920,30 @@ test("status timeout registration failure fails closed without leaking process s
   assert.equal(process.forceExitCount, 1);
   assert.equal(fixture.activeTimers("timeout").length, 0);
   assert.equal(applet._statusLastGood, null);
+
+  process.stdout.releaseEof();
+  process.stderr.releaseEof();
+  process.emitDone();
+  assert.equal(applet._statusInFlight, false);
+  assert.equal(applet._statusActiveState, null);
+});
+
+test("invalid timeout source id fails closed without an unbounded process", () => {
+  const fixture = loadApplet();
+  queuePayloadProcess(fixture, samplePayload(), { holdEof: true, forceExitFailures: 1 });
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  fixture.GLib.timeout_add = () => 0;
+
+  applet.menu.items[0].activate();
+
+  const process = fixture.subprocesses[0];
+  const state = applet._statusActiveState;
+  assert.equal(process.forceExitAttempts, 2);
+  assert.equal(process.forceExitCount, 1);
+  assert.equal(state.cancellable.cancelCount, 1);
+  assert.equal(state.timedOut, true);
+  assert.equal(state.timeoutSource, 0);
+  assert.equal(fixture.activeTimers("timeout").length, 0);
 
   process.stdout.releaseEof();
   process.stderr.releaseEof();
