@@ -15388,6 +15388,32 @@ class AppletStatusContractTest(unittest.TestCase):
         ):
             self.assertNotIn(private_value, payload)
 
+    @patch("codex_master.server.agent_lease_status")
+    @patch("codex_master.server.agent_auth_status")
+    @patch("codex_master.server.agent_home_process_summary")
+    @patch("codex_master.server.run_tmux")
+    def test_applet_status_rejects_non_absence_session_returncodes(
+        self, mock_run_tmux, mock_process_summary, mock_auth, mock_lease
+    ) -> None:
+        for returncode in (2, COMMAND_TIMEOUT_RETURN_CODE, COMMAND_UNAVAILABLE_RETURN_CODE):
+            with self.subTest(returncode=returncode):
+                mock_run_tmux.return_value = subprocess.CompletedProcess(
+                    ["tmux"], returncode, "not_returned", "SECRET_TMUX_ERROR"
+                )
+
+                result = applet_status(["a1"])
+
+                self.assertEqual(result["activity_state"], "unknown")
+                self.assertEqual(result["backend_state"], "unavailable")
+                self.assertEqual(result["control_state"], "unknown")
+                self.assertEqual(result["counts"]["issues"], 1)
+                self.assertNotIn("SECRET", json.dumps(result, sort_keys=True))
+                mock_process_summary.assert_not_called()
+                mock_auth.assert_not_called()
+                mock_lease.assert_not_called()
+                mock_run_tmux.assert_called_once()
+                mock_run_tmux.reset_mock()
+
     @patch(
         "codex_master.server.agent_lease_status",
         return_value={"state": "held", "raw_output": "not_returned"},

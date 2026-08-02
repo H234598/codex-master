@@ -1198,7 +1198,7 @@ def applet_agent_observation(agent: str, *, deadline: float) -> dict[str, Any]:
         check=False,
         timeout=applet_remaining_timeout(deadline),
     )
-    if session_check.returncode in {COMMAND_TIMEOUT_RETURN_CODE, COMMAND_UNAVAILABLE_RETURN_CODE}:
+    if session_check.returncode not in {0, 1}:
         raise AgentError("applet status backend unavailable")
     running = session_check.returncode == 0
 
