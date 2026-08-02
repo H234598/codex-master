@@ -602,7 +602,7 @@ test("settings launcher failure stays inside menu callback", () => {
   assert.equal(applet.labels.at(-1), "Flottenmanagement");
 });
 
-test("menu cleanup failures are retried and not lost", () => {
+test("single removal retries transient menu cleanup failures", () => {
   for (const failure of ["close", "remove", "menu-destroy", "manager-destroy"]) {
     const { main } = loadApplet();
     const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
@@ -618,17 +618,14 @@ test("menu cleanup failures are retried and not lost", () => {
 
     applet.on_applet_removed_from_panel();
 
-    assert.equal(applet.menu, menu);
-    assert.equal(applet.menuManager, manager);
-    assert.equal(manager.grabbed, false);
-
-    applet.on_applet_removed_from_panel();
-
+    assert.equal(applet._cleanupComplete, true);
     assert.equal(menu.destroyed, true);
     assert.equal(manager.destroyed, true);
     assert.equal(menu.isOpen, false);
     assert.equal(applet.menu, null);
     assert.equal(applet.menuManager, null);
+    assert.equal(manager.grabbed, false);
+    assert.doesNotThrow(() => applet.on_applet_removed_from_panel());
   }
 });
 
@@ -2057,7 +2054,7 @@ test("background cleanup failure does not retain cleaned status process", () => 
   assert.equal(fixture.activeTimers().length, 0);
 });
 
-test("removal retries a failed force_exit without losing process state", () => {
+test("single removal retries a failed force_exit without losing process state", () => {
   const fixture = loadApplet();
   fixture.setProcessFactory(() => {
     const stdout = fixture.makeStream([], true);
@@ -2081,14 +2078,11 @@ test("removal retries a failed force_exit without losing process state", () => {
   const process = fixture.subprocesses[0];
 
   applet.on_applet_removed_from_panel();
-  assert.equal(process.forceExitCount, 1);
-  assert.notEqual(applet._statusActiveState, null);
-  assert.equal(applet._cleanupComplete, false);
-
-  applet.on_applet_removed_from_panel();
   assert.equal(process.forceExitCount, 2);
   assert.equal(applet._statusActiveState, null);
   assert.equal(applet._cleanupComplete, true);
+  applet.on_applet_removed_from_panel();
+  assert.equal(process.forceExitCount, 2);
 });
 
 test("timeout retries force_exit failure and refresh recovers", () => {
@@ -2196,7 +2190,6 @@ test("100 injected add-remove cycles release processes streams signals timers an
 
     const process = fixture.subprocesses[0];
     const cancellable = applet._statusActiveState.cancellable;
-    applet.on_applet_removed_from_panel();
     applet.on_applet_removed_from_panel();
     process.stdout.releaseEof();
     process.stderr.releaseEof();

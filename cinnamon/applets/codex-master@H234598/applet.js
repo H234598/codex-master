@@ -1037,12 +1037,14 @@ FlottenmanagementApplet.prototype = {
     on_applet_removed_from_panel() {
         if (this._cleanupComplete) return;
         this._removed = true;
-        const statusClean = this._cleanupStatusResources();
-        const settingsClean = this._cleanupSettings();
-        const signalsClean = this._disconnectTrackedSignals();
-        const appletMenuClean = this._cleanupMenuResource("menu", "menuManager");
-        const contextMenuClean = this._cleanupMenuResource("_applet_context_menu", "_menuManager");
-        this._cleanupComplete = statusClean && settingsClean && signalsClean && appletMenuClean && contextMenuClean;
+        for (let attempt = 0; attempt < 2 && !this._cleanupComplete; attempt += 1) {
+            const statusClean = this._cleanupStatusResources();
+            const settingsClean = this._cleanupSettings();
+            const signalsClean = this._disconnectTrackedSignals();
+            const appletMenuClean = this._cleanupMenuResource("menu", "menuManager");
+            const contextMenuClean = this._cleanupMenuResource("_applet_context_menu", "_menuManager");
+            this._cleanupComplete = statusClean && settingsClean && signalsClean && appletMenuClean && contextMenuClean;
+        }
     },
 };
 
