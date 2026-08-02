@@ -108,6 +108,7 @@ function loadApplet() {
   const timeouts = [];
   const settingsInstances = [];
   const settingsBindFailures = new Set();
+  let settingsFinalizeFailures = 0;
   const settingsValues = {
     "tracked-agents": "a1,b1",
     "refresh-on-open": true,
@@ -389,6 +390,10 @@ function loadApplet() {
     }
     finalize() {
       this.finalizeCount += 1;
+      if (settingsFinalizeFailures > 0) {
+        settingsFinalizeFailures -= 1;
+        throw new Error("injected settings finalize failure");
+      }
       for (const binding of this.bindings.values()) {
         delete this.target[binding.property];
       }
@@ -519,6 +524,7 @@ function loadApplet() {
       `, context);
     },
     rejectSettingsBinding(key) { settingsBindFailures.add(key); },
+    failSettingsFinalizes(count) { settingsFinalizeFailures = count; },
     setProcessFactory(factory) { pendingFactories.push(factory); },
     resetFactories() { pendingFactories.length = 0; },
     setSetting(key, value) {
@@ -2017,6 +2023,37 @@ test("rejected settings binding finalizes partial settings and fails closed", ()
   assert.deepEqual(Array.from(applet._trackedAgents), ["a1", "b1"]);
   assert.equal(fixture.activeTimers("background").length, 0);
   assert.match(applet._statusSummaryItem.label, /Konfiguration/);
+});
+
+test("failed partial settings finalization stays owned and retryable", () => {
+  for (const finalizeFailures of [1, 2]) {
+    const fixture = loadApplet();
+    fixture.rejectSettingsBinding("background-refresh");
+    fixture.failSettingsFinalizes(finalizeFailures);
+
+    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, finalizeFailures);
+    const settings = fixture.settingsInstances[0];
+
+    assert.equal(settings.finalizeCount, 2);
+    assert.equal(applet.settings, null);
+    assert.equal(applet._settingsValid, false);
+    assert.equal(fixture.activeTimers("background").length, 0);
+    if (finalizeFailures === 1) {
+      assert.equal(applet._settingsCleanupPending, null);
+      assert.equal(settings.bindings.size, 0);
+    } else {
+      assert.equal(applet._settingsCleanupPending, settings);
+      assert.ok(settings.bindings.size > 0);
+      settings.set("refresh-on-open", false);
+      assert.equal(applet._settingsValid, false);
+      assert.equal(fixture.activeTimers("background").length, 0);
+    }
+
+    applet.on_applet_removed_from_panel();
+    assert.equal(applet._cleanupComplete, true);
+    assert.equal(applet._settingsCleanupPending, null);
+    assert.equal(settings.bindings.size, 0);
+  }
 });
 
 test("scalar setting normalization never writes through Cinnamon bindings", () => {

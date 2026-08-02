@@ -96,6 +96,7 @@ FlottenmanagementApplet.prototype = {
         this._settingsValid = true;
         this._settingsInitializing = false;
         this.settings = null;
+        this._settingsCleanupPending = null;
         this._statusSummaryItem = null;
         this._statusRowItems = [];
         this._menuCleanupState = {};
@@ -165,13 +166,17 @@ FlottenmanagementApplet.prototype = {
             bind("background-refresh", "backgroundRefreshSetting");
             bind("refresh-interval-seconds", "refreshIntervalSecondsSetting");
         } catch (_error) {
-            if (this.settings && typeof this.settings.finalize === "function") {
+            const incompleteSettings = this.settings;
+            let settingsFinalized = !incompleteSettings || typeof incompleteSettings.finalize !== "function";
+            for (let attempt = 0; attempt < 2 && !settingsFinalized; attempt += 1) {
                 try {
-                    this.settings.finalize();
+                    incompleteSettings.finalize();
+                    settingsFinalized = true;
                 } catch (error) {
                     this._logCleanupError(error);
                 }
             }
+            this._settingsCleanupPending = settingsFinalized ? null : incompleteSettings;
             this.settings = null;
             this._settingsValid = false;
         } finally {
@@ -1061,10 +1066,12 @@ FlottenmanagementApplet.prototype = {
     },
 
     _cleanupSettings() {
-        if (!this.settings) return true;
+        const settings = this.settings || this._settingsCleanupPending;
+        if (!settings) return true;
         try {
-            this.settings.finalize();
-            this.settings = null;
+            settings.finalize();
+            if (this.settings === settings) this.settings = null;
+            if (this._settingsCleanupPending === settings) this._settingsCleanupPending = null;
             return true;
         } catch (error) {
             this._logCleanupError(error);
