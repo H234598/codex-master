@@ -22,8 +22,10 @@ const MIN_REFRESH_INTERVAL_SECONDS = 15;
 const MAX_REFRESH_INTERVAL_SECONDS = 3600;
 const MAX_TRACKED_AGENTS = 6;
 const MAX_TRACKED_AGENTS_SETTING_CHARS = 128;
+const APPLET_ERROR_LOG_LIMIT = 8;
 const APPLET_SAFE_PATH = "/usr/bin:/bin";
 const APPLET_STATUS_COMMAND = "applet-status";
+let appletErrorLogCount = 0;
 const APPLET_STATUS_REQUIRED_FIELDS = [
     "schema_version", "mode", "activity_state", "backend_state", "control_state", "counts", "agents", "raw_output",
 ];
@@ -858,7 +860,13 @@ FlottenmanagementApplet.prototype = {
 
     _logCleanupError(error) {
         try {
-            if (typeof global !== "undefined" && global && typeof global.logError === "function") {
+            if (
+                appletErrorLogCount < APPLET_ERROR_LOG_LIMIT
+                && typeof global !== "undefined"
+                && global
+                && typeof global.logError === "function"
+            ) {
+                appletErrorLogCount += 1;
                 global.logError(error);
             }
         } catch (_loggingError) {}

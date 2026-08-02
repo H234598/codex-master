@@ -1824,6 +1824,25 @@ test("logger failure cannot pierce the status render boundary", () => {
   assert.equal(applet._statusViewState, "ready");
 });
 
+test("cleanup logging has a fixed Cinnamon heap budget", () => {
+  const fixture = loadApplet();
+  let logCalls = 0;
+  fixture.setGlobalLogger(() => { logCalls += 1; });
+  const applets = [
+    fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1),
+    fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 2),
+  ];
+  for (const applet of applets) {
+    applet._renderStatus = () => { throw new Error("persistent render failure"); };
+  }
+
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    assert.equal(applets[attempt % applets.length]._renderStatusSafely(), false);
+  }
+
+  assert.equal(logCalls, 8);
+});
+
 test("reader exceptions set streamFailed, force_exit once, and finalize", async () => {
   const fixture = loadApplet();
   const payload = makeBytes(JSON.stringify(samplePayload()));
