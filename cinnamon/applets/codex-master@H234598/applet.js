@@ -146,13 +146,14 @@ FlottenmanagementApplet.prototype = {
         try {
             this.settings = new Settings.AppletSettings(this, UUID, instanceId);
             const bind = (key, property) => {
-                this.settings.bindProperty(
+                const bound = this.settings.bindProperty(
                     Settings.BindingDirection.IN,
                     key,
                     property,
                     () => this._onSettingsChanged(),
                     null
                 );
+                if (bound !== true) throw new Error("Applet setting binding failed");
             };
             bind("tracked-agents", "trackedAgentsSetting");
             bind("refresh-on-open", "refreshOnOpen");

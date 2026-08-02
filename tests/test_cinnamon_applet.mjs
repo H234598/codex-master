@@ -107,6 +107,7 @@ function loadApplet() {
   const pendingFactories = [];
   const timeouts = [];
   const settingsInstances = [];
+  const settingsBindFailures = new Set();
   const settingsValues = {
     "tracked-agents": "a1,b1",
     "refresh-on-open": true,
@@ -370,8 +371,10 @@ function loadApplet() {
       settingsInstances.push(this);
     }
     bindProperty(_direction, key, property, callback) {
+      if (settingsBindFailures.has(key)) return false;
       this.target[property] = settingsValues[key];
       this.bindings.set(key, { property, callback });
+      return true;
     }
     finalize() { this.finalizeCount += 1; }
     set(key, value) {
@@ -497,6 +500,7 @@ function loadApplet() {
         };
       `, context);
     },
+    rejectSettingsBinding(key) { settingsBindFailures.add(key); },
     setProcessFactory(factory) { pendingFactories.push(factory); },
     resetFactories() { pendingFactories.length = 0; },
     setSetting(key, value) {
@@ -1878,6 +1882,20 @@ test("oversized tracked-agent setting is rejected before string splitting", () =
   assert.equal(applet._settingsValid, false);
   assert.deepEqual(Array.from(applet._trackedAgents), ["a1", "b1"]);
   assert.equal(fixture.activeTimers("background").length, 0);
+});
+
+test("rejected settings binding finalizes partial settings and fails closed", () => {
+  const fixture = loadApplet();
+  fixture.rejectSettingsBinding("background-refresh");
+
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+
+  assert.equal(fixture.settingsInstances[0].finalizeCount, 1);
+  assert.equal(applet.settings, null);
+  assert.equal(applet._settingsValid, false);
+  assert.deepEqual(Array.from(applet._trackedAgents), ["a1", "b1"]);
+  assert.equal(fixture.activeTimers("background").length, 0);
+  assert.match(applet._statusSummaryItem.label, /Konfiguration/);
 });
 
 test("read-only UI keeps title and separates activity backend and stale state", () => {
