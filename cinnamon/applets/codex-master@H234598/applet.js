@@ -229,15 +229,21 @@ FlottenmanagementApplet.prototype = {
             this._backgroundRefreshSource = 0;
         }
         if (this._removed || !this._settingsValid || !this.backgroundRefresh) return;
-        this._backgroundRefreshSource = GLib.timeout_add_seconds(
-            GLib.PRIORITY_DEFAULT,
-            this.refreshIntervalSeconds,
-            () => {
-                if (this._removed) return GLib.SOURCE_REMOVE;
-                this._refreshStatus();
-                return GLib.SOURCE_CONTINUE;
-            }
-        );
+        try {
+            this._backgroundRefreshSource = GLib.timeout_add_seconds(
+                GLib.PRIORITY_DEFAULT,
+                this.refreshIntervalSeconds,
+                () => {
+                    if (this._removed) return GLib.SOURCE_REMOVE;
+                    this._refreshStatus();
+                    return GLib.SOURCE_CONTINUE;
+                }
+            );
+        } catch (error) {
+            this._backgroundRefreshSource = 0;
+            this._settingsValid = false;
+            this._logCleanupError(error);
+        }
     },
 
     _trackedStatusArgv() {

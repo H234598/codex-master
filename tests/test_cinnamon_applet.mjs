@@ -1783,6 +1783,22 @@ test("refresh-on-open and bounded opt-in background timer preserve single-flight
   assert.equal(fixture.activeTimers("background").length, 0);
 });
 
+test("background timer registration failure does not prevent applet load", () => {
+  const fixture = loadApplet();
+  fixture.setSetting("background-refresh", true);
+  fixture.GLib.timeout_add_seconds = () => { throw new Error("injected background timer failure"); };
+  let applet = null;
+
+  assert.doesNotThrow(() => {
+    applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  });
+
+  assert.equal(applet._backgroundRefreshSource, 0);
+  assert.equal(fixture.activeTimers("background").length, 0);
+  assert.equal(applet._settingsValid, false);
+  assert.match(applet._statusSummaryItem.label, /Konfigurationsfehler/);
+});
+
 test("failed refresh keeps last-good visibly stale", () => {
   const fixture = loadApplet();
   const payload = samplePayload();
