@@ -1210,10 +1210,10 @@ def applet_agent_observation(agent: str, *, deadline: float) -> dict[str, Any]:
             check=False,
             timeout=applet_remaining_timeout(deadline),
         )
-        if pane_check.returncode in {COMMAND_TIMEOUT_RETURN_CODE, COMMAND_UNAVAILABLE_RETURN_CODE}:
+        if pane_check.returncode != 0:
             raise AgentError("applet status backend unavailable")
         pane_text = pane_check.stdout.strip()
-        pane_process_id = pane_pid_from_text(pane_text) if pane_check.returncode == 0 else None
+        pane_process_id = pane_pid_from_text(pane_text)
         identity_guard = agent_identity_guard(True, process_summary, pane_process_id=pane_process_id)
         identity_state = "verified" if identity_guard.get("ok") is True else "unverified"
         backend_state = "ok" if identity_state == "verified" else "degraded"

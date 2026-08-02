@@ -15498,6 +15498,27 @@ class AppletStatusContractTest(unittest.TestCase):
             ),
         )
 
+    @patch("codex_master.server.agent_home_process_summary")
+    @patch("codex_master.server.agent_auth_status")
+    @patch("codex_master.server.agent_lease_status")
+    @patch("codex_master.server.run_tmux")
+    def test_applet_agent_observation_rejects_display_message_nonzero_returncode(
+        self, mock_run_tmux, mock_lease, mock_auth, mock_process_summary
+    ) -> None:
+        mock_run_tmux.side_effect = [
+            subprocess.CompletedProcess(["tmux"], 0, "", ""),
+            subprocess.CompletedProcess(["tmux"], 1, "", "SECRET tmux display error"),
+        ]
+
+        with self.assertRaisesRegex(AgentError, "applet status backend unavailable") as raised:
+            applet_agent_observation("a1", deadline=10**12)
+
+        self.assertNotIn("SECRET", str(raised.exception))
+        mock_auth.assert_not_called()
+        mock_lease.assert_not_called()
+        self.assertEqual(mock_process_summary.call_count, 1)
+        self.assertEqual(len(mock_run_tmux.call_args_list), 2)
+
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.run_tmux")
     def test_pane_pid_returns_none_for_leading_zeros(self, mock_run_tmux, _mock_tmux_alive) -> None:
