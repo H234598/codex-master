@@ -197,6 +197,15 @@ class FakeStdin:
         self.buffer = io.BytesIO(data)
 
 
+ADMITTED_SPAWN_DECISION = {
+    "allowed": True,
+    "required_slots": 1,
+    "available_slots": 1,
+    "reason_codes": [],
+    "raw_output": "not_returned",
+}
+
+
 class ServerHelpersTest(unittest.TestCase):
     def test_spawn_offers_omit_unimplemented_routes(self) -> None:
         with patch.dict(
@@ -12710,6 +12719,8 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
+            ), patch(
+                "codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
             ):
                 with self.assertRaisesRegex(RuntimeError, "CODEX_HOME is already used"):
                     start_agent("a", cwd=tmpdir)
@@ -12744,6 +12755,8 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
+            ), patch(
+                "codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
             ):
                 with self.assertRaisesRegex(AgentError, "managed process\\(es\\) without the managed tmux session"):
                     start_agent("a", cwd=tmpdir)
@@ -12805,7 +12818,9 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": root, "session": "test_session"}},
                 clear=False,
-            ), patch("codex_master.server.agent_home_process_summary", side_effect=swap_after_process_scan):
+            ), patch("codex_master.server.agent_home_process_summary", side_effect=swap_after_process_scan), patch(
+                "codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
+            ):
                 with self.assertRaisesRegex(AgentError, "runner changed unexpectedly"):
                     start_agent("a", cwd=tmpdir)
 
@@ -12841,6 +12856,8 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": tmp_path, "session": "test_session"}},
                 clear=False,
+            ), patch(
+                "codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
             ):
                 with self.assertRaisesRegex(AgentError, "cwd is not a directory") as raised:
                     start_agent("a", cwd=str(secret_cwd))
@@ -13024,7 +13041,9 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
-            ), patch("codex_master.server.RAW_DIR", Path(tmpdir)), patch("codex_master.server.META_DIR", Path(tmpdir)):
+            ), patch("codex_master.server.RAW_DIR", Path(tmpdir)), patch(
+                "codex_master.server.META_DIR", Path(tmpdir)
+            ), patch("codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION):
                 with self.assertRaisesRegex(RuntimeError, "pipe-pane failed") as raised:
                     start_agent("a", cwd=tmpdir)
 
@@ -13069,7 +13088,9 @@ class ServerHelpersTest(unittest.TestCase):
             ) as mock_summary, patch(
                 "codex_master.server.agent_lease_status",
                 return_value={"held_by_this_server": True},
-            ), patch("codex_master.server.release_agent") as mock_release:
+            ), patch("codex_master.server.release_agent") as mock_release, patch(
+                "codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
+            ):
                 with self.assertRaisesRegex(AgentError, "tmux pipe-pane failed"):
                     start_agent(
                         "a",
@@ -13102,7 +13123,9 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": runner, "home": root, "session": "test_session"}},
                 clear=False,
-            ), patch("codex_master.server.RAW_DIR", root), patch("codex_master.server.META_DIR", root):
+            ), patch("codex_master.server.RAW_DIR", root), patch(
+                "codex_master.server.META_DIR", root
+            ), patch("codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION):
                 with self.assertRaisesRegex(AgentError, "meta failed"):
                     start_agent("a", cwd=tmpdir)
 
@@ -13365,7 +13388,7 @@ class ServerHelpersTest(unittest.TestCase):
                     "external_processes_truncated": False,
                     "raw_output": "not_returned",
                 },
-            ):
+            ), patch("codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION):
                 result = start_agent("a", cwd=tmpdir)
 
             raw_log_path = str(raw_dir / "fixed-a.log")
@@ -13401,12 +13424,102 @@ class ServerHelpersTest(unittest.TestCase):
                     "external_processes_truncated": False,
                     "raw_output": "not_returned",
                 },
+            ), patch(
+                "codex_master.server.require_spawn_capacity",
+                return_value={
+                    "allowed": True,
+                    "required_slots": 1,
+                    "available_slots": 1,
+                    "reason_codes": [],
+                    "raw_output": "not_returned",
+                },
             ):
                 with self.assertRaisesRegex(RuntimeError, "tmux start failed"):
                     start_agent("a", cwd=tmpdir)
                 leftover_logs = list(Path(tmpdir).glob("*.log"))
 
         self.assertEqual(leftover_logs, [])
+
+    def test_failed_fresh_start_releases_admission_lock_and_preserves_cleanup(self) -> None:
+        admission = {
+            "allowed": True,
+            "required_slots": 1,
+            "available_slots": 1,
+            "reason_codes": [],
+            "raw_output": "not_returned",
+        }
+        process_summary = {
+            "process_count": 0,
+            "external_process_count": 0,
+            "managed_process_count": 0,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        }
+        new_session_targets: list[str] = []
+
+        def fake_run_tmux(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if args[0] == "new-session":
+                target = args[args.index("-s") + 1]
+                new_session_targets.append(target)
+                return subprocess.CompletedProcess(
+                    ["tmux", *args],
+                    1 if target == "session-a1" else 0,
+                    "",
+                    "",
+                )
+            if args[0] == "pipe-pane":
+                return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
+            raise AssertionError(f"unexpected tmux command: {args[0]}")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            agents: dict[str, dict[str, Any]] = {}
+            for agent in ("a1", "a2"):
+                runner = root / f"{agent}-codex"
+                runner.write_text("#!/bin/sh\n", encoding="utf-8")
+                runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+                agents[agent] = {
+                    "label": agent.upper(),
+                    "runner": runner,
+                    "home": root,
+                    "session": f"session-{agent}",
+                }
+            with patch.dict("codex_master.server.AGENTS", agents, clear=True), patch(
+                "codex_master.server.STATE_ROOT", state
+            ), patch("codex_master.server.RAW_DIR", state / "raw"), patch(
+                "codex_master.server.META_DIR", state / "meta"
+            ), patch("codex_master.server.LOCK_DIR", state / "locks"), patch(
+                "codex_master.server.LEASE_DIR", state / "leases"
+            ), patch(
+                "codex_master.server.require_spawn_capacity", side_effect=[admission, admission]
+            ) as require_capacity, patch("codex_master.server.tmux_alive", return_value=False), patch(
+                "codex_master.server.agent_home_process_summary", return_value=process_summary
+            ), patch("codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}), patch(
+                "codex_master.server.release_agent"
+            ) as release_agent_mock, patch(
+                "codex_master.server.run_tmux", side_effect=fake_run_tmux
+            ), patch("codex_master.server.write_meta"), patch(
+                "codex_master.server.now_id", side_effect=["first", "second"]
+            ):
+                with self.assertRaisesRegex(AgentError, "tmux start failed"):
+                    start_agent(
+                        "a1",
+                        cwd=tmpdir,
+                        lease={"held_by_this_server": True},
+                        release_lease_on_failure=True,
+                    )
+                first_raw_log_removed = not (state / "raw" / "first-a1.log").exists()
+                second = start_agent("a2", cwd=tmpdir)
+                second_raw_log_exists = (state / "raw" / "second-a2.log").is_file()
+
+        self.assertTrue(first_raw_log_removed)
+        self.assertTrue(second_raw_log_exists)
+        self.assertEqual(new_session_targets, ["session-a1", "session-a2"])
+        self.assertEqual([call.args for call in require_capacity.call_args_list], [(1,), (1,)])
+        release_agent_mock.assert_called_once_with("a1", force=True)
+        self.assertEqual(second["status"], "started")
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.write_meta")
@@ -13435,6 +13548,8 @@ class ServerHelpersTest(unittest.TestCase):
                     "external_processes_truncated": False,
                     "raw_output": "not_returned",
                 },
+            ), patch(
+                "codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
             ):
                 with self.assertRaisesRegex(RuntimeError, "tmux start failed"):
                     start_agent("a", cwd=tmpdir)
@@ -13477,7 +13592,7 @@ class ServerHelpersTest(unittest.TestCase):
                     "external_processes_truncated": False,
                     "raw_output": "not_returned",
                 },
-            ):
+            ), patch("codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION):
                 with self.assertRaises(AgentError) as raised:
                     start_agent("a", cwd=tmpdir)
 
@@ -13522,6 +13637,8 @@ class ServerHelpersTest(unittest.TestCase):
                 },
             ), patch(
                 "codex_master.server.now_id", return_value="fixed"
+            ), patch(
+                "codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
             ):
                 with self.assertRaisesRegex(AgentError, "without following symlinks") as raised:
                     start_agent("a", cwd=tmpdir)
