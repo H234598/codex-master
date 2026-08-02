@@ -546,6 +546,11 @@ def verify_running() -> None:
 def verify_files(source: Path, target: Path) -> None:
     _source_dirs, source_manifest = validate_source(source)
     _target_dirs, target_manifest = scan_tree(target, "installed applet")
+    # ponytail: Source writers share no lock; add a generation protocol if changes after
+    # the final source read must be atomic with this verification result.
+    _current_source_dirs, current_source_manifest = validate_source(source)
+    if current_source_manifest != source_manifest:
+        raise InstallerError("source applet changed during verification")
     if target_manifest != source_manifest:
         raise InstallerError("installed applet differs from repository source")
 

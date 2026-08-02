@@ -424,6 +424,23 @@ else:
         self.assertFalse(self.backup.exists())
         self.assertEqual(list(self.target.parent.glob(f".{UUID}.staging-*")), [])
 
+    def test_verify_rejects_source_change_during_target_scan(self) -> None:
+        shutil.copytree(self.source, self.target)
+        module = self._load_tool_module()
+        real_scan = module.scan_tree
+        changed = False
+
+        def change_source_before_target_scan(root, label):
+            nonlocal changed
+            if Path(root) == self.target and not changed:
+                changed = True
+                (self.source / "applet.js").write_text("changed during verify\n", encoding="utf-8")
+            return real_scan(root, label)
+
+        with mock.patch.object(module, "scan_tree", side_effect=change_source_before_target_scan):
+            with self.assertRaisesRegex(module.InstallerError, "source applet changed during verification"):
+                module.verify_files(self.source, self.target)
+
     def test_source_mode_change_between_stat_and_open_is_rejected(self) -> None:
         module = self._load_tool_module()
         source_file = self.source / "applet.js"
