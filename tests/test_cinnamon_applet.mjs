@@ -754,7 +754,7 @@ test("single-flight keeps one pending refresh", async () => {
   assert.equal(applet._statusPendingRefresh, false);
 });
 
-test("stdout cap, stderr cap, and timeout each force_exit exactly once", () => {
+test("stdout cap, stderr cap, and timeout each cancel and force_exit exactly once", () => {
   for (const failure of ["stdout", "stderr", "timeout"]) {
     const fixture = loadApplet();
     fixture.setProcessFactory(() => ({
@@ -775,9 +775,11 @@ test("stdout cap, stderr cap, and timeout each force_exit exactly once", () => {
     const { main, subprocesses, runTimeouts } = fixture;
     const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
     applet.menu.items[0].activate();
+    const cancellable = applet._statusActiveState.cancellable;
     if (failure === "timeout") runTimeouts();
 
     assert.equal(subprocesses[0].forceExitCount, 1, `${failure}: exactly once`);
+    assert.equal(cancellable.cancelCount, 1, `${failure}: cancellation exactly once`);
   }
 });
 

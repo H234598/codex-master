@@ -342,7 +342,20 @@ FlottenmanagementApplet.prototype = {
             }
         };
 
+        const requestCancel = (stateArg) => {
+            if (stateArg.cancellableCancelled || !stateArg.cancellable) return true;
+            try {
+                stateArg.cancellable.cancel();
+                stateArg.cancellableCancelled = true;
+                return true;
+            } catch (error) {
+                this._logCleanupError(error);
+                return false;
+            }
+        };
+
         const failRefresh = (stateArg) => {
+            requestCancel(stateArg);
             stateArg.discardOutput = true;
             this._clearStatusBuffers(stateArg);
             this._markRefreshFailed();
