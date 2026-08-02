@@ -368,20 +368,36 @@ function loadApplet() {
       this.instanceId = instanceId;
       this.bindings = new Map();
       this.finalizeCount = 0;
+      this.saveCount = 0;
       settingsInstances.push(this);
     }
     bindProperty(_direction, key, property, callback) {
       if (settingsBindFailures.has(key)) return false;
-      this.target[property] = settingsValues[key];
       this.bindings.set(key, { property, callback });
+      Object.defineProperty(this.target, property, {
+        configurable: true,
+        enumerable: true,
+        get: () => settingsValues[key],
+        set: (value) => {
+          if (settingsValues[key] !== value) {
+            settingsValues[key] = value;
+            this.saveCount += 1;
+          }
+        },
+      });
       return true;
     }
-    finalize() { this.finalizeCount += 1; }
+    finalize() {
+      this.finalizeCount += 1;
+      for (const binding of this.bindings.values()) {
+        delete this.target[binding.property];
+      }
+      this.bindings.clear();
+    }
     set(key, value) {
       settingsValues[key] = value;
       const binding = this.bindings.get(key);
       if (!binding) return;
-      this.target[binding.property] = value;
       if (binding.callback) binding.callback();
     }
   }
@@ -1893,6 +1909,28 @@ test("rejected settings binding finalizes partial settings and fails closed", ()
   assert.deepEqual(Array.from(applet._trackedAgents), ["a1", "b1"]);
   assert.equal(fixture.activeTimers("background").length, 0);
   assert.match(applet._statusSummaryItem.label, /Konfiguration/);
+});
+
+test("scalar setting normalization never writes through Cinnamon bindings", () => {
+  const cases = [
+    { key: "refresh-on-open", value: "yes", property: "refreshOnOpen", expected: true, valid: false },
+    { key: "background-refresh", value: "yes", property: "backgroundRefresh", expected: false, valid: false },
+    { key: "refresh-interval-seconds", value: 5, property: "refreshIntervalSeconds", expected: 15, valid: true },
+    { key: "refresh-interval-seconds", value: "5", property: "refreshIntervalSeconds", expected: 60, valid: false },
+  ];
+
+  for (const item of cases) {
+    const fixture = loadApplet();
+    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+    const settings = fixture.settingsInstances[0];
+
+    fixture.setSetting(item.key, item.value);
+
+    assert.equal(settings.saveCount, 0, item.key);
+    assert.equal(applet[item.property], item.expected, item.key);
+    assert.equal(applet._settingsValid, item.valid, item.key);
+    assert.equal(fixture.activeTimers("background").length, 0, item.key);
+  }
 });
 
 test("read-only UI keeps title and separates activity backend and stale state", () => {

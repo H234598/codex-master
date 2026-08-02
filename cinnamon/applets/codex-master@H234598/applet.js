@@ -85,6 +85,9 @@ FlottenmanagementApplet.prototype = {
         this._backgroundRefreshSource = 0;
         this._trackedAgents = APPLET_STATUS_AGENTS.slice();
         this.trackedAgentsSetting = DEFAULT_TRACKED_AGENTS_TEXT;
+        this.refreshOnOpenSetting = DEFAULT_REFRESH_ON_OPEN;
+        this.backgroundRefreshSetting = DEFAULT_BACKGROUND_REFRESH;
+        this.refreshIntervalSecondsSetting = DEFAULT_REFRESH_INTERVAL_SECONDS;
         this.refreshOnOpen = DEFAULT_REFRESH_ON_OPEN;
         this.backgroundRefresh = DEFAULT_BACKGROUND_REFRESH;
         this.refreshIntervalSeconds = DEFAULT_REFRESH_INTERVAL_SECONDS;
@@ -156,9 +159,9 @@ FlottenmanagementApplet.prototype = {
                 if (bound !== true) throw new Error("Applet setting binding failed");
             };
             bind("tracked-agents", "trackedAgentsSetting");
-            bind("refresh-on-open", "refreshOnOpen");
-            bind("background-refresh", "backgroundRefresh");
-            bind("refresh-interval-seconds", "refreshIntervalSeconds");
+            bind("refresh-on-open", "refreshOnOpenSetting");
+            bind("background-refresh", "backgroundRefreshSetting");
+            bind("refresh-interval-seconds", "refreshIntervalSecondsSetting");
         } catch (_error) {
             if (this.settings && typeof this.settings.finalize === "function") {
                 try {
@@ -196,21 +199,25 @@ FlottenmanagementApplet.prototype = {
         this._trackedAgents = agents || APPLET_STATUS_AGENTS.slice();
         if (!agents) valid = false;
 
-        if (typeof this.refreshOnOpen !== "boolean") {
+        if (typeof this.refreshOnOpenSetting !== "boolean") {
             this.refreshOnOpen = DEFAULT_REFRESH_ON_OPEN;
             valid = false;
+        } else {
+            this.refreshOnOpen = this.refreshOnOpenSetting;
         }
-        if (typeof this.backgroundRefresh !== "boolean") {
+        if (typeof this.backgroundRefreshSetting !== "boolean") {
             this.backgroundRefresh = DEFAULT_BACKGROUND_REFRESH;
             valid = false;
+        } else {
+            this.backgroundRefresh = this.backgroundRefreshSetting;
         }
-        if (!Number.isFinite(this.refreshIntervalSeconds)) {
+        if (!Number.isFinite(this.refreshIntervalSecondsSetting)) {
             this.refreshIntervalSeconds = DEFAULT_REFRESH_INTERVAL_SECONDS;
             valid = false;
         } else {
             this.refreshIntervalSeconds = Math.min(
                 MAX_REFRESH_INTERVAL_SECONDS,
-                Math.max(MIN_REFRESH_INTERVAL_SECONDS, Math.trunc(this.refreshIntervalSeconds))
+                Math.max(MIN_REFRESH_INTERVAL_SECONDS, Math.trunc(this.refreshIntervalSecondsSetting))
             );
         }
 
