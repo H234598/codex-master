@@ -256,7 +256,7 @@ FlottenmanagementApplet.prototype = {
         }
         if (this._removed || !this._settingsValid || !this.backgroundRefresh) return;
         try {
-            this._backgroundRefreshSource = GLib.timeout_add_seconds(
+            const backgroundRefreshSource = GLib.timeout_add_seconds(
                 GLib.PRIORITY_DEFAULT,
                 this.refreshIntervalSeconds,
                 () => {
@@ -268,6 +268,10 @@ FlottenmanagementApplet.prototype = {
                     return GLib.SOURCE_CONTINUE;
                 }
             );
+            if (!Number.isSafeInteger(backgroundRefreshSource) || backgroundRefreshSource <= 0) {
+                throw new Error("Invalid background timeout source id");
+            }
+            this._backgroundRefreshSource = backgroundRefreshSource;
         } catch (error) {
             this._backgroundRefreshSource = 0;
             this._settingsValid = false;

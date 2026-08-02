@@ -2185,6 +2185,21 @@ test("background timer registration failure does not prevent applet load", () =>
   assert.match(applet._statusSummaryItem.label, /Konfigurationsfehler/);
 });
 
+test("invalid background timer source ids fail settings closed", () => {
+  for (const invalidSourceId of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    const fixture = loadApplet();
+    fixture.setSetting("background-refresh", true);
+    fixture.GLib.timeout_add_seconds = () => invalidSourceId;
+
+    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+
+    assert.equal(applet._backgroundRefreshSource, 0);
+    assert.equal(fixture.activeTimers("background").length, 0);
+    assert.equal(applet._settingsValid, false);
+    assert.match(applet._statusSummaryItem.label, /Konfigurationsfehler/);
+  }
+});
+
 test("background timer removal failure cannot keep disabled refresh running", () => {
   const fixture = loadApplet();
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
