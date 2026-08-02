@@ -474,6 +474,8 @@ FlottenmanagementApplet.prototype = {
 
     _sanitizeLauncherEnvironment(launcher) {
         launcher.setenv("PATH", APPLET_SAFE_PATH, true);
+        const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
+        launcher.setenv("HOME", home, true);
         for (const key of APPLET_INVALID_ENV_VARS) {
             if (typeof launcher.unsetenv === "function") {
                 launcher.unsetenv(key);

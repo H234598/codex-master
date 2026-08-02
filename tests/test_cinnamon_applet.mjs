@@ -639,6 +639,7 @@ test("builds fixed mcp argv and validierte ids", async () => {
   assert.equal(launch.argv[3], "b1");
   assert.deepEqual(Array.from(launch.envCalls), [
     { key: "PATH", value: "/usr/bin:/bin", overwrite: true },
+    { key: "HOME", value: "/tmp/home", overwrite: true },
   ]);
   for (const key of ["BASH_ENV", "LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONHOME", "GJS_PATH"]) {
     assert.ok(launch.unsetCalls.includes(key), `strips ${key}`);
