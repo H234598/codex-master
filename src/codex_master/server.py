@@ -1202,9 +1202,9 @@ def applet_agent_observation(agent: str, *, deadline: float) -> dict[str, Any]:
         raise AgentError("applet status backend unavailable")
     running = session_check.returncode == 0
 
+    applet_remaining_timeout(deadline)
+    process_summary = agent_home_process_summary(agent)
     if running:
-        applet_remaining_timeout(deadline)
-        process_summary = agent_home_process_summary(agent)
         pane_check = run_tmux(
             ["display-message", "-p", "-t", session, "#{pane_pid}"],
             check=False,
@@ -1214,14 +1214,18 @@ def applet_agent_observation(agent: str, *, deadline: float) -> dict[str, Any]:
             raise AgentError("applet status backend unavailable")
         pane_text = pane_check.stdout.strip()
         pane_process_id = pane_pid_from_text(pane_text)
-        identity_guard = agent_identity_guard(True, process_summary, pane_process_id=pane_process_id)
-        identity_state = "verified" if identity_guard.get("ok") is True else "unverified"
-        backend_state = "ok" if identity_state == "verified" else "degraded"
         activity_state = "running"
     else:
-        identity_state = "stopped"
-        backend_state = "ok"
+        pane_process_id = None
         activity_state = "sleeping"
+    identity_guard = agent_identity_guard(
+        running,
+        process_summary,
+        pane_process_id=pane_process_id,
+    )
+    identity_verified = identity_guard.get("ok") is True
+    identity_state = ("verified" if running else "stopped") if identity_verified else "unverified"
+    backend_state = "ok" if identity_verified else "degraded"
 
     applet_remaining_timeout(deadline)
     auth = agent_auth_status(agent)
