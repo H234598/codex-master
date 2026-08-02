@@ -485,6 +485,32 @@ else:
         calls = self.log.read_text(encoding="utf-8").count("org.Cinnamon.ReloadXlet")
         self.assertEqual(calls, 2, "restored current applet must be reloaded after failed rollback")
 
+    def test_swap_recovery_failure_does_not_mask_primary_error(self) -> None:
+        self._write_tree(self.target, "current")
+        self._write_tree(self.backup, "previous")
+        module = self._load_tool_module()
+        real_replace = module.os.replace
+
+        def fail_swap_and_recovery(source, destination):
+            source = Path(source)
+            destination = Path(destination)
+            if source.name.startswith(f".{UUID}.swap-") and destination == self.backup:
+                raise OSError("primary swap failure")
+            if source == self.target and destination == self.backup:
+                raise OSError("swap recovery failure")
+            return real_replace(source, destination)
+
+        with mock.patch.object(module.os, "replace", side_effect=fail_swap_and_recovery):
+            with self.assertRaisesRegex(OSError, "primary swap failure") as caught:
+                module.swap_directories(self.target, self.backup)
+
+        self.assertIn("swap recovery failure", "\n".join(caught.exception.__notes__))
+        self.assertIn("previous", (self.target / "applet.js").read_text(encoding="utf-8"))
+        self.assertFalse(self.backup.exists())
+        unfinished = list(self.target.parent.glob(f".{UUID}.swap-*"))
+        self.assertEqual(len(unfinished), 1)
+        self.assertIn("current", (unfinished[0] / "applet.js").read_text(encoding="utf-8"))
+
     def test_rollback_refuses_unfinished_rotation_without_mutation(self) -> None:
         retired = self.target.parent / f".{UUID}.retired"
         self._write_tree(self.target, "current")

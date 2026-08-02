@@ -649,11 +649,20 @@ def swap_directories(first: Path, second: Path) -> None:
     try:
         os.replace(second, first)
         os.replace(temporary, second)
-    except Exception:
-        if lexical_exists(first) and not lexical_exists(second):
-            os.replace(first, second)
-        if lexical_exists(temporary) and not lexical_exists(first):
-            os.replace(temporary, first)
+    except Exception as swap_error:
+        recovery_errors: list[Exception] = []
+        try:
+            if lexical_exists(first) and not lexical_exists(second):
+                os.replace(first, second)
+        except Exception as exc:
+            recovery_errors.append(exc)
+        try:
+            if lexical_exists(temporary) and not lexical_exists(first):
+                os.replace(temporary, first)
+        except Exception as exc:
+            recovery_errors.append(exc)
+        for recovery_error in recovery_errors:
+            swap_error.add_note(f"rollback swap recovery also failed: {recovery_error}")
         raise
 
 
