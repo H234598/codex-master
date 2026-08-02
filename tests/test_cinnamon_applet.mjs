@@ -503,6 +503,7 @@ function loadApplet() {
     settingsInstances,
     runTimeouts() { return Mainloop.runTimeouts(); },
     setSpawnError(message) { spawnError = new Error(message); },
+    setGlobalLogger(logger) { context.global = { logError: logger }; },
     setHome(value) { home = value; },
     guardOversizedStringSplit(maxLength) {
       context.__splitGuardMaxLength = maxLength;
@@ -1791,6 +1792,32 @@ test("final render exception cannot block cleanup or pending refresh", () => {
   assert.equal(fixture.subprocesses.length, 2);
   assert.equal(applet._statusPendingRefresh, false);
 
+  fixture.subprocesses[1].emitDone();
+  assert.equal(applet._statusInFlight, false);
+  assert.equal(applet._statusActiveState, null);
+  assert.equal(applet._statusViewState, "ready");
+});
+
+test("logger failure cannot pierce the status render boundary", () => {
+  const fixture = loadApplet();
+  queuePayloadProcess(fixture, samplePayload());
+  queuePayloadProcess(fixture, samplePayload());
+  fixture.setGlobalLogger(() => { throw new Error("injected logger failure"); });
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const originalRender = applet._renderStatus.bind(applet);
+  let renderCalls = 0;
+  applet._renderStatus = () => {
+    renderCalls += 1;
+    if (renderCalls === 2) throw new Error("injected final render failure");
+    return originalRender();
+  };
+
+  const statusItem = applet.menu.items[0];
+  statusItem.activate();
+  statusItem.activate();
+
+  assert.doesNotThrow(() => fixture.subprocesses[0].emitDone());
+  assert.equal(fixture.subprocesses.length, 2);
   fixture.subprocesses[1].emitDone();
   assert.equal(applet._statusInFlight, false);
   assert.equal(applet._statusActiveState, null);

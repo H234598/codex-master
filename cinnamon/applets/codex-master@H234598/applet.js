@@ -857,9 +857,11 @@ FlottenmanagementApplet.prototype = {
     },
 
     _logCleanupError(error) {
-        if (typeof global !== "undefined" && global && typeof global.logError === "function") {
-            global.logError(error);
-        }
+        try {
+            if (typeof global !== "undefined" && global && typeof global.logError === "function") {
+                global.logError(error);
+            }
+        } catch (_loggingError) {}
     },
 
     _disconnectTrackedSignals() {
