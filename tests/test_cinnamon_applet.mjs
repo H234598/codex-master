@@ -1026,6 +1026,100 @@ test("invalid timeout handle retries a failed replacement wait once", () => {
   assert.equal(fixture.activeTimers("timeout").length, 0);
 });
 
+test("timerless replacement wait retries a transient cancellable construction failure", () => {
+  const fixture = loadApplet();
+  let cancellableConstructions = 0;
+  fixture.Gio.Cancellable = class {
+    constructor() {
+      cancellableConstructions += 1;
+      if (cancellableConstructions === 2) throw new Error("injected replacement cancellable failure");
+      this.cancelCount = 0;
+    }
+    cancel() { this.cancelCount += 1; }
+  };
+  fixture.setProcessFactory(() => {
+    const stdout = fixture.makeStream([], true);
+    const stderr = fixture.makeStream([], true);
+    return {
+      waitFinishCount: 0,
+      waitCallbacks: [],
+      stdout,
+      stderr,
+      get_stdout_pipe() { return stdout; },
+      get_stderr_pipe() { return stderr; },
+      get_successful: () => false,
+      force_exit() {},
+      wait_async(_cancellable, callback) { this.waitCallbacks.push(callback); },
+      wait_finish() {
+        this.waitFinishCount += 1;
+        if (this.waitFinishCount === 1) throw new Error("injected original wait failure");
+      },
+      emitOneWait() {
+        const callback = this.waitCallbacks.shift();
+        callback(this, null);
+      },
+    };
+  });
+  fixture.GLib.timeout_add = () => 0;
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  applet.menu.items[0].activate();
+  const process = fixture.subprocesses[0];
+
+  process.stdout.releaseEof();
+  process.stderr.releaseEof();
+  process.emitOneWait();
+
+  assert.equal(cancellableConstructions, 3, "one bounded immediate constructor retry");
+  assert.equal(process.waitCallbacks.length, 1, "retry starts replacement wait");
+  process.emitOneWait();
+  assert.equal(applet._statusActiveState, null);
+  assert.equal(fixture.activeTimers().length, 0);
+});
+
+test("timerless replacement wait bounds permanent cancellable construction failures", () => {
+  const fixture = loadApplet();
+  let cancellableConstructions = 0;
+  fixture.Gio.Cancellable = class {
+    constructor() {
+      cancellableConstructions += 1;
+      if (cancellableConstructions > 1) throw new Error("injected permanent replacement cancellable failure");
+      this.cancelCount = 0;
+    }
+    cancel() { this.cancelCount += 1; }
+  };
+  fixture.setProcessFactory(() => {
+    const stdout = fixture.makeStream([], true);
+    const stderr = fixture.makeStream([], true);
+    return {
+      waitCallbacks: [],
+      get_stdout_pipe() { return stdout; },
+      get_stderr_pipe() { return stderr; },
+      get_successful: () => false,
+      force_exit() {},
+      wait_async(_cancellable, callback) { this.waitCallbacks.push(callback); },
+      wait_finish() { throw new Error("injected original wait failure"); },
+      emitOneWait() {
+        const callback = this.waitCallbacks.shift();
+        callback(this, null);
+      },
+    };
+  });
+  fixture.GLib.timeout_add = () => 0;
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  applet.menu.items[0].activate();
+  const process = fixture.subprocesses[0];
+  const state = applet._statusActiveState;
+
+  process.emitOneWait();
+
+  assert.equal(cancellableConstructions, 3, "replacement construction stops after two attempts");
+  assert.equal(process.waitCallbacks.length, 0);
+  assert.equal(applet._statusActiveState, state, "failed state remains bounded and owned");
+  assert.equal(fixture.activeTimers().length, 0);
+  applet.on_applet_removed_from_panel();
+  assert.equal(applet._statusActiveState, null, "removal releases bounded failed state");
+});
+
 test("cancellable construction failure keeps the process managed", () => {
   const fixture = loadApplet();
   queuePayloadProcess(fixture, samplePayload());

@@ -408,17 +408,25 @@ FlottenmanagementApplet.prototype = {
         const ensureExitWait = (stateArg) => {
             if (stateArg.finalizing || stateArg.exitConfirmed || stateArg.exitWaitInFlight || !stateArg.process) return;
             if (typeof stateArg.process.wait_async !== "function") return;
+            stateArg.exitWaitAttempts += 1;
             if (!stateArg.exitWaitCancellable) {
                 try {
                     stateArg.exitWaitCancellable = Gio.Cancellable ? new Gio.Cancellable() : null;
                 } catch (error) {
                     this._logCleanupError(error);
+                    if (!stateArg.timeoutSource && stateArg.exitWaitAttempts < APPLET_IMMEDIATE_EXIT_WAIT_LIMIT) {
+                        ensureExitWait(stateArg);
+                    }
                     return;
                 }
             }
-            if (!stateArg.exitWaitCancellable || stateArg.exitWaitCancellableCancelled) return;
+            if (!stateArg.exitWaitCancellable || stateArg.exitWaitCancellableCancelled) {
+                if (!stateArg.timeoutSource && stateArg.exitWaitAttempts < APPLET_IMMEDIATE_EXIT_WAIT_LIMIT) {
+                    ensureExitWait(stateArg);
+                }
+                return;
+            }
             stateArg.exitWaitInFlight = true;
-            stateArg.exitWaitAttempts += 1;
             try {
                 stateArg.process.wait_async(stateArg.exitWaitCancellable, (_proc, result) => {
                     try {
