@@ -21,6 +21,7 @@ const DEFAULT_REFRESH_INTERVAL_SECONDS = 60;
 const MIN_REFRESH_INTERVAL_SECONDS = 15;
 const MAX_REFRESH_INTERVAL_SECONDS = 3600;
 const MAX_TRACKED_AGENTS = 6;
+const MAX_TRACKED_AGENTS_SETTING_CHARS = 128;
 const APPLET_SAFE_PATH = "/usr/bin:/bin";
 const APPLET_STATUS_COMMAND = "applet-status";
 const APPLET_STATUS_REQUIRED_FIELDS = [
@@ -173,7 +174,7 @@ FlottenmanagementApplet.prototype = {
     },
 
     _normalizeTrackedAgents(value) {
-        if (typeof value !== "string") return null;
+        if (typeof value !== "string" || value.length > MAX_TRACKED_AGENTS_SETTING_CHARS) return null;
         const entries = value.split(",").map((entry) => entry.trim().toLowerCase());
         if (entries.length < 1 || entries.length > MAX_TRACKED_AGENTS) return null;
         const normalized = [];

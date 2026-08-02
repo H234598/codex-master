@@ -485,6 +485,18 @@ function loadApplet() {
     runTimeouts() { return Mainloop.runTimeouts(); },
     setSpawnError(message) { spawnError = new Error(message); },
     setHome(value) { home = value; },
+    guardOversizedStringSplit(maxLength) {
+      context.__splitGuardMaxLength = maxLength;
+      vm.runInNewContext(`
+        globalThis.__originalStringSplit = String.prototype.split;
+        String.prototype.split = function (...args) {
+          if (this.length > globalThis.__splitGuardMaxLength) {
+            throw new Error("oversized string reached split");
+          }
+          return globalThis.__originalStringSplit.apply(this, args);
+        };
+      `, context);
+    },
     setProcessFactory(factory) { pendingFactories.push(factory); },
     resetFactories() { pendingFactories.length = 0; },
     setSetting(key, value) {
@@ -1854,6 +1866,18 @@ test("settings parser canonicalizes bounded concrete ids and never launches atta
   assert.ok(!argv.join(" ").includes("/tmp/owned"));
   fixture.setSetting("background-refresh", true);
   assert.equal(fixture.activeTimers("background").length, 0, "invalid settings disable background work");
+});
+
+test("oversized tracked-agent setting is rejected before string splitting", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  fixture.guardOversizedStringSplit(128);
+  const oversized = "a1,".repeat(64) + "a1";
+
+  assert.doesNotThrow(() => fixture.setSetting("tracked-agents", oversized));
+  assert.equal(applet._settingsValid, false);
+  assert.deepEqual(Array.from(applet._trackedAgents), ["a1", "b1"]);
+  assert.equal(fixture.activeTimers("background").length, 0);
 });
 
 test("read-only UI keeps title and separates activity backend and stale state", () => {
