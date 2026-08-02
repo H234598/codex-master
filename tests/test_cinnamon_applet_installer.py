@@ -589,6 +589,66 @@ else:
                 with module.operation_lock(create_parent=True):
                     raise OSError("injected operation failure")
 
+    def _assert_selector_setup_failure_is_cleaned(self, invoke) -> None:
+        module = self._load_tool_module()
+
+        class Pipe:
+            def __init__(self, label):
+                self.label = label
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+                raise OSError(f"injected {self.label} cleanup failure")
+
+        class Process:
+            def __init__(self):
+                self.stdout = Pipe("stdout")
+                self.stderr = Pipe("stderr")
+                self.kill_count = 0
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                self.kill_count += 1
+
+            def wait(self, timeout=None):
+                return 0
+
+        class BrokenSelector:
+            def __init__(self):
+                self.closed = False
+
+            def register(self, *_args):
+                raise OSError("injected selector setup failure")
+
+            def close(self):
+                self.closed = True
+                raise OSError("injected selector cleanup failure")
+
+        process = Process()
+        selector = BrokenSelector()
+        with mock.patch.object(module.subprocess, "Popen", return_value=process):
+            with mock.patch.object(module.selectors, "DefaultSelector", return_value=selector):
+                with self.assertRaisesRegex(OSError, "injected selector setup failure") as caught:
+                    invoke(module)
+
+        self.assertEqual(process.kill_count, 1)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+        self.assertTrue(selector.closed)
+        notes = "\n".join(caught.exception.__notes__)
+        self.assertIn("injected selector cleanup failure", notes)
+        self.assertIn("injected stdout cleanup failure", notes)
+        self.assertIn("injected stderr cleanup failure", notes)
+
+    def test_run_bounded_cleans_up_selector_setup_failure(self) -> None:
+        self._assert_selector_setup_failure_is_cleaned(lambda module: module.run_bounded(["gdbus"]))
+
+    def test_reload_cleans_up_selector_setup_failure(self) -> None:
+        self._assert_selector_setup_failure_is_cleaned(lambda module: module.reload_xlet())
+
     def test_kill_and_wait_remains_bounded_when_process_cannot_be_reaped(self) -> None:
         module = self._load_tool_module()
 

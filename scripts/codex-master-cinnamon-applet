@@ -297,6 +297,49 @@ def kill_and_wait(process: subprocess.Popen[bytes]) -> None:
             return
 
 
+def cleanup_process(
+    process: subprocess.Popen[bytes], selector: selectors.BaseSelector | None = None
+) -> list[BaseException]:
+    errors: list[BaseException] = []
+    actions = []
+    if selector is not None:
+        actions.append(selector.close)
+    actions.append(lambda: kill_and_wait(process))
+    actions.extend(
+        pipe.close for pipe in (process.stdout, process.stderr) if pipe is not None and not pipe.closed
+    )
+    for action in actions:
+        try:
+            action()
+        except BaseException as exc:
+            errors.append(exc)
+    return errors
+
+
+def report_cleanup_errors(primary: BaseException | None, errors: list[BaseException]) -> None:
+    if not errors:
+        return
+    if primary is None:
+        primary = errors[0]
+        for error in errors[1:]:
+            primary.add_note(f"process cleanup also failed: {error}")
+        raise primary
+    for error in errors:
+        primary.add_note(f"process cleanup also failed: {error}")
+
+
+def selector_for_process(process: subprocess.Popen[bytes]) -> selectors.BaseSelector:
+    selector: selectors.BaseSelector | None = None
+    try:
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        return selector
+    except BaseException as primary:
+        report_cleanup_errors(primary, cleanup_process(process, selector))
+        raise
+
+
 def run_bounded(argv: list[str]) -> str:
     try:
         process = subprocess.Popen(
@@ -309,20 +352,19 @@ def run_bounded(argv: list[str]) -> str:
     except OSError as exc:
         raise InstallerError("gdbus is unavailable") from exc
     if process.stdout is None or process.stderr is None:
-        kill_and_wait(process)
-        raise InstallerError("gdbus pipes are unavailable")
+        error = InstallerError("gdbus pipes are unavailable")
+        report_cleanup_errors(error, cleanup_process(process))
+        raise error
 
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
-    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    selector = selector_for_process(process)
     chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
     total = 0
     deadline = time.monotonic() + DBUS_TIMEOUT_SECONDS
+    operation_error: BaseException | None = None
     try:
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                kill_and_wait(process)
                 raise InstallerError("gdbus timed out")
             events = selector.select(min(remaining, 0.25))
             if not events and process.poll() is not None:
@@ -331,7 +373,6 @@ def run_bounded(argv: list[str]) -> str:
                 try:
                     chunk = os.read(key.fileobj.fileno(), 4096)
                 except OSError as exc:
-                    kill_and_wait(process)
                     raise InstallerError("gdbus output could not be read") from exc
                 if not chunk:
                     selector.unregister(key.fileobj)
@@ -339,17 +380,18 @@ def run_bounded(argv: list[str]) -> str:
                     continue
                 total += len(chunk)
                 if total > DBUS_OUTPUT_LIMIT_BYTES:
-                    kill_and_wait(process)
                     raise InstallerError("gdbus output exceeded limit")
                 chunks[key.data].append(chunk)
         remaining = max(0.0, deadline - time.monotonic())
         try:
             returncode = process.wait(timeout=remaining)
         except subprocess.TimeoutExpired as exc:
-            kill_and_wait(process)
             raise InstallerError("gdbus timed out") from exc
+    except BaseException as exc:
+        operation_error = exc
+        raise
     finally:
-        selector.close()
+        report_cleanup_errors(operation_error, cleanup_process(process, selector))
 
     stdout = b"".join(chunks["stdout"]).decode("utf-8", errors="replace")
     stderr = b"".join(chunks["stderr"]).decode("utf-8", errors="replace")
@@ -399,12 +441,11 @@ def reload_xlet() -> None:
     except OSError as exc:
         raise InstallerError("gdbus monitor is unavailable") from exc
     if monitor.stdout is None or monitor.stderr is None:
-        kill_and_wait(monitor)
-        raise InstallerError("gdbus monitor pipes are unavailable")
+        error = InstallerError("gdbus monitor pipes are unavailable")
+        report_cleanup_errors(error, cleanup_process(monitor))
+        raise error
 
-    selector = selectors.DefaultSelector()
-    selector.register(monitor.stdout, selectors.EVENT_READ, "stdout")
-    selector.register(monitor.stderr, selectors.EVENT_READ, "stderr")
+    selector = selector_for_process(monitor)
     stdout_buffer = bytearray()
     stderr_buffer = bytearray()
     total = 0
@@ -447,6 +488,7 @@ def reload_xlet() -> None:
                 detail = stderr_buffer.decode("utf-8", errors="replace").strip()[:300]
                 raise InstallerError(detail or "gdbus reload monitor ended unexpectedly")
 
+    reload_error: BaseException | None = None
     try:
         ready_deadline = time.monotonic() + RELOAD_SIGNAL_TIMEOUT_SECONDS
         while True:
@@ -477,12 +519,11 @@ def reload_xlet() -> None:
                 raise InstallerError("Cinnamon reported that the applet failed to load")
             if UUID in payload:
                 raise InstallerError("Cinnamon returned an invalid applet-load signal")
+    except BaseException as exc:
+        reload_error = exc
+        raise
     finally:
-        selector.close()
-        kill_and_wait(monitor)
-        for pipe in (monitor.stdout, monitor.stderr):
-            if not pipe.closed:
-                pipe.close()
+        report_cleanup_errors(reload_error, cleanup_process(monitor, selector))
 
 
 def verify_running() -> None:
