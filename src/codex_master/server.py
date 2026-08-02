@@ -134,6 +134,8 @@ RESOURCE_MAX_LOAD_PER_CPU = 0.85
 RESOURCE_MIN_AVAILABLE_MEMORY_PERCENT = 20.0
 RESOURCE_MIN_AVAILABLE_MEMORY_MIB = 1024
 RESOURCE_MAX_RUNNING_AGENTS = 6
+SPAWN_OFFER_TTL_SECONDS = 5
+SPAWN_OFFER_RETRY_AFTER_SECONDS = 15
 RESOURCE_REASON_CODES = frozenset(
     {
         "cpu_metrics_unavailable",
@@ -2603,6 +2605,40 @@ def spawn_admission_decision(required_slots: int = 1) -> dict[str, Any]:
         available_slots=available_slots,
         reason_codes=reasons,
     )
+
+
+def _spawn_priority_routes() -> tuple[str, ...]:
+    configured = os.environ.get("CODEX_MASTER_SPAWN_PRIORITY")
+    if configured is None:
+        configured = "mcp_host"
+    routes: list[str] = []
+    seen: set[str] = set()
+    for item in configured.split(","):
+        route = item.strip()
+        if route and route not in seen:
+            routes.append(route)
+            seen.add(route)
+    return tuple(routes)
+
+
+def agent_spawn_offers(required_slots: int = 1) -> dict[str, Any]:
+    required_slots = normalize_int_field(required_slots, field="required_slots", minimum=1, maximum=6)
+    admission = spawn_admission_decision(required_slots)
+    routes = _spawn_priority_routes()
+    allowed = admission.get("allowed") is True
+    offers = [{"route": route} for route in routes if allowed and route == "mcp_host"]
+    retryable = not allowed
+    return {
+        "ok": allowed,
+        "offers": offers,
+        "offer_count": len(offers),
+        "unavailable_route_count": sum(route != "mcp_host" for route in routes),
+        "ttl_seconds": SPAWN_OFFER_TTL_SECONDS,
+        "reservation": "none",
+        "retryable": retryable,
+        "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS if retryable else None,
+        "raw_output": "not_returned",
+    }
 
 
 def normalize_lease_seconds(value: Any) -> int:
@@ -11048,6 +11084,8 @@ def call_authenticated_agent_mutation(
 
 
 def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    if name == "agent_spawn_offers":
+        return agent_spawn_offers(int_arg(args, "required_slots", 1))
     if name == "agent_start":
         selected = agent_ids(str(args.get("agent", "both")))
         allow_unauthenticated = bool_arg(args, "allow_unauthenticated", False)
@@ -12970,6 +13008,17 @@ def agent_pool_destroy_pool(
 
 TOOLS: list[dict[str, Any]] = [
     {
+        "name": "agent_spawn_offers",
+        "description": "Return short-lived, advisory spawn offers for currently admitted routes. Does not reserve capacity or return raw output.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "required_slots": {"type": "integer", "minimum": 1, "maximum": 6, "default": 1}
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "agent_start",
         "description": "Start selected Codex Agentinnen in persistent tmux sessions with gpt-5.4-mini, --yolo -s danger-full-access --search. Does not return raw output.",
         "inputSchema": {
@@ -13915,6 +13964,9 @@ def main_cli(argv: list[str]) -> int:
     p_start.add_argument("--allow-unauthenticated", action="store_true")
     p_start.add_argument("--allow-broad-selector", action="store_true")
 
+    p_spawn_offers = sub.add_parser("spawn-offers")
+    p_spawn_offers.add_argument("--required-slots", type=int, default=1)
+
     p_status = sub.add_parser("status")
     p_status.add_argument("agent", nargs="?", default="all", help=AGENT_SELECTOR_DESCRIPTION)
     p_status.add_argument("--agents-offset", type=int, default=0)
@@ -14203,6 +14255,13 @@ def main_cli(argv: list[str]) -> int:
                         "allow_unauthenticated": True if args.allow_unauthenticated else None,
                         "allow_broad_selector": True if args.allow_broad_selector else None,
                     },
+                )
+            )
+        if args.command == "spawn-offers":
+            return print_json(
+                call_validated_tool(
+                    "agent_spawn_offers",
+                    {"required_slots": args.required_slots},
                 )
             )
         if args.command == "status":

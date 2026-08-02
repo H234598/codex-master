@@ -138,6 +138,7 @@ from codex_master.server import (
     run_tmux,
     send_agent,
     server_instance_identity_status,
+    agent_spawn_offers,
     spawn_admission_decision,
     spawn_resource_policy,
     selector_policy_status,
@@ -195,6 +196,119 @@ class FakeStdin:
 
 
 class ServerHelpersTest(unittest.TestCase):
+    def test_spawn_offers_omit_unimplemented_routes(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"CODEX_MASTER_SPAWN_PRIORITY": "developer_vm,mcp_host,sandbox"},
+        ), patch(
+            "codex_master.server.spawn_admission_decision",
+            return_value={"allowed": True, "available_slots": 3, "reason_codes": []},
+        ):
+            result = call_tool("agent_spawn_offers", {"required_slots": 1})
+
+        self.assertEqual([offer["route"] for offer in result["offers"]], ["mcp_host"])
+        self.assertNotIn("developer_vm", json.dumps(result))
+        self.assertNotIn("sandbox", json.dumps(result))
+
+    def test_spawn_offer_is_advisory_and_short_lived(self) -> None:
+        with patch(
+            "codex_master.server.spawn_admission_decision",
+            return_value={"allowed": True, "available_slots": 3, "reason_codes": []},
+        ):
+            result = agent_spawn_offers()
+
+        self.assertEqual(result["ttl_seconds"], 5)
+        self.assertEqual(result["reservation"], "none")
+
+    def test_spawn_offer_schema_is_strict_and_bounded(self) -> None:
+        response = handle_rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        tool = next(tool for tool in response["result"]["tools"] if tool["name"] == "agent_spawn_offers")
+
+        self.assertEqual(
+            tool["inputSchema"],
+            {
+                "type": "object",
+                "properties": {
+                    "required_slots": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 6,
+                        "default": 1,
+                    }
+                },
+                "additionalProperties": False,
+            },
+        )
+
+        for arguments in ({"required_slots": "1"}, {"required_slots": True}, {"unexpected": 1}):
+            with self.subTest(arguments=arguments):
+                response = handle_rpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {"name": "agent_spawn_offers", "arguments": arguments},
+                    }
+                )
+                self.assertTrue(response["result"]["isError"])
+
+    def test_spawn_offer_priority_deduplicates_without_fallback(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"CODEX_MASTER_SPAWN_PRIORITY": "sandbox,mcp_host,mcp_host,developer_vm"},
+        ), patch(
+            "codex_master.server.spawn_admission_decision",
+            return_value={"allowed": True, "available_slots": 3, "reason_codes": []},
+        ):
+            result = agent_spawn_offers()
+
+        self.assertEqual([offer["route"] for offer in result["offers"]], ["mcp_host"])
+        self.assertEqual(result["unavailable_route_count"], 2)
+
+        with patch.dict(
+            os.environ,
+            {"CODEX_MASTER_SPAWN_PRIORITY": "developer_vm,sandbox"},
+        ), patch(
+            "codex_master.server.spawn_admission_decision",
+            return_value={"allowed": True, "available_slots": 3, "reason_codes": []},
+        ):
+            result = agent_spawn_offers()
+
+        self.assertEqual(result["offers"], [])
+        self.assertEqual(result["unavailable_route_count"], 2)
+        self.assertNotIn("developer_vm", json.dumps(result))
+        self.assertNotIn("sandbox", json.dumps(result))
+
+    def test_spawn_offer_resource_deny_is_retryable_without_state(self) -> None:
+        with patch(
+            "codex_master.server.spawn_admission_decision",
+            return_value={
+                "allowed": False,
+                "available_slots": 0,
+                "reason_codes": ["memory_pressure_high"],
+            },
+        ), patch("codex_master.server.ensure_state") as ensure_state:
+            result = agent_spawn_offers(2)
+
+        self.assertEqual(result["offers"], [])
+        self.assertEqual(result["offer_count"], 0)
+        self.assertTrue(result["retryable"])
+        self.assertEqual(result["retry_after_seconds"], 15)
+        self.assertEqual(result["reservation"], "none")
+        ensure_state.assert_not_called()
+
+    def test_spawn_offer_cli_matches_mcp_semantic_contract(self) -> None:
+        admission = {"allowed": True, "available_slots": 3, "reason_codes": []}
+        with patch.dict(os.environ, {"CODEX_MASTER_SPAWN_PRIORITY": "mcp_host"}), patch(
+            "codex_master.server.spawn_admission_decision", return_value=admission
+        ):
+            mcp_result = agent_spawn_offers(2)
+            with patch("codex_master.server.print_json", return_value=0) as print_json:
+                self.assertEqual(main_cli(["spawn-offers", "--required-slots", "2"]), 0)
+
+        self.assertEqual(print_json.call_args.args[0], mcp_result)
+
+
     def test_spawn_admission_allows_healthy_host(self) -> None:
         snapshot = {
             "ok": True,
