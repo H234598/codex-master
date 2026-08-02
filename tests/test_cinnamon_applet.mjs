@@ -951,6 +951,27 @@ test("finalize waits for wait + both stream EOFs", async () => {
   assert.equal(applet._statusLastGood.schema_version, 1);
 });
 
+test("timeout removal failure defers finalization to timer without wedging", () => {
+  const fixture = loadApplet();
+  queuePayloadProcess(fixture, samplePayload());
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  applet.menu.items[0].activate();
+  const process = fixture.subprocesses[0];
+  fixture.GLib.source_remove = () => { throw new Error("injected timeout removal failure"); };
+
+  assert.doesNotThrow(() => process.emitDone());
+
+  assert.equal(applet._statusInFlight, true);
+  assert.equal(applet._statusActiveState.finalizing, false);
+  assert.equal(fixture.activeTimers("timeout").length, 1);
+  fixture.runTimeouts();
+  assert.equal(process.forceExitCount, 1);
+  assert.equal(applet._statusInFlight, false);
+  assert.equal(applet._statusActiveState, null);
+  assert.equal(applet._statusLastGood, null);
+  assert.equal(fixture.activeTimers("timeout").length, 0);
+});
+
 test("real backend payload with sleeping and expired states is accepted", async () => {
   const fixture = loadApplet();
   const payload = samplePayload();

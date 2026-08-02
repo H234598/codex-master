@@ -333,7 +333,13 @@ FlottenmanagementApplet.prototype = {
             }
             stateArg.finalizing = true;
             if (stateArg.timeoutSource) {
-                GLib.source_remove(stateArg.timeoutSource);
+                try {
+                    GLib.source_remove(stateArg.timeoutSource);
+                } catch (error) {
+                    stateArg.finalizing = false;
+                    this._logCleanupError(error);
+                    return;
+                }
                 stateArg.timeoutSource = 0;
             }
             this._finalizeStatusProcess(stateArg);
