@@ -1244,6 +1244,26 @@ test("exact python error row mixed with a normal row is accepted", () => {
   );
 });
 
+test("exact python stopped-orphan row is accepted", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const payload = samplePayload();
+  payload.agents[0].activity_state = "sleeping";
+  realignCounts(payload);
+
+  assert.equal(applet._maybeApplyStatusPayload(payload), true);
+  assert.equal(applet._statusLastGood.activity_state, "sleeping");
+  assert.deepEqual(applet._statusLastGood.agents[0], {
+    agent: "a1",
+    activity_state: "sleeping",
+    backend_state: "degraded",
+    control_state: "blocked",
+    auth_state: "ready",
+    identity_state: "unverified",
+    lease_state: "unclaimed",
+  });
+});
+
 test("validator rejects syntactically valid but backend-impossible row combinations", async () => {
   const fixture = loadApplet();
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
@@ -1280,6 +1300,11 @@ test("validator rejects syntactically valid but backend-impossible row combinati
   wrongControl.agents[0].control_state = "ready";
   realignCounts(wrongControl);
 
+  const wrongSleepingBackend = JSON.parse(JSON.stringify(base));
+  wrongSleepingBackend.agents[0].activity_state = "sleeping";
+  wrongSleepingBackend.agents[0].backend_state = "ok";
+  realignCounts(wrongSleepingBackend);
+
   const invalidErrorShape = JSON.parse(JSON.stringify(base));
   invalidErrorShape.agents[0].activity_state = "unknown";
   invalidErrorShape.agents[0].backend_state = "error";
@@ -1294,6 +1319,7 @@ test("validator rejects syntactically valid but backend-impossible row combinati
     { name: "sleeping with verified identity", payload: mixedRow },
     { name: "backend error with non-error shape", payload: backendError },
     { name: "running unverified not blocked", payload: wrongControl },
+    { name: "sleeping unverified with healthy backend", payload: wrongSleepingBackend },
     { name: "non-exact error row", payload: invalidErrorShape },
   ];
 

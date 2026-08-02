@@ -596,9 +596,10 @@ FlottenmanagementApplet.prototype = {
             if (row.backend_state !== "ok") return false;
         } else if (row.activity_state === "running" && row.identity_state === "unverified") {
             if (row.backend_state !== "degraded") return false;
-        } else if (row.activity_state === "sleeping") {
-            if (row.identity_state !== "stopped") return false;
+        } else if (row.activity_state === "sleeping" && row.identity_state === "stopped") {
             if (row.backend_state !== "ok") return false;
+        } else if (row.activity_state === "sleeping" && row.identity_state === "unverified") {
+            if (row.backend_state !== "degraded") return false;
         } else {
             return false;
         }
