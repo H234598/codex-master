@@ -417,8 +417,24 @@ FlottenmanagementApplet.prototype = {
             }
         );
 
-        readStream(state, "stdout", process.get_stdout_pipe(), APPLET_STDOUT_LIMIT_BYTES);
-        readStream(state, "stderr", process.get_stderr_pipe(), APPLET_STDERR_LIMIT_BYTES);
+        let stdoutStream = null;
+        let stderrStream = null;
+        try {
+            stdoutStream = process.get_stdout_pipe();
+            stderrStream = process.get_stderr_pipe();
+        } catch (_error) {
+            state.streamFailed = true;
+            state.stdoutDone = true;
+            state.stderrDone = true;
+            requestForceExit(state);
+            this._markRefreshFailed();
+        }
+        if (!state.stdoutDone) {
+            readStream(state, "stdout", stdoutStream, APPLET_STDOUT_LIMIT_BYTES);
+        }
+        if (!state.stderrDone) {
+            readStream(state, "stderr", stderrStream, APPLET_STDERR_LIMIT_BYTES);
+        }
 
         try {
             process.wait_async(state.cancellable, (_proc, result) => {
