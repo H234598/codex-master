@@ -80,11 +80,22 @@ const APPLET_STATUS_LABELS = {
 };
 const APPLET_INVALID_ENV_VARS = [
     "BASH_ENV",
-    "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
-    "PYTHONPATH",
-    "PYTHONHOME",
+    "GCONV_PATH",
+    "GIO_EXTRA_MODULES",
+    "GIO_MODULE_DIR",
+    "GI_TYPELIB_PATH",
     "GJS_PATH",
+    "LD_AUDIT",
+    "LD_DEBUG",
+    "LD_DEBUG_OUTPUT",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LD_PROFILE",
+    "LD_PROFILE_OUTPUT",
+    "LD_SHOW_AUXV",
+    "LD_TRACE_LOADED_OBJECTS",
+    "PYTHONHOME",
+    "PYTHONPATH",
 ];
 
 function FlottenmanagementApplet(metadata, orientation, panel_height, instance_id) {

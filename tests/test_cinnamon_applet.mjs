@@ -739,7 +739,25 @@ test("builds fixed mcp argv and validierte ids", async () => {
     { key: "PATH", value: "/usr/bin:/bin", overwrite: true },
     { key: "HOME", value: "/tmp/home", overwrite: true },
   ]);
-  for (const key of ["BASH_ENV", "LD_PRELOAD", "LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONHOME", "GJS_PATH"]) {
+  for (const key of [
+    "BASH_ENV",
+    "GCONV_PATH",
+    "GIO_EXTRA_MODULES",
+    "GIO_MODULE_DIR",
+    "GI_TYPELIB_PATH",
+    "GJS_PATH",
+    "LD_AUDIT",
+    "LD_DEBUG",
+    "LD_DEBUG_OUTPUT",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "LD_PROFILE",
+    "LD_PROFILE_OUTPUT",
+    "LD_SHOW_AUXV",
+    "LD_TRACE_LOADED_OBJECTS",
+    "PYTHONHOME",
+    "PYTHONPATH",
+  ]) {
     assert.ok(launch.unsetCalls.includes(key), `strips ${key}`);
   }
 });
