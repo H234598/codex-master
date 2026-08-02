@@ -153,6 +153,7 @@ from codex_master.server import (
     wait_terminal_status,
     wait_terminal_visible_input_status,
     normalize_applet_agents,
+    pane_pid,
     WRITE_AGENT_MODEL,
     WRITE_AGENT_MODEL_EFFORT,
     write_bounded_raw_log,
@@ -15221,6 +15222,41 @@ class AppletStatusContractTest(unittest.TestCase):
         self.assertNotIn("SECRET", json.dumps(result, sort_keys=True))
         self.assertNotIn("/home/private", json.dumps(result, sort_keys=True))
 
+    @patch(
+        "codex_master.server.agent_lease_status",
+        return_value={"state": "unclaimed", "raw_output": "not_returned"},
+    )
+    @patch(
+        "codex_master.server.agent_auth_status",
+        return_value={"authenticated": True, "auth_state": "present_regular", "raw_output": "not_returned"},
+    )
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 1,
+            "managed_process_count": 1,
+            "external_process_count": 0,
+            "managed_process_ids": [123],
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
+    @patch("codex_master.server.run_tmux")
+    def test_applet_status_keeps_degraded_state_when_pane_pid_overflows(
+        self, mock_run_tmux, _mock_process_summary, _mock_auth, _mock_lease
+    ) -> None:
+        mock_run_tmux.side_effect = [
+            subprocess.CompletedProcess(["tmux"], 0, "", ""),
+            subprocess.CompletedProcess(["tmux"], 0, f"{'3' * 5000}\n", ""),
+        ]
+
+        result = applet_status(["a1"])
+
+        self.assertEqual(result["activity_state"], "running")
+        self.assertEqual(result["backend_state"], "degraded")
+        self.assertEqual(result["control_state"], "blocked")
+
     @patch("codex_master.server.applet_agent_observation", side_effect=AgentError("SECRET"))
     def test_applet_status_is_unavailable_when_every_observation_fails(self, _mock_observation) -> None:
         result = applet_status(["a1", "b1"])
@@ -15435,6 +15471,13 @@ class AppletStatusContractTest(unittest.TestCase):
                 identity="unverified",
             ),
         )
+
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("codex_master.server.run_tmux")
+    def test_pane_pid_returns_none_for_overlong_numeric_text(self, mock_run_tmux, _mock_tmux_alive) -> None:
+        mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, f"{'2' * 5000}\n", "")
+
+        self.assertIsNone(pane_pid("a1"))
 
     @patch(
         "codex_master.server.agent_lease_status",

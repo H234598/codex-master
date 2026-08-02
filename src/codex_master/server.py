@@ -1179,6 +1179,15 @@ def applet_remaining_timeout(deadline: float) -> float:
     return min(APPLET_TMUX_TIMEOUT_SECONDS, remaining)
 
 
+def pane_pid_from_text(text: str) -> int | None:
+    if not text.isdigit():
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
 def applet_agent_observation(agent: str, *, deadline: float) -> dict[str, Any]:
     agent = normalize_applet_agents([agent])[0]
     cfg = AGENTS[agent]
@@ -1203,7 +1212,7 @@ def applet_agent_observation(agent: str, *, deadline: float) -> dict[str, Any]:
         if pane_check.returncode in {COMMAND_TIMEOUT_RETURN_CODE, COMMAND_UNAVAILABLE_RETURN_CODE}:
             raise AgentError("applet status backend unavailable")
         pane_text = pane_check.stdout.strip()
-        pane_process_id = int(pane_text) if pane_check.returncode == 0 and pane_text.isdigit() else None
+        pane_process_id = pane_pid_from_text(pane_text) if pane_check.returncode == 0 else None
         identity_guard = agent_identity_guard(True, process_summary, pane_process_id=pane_process_id)
         identity_state = "verified" if identity_guard.get("ok") is True else "unverified"
         backend_state = "ok" if identity_state == "verified" else "degraded"
@@ -4264,7 +4273,7 @@ def pane_pid(session: str) -> int | None:
     if cp.returncode != 0:
         return None
     text = cp.stdout.strip()
-    return int(text) if text.isdigit() else None
+    return pane_pid_from_text(text)
 
 
 def cleanup_failed_start(session: str, raw_log: Path, *, kill_session: bool) -> None:
