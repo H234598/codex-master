@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -363,7 +364,17 @@ def reload_xlet() -> None:
 
 def verify_running() -> None:
     output = cinnamon_call("GetRunningXletUUIDs", "applet")
-    if f"'{UUID}'" not in output and f'"{UUID}"' not in output:
+    try:
+        reply = ast.literal_eval(output.strip())
+    except (MemoryError, RecursionError, SyntaxError, TypeError, ValueError) as exc:
+        raise InstallerError("Cinnamon returned an invalid running-applet response") from exc
+    if (
+        not isinstance(reply, tuple)
+        or len(reply) != 1
+        or not isinstance(reply[0], list)
+        or not all(isinstance(item, str) for item in reply[0])
+        or UUID not in reply[0]
+    ):
         raise InstallerError("Cinnamon does not report the applet as running")
 
 

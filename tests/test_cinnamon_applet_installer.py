@@ -85,6 +85,8 @@ if method.endswith("ReloadXlet"):
 if method.endswith("GetRunningXletUUIDs"):
     if mode == "missing":
         print("(@as [],)")
+    elif mode == "spoofed":
+        print("({'running': 'codex-master@H234598'},)")
     elif mode == "large":
         print("X" * 70000)
     else:
@@ -168,7 +170,7 @@ else:
         self.assertIn("GetRunningXletUUIDs", self.log.read_text(encoding="utf-8"))
 
     def test_reload_or_running_verification_failure_restores_previous_tree(self) -> None:
-        for mode in ("reload-fail", "missing"):
+        for mode in ("reload-fail", "missing", "spoofed"):
             with self.subTest(mode=mode):
                 self.log.unlink(missing_ok=True)
                 if self.target.exists():
