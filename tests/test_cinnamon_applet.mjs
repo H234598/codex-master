@@ -647,6 +647,19 @@ test("single removal retries transient menu cleanup failures", () => {
   }
 });
 
+test("removal releases status actor wrapper references", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  assert.notEqual(applet._statusSummaryItem, null);
+  assert.equal(applet._statusRowItems.length, 6);
+
+  applet.on_applet_removed_from_panel();
+
+  assert.equal(applet._cleanupComplete, true);
+  assert.equal(applet._statusSummaryItem, null);
+  assert.equal(applet._statusRowItems.length, 0);
+});
+
 test("builds fixed mcp argv and validierte ids", async () => {
   const fixture = loadApplet();
   fixture.setHome("/tmp/home");

@@ -1089,6 +1089,10 @@ FlottenmanagementApplet.prototype = {
             const signalsClean = this._disconnectTrackedSignals();
             const appletMenuClean = this._cleanupMenuResource("menu", "menuManager");
             const contextMenuClean = this._cleanupMenuResource("_applet_context_menu", "_menuManager");
+            if (appletMenuClean) {
+                this._statusSummaryItem = null;
+                this._statusRowItems = [];
+            }
             this._cleanupComplete = statusClean && settingsClean && signalsClean && appletMenuClean && contextMenuClean;
         }
     },
