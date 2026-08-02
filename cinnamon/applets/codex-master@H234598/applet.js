@@ -497,6 +497,11 @@ FlottenmanagementApplet.prototype = {
                                 return;
                             }
 
+                            if (stateArg.finalizing) {
+                                stateArg[doneKey] = true;
+                                return;
+                            }
+
                             if (!packet) {
                                 stateArg[doneKey] = true;
                                 attemptFinalize(stateArg);

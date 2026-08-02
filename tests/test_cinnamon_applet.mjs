@@ -2533,6 +2533,54 @@ test("removal during stream timeout and pending refresh tears down once", () => 
   assert.equal(fixture.settingsInstances[0].finalizeCount, 1);
 });
 
+test("successful stream callback after removal starts no further read", () => {
+  const fixture = loadApplet();
+  const lateBytes = makeBytes("late");
+  const stdout = {
+    callbacks: [],
+    readAsyncCount: 0,
+    readFinishCount: 0,
+    read_bytes_async(_size, _priority, _cancellable, callback) {
+      this.readAsyncCount += 1;
+      this.callbacks.push(callback);
+    },
+    read_bytes_finish(result) {
+      this.readFinishCount += 1;
+      return result;
+    },
+    releaseOne() {
+      const callback = this.callbacks.shift();
+      callback(this, {
+        get_data: () => lateBytes,
+        get_size: () => lateBytes.length,
+      });
+    },
+  };
+  const stderr = fixture.makeStream([], true);
+  fixture.setProcessFactory(() => ({
+    forceExitCount: 0,
+    waitCallbacks: [],
+    get_stdout_pipe() { return stdout; },
+    get_stderr_pipe() { return stderr; },
+    get_successful: () => false,
+    force_exit() { this.forceExitCount += 1; },
+    wait_async(_cancellable, callback) { this.waitCallbacks.push(callback); },
+    wait_finish() {},
+  }));
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  applet.menu.items[0].activate();
+  const process = fixture.subprocesses[0];
+
+  applet.on_applet_removed_from_panel();
+  stdout.releaseOne();
+
+  assert.equal(stdout.readFinishCount, 1, "completed Gio operation is finished");
+  assert.equal(stdout.readAsyncCount, 1, "removed applet schedules no further stream read");
+  assert.equal(process.forceExitCount, 1);
+  assert.equal(fixture.subprocesses.length, 1);
+  assert.equal(fixture.activeTimers().length, 0);
+});
+
 test("background cleanup failure does not retain cleaned status process", () => {
   const fixture = loadApplet();
   queuePayloadProcess(fixture, samplePayload(), { holdEof: true });
