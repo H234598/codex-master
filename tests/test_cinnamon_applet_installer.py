@@ -188,6 +188,22 @@ else:
         self.assertNotIn("RestartCinnamon", joined)
         self.assertNotIn("Eval", joined)
 
+    def test_install_preserves_existing_rollback_when_target_is_missing(self) -> None:
+        self._write_tree(self.backup, "known-good")
+
+        result = self._run("install")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["rollback"])
+        self.assertEqual(self._manifest(self.target), self._manifest(self.source))
+        self.assertTrue(self.backup.exists())
+        self.assertIn("known-good", (self.backup / "applet.js").read_text(encoding="utf-8"))
+        self.assertEqual(list(self.target.parent.glob(f".{UUID}.retired*")), [])
+
+        rollback = self._run("rollback", "--no-reload")
+        self.assertEqual(rollback.returncode, 0, rollback.stderr)
+        self.assertIn("known-good", (self.target / "applet.js").read_text(encoding="utf-8"))
+
     def test_failed_backup_rotation_preserves_existing_rollback(self) -> None:
         self._write_tree(self.target, "current")
         self._write_tree(self.backup, "known-good")

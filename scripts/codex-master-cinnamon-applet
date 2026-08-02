@@ -529,7 +529,7 @@ def install(*, dry_run: bool, no_reload: bool) -> dict[str, Any]:
     deployment_succeeded = False
     install_error: Exception | None = None
     try:
-        if lexical_exists(backup):
+        if had_previous and lexical_exists(backup):
             if lexical_exists(retired_backup):
                 raise InstallerError("retired rollback path already exists")
             retired_backup_active = True
@@ -583,7 +583,7 @@ def install(*, dry_run: bool, no_reload: bool) -> dict[str, Any]:
                 raise cleanup_errors[0]
             for cleanup_error in cleanup_errors:
                 install_error.add_note(f"installer cleanup also failed: {cleanup_error}")
-    return {"ok": True, "action": "install", "dry_run": False, "uuid": UUID, "rollback": had_previous}
+    return {"ok": True, "action": "install", "dry_run": False, "uuid": UUID, "rollback": lexical_exists(backup)}
 
 
 def swap_directories(first: Path, second: Path) -> None:
