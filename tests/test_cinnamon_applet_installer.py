@@ -425,6 +425,24 @@ else:
         calls = self.log.read_text(encoding="utf-8").count("org.Cinnamon.ReloadXlet")
         self.assertEqual(calls, 2, "restored current applet must be reloaded after failed rollback")
 
+    def test_rollback_refuses_unfinished_rotation_without_mutation(self) -> None:
+        retired = self.target.parent / f".{UUID}.retired"
+        self._write_tree(self.target, "current")
+        self._write_tree(self.backup, "previous")
+        self._write_tree(retired, "older")
+        before = {
+            "target": self._manifest(self.target),
+            "backup": self._manifest(self.backup),
+            "retired": self._manifest(retired),
+        }
+
+        result = self._run("rollback", "--no-reload")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self._manifest(self.target), before["target"])
+        self.assertEqual(self._manifest(self.backup), before["backup"])
+        self.assertEqual(self._manifest(retired), before["retired"])
+
     def test_rollback_works_without_repository_source(self) -> None:
         self._write_tree(self.target, "current")
         self._write_tree(self.backup, "previous")

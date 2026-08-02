@@ -62,6 +62,10 @@ def rollback_directory(target: Path) -> Path:
     return target.with_name(f"{UUID}.rollback")
 
 
+def retired_rollback_directory(target: Path) -> Path:
+    return target.with_name(f".{UUID}.retired")
+
+
 @contextmanager
 def operation_lock(*, create_parent: bool):
     parent = target_directory().parent
@@ -398,7 +402,7 @@ def install(*, dry_run: bool, no_reload: bool) -> dict[str, Any]:
     directories, manifest = validate_source(source)
     target = target_directory()
     backup = rollback_directory(target)
-    retired_backup = target.parent / f".{UUID}.retired"
+    retired_backup = retired_rollback_directory(target)
     ensure_real_directory_chain(target.parent, create=False)
     if lexical_exists(target):
         scan_tree(target, "installed applet")
@@ -494,6 +498,7 @@ def swap_directories(first: Path, second: Path) -> None:
 def rollback(*, no_reload: bool) -> dict[str, Any]:
     target = target_directory()
     backup = rollback_directory(target)
+    retired_backup = retired_rollback_directory(target)
     ensure_real_directory_chain(target.parent, create=False)
     if not lexical_exists(target):
         raise InstallerError("installed applet is missing")
@@ -501,6 +506,9 @@ def rollback(*, no_reload: bool) -> dict[str, Any]:
         raise InstallerError("rollback applet is missing")
     scan_tree(target, "installed applet")
     scan_tree(backup, "rollback applet")
+    if lexical_exists(retired_backup):
+        scan_tree(retired_backup, "unfinished rollback rotation")
+        raise InstallerError("unfinished rollback rotation exists")
     swap_directories(target, backup)
     try:
         if not no_reload:
