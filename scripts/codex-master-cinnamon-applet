@@ -67,6 +67,18 @@ def retired_rollback_directory(target: Path) -> Path:
     return target.with_name(f".{UUID}.retired")
 
 
+def reject_unfinished_swaps(parent: Path) -> None:
+    prefix = f".{UUID}.swap-"
+    try:
+        with os.scandir(parent) as entries:
+            if any(entry.name.startswith(prefix) for entry in entries):
+                raise InstallerError("unfinished rollback swap exists")
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise InstallerError("applet directory is unreadable") from exc
+
+
 @contextmanager
 def operation_lock(*, create_parent: bool):
     parent = target_directory().parent
@@ -512,6 +524,7 @@ def install(*, dry_run: bool, no_reload: bool) -> dict[str, Any]:
     backup = rollback_directory(target)
     retired_backup = retired_rollback_directory(target)
     ensure_real_directory_chain(target.parent, create=False)
+    reject_unfinished_swaps(target.parent)
     if lexical_exists(target):
         scan_tree(target, "installed applet")
     if lexical_exists(backup):
@@ -608,6 +621,7 @@ def rollback(*, no_reload: bool) -> dict[str, Any]:
     backup = rollback_directory(target)
     retired_backup = retired_rollback_directory(target)
     ensure_real_directory_chain(target.parent, create=False)
+    reject_unfinished_swaps(target.parent)
     if not lexical_exists(target):
         raise InstallerError("installed applet is missing")
     if not lexical_exists(backup):

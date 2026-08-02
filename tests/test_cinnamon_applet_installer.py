@@ -503,6 +503,31 @@ else:
         self.assertEqual(self._manifest(self.backup), before["backup"])
         self.assertEqual(self._manifest(retired), before["retired"])
 
+    def test_mutating_commands_refuse_unfinished_swap_without_mutation(self) -> None:
+        unfinished = self.target.parent / f".{UUID}.swap-123-456"
+        self._write_tree(self.target, "current")
+        self._write_tree(self.backup, "previous")
+        self._write_tree(unfinished, "interrupted")
+        before = {
+            "target": self._manifest(self.target),
+            "backup": self._manifest(self.backup),
+            "unfinished": self._manifest(unfinished),
+        }
+
+        install = self._run("install", "--no-reload")
+
+        self.assertNotEqual(install.returncode, 0)
+        self.assertEqual(self._manifest(self.target), before["target"])
+        self.assertEqual(self._manifest(self.backup), before["backup"])
+        self.assertEqual(self._manifest(unfinished), before["unfinished"])
+
+        rollback = self._run("rollback", "--no-reload")
+
+        self.assertNotEqual(rollback.returncode, 0)
+        self.assertEqual(self._manifest(self.target), before["target"])
+        self.assertEqual(self._manifest(self.backup), before["backup"])
+        self.assertEqual(self._manifest(unfinished), before["unfinished"])
+
     def test_rollback_works_without_repository_source(self) -> None:
         self._write_tree(self.target, "current")
         self._write_tree(self.backup, "previous")
