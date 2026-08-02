@@ -15,6 +15,7 @@ from unittest.mock import Mock, patch
 
 from codex_master.server import (
     AgentError,
+    AgentCapacityError,
     AgentBusyError,
     AgentInputNotReadyError,
     DEFAULT_CLAIM_WAIT_FOREVER,
@@ -95,6 +96,7 @@ from codex_master.server import (
     installed_source_worktree_state,
     agent_lease_status,
     public_agent_lease,
+    public_error_payload,
     agent_auth_status,
     assignment_report,
     assign_agent,
@@ -136,6 +138,8 @@ from codex_master.server import (
     run_tmux,
     send_agent,
     server_instance_identity_status,
+    spawn_admission_decision,
+    spawn_resource_policy,
     selector_policy_status,
     start_agent,
     start_agent_with_lease,
@@ -181,6 +185,7 @@ from codex_master.server import (
     watchdog_effective_idle,
     watchdog_marker_matches,
     watchdog_output_changed_since_marker,
+    system_resource_snapshot,
 )
 
 
@@ -190,6 +195,214 @@ class FakeStdin:
 
 
 class ServerHelpersTest(unittest.TestCase):
+    def test_spawn_admission_allows_healthy_host(self) -> None:
+        snapshot = {
+            "ok": True,
+            "load_per_cpu": 0.25,
+            "available_memory_percent": 60.0,
+            "available_memory_mib": 8192,
+            "running_agents": 2,
+        }
+        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+            result = spawn_admission_decision(2)
+
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["available_slots"], 4)
+
+    def test_spawn_admission_fails_closed_without_memory_evidence(self) -> None:
+        with patch(
+            "codex_master.server.system_resource_snapshot",
+            return_value={"ok": False, "reason_codes": ["memory_metrics_unavailable"]},
+        ):
+            result = spawn_admission_decision()
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason_codes"], ["memory_metrics_unavailable"])
+
+    def test_spawn_resource_policy_exposes_exact_default_thresholds(self) -> None:
+        self.assertEqual(
+            spawn_resource_policy(),
+            {
+                "max_load_per_cpu": 0.85,
+                "min_available_memory_percent": 20.0,
+                "min_available_memory_mib": 1024,
+                "max_running_agents": 6,
+                "raw_output": "not_returned",
+            },
+        )
+
+    def test_system_resource_snapshot_counts_only_managed_tmux_sessions(self) -> None:
+        meminfo = "MemTotal:       16384 kB\nMemAvailable:    8192 kB\n"
+        tmux = subprocess.CompletedProcess(["tmux", "list-sessions"], 0, "managed-session\nforeign-session\n", "")
+        agents = {"a1": {"session": "managed-session"}}
+        with patch("codex_master.server.os.cpu_count", return_value=4), patch(
+            "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
+        ), patch("codex_master.server.Path.read_text", return_value=meminfo), patch(
+            "codex_master.server.run_tmux", return_value=tmux
+        ), patch.dict("codex_master.server.AGENTS", agents, clear=True):
+            snapshot = system_resource_snapshot()
+
+        self.assertEqual(snapshot["running_agents"], 1)
+        self.assertEqual(snapshot["load_per_cpu"], 0.25)
+        self.assertEqual(snapshot["available_memory_percent"], 50.0)
+        self.assertEqual(snapshot["available_memory_mib"], 8.0)
+        self.assertTrue(snapshot["ok"])
+        self.assertEqual(snapshot["reason_codes"], [])
+        payload = json.dumps(snapshot)
+        self.assertNotIn("foreign-session", payload)
+        self.assertNotIn("/proc/meminfo", payload)
+
+    def test_system_resource_snapshot_fails_closed_for_missing_memory_evidence(self) -> None:
+        with patch("codex_master.server.os.cpu_count", return_value=4), patch(
+            "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
+        ), patch("codex_master.server.Path.read_text", return_value="MemTotal: 16384 kB\n"), patch(
+            "codex_master.server.run_tmux",
+            return_value=subprocess.CompletedProcess(["tmux"], 0, "", ""),
+        ):
+            snapshot = system_resource_snapshot()
+
+        self.assertFalse(snapshot["ok"])
+        self.assertEqual(snapshot["reason_codes"], ["memory_metrics_unavailable"])
+        self.assertNotIn("/proc/meminfo", json.dumps(snapshot))
+
+    def test_system_resource_snapshot_fails_closed_when_cpu_count_is_unavailable(self) -> None:
+        with patch("codex_master.server.os.cpu_count", return_value=None), patch(
+            "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
+        ), patch("codex_master.server.Path.read_text", return_value="MemTotal: 16384 kB\nMemAvailable: 8192 kB\n"), patch(
+            "codex_master.server.run_tmux",
+            return_value=subprocess.CompletedProcess(["tmux"], 0, "", ""),
+        ):
+            snapshot = system_resource_snapshot()
+
+        self.assertFalse(snapshot["ok"])
+        self.assertIn("cpu_metrics_unavailable", snapshot["reason_codes"])
+
+    def test_spawn_admission_allows_load_and_memory_at_policy_boundaries(self) -> None:
+        snapshot = {
+            "ok": True,
+            "load_per_cpu": 0.85,
+            "available_memory_percent": 20.0,
+            "available_memory_mib": 1024,
+            "running_agents": 5,
+        }
+        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+            result = spawn_admission_decision()
+
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["reason_codes"], [])
+        self.assertEqual(result["available_slots"], 1)
+
+    def test_spawn_admission_blocks_when_required_slots_exceed_capacity(self) -> None:
+        snapshot = {
+            "ok": True,
+            "load_per_cpu": 0.25,
+            "available_memory_percent": 60.0,
+            "available_memory_mib": 8192,
+            "running_agents": 2,
+        }
+        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+            result = spawn_admission_decision(5)
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["available_slots"], 4)
+        self.assertEqual(result["reason_codes"], ["insufficient_slots"])
+
+    def test_spawn_admission_blocks_load_memory_and_slot_pressure_above_boundaries(self) -> None:
+        cases = (
+            ("load_per_cpu", 0.850001, "cpu_pressure_high"),
+            ("available_memory_percent", 19.999, "memory_pressure_high"),
+            ("available_memory_mib", 1023.999, "memory_pressure_high"),
+            ("running_agents", 6, "running_agent_limit"),
+        )
+        for field, value, reason in cases:
+            with self.subTest(field=field), patch(
+                "codex_master.server.system_resource_snapshot",
+                return_value={
+                    "ok": True,
+                    "load_per_cpu": value if field == "load_per_cpu" else 0.25,
+                    "available_memory_percent": value if field == "available_memory_percent" else 60.0,
+                    "available_memory_mib": value if field == "available_memory_mib" else 8192,
+                    "running_agents": value if field == "running_agents" else 2,
+                },
+            ):
+                result = spawn_admission_decision()
+
+            self.assertFalse(result["allowed"])
+            self.assertIn(reason, result["reason_codes"])
+
+    def test_spawn_admission_rejects_non_finite_negative_and_boolean_metrics(self) -> None:
+        cases = (
+            ("load_per_cpu", float("nan"), "cpu_metrics_unavailable"),
+            ("load_per_cpu", float("inf"), "cpu_metrics_unavailable"),
+            ("load_per_cpu", -1.0, "cpu_metrics_unavailable"),
+            ("load_per_cpu", True, "cpu_metrics_unavailable"),
+            ("available_memory_percent", float("nan"), "memory_metrics_unavailable"),
+            ("available_memory_mib", -1.0, "memory_metrics_unavailable"),
+            ("running_agents", True, "session_metrics_unavailable"),
+        )
+        for field, value, reason in cases:
+            snapshot = {
+                "ok": True,
+                "load_per_cpu": 0.25,
+                "available_memory_percent": 60.0,
+                "available_memory_mib": 8192,
+                "running_agents": 2,
+            }
+            snapshot[field] = value
+            with self.subTest(field=field, value=value), patch(
+                "codex_master.server.system_resource_snapshot", return_value=snapshot
+            ):
+                result = spawn_admission_decision()
+
+            self.assertFalse(result["allowed"])
+            self.assertIn(reason, result["reason_codes"])
+
+    def test_spawn_admission_rejects_invalid_policy_and_keeps_output_data_sparse(self) -> None:
+        with patch(
+            "codex_master.server.system_resource_snapshot",
+            return_value={
+                "ok": True,
+                "load_per_cpu": 0.25,
+                "available_memory_percent": 60.0,
+                "available_memory_mib": 8192,
+                "running_agents": 2,
+            },
+        ), patch(
+            "codex_master.server.spawn_resource_policy",
+            return_value={"max_load_per_cpu": float("nan")},
+        ):
+            result = spawn_admission_decision()
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason_codes"], ["policy_invalid"])
+        payload = json.dumps(result)
+        self.assertNotIn("/proc", payload)
+        self.assertNotIn("OPENAI_API_KEY=secret", payload)
+        self.assertNotIn("managed-session", payload)
+
+    def test_public_error_payload_preserves_agent_capacity_payload(self) -> None:
+        error = AgentCapacityError(
+            "capacity unavailable",
+            {
+                "error_code": "spawn_capacity_unavailable",
+                "retryable": True,
+                "retry_after_seconds": 15,
+                "reason_codes": ["memory_pressure_high"],
+            },
+        )
+
+        self.assertEqual(
+            public_error_payload(error),
+            {
+                "error": "capacity unavailable",
+                "error_code": "spawn_capacity_unavailable",
+                "retryable": True,
+                "retry_after_seconds": 15,
+                "reason_codes": ["memory_pressure_high"],
+            },
+        )
+
+
     def test_proc_is_codex_like_recognizes_codex_code_mode_host(self) -> None:
         self.assertTrue(proc_is_codex_like({"Name": "codex-code-mode-host"}, []))
         self.assertTrue(proc_is_codex_like({"Name": "codex-code-mode"}, []))

@@ -129,6 +129,23 @@ MAX_LIVE_DATA_TOPIC = 400
 MAX_RPC_MESSAGE_BYTES = 1024 * 1024
 MAX_ERROR_CHARS = 1200
 MAX_META_BYTES = 64 * 1024
+RESOURCE_MEMINFO_PATH = Path("/proc/meminfo")
+RESOURCE_MAX_LOAD_PER_CPU = 0.85
+RESOURCE_MIN_AVAILABLE_MEMORY_PERCENT = 20.0
+RESOURCE_MIN_AVAILABLE_MEMORY_MIB = 1024
+RESOURCE_MAX_RUNNING_AGENTS = 6
+RESOURCE_REASON_CODES = frozenset(
+    {
+        "cpu_metrics_unavailable",
+        "memory_metrics_unavailable",
+        "session_metrics_unavailable",
+        "policy_invalid",
+        "cpu_pressure_high",
+        "memory_pressure_high",
+        "running_agent_limit",
+        "insufficient_slots",
+    }
+)
 MAX_CODEX_USAGE_SNAPSHOT_BYTES = 64 * 1024
 MAX_CODEX_USAGE_DECISION_BYTES = 64 * 1024
 MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID = 512
@@ -460,9 +477,17 @@ class AgentInputNotReadyError(AgentError):
         self.payload = payload
 
 
+class AgentCapacityError(AgentError):
+    """Raised when host resources cannot admit another managed Agentin."""
+
+    def __init__(self, message: str, payload: dict[str, Any]):
+        super().__init__(message)
+        self.payload = payload
+
+
 def public_error_payload(exc: Exception) -> dict[str, Any]:
     payload: dict[str, Any] = {"error": safe_error_text(exc)}
-    if isinstance(exc, (AgentBusyError, AgentInputNotReadyError)):
+    if isinstance(exc, (AgentBusyError, AgentInputNotReadyError, AgentCapacityError)):
         payload.update(exc.payload)
     return payload
 
@@ -2362,6 +2387,222 @@ def normalize_int_field(value: Any, *, field: str, minimum: int, maximum: int) -
     if number > maximum:
         raise AgentError(f"{field} must be <= {maximum}")
     return number
+
+
+def spawn_resource_policy() -> dict[str, Any]:
+    return {
+        "max_load_per_cpu": RESOURCE_MAX_LOAD_PER_CPU,
+        "min_available_memory_percent": RESOURCE_MIN_AVAILABLE_MEMORY_PERCENT,
+        "min_available_memory_mib": RESOURCE_MIN_AVAILABLE_MEMORY_MIB,
+        "max_running_agents": RESOURCE_MAX_RUNNING_AGENTS,
+        "raw_output": "not_returned",
+    }
+
+
+def _finite_resource_number(value: Any, *, minimum: float = 0.0) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value >= minimum
+    )
+
+
+def _resource_meminfo() -> tuple[float, float] | None:
+    try:
+        text = RESOURCE_MEMINFO_PATH.read_text(encoding="utf-8", errors="replace")
+    except (OSError, UnicodeError):
+        return None
+    values: dict[str, int] = {}
+    for line in text.splitlines():
+        key, separator, remainder = line.partition(":")
+        if separator == "" or key not in {"MemTotal", "MemAvailable"}:
+            continue
+        parts = remainder.strip().split()
+        if len(parts) != 2 or parts[1] != "kB":
+            continue
+        try:
+            value = int(parts[0])
+        except (TypeError, ValueError):
+            continue
+        if value < 0:
+            return None
+        values[key] = value
+    total_kib = values.get("MemTotal")
+    available_kib = values.get("MemAvailable")
+    if (
+        total_kib is None
+        or available_kib is None
+        or total_kib <= 0
+        or available_kib > total_kib
+    ):
+        return None
+    return available_kib / total_kib * 100.0, available_kib / 1024.0
+
+
+def _managed_tmux_session_count() -> int | None:
+    try:
+        completed = run_tmux(["list-sessions", "-F", "#{session_name}"], check=False)
+        if completed.returncode != 0:
+            return None
+        configured_sessions = {
+            config.get("session")
+            for config in AGENTS.values()
+            if isinstance(config, dict) and isinstance(config.get("session"), str)
+        }
+        listed_sessions = {
+            line.strip() for line in completed.stdout.splitlines() if line.strip()
+        }
+        return len(configured_sessions & listed_sessions)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def system_resource_snapshot() -> dict[str, Any]:
+    load_per_cpu: float | None = None
+    available_memory_percent: float | None = None
+    available_memory_mib: float | None = None
+    running_agents: int | None = None
+    reason_codes: list[str] = []
+
+    cpu_count = os.cpu_count()
+    try:
+        load1 = os.getloadavg()[0]
+    except (AttributeError, OSError, TypeError, ValueError):
+        load1 = None
+    if (
+        isinstance(cpu_count, int)
+        and not isinstance(cpu_count, bool)
+        and cpu_count > 0
+        and _finite_resource_number(load1)
+    ):
+        load_per_cpu = load1 / cpu_count
+    else:
+        reason_codes.append("cpu_metrics_unavailable")
+
+    memory = _resource_meminfo()
+    if memory is None:
+        reason_codes.append("memory_metrics_unavailable")
+    else:
+        available_memory_percent, available_memory_mib = memory
+
+    running_agents = _managed_tmux_session_count()
+    if running_agents is None:
+        reason_codes.append("session_metrics_unavailable")
+
+    return {
+        "ok": not reason_codes,
+        "load_per_cpu": load_per_cpu,
+        "available_memory_percent": available_memory_percent,
+        "available_memory_mib": available_memory_mib,
+        "running_agents": running_agents,
+        "reason_codes": reason_codes,
+        "raw_output": "not_returned",
+    }
+
+
+def _valid_spawn_policy(policy: Any) -> bool:
+    return (
+        isinstance(policy, dict)
+        and _finite_resource_number(policy.get("max_load_per_cpu"), minimum=0.0)
+        and _finite_resource_number(policy.get("min_available_memory_percent"), minimum=0.0)
+        and policy["min_available_memory_percent"] <= 100.0
+        and _finite_resource_number(policy.get("min_available_memory_mib"), minimum=0.0)
+        and isinstance(policy.get("max_running_agents"), int)
+        and not isinstance(policy["max_running_agents"], bool)
+        and 1 <= policy["max_running_agents"] <= 6
+    )
+
+
+def _admission_result(
+    *,
+    required_slots: int,
+    allowed: bool,
+    available_slots: int | None,
+    reason_codes: list[str],
+) -> dict[str, Any]:
+    return {
+        "allowed": allowed,
+        "required_slots": required_slots,
+        "available_slots": available_slots,
+        "reason_codes": reason_codes,
+        "raw_output": "not_returned",
+    }
+
+
+def spawn_admission_decision(required_slots: int = 1) -> dict[str, Any]:
+    required_slots = normalize_int_field(required_slots, field="required_slots", minimum=1, maximum=6)
+    snapshot = system_resource_snapshot()
+    policy = spawn_resource_policy()
+    if not _valid_spawn_policy(policy):
+        return _admission_result(
+            required_slots=required_slots,
+            allowed=False,
+            available_slots=None,
+            reason_codes=["policy_invalid"],
+        )
+    if not isinstance(snapshot, dict):
+        return _admission_result(
+            required_slots=required_slots,
+            allowed=False,
+            available_slots=None,
+            reason_codes=["cpu_metrics_unavailable", "memory_metrics_unavailable", "session_metrics_unavailable"],
+        )
+    if snapshot.get("ok") is False:
+        reasons = [
+            reason
+            for reason in snapshot.get("reason_codes", [])
+            if reason in RESOURCE_REASON_CODES
+        ]
+        if not reasons:
+            reasons = [
+                "cpu_metrics_unavailable",
+                "memory_metrics_unavailable",
+                "session_metrics_unavailable",
+            ]
+        return _admission_result(
+            required_slots=required_slots,
+            allowed=False,
+            available_slots=None,
+            reason_codes=reasons,
+        )
+
+    reasons: list[str] = []
+    load_per_cpu = snapshot.get("load_per_cpu")
+    if not _finite_resource_number(load_per_cpu):
+        reasons.append("cpu_metrics_unavailable")
+    elif load_per_cpu > policy["max_load_per_cpu"]:
+        reasons.append("cpu_pressure_high")
+
+    memory_percent = snapshot.get("available_memory_percent")
+    memory_mib = snapshot.get("available_memory_mib")
+    if not _finite_resource_number(memory_percent) or not _finite_resource_number(memory_mib):
+        reasons.append("memory_metrics_unavailable")
+    else:
+        if memory_percent < policy["min_available_memory_percent"] or memory_mib < policy["min_available_memory_mib"]:
+            reasons.append("memory_pressure_high")
+
+    running_agents = snapshot.get("running_agents")
+    available_slots: int | None = None
+    if (
+        isinstance(running_agents, int)
+        and not isinstance(running_agents, bool)
+        and running_agents >= 0
+    ):
+        available_slots = policy["max_running_agents"] - running_agents
+        if running_agents >= policy["max_running_agents"]:
+            reasons.append("running_agent_limit")
+        elif available_slots < required_slots:
+            reasons.append("insufficient_slots")
+    else:
+        reasons.append("session_metrics_unavailable")
+
+    return _admission_result(
+        required_slots=required_slots,
+        allowed=not reasons,
+        available_slots=available_slots,
+        reason_codes=reasons,
+    )
 
 
 def normalize_lease_seconds(value: Any) -> int:
