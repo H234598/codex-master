@@ -895,6 +895,32 @@ test("status buffering retains chunks instead of one JS array element per byte",
   assert.ok(state.stdoutChunks.every((chunk) => chunk.byteLength === 1024));
 });
 
+test("stderr is bounded by byte count without retaining diagnostic chunks", () => {
+  const fixture = loadApplet();
+  const stdout = fixture.makeStream([], true);
+  const stderr = fixture.makeStream(
+    Array.from({ length: 4 }, () => makeBytes("E".repeat(1024))),
+    true
+  );
+  fixture.setProcessFactory(() => ({
+    forceExitCount: 0,
+    waitCallbacks: [],
+    get_stdout_pipe() { return stdout; },
+    get_stderr_pipe() { return stderr; },
+    get_successful: () => false,
+    force_exit() { this.forceExitCount += 1; },
+    wait_async(_cancellable, callback) { this.waitCallbacks.push(callback); },
+    wait_finish() {},
+  }));
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  applet.menu.items[0].activate();
+  const state = applet._statusActiveState;
+
+  assert.equal(state.stderrByteCount, 4 * 1024);
+  assert.equal(Object.hasOwn(state, "stderrChunks"), false);
+  applet.on_applet_removed_from_panel();
+});
+
 test("stdout overflow releases accumulated status data before process exit", () => {
   const fixture = loadApplet();
   fixture.setProcessFactory(() => ({

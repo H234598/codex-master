@@ -366,7 +366,6 @@ FlottenmanagementApplet.prototype = {
             stdoutDone: false,
             stderrDone: false,
             stdoutChunks: [],
-            stderrChunks: [],
             stdoutByteCount: 0,
             stderrByteCount: 0,
             discardOutput: false,
@@ -504,7 +503,7 @@ FlottenmanagementApplet.prototype = {
                 return;
             }
 
-            const chunksKey = `${key}Chunks`;
+            const chunksKey = key === "stdout" ? "stdoutChunks" : null;
             const byteCountKey = `${key}ByteCount`;
             const doneKey = `${key}Done`;
             const finishKey = key === "stdout" ? "stdoutLimitExceeded" : "stderrLimitExceeded";
@@ -570,10 +569,13 @@ FlottenmanagementApplet.prototype = {
                             const take = Math.max(0, limit - stateArg[byteCountKey]);
                             const exceedsLimit = bytes.length > take;
                             if (take > 0) {
-                                const chunk = new Uint8Array(Math.min(bytes.length, take));
-                                chunk.set(bytes.subarray(0, chunk.length));
-                                stateArg[chunksKey].push(chunk);
-                                stateArg[byteCountKey] += chunk.length;
+                                const chunkLength = Math.min(bytes.length, take);
+                                if (chunksKey) {
+                                    const chunk = new Uint8Array(chunkLength);
+                                    chunk.set(bytes.subarray(0, chunk.length));
+                                    stateArg[chunksKey].push(chunk);
+                                }
+                                stateArg[byteCountKey] += chunkLength;
                             }
 
                             if (exceedsLimit) {
@@ -699,7 +701,6 @@ FlottenmanagementApplet.prototype = {
     _clearStatusBuffers(state) {
         if (!state) return;
         state.stdoutChunks = [];
-        state.stderrChunks = [];
         state.stdoutByteCount = 0;
         state.stderrByteCount = 0;
     },
