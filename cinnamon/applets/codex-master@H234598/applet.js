@@ -972,7 +972,12 @@ FlottenmanagementApplet.prototype = {
     },
 
     _connectTracked(target, signal, callback) {
-        if (this._removed || !target || typeof target.connect !== "function") return 0;
+        if (
+            this._removed
+            || !target
+            || typeof target.connect !== "function"
+            || typeof target.disconnect !== "function"
+        ) return 0;
         let id = 0;
         try {
             id = target.connect(signal, callback);

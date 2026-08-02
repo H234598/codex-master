@@ -660,6 +660,7 @@ test("signal connection failures do not escape or retain invalid handles", () =>
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
   const baseline = applet._signalConnections.length;
   const targets = [
+    { connect() { return 1; } },
     { connect() { throw new Error("injected connect failure"); } },
     { connect() { return -1; } },
     { connect() { return 1.5; } },
