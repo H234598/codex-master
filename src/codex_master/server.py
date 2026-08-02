@@ -2548,7 +2548,7 @@ def spawn_admission_decision(required_slots: int = 1) -> dict[str, Any]:
             available_slots=None,
             reason_codes=["cpu_metrics_unavailable", "memory_metrics_unavailable", "session_metrics_unavailable"],
         )
-    if snapshot.get("ok") is False:
+    if snapshot.get("ok") is not True:
         reasons = [
             reason
             for reason in snapshot.get("reason_codes", [])

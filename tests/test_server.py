@@ -219,6 +219,42 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(result["allowed"])
         self.assertEqual(result["reason_codes"], ["memory_metrics_unavailable"])
 
+    def test_spawn_admission_fails_closed_without_snapshot_ok_evidence(self) -> None:
+        snapshot = {
+            "load_per_cpu": 0.25,
+            "available_memory_percent": 60.0,
+            "available_memory_mib": 8192,
+            "running_agents": 2,
+        }
+        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+            result = spawn_admission_decision()
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(
+            result["reason_codes"],
+            ["cpu_metrics_unavailable", "memory_metrics_unavailable", "session_metrics_unavailable"],
+        )
+
+    def test_spawn_admission_fails_closed_for_non_boolean_snapshot_ok(self) -> None:
+        for ok in (None, 1, "true"):
+            with self.subTest(ok=ok), patch(
+                "codex_master.server.system_resource_snapshot",
+                return_value={
+                    "ok": ok,
+                    "load_per_cpu": 0.25,
+                    "available_memory_percent": 60.0,
+                    "available_memory_mib": 8192,
+                    "running_agents": 2,
+                },
+            ):
+                result = spawn_admission_decision()
+
+            self.assertFalse(result["allowed"])
+            self.assertEqual(
+                result["reason_codes"],
+                ["cpu_metrics_unavailable", "memory_metrics_unavailable", "session_metrics_unavailable"],
+            )
+
     def test_spawn_resource_policy_exposes_exact_default_thresholds(self) -> None:
         self.assertEqual(
             spawn_resource_policy(),
