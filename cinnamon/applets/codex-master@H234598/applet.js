@@ -973,10 +973,15 @@ FlottenmanagementApplet.prototype = {
 
     _connectTracked(target, signal, callback) {
         if (this._removed || !target || typeof target.connect !== "function") return 0;
-        const id = target.connect(signal, callback);
-        if (id) {
-            this._signalConnections.push({ target, id });
+        let id = 0;
+        try {
+            id = target.connect(signal, callback);
+        } catch (error) {
+            this._logCleanupError(error);
+            return 0;
         }
+        if (!Number.isSafeInteger(id) || id <= 0) return 0;
+        this._signalConnections.push({ target, id });
         return id;
     },
 

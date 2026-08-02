@@ -655,6 +655,26 @@ test("settings launcher failure stays inside menu callback", () => {
   assert.equal(applet.labels.at(-1), "Flottenmanagement");
 });
 
+test("signal connection failures do not escape or retain invalid handles", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const baseline = applet._signalConnections.length;
+  const targets = [
+    { connect() { throw new Error("injected connect failure"); } },
+    { connect() { return -1; } },
+    { connect() { return 1.5; } },
+    { connect() { return Number.MAX_SAFE_INTEGER + 1; } },
+    { connect() { return "1"; } },
+  ];
+
+  for (const target of targets) {
+    let result = null;
+    assert.doesNotThrow(() => { result = applet._connectTracked(target, "activate", () => {}); });
+    assert.equal(result, 0);
+    assert.equal(applet._signalConnections.length, baseline);
+  }
+});
+
 test("single removal retries transient menu cleanup failures", () => {
   for (const failure of ["close", "remove", "menu-destroy", "manager-destroy"]) {
     const { main } = loadApplet();
