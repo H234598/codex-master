@@ -301,10 +301,17 @@ FlottenmanagementApplet.prototype = {
             return;
         }
 
+        let cancellable = null;
+        try {
+            cancellable = Gio.Cancellable ? new Gio.Cancellable() : null;
+        } catch (error) {
+            this._logCleanupError(error);
+        }
+
         const state = {
             generation,
             process,
-            cancellable: Gio.Cancellable ? new Gio.Cancellable() : null,
+            cancellable,
             cancellableCancelled: false,
             timeoutSource: 0,
             finalizing: false,

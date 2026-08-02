@@ -494,6 +494,7 @@ function loadApplet() {
 
   return {
     main: context.main,
+    Gio,
     GLib,
     spawned,
     launcherSpawns,
@@ -887,6 +888,25 @@ test("status timeout registration failure fails closed without leaking process s
   process.emitDone();
   assert.equal(applet._statusInFlight, false);
   assert.equal(applet._statusActiveState, null);
+});
+
+test("cancellable construction failure keeps the process managed", () => {
+  const fixture = loadApplet();
+  queuePayloadProcess(fixture, samplePayload());
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  fixture.Gio.Cancellable = class {
+    constructor() { throw new Error("injected cancellable construction failure"); }
+  };
+
+  assert.doesNotThrow(() => applet.menu.items[0].activate());
+
+  assert.equal(fixture.subprocesses[0].forceExitCount, 0);
+  assert.equal(applet._statusInFlight, true);
+  assert.equal(applet._statusActiveState.cancellable, null);
+  fixture.subprocesses[0].emitDone();
+  assert.equal(applet._statusInFlight, false);
+  assert.equal(applet._statusActiveState, null);
+  assert.equal(fixture.activeTimers().length, 0);
 });
 
 test("invalid utf8/json/schema/types do not overwrite last-good", async () => {
