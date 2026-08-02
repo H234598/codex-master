@@ -1186,7 +1186,7 @@ def pane_pid_from_text(text: str) -> int | None:
         value = int(text)
     except ValueError:
         return None
-    return value if value > 0 else None
+    return value if value > 0 and text == str(value) else None
 
 
 def applet_agent_observation(agent: str, *, deadline: float) -> dict[str, Any]:

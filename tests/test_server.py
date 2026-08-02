@@ -15474,6 +15474,13 @@ class AppletStatusContractTest(unittest.TestCase):
 
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.run_tmux")
+    def test_pane_pid_returns_none_for_leading_zeros(self, mock_run_tmux, _mock_tmux_alive) -> None:
+        mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "00123\n", "")
+
+        self.assertIsNone(pane_pid("a1"))
+
+    @patch("codex_master.server.tmux_alive", return_value=True)
+    @patch("codex_master.server.run_tmux")
     def test_pane_pid_returns_none_for_overlong_numeric_text(self, mock_run_tmux, _mock_tmux_alive) -> None:
         mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, f"{'2' * 5000}\n", "")
 
@@ -15513,29 +15520,30 @@ class AppletStatusContractTest(unittest.TestCase):
             "raw_output": "not_returned",
         },
     )
-    @patch(
-        "codex_master.server.run_tmux",
-        side_effect=[
-            subprocess.CompletedProcess(["tmux"], 0, "", ""),
-            subprocess.CompletedProcess(["tmux"], 0, "１２３\n", ""),
-        ],
-    )
+    @patch("codex_master.server.run_tmux")
     @patch("codex_master.server.time.monotonic", return_value=1.0)
-    def test_applet_agent_observation_rejects_unicode_pane_pid_for_identity(
-        self, _mock_monotonic, _mock_run_tmux, _mock_process_summary, _mock_auth, _mock_lease
+    def test_applet_agent_observation_rejects_noncanonical_pane_pid_for_identity(
+        self, _mock_monotonic, mock_run_tmux, _mock_process_summary, _mock_auth, _mock_lease
     ) -> None:
-        row = applet_agent_observation("a1", deadline=10**12)
+        for pane_pid_text in ("１２３", "00123"):
+            with self.subTest(pane_pid_text=pane_pid_text):
+                mock_run_tmux.side_effect = [
+                    subprocess.CompletedProcess(["tmux"], 0, "", ""),
+                    subprocess.CompletedProcess(["tmux"], 0, f"{pane_pid_text}\n", ""),
+                ]
 
-        self.assertEqual(
-            row,
-            self._row(
-                "a1",
-                activity="running",
-                backend="degraded",
-                control="blocked",
-                identity="unverified",
-            ),
-        )
+                row = applet_agent_observation("a1", deadline=10**12)
+
+                self.assertEqual(
+                    row,
+                    self._row(
+                        "a1",
+                        activity="running",
+                        backend="degraded",
+                        control="blocked",
+                        identity="unverified",
+                    ),
+                )
 
     @patch(
         "codex_master.server.agent_lease_status",
