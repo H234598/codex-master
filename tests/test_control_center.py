@@ -220,6 +220,28 @@ class ControlCenterControllerTest(unittest.TestCase):
             dispatcher("agent_status", {})
         self.assertLess(time.monotonic() - started, 2)
 
+    def test_subprocess_dispatcher_deadline_covers_blocked_request_write(self) -> None:
+        dispatcher = control_center.SubprocessToolDispatcher(
+            argv=[sys.executable, "-c", "import time; time.sleep(30)"],
+            timeout_seconds=0.05,
+        )
+        started = time.monotonic()
+        with self.assertRaisesRegex(AgentError, "outcome unknown after timeout"):
+            dispatcher("agent_status", {"padding": "x" * 200_000})
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_subprocess_dispatcher_stops_reading_at_stream_cap(self) -> None:
+        dispatcher = control_center.SubprocessToolDispatcher(
+            argv=[
+                sys.executable,
+                "-c",
+                f"import sys; sys.stdout.write('x' * {control_center.MAX_BACKEND_STDOUT_BYTES * 2})",
+            ],
+            timeout_seconds=2,
+        )
+        with self.assertRaisesRegex(AgentError, "output exceeded limit"):
+            dispatcher("agent_status", {})
+
     def test_controller_forwards_cancel_to_killable_dispatcher(self) -> None:
         class CancelDispatch:
             def __call__(self, _name, _args):

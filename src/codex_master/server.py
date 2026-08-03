@@ -11479,31 +11479,22 @@ def doctor() -> dict[str, Any]:
     return {"ok": all(check["ok"] for check in checks), "checks": checks, "raw_output": "not_returned"}
 
 
-def _install_unlocked(
+def _install_enrolled_unlocked(
     register: bool = True,
     force: bool = False,
     install_path: Path = DEFAULT_INSTALL_PATH,
     sync_plugin_cache: bool = True,
 ) -> dict[str, Any]:
-    if register:
-        assert_install_context_allows_master_registration()
     wrapper = repo_wrapper_path()
     if not path_present_no_follow(wrapper):
         raise AgentError("repo wrapper missing")
     if not is_regular_executable_no_symlink(wrapper):
         raise AgentError("repo wrapper is not executable")
     startup_self_test: dict[str, Any] = {"requested": register, "status": "skipped", "raw_output": "not_returned"}
-    teamleader_enrollment: dict[str, Any] | None = None
     if register:
-        teamleader_enrollment = enroll_current_teamleader()
-        try:
-            wrapper_self_test = mcp_command_startup_self_test(wrapper)
-            if not wrapper_self_test["ok"]:
-                raise AgentError("repo wrapper failed MCP startup self-test")
-        except Exception:
-            if teamleader_enrollment.get("changed"):
-                revoke_current_teamleader()
-            raise
+        wrapper_self_test = mcp_command_startup_self_test(wrapper)
+        if not wrapper_self_test["ok"]:
+            raise AgentError("repo wrapper failed MCP startup self-test")
     ensure_applet_action_key()
 
     install_path = normalize_install_path(install_path)
@@ -11609,10 +11600,9 @@ def _install_unlocked(
             plugin_cache_install = sync_plugin_cache_from_repo()
             if not plugin_cache_install.get("ok"):
                 raise AgentError("plugin cache sync incomplete")
-    except Exception:
+    except BaseException:
         mcp_restore_error: Exception | None = None
         config_restore_error: Exception | None = None
-        teamleader_restore_error: Exception | None = None
         if registration_added or registration_removed:
             try:
                 if registration_added:
@@ -11630,11 +11620,6 @@ def _install_unlocked(
                 restore_mcp_startup_timeout_snapshot(startup_timeout_snapshot)
             except Exception as restore_exc:
                 config_restore_error = restore_exc
-        if teamleader_enrollment is not None and teamleader_enrollment.get("changed"):
-            try:
-                revoke_current_teamleader()
-            except Exception as restore_exc:
-                teamleader_restore_error = restore_exc
         rollback_install = symlink_status != "already_installed" and (
             not previous_install_present or previous_install_target_text is not None
         )
@@ -11650,8 +11635,6 @@ def _install_unlocked(
                 raise AgentError("could_not_restore_install_symlink") from restore_exc
         if mcp_restore_error is not None:
             raise AgentError("could_not_restore_mcp_registration") from mcp_restore_error
-        if teamleader_restore_error is not None:
-            raise AgentError("could_not_restore_teamleader_registry") from teamleader_restore_error
         if config_restore_error is not None:
             raise AgentError("could_not_restore_codex_config") from config_restore_error
         raise
@@ -11668,6 +11651,32 @@ def _install_unlocked(
         "plugin_cache_install": plugin_cache_install,
         "raw_output": "not_returned",
     }
+
+
+def _install_unlocked(
+    register: bool = True,
+    force: bool = False,
+    install_path: Path = DEFAULT_INSTALL_PATH,
+    sync_plugin_cache: bool = True,
+) -> dict[str, Any]:
+    enrollment: dict[str, Any] | None = None
+    if register:
+        assert_install_context_allows_master_registration()
+        enrollment = enroll_current_teamleader()
+    try:
+        return _install_enrolled_unlocked(
+            register=register,
+            force=force,
+            install_path=install_path,
+            sync_plugin_cache=sync_plugin_cache,
+        )
+    except BaseException:
+        if enrollment is not None and enrollment.get("changed"):
+            try:
+                revoke_current_teamleader()
+            except Exception as restore_exc:
+                raise AgentError("could_not_restore_teamleader_registry") from restore_exc
+        raise
 
 
 def install(
@@ -11696,6 +11705,7 @@ def _uninstall_unlocked(
     expected_parent_stat: os.stat_result | None = None
     wrapper: Path | None = None
     symlink_removed = False
+    registration_removed = False
     if remove_symlink:
         wrapper = repo_wrapper_path()
         try:
@@ -11727,11 +11737,17 @@ def _uninstall_unlocked(
                     if remove.returncode != 0:
                         raise AgentError("codex mcp remove failed")
                     mcp_status = "removed"
+                    registration_removed = True
                 else:
                     mcp_status = "left_in_place_different_command"
             else:
                 mcp_status = "not_registered"
-    except Exception:
+        teamleader_status = "preserved"
+        if unregister and mcp_status in {"removed", "not_registered"}:
+            revoked = revoke_current_teamleader()
+            teamleader_status = "removed" if revoked["changed"] else "not_registered"
+    except BaseException:
+        symlink_restore_error: Exception | None = None
         if symlink_removed and wrapper is not None and expected_parent_stat is not None:
             try:
                 if install_path.exists() or install_path.is_symlink():
@@ -11742,13 +11758,20 @@ def _uninstall_unlocked(
                     expected_parent_stat=expected_parent_stat,
                 )
             except Exception as restore_exc:
-                raise AgentError("could_not_restore_install_symlink") from restore_exc
+                symlink_restore_error = restore_exc
+        registration_restore_error: Exception | None = None
+        if registration_removed:
+            try:
+                restore = run_command(["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(install_path)])
+                if restore.returncode != 0:
+                    raise AgentError("codex mcp add failed")
+            except Exception as restore_exc:
+                registration_restore_error = restore_exc
+        if registration_restore_error is not None:
+            raise AgentError("could_not_restore_mcp_registration") from registration_restore_error
+        if symlink_restore_error is not None:
+            raise AgentError("could_not_restore_install_symlink") from symlink_restore_error
         raise
-
-    teamleader_status = "preserved"
-    if unregister and mcp_status == "removed":
-        revoked = revoke_current_teamleader()
-        teamleader_status = "removed" if revoked["changed"] else "not_registered"
 
     return {
         "ok": True,

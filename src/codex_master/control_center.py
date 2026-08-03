@@ -11,9 +11,11 @@ import json
 import os
 import re
 import secrets
+import selectors
 import signal
 import subprocess
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -387,6 +389,8 @@ class SubprocessToolDispatcher:
             "params": {"name": tool_name, "arguments": args},
         }
         encoded = (json.dumps(request, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+        if len(encoded) > MAX_BACKEND_STDOUT_BYTES:
+            raise AgentError("control-center backend request exceeded limit")
         timeout = self._timeout_seconds
         if timeout is None:
             timeout = float(backend_timeout_seconds(tool_name, args))
@@ -404,22 +408,41 @@ class SubprocessToolDispatcher:
             with self._lock:
                 self._process = process
                 self._cancel_requested = False
-            stdout, stderr = process.communicate(input=encoded, timeout=timeout)
+            stdout, stderr = self._bounded_exchange(process, encoded, timeout)
         except subprocess.TimeoutExpired as exc:
             if process is not None:
                 self._kill_process_group(process)
-                process.communicate()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=5)
+            self._close_process_pipes(process)
             raise AgentError("control-center backend outcome unknown after timeout") from exc
+        except AgentError:
+            if process is not None and process.poll() is None:
+                self._kill_process_group(process)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=5)
+            self._close_process_pipes(process)
+            raise
         except OSError as exc:
+            if process is not None and process.poll() is None:
+                self._kill_process_group(process)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=5)
+            self._close_process_pipes(process)
             raise AgentError("control-center backend is unavailable") from exc
+        except Exception:
+            if process is not None and process.poll() is None:
+                self._kill_process_group(process)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=5)
+            self._close_process_pipes(process)
+            raise
         finally:
             with self._lock:
                 cancelled = self._cancel_requested
                 self._cancel_requested = False
                 if self._process is process:
                     self._process = None
-        if len(stdout) > MAX_BACKEND_STDOUT_BYTES or len(stderr) > MAX_BACKEND_STDERR_BYTES:
-            raise AgentError("control-center backend output exceeded limit")
         if process.returncode != 0:
             if cancelled:
                 raise AgentError("control-center backend outcome unknown after cancellation")
@@ -435,6 +458,15 @@ class SubprocessToolDispatcher:
         except OSError:
             with contextlib.suppress(OSError):
                 process.kill()
+
+    @staticmethod
+    def _close_process_pipes(process: subprocess.Popen[bytes] | None) -> None:
+        if process is None:
+            return
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                with contextlib.suppress(OSError):
+                    stream.close()
 
     def cancel(self) -> bool:
         with self._lock:
@@ -477,6 +509,74 @@ class SubprocessToolDispatcher:
         if result["isError"] and "error" not in payload:
             return {"error": "control-center backend rejected request"}
         return payload
+
+    @staticmethod
+    def _bounded_exchange(
+        process: subprocess.Popen[bytes],
+        request: bytes,
+        timeout_seconds: float,
+    ) -> tuple[bytes, bytes]:
+        if process.stdin is None or process.stdout is None or process.stderr is None:
+            raise AgentError("control-center backend pipes are unavailable")
+        stdin_fd = process.stdin.fileno()
+        stdout_fd = process.stdout.fileno()
+        stderr_fd = process.stderr.fileno()
+        streams = {
+            stdout_fd: (process.stdout, bytearray(), MAX_BACKEND_STDOUT_BYTES),
+            stderr_fd: (process.stderr, bytearray(), MAX_BACKEND_STDERR_BYTES),
+        }
+        selector = selectors.DefaultSelector()
+        deadline = time.monotonic() + timeout_seconds
+        pending = memoryview(request)
+        try:
+            os.set_blocking(stdin_fd, False)
+            selector.register(process.stdin, selectors.EVENT_WRITE, data=("input", stdin_fd))
+            for fd, (stream, _buffer, _limit) in streams.items():
+                os.set_blocking(fd, False)
+                selector.register(stream, selectors.EVENT_READ, data=("output", fd))
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+                events = selector.select(remaining)
+                if not events:
+                    raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+                for key, _mask in events:
+                    kind, fd = key.data
+                    if kind == "input":
+                        try:
+                            written = os.write(fd, pending)
+                        except BlockingIOError:
+                            continue
+                        except (BrokenPipeError, OSError) as exc:
+                            raise AgentError("control-center backend input failed") from exc
+                        pending = pending[written:]
+                        if not pending:
+                            selector.unregister(process.stdin)
+                            process.stdin.close()
+                        continue
+                    stream, buffer, limit = streams[fd]
+                    try:
+                        chunk = os.read(fd, min(64 * 1024, limit + 1 - len(buffer)))
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(stream)
+                        continue
+                    buffer.extend(chunk)
+                    if len(buffer) > limit:
+                        raise AgentError("control-center backend output exceeded limit")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+            process.wait(timeout=remaining)
+        finally:
+            selector.close()
+            with contextlib.suppress(OSError):
+                process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+        return bytes(streams[stdout_fd][1]), bytes(streams[stderr_fd][1])
 
 
 class OperationController:
