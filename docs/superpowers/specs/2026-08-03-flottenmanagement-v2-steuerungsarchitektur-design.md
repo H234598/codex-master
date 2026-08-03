@@ -4,6 +4,7 @@ project: codex-master
 status: approved
 created: 2026-08-03
 updated: 2026-08-03
+implementation_status: P3/P3a source-complete; live deployment pending
 source_of_truth: /home/teladi/Dokumente/Obsidian_Vaults/Teladi_Programming/Projekte/codex-master/Baupläne!/Flottenmanagement-v2-Steuerungsarchitektur-Spezifikation.md
 ---
 
@@ -43,6 +44,49 @@ Verbindliche Entscheidungen:
 - Umsetzung wird in getrennte, jeweils test- und rückrollbare Meilensteinpläne
   zerlegt.
 - Stabilität > Security > Performance.
+
+## Belegter P3/P3a-Stand
+
+- Vertrag 1 bleibt für alte Aufrufer verfügbar. Das Cinnamon-Applet fordert
+  ausdrücklich Vertrag 2 an.
+- Vertrag 2 inventarisiert bekannte laufende tmux-Bienen einmal pro Refresh
+  automatisch. Angeheftete schlafende Bienen füllen nur freie der sechs festen
+  Zeilen; Inventurfehler fallen nicht auf `a1,b1` als angebliche Flotte zurück.
+- Native Bienen laufen über das private, atomar geschriebene und begrenzte
+  Register. Hook-State und UI enthalten keine Prompts, Antworten,
+  Transkriptpfade oder Terminaldaten.
+- Verwaltete und Native-Bienen bleiben in Vertrag und Applet getrennt. Das
+  Native-Untermenü besitzt sechs einmal erzeugte Zeilen; 500 Refreshes und 100
+  Load-/Unload-Zyklen behalten feste Objekt- und Ressourcenobergrenzen.
+- Hookfehler sind zeitbegrenzt und können Codex-Lifecycle-Ereignisse nicht
+  blockieren. Symlink-, Hardlink-, Größen-, Lock-, Zeit- und kaputte
+  State-Fälle sind verhaltensgetestet.
+- Plugin-Sync übernimmt die regulären Dateien `hooks/hooks.json` und
+  `hooks/native_bee_event.py`. Der Applet-Installer verweigert unsichere
+  Dateitypen und Identitätswechsel; atomare Installation und Rollback bleiben
+  direkt getestet.
+
+Damit sind Source- und automatisierte Testgates für P3/P3a erfüllt. Reale
+Cinnamon-Anzeige und Codex-Hookvertrauen bleiben externe Deploymentgates; ohne
+diese Handlungen ist keine Live-Abnahme behauptet.
+
+## Deployment- und Vertrauensgate
+
+```sh
+./bin/codex-master-mcp install
+./scripts/codex-master-cinnamon-applet install
+./scripts/codex-master-cinnamon-applet verify
+```
+
+Danach muss eine neue Codex-Sitzung geöffnet werden. Dort `/hooks` ausführen,
+die vier Plugin-Hookdefinitionen prüfen und ausdrücklich manuell vertrauen.
+Kein Installer und kein Test manipuliert Hook-Trust-State oder behauptet einen
+Trust-Automatismus.
+
+Abschluss in realer Cinnamon-Sitzung: Titel `Flottenmanagement`, alle regulär
+aktiven verwalteten Bienen, getrenntes Untermenü `Native Bienen`, keine neuen
+kritischen Journalmeldungen. Echte Nutzerinstallation und Vertrauenshandlung
+erfolgen erst nach Review durch Controller.
 
 Vollständige Architektur, Phasen, Testmatrix und Abnahmekriterien stehen in der
 oben genannten Obsidian-Spezifikation.

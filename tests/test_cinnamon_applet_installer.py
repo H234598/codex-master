@@ -459,6 +459,27 @@ else:
         finally:
             source_file.chmod(0o644)
 
+    def test_source_identity_change_between_stat_and_open_is_rejected(self) -> None:
+        module = self._load_tool_module()
+        source_file = self.source / "applet.js"
+        replacement = self.root / "replacement.js"
+        replacement.write_bytes(source_file.read_bytes())
+        replacement.chmod(source_file.stat().st_mode)
+        expected = source_file.lstat()
+        real_open = module.os.open
+        swapped = False
+
+        def replace_then_open(path, flags, *args):
+            nonlocal swapped
+            if Path(path) == source_file and not swapped:
+                swapped = True
+                replacement.replace(source_file)
+            return real_open(path, flags, *args)
+
+        with mock.patch.object(module.os, "open", side_effect=replace_then_open):
+            with self.assertRaisesRegex(module.InstallerError, "file identity changed"):
+                module.hash_regular_file(source_file, expected)
+
     def test_target_parent_and_target_symlinks_are_rejected(self) -> None:
         outside = self.root / "outside"
         outside.mkdir()
@@ -472,6 +493,45 @@ else:
         self.target.symlink_to(outside, target_is_directory=True)
         target_result = self._run("install")
         self.assertNotEqual(target_result.returncode, 0)
+
+    def test_uninstall_removes_validated_target_and_preserves_rollback_without_dbus(self) -> None:
+        self._write_tree(self.target, "current")
+        self._write_tree(self.backup, "previous")
+        rollback_before = self._manifest(self.backup)
+
+        result = self._run("uninstall")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.target.exists())
+        self.assertEqual(self._manifest(self.backup), rollback_before)
+        self.assertFalse(self.log.exists())
+
+    def test_uninstall_refuses_symlink_target_without_touching_external_tree(self) -> None:
+        outside = self.root / "outside"
+        self._write_tree(outside, "external")
+        self.target.parent.mkdir(parents=True)
+        self.target.symlink_to(outside, target_is_directory=True)
+
+        result = self._run("uninstall")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("installed applet must be a real directory", result.stderr)
+        self.assertTrue(self.target.is_symlink())
+        self.assertIn("external", (outside / "applet.js").read_text(encoding="utf-8"))
+
+    def test_uninstall_refuses_hardlinked_file_without_removing_installed_tree(self) -> None:
+        self._write_tree(self.target, "current")
+        outside = self.root / "outside.js"
+        outside.write_text("external\n", encoding="utf-8")
+        (self.target / "applet.js").unlink()
+        os.link(outside, self.target / "applet.js")
+
+        result = self._run("uninstall")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("installed applet must contain only non-hardlinked regular files", result.stderr)
+        self.assertTrue(self.target.exists())
+        self.assertEqual(outside.read_text(encoding="utf-8"), "external\n")
 
     def test_rollback_swaps_exact_tree_and_rejects_missing_or_symlink_backup(self) -> None:
         self._write_tree(self.target, "current")

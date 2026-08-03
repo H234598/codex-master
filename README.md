@@ -405,11 +405,28 @@ the auth-copy safety model.
 
 ## Cinnamon Applet: Flottenmanagement
 
-`codex-master@H234598` is a read-only Cinnamon panel view for up to six concrete
-Agentinnen. Its visible panel title is always `Flottenmanagement`. The applet
-starts at most one bounded `codex-master-mcp applet-status` child process,
-never invokes a shell, and exposes no start, stop, interrupt, auth, or lease
-mutation.
+`codex-master@H234598` is the P3/P3a read-only status applet. Its visible panel
+title is always `Flottenmanagement`. It explicitly requests applet status
+schema v2; schema v1 remains available for older callers.
+
+Each schema-v2 refresh uses one bounded tmux session inventory. Every known
+running codex-master Agentin is discovered automatically and shown, up to the
+fixed six-row limit. Foreign tmux sessions are ignored. `tracked-agents` no
+longer defines the visible fleet: it only pins sleeping Agentinnen into rows
+left free by active Agentinnen. Its `a1,b1` default therefore does not limit
+automatic discovery. More than six active managed Agentinnen produce a bounded
+overflow marker instead of an unbounded menu.
+
+Native Codex-Subagentinnen are not mixed with managed tmux Agentinnen. Official
+`SessionStart`, `SubagentStart`, `SubagentStop`, and `SessionEnd` hooks maintain
+a private bounded register. The applet renders that register only in the
+separate `Native Bienen (N)` submenu, using six fixed, non-reactive child rows.
+Native rows are status-only and contain no action or context token.
+
+The applet starts at most one bounded `codex-master-mcp applet-status` child
+process, never invokes a shell, and currently exposes no start, stop,
+interrupt, auth, or lease mutation. Applet actions belong to later milestone
+P4.
 
 The status model keeps three concerns separate:
 
@@ -424,7 +441,8 @@ lease owners, lease IDs, and raw output are not returned.
 
 The four applet settings are:
 
-- `tracked-agents`: comma-separated `a1` through `c100`; 1–6 concrete IDs,
+- `tracked-agents`: comma-separated `a1` through `c100`; 1–6 concrete IDs to
+  pin as sleeping rows when automatic active discovery leaves capacity,
   case-normalized and deduplicated; default `a1,b1`;
 - `refresh-on-open`: refresh when opening the menu; default on;
 - `background-refresh`: opt-in periodic refresh; default off;
@@ -434,15 +452,30 @@ Malformed agent, switch, or interval values show a configuration error, fall
 back to safe defaults, disable background work, and never reach the process
 argv. Finite refresh intervals outside the allowed range are clamped to
 15–3600 seconds. The menu contains a manual refresh, applet administration,
-one summary, and at most six non-reactive Agentinnen rows.
+one summary, at most six managed rows, and the separately bounded Native-Bienen
+submenu.
 
-Install and verify with the repository-owned atomic installer:
+Install MCP/plugin and applet with the repository-owned installers:
 
 ```sh
-scripts/codex-master-cinnamon-applet install --dry-run
-scripts/codex-master-cinnamon-applet install
-scripts/codex-master-cinnamon-applet verify
-scripts/codex-master-cinnamon-applet rollback
+./bin/codex-master-mcp install
+./scripts/codex-master-cinnamon-applet install --dry-run
+./scripts/codex-master-cinnamon-applet install
+./scripts/codex-master-cinnamon-applet verify
+```
+
+`codex-master-mcp install` synchronizes the regular `hooks/hooks.json` and
+`hooks/native_bee_event.py` files into the personal plugin cache. It does not
+and must not alter Codex hook-trust state. After installation, open a new Codex
+session, run `/hooks`, inspect the four `codex-master` lifecycle hook
+definitions, and explicitly trust them. Until that manual step succeeds, do
+not claim that Native-Bienen hooks are active.
+
+Rollback or remove the active applet tree with:
+
+```sh
+./scripts/codex-master-cinnamon-applet rollback
+./scripts/codex-master-cinnamon-applet uninstall
 ```
 
 `install` stages and hashes regular non-hardlinked source files, rejects
@@ -451,15 +484,16 @@ symlinked source/target paths, reloads only this UUID through Cinnamon's
 `verify` requires byte-identical installed files and a running UUID from
 `GetRunningXletUUIDs applet`. `rollback` requires validated installed and
 rollback trees, but not an intact repository source. It fails closed when a
-required tree is missing or unexpected. Install, verify, and rollback are
-serialized by a private per-UUID lock. `--no-reload` is available for
-controlled offline install/rollback tests. No command uses `Eval` or restarts
-Cinnamon globally.
+required tree is missing or unexpected. Install, verify, rollback, and
+uninstall are serialized by a private per-UUID lock. `--no-reload` is
+available for controlled offline install/rollback tests. `uninstall` removes
+only a validated active tree without D-Bus calls and preserves an existing
+rollback tree. No command uses `Eval` or restarts Cinnamon globally.
 
 Useful diagnostics:
 
 ```sh
-./bin/codex-master-mcp applet-status a1 b1
+./bin/codex-master-mcp applet-status --schema-version 2
 gdbus call --session --dest org.Cinnamon --object-path /org/Cinnamon \
   --method org.Cinnamon.GetRunningXletUUIDs applet
 journalctl --user -b | grep -F codex-master@H234598

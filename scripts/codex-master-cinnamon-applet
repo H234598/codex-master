@@ -705,6 +705,30 @@ def rollback(*, no_reload: bool) -> dict[str, Any]:
     return {"ok": True, "action": "rollback", "uuid": UUID}
 
 
+def uninstall() -> dict[str, Any]:
+    target = target_directory()
+    backup = rollback_directory(target)
+    retired_backup = retired_rollback_directory(target)
+    ensure_real_directory_chain(target.parent, create=False)
+    reject_unfinished_swaps(target.parent)
+    if not lexical_exists(target):
+        return {"ok": True, "action": "uninstall", "uuid": UUID, "removed": False}
+    scan_tree(target, "installed applet")
+    if lexical_exists(backup):
+        scan_tree(backup, "rollback applet")
+    if lexical_exists(retired_backup):
+        scan_tree(retired_backup, "unfinished rollback rotation")
+        raise InstallerError("unfinished rollback rotation exists")
+    remove_validated_tree(target, "installed applet")
+    return {
+        "ok": True,
+        "action": "uninstall",
+        "uuid": UUID,
+        "removed": True,
+        "rollback": lexical_exists(backup),
+    }
+
+
 def verify() -> dict[str, Any]:
     source = source_directory()
     target = target_directory()
@@ -721,6 +745,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     install_parser.add_argument("--dry-run", action="store_true")
     install_parser.add_argument("--no-reload", action="store_true")
     commands.add_parser("verify")
+    commands.add_parser("uninstall")
     rollback_parser = commands.add_parser("rollback")
     rollback_parser.add_argument("--no-reload", action="store_true")
     return parser.parse_args(argv)
@@ -738,6 +763,8 @@ def main(argv: list[str]) -> int:
                     result = install(dry_run=False, no_reload=args.no_reload)
                 elif args.command == "verify":
                     result = verify()
+                elif args.command == "uninstall":
+                    result = uninstall()
                 else:
                     result = rollback(no_reload=args.no_reload)
     except (InstallerError, OSError) as exc:
