@@ -16376,7 +16376,7 @@ class AppletStatusContractTest(unittest.TestCase):
         payload = applet_status(["a1"], schema_version=2)
 
         self.assertEqual([row["agent"] for row in payload["agents"]], ["a1"])
-        self.assertEqual(payload["counts"], {"running": 0, "sleeping": 1, "overflow": 0})
+        self.assertEqual(payload["counts"], {"tracked": 1, "running": 0, "sleeping": 1, "overflow": 0})
         mock_run_tmux.assert_called_once_with(
             ["list-sessions", "-F", "#{session_name}"],
             check=False,
@@ -16399,8 +16399,31 @@ class AppletStatusContractTest(unittest.TestCase):
     def test_applet_status_schema_v2_inventory_error_has_no_fallback_rows(self, _mock_run_tmux, _mock_native_status) -> None:
         payload = applet_status([], schema_version=2)
 
-        self.assertEqual(payload["counts"], {"running": 0, "sleeping": 0, "overflow": 0})
+        self.assertEqual(payload["counts"], {"tracked": 0, "running": 0, "sleeping": 0, "overflow": 0})
         self.assertEqual(payload["agents"], [])
+        self.assertNotIn("SECRET_TMUX_ERROR", json.dumps(payload, sort_keys=True))
+
+    @patch(
+        "codex_master.server.native_agent_status",
+        return_value={
+            "bridge_state": "ready",
+            "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
+            "agents": [],
+            "truncated": False,
+        },
+    )
+    @patch(
+        "codex_master.server.run_tmux",
+        return_value=subprocess.CompletedProcess(["tmux"], COMMAND_TIMEOUT_RETURN_CODE, "", "SECRET_TMUX_ERROR"),
+    )
+    def test_applet_status_schema_v2_inventory_error_discards_pinned_agents(
+        self, _mock_run_tmux, mock_native_status
+    ) -> None:
+        payload = applet_status(["a1"], schema_version=2)
+
+        self.assertEqual(payload["agents"], [])
+        self.assertEqual(payload["counts"], {"tracked": 0, "running": 0, "sleeping": 0, "overflow": 0})
+        self.assertEqual(payload["native_agents"], mock_native_status.return_value)
         self.assertNotIn("SECRET_TMUX_ERROR", json.dumps(payload, sort_keys=True))
 
     @patch(

@@ -1430,27 +1430,27 @@ def applet_status_v1(agents: Any) -> dict[str, Any]:
 
 def applet_status_v2(agents: Any) -> dict[str, Any]:
     pinned_agents = normalize_applet_agents(agents, allow_empty=True)
+    selected: list[str] = []
+    running_agents: list[str] = []
+    overflow = 0
     try:
         inventory = managed_applet_inventory()
     except AgentError:
-        visible_running_agents: list[str] = []
-        running_agents: list[str] = []
-        overflow = 0
+        pass
     else:
-        visible_running_agents = inventory["visible_running_agents"]
         running_agents = inventory["running_agents"]
         overflow = inventory["overflow"]
-
-    selected: list[str] = list(visible_running_agents)
-    running_set = set(running_agents)
-    for agent in pinned_agents:
-        if agent in running_set or agent in selected:
-            continue
-        if len(selected) >= MAX_APPLET_AGENTS:
-            break
-        selected.append(agent)
+        selected = list(inventory["visible_running_agents"])
+        running_set = set(running_agents)
+        for agent in pinned_agents:
+            if agent in running_set or agent in selected:
+                continue
+            if len(selected) >= MAX_APPLET_AGENTS:
+                break
+            selected.append(agent)
 
     deadline = time.monotonic() + APPLET_STATUS_TIMEOUT_SECONDS
+    running_set = set(running_agents)
     rows: list[dict[str, Any]] = []
     for agent in selected:
         if time.monotonic() >= deadline:
@@ -1481,6 +1481,7 @@ def applet_status_v2(agents: Any) -> dict[str, Any]:
         "schema_version": 2,
         "mode": "read_only",
         "counts": {
+            "tracked": len(rows),
             "running": len(running_agents),
             "sleeping": sum(row["activity_state"] == "sleeping" for row in rows),
             "overflow": overflow,
