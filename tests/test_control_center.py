@@ -432,6 +432,44 @@ class ControlCenterControllerTest(unittest.TestCase):
             self.assertFalse(view._on_delete(None, None))
             self.assertEqual(view._close_poll_id, 0)
             controller.cancel.assert_called_once_with()
+            controller.abandon.assert_called_once_with()
+
+    def test_invalid_close_timer_abandons_queued_delivery_and_executor(self) -> None:
+        scheduled = []
+        completed = threading.Event()
+
+        def dispatch(_name, _args):
+            completed.set()
+            return {"ok": True}
+
+        controller = control_center.OperationController(
+            dispatch=dispatch,
+            schedule=lambda callback, *args: scheduled.append((callback, args)) or 7,
+        )
+        self.assertTrue(controller.submit("agent_status", {}, lambda _result: None))
+        self.assertTrue(completed.wait(1))
+        deadline = time.monotonic() + 2
+        while not scheduled and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(scheduled), 1)
+        self.assertTrue(controller.busy)
+
+        view = control_center.ControlCenterWindow.__new__(
+            control_center.ControlCenterWindow
+        )
+        view.controller = controller
+        view.GLib = Mock()
+        view.GLib.timeout_add.return_value = 0
+        view.window = Mock()
+        view.status_label = Mock()
+        view.tool_status_label = Mock()
+        view._close_poll_id = 0
+
+        self.assertFalse(view._on_delete(None, None))
+        self.assertFalse(controller.busy)
+        self.assertTrue(controller.close())
+        self.assertTrue(controller._executor._shutdown)
+        self.assertFalse(scheduled[0][0](*scheduled[0][1]))
 
 
 class ControlCenterCliTest(unittest.TestCase):

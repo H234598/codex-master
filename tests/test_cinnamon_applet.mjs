@@ -134,6 +134,35 @@ function loadApplet() {
   let timeoutId = 1;
   let createdNativeRows = 0;
   let createdQuickControlRows = 0;
+  const environmentKeys = [
+    "DISPLAY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_RUNTIME_DIR",
+    "LANG",
+    "PATH",
+    "HOME",
+    "BASH_ENV",
+    "GCONV_PATH",
+    "GIO_EXTRA_MODULES",
+    "GIO_MODULE_DIR",
+    "GI_TYPELIB_PATH",
+    "GJS_PATH",
+    "LD_AUDIT",
+    "LD_DEBUG",
+    "LD_DEBUG_OUTPUT",
+    "LD_LIBRARY_PATH",
+    "GTK_MODULES",
+    "GTK_PATH",
+    "GDK_PIXBUF_MODULE_FILE",
+    "LD_PRELOAD",
+    "LD_PROFILE",
+    "LD_PROFILE_OUTPUT",
+    "LD_SHOW_AUXV",
+    "LD_TRACE_LOADED_OBJECTS",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "UNEXPECTED_INJECTOR",
+  ];
 
   const TextEncoder = globalThis.TextEncoder;
   function makeLabel(text) {
@@ -472,6 +501,7 @@ function loadApplet() {
     SOURCE_REMOVE: false,
     SOURCE_CONTINUE: true,
     get_home_dir() { return home; },
+    listenv() { return [...environmentKeys]; },
     timeout_add(_priority, _ms, callback) {
       const id = timeoutId += 1;
       timeouts.push({ id, callback, cancelled: false, kind: "timeout" });
@@ -886,12 +916,19 @@ test("builds fixed mcp argv and validierte ids", async () => {
     "LD_TRACE_LOADED_OBJECTS",
     "PYTHONHOME",
     "PYTHONPATH",
+    "GTK_MODULES",
+    "GTK_PATH",
+    "GDK_PIXBUF_MODULE_FILE",
+    "UNEXPECTED_INJECTOR",
   ]) {
     assert.ok(launch.unsetCalls.includes(key), `strips ${key}`);
   }
+  for (const key of ["DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "LANG"]) {
+    assert.ok(!launch.unsetCalls.includes(key), `preserves allowlisted ${key}`);
+  }
 });
 
-test("control-center launcher uses fixed sanitized argv and no backend resources", () => {
+test("control-center uses one fixed bounded detach helper", () => {
   const fixture = loadApplet();
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
   const controlCenterItem = applet.menu.items[2];
@@ -901,52 +938,54 @@ test("control-center launcher uses fixed sanitized argv and no backend resources
   assert.equal(fixture.subprocesses.length, 1);
   assert.deepEqual(Array.from(fixture.launcherSpawns[0].argv), [
     "/home/tester/.local/bin/codex-master-mcp",
-    "control-center",
+    "control-center-launch",
   ]);
-  assert.equal(
-    fixture.launcherSpawns[0].flags,
-    fixture.Gio.SubprocessFlags.STDOUT_SILENCE | fixture.Gio.SubprocessFlags.STDERR_SILENCE,
-  );
-  assert.equal(fixture.subprocesses[0].waitCallbacks.length, 1, "launcher exit is reaped asynchronously");
   assert.deepEqual(Array.from(fixture.launcherSpawns[0].envCalls), [
     { key: "PATH", value: "/usr/bin:/bin", overwrite: true },
     { key: "HOME", value: "/home/tester", overwrite: true },
   ]);
+  for (const key of ["GTK_MODULES", "GTK_PATH", "GDK_PIXBUF_MODULE_FILE", "UNEXPECTED_INJECTOR"]) {
+    assert.ok(fixture.launcherSpawns[0].unsetCalls.includes(key), `helper strips ${key}`);
+  }
+  assert.equal(applet._launcherInFlight, true);
+  assert.equal(fixture.activeTimers("timeout").length, 1);
+  assert.equal(fixture.subprocesses.length, 1);
+  controlCenterItem.activate();
+  assert.equal(fixture.subprocesses.length, 1, "helper is single-flight");
+
+  fixture.subprocesses[0].emitDone();
   assert.equal(applet._launcherInFlight, false);
   assert.equal(fixture.activeTimers("timeout").length, 0);
   applet.menu.items[0].activate();
-  assert.equal(fixture.subprocesses.length, 2);
-  controlCenterItem.activate();
-  assert.equal(fixture.subprocesses.length, 2, "status single-flight blocks another launch");
+  assert.equal(fixture.subprocesses.length, 2, "status works after helper exits");
 });
 
-test("control-center launcher is persistent and never receives a backend timeout", () => {
+test("control-center detach helper timeout is bounded and never retries", () => {
   const fixture = loadApplet();
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
   const controlCenterItem = applet.menu.items[2];
 
   controlCenterItem.activate();
-  const process = fixture.subprocesses[0];
 
-  assert.equal(applet._launcherInFlight, false);
-  assert.equal(fixture.activeTimers("timeout").length, 0);
+  assert.equal(applet._launcherInFlight, true);
+  assert.equal(fixture.subprocesses.length, 1);
+  assert.equal(fixture.activeTimers("timeout").length, 1);
   fixture.runTimeouts();
-  assert.equal(process.forceExitCount, 0);
-  applet.menu.items[0].activate();
-  assert.equal(fixture.subprocesses.length, 2, "status remains usable while GTK stays open");
+  assert.equal(fixture.subprocesses[0].forceExitCount, 1);
+  assert.equal(fixture.subprocesses.length, 1, "helper timeout never retries");
 });
 
-test("removal leaves detached control-center alive without retaining resources", () => {
+test("removal terminates only active detach helper and clears its resources", () => {
   const fixture = loadApplet();
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
   applet.menu.items[2].activate();
-  const launcher = fixture.subprocesses[0];
+  const helper = fixture.subprocesses[0];
 
   applet.on_applet_removed_from_panel();
 
   assert.equal(applet._cleanupComplete, true);
   assert.equal(applet._launcherInFlight, false);
-  assert.equal(launcher.forceExitCount, 0);
+  assert.equal(helper.forceExitCount, 1);
   assert.equal(fixture.activeTimers().length, 0);
 });
 

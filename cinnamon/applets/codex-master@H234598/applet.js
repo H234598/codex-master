@@ -11,6 +11,7 @@ const LABEL = "Flottenmanagement";
 const UUID = "codex-master@H234598";
 const APPLET_STATUS_TIMEOUT_MILLISECONDS = 10 * 1000;
 const APPLET_ACTION_TIMEOUT_MILLISECONDS = 120 * 1000;
+const CONTROL_CENTER_LAUNCH_TIMEOUT_MILLISECONDS = 10 * 1000;
 const APPLET_STDOUT_LIMIT_BYTES = 64 * 1024;
 const APPLET_STDERR_LIMIT_BYTES = 8 * 1024;
 const APPLET_STATUS_CHUNK_BYTES = 1024;
@@ -30,6 +31,7 @@ const APPLET_SAFE_PATH = "/usr/bin:/bin";
 const APPLET_STATUS_COMMAND = "applet-status";
 const APPLET_ACTION_COMMAND = "applet-action";
 const APPLET_STATUS_SCHEMA_VERSION = 2;
+const MAX_ENVIRONMENT_KEYS = 256;
 let appletErrorLogCount = 0;
 const APPLET_STATUS_REQUIRED_FIELDS = [
     "schema_version", "mode", "counts", "agents", "native_agents", "raw_output",
@@ -100,25 +102,22 @@ const APPLET_STATUS_LABELS = {
         unavailable: "nicht verfügbar",
     },
 };
-const APPLET_INVALID_ENV_VARS = [
-    "BASH_ENV",
-    "GCONV_PATH",
-    "GIO_EXTRA_MODULES",
-    "GIO_MODULE_DIR",
-    "GI_TYPELIB_PATH",
-    "GJS_PATH",
-    "LD_AUDIT",
-    "LD_DEBUG",
-    "LD_DEBUG_OUTPUT",
-    "LD_LIBRARY_PATH",
-    "LD_PRELOAD",
-    "LD_PROFILE",
-    "LD_PROFILE_OUTPUT",
-    "LD_SHOW_AUXV",
-    "LD_TRACE_LOADED_OBJECTS",
-    "PYTHONHOME",
-    "PYTHONPATH",
-];
+const APPLET_ALLOWED_ENV_VARS = new Set([
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_RUNTIME_DIR",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_DESKTOP",
+    "XDG_SESSION_TYPE",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "TZ",
+]);
 
 function FlottenmanagementApplet(metadata, orientation, panel_height, instance_id) {
     this._init(metadata, orientation, panel_height, instance_id);
@@ -393,31 +392,13 @@ FlottenmanagementApplet.prototype = {
     },
 
     _launchControlCenter() {
-        if (this._removed || this._statusInFlight || this._actionInFlight || this._launcherInFlight) return;
-        this._launcherInFlight = true;
-        try {
-            const launcher = Gio.SubprocessLauncher.new(
-                Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE
-            );
-            this._sanitizeLauncherEnvironment(launcher);
-            const process = launcher.spawnv(this._controlCenterArgv());
-            process.wait_async(null, (_proc, result) => {
-                try {
-                    if (typeof process.wait_finish === "function") process.wait_finish(result);
-                } catch (_error) {
-                    // Window exit is not an applet status operation.
-                }
-            });
-        } catch (_error) {
-            // Missing launcher fails locally without creating Cinnamon work.
-        } finally {
-            this._launcherInFlight = false;
-        }
+        if (this._removed || this._statusInFlight) return;
+        this._startStatusRefresh({ kind: "launcher" });
     },
 
     _controlCenterArgv() {
         const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
-        return [home + "/.local/bin/codex-master-mcp", "control-center"];
+        return [home + "/.local/bin/codex-master-mcp", "control-center-launch"];
     },
 
     _appletActionArgv(actionRequest) {
@@ -529,13 +510,15 @@ FlottenmanagementApplet.prototype = {
 
     _startStatusRefresh(request = null) {
         if (this._removed) return;
-        const commandKind = request ? "action" : "status";
+        const commandKind = request && request.kind === "launcher" ? "launcher" : request ? "action" : "status";
         const actionRequest = commandKind === "action" ? request : null;
 
         const generation = ++this._statusGeneration;
         let process;
         try {
-            const argv = actionRequest ? this._appletActionArgv(actionRequest) : this._trackedStatusArgv();
+            const argv = commandKind === "launcher"
+                ? this._controlCenterArgv()
+                : actionRequest ? this._appletActionArgv(actionRequest) : this._trackedStatusArgv();
             const launcher = Gio.SubprocessLauncher.new(
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
             );
@@ -595,6 +578,7 @@ FlottenmanagementApplet.prototype = {
         this._statusActiveGeneration = generation;
         this._statusInFlight = true;
         this._actionInFlight = commandKind === "action";
+        this._launcherInFlight = commandKind === "launcher";
         if (commandKind === "status") {
             this._statusViewState = this._statusLastGood ? "refreshing" : "initializing";
         }
@@ -824,7 +808,9 @@ FlottenmanagementApplet.prototype = {
                 GLib.PRIORITY_DEFAULT,
                 commandKind === "action"
                     ? APPLET_ACTION_TIMEOUT_MILLISECONDS
-                    : APPLET_STATUS_TIMEOUT_MILLISECONDS,
+                    : commandKind === "launcher"
+                        ? CONTROL_CENTER_LAUNCH_TIMEOUT_MILLISECONDS
+                        : APPLET_STATUS_TIMEOUT_MILLISECONDS,
                 () => {
                     if (this._removed) {
                         state.timeoutSource = 0;
@@ -912,14 +898,16 @@ FlottenmanagementApplet.prototype = {
     },
 
     _sanitizeLauncherEnvironment(launcher) {
-        launcher.setenv("PATH", APPLET_SAFE_PATH, true);
-        const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
-        launcher.setenv("HOME", home, true);
-        for (const key of APPLET_INVALID_ENV_VARS) {
-            if (typeof launcher.unsetenv === "function") {
-                launcher.unsetenv(key);
-            }
+        const keys = typeof GLib.listenv === "function" ? GLib.listenv() : null;
+        if (!Array.isArray(keys) || keys.length > MAX_ENVIRONMENT_KEYS) {
+            throw new Error("Process environment unavailable");
         }
+        for (const key of keys) {
+            if (typeof key !== "string" || !APPLET_ALLOWED_ENV_VARS.has(key)) launcher.unsetenv(key);
+        }
+        const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
+        launcher.setenv("PATH", APPLET_SAFE_PATH, true);
+        launcher.setenv("HOME", home, true);
     },
 
     _clearStatusBuffers(state) {
@@ -937,6 +925,17 @@ FlottenmanagementApplet.prototype = {
         this._statusActiveGeneration = 0;
         this._statusActiveState = null;
         this._activeStatusProcess = null;
+
+        if (state.commandKind === "launcher") {
+            this._clearStatusBuffers(state);
+            this._launcherInFlight = false;
+            this._statusPendingRefresh = false;
+            if (state.timeoutSource) {
+                GLib.source_remove(state.timeoutSource);
+                state.timeoutSource = 0;
+            }
+            return;
+        }
 
         if (state.commandKind === "action") {
             let actionCompleted = false;

@@ -676,6 +676,9 @@ class OperationController:
             result = future.result()
         except Exception as exc:
             result = public_error_payload(exc)
+        with self._lock:
+            if self._closed or generation != self._generation:
+                return
         try:
             source_id = self._schedule(self._deliver, generation, callback, result)
         except BaseException:
@@ -734,6 +737,20 @@ class OperationController:
                 return False
         cancel = getattr(self._dispatch, "cancel", None)
         return bool(cancel()) if callable(cancel) else False
+
+    def abandon(self) -> None:
+        try:
+            self.cancel()
+        except Exception:
+            pass
+        with self._lock:
+            if self._closed:
+                return
+            self._busy = False
+            self._closed = True
+            self._closing = True
+            self._generation += 1
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 def load_gtk() -> tuple[Any, Any]:
@@ -1303,6 +1320,10 @@ class ControlCenterWindow:
                 except Exception:
                     self._close_poll_id = 0
                 if not self._close_poll_id:
+                    try:
+                        self.controller.abandon()
+                    except Exception:
+                        pass
                     return False
             return True
 

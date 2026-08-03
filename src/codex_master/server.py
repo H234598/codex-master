@@ -28,7 +28,7 @@ import time
 import tomllib
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from codex_master import __version__
 
@@ -108,6 +108,24 @@ MAX_AGENT_LEASE_SECONDS = 7200
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
 MCP_SERVER_NAME = "codex-master-mcp"
 DEFAULT_INSTALL_PATH = Path("~/.local/bin/codex-master-mcp").expanduser()
+CONTROL_CENTER_ENV_KEYS = frozenset(
+    {
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XAUTHORITY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_RUNTIME_DIR",
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_DESKTOP",
+        "XDG_SESSION_TYPE",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_MESSAGES",
+        "TZ",
+    }
+)
 MAX_SKILL_NAMES = 200
 MAX_CAPABILITY_PLUGINS = 20
 DEFAULT_MULTI_AGENT_RESULT_LIMIT = 30
@@ -11517,6 +11535,44 @@ def fleet_desktop_entry_bytes(install_path: Path) -> bytes:
     ).encode("utf-8")
 
 
+def launch_control_center_detached(
+    *,
+    command_path: Path = DEFAULT_INSTALL_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    require_teamleader_tool_access()
+    fleet_desktop_entry_bytes(command_path)
+    source = os.environ if environ is None else environ
+    child_env = {
+        key: value
+        for key, value in source.items()
+        if key in CONTROL_CENTER_ENV_KEYS
+        and isinstance(value, str)
+        and "\0" not in value
+        and len(value) <= 4096
+    }
+    child_env["PATH"] = "/usr/bin:/bin"
+    child_env["HOME"] = str(Path.home())
+    file_actions = (
+        (os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDONLY, 0),
+        (os.POSIX_SPAWN_OPEN, 1, os.devnull, os.O_WRONLY, 0),
+        (os.POSIX_SPAWN_OPEN, 2, os.devnull, os.O_WRONLY, 0),
+        (os.POSIX_SPAWN_CLOSEFROM, 3),
+    )
+    command = str(command_path)
+    try:
+        os.posix_spawn(
+            command,
+            [command, "control-center"],
+            child_env,
+            file_actions=file_actions,
+            setsid=True,
+        )
+    except OSError as exc:
+        raise AgentError("control-center launch failed") from exc
+    return {"status": "launched", "raw_output": "not_returned"}
+
+
 def _validate_fleet_desktop_stat(current: os.stat_result) -> None:
     if (
         not stat_module.S_ISREG(current.st_mode)
@@ -15929,6 +15985,7 @@ def main_cli(argv: list[str]) -> int:
     sub.add_parser("watchdog-status")
     sub.add_parser("timeout-policy")
     sub.add_parser("control-center")
+    sub.add_parser("control-center-launch", help=argparse.SUPPRESS)
     p_applet_status = sub.add_parser("applet-status")
     p_applet_status.add_argument("agents", nargs="*")
     p_applet_status.add_argument("--schema-version", type=int, default=1)
@@ -16349,6 +16406,8 @@ def main_cli(argv: list[str]) -> int:
             from codex_master.control_center import run_control_center
 
             return run_control_center([])
+        if args.command == "control-center-launch":
+            return print_json(launch_control_center_detached())
         if args.command == "applet-status":
             return print_json(
                 call_validated_tool(

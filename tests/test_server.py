@@ -17594,6 +17594,67 @@ class CliLifecycleTest(unittest.TestCase):
         mock_control_center.assert_called_once_with([])
         self.assertNotIn("control_center", {tool["name"] for tool in server_module.TOOLS})
 
+    @patch("codex_master.server.require_teamleader_tool_access")
+    @patch("codex_master.server.os.posix_spawn", return_value=12345)
+    def test_detached_control_center_spawn_is_private_bounded_and_path_sparse(
+        self,
+        mock_spawn,
+        mock_access,
+    ) -> None:
+        command = Path("/home/tester/.local/bin/codex-master-mcp")
+        result = server_module.launch_control_center_detached(
+            command_path=command,
+            environ={
+                "DISPLAY": ":0",
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+                "XDG_RUNTIME_DIR": "/run/user/1000",
+                "LANG": "de_DE.UTF-8",
+                "GTK_MODULES": "/attacker/module.so",
+                "LD_PRELOAD": "/attacker/preload.so",
+                "PYTHONPATH": "/attacker/python",
+                "SECRET_TOKEN": "do-not-forward",
+            },
+        )
+
+        mock_access.assert_called_once_with()
+        executable, argv, env = mock_spawn.call_args.args
+        self.assertEqual(executable, str(command))
+        self.assertEqual(argv, [str(command), "control-center"])
+        self.assertEqual(
+            env,
+            {
+                "DISPLAY": ":0",
+                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+                "XDG_RUNTIME_DIR": "/run/user/1000",
+                "LANG": "de_DE.UTF-8",
+                "PATH": "/usr/bin:/bin",
+                "HOME": str(Path.home()),
+            },
+        )
+        self.assertEqual(mock_spawn.call_args.kwargs["setsid"], True)
+        file_actions = mock_spawn.call_args.kwargs["file_actions"]
+        self.assertEqual([action[1] for action in file_actions], [0, 1, 2, 3])
+        self.assertEqual(file_actions[-1], (os.POSIX_SPAWN_CLOSEFROM, 3))
+        self.assertNotIn("pid", result)
+        self.assertEqual(result["status"], "launched")
+        self.assertEqual(result["raw_output"], "not_returned")
+
+    @patch("codex_master.server.print_json", return_value=0)
+    @patch("codex_master.server.launch_control_center_detached")
+    def test_cli_control_center_launch_routes_to_hidden_detach_helper(
+        self,
+        mock_launch,
+        mock_print,
+    ) -> None:
+        payload = {"status": "launched", "raw_output": "not_returned"}
+        mock_launch.return_value = payload
+
+        self.assertEqual(main_cli(["control-center-launch"]), 0)
+
+        mock_launch.assert_called_once_with()
+        mock_print.assert_called_once_with(payload)
+        self.assertNotIn("control_center_launch", {tool["name"] for tool in server_module.TOOLS})
+
     @patch("codex_master.server.print_json")
     @patch("codex_master.server.call_tool", return_value={"results": [], "raw_output": "not_returned"})
     def test_cli_start_can_confirm_broad_selector(self, mock_call_tool, mock_print_json) -> None:
