@@ -542,3 +542,113 @@ def test_server_registry_lock_is_reentrant_and_private(tmp_path: Path) -> None:
     with io.lock():
         with io.lock():
             assert os.stat(paths.lock).st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("reader", ["text", "bytes"])
+def test_optional_private_read_rejects_missing_parent(tmp_path: Path, reader: str) -> None:
+    from codex_master.fleet_service import FleetPaths
+    from codex_master.server import AgentError, build_fleet_private_io
+
+    paths = FleetPaths.from_state_root(tmp_path)
+    io = build_fleet_private_io(paths)
+    target = tmp_path / "missing-parent" / "target"
+
+    with pytest.raises(AgentError, match="read_error"):
+        if reader == "text":
+            io.read_text(target, 1024, "read_error")
+        else:
+            io.read_bytes(target, 1024, "read_error")
+
+
+@pytest.mark.parametrize("reader", ["text", "bytes"])
+def test_optional_private_read_rejects_parent_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: str,
+) -> None:
+    from codex_master import server
+    from codex_master.fleet_service import FleetPaths
+
+    paths = FleetPaths.from_state_root(tmp_path)
+    io = server.build_fleet_private_io(paths)
+    io.ensure_dir(paths.root)
+    io.replace_text(paths.registry, "before")
+    moved = tmp_path / "moved-fleet"
+    function_name = "read_private_regular_text" if reader == "text" else "pool_read_private_bytes"
+    real_read = getattr(server, function_name)
+
+    def swap_parent_then_read(
+        path: Path,
+        max_bytes: int,
+        error_text: str,
+        *,
+        expected_parent_stat=None,
+    ):
+        os.rename(paths.root, moved)
+        io.ensure_dir(paths.root)
+        paths.registry.write_text("after")
+        return real_read(
+            path,
+            max_bytes,
+            error_text,
+            expected_parent_stat=expected_parent_stat,
+        )
+
+    monkeypatch.setattr(server, function_name, swap_parent_then_read)
+
+    with pytest.raises(server.AgentError, match="read_error"):
+        if reader == "text":
+            io.read_text(paths.registry, 1024, "read_error")
+        else:
+            io.read_bytes(paths.registry, 1024, "read_error")
+
+
+def test_private_replace_rejects_hardlink_added_during_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from codex_master import server
+    from codex_master.fleet_service import FleetPaths
+
+    paths = FleetPaths.from_state_root(tmp_path)
+    io = server.build_fleet_private_io(paths)
+    io.ensure_dir(paths.root)
+    io.replace_text(paths.registry, "before")
+    alias = paths.root / "registry-alias"
+    real_write = server.write_private_new_bytes
+
+    def add_hardlink_then_write(
+        path: Path,
+        data: bytes,
+        mode: int = 0o600,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        os.link(paths.registry, alias)
+        real_write(path, data, mode=mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(server, "write_private_new_bytes", add_hardlink_then_write)
+
+    with pytest.raises(server.AgentError, match="private state path changed unexpectedly"):
+        io.replace_text(paths.registry, "after")
+
+    assert paths.registry.read_text() == "before"
+    assert alias.read_text() == "before"
+
+
+def test_fleet_paths_repr_redacts_private_paths(tmp_path: Path) -> None:
+    from codex_master.fleet_service import FleetPaths
+
+    paths = FleetPaths.from_state_root(tmp_path / "private-state")
+    rendered = repr(paths)
+
+    assert all(
+        str(path) not in rendered
+        for path in (
+            paths.root,
+            paths.registry,
+            paths.secrets,
+            paths.limits,
+            paths.lock,
+        )
+    )

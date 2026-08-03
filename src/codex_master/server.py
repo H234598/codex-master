@@ -12,7 +12,6 @@ import base64
 import contextlib
 import contextvars
 import datetime as _dt
-import errno
 import fcntl
 import hashlib
 import hmac
@@ -2690,11 +2689,21 @@ def replace_private_text(path: Path, text: str, mode: int = 0o600) -> None:
     replace_private_bytes(path, text.encode("utf-8"), mode=mode)
 
 
-def read_private_regular_text(path: Path, max_bytes: int, error_text: str) -> str:
+def read_private_regular_text(
+    path: Path,
+    max_bytes: int,
+    error_text: str,
+    *,
+    expected_parent_stat: os.stat_result | None = None,
+) -> str:
     max_bytes = max(1, int(max_bytes))
     parent_fd = -1
     try:
-        parent_stat = path.parent.lstat()
+        parent_stat = (
+            expected_parent_stat
+            if expected_parent_stat is not None
+            else path.parent.lstat()
+        )
         parent_fd = open_directory_no_follow_matching(
             path.parent,
             parent_stat,
@@ -2748,24 +2757,43 @@ def read_private_regular_text(path: Path, max_bytes: int, error_text: str) -> st
         raise AgentError(error_text) from exc
 
 
-def _fleet_error_is_missing(exc: BaseException) -> bool:
-    current: BaseException | None = exc
-    seen: set[int] = set()
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if isinstance(current, OSError) and current.errno == errno.ENOENT:
-            return True
-        current = current.__cause__ or current.__context__
-    return False
+def _fleet_optional_parent_stat(path: Path, error_text: str) -> os.stat_result | None:
+    try:
+        parent_stat = path.parent.lstat()
+    except OSError as exc:
+        raise AgentError(error_text) from exc
+    parent_fd = -1
+    try:
+        parent_fd = open_directory_no_follow_matching(
+            path.parent,
+            parent_stat,
+            error_text=error_text,
+            changed_text=error_text,
+        )
+        try:
+            os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise AgentError(error_text) from exc
+    except AgentError:
+        raise
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+    return parent_stat
 
 
 def fleet_read_optional_private_text(path: Path, max_bytes: int, error_text: str) -> str | None:
-    try:
-        return read_private_regular_text(path, max_bytes, error_text)
-    except AgentError as exc:
-        if _fleet_error_is_missing(exc):
-            return None
-        raise
+    parent_stat = _fleet_optional_parent_stat(path, error_text)
+    if parent_stat is None:
+        return None
+    return read_private_regular_text(
+        path,
+        max_bytes,
+        error_text,
+        expected_parent_stat=parent_stat,
+    )
 
 
 def replace_private_bytes(
@@ -2835,9 +2863,11 @@ def replace_private_bytes(
             if expected_existing_stat is None:
                 if current is not None:
                     raise AgentError("private state path changed unexpectedly")
-            elif current is None or not source_identity_with_snapshot_matches(
-                current,
-                expected_existing_stat,
+            elif (
+                current is None
+                or not stat_module.S_ISREG(current.st_mode)
+                or getattr(current, "st_nlink", 1) != 1
+                or not source_identity_with_snapshot_matches(current, expected_existing_stat)
             ):
                 raise AgentError("private state path changed unexpectedly")
         os.replace(tmp_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
@@ -13948,10 +13978,20 @@ def pool_write_private_bytes_if_absent(path: Path, data: bytes, mode: int = 0o60
         os.close(parent_fd)
 
 
-def pool_read_private_bytes(path: Path, max_bytes: int, error_text: str) -> bytes:
+def pool_read_private_bytes(
+    path: Path,
+    max_bytes: int,
+    error_text: str,
+    *,
+    expected_parent_stat: os.stat_result | None = None,
+) -> bytes:
     parent_fd = -1
     try:
-        parent_stat = path.parent.lstat()
+        parent_stat = (
+            expected_parent_stat
+            if expected_parent_stat is not None
+            else path.parent.lstat()
+        )
         parent_fd = open_directory_no_follow_matching(
             path.parent,
             parent_stat,
@@ -14003,12 +14043,15 @@ def pool_read_private_bytes(path: Path, max_bytes: int, error_text: str) -> byte
 
 
 def fleet_read_optional_private_bytes(path: Path, max_bytes: int, error_text: str) -> bytes | None:
-    try:
-        return pool_read_private_bytes(path, max_bytes, error_text)
-    except AgentError as exc:
-        if _fleet_error_is_missing(exc):
-            return None
-        raise
+    parent_stat = _fleet_optional_parent_stat(path, error_text)
+    if parent_stat is None:
+        return None
+    return pool_read_private_bytes(
+        path,
+        max_bytes,
+        error_text,
+        expected_parent_stat=parent_stat,
+    )
 
 
 def pool_private_text_matches(path: Path, expected: str, max_bytes: int) -> bool:

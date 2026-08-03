@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, replace as dataclass_replace
+from dataclasses import dataclass, field, replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import ContextManager
@@ -48,11 +48,11 @@ class AccountGateDecision:
 
 @dataclass(frozen=True, slots=True)
 class FleetPaths:
-    root: Path
-    registry: Path
-    secrets: Path
-    limits: Path
-    lock: Path
+    root: Path = field(repr=False)
+    registry: Path = field(repr=False)
+    secrets: Path = field(repr=False)
+    limits: Path = field(repr=False)
+    lock: Path = field(repr=False)
 
     @classmethod
     def from_state_root(cls, root: Path) -> FleetPaths:
