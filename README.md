@@ -471,11 +471,10 @@ session, run `/hooks`, inspect the four `codex-master` lifecycle hook
 definitions, and explicitly trust them. Until that manual step succeeds, do
 not claim that Native-Bienen hooks are active.
 
-Rollback or remove the active applet tree with:
+Rollback the active applet tree with:
 
 ```sh
 ./scripts/codex-master-cinnamon-applet rollback
-./scripts/codex-master-cinnamon-applet uninstall
 ```
 
 `install` stages and hashes regular non-hardlinked source files, rejects
@@ -484,11 +483,10 @@ symlinked source/target paths, reloads only this UUID through Cinnamon's
 `verify` requires byte-identical installed files and a running UUID from
 `GetRunningXletUUIDs applet`. `rollback` requires validated installed and
 rollback trees, but not an intact repository source. It fails closed when a
-required tree is missing or unexpected. Install, verify, rollback, and
-uninstall are serialized by a private per-UUID lock. `--no-reload` is
-available for controlled offline install/rollback tests. `uninstall` removes
-only a validated active tree without D-Bus calls and preserves an existing
-rollback tree. No command uses `Eval` or restarts Cinnamon globally.
+required tree is missing or unexpected. Install, verify, and rollback are
+serialized by a private per-UUID lock. `--no-reload` is available for
+controlled offline install/rollback tests. No command uses `Eval` or restarts
+Cinnamon globally.
 
 Useful diagnostics:
 
