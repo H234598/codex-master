@@ -29,16 +29,28 @@ class NativeBeeHookTest(unittest.TestCase):
             check=False,
         )
 
-    def test_hooks_manifest_declares_four_command_hooks(self) -> None:
+    def test_hooks_manifest_uses_official_event_group_schema(self) -> None:
         payload = json.loads(HOOKS_MANIFEST.read_text(encoding="utf-8"))
         hooks = payload["hooks"]
+        events = ["SessionStart", "SubagentStart", "SubagentStop", "SessionEnd"]
 
-        self.assertEqual([entry["event"] for entry in hooks], ["SessionStart", "SubagentStart", "SubagentStop", "SessionEnd"])
-        for entry in hooks:
-            with self.subTest(event=entry["event"]):
-                self.assertEqual(entry["type"], "command")
-                self.assertEqual(entry["timeout"], 1)
-                self.assertEqual(entry["command"], "python3 $PLUGIN_ROOT/hooks/native_bee_event.py")
+        self.assertEqual(list(hooks), events)
+        for event in events:
+            with self.subTest(event=event):
+                self.assertEqual(
+                    hooks[event],
+                    [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python3 ${PLUGIN_ROOT}/hooks/native_bee_event.py",
+                                    "timeout": 1,
+                                }
+                            ]
+                        }
+                    ],
+                )
 
     def test_plugin_manifest_points_at_hooks_manifest(self) -> None:
         payload = json.loads(PLUGIN_MANIFEST.read_text(encoding="utf-8"))
