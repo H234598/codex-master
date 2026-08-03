@@ -133,6 +133,33 @@ def ensure_real_directory_chain(path: Path, *, create: bool) -> None:
             raise InstallerError("directory chain must contain only real directories")
 
 
+def same_identity(current: os.stat_result, expected: os.stat_result) -> bool:
+    return (current.st_dev, current.st_ino) == (expected.st_dev, expected.st_ino)
+
+
+def open_matching_directory(
+    path: Path | str,
+    expected: os.stat_result,
+    label: str,
+    *,
+    dir_fd: int | None = None,
+) -> int:
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise InstallerError("safe recursive removal is unavailable")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except OSError as exc:
+        raise InstallerError(f"{label} changed during removal") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISDIR(opened.st_mode) or not same_identity(opened, expected):
+            raise InstallerError(f"{label} changed during removal")
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
 def hash_regular_file(path: Path, expected: os.stat_result) -> str:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -280,8 +307,57 @@ def stage_source(
 
 
 def remove_validated_tree(path: Path, label: str) -> None:
+    try:
+        expected_parent = path.parent.lstat()
+        expected_root = path.lstat()
+    except OSError as exc:
+        raise InstallerError(f"{label} is missing or unreadable") from exc
+    if stat.S_ISLNK(expected_parent.st_mode) or not stat.S_ISDIR(expected_parent.st_mode):
+        raise InstallerError(f"{label} parent must be a real directory")
+    if stat.S_ISLNK(expected_root.st_mode) or not stat.S_ISDIR(expected_root.st_mode):
+        raise InstallerError(f"{label} must be a real directory")
     scan_tree(path, label)
-    shutil.rmtree(path)
+    if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+        raise InstallerError("safe recursive removal is unavailable")
+
+    parent_fd = -1
+    root_fd = -1
+    try:
+        parent_fd = open_matching_directory(path.parent, expected_parent, label)
+        latest = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(latest.st_mode) or not same_identity(latest, expected_root):
+            raise InstallerError(f"{label} changed during removal")
+        root_fd = open_matching_directory(path.name, expected_root, label, dir_fd=parent_fd)
+
+        def ignore_root_rmdir(func: Any, error_path: Any, exc_info: Any) -> None:
+            if func is os.rmdir and error_path in {".", b"."}:
+                return
+            raise exc_info[1]
+
+        shutil.rmtree(".", dir_fd=root_fd, onerror=ignore_root_rmdir)
+        latest = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(latest.st_mode) or not same_identity(latest, expected_root):
+            raise InstallerError(f"{label} changed during removal")
+        os.rmdir(path.name, dir_fd=parent_fd)
+        try:
+            latest_parent = path.parent.lstat()
+        except OSError as exc:
+            raise InstallerError(f"{label} parent changed during removal") from exc
+        if (
+            stat.S_ISLNK(latest_parent.st_mode)
+            or not stat.S_ISDIR(latest_parent.st_mode)
+            or not same_identity(latest_parent, expected_parent)
+        ):
+            raise InstallerError(f"{label} parent changed during removal")
+    except InstallerError:
+        raise
+    except OSError as exc:
+        raise InstallerError(f"{label} changed during removal") from exc
+    finally:
+        if root_fd >= 0:
+            os.close(root_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
 
 def kill_and_wait(process: subprocess.Popen[bytes]) -> None:
@@ -711,14 +787,14 @@ def uninstall() -> dict[str, Any]:
     retired_backup = retired_rollback_directory(target)
     ensure_real_directory_chain(target.parent, create=False)
     reject_unfinished_swaps(target.parent)
+    if lexical_exists(retired_backup):
+        scan_tree(retired_backup, "unfinished rollback rotation")
+        raise InstallerError("unfinished rollback rotation exists")
     if not lexical_exists(target):
         return {"ok": True, "action": "uninstall", "uuid": UUID, "removed": False}
     scan_tree(target, "installed applet")
     if lexical_exists(backup):
         scan_tree(backup, "rollback applet")
-    if lexical_exists(retired_backup):
-        scan_tree(retired_backup, "unfinished rollback rotation")
-        raise InstallerError("unfinished rollback rotation exists")
     remove_validated_tree(target, "installed applet")
     return {
         "ok": True,

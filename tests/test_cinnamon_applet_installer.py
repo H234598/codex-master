@@ -533,6 +533,107 @@ else:
         self.assertTrue(self.target.exists())
         self.assertEqual(outside.read_text(encoding="utf-8"), "external\n")
 
+    def test_uninstall_rejects_target_swap_without_recursively_deleting_replacement(self) -> None:
+        self._write_tree(self.target, "current")
+        original = self.root / "original-target"
+        replacement = self.root / "replacement-target"
+        self._write_tree(replacement, "external")
+        replacement_before = self._manifest(replacement)
+        module = self._load_tool_module()
+        real_rmtree = module.shutil.rmtree
+
+        def swap_before_rmtree(path, *args, **kwargs):
+            self.target.rename(original)
+            replacement.rename(self.target)
+            return real_rmtree(path, *args, **kwargs)
+
+        swap_before_rmtree.avoids_symlink_attacks = True
+        error = None
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            with mock.patch.object(module.shutil, "rmtree", side_effect=swap_before_rmtree) as patched:
+                patched.avoids_symlink_attacks = True
+                try:
+                    module.uninstall()
+                except module.InstallerError as exc:
+                    error = exc
+
+        self.assertTrue(self.target.is_dir(), "replacement tree was recursively deleted")
+        self.assertEqual(self._manifest(self.target), replacement_before)
+        self.assertIsNotNone(error)
+        self.assertIn("installed applet changed during removal", str(error))
+        self.assertFalse(self.log.exists())
+
+    def test_uninstall_fails_closed_when_parent_is_replaced_by_foreign_symlink(self) -> None:
+        self._write_tree(self.target, "current")
+        parent = self.target.parent
+        original_parent = self.root / "original-applets"
+        foreign_parent = self.root / "foreign-applets"
+        foreign_target = foreign_parent / UUID
+        self._write_tree(foreign_target, "external")
+        foreign_before = self._manifest(foreign_target)
+        module = self._load_tool_module()
+        real_rmtree = module.shutil.rmtree
+
+        def swap_parent_before_rmtree(path, *args, **kwargs):
+            parent.rename(original_parent)
+            parent.symlink_to(foreign_parent, target_is_directory=True)
+            return real_rmtree(path, *args, **kwargs)
+
+        swap_parent_before_rmtree.avoids_symlink_attacks = True
+        error = None
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            with mock.patch.object(module.shutil, "rmtree", side_effect=swap_parent_before_rmtree) as patched:
+                patched.avoids_symlink_attacks = True
+                try:
+                    module.uninstall()
+                except module.InstallerError as exc:
+                    error = exc
+
+        self.assertIsNotNone(error)
+        self.assertIn("installed applet parent changed during removal", str(error))
+        self.assertEqual(self._manifest(foreign_target), foreign_before)
+        self.assertFalse((original_parent / UUID).exists())
+        self.assertFalse(self.log.exists())
+
+    def test_uninstall_refuses_unsafe_recursive_removal_without_mutation(self) -> None:
+        self._write_tree(self.target, "current")
+        before = self._manifest(self.target)
+        module = self._load_tool_module()
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            with mock.patch.object(module.shutil.rmtree, "avoids_symlink_attacks", False):
+                with self.assertRaisesRegex(module.InstallerError, "safe recursive removal is unavailable"):
+                    module.uninstall()
+
+        self.assertEqual(self._manifest(self.target), before)
+        self.assertFalse(self.log.exists())
+
+    def test_uninstall_missing_target_rejects_retired_rollback_without_mutation(self) -> None:
+        retired = self.target.parent / f".{UUID}.retired"
+        self._write_tree(retired, "unfinished")
+        before = self._manifest(retired)
+
+        result = self._run("uninstall")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unfinished rollback rotation exists", result.stderr)
+        self.assertFalse(self.target.exists())
+        self.assertEqual(self._manifest(retired), before)
+        self.assertFalse(self.log.exists())
+
+    def test_uninstall_missing_target_is_idempotent_without_swap_artifacts(self) -> None:
+        self.target.parent.mkdir(parents=True)
+
+        result = self._run("uninstall")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"action": "uninstall", "ok": True, "removed": False, "uuid": UUID},
+        )
+        self.assertFalse(self.target.exists())
+        self.assertFalse(self.log.exists())
+
     def test_rollback_swaps_exact_tree_and_rejects_missing_or_symlink_backup(self) -> None:
         self._write_tree(self.target, "current")
         self._write_tree(self.backup, "previous")
@@ -631,6 +732,13 @@ else:
         self.assertEqual(self._manifest(self.backup), before["backup"])
         self.assertEqual(self._manifest(unfinished), before["unfinished"])
 
+        uninstall = self._run("uninstall")
+
+        self.assertNotEqual(uninstall.returncode, 0)
+        self.assertEqual(self._manifest(self.target), before["target"])
+        self.assertEqual(self._manifest(self.backup), before["backup"])
+        self.assertEqual(self._manifest(unfinished), before["unfinished"])
+
     def test_rollback_works_without_repository_source(self) -> None:
         self._write_tree(self.target, "current")
         self._write_tree(self.backup, "previous")
@@ -674,6 +782,49 @@ else:
                         second.start()
                         time.sleep(0.2)
                         self.assertEqual(entered, 1, "second mutator entered before first released lock")
+                    finally:
+                        release_first.set()
+                        first.join(timeout=5)
+                        if second.ident is not None:
+                            second.join(timeout=5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(sorted(results), [0, 0])
+
+    def test_uninstall_commands_are_serialized_by_uuid_lock(self) -> None:
+        self.target.parent.mkdir(parents=True)
+        module = self._load_tool_module()
+        entered = 0
+        entered_lock = threading.Lock()
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        results: list[int] = []
+
+        def fake_uninstall():
+            nonlocal entered
+            with entered_lock:
+                entered += 1
+                current = entered
+            if current == 1:
+                first_entered.set()
+                release_first.wait(timeout=5)
+            return {"ok": True, "action": "uninstall"}
+
+        def invoke() -> None:
+            results.append(module.main(["uninstall"]))
+
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            with mock.patch.object(module.os, "umask"):
+                with mock.patch.object(module, "uninstall", side_effect=fake_uninstall):
+                    first = threading.Thread(target=invoke)
+                    second = threading.Thread(target=invoke)
+                    first.start()
+                    try:
+                        self.assertTrue(first_entered.wait(timeout=2))
+                        second.start()
+                        time.sleep(0.2)
+                        self.assertEqual(entered, 1, "second uninstall entered before first released lock")
                     finally:
                         release_first.set()
                         first.join(timeout=5)
