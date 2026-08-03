@@ -15190,6 +15190,7 @@ def main_cli(argv: list[str]) -> int:
     sub.add_parser("release-status")
     sub.add_parser("watchdog-status")
     sub.add_parser("timeout-policy")
+    sub.add_parser("control-center")
     p_applet_status = sub.add_parser("applet-status")
     p_applet_status.add_argument("agents", nargs="*")
     p_applet_status.add_argument("--schema-version", type=int, default=1)
@@ -15606,6 +15607,10 @@ def main_cli(argv: list[str]) -> int:
             )
         if args.command == "timeout-policy":
             return print_json(call_validated_tool("master_timeout_policy", {}))
+        if args.command == "control-center":
+            from codex_master.control_center import run_control_center
+
+            return run_control_center([])
         if args.command == "applet-status":
             return print_json(
                 call_validated_tool(

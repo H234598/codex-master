@@ -17586,6 +17586,14 @@ class CliLifecycleTest(unittest.TestCase):
         mock_applet_action.assert_called_once_with("start", "a1", "cGF5bG9hZA.c2ln")
         self.assertNotIn("applet_action", {tool["name"] for tool in server_module.TOOLS})
 
+    @patch("codex_master.control_center.run_control_center", return_value=0)
+    def test_cli_control_center_routes_to_internal_gtk_frontend(self, mock_control_center) -> None:
+        result = main_cli(["control-center"])
+
+        self.assertEqual(result, 0)
+        mock_control_center.assert_called_once_with([])
+        self.assertNotIn("control_center", {tool["name"] for tool in server_module.TOOLS})
+
     @patch("codex_master.server.print_json")
     @patch("codex_master.server.call_tool", return_value={"results": [], "raw_output": "not_returned"})
     def test_cli_start_can_confirm_broad_selector(self, mock_call_tool, mock_print_json) -> None:
