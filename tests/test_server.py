@@ -4712,7 +4712,7 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(inventory.agent_ids, ())
             self.assertTrue(result["cleanup_pending"])
 
-    def test_fleet_registry_delete_releases_reservations_after_concurrent_snapshot(self) -> None:
+    def test_fleet_registry_delete_releases_reservations_before_old_descriptor_publish(self) -> None:
         from codex_master.fleet_service import FleetConflictError
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -4728,8 +4728,68 @@ class ServerHelpersTest(unittest.TestCase):
                 )
                 service = server_module.current_fleet_service()
                 real_commit = service.commit_snapshot
+                real_publish = server_module.publish_agent_inventory
+                released_before_publish = False
 
                 def concurrent_snapshot_then_conflict(*_args, **_kwargs):
+                    current = service.load()
+                    concurrent = type(current)(
+                        current.schema_version,
+                        current.generation + 1,
+                        current.accounts,
+                        current.series,
+                    )
+                    real_commit(concurrent, expected_generation=current.generation)
+                    raise FleetConflictError("generation_conflict")
+
+                def publish_after_release(inventory):
+                    nonlocal released_before_publish
+                    try:
+                        (pool / "d1").mkdir()
+                    except FileExistsError:
+                        pass
+                    else:
+                        released_before_publish = True
+                        (pool / "d1").rmdir()
+                    real_publish(inventory)
+
+                with patch.object(service, "commit_snapshot", side_effect=concurrent_snapshot_then_conflict), patch.object(
+                    server_module, "current_fleet_service", return_value=service
+                ), patch.object(
+                    server_module, "publish_agent_inventory", side_effect=publish_after_release
+                ):
+                    with self.assertRaisesRegex(AgentError, "fleet_registry_commit_diverged"):
+                        server_module.fleet_series_delete(
+                            prefix="d", expected_generation=2,
+                            confirmed_remove_ids=["d1"], yes=True,
+                        )
+                stored = service.load()
+                inventory = server_module.current_agent_inventory()
+
+            self.assertEqual(stored.generation, 3)
+            self.assertEqual(inventory.agents["d1"].model, "local")
+            self.assertTrue(released_before_publish)
+            self.assertFalse((pool / "d1").exists())
+
+    def test_fleet_registry_delete_does_not_publish_third_descriptor_after_releasing_reservation(self) -> None:
+        from codex_master.fleet_service import FleetConflictError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                    model="local", account_id=None, enabled=False, expected_generation=1,
+                )
+                service = server_module.current_fleet_service()
+                before = server_module.current_agent_inventory()
+                real_commit = service.commit_snapshot
+
+                def third_descriptor_then_conflict(*_args, **_kwargs):
                     current = service.load()
                     series = current.series[0]
                     concurrent_series = type(series)(
@@ -4751,7 +4811,7 @@ class ServerHelpersTest(unittest.TestCase):
                     real_commit(concurrent, expected_generation=current.generation)
                     raise FleetConflictError("generation_conflict")
 
-                with patch.object(service, "commit_snapshot", side_effect=concurrent_snapshot_then_conflict), patch.object(
+                with patch.object(service, "commit_snapshot", side_effect=third_descriptor_then_conflict), patch.object(
                     server_module, "current_fleet_service", return_value=service
                 ):
                     with self.assertRaisesRegex(AgentError, "fleet_registry_commit_diverged"):
@@ -4764,7 +4824,7 @@ class ServerHelpersTest(unittest.TestCase):
 
             self.assertEqual(stored.generation, 3)
             self.assertEqual(stored.series[0].display_name, "Concurrent D")
-            self.assertEqual(inventory.agents["d1"].label, "Concurrent D 1")
+            self.assertEqual(inventory.agents["d1"].label, before.agents["d1"].label)
             self.assertFalse((pool / "d1").exists())
 
     def test_fleet_registry_delete_releases_reservations_after_publish_failure(self) -> None:
@@ -4926,6 +4986,207 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(inventory.agent_ids, ("d1",))
             self.assertTrue((pool / "d1").is_dir())
 
+    def test_fleet_grow_quarantines_created_home_absent_from_authoritative_snapshot(self) -> None:
+        from codex_master.fleet_service import FleetConflictError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                    model="local", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                service = server_module.current_fleet_service()
+                real_commit = service.commit_snapshot
+
+                def concurrent_disable_then_conflict(*_args, **_kwargs):
+                    concurrent = server_module.plan_series_disable(
+                        service.load(),
+                        "d",
+                        expected_generation=2,
+                    )
+                    real_commit(concurrent, expected_generation=2)
+                    raise FleetConflictError("generation_conflict")
+
+                with patch.object(service, "commit_snapshot", side_effect=concurrent_disable_then_conflict), patch.object(
+                    server_module, "current_fleet_service", return_value=service
+                ):
+                    with self.assertRaisesRegex(AgentError, "fleet_registry_commit_diverged"):
+                        server_module.fleet_series_apply(
+                            prefix="d", count=2, runner="codex_cli", provider="ollama_local",
+                            model="local", account_id=None, expected_generation=2,
+                            codex_executable=executable,
+                        )
+
+                stored = service.load()
+                inventory = server_module.current_agent_inventory()
+                quarantines = [
+                    path
+                    for path in pool.iterdir()
+                    if path.name.startswith(server_module.FLEET_TOMBSTONE_PREFIX)
+                ]
+
+            self.assertEqual(stored.generation, 3)
+            self.assertEqual(stored.series[0].count, 1)
+            self.assertFalse(stored.series[0].enabled)
+            self.assertEqual(inventory.agent_ids, ("d1",))
+            self.assertFalse((pool / "d2").exists())
+            self.assertEqual(len(quarantines), 1)
+            self.assertEqual(
+                json.loads(
+                    (quarantines[0] / server_module.FLEET_AGENT_MARKER_FILE).read_text(
+                        encoding="utf-8"
+                    )
+                )["agent_id"],
+                "d2",
+            )
+
+    def test_fleet_managed_update_restores_old_descriptor_after_divergent_commit(self) -> None:
+        from codex_master.fleet_service import FleetConflictError
+
+        def home_snapshot(home: Path) -> dict[str, tuple[int, int, int, bytes]]:
+            result: dict[str, tuple[int, int, int, bytes]] = {}
+            for path in (home, *sorted(home.rglob("*"))):
+                current = path.stat()
+                result[path.relative_to(home).as_posix()] = (
+                    current.st_ino,
+                    current.st_mtime_ns,
+                    stat.S_IMODE(current.st_mode),
+                    path.read_bytes() if path.is_file() else b"",
+                )
+            return result
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None), patch.object(
+                server_module, "agent_lease_status", return_value={"state": "unclaimed"}
+            ), patch.object(server_module, "run_tmux", return_value=stopped), patch.object(
+                server_module, "pool_home_processes", return_value=[]
+            ):
+                server_module.fleet_series_apply(
+                    prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                    model="old", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                server_module.fleet_series_disable(prefix="d", expected_generation=2)
+                before = home_snapshot(pool / "d1")
+                service = server_module.current_fleet_service()
+                real_commit = service.commit_snapshot
+
+                def old_descriptor_then_conflict(*_args, **_kwargs):
+                    current = service.load()
+                    concurrent = type(current)(
+                        current.schema_version,
+                        current.generation + 1,
+                        current.accounts,
+                        current.series,
+                    )
+                    real_commit(concurrent, expected_generation=current.generation)
+                    raise FleetConflictError("generation_conflict")
+
+                with patch.object(service, "commit_snapshot", side_effect=old_descriptor_then_conflict), patch.object(
+                    server_module, "current_fleet_service", return_value=service
+                ):
+                    with self.assertRaisesRegex(AgentError, "fleet_registry_commit_diverged"):
+                        server_module.fleet_series_apply(
+                            prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                            model="new", account_id=None, enabled=False,
+                            expected_generation=3, codex_executable=executable,
+                        )
+
+                stored = service.load()
+                inventory = server_module.current_agent_inventory()
+                after = home_snapshot(pool / "d1")
+
+            self.assertEqual(stored.generation, 4)
+            self.assertEqual(stored.series[0].model, "old")
+            self.assertEqual(inventory.agents["d1"].model, "old")
+            self.assertEqual(after, before)
+
+    def test_fleet_managed_update_keeps_new_descriptor_and_old_backup_after_divergence(self) -> None:
+        from codex_master.fleet_service import FleetConflictError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None), patch.object(
+                server_module, "agent_lease_status", return_value={"state": "unclaimed"}
+            ), patch.object(server_module, "run_tmux", return_value=stopped), patch.object(
+                server_module, "pool_home_processes", return_value=[]
+            ):
+                server_module.fleet_series_apply(
+                    prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                    model="old", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                server_module.fleet_series_disable(prefix="d", expected_generation=2)
+                old_home_ino = (pool / "d1").stat().st_ino
+                service = server_module.current_fleet_service()
+                real_commit = service.commit_snapshot
+
+                def new_descriptor_then_conflict(planned, **_kwargs):
+                    series = planned.series[0]
+                    extra = type(series)(
+                        "e", "E Series", 1, series.runner, series.provider,
+                        "extra", series.account_id, False,
+                    )
+                    concurrent = type(planned)(
+                        planned.schema_version,
+                        planned.generation,
+                        planned.accounts,
+                        (series, extra),
+                    )
+                    real_commit(concurrent, expected_generation=3)
+                    raise FleetConflictError("generation_conflict")
+
+                with patch.object(service, "commit_snapshot", side_effect=new_descriptor_then_conflict), patch.object(
+                    server_module, "current_fleet_service", return_value=service
+                ):
+                    with self.assertRaisesRegex(AgentError, "fleet_registry_commit_diverged"):
+                        server_module.fleet_series_apply(
+                            prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                            model="new", account_id=None, enabled=False,
+                            expected_generation=3, codex_executable=executable,
+                        )
+
+                stored = service.load()
+                inventory = server_module.current_agent_inventory()
+                backups = [
+                    path
+                    for path in pool.iterdir()
+                    if path.name.startswith(f"{server_module.FLEET_TOMBSTONE_PREFIX}backup-")
+                ]
+
+            self.assertEqual(stored.generation, 4)
+            self.assertEqual(stored.series[0].model, "new")
+            self.assertEqual(inventory.agents["d1"].model, "new")
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].stat().st_ino, old_home_ino)
+            self.assertNotEqual((pool / "d1").stat().st_ino, old_home_ino)
+
     def test_fleet_delete_persist_then_raise_keeps_authoritative_registry_and_publish(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4961,7 +5222,7 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(inventory.agent_ids, ())
             self.assertFalse((pool / "d1").exists())
 
-    def test_fleet_shrink_reconciles_staged_home_to_concurrent_authoritative_disable(self) -> None:
+    def test_fleet_shrink_restores_staged_home_for_same_old_authoritative_descriptor(self) -> None:
         from codex_master.fleet_service import FleetConflictError
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -4989,6 +5250,68 @@ class ServerHelpersTest(unittest.TestCase):
                 service = server_module.current_fleet_service()
                 real_commit = service.commit_snapshot
 
+                def concurrent_old_descriptor_then_conflict(*_args, **_kwargs):
+                    current = service.load()
+                    concurrent = type(current)(
+                        current.schema_version,
+                        current.generation + 1,
+                        current.accounts,
+                        current.series,
+                    )
+                    real_commit(concurrent, expected_generation=current.generation)
+                    raise FleetConflictError("generation_conflict")
+
+                with patch.object(service, "commit_snapshot", side_effect=concurrent_old_descriptor_then_conflict), patch.object(
+                    server_module, "current_fleet_service", return_value=service
+                ):
+                    with self.assertRaisesRegex(AgentError, "fleet_registry_commit_diverged"):
+                        server_module.fleet_series_apply(
+                            prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                            model="local", account_id=None, expected_generation=2,
+                            confirmed_remove_ids=["d2"], codex_executable=executable,
+                        )
+
+                stored = service.load()
+                inventory = server_module.current_agent_inventory()
+
+            self.assertEqual(stored.generation, 3)
+            self.assertEqual(stored.series[0].count, 2)
+            self.assertTrue(stored.series[0].enabled)
+            self.assertEqual(inventory.agent_ids, ("d1", "d2"))
+            self.assertTrue(inventory.agents["d2"].enabled)
+            self.assertEqual((pool / "d2").stat().st_ino, d2_stat.st_ino)
+            self.assertEqual(
+                (pool / "d2" / server_module.FLEET_AGENT_MARKER_FILE).read_bytes(),
+                d2_marker,
+            )
+
+    def test_fleet_shrink_does_not_restore_or_publish_different_authoritative_descriptor(self) -> None:
+        from codex_master.fleet_service import FleetConflictError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None), patch.object(
+                server_module, "agent_lease_status", return_value={"state": "unclaimed"}
+            ), patch.object(server_module, "run_tmux", return_value=stopped), patch.object(
+                server_module, "pool_home_processes", return_value=[]
+            ):
+                server_module.fleet_series_apply(
+                    prefix="d", count=2, runner="codex_cli", provider="ollama_local",
+                    model="local", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                d2_stat = (pool / "d2").stat()
+                service = server_module.current_fleet_service()
+                real_commit = service.commit_snapshot
+
                 def concurrent_disable_then_conflict(*_args, **_kwargs):
                     concurrent = server_module.plan_series_disable(
                         service.load(),
@@ -5010,17 +5333,18 @@ class ServerHelpersTest(unittest.TestCase):
 
                 stored = service.load()
                 inventory = server_module.current_agent_inventory()
+                tombstones = [
+                    path
+                    for path in pool.iterdir()
+                    if path.name.startswith(server_module.FLEET_TOMBSTONE_PREFIX)
+                ]
 
             self.assertEqual(stored.generation, 3)
-            self.assertEqual(stored.series[0].count, 2)
             self.assertFalse(stored.series[0].enabled)
-            self.assertEqual(inventory.agent_ids, ("d1", "d2"))
-            self.assertFalse(inventory.agents["d2"].enabled)
-            self.assertEqual((pool / "d2").stat().st_ino, d2_stat.st_ino)
-            self.assertEqual(
-                (pool / "d2" / server_module.FLEET_AGENT_MARKER_FILE).read_bytes(),
-                d2_marker,
-            )
+            self.assertTrue(inventory.agents["d2"].enabled)
+            self.assertFalse((pool / "d2").exists())
+            self.assertEqual(len(tombstones), 1)
+            self.assertEqual(tombstones[0].stat().st_ino, d2_stat.st_ino)
 
     def test_fleet_post_cas_cleanup_oserror_becomes_cleanup_pending(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

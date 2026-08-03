@@ -15017,6 +15017,29 @@ def _fleet_reconcile_commit_exception(
     return "diverged", reloaded
 
 
+def _fleet_descriptor_reconciliation_states(
+    current: FleetSnapshot,
+    planned: FleetSnapshot,
+    authoritative: FleetSnapshot,
+    agent_ids: set[str],
+) -> dict[str, str]:
+    old_agents = build_inventory(current, AGENT_POOL_ROOT).agents
+    new_agents = build_inventory(planned, AGENT_POOL_ROOT).agents
+    authoritative_agents = build_inventory(authoritative, AGENT_POOL_ROOT).agents
+    states: dict[str, str] = {}
+    for agent_id in agent_ids:
+        authoritative_agent = authoritative_agents.get(agent_id)
+        if authoritative_agent is None:
+            states[agent_id] = "absent"
+        elif authoritative_agent == old_agents.get(agent_id):
+            states[agent_id] = "old"
+        elif authoritative_agent == new_agents.get(agent_id):
+            states[agent_id] = "new"
+        else:
+            states[agent_id] = "unknown"
+    return states
+
+
 def _fleet_tmux_state(session: str) -> str:
     try:
         result = run_tmux(["has-session", "-t", session], check=False)
@@ -15281,16 +15304,6 @@ def _fleet_restore_tombstones(staged: list[dict[str, Any]]) -> bool:
     return True
 
 
-def _fleet_restore_registered_tombstones(
-    staged: list[dict[str, Any]],
-    authoritative: FleetSnapshot,
-) -> bool:
-    registered_ids = set(build_inventory(authoritative, AGENT_POOL_ROOT).agent_ids)
-    return _fleet_restore_tombstones(
-        [item for item in staged if item["agent"].agent_id in registered_ids]
-    )
-
-
 def _fleet_stage_tombstones(
     inventory: InventorySnapshot,
     agent_ids_to_remove: list[str],
@@ -15532,8 +15545,14 @@ def _fleet_commit_staged_removal(
             _fleet_publish_stored(service, reloaded)
             raise AgentError("fleet_registry_commit_failed_after_cas") from None
         if state == "diverged":
-            if not _fleet_restore_registered_tombstones(staged, reloaded):
-                raise AgentError("fleet_tombstone_rollback_diverged") from None
+            reconciled = _fleet_reconcile_divergent_materialization(
+                current,
+                planned,
+                reloaded,
+                staged=staged,
+            )
+            if not reconciled:
+                raise AgentError("fleet_registry_commit_diverged") from None
             _fleet_publish_stored(service, reloaded)
             raise AgentError("fleet_registry_commit_diverged") from None
         if not _fleet_restore_tombstones(staged):
@@ -15674,6 +15693,74 @@ def _fleet_restore_managed_updates(backups: list[dict[str, Any]]) -> bool:
     except (AgentError, OSError):
         return False
     return True
+
+
+def _fleet_created_homes_match(
+    created: list[tuple[str, os.stat_result, dict[str, Any]]],
+) -> bool:
+    if not created:
+        return True
+    try:
+        with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+            AGENT_POOL_ROOT,
+            ensure=False,
+            error_text="fleet_create_rollback_diverged",
+            require_private=True,
+        ) as root:
+            for agent_id, expected_home, artifacts in created:
+                current = _fleet_verify_home(
+                    root,
+                    agent_id,
+                    artifacts,
+                    exact_contents=True,
+                )
+                if not source_identity_matches(current, expected_home):
+                    return False
+    except (AgentError, OSError):
+        return False
+    return True
+
+
+def _fleet_reconcile_divergent_materialization(
+    current: FleetSnapshot,
+    planned: FleetSnapshot,
+    authoritative: FleetSnapshot,
+    *,
+    created: list[tuple[str, os.stat_result, dict[str, Any]]] | None = None,
+    backups: list[dict[str, Any]] | None = None,
+    staged: list[dict[str, Any]] | None = None,
+) -> bool:
+    created = created or []
+    backups = backups or []
+    staged = staged or []
+    agent_ids = {item[0] for item in created}
+    agent_ids.update(item["old_agent"].agent_id for item in backups)
+    agent_ids.update(item["agent"].agent_id for item in staged)
+    states = _fleet_descriptor_reconciliation_states(
+        current,
+        planned,
+        authoritative,
+        agent_ids,
+    )
+    quarantine_created = [
+        item for item in created if states[item[0]] in {"absent", "old"}
+    ]
+    keep_created = [item for item in created if states[item[0]] == "new"]
+    restore_backups = [
+        item for item in backups if states[item["old_agent"].agent_id] == "old"
+    ]
+    restore_staged = [
+        item for item in staged if states[item["agent"].agent_id] == "old"
+    ]
+    if quarantine_created and not _fleet_rollback_created(quarantine_created):
+        raise AgentError("fleet_create_rollback_diverged")
+    if keep_created and not _fleet_created_homes_match(keep_created):
+        raise AgentError("fleet_create_rollback_diverged")
+    if restore_backups and not _fleet_restore_managed_updates(restore_backups):
+        raise AgentError("fleet_update_rollback_diverged")
+    if restore_staged and not _fleet_restore_tombstones(restore_staged):
+        raise AgentError("fleet_tombstone_rollback_diverged")
+    return all(state != "unknown" for state in states.values())
 
 
 def _fleet_apply_managed_update(
@@ -15869,8 +15956,16 @@ def _fleet_apply_managed_update(
                     raise AgentError("fleet_executable_changed_after_cas") from None
                 raise AgentError("fleet_registry_commit_failed_after_cas") from None
             if state == "diverged":
-                if staged and not _fleet_restore_registered_tombstones(staged, reloaded):
-                    raise AgentError("fleet_tombstone_rollback_diverged") from None
+                reconciled = _fleet_reconcile_divergent_materialization(
+                    current,
+                    planned,
+                    reloaded,
+                    created=created,
+                    backups=backups,
+                    staged=staged,
+                )
+                if not reconciled:
+                    raise AgentError("fleet_registry_commit_diverged") from None
                 _fleet_publish_stored(service, reloaded)
                 raise AgentError("fleet_registry_commit_diverged") from None
             if not rollback():
@@ -16092,8 +16187,15 @@ def fleet_series_apply(
                         raise AgentError("fleet_executable_changed_after_cas") from None
                 raise AgentError("fleet_registry_commit_failed_after_cas") from None
             if state == "diverged":
-                if staged and not _fleet_restore_registered_tombstones(staged, reloaded):
-                    raise AgentError("fleet_tombstone_rollback_diverged") from None
+                reconciled = _fleet_reconcile_divergent_materialization(
+                    current,
+                    planned,
+                    reloaded,
+                    created=created,
+                    staged=staged,
+                )
+                if not reconciled:
+                    raise AgentError("fleet_registry_commit_diverged") from None
                 _fleet_publish_stored(service, reloaded)
                 raise AgentError("fleet_registry_commit_diverged") from None
             clean = _fleet_rollback_created(created)
@@ -16219,6 +16321,23 @@ def fleet_series_delete(
                     _fleet_publish_stored(service, reloaded)
                     raise AgentError("fleet_registry_commit_failed_after_cas") from None
                 if state == "diverged":
+                    descriptor_states = _fleet_descriptor_reconciliation_states(
+                        current,
+                        planned,
+                        reloaded,
+                        set(expected_ids),
+                    )
+                    reservations_released = _fleet_release_reservations(reservations)
+                    reservations.clear()
+                    if not reservations_released:
+                        raise AgentError(
+                            "fleet_registry_delete_reservation_diverged"
+                        ) from None
+                    if any(
+                        descriptor_state == "unknown"
+                        for descriptor_state in descriptor_states.values()
+                    ):
+                        raise AgentError("fleet_registry_commit_diverged") from None
                     _fleet_publish_stored(service, reloaded)
                     raise AgentError("fleet_registry_commit_diverged") from None
                 if isinstance(exc, FleetConflictError):
