@@ -1012,9 +1012,7 @@ FlottenmanagementApplet.prototype = {
                 if (connection.target && typeof connection.target.disconnect === "function") {
                     connection.target.disconnect(connection.id);
                 }
-            } catch (error) {
-                this._logCleanupError(error);
-            }
+            } catch (_error) {}
         }
         return true;
     },

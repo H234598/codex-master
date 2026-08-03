@@ -678,6 +678,8 @@ test("signal connection failures do not escape or retain invalid handles", () =>
 
 test("removal drops signal handles Cinnamon already disconnected", () => {
   const fixture = loadApplet();
+  let logCalls = 0;
+  fixture.setGlobalLogger(() => { logCalls += 1; });
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
 
   for (const connection of applet._signalConnections) {
@@ -691,6 +693,7 @@ test("removal drops signal handles Cinnamon already disconnected", () => {
   assert.equal(applet._signalConnections.length, 0);
   assert.equal(applet.menu, null);
   assert.equal(applet.menuManager, null);
+  assert.equal(logCalls, 0);
 });
 
 test("single removal retries transient menu cleanup failures", () => {
