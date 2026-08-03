@@ -60,6 +60,50 @@ class NativeBeeHookTest(unittest.TestCase):
                 {"schema_version": 1, "agents": []},
             )
 
+    def test_subagent_start_stores_only_allowlisted_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_root = Path(tmpdir) / "state"
+            transcript_secret = "/tmp/SECRET_TRANSCRIPT_PATH.jsonl"
+            message_secret = "SECRET_LAST_ASSISTANT_MESSAGE"
+            completed = self.run_hook(
+                json.dumps(
+                    {
+                        "hook_event_name": "SubagentStart",
+                        "session_id": "thr_parent",
+                        "agent_id": "agent_1",
+                        "agent_type": "worker",
+                        "agent_transcript_path": transcript_secret,
+                        "last_assistant_message": message_secret,
+                    }
+                ),
+                state_root=state_root,
+            )
+
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(completed.stdout, "")
+            self.assertEqual(completed.stderr, "")
+            state_text = (state_root / "native-agents.json").read_text(encoding="utf-8")
+            state = json.loads(state_text)
+            self.assertEqual(state["schema_version"], 1)
+            self.assertEqual(len(state["agents"]), 1)
+            row = state["agents"][0]
+            self.assertEqual(
+                {key: value for key, value in row.items() if key != "updated_at"},
+                {
+                    "session_id": "thr_parent",
+                    "agent_id": "agent_1",
+                    "agent_type": "worker",
+                    "activity_state": "active",
+                },
+            )
+            self.assertIsInstance(row["updated_at"], (int, float))
+            self.assertNotIn("agent_transcript_path", row)
+            self.assertNotIn("last_assistant_message", row)
+            self.assertNotIn('"agent_transcript_path"', state_text)
+            self.assertNotIn('"last_assistant_message"', state_text)
+            self.assertNotIn(transcript_secret, state_text)
+            self.assertNotIn(message_secret, state_text)
+
     def test_subagent_stop_returns_json_object_line(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             completed = self.run_hook(
@@ -76,6 +120,35 @@ class NativeBeeHookTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 0)
             self.assertEqual(completed.stdout, "{}\n")
             self.assertEqual(completed.stderr, "")
+
+    def test_session_end_marks_seeded_agent_unconfirmed_silently(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_root = Path(tmpdir) / "state"
+            started = self.run_hook(
+                json.dumps(
+                    {
+                        "hook_event_name": "SubagentStart",
+                        "session_id": "thr_parent",
+                        "agent_id": "agent_1",
+                        "agent_type": "worker",
+                    }
+                ),
+                state_root=state_root,
+            )
+            completed = self.run_hook(
+                json.dumps({"hook_event_name": "SessionEnd", "session_id": "thr_parent"}),
+                state_root=state_root,
+            )
+
+            self.assertEqual(started.returncode, 0)
+            self.assertEqual(started.stdout, "")
+            self.assertEqual(started.stderr, "")
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(completed.stdout, "")
+            self.assertEqual(completed.stderr, "")
+            state = json.loads((state_root / "native-agents.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(state["agents"]), 1)
+            self.assertEqual(state["agents"][0]["activity_state"], "unconfirmed")
 
     def test_invalid_and_oversized_json_are_silent(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -115,4 +188,3 @@ class NativeBeeHookTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 0)
             self.assertEqual(completed.stdout, "")
             self.assertEqual(completed.stderr, "")
-
