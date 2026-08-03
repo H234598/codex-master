@@ -9,6 +9,7 @@ from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+from unicodedata import category
 
 
 MAX_DOCUMENT_BYTES = 1024 * 1024
@@ -160,7 +161,7 @@ def _enum(enum: type[Enum], value: object, code: str) -> Any:
 def _text(value: object, *, minimum: int, maximum: int, code: str) -> str:
     if not isinstance(value, str) or not minimum <= len(value) <= maximum:
         _fail(code)
-    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+    if any(category(character) == "Cc" for character in value):
         _fail(code)
     return value
 
@@ -255,9 +256,10 @@ def _series(value: object) -> FleetSeries:
 def normalize_fleet_document(raw: object) -> FleetSnapshot:
     try:
         encoded = json.dumps(raw, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    except (TypeError, ValueError):
+        encoded_bytes = encoded.encode("utf-8")
+    except (TypeError, UnicodeEncodeError, ValueError):
         _fail("invalid_document")
-    if len(encoded.encode("utf-8")) > MAX_DOCUMENT_BYTES:
+    if len(encoded_bytes) > MAX_DOCUMENT_BYTES:
         _fail("invalid_document")
     document = _mapping(raw, "invalid_document")
     if set(document) != _ROOT_FIELDS or document.get("schema_version") != 1:

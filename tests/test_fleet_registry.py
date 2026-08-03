@@ -73,6 +73,26 @@ def test_normalization_rejects_not_required_secret_state_for_api_account() -> No
     assert caught.value.code == "invalid_account"
 
 
+@pytest.mark.parametrize(
+    ("location", "field", "value", "code"),
+    [
+        ("accounts", "label", "bad\u0085label", "invalid_account"),
+        ("series", "model", "bad\u009fmodel", "invalid_series"),
+        ("accounts", "label", "\ud800", "invalid_document"),
+    ],
+)
+def test_normalization_rejects_c1_controls_and_unpaired_surrogates(
+    location: str, field: str, value: str, code: str
+) -> None:
+    document = valid_document()
+    document[location][0][field] = value
+
+    with pytest.raises(FleetValidationError) as caught:
+        normalize_fleet_document(document)
+
+    assert caught.value.code == code
+
+
 @pytest.mark.parametrize(("change", "code"), [
     (lambda document: document["series"].append(deepcopy(document["series"][0])), "invalid_series"),
     (lambda document: document["series"][0].update(prefix="aa"), "invalid_series"),

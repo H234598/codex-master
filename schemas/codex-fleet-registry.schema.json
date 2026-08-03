@@ -24,7 +24,7 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 120,
-      "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+      "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"
     },
     "timestamp": {
       "type": ["string", "null"],
@@ -66,7 +66,7 @@
         "count": {"type": "integer", "minimum": 1, "maximum": 100},
         "runner": {"enum": ["codex_cli", "gemini_cli"]},
         "provider": {"enum": ["openai_chatgpt", "openai_api", "gemini_api", "ollama_local", "huggingface_inference"]},
-        "model": {"type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[^\\u0000-\\u001F\\u007F]+$"},
+        "model": {"type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"},
         "account_id": {"type": ["string", "null"], "pattern": "^[a-z][a-z0-9-]{0,63}$"},
         "enabled": {"type": "boolean"}
       },
