@@ -159,9 +159,20 @@ MAX_PLUGIN_CACHE_RETAINED_VERSIONS = 5
 MAX_SELECTOR_POLICY_BYTES = 4096
 MAX_PAGED_OFFSET = 10_000_000
 PLUGIN_CACHE_ALLOWED_FILES = (".app.json", ".mcp.json", "README.md", "codex-agent-pool.json", "pyproject.toml")
-PLUGIN_CACHE_ALLOWED_DIRS = (".codex-plugin", "bin", "docs", "examples", "schemas", "scripts", "skills", "src", "systemd")
+PLUGIN_CACHE_ALLOWED_DIRS = (
+    ".codex-plugin",
+    "bin",
+    "docs",
+    "examples",
+    "hooks",
+    "schemas",
+    "scripts",
+    "skills",
+    "src",
+    "systemd",
+)
 PLUGIN_CACHE_OPTIONAL_FILES = ("codex-agent-pool.json",)
-PLUGIN_CACHE_OPTIONAL_DIRS = ("docs", "examples", "schemas", "scripts")
+PLUGIN_CACHE_OPTIONAL_DIRS = ("docs", "examples", "hooks", "schemas", "scripts")
 PLUGIN_CACHE_EXCLUDED_NAMES = (".git", ".pytest_cache", ".mypy_cache", ".ruff_cache", "__pycache__")
 PLUGIN_CACHE_EXCLUDED_SUFFIXES = (".pyc", ".pyo", ".swp", ".swo", ".tmp", ".bak", ".orig", ".rej", "~")
 COMMAND_TIMEOUT_RETURN_CODE = 124
@@ -2566,7 +2577,11 @@ def record_native_agent_event(payload: Any, *, now: float | None = None) -> None
     agent_type = payload.get("agent_type")
     if not _validate_native_agent_identifier(session_id, NATIVE_AGENT_ID_RE):
         return
-    if event_name not in {"SubagentStart", "SubagentStop", "SessionEnd"}:
+    if event_name not in {"SessionStart", "SubagentStart", "SubagentStop", "SessionEnd"}:
+        return
+    if event_name == "SessionStart":
+        with native_agent_registry_lock():
+            _write_native_agent_registry(_native_agent_registry_payload())
         return
     if event_name != "SessionEnd" and not _validate_native_agent_identifier(agent_id, NATIVE_AGENT_ID_RE):
         return

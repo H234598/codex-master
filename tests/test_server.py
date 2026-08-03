@@ -2821,6 +2821,7 @@ class ServerHelpersTest(unittest.TestCase):
             (root / "examples").mkdir()
             (root / "schemas").mkdir()
             (root / "scripts").mkdir()
+            (root / "hooks").mkdir()
             (root / "skills" / "codex-master-fleet").mkdir(parents=True)
             (root / "systemd" / "user").mkdir(parents=True)
             (root / "src" / "codex_master" / "__pycache__").mkdir(parents=True)
@@ -2841,6 +2842,22 @@ class ServerHelpersTest(unittest.TestCase):
             (root / "examples" / "codex-agent-pool.json").write_text("{}", encoding="utf-8")
             (root / "schemas" / "codex-agent-pool.schema.json").write_text("{}", encoding="utf-8")
             (root / "scripts" / "install-agent-pool").write_text("#!/bin/sh\n", encoding="utf-8")
+            (root / "hooks" / "hooks.json").write_text(
+                json.dumps(
+                    {
+                        "hooks": [
+                            {
+                                "event": "SessionStart",
+                                "type": "command",
+                                "timeout": 1,
+                                "command": "python3 $PLUGIN_ROOT/hooks/native_bee_event.py",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "hooks" / "native_bee_event.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
             (root / "skills" / "codex-master-fleet" / "SKILL.md").write_text("skill", encoding="utf-8")
             (root / "src" / "codex_master" / "server.py").write_text("print('ok')\n", encoding="utf-8")
             (root / "src" / "codex_master" / "__pycache__" / "server.pyc").write_bytes(b"cache")
@@ -2864,6 +2881,8 @@ class ServerHelpersTest(unittest.TestCase):
                 "bin_executable": os.access(entry / "bin" / "codex-master-mcp", os.X_OK),
                 "docs": (entry / "docs" / "agent-pool.md").exists(),
                 "examples": (entry / "examples" / "codex-agent-pool.json").exists(),
+                "hooks": (entry / "hooks" / "hooks.json").exists(),
+                "hook_script": (entry / "hooks" / "native_bee_event.py").exists(),
                 "schemas": (entry / "schemas" / "codex-agent-pool.schema.json").exists(),
                 "scripts": (entry / "scripts" / "install-agent-pool").exists(),
                 "skill": (entry / "skills" / "codex-master-fleet" / "SKILL.md").exists(),
@@ -2889,6 +2908,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(copied_state["bin_executable"])
         self.assertTrue(copied_state["docs"])
         self.assertTrue(copied_state["examples"])
+        self.assertTrue(copied_state["hooks"])
+        self.assertTrue(copied_state["hook_script"])
         self.assertTrue(copied_state["schemas"])
         self.assertTrue(copied_state["scripts"])
         self.assertTrue(copied_state["skill"])
@@ -20920,6 +20941,25 @@ class NativeAgentRegistryTest(unittest.TestCase):
                 server_module.record_native_agent_event({"hook_event_name": "SessionEnd", "session_id": "s-parent"}, now=1_008.0)
                 status = server_module.native_agent_status(now=1_008.0)
                 self.assertEqual({entry["activity_state"] for entry in status["agents"]}, {"unconfirmed"})
+
+    def test_session_start_initializes_empty_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
+                server_module.record_native_agent_event(
+                    {"hook_event_name": "SessionStart", "session_id": "thr_parent"},
+                    now=1_000.0,
+                )
+
+                self.assertEqual(
+                    json.loads(record_path.read_text(encoding="utf-8")),
+                    {"schema_version": 1, "agents": []},
+                )
 
     def test_status_marks_stale_and_prunes_retention(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

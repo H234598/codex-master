@@ -20,6 +20,7 @@
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "apps": "./.app.json",
+  "hooks": "./hooks/hooks.json",
   "interface": {
     "displayName": "Codex Master",
     "shortDescription": "Control isolated Codex Agentinnen with a local Masterjet MCP.",

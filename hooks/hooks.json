@@ -1,0 +1,28 @@
+{
+  "hooks": [
+    {
+      "event": "SessionStart",
+      "type": "command",
+      "timeout": 1,
+      "command": "python3 $PLUGIN_ROOT/hooks/native_bee_event.py"
+    },
+    {
+      "event": "SubagentStart",
+      "type": "command",
+      "timeout": 1,
+      "command": "python3 $PLUGIN_ROOT/hooks/native_bee_event.py"
+    },
+    {
+      "event": "SubagentStop",
+      "type": "command",
+      "timeout": 1,
+      "command": "python3 $PLUGIN_ROOT/hooks/native_bee_event.py"
+    },
+    {
+      "event": "SessionEnd",
+      "type": "command",
+      "timeout": 1,
+      "command": "python3 $PLUGIN_ROOT/hooks/native_bee_event.py"
+    }
+  ]
+}
