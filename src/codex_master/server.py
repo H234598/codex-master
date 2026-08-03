@@ -12,6 +12,7 @@ import base64
 import contextlib
 import contextvars
 import datetime as _dt
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -31,6 +32,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from codex_master import __version__
+from codex_master.fleet_service import FleetPaths, FleetPrivateIO
 
 
 STATE_ROOT = Path(
@@ -2746,6 +2748,26 @@ def read_private_regular_text(path: Path, max_bytes: int, error_text: str) -> st
         raise AgentError(error_text) from exc
 
 
+def _fleet_error_is_missing(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, OSError) and current.errno == errno.ENOENT:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def fleet_read_optional_private_text(path: Path, max_bytes: int, error_text: str) -> str | None:
+    try:
+        return read_private_regular_text(path, max_bytes, error_text)
+    except AgentError as exc:
+        if _fleet_error_is_missing(exc):
+            return None
+        raise
+
+
 def replace_private_bytes(
     path: Path,
     data: bytes,
@@ -2826,6 +2848,33 @@ def replace_private_bytes(
                 os.unlink(tmp_name, dir_fd=parent_fd)
         if parent_fd >= 0:
             os.close(parent_fd)
+
+
+def _fleet_replace_private_bytes(path: Path, data: bytes, mode: int) -> None:
+    error_text = "could_not_replace_fleet_private_file"
+    parent_stat = ensure_real_parent(path, error_text)
+    try:
+        existing_stat = path.lstat()
+    except FileNotFoundError:
+        existing_stat = None
+    except OSError as exc:
+        raise AgentError(error_text) from exc
+    if existing_stat is not None and (
+        not stat_module.S_ISREG(existing_stat.st_mode)
+        or getattr(existing_stat, "st_nlink", 1) > 1
+    ):
+        raise AgentError(error_text)
+    replace_private_bytes(
+        path,
+        data,
+        mode=mode,
+        expected_parent_stat=parent_stat,
+        expected_existing_stat=existing_stat,
+    )
+
+
+def _fleet_replace_private_text(path: Path, text: str) -> None:
+    _fleet_replace_private_bytes(path, text.encode("utf-8"), 0o600)
 
 
 def write_private_new_bytes(
@@ -2958,6 +3007,48 @@ _PLUGIN_CACHE_LOCK_HELD: contextvars.ContextVar[bool] = contextvars.ContextVar(
 _POOL_ROOT_LOCK_STACK: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
     "codex_master_pool_root_lock_stack", default=()
 )
+_FLEET_REGISTRY_LOCK_STACK: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "codex_master_fleet_registry_lock_stack", default=()
+)
+
+
+@contextlib.contextmanager
+def fleet_registry_lock(lock_path: Path) -> Any:
+    lock_key = str(lock_path.absolute())
+    held_locks = _FLEET_REGISTRY_LOCK_STACK.get()
+    if lock_key in held_locks:
+        yield
+        return
+    with open_private_regular_update(lock_path) as fh:
+        lock_acquired = False
+        token = None
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            lock_acquired = True
+            token = _FLEET_REGISTRY_LOCK_STACK.set((*held_locks, lock_key))
+            yield
+        except OSError as exc:
+            raise AgentError("could_not_acquire_fleet_registry_lock") from exc
+        finally:
+            if token is not None:
+                _FLEET_REGISTRY_LOCK_STACK.reset(token)
+            if lock_acquired:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+
+
+def build_fleet_private_io(paths: FleetPaths) -> FleetPrivateIO:
+    return FleetPrivateIO(
+        ensure_dir=ensure_private_dir,
+        read_text=fleet_read_optional_private_text,
+        replace_text=_fleet_replace_private_text,
+        read_bytes=fleet_read_optional_private_bytes,
+        replace_bytes=_fleet_replace_private_bytes,
+        lock=lambda: fleet_registry_lock(paths.lock),
+        utc_now=lambda: _dt.datetime.now(_dt.timezone.utc),
+    )
 
 
 @contextlib.contextmanager
@@ -13909,6 +14000,15 @@ def pool_read_private_bytes(path: Path, max_bytes: int, error_text: str) -> byte
     if len(data) > max_bytes:
         raise AgentError(error_text)
     return data
+
+
+def fleet_read_optional_private_bytes(path: Path, max_bytes: int, error_text: str) -> bytes | None:
+    try:
+        return pool_read_private_bytes(path, max_bytes, error_text)
+    except AgentError as exc:
+        if _fleet_error_is_missing(exc):
+            return None
+        raise
 
 
 def pool_private_text_matches(path: Path, expected: str, max_bytes: int) -> bool:
