@@ -1195,11 +1195,11 @@ def agent_ids(agent: str) -> list[str]:
     return [canonical_agent_id(normalized)]
 
 
-def normalize_applet_agents(agents: Any) -> list[str]:
+def normalize_applet_agents(agents: Any, *, allow_empty: bool = False) -> list[str]:
     if not isinstance(agents, list):
         raise AgentError("applet_agents must be a list")
     normalized_agents = agents
-    if not normalized_agents:
+    if not normalized_agents and not allow_empty:
         raise AgentError("applet_agents must contain 1 to 6 entries")
     if len(normalized_agents) > MAX_APPLET_AGENTS:
         raise AgentError("applet_agents list has at most 6 entries")
@@ -1237,18 +1237,49 @@ def pane_pid_from_text(text: str) -> int | None:
     return value if value > 0 and text == str(value) else None
 
 
-def applet_agent_observation(agent: str, *, deadline: float) -> dict[str, Any]:
+def managed_applet_inventory() -> dict[str, Any]:
+    inventory = run_tmux(
+        ["list-sessions", "-F", "#{session_name}"],
+        check=False,
+        timeout=APPLET_TMUX_TIMEOUT_SECONDS,
+    )
+    if inventory.returncode != 0:
+        raise AgentError("applet status backend unavailable")
+    session_to_agent = {cfg["session"]: agent for agent, cfg in AGENTS.items()}
+    ordered_running: list[str] = []
+    seen: set[str] = set()
+    for line in inventory.stdout.splitlines():
+        agent = session_to_agent.get(line.strip())
+        if agent is None or agent in seen:
+            continue
+        seen.add(agent)
+        ordered_running.append(agent)
+    ordered_running.sort(key=AGENT_IDS.index)
+    visible_running = ordered_running[:MAX_APPLET_AGENTS]
+    return {
+        "running_agents": ordered_running,
+        "visible_running_agents": visible_running,
+        "overflow": max(0, len(ordered_running) - len(visible_running)),
+    }
+
+
+def applet_agent_observation(agent: str, *, deadline: float, known_running: bool | None = None) -> dict[str, Any]:
     agent = normalize_applet_agents([agent])[0]
     cfg = AGENTS[agent]
     session = cfg["session"]
-    session_check = run_tmux(
-        ["has-session", "-t", session],
-        check=False,
-        timeout=applet_remaining_timeout(deadline),
-    )
-    if session_check.returncode not in {0, 1}:
-        raise AgentError("applet status backend unavailable")
-    running = session_check.returncode == 0
+    if known_running is None:
+        session_check = run_tmux(
+            ["has-session", "-t", session],
+            check=False,
+            timeout=applet_remaining_timeout(deadline),
+        )
+        if session_check.returncode not in {0, 1}:
+            raise AgentError("applet status backend unavailable")
+        running = session_check.returncode == 0
+    else:
+        if not isinstance(known_running, bool):
+            raise AgentError("known_running must be a boolean")
+        running = known_running
 
     applet_remaining_timeout(deadline)
     process_summary = agent_home_process_summary(agent)
@@ -1326,7 +1357,15 @@ def applet_error_row(agent: str) -> dict[str, Any]:
     }
 
 
-def applet_status(agents: Any) -> dict[str, Any]:
+def normalize_applet_schema_version(schema_version: Any) -> int:
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+        raise AgentError("schema_version must be an integer")
+    if schema_version not in {1, 2}:
+        raise AgentError("schema_version must be 1 or 2")
+    return schema_version
+
+
+def applet_status_v1(agents: Any) -> dict[str, Any]:
     selected = normalize_applet_agents(agents)
     deadline = time.monotonic() + APPLET_STATUS_TIMEOUT_SECONDS
     rows: list[dict[str, Any]] = []
@@ -1387,6 +1426,76 @@ def applet_status(agents: Any) -> dict[str, Any]:
         "agents": rows,
         "raw_output": "not_returned",
     }
+
+
+def applet_status_v2(agents: Any) -> dict[str, Any]:
+    pinned_agents = normalize_applet_agents(agents, allow_empty=True)
+    try:
+        inventory = managed_applet_inventory()
+    except AgentError:
+        visible_running_agents: list[str] = []
+        running_agents: list[str] = []
+        overflow = 0
+    else:
+        visible_running_agents = inventory["visible_running_agents"]
+        running_agents = inventory["running_agents"]
+        overflow = inventory["overflow"]
+
+    selected: list[str] = list(visible_running_agents)
+    running_set = set(running_agents)
+    for agent in pinned_agents:
+        if agent in running_set or agent in selected:
+            continue
+        if len(selected) >= MAX_APPLET_AGENTS:
+            break
+        selected.append(agent)
+
+    deadline = time.monotonic() + APPLET_STATUS_TIMEOUT_SECONDS
+    rows: list[dict[str, Any]] = []
+    for agent in selected:
+        if time.monotonic() >= deadline:
+            rows.append(applet_error_row(agent))
+            continue
+        try:
+            rows.append(
+                applet_agent_observation(
+                    agent,
+                    deadline=deadline,
+                    known_running=agent in running_set,
+                )
+            )
+        except AgentError:
+            rows.append(applet_error_row(agent))
+
+    try:
+        native_agents = native_agent_status()
+    except AgentError:
+        native_agents = {
+            "bridge_state": "degraded",
+            "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
+            "agents": [],
+            "truncated": False,
+        }
+
+    return {
+        "schema_version": 2,
+        "mode": "read_only",
+        "counts": {
+            "running": len(running_agents),
+            "sleeping": sum(row["activity_state"] == "sleeping" for row in rows),
+            "overflow": overflow,
+        },
+        "agents": rows,
+        "native_agents": native_agents,
+        "raw_output": "not_returned",
+    }
+
+
+def applet_status(agents: Any, schema_version: Any = 1) -> dict[str, Any]:
+    normalized_schema_version = normalize_applet_schema_version(schema_version)
+    if normalized_schema_version == 1:
+        return applet_status_v1(agents)
+    return applet_status_v2(agents)
 
 
 def single_agent_id(agent: str, tool_name: str) -> str:
@@ -11766,7 +11875,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "master_timeout_policy":
         return master_timeout_policy()
     if name == "master_applet_status":
-        return applet_status(args.get("agents"))
+        return applet_status(args.get("agents"), schema_version=args.get("schema_version", 1))
     if name == "agent_selector_policy":
         series = args.get("series")
         if series is None:
@@ -14008,10 +14117,11 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "agents": {
                     "type": "array",
-                    "minItems": 1,
+                    "minItems": 0,
                     "maxItems": MAX_APPLET_AGENTS,
                     "items": text_schema(MAX_AGENT_SELECTOR_TEXT),
-                }
+                },
+                "schema_version": {"type": "integer", "enum": [1, 2], "default": 1},
             },
             "additionalProperties": False,
         },
@@ -14157,6 +14267,9 @@ def validate_schema_value(field: str, value: Any, schema: dict[str, Any]) -> Non
     if value_type == "integer":
         if isinstance(value, bool) or not isinstance(value, int):
             raise AgentError(f"{field} must be an integer")
+        allowed = schema.get("enum")
+        if allowed and value not in allowed:
+            raise AgentError(f"{field} must be one of: {', '.join(str(item) for item in allowed)}")
         minimum = schema.get("minimum")
         maximum = schema.get("maximum")
         if isinstance(minimum, int) and value < minimum:
@@ -14612,7 +14725,8 @@ def main_cli(argv: list[str]) -> int:
     sub.add_parser("watchdog-status")
     sub.add_parser("timeout-policy")
     p_applet_status = sub.add_parser("applet-status")
-    p_applet_status.add_argument("agents", nargs="+")
+    p_applet_status.add_argument("agents", nargs="*")
+    p_applet_status.add_argument("--schema-version", type=int, default=1)
 
     p_pool = sub.add_parser("pool")
     pool_sub = p_pool.add_subparsers(dest="pool_command", required=True)
@@ -15023,7 +15137,12 @@ def main_cli(argv: list[str]) -> int:
         if args.command == "timeout-policy":
             return print_json(call_validated_tool("master_timeout_policy", {}))
         if args.command == "applet-status":
-            return print_json(call_validated_tool("master_applet_status", {"agents": args.agents}))
+            return print_json(
+                call_validated_tool(
+                    "master_applet_status",
+                    {"agents": args.agents, "schema_version": args.schema_version},
+                )
+            )
         if args.command == "pool":
             common = {"spec": args.spec, "target_dir": args.target_dir, "codex_bin": args.codex_bin}
             if args.pool_command == "validate":

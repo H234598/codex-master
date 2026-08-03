@@ -2040,10 +2040,13 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(master_applet_status_schema["required"], ["agents"])
         self.assertTrue(master_applet_status_schema["additionalProperties"] is False)
         self.assertEqual(master_applet_status_props["agents"]["type"], "array")
-        self.assertEqual(master_applet_status_props["agents"]["minItems"], 1)
+        self.assertEqual(master_applet_status_props["agents"]["minItems"], 0)
         self.assertEqual(master_applet_status_props["agents"]["maxItems"], MAX_APPLET_AGENTS)
         self.assertEqual(master_applet_status_props["agents"]["items"]["type"], "string")
         self.assertEqual(master_applet_status_props["agents"]["items"]["maxLength"], MAX_AGENT_SELECTOR_TEXT)
+        self.assertEqual(master_applet_status_props["schema_version"]["type"], "integer")
+        self.assertEqual(master_applet_status_props["schema_version"]["enum"], [1, 2])
+        self.assertEqual(master_applet_status_props["schema_version"]["default"], 1)
         self.assertEqual(assign_props["task"]["maxLength"], MAX_TASK_TEXT)
         self.assertEqual(assign_props["context"]["maxItems"], MAX_ASSIGNMENT_LIST_ITEMS)
         self.assertEqual(worktree_create_props["base_ref"]["maxLength"], MAX_GIT_REF_TEXT)
@@ -12500,7 +12503,7 @@ class ServerHelpersTest(unittest.TestCase):
         result = call_tool("master_applet_status", {"agents": ["a1", "b1"]})
 
         self.assertEqual(result["schema_version"], 1)
-        mock_applet_status.assert_called_once_with(["a1", "b1"])
+        mock_applet_status.assert_called_once_with(["a1", "b1"], schema_version=1)
 
     @patch("codex_master.server._start_agent_with_lease_unlocked", return_value={"status": "started"})
     @patch("codex_master.server.agent_lifecycle_lock")
@@ -16283,6 +16286,191 @@ class AppletStatusContractTest(unittest.TestCase):
         with self.assertRaisesRegex(AgentError, "duplicates"):
             normalize_applet_agents(["a1", "a1"])
 
+    @patch(
+        "codex_master.server.native_agent_status",
+        return_value={
+            "bridge_state": "ready",
+            "counts": {"active": 1, "unconfirmed": 0, "overflow": 0},
+            "agents": [
+                {
+                    "display_id": "native001",
+                    "agent_type": "worker",
+                    "activity_state": "active",
+                    "updated_at_utc": "1970-01-01T00:16:40+00:00",
+                }
+            ],
+            "truncated": False,
+        },
+    )
+    @patch("codex_master.server.run_tmux")
+    @patch("codex_master.server.applet_agent_observation")
+    def test_applet_status_schema_v2_lists_managed_inventory_once_and_pins_sleepers(
+        self, mock_observation, mock_run_tmux, mock_native_status
+    ) -> None:
+        native_fixture = mock_native_status.return_value
+        list_sessions_calls = 0
+
+        def fake_run_tmux(args, check=True, timeout=None):
+            nonlocal list_sessions_calls
+            self.assertEqual(args, ["list-sessions", "-F", "#{session_name}"])
+            self.assertFalse(check)
+            self.assertEqual(timeout, 1.0)
+            list_sessions_calls += 1
+            return subprocess.CompletedProcess(
+                ["tmux"],
+                0,
+                "\n".join(
+                    [
+                        AGENTS["b3"]["session"],
+                        "foreign-session",
+                        AGENTS["a2"]["session"],
+                        AGENTS["a2"]["session"],
+                        "",
+                    ]
+                ),
+                "",
+            )
+
+        def fake_observation(agent, *, deadline, known_running=None):
+            self.assertGreater(deadline, 0.0)
+            if agent in {"a2", "b3"}:
+                self.assertTrue(known_running)
+                return self._row(agent, activity="running", identity="verified")
+            if agent == "a1":
+                self.assertFalse(known_running)
+                return self._row("a1")
+            raise AssertionError(f"unexpected agent {agent}")
+
+        mock_run_tmux.side_effect = fake_run_tmux
+        mock_observation.side_effect = fake_observation
+
+        payload = applet_status(["a1"], schema_version=2)
+
+        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual([row["agent"] for row in payload["agents"]], ["a2", "b3", "a1"])
+        self.assertEqual(payload["counts"]["running"], 2)
+        self.assertEqual(payload["counts"]["sleeping"], 1)
+        self.assertEqual(payload["counts"]["overflow"], 0)
+        self.assertEqual(payload["native_agents"], native_fixture)
+        self.assertEqual(list_sessions_calls, 1)
+
+    @patch(
+        "codex_master.server.native_agent_status",
+        return_value={
+            "bridge_state": "ready",
+            "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
+            "agents": [],
+            "truncated": False,
+        },
+    )
+    @patch(
+        "codex_master.server.run_tmux",
+        return_value=subprocess.CompletedProcess(["tmux"], 0, "\n", ""),
+    )
+    @patch("codex_master.server.applet_agent_observation")
+    def test_applet_status_schema_v2_accepts_empty_inventory_and_keeps_pinned_sleepers(
+        self, mock_observation, mock_run_tmux, _mock_native_status
+    ) -> None:
+        mock_observation.return_value = self._row("a1")
+
+        payload = applet_status(["a1"], schema_version=2)
+
+        self.assertEqual([row["agent"] for row in payload["agents"]], ["a1"])
+        self.assertEqual(payload["counts"], {"running": 0, "sleeping": 1, "overflow": 0})
+        mock_run_tmux.assert_called_once_with(
+            ["list-sessions", "-F", "#{session_name}"],
+            check=False,
+            timeout=1.0,
+        )
+
+    @patch(
+        "codex_master.server.native_agent_status",
+        return_value={
+            "bridge_state": "ready",
+            "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
+            "agents": [],
+            "truncated": False,
+        },
+    )
+    @patch(
+        "codex_master.server.run_tmux",
+        return_value=subprocess.CompletedProcess(["tmux"], COMMAND_TIMEOUT_RETURN_CODE, "", "SECRET_TMUX_ERROR"),
+    )
+    def test_applet_status_schema_v2_inventory_error_has_no_fallback_rows(self, _mock_run_tmux, _mock_native_status) -> None:
+        payload = applet_status([], schema_version=2)
+
+        self.assertEqual(payload["counts"], {"running": 0, "sleeping": 0, "overflow": 0})
+        self.assertEqual(payload["agents"], [])
+        self.assertNotIn("SECRET_TMUX_ERROR", json.dumps(payload, sort_keys=True))
+
+    @patch(
+        "codex_master.server.native_agent_status",
+        return_value={
+            "bridge_state": "ready",
+            "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
+            "agents": [],
+            "truncated": False,
+        },
+    )
+    @patch("codex_master.server.run_tmux")
+    @patch("codex_master.server.applet_agent_observation")
+    def test_applet_status_schema_v2_limits_visible_rows_and_reports_active_overflow(
+        self, mock_observation, mock_run_tmux, _mock_native_status
+    ) -> None:
+        running_agents = [f"a{index}" for index in range(1, 8)]
+        mock_run_tmux.return_value = subprocess.CompletedProcess(
+            ["tmux"],
+            0,
+            "\n".join(AGENTS[agent]["session"] for agent in reversed(running_agents)),
+            "",
+        )
+        mock_observation.side_effect = [
+            self._row(agent, activity="running", identity="verified") for agent in running_agents[:6]
+        ]
+
+        payload = applet_status([], schema_version=2)
+
+        self.assertEqual([row["agent"] for row in payload["agents"]], running_agents[:6])
+        self.assertEqual(len(payload["agents"]), 6)
+        self.assertEqual(payload["counts"]["running"], 7)
+        self.assertEqual(payload["counts"]["sleeping"], 0)
+        self.assertEqual(payload["counts"]["overflow"], 1)
+
+    @patch("codex_master.server.native_agent_status", side_effect=AgentError("SECRET_NATIVE_STATUS"))
+    @patch(
+        "codex_master.server.run_tmux",
+        return_value=subprocess.CompletedProcess(["tmux"], 0, AGENTS["a2"]["session"], ""),
+    )
+    @patch("codex_master.server.applet_agent_observation")
+    def test_applet_status_schema_v2_native_bridge_degradation_keeps_managed_rows(
+        self, mock_observation, _mock_run_tmux, _mock_native_status
+    ) -> None:
+        mock_observation.return_value = self._row("a2", activity="running", identity="verified")
+
+        payload = applet_status([], schema_version=2)
+
+        self.assertEqual([row["agent"] for row in payload["agents"]], ["a2"])
+        self.assertEqual(
+            payload["native_agents"],
+            {
+                "bridge_state": "degraded",
+                "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
+                "agents": [],
+                "truncated": False,
+            },
+        )
+        self.assertNotIn("SECRET_NATIVE_STATUS", json.dumps(payload, sort_keys=True))
+
+    def test_applet_status_schema_v1_rejects_empty_agents(self) -> None:
+        with self.assertRaisesRegex(AgentError, "1 to 6"):
+            applet_status([], schema_version=1)
+
+    def test_applet_status_rejects_invalid_schema_versions(self) -> None:
+        for invalid_schema_version in (True, "2", 0, 3, None):
+            with self.subTest(schema_version=invalid_schema_version):
+                with self.assertRaisesRegex(AgentError, "schema_version"):
+                    applet_status(["a1"], schema_version=invalid_schema_version)
+
     @patch("codex_master.server.applet_agent_observation")
     def test_applet_status_keeps_sleeping_agents_healthy(self, mock_observation) -> None:
         mock_observation.return_value = self._row("a1")
@@ -16692,7 +16880,42 @@ class AppletStatusContractTest(unittest.TestCase):
                 backend="degraded",
                 control="blocked",
                 identity="unverified",
-            ),
+                ),
+                )
+
+    @patch(
+        "codex_master.server.agent_lease_status",
+        return_value={"state": "unclaimed", "raw_output": "not_returned"},
+    )
+    @patch(
+        "codex_master.server.agent_auth_status",
+        return_value={"authenticated": True, "auth_state": "present_regular", "raw_output": "not_returned"},
+    )
+    @patch(
+        "codex_master.server.agent_home_process_summary",
+        return_value={
+            "process_count": 1,
+            "managed_process_count": 1,
+            "external_process_count": 0,
+            "managed_process_ids": [123],
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        },
+    )
+    @patch("codex_master.server.run_tmux")
+    def test_applet_agent_observation_known_running_true_skips_has_session(
+        self, mock_run_tmux, _mock_process_summary, _mock_auth, _mock_lease
+    ) -> None:
+        mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "123\n", "")
+
+        row = applet_agent_observation("a1", deadline=10**12, known_running=True)
+
+        self.assertEqual(row, self._row("a1", activity="running", identity="verified"))
+        self.assertEqual(len(mock_run_tmux.call_args_list), 1)
+        self.assertEqual(
+            mock_run_tmux.call_args_list[0].args[0],
+            ["display-message", "-p", "-t", AGENTS["a1"]["session"], "#{pane_pid}"],
         )
 
     @patch("codex_master.server.agent_home_process_summary")
@@ -16891,7 +17114,27 @@ class CliLifecycleTest(unittest.TestCase):
         result = main_cli(["applet-status", "a1", "b1"])
 
         self.assertEqual(result, 0)
-        mock_call_tool.assert_called_once_with("master_applet_status", {"agents": ["a1", "b1"]})
+        mock_call_tool.assert_called_once_with("master_applet_status", {"agents": ["a1", "b1"], "schema_version": 1})
+
+    @patch("builtins.print")
+    def test_cli_applet_status_without_schema_version_and_agents_fails_closed(self, mock_print) -> None:
+        result = main_cli(["applet-status"])
+
+        self.assertEqual(result, 1)
+        mock_print.assert_called_once()
+        payload = json.loads(mock_print.call_args.args[0])
+        self.assertIn("error", payload)
+        self.assertIn("applet_agents", payload["error"])
+
+    @patch("codex_master.server.print_json")
+    @patch("codex_master.server.call_tool", return_value={"schema_version": 2, "agents": []})
+    def test_cli_applet_status_schema_v2_allows_empty_agents(self, mock_call_tool, mock_print_json) -> None:
+        mock_print_json.return_value = 0
+
+        result = main_cli(["applet-status", "--schema-version", "2"])
+
+        self.assertEqual(result, 0)
+        mock_call_tool.assert_called_once_with("master_applet_status", {"agents": [], "schema_version": 2})
 
     @patch("builtins.print")
     @patch("codex_master.server.call_tool")
