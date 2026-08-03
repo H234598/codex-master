@@ -20829,6 +20829,10 @@ class AgentPoolManagementTest(unittest.TestCase):
 
 
 class NativeAgentRegistryTest(unittest.TestCase):
+    def test_native_agent_registry_threshold_constants(self) -> None:
+        self.assertEqual(server_module.NATIVE_AGENT_ACTIVE_SECONDS, 2 * 60 * 60)
+        self.assertEqual(server_module.NATIVE_AGENT_RETENTION_SECONDS, 24 * 60 * 60)
+
     def test_native_agent_lifecycle_and_data_sparsity(self) -> None:
         start = {
             "hook_event_name": "SubagentStart",
@@ -20914,7 +20918,7 @@ class NativeAgentRegistryTest(unittest.TestCase):
                         now=1_000.0 + index,
                     )
                 server_module.record_native_agent_event({"hook_event_name": "SessionEnd", "session_id": "s-parent"}, now=1_008.0)
-                status = server_module.native_agent_status(now=1_008.5)
+                status = server_module.native_agent_status(now=1_008.0)
                 self.assertEqual({entry["activity_state"] for entry in status["agents"]}, {"unconfirmed"})
 
     def test_status_marks_stale_and_prunes_retention(self) -> None:
@@ -20930,9 +20934,9 @@ class NativeAgentRegistryTest(unittest.TestCase):
                     {"hook_event_name": "SubagentStart", "session_id": "s", "agent_id": "agent", "agent_type": "worker"},
                     now=1000.0,
                 )
-                stale = server_module.native_agent_status(now=1_007.201)
+                stale = server_module.native_agent_status(now=8_201.0)
                 self.assertEqual(stale["agents"][0]["activity_state"], "unconfirmed")
-                dropped = server_module.native_agent_status(now=1_086.401)
+                dropped = server_module.native_agent_status(now=87_401.0)
                 self.assertEqual(dropped["agents"], [])
 
     def test_status_limits_public_lines_and_overflow(self) -> None:
