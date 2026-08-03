@@ -2139,6 +2139,247 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(selected, ["c1", "a2"])
         mock_inventory.assert_called_once_with()
 
+    def test_published_inventory_makes_d_e_f_selectable_without_restart(self) -> None:
+        from codex_master.fleet_registry import build_inventory, normalize_fleet_document
+
+        fleet = normalize_fleet_document(
+            {
+                "schema_version": 1,
+                "generation": 1,
+                "accounts": [],
+                "series": [
+                    {
+                        "prefix": prefix,
+                        "display_name": prefix.upper(),
+                        "count": 100,
+                        "runner": "codex_cli",
+                        "provider": "ollama_local",
+                        "model": "local-model",
+                        "account_id": None,
+                        "enabled": True,
+                    }
+                    for prefix in ("d", "e", "f")
+                ],
+            }
+        )
+        inventory = build_inventory(fleet, Path("/inventory"))
+        previous = server_module.swap_agent_inventory(inventory)
+        try:
+            server_module.publish_agent_inventory(inventory)
+            self.assertEqual(server_module.canonical_agent_id("d100"), "d100")
+            self.assertEqual(server_module.agent_ids("e-series")[0], "e1")
+            self.assertEqual(server_module.agent_ids("f-series")[-1], "f100")
+        finally:
+            server_module.swap_agent_inventory(previous)
+
+    def test_temporary_agent_inventory_restores_previous_pointer_after_exception(self) -> None:
+        from codex_master.fleet_registry import build_inventory, normalize_fleet_document
+
+        def inventory(prefix: str):
+            fleet = normalize_fleet_document(
+                {
+                    "schema_version": 1,
+                    "generation": 1,
+                    "accounts": [],
+                    "series": [
+                        {
+                            "prefix": prefix,
+                            "display_name": prefix.upper(),
+                            "count": 1,
+                            "runner": "codex_cli",
+                            "provider": "ollama_local",
+                            "model": "local-model",
+                            "account_id": None,
+                            "enabled": True,
+                        }
+                    ],
+                }
+            )
+            return build_inventory(fleet, Path("/inventory"))
+
+        first = inventory("d")
+        second = inventory("e")
+        original = server_module.swap_agent_inventory(first)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                with server_module.temporary_agent_inventory(second):
+                    self.assertIs(server_module.current_agent_inventory(), second)
+                    raise RuntimeError("boom")
+            self.assertIs(server_module.current_agent_inventory(), first)
+        finally:
+            server_module.swap_agent_inventory(original)
+
+    def test_current_inventory_follows_legacy_agents_patch_without_override(self) -> None:
+        config = {
+            "label": "Patched D1",
+            "runner": Path("/legacy/d1/codex"),
+            "home": Path("/legacy/d1"),
+            "session": "codex_agent_d1_mcp",
+        }
+        with server_module.temporary_agent_inventory(None), patch.dict(
+            server_module.AGENTS, {"d1": config}, clear=True
+        ):
+            inventory = server_module.current_agent_inventory()
+
+            self.assertEqual(inventory.agent_ids, ("d1",))
+            self.assertIs(server_module.agent_config("d1"), config)
+
+    def test_selector_policy_uses_only_currently_enabled_series(self) -> None:
+        from codex_master.fleet_registry import build_inventory, normalize_fleet_document
+
+        fleet = normalize_fleet_document(
+            {
+                "schema_version": 1,
+                "generation": 1,
+                "accounts": [],
+                "series": [
+                    {
+                        "prefix": prefix,
+                        "display_name": prefix.upper(),
+                        "count": 1,
+                        "runner": "codex_cli",
+                        "provider": "ollama_local",
+                        "model": "local-model",
+                        "account_id": None,
+                        "enabled": prefix in {"b", "d"},
+                    }
+                    for prefix in ("a", "b", "d")
+                ],
+            }
+        )
+        inventory = build_inventory(fleet, Path("/inventory"))
+        with server_module.temporary_agent_inventory(inventory):
+            self.assertEqual(server_module.parse_selector_series_value("d"), ("d",))
+            with self.assertRaisesRegex(AgentError, "unknown Agentinnen series"):
+                server_module.parse_selector_series_value("a")
+            with patch.dict(os.environ, {server_module.AGENT_SELECTOR_SERIES_ENV: "stale"}, clear=False):
+                self.assertEqual(server_module.selector_policy_series(), ("b",))
+            self.assertEqual(server_module.agent_ids("all"), ["b1", "d1"])
+            self.assertEqual(server_module.canonical_agent_id("a1"), "a1")
+            self.assertEqual(server_module.agent_ids("a-series"), [])
+
+    def test_legacy_migration_dry_run_is_redacted_and_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool = root / "pool"
+            state = root / "state"
+            agents: dict[str, dict[str, Any]] = {}
+            secret = "synthetic-sensitive-value"
+            for agent in ("a1", "a2", "b1"):
+                home = pool / agent
+                home.mkdir(parents=True)
+                home.joinpath("auth.json").write_text(
+                    json.dumps({"tokens": {"access_token": secret}}), encoding="utf-8"
+                )
+                agents[agent] = {
+                    "label": agent.upper(),
+                    "runner": home / "codex",
+                    "home": home,
+                    "session": f"codex_agent_{agent}_mcp",
+                }
+            lease = state / "leases" / "a2.json"
+            lease.parent.mkdir(parents=True)
+            lease.write_text("sentinel", encoding="utf-8")
+
+            def fake_run_tmux(command, **_kwargs):
+                if command[:2] != ["list-sessions", "-F"]:
+                    raise AssertionError("migration attempted process mutation")
+                return subprocess.CompletedProcess(command, 0, agents["a2"]["session"] + "\n", "")
+
+            before = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            with server_module.temporary_agent_inventory(None), patch.dict(
+                server_module.AGENTS, agents, clear=True
+            ), patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "run_tmux", side_effect=fake_run_tmux
+            ):
+                projected = server_module.legacy_fleet_snapshot()
+                result = server_module.legacy_fleet_migration_dry_run()
+                self.assertIsNone(server_module.swap_agent_inventory(None))
+
+            after = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual([account.account_id for account in projected.accounts], ["legacy-a", "legacy-b"])
+            self.assertEqual([series.count for series in projected.series], [2, 1])
+            self.assertEqual(
+                result,
+                {
+                    "mutation_performed": False,
+                    "representable": True,
+                    "agent_count": 3,
+                    "series_count": 2,
+                    "running_count": 1,
+                    "reason_codes": [],
+                    "series": [
+                        {"prefix": "a", "agent_count": 2, "running_count": 1, "auth_status": "configured"},
+                        {"prefix": "b", "agent_count": 1, "running_count": 0, "auth_status": "configured"},
+                    ],
+                },
+            )
+            self.assertEqual(after, before)
+            public_text = json.dumps(result, sort_keys=True)
+            self.assertNotIn(str(root), public_text)
+            self.assertNotIn(secret, public_text)
+
+    def test_legacy_migration_rejects_overrides_gaps_and_mixed_auth_without_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool = root / "pool"
+
+            def config(agent: str, *, home: Path | None = None) -> dict[str, Any]:
+                agent_home = home or pool / agent
+                return {
+                    "label": agent.upper(),
+                    "runner": agent_home / "codex",
+                    "home": agent_home,
+                    "session": f"codex_agent_{agent}_mcp",
+                }
+
+            cases = (
+                ({"a1": config("a1", home=pool / "custom")}, "legacy_home_override"),
+                ({"a1": config("a1"), "a3": config("a3")}, "legacy_id_gap"),
+            )
+            for agents, reason in cases:
+                with self.subTest(reason=reason), server_module.temporary_agent_inventory(None), patch.dict(
+                    server_module.AGENTS, agents, clear=True
+                ), patch.object(
+                    server_module,
+                    "run_tmux",
+                    return_value=subprocess.CompletedProcess([], 0, "", ""),
+                ):
+                    result = server_module.legacy_fleet_migration_dry_run()
+                    self.assertFalse(result["representable"])
+                    self.assertIn(reason, result["reason_codes"])
+                    with self.assertRaisesRegex(AgentError, "legacy_fleet_not_representable"):
+                        server_module.legacy_fleet_snapshot()
+                    self.assertIsNone(server_module.swap_agent_inventory(None))
+
+            mixed_agents = {"a1": config("a1"), "a2": config("a2")}
+            (pool / "a1").mkdir(parents=True)
+            (pool / "a1" / "auth.json").write_text(
+                json.dumps({"tokens": {"access_token": "synthetic-sensitive-value"}}), encoding="utf-8"
+            )
+            with server_module.temporary_agent_inventory(None), patch.dict(
+                server_module.AGENTS, mixed_agents, clear=True
+            ), patch.object(
+                server_module,
+                "run_tmux",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ):
+                result = server_module.legacy_fleet_migration_dry_run()
+                self.assertFalse(result["representable"])
+                self.assertIn("legacy_auth_mixed", result["reason_codes"])
+                self.assertEqual(result["series"][0]["auth_status"], "mixed")
+                with self.assertRaisesRegex(AgentError, "legacy_fleet_not_representable"):
+                    server_module.legacy_fleet_snapshot()
+                self.assertIsNone(server_module.swap_agent_inventory(None))
+
     @patch("codex_master.server.status_agent")
     def test_multi_agent_status_results_are_paged_for_broad_selectors(self, mock_status_agent) -> None:
         mock_status_agent.side_effect = lambda agent: {

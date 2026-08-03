@@ -24,13 +24,23 @@ import shlex
 import stat as stat_module
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 import uuid
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from codex_master import __version__
+from codex_master.fleet_registry import (
+    AgentDescriptor,
+    FleetSnapshot,
+    InventorySnapshot,
+    Provider,
+    RunnerKind,
+    normalize_fleet_document,
+)
 from codex_master.fleet_service import FleetPaths, FleetPrivateIO
 
 
@@ -495,7 +505,267 @@ def build_agent_config(agent: str) -> dict[str, Any]:
 
 
 AGENTS = {agent: build_agent_config(agent) for agent in AGENT_IDS}
+_ACTIVE_AGENT_INVENTORY: InventorySnapshot | None = None
+_ACTIVE_AGENT_INVENTORY_LOCK = threading.RLock()
 RUNNER_EXECUTION_FDS: dict[str, int] = {}
+
+
+def legacy_agent_inventory(
+    agents: Mapping[str, Mapping[str, Any]] | None = None,
+) -> InventorySnapshot:
+    runtime_fallback = agents is None
+    source = AGENTS if runtime_fallback else agents
+    descriptors: dict[str, AgentDescriptor] = {}
+    by_series_lists: dict[str, list[str]] = {}
+    positions: dict[str, int] = {}
+    agent_ids: list[str] = []
+    series_prefixes: list[str] = []
+    for agent, config in source.items():
+        match = re.fullmatch(r"([a-z])([1-9][0-9]{0,2})", agent)
+        if not isinstance(config, Mapping):
+            raise AgentError("legacy_agent_inventory_invalid")
+        if match is None:
+            if not runtime_fallback or agent not in LEGACY_AGENT_ALIASES:
+                raise AgentError("legacy_agent_inventory_invalid")
+            prefix = agent
+            ordinal = 1
+        else:
+            prefix, ordinal_text = match.groups()
+            ordinal = int(ordinal_text)
+        if runtime_fallback:
+            home = Path(config.get("home", AGENT_POOL_ROOT / agent))
+            label = config.get("label", f"Codex Agentin {agent.upper()}")
+            runner = Path(config.get("runner", home / "codex"))
+            session = config.get("session", f"codex_agent_{agent}_mcp")
+        else:
+            try:
+                label = config["label"]
+                runner = Path(config["runner"])
+                home = Path(config["home"])
+                session = config["session"]
+            except (KeyError, TypeError, ValueError):
+                raise AgentError("legacy_agent_inventory_invalid") from None
+        if not isinstance(label, str) or not isinstance(session, str):
+            raise AgentError("legacy_agent_inventory_invalid")
+        if prefix not in by_series_lists:
+            by_series_lists[prefix] = []
+            series_prefixes.append(prefix)
+        positions[agent] = len(agent_ids)
+        agent_ids.append(agent)
+        by_series_lists[prefix].append(agent)
+        descriptors[agent] = AgentDescriptor(
+            agent_id=agent,
+            series_prefix=prefix,
+            ordinal=ordinal,
+            label=label,
+            runner=RunnerKind.CODEX_CLI,
+            provider=Provider.OPENAI_CHATGPT,
+            model=DEFAULT_AGENT_MODEL,
+            account_id=f"legacy-{prefix}",
+            home=home,
+            session=session,
+            enabled=config.get("enabled", True) is True,
+        )
+    by_series = {f"{prefix}-series": tuple(ids) for prefix, ids in by_series_lists.items()}
+    return InventorySnapshot(
+        agent_ids=tuple(agent_ids),
+        agents=MappingProxyType(descriptors),
+        by_series=MappingProxyType(by_series),
+        positions=MappingProxyType(positions),
+        series_prefixes=tuple(series_prefixes),
+    )
+
+
+def current_agent_inventory() -> InventorySnapshot:
+    with _ACTIVE_AGENT_INVENTORY_LOCK:
+        snapshot = _ACTIVE_AGENT_INVENTORY
+    return snapshot if snapshot is not None else legacy_agent_inventory()
+
+
+def swap_agent_inventory(snapshot: InventorySnapshot | None) -> InventorySnapshot | None:
+    if snapshot is not None and not isinstance(snapshot, InventorySnapshot):
+        raise AgentError("inventory_snapshot_required")
+    global _ACTIVE_AGENT_INVENTORY
+    with _ACTIVE_AGENT_INVENTORY_LOCK:
+        previous = _ACTIVE_AGENT_INVENTORY
+        _ACTIVE_AGENT_INVENTORY = snapshot
+    return previous
+
+
+def publish_agent_inventory(snapshot: InventorySnapshot) -> None:
+    if not isinstance(snapshot, InventorySnapshot):
+        raise AgentError("inventory_snapshot_required")
+    swap_agent_inventory(snapshot)
+
+
+@contextlib.contextmanager
+def temporary_agent_inventory(snapshot: InventorySnapshot | None):
+    previous = swap_agent_inventory(snapshot)
+    try:
+        yield
+    finally:
+        swap_agent_inventory(previous)
+
+
+def agent_config(
+    agent: str,
+    snapshot: InventorySnapshot | None = None,
+) -> Mapping[str, Any]:
+    with _ACTIVE_AGENT_INVENTORY_LOCK:
+        active = _ACTIVE_AGENT_INVENTORY
+    selected = active if snapshot is None else snapshot
+    if selected is None or (snapshot is not None and snapshot is not active):
+        try:
+            return AGENTS[agent]
+        except KeyError:
+            raise AgentError("unknown agent") from None
+    descriptor = selected.agents.get(agent)
+    if descriptor is None:
+        raise AgentError("unknown agent")
+    executable = "codex" if descriptor.runner is RunnerKind.CODEX_CLI else "gemini"
+    return MappingProxyType(
+        {
+            "label": descriptor.label,
+            "runner": descriptor.home / executable,
+            "home": descriptor.home,
+            "session": descriptor.session,
+            "enabled": descriptor.enabled,
+        }
+    )
+
+
+def all_agent_ids(snapshot: InventorySnapshot | None = None) -> tuple[str, ...]:
+    return (snapshot or current_agent_inventory()).agent_ids
+
+
+def series_agent_ids(
+    selector: str,
+    snapshot: InventorySnapshot | None = None,
+) -> tuple[str, ...]:
+    inventory = snapshot or current_agent_inventory()
+    try:
+        return inventory.by_series[selector]
+    except KeyError:
+        raise AgentError("unknown Agentinnen series selector") from None
+
+
+def _legacy_fleet_analysis(*, include_running: bool) -> tuple[FleetSnapshot | None, dict[str, Any]]:
+    inventory = legacy_agent_inventory()
+    reason_codes: list[str] = []
+    series_rows: list[dict[str, Any]] = []
+    auth_by_series: dict[str, str] = {}
+    pool_root: Path | None = None
+
+    if len(inventory.agent_ids) > MAX_POOL_AGENTS or len(inventory.series_prefixes) > MAX_POOL_SERIES:
+        reason_codes.append("legacy_inventory_too_large")
+
+    for prefix in inventory.series_prefixes:
+        ids = inventory.by_series[f"{prefix}-series"]
+        if prefix not in DEFAULT_ORDINAL_AGENT_SERIES + ("c",):
+            reason_codes.append("legacy_series_unsupported")
+        if len(ids) > 100:
+            reason_codes.append("legacy_series_count_invalid")
+        expected_ids = tuple(f"{prefix}{ordinal}" for ordinal in range(1, len(ids) + 1))
+        if ids != expected_ids:
+            reason_codes.append("legacy_id_gap")
+
+        states: list[dict[str, Any]] = []
+        for agent in ids:
+            config = agent_config(agent, inventory)
+            home = Path(config["home"])
+            candidate_root = home.parent
+            if pool_root is None:
+                pool_root = candidate_root
+            if candidate_root != pool_root or home != pool_root / agent:
+                reason_codes.append("legacy_home_override")
+            if Path(config["runner"]) != home / "codex":
+                reason_codes.append("legacy_runner_override")
+            if config["session"] != f"codex_agent_{agent}_mcp":
+                reason_codes.append("legacy_session_override")
+            states.append(agent_auth_status(agent))
+
+        if all(state.get("authenticated") is True for state in states):
+            auth_status = "configured"
+        elif all(state.get("auth_state") == "missing" for state in states):
+            auth_status = "missing"
+        else:
+            auth_status = "mixed"
+            reason_codes.append("legacy_auth_mixed")
+        auth_by_series[prefix] = auth_status
+
+    running: set[str] = set()
+    if include_running:
+        try:
+            running = set(managed_applet_inventory()["running_agents"])
+        except AgentError:
+            running = set()
+
+    for prefix in inventory.series_prefixes:
+        ids = inventory.by_series[f"{prefix}-series"]
+        series_rows.append(
+            {
+                "prefix": prefix,
+                "agent_count": len(ids),
+                "running_count": sum(agent in running for agent in ids),
+                "auth_status": auth_by_series[prefix],
+            }
+        )
+
+    reason_codes = list(dict.fromkeys(reason_codes))
+    snapshot = None
+    if not reason_codes:
+        snapshot = normalize_fleet_document(
+            {
+                "schema_version": 1,
+                "generation": 1,
+                "accounts": [
+                    {
+                        "account_id": f"legacy-{prefix}",
+                        "label": f"Legacy {prefix.upper()}",
+                        "provider": "openai_chatgpt",
+                        "auth_kind": "chatgpt_session",
+                        "secret_state": auth_by_series[prefix],
+                        "limit_state": "unknown",
+                        "enabled": True,
+                    }
+                    for prefix in inventory.series_prefixes
+                ],
+                "series": [
+                    {
+                        "prefix": prefix,
+                        "display_name": f"Codex Agentin {prefix.upper()}",
+                        "count": len(inventory.by_series[f"{prefix}-series"]),
+                        "runner": "codex_cli",
+                        "provider": "openai_chatgpt",
+                        "model": DEFAULT_AGENT_MODEL,
+                        "account_id": f"legacy-{prefix}",
+                        "enabled": True,
+                    }
+                    for prefix in inventory.series_prefixes
+                ],
+            }
+        )
+    return snapshot, {
+        "mutation_performed": False,
+        "representable": snapshot is not None,
+        "agent_count": min(len(inventory.agent_ids), MAX_POOL_AGENTS),
+        "series_count": min(len(inventory.series_prefixes), MAX_POOL_SERIES),
+        "running_count": min(len(running & set(inventory.agent_ids)), MAX_POOL_AGENTS),
+        "reason_codes": reason_codes,
+        "series": series_rows,
+    }
+
+
+def legacy_fleet_snapshot() -> FleetSnapshot:
+    snapshot, _result = _legacy_fleet_analysis(include_running=False)
+    if snapshot is None:
+        raise AgentError("legacy_fleet_not_representable")
+    return snapshot
+
+
+def legacy_fleet_migration_dry_run() -> dict[str, Any]:
+    _snapshot, result = _legacy_fleet_analysis(include_running=True)
+    return result
 
 
 ANSI_RE = re.compile(
@@ -740,7 +1010,9 @@ def classify_codex_home(raw_codex_home: str | None) -> dict[str, Any]:
     default_home_cmp = normalized_compare_path(Path.home() / ".codex")
 
     matched_agent = None
-    for agent, cfg in AGENTS.items():
+    snapshot = current_agent_inventory()
+    for agent in snapshot.agent_ids:
+        cfg = agent_config(agent, snapshot)
         if active_home_cmp == normalized_compare_path(cfg["home"]):
             matched_agent = agent
             break
@@ -1296,6 +1568,21 @@ def selector_policy_path() -> Path:
     return SELECTOR_POLICY_FILE
 
 
+def enabled_agent_series(snapshot: InventorySnapshot | None = None) -> tuple[str, ...]:
+    inventory = snapshot or current_agent_inventory()
+    return tuple(
+        prefix
+        for prefix in inventory.series_prefixes
+        if any(inventory.agents[agent].enabled for agent in inventory.by_series[f"{prefix}-series"])
+    )
+
+
+def default_selector_series(snapshot: InventorySnapshot | None = None) -> tuple[str, ...]:
+    active = enabled_agent_series(snapshot)
+    legacy = tuple(prefix for prefix in DEFAULT_ORDINAL_AGENT_SERIES if prefix in active)
+    return legacy or active[:2]
+
+
 def parse_selector_series_value(value: Any, *, field: str = "series") -> tuple[str, ...]:
     if isinstance(value, str):
         items = [item.strip().lower() for item in value.split(",")]
@@ -1308,7 +1595,8 @@ def parse_selector_series_value(value: Any, *, field: str = "series") -> tuple[s
     series = tuple(item for item in items if item)
     if not series:
         raise AgentError(f"{field} must contain at least one Agentinnen series")
-    invalid = [item for item in series if item not in AGENT_SERIES]
+    active_series = enabled_agent_series()
+    invalid = [item for item in series if item not in active_series]
     if invalid:
         raise AgentError(f"{field} contains unknown Agentinnen series")
     if len(set(series)) != len(series):
@@ -1317,29 +1605,33 @@ def parse_selector_series_value(value: Any, *, field: str = "series") -> tuple[s
 
 
 def selector_policy_series() -> tuple[str, ...]:
+    fallback = default_selector_series()
     env_value = os.environ.get(AGENT_SELECTOR_SERIES_ENV)
     if env_value:
-        return parse_selector_series_value(env_value, field=AGENT_SELECTOR_SERIES_ENV)
+        try:
+            return parse_selector_series_value(env_value, field=AGENT_SELECTOR_SERIES_ENV)
+        except AgentError:
+            return fallback
     path = selector_policy_path()
     try:
         current_stat = path.lstat()
     except FileNotFoundError:
-        return DEFAULT_ORDINAL_AGENT_SERIES
+        return fallback
     except OSError:
-        return DEFAULT_ORDINAL_AGENT_SERIES
+        return fallback
     if not stat_module.S_ISREG(current_stat.st_mode) or current_stat.st_size > MAX_SELECTOR_POLICY_BYTES:
-        return DEFAULT_ORDINAL_AGENT_SERIES
+        return fallback
     try:
         text = read_private_regular_text(path, MAX_SELECTOR_POLICY_BYTES, "could not read selector policy")
         payload = json.loads(text)
     except (AgentError, json.JSONDecodeError):
-        return DEFAULT_ORDINAL_AGENT_SERIES
+        return fallback
     if not isinstance(payload, dict) or "series" not in payload:
-        return DEFAULT_ORDINAL_AGENT_SERIES
+        return fallback
     try:
         return parse_selector_series_value(payload["series"], field="selector policy series")
     except AgentError:
-        return DEFAULT_ORDINAL_AGENT_SERIES
+        return fallback
 
 
 def selector_policy_status() -> dict[str, Any]:
@@ -1372,7 +1664,12 @@ def ordinal_mapping_preview(series: tuple[str, ...] | None = None, *, limit: int
     return preview
 
 
-def ordinal_agent_id(selector: str, series: tuple[str, ...] | None = None) -> str:
+def ordinal_agent_id(
+    selector: str,
+    series: tuple[str, ...] | None = None,
+    *,
+    snapshot: InventorySnapshot | None = None,
+) -> str:
     value = normalize_agent_selector_text(selector)
     if len(value) > MAX_AGENT_SELECTOR_TEXT:
         raise AgentError("ordinal selector is too long")
@@ -1382,22 +1679,28 @@ def ordinal_agent_id(selector: str, series: tuple[str, ...] | None = None) -> st
     if ordinal < 1:
         raise AgentError("ordinal selector must be >= 1")
     selected_series = series or selector_policy_series()
+    if not selected_series:
+        raise AgentError("ordinal selector has no enabled Agentinnen series")
     series_index = (ordinal - 1) % len(selected_series)
     agent_index = ((ordinal - 1) // len(selected_series)) + 1
     agent = f"{selected_series[series_index]}{agent_index}"
-    if agent not in AGENTS:
+    inventory = snapshot or current_agent_inventory()
+    descriptor = inventory.agents.get(agent)
+    if descriptor is None or not descriptor.enabled:
         raise AgentError("ordinal selector resolves outside the installed Agentinnen pool")
     return agent
 
 
 def canonical_agent_id(agent: str) -> str:
     normalized = normalize_agent_selector_text(agent)
+    snapshot = current_agent_inventory()
     if normalized.isdecimal():
-        return ordinal_agent_id(normalized)
-    if normalized in AGENTS:
+        return ordinal_agent_id(normalized, snapshot=snapshot)
+    if normalized in snapshot.agents:
         return normalized
-    if normalized in LEGACY_AGENT_ALIASES:
-        return LEGACY_AGENT_ALIASES[normalized]
+    alias = LEGACY_AGENT_ALIASES.get(normalized)
+    if alias in snapshot.agents:
+        return alias
     raise AgentError("unknown agent; expected a concrete id like a1, b1, c1 or a selector like both/all/a-series")
 
 
@@ -1411,13 +1714,26 @@ def agent_ids(agent: str) -> list[str]:
     normalized = normalize_agent_selector_text(agent)
     if normalized == "active":
         return list(managed_applet_inventory()["running_agents"])
+    snapshot = current_agent_inventory()
     if normalized == "all":
-        return list(AGENTS)
+        return [agent_id for agent_id in snapshot.agent_ids if snapshot.agents[agent_id].enabled]
     if normalized == "both":
-        return [canonical_agent_id("a"), canonical_agent_id("b")]
-    if normalized in SERIES_AGENT_IDS:
-        return [item for item in SERIES_AGENT_IDS[normalized] if item in AGENTS]
-    return [canonical_agent_id(normalized)]
+        aliases = (LEGACY_AGENT_ALIASES["a"], LEGACY_AGENT_ALIASES["b"])
+        return [
+            agent_id
+            for agent_id in aliases
+            if agent_id in snapshot.agents and snapshot.agents[agent_id].enabled
+        ]
+    if normalized in snapshot.by_series:
+        return [agent_id for agent_id in snapshot.by_series[normalized] if snapshot.agents[agent_id].enabled]
+    if normalized.isdecimal():
+        return [ordinal_agent_id(normalized, snapshot=snapshot)]
+    if normalized in snapshot.agents:
+        return [normalized]
+    alias = LEGACY_AGENT_ALIASES.get(normalized)
+    if alias in snapshot.agents:
+        return [alias]
+    raise AgentError("unknown agent; expected a concrete id like a1, b1, c1 or a selector like both/all/a-series")
 
 
 def normalize_applet_agents(agents: Any, *, allow_empty: bool = False) -> list[str]:
@@ -1430,13 +1746,14 @@ def normalize_applet_agents(agents: Any, *, allow_empty: bool = False) -> list[s
         raise AgentError("applet_agents list has at most 6 entries")
     normalized: list[str] = []
     seen: set[str] = set()
+    snapshot = current_agent_inventory()
     for agent in normalized_agents:
         if not isinstance(agent, str):
             raise AgentError("applet_agents entries must be strings")
         value = normalize_agent_selector_text(agent)
         if value in seen:
             raise AgentError("applet_agents must not contain duplicates")
-        if value not in AGENTS:
+        if value not in snapshot.agents:
             raise AgentError("applet_agents only accepts concrete tracked agent ids")
         normalized.append(value)
         seen.add(value)
@@ -1603,7 +1920,7 @@ def validate_applet_action_token(
         claims.get("v") != 1
         or claims.get("a") not in {"start", "stop"}
         or not isinstance(claims.get("g"), str)
-        or claims["g"] not in AGENTS
+        or claims["g"] not in current_agent_inventory().agents
         or not isinstance(claims.get("f"), str)
         or not re.fullmatch(r"[0-9a-f]{64}", claims["f"])
         or isinstance(claims.get("i"), bool)
@@ -1717,6 +2034,7 @@ def pane_pid_from_text(text: str) -> int | None:
 
 
 def managed_applet_inventory() -> dict[str, Any]:
+    snapshot = current_agent_inventory()
     inventory = run_tmux(
         ["list-sessions", "-F", "#{session_name}"],
         check=False,
@@ -1724,7 +2042,9 @@ def managed_applet_inventory() -> dict[str, Any]:
     )
     if inventory.returncode != 0:
         raise AgentError("applet status backend unavailable")
-    session_to_agent = {cfg["session"]: agent for agent, cfg in AGENTS.items()}
+    session_to_agent = {
+        agent_config(agent, snapshot)["session"]: agent for agent in snapshot.agent_ids
+    }
     ordered_running: list[str] = []
     seen: set[str] = set()
     for line in inventory.stdout.splitlines():
@@ -1733,7 +2053,7 @@ def managed_applet_inventory() -> dict[str, Any]:
             continue
         seen.add(agent)
         ordered_running.append(agent)
-    ordered_running.sort(key=AGENT_IDS.index)
+    ordered_running.sort(key=snapshot.positions.__getitem__)
     visible_running = ordered_running[:MAX_APPLET_AGENTS]
     return {
         "running_agents": ordered_running,
@@ -1744,7 +2064,7 @@ def managed_applet_inventory() -> dict[str, Any]:
 
 def applet_agent_observation(agent: str, *, deadline: float, known_running: bool | None = None) -> dict[str, Any]:
     agent = normalize_applet_agents([agent])[0]
-    cfg = AGENTS[agent]
+    cfg = agent_config(agent)
     session = cfg["session"]
     if known_running is None:
         session_check = run_tmux(
@@ -3643,10 +3963,9 @@ def _managed_tmux_session_count() -> int | None:
             ):
                 return None
             return 0
+        snapshot = current_agent_inventory()
         configured_sessions = {
-            config.get("session")
-            for config in AGENTS.values()
-            if isinstance(config, dict) and isinstance(config.get("session"), str)
+            agent_config(agent, snapshot).get("session") for agent in snapshot.agent_ids
         }
         listed_sessions = {
             line.strip() for line in completed.stdout.splitlines() if line.strip()
@@ -4435,7 +4754,7 @@ def is_regular_file_no_symlink(path: Path) -> bool:
 
 def open_agent_auth_fd(agent: str) -> int:
     agent = canonical_agent_id(agent)
-    auth_file = AGENTS[agent]["home"] / "auth.json"
+    auth_file = agent_config(agent)["home"] / "auth.json"
     try:
         auth_stat = auth_file.lstat()
         parent_stat = auth_file.parent.lstat()
@@ -4517,7 +4836,7 @@ def auth_access_token_state(value: Any) -> str:
 
 def agent_auth_status(agent: str) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
-    auth_file = AGENTS[agent]["home"] / "auth.json"
+    auth_file = agent_config(agent)["home"] / "auth.json"
     token_state = "unknown"
     auth_mode = "unknown"
     try:
@@ -4870,7 +5189,7 @@ def allowed_agent_raw_log_identity(agent: str, raw_log: Any) -> tuple[Path, os.s
     if not name.endswith(".log"):
         return None
     _prefix, separator, suffix = name[:-4].rpartition("-")
-    known_suffixes = set(AGENT_IDS) | set(LEGACY_AGENT_ALIASES)
+    known_suffixes = set(all_agent_ids()) | set(LEGACY_AGENT_ALIASES)
     if separator and suffix in known_suffixes and suffix not in agent_record_aliases(agent):
         return None
     return identity
@@ -4927,7 +5246,8 @@ def latest_managed_raw_log(agent: str, *, include_legacy: bool = True) -> Path |
 
 
 def raw_log_candidate_agents(running_agents: set[str]) -> list[str]:
-    candidates = {agent for agent in running_agents if agent in AGENTS}
+    snapshot = current_agent_inventory()
+    candidates = {agent for agent in running_agents if agent in snapshot.agents}
 
     for metadata_dir in (META_DIR, LEGACY_META_DIR):
         if not is_real_directory_no_symlink(metadata_dir):
@@ -4940,8 +5260,8 @@ def raw_log_candidate_agents(running_agents: set[str]) -> list[str]:
             if not path.name.endswith(".json"):
                 continue
             name = path.name[:-5]
-            candidate = name if name in AGENTS else LEGACY_AGENT_ALIASES.get(name)
-            if candidate in AGENTS:
+            candidate = name if name in snapshot.agents else LEGACY_AGENT_ALIASES.get(name)
+            if candidate in snapshot.agents:
                 candidates.add(candidate)
 
     for raw_dir in managed_raw_dirs():
@@ -4957,11 +5277,11 @@ def raw_log_candidate_agents(running_agents: set[str]) -> list[str]:
             _prefix, separator, name = path.name[:-4].rpartition("-")
             if not separator:
                 continue
-            candidate = name if name in AGENTS else LEGACY_AGENT_ALIASES.get(name)
-            if candidate in AGENTS:
+            candidate = name if name in snapshot.agents else LEGACY_AGENT_ALIASES.get(name)
+            if candidate in snapshot.agents:
                 candidates.add(candidate)
 
-    return sorted(candidates)
+    return sorted(candidates, key=snapshot.positions.__getitem__)
 
 
 def protected_raw_log_paths() -> set[Path]:
@@ -5433,7 +5753,7 @@ def public_config_path_state(path: Any) -> str:
 
 def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[dict[str, Any]] | None:
     agent = canonical_agent_id(agent)
-    cfg = AGENTS[agent]
+    cfg = agent_config(agent)
     home = cfg["home"]
     processes: list[dict[str, Any]] = []
     if not proc_root.exists():
@@ -5737,7 +6057,7 @@ def require_managed_tmux_session(agent: str, process_summary: dict[str, Any] | N
     agent = canonical_agent_id(agent)
     summary = process_summary if process_summary is not None else agent_home_process_summary(agent)
     pane_process_id = (
-        pane_pid(AGENTS[agent]["session"])
+        pane_pid(agent_config(agent)["session"])
         if "managed_process_ids" in summary
         else None
     )
@@ -5942,7 +6262,7 @@ def _start_agent_unlocked(
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     ensure_state()
-    cfg = AGENTS[agent]
+    cfg = agent_config(agent)
     runner = cfg["runner"]
     session = cfg["session"]
     try:
@@ -6154,7 +6474,8 @@ def _start_agent_with_lease_unlocked(
     lease = claim["lease"]
     release_on_completion = claim["status"] in {"claimed", "claimed_expired"}
     result: dict[str, Any] | None = None
-    if tmux_alive(AGENTS[agent]["session"]):
+    session = agent_config(agent)["session"]
+    if tmux_alive(session):
         try:
             result = start_agent(
                 agent,
@@ -6173,9 +6494,9 @@ def _start_agent_with_lease_unlocked(
                 raw_log_identity = allowed_agent_raw_log_identity(agent, raw_log)
                 raw_log_path = raw_log_identity[0] if raw_log_identity is not None else None
                 if raw_log_path is not None:
-                    cleanup_failed_start(AGENTS[agent]["session"], raw_log_path, kill_session=True)
+                    cleanup_failed_start(session, raw_log_path, kill_session=True)
                 else:
-                    run_tmux(["kill-session", "-t", AGENTS[agent]["session"]], check=False)
+                    run_tmux(["kill-session", "-t", session], check=False)
             release_start_lease_if_safe(
                 agent,
                 lease,
@@ -6216,9 +6537,9 @@ def _start_agent_with_lease_unlocked(
             raw_log_identity = allowed_agent_raw_log_identity(agent, raw_log)
             raw_log_path = raw_log_identity[0] if raw_log_identity is not None else None
             if raw_log_path is not None:
-                cleanup_failed_start(AGENTS[agent]["session"], raw_log_path, kill_session=True)
+                cleanup_failed_start(session, raw_log_path, kill_session=True)
             else:
-                run_tmux(["kill-session", "-t", AGENTS[agent]["session"]], check=False)
+                run_tmux(["kill-session", "-t", session], check=False)
         release_start_lease_if_safe(agent, lease, release_on_completion)
         raise
     if release_on_completion and agent_lease_status(agent).get("held_by_this_server"):
@@ -6236,7 +6557,7 @@ def stop_agent(agent: str, force: bool = False) -> dict[str, Any]:
 
 def _stop_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
-    cfg = AGENTS[agent]
+    cfg = agent_config(agent)
     session = cfg["session"]
     was_running = tmux_alive(session)
     if was_running:
@@ -6272,7 +6593,7 @@ def _stop_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]:
 
 def require_running_agent(agent: str) -> None:
     agent = canonical_agent_id(agent)
-    if not tmux_alive(AGENTS[agent]["session"]):
+    if not tmux_alive(agent_config(agent)["session"]):
         raise AgentError(f"agent {agent} is not running")
 
 
@@ -6973,7 +7294,7 @@ def status_agent(agent: str, *, initialize_state: bool = True) -> dict[str, Any]
     agent = canonical_agent_id(agent)
     if initialize_state:
         ensure_state()
-    cfg = AGENTS[agent]
+    cfg = agent_config(agent)
     session = cfg["session"]
     meta = read_meta(agent)
     raw_log = meta.get("raw_log")
@@ -7774,7 +8095,7 @@ def _usage_watchdog_agent_unlocked(agent: str, *, dry_run: bool) -> dict[str, An
     agent = canonical_agent_id(agent)
     if not dry_run:
         ensure_state()
-    cfg = AGENTS[agent]
+    cfg = agent_config(agent)
     session = cfg["session"]
     running = tmux_alive(session)
     lease = agent_lease_status(agent, initialize_state=not dry_run)
@@ -8032,7 +8353,7 @@ def skills_agent(
     plugins_limit: int = MAX_CAPABILITY_PLUGINS,
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
-    cfg = AGENTS[agent]
+    cfg = agent_config(agent)
     home = cfg["home"]
     limit = normalize_int_field(limit, field="limit", minimum=0, maximum=MAX_SKILL_NAMES)
     names_offset = normalize_int_field(names_offset, field="names_offset", minimum=0, maximum=MAX_PAGED_OFFSET)
@@ -8170,7 +8491,7 @@ def as_string_list(
 
 def skill_matches(agent: str, skill_ref: str, limit: int = 8) -> list[dict[str, str]]:
     agent = canonical_agent_id(agent)
-    cfg = AGENTS[agent]
+    cfg = agent_config(agent)
     home = cfg["home"]
     wanted = skill_ref.strip().lower()
     matches: list[dict[str, str]] = []
@@ -8226,7 +8547,7 @@ def capabilities_agent(agent: str) -> dict[str, Any]:
     inventory = skills_agent(agent, include_names=False)
     return {
         "agent": agent,
-        "label": AGENTS[agent]["label"],
+        "label": agent_config(agent)["label"],
         "home": PATH_NOT_RETURNED,
         "home_kind": "managed_agent_home",
         "models": {
@@ -8414,7 +8735,7 @@ def ensure_assignment_session_model(
     release_lease_on_failure: bool = False,
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
-    cfg = AGENTS[agent]
+    cfg = agent_config(agent)
     if not tmux_alive(cfg["session"]):
         raise AgentError(f"agent {agent} is not running")
     require_managed_tmux_session(agent)
@@ -11571,7 +11892,9 @@ def doctor() -> dict[str, Any]:
         installed_source_worktree_state(resolved_install_path, wrapper),
         {"name": "mcp_startup_self_test", **mcp_command_startup_self_test(install_path)},
     ]
-    for agent, cfg in AGENTS.items():
+    snapshot = current_agent_inventory()
+    for agent in snapshot.agent_ids:
+        cfg = agent_config(agent, snapshot)
         process_summary = agent_home_process_summary(agent)
         running = tmux_alive(cfg["session"])
         identity_guard = agent_identity_guard(
@@ -12515,7 +12838,7 @@ def dismiss_codex_project_trust_prompt(agent: str, text: str) -> bool:
     if not codex_project_trust_prompt_visible(text):
         return False
     agent = canonical_agent_id(agent)
-    session = AGENTS[agent]["session"]
+    session = agent_config(agent)["session"]
     with agent_lifecycle_lock(agent):
         require_managed_tmux_session(agent)
         result = run_tmux(["send-keys", "-t", session, CODEX_TUI_TRUST_PROMPT_SUBMIT_KEY], check=False)
@@ -12539,7 +12862,7 @@ def dismiss_codex_update_prompt(agent: str, text: str) -> bool:
         return False
     keys = ("Down", "Enter") if selected == "1" else ("Enter",)
     agent = canonical_agent_id(agent)
-    session = AGENTS[agent]["session"]
+    session = agent_config(agent)["session"]
     with agent_lifecycle_lock(agent):
         require_managed_tmux_session(agent)
         for key in keys:
@@ -12610,7 +12933,7 @@ def send_agent(
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     text = bounded_text(text, field="text", max_chars=MAX_SEND_TEXT, required=True, strip=False) or ""
-    cfg = AGENTS[agent]
+    cfg = agent_config(agent)
     session = cfg["session"]
     with agent_lifecycle_lock(agent):
         if not tmux_alive(session):
@@ -12671,7 +12994,7 @@ def interrupt_agent(agent: str, force: bool = False) -> dict[str, Any]:
 
 def _interrupt_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
-    cfg = AGENTS[agent]
+    cfg = agent_config(agent)
     session = cfg["session"]
     if not tmux_alive(session):
         raise AgentError(f"agent {agent} is not running")
@@ -12805,7 +13128,7 @@ def read_log_tail(
 
 def pane_tail(agent: str, lines: int, *, visible_only: bool = False, verify_identity: bool = False) -> str:
     agent = canonical_agent_id(agent)
-    cfg = AGENTS[agent]
+    cfg = agent_config(agent)
     session = cfg["session"]
     if not tmux_alive(session):
         return ""
@@ -12829,7 +13152,7 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
         raise AgentError("source must be 'pane' or 'log'")
     lease = ensure_agent_lease_available(agent)
     meta = read_meta(agent)
-    session_live = tmux_alive(AGENTS[agent]["session"])
+    session_live = tmux_alive(agent_config(agent)["session"])
     raw_log_path: Path | None = None
     if source == "pane":
         if session_live:
@@ -14711,9 +15034,10 @@ def agent_pool_copy_auth(
 
 @contextlib.contextmanager
 def pool_agent_lifecycle_locks(agents: list[str]) -> Any:
+    known_agents = set(all_agent_ids())
     with contextlib.ExitStack() as stack:
         for agent in sorted(agents):
-            if agent in AGENTS:
+            if agent in known_agents:
                 stack.enter_context(agent_lifecycle_lock(agent))
         yield
 
@@ -14834,8 +15158,9 @@ def _agent_pool_destroy_pool_unlocked(
                     raise AgentError("pool marker changed during removal")
 
         with pool_agent_lifecycle_locks(normalized["ids"]):
+            known_agents = set(all_agent_ids())
             for agent in normalized["ids"]:
-                if agent in AGENTS:
+                if agent in known_agents:
                     lease = agent_lease_status(agent, initialize_state=False)
                     if lease.get("state") not in {"unclaimed", "expired"}:
                         raise AgentError("pool Agentin has an active or unreadable lease")
