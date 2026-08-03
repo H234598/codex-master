@@ -19526,7 +19526,9 @@ class CliLifecycleTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_home:
             local_bin = Path(tmp_home) / ".local" / "bin"
             local_bin.mkdir(parents=True, exist_ok=True)
-            with patch.dict("os.environ", {"HOME": tmp_home}):
+            with patch("codex_master.server.enroll_current_teamleader", return_value={"changed": False}), patch.dict(
+                "os.environ", {"HOME": tmp_home}
+            ):
                 with patch("codex_master.server.shutil.which", return_value="/usr/bin/codex"):
                     mock_run.side_effect = [
                         subprocess.CompletedProcess(
@@ -19794,7 +19796,9 @@ class CliLifecycleTest(unittest.TestCase):
                 subprocess.CompletedProcess(["codex", "mcp", "remove"], 0, "", ""),
             ]
 
-            with patch.dict("os.environ", {"HOME": str(tmp_path)}, clear=False):
+            with patch("codex_master.server.enroll_current_teamleader", return_value={"changed": False}), patch.dict(
+                "os.environ", {"HOME": str(tmp_path)}, clear=False
+            ):
                 with self.assertRaisesRegex(AgentError, "cache failed"):
                     install(register=True, install_path=install_link)
 
