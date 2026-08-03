@@ -2491,6 +2491,37 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(sentinel.read_bytes(), before)
             self.assertNotIn(str(root), json.dumps(result, sort_keys=True))
 
+    def test_legacy_migration_marks_tmux_backend_unknown_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "pool" / "a1"
+            home.mkdir(parents=True)
+            agents = {
+                "a1": {
+                    "label": "A1",
+                    "runner": home / "codex",
+                    "home": home,
+                    "session": "codex_agent_a1_mcp",
+                }
+            }
+            with server_module.temporary_agent_inventory(None), patch.dict(
+                server_module.AGENTS, agents, clear=True
+            ), patch.object(
+                server_module,
+                "run_tmux",
+                return_value=subprocess.CompletedProcess(
+                    [], COMMAND_TIMEOUT_RETURN_CODE, "", "backend unavailable"
+                ),
+            ):
+                projected = server_module.legacy_fleet_snapshot()
+                result = server_module.legacy_fleet_migration_dry_run()
+
+            self.assertEqual(projected.series[0].count, 1)
+            self.assertFalse(result["representable"])
+            self.assertIn("legacy_running_unknown", result["reason_codes"])
+            self.assertIsNone(result["running_count"])
+            self.assertIsNone(result["series"][0]["running_count"])
+
     def test_legacy_migration_rejects_overrides_gaps_and_mixed_auth_without_activation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2840,6 +2871,796 @@ class ServerHelpersTest(unittest.TestCase):
                 self.assertEqual(service.load().generation, 1)
             self.assertFalse((pool / "d1").exists())
             self.assertEqual((pool / "d2" / "foreign").read_text(encoding="utf-8"), "untouched")
+
+    def test_fleet_series_account_change_is_metadata_only_and_invalid_target_is_noop(self) -> None:
+        from datetime import datetime, timezone
+
+        from codex_master.fleet_registry import (
+            AuthKind,
+            FleetAccount,
+            FleetSnapshot,
+            LimitState,
+            Provider,
+            SecretState,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            probed_at = datetime.now(timezone.utc).isoformat()
+
+            def account(account_id: str, limit_state: LimitState) -> FleetAccount:
+                return FleetAccount(
+                    account_id, "Account", Provider.GEMINI_API, AuthKind.API_KEY,
+                    SecretState.CONFIGURED, limit_state, True, None, probed_at, None,
+                )
+
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                service = server_module.current_fleet_service()
+                service.commit_snapshot(
+                    FleetSnapshot(
+                        1,
+                        2,
+                        (
+                            account("first", LimitState.READY),
+                            account("second", LimitState.READY),
+                            account("limited", LimitState.LIMITED),
+                        ),
+                        (),
+                    ),
+                    expected_generation=1,
+                )
+                server_module.fleet_series_apply(
+                    prefix="d", count=1, runner="gemini_cli", provider="gemini_api",
+                    model="model", account_id="first", expected_generation=2,
+                    gemini_executable=executable,
+                )
+                before = {
+                    path.name: (
+                        path.stat().st_ino,
+                        path.stat().st_mtime_ns,
+                        hashlib.sha256(path.read_bytes()).hexdigest(),
+                    )
+                    for path in (pool / "d1").iterdir()
+                }
+
+                with patch.object(
+                    server_module, "run_tmux", side_effect=AssertionError("tmux I/O attempted")
+                ), patch.object(
+                    server_module,
+                    "pool_home_processes",
+                    side_effect=AssertionError("process I/O attempted"),
+                ):
+                    result = server_module.fleet_series_apply(
+                        prefix="d", count=1, runner="gemini_cli", provider="gemini_api",
+                        model="model", account_id="second", expected_generation=3,
+                        gemini_executable=executable,
+                    )
+
+                after = {
+                    path.name: (
+                        path.stat().st_ino,
+                        path.stat().st_mtime_ns,
+                        hashlib.sha256(path.read_bytes()).hexdigest(),
+                    )
+                    for path in (pool / "d1").iterdir()
+                }
+                self.assertEqual(result["updated_count"], 1)
+                self.assertEqual(before, after)
+                self.assertEqual(
+                    server_module.current_agent_inventory().agents["d1"].account_id,
+                    "second",
+                )
+
+                with self.assertRaisesRegex(AgentError, "limit_active"):
+                    server_module.fleet_series_apply(
+                        prefix="d", count=1, runner="gemini_cli", provider="gemini_api",
+                        model="model", account_id="limited", expected_generation=4,
+                        gemini_executable=executable,
+                    )
+                self.assertEqual(service.load().generation, 4)
+                after_rejection = {
+                    path.name: (
+                        path.stat().st_ino,
+                        path.stat().st_mtime_ns,
+                        hashlib.sha256(path.read_bytes()).hexdigest(),
+                    )
+                    for path in (pool / "d1").iterdir()
+                }
+                self.assertEqual(after, after_rejection)
+
+    def test_fleet_series_disable_changes_only_registry_and_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d", count=2, runner="codex_cli", provider="ollama_local",
+                    model="local-model", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                before = {
+                    str(path.relative_to(pool)): hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in pool.rglob("*") if path.is_file()
+                }
+                with patch.object(
+                    server_module, "run_tmux", side_effect=AssertionError("tmux I/O attempted")
+                ), patch.object(
+                    server_module,
+                    "pool_home_processes",
+                    side_effect=AssertionError("process I/O attempted"),
+                ):
+                    result = server_module.fleet_series_disable(prefix="d", expected_generation=2)
+                after = {
+                    str(path.relative_to(pool)): hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in pool.rglob("*") if path.is_file()
+                }
+                inventory = server_module.current_agent_inventory()
+
+            self.assertEqual(result["generation"], 3)
+            self.assertEqual(before, after)
+            self.assertFalse(inventory.agents["d1"].enabled)
+            self.assertFalse(inventory.agents["d2"].enabled)
+
+    def test_fleet_series_shrink_fails_closed_for_confirmation_and_lifecycle_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d", count=5, runner="codex_cli", provider="ollama_local",
+                    model="local-model", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                with patch.object(
+                    server_module, "run_tmux", side_effect=AssertionError("tmux I/O attempted")
+                ):
+                    with self.assertRaisesRegex(AgentError, "remove_confirmation_required"):
+                        server_module.fleet_series_apply(
+                            prefix="d", count=3, runner="codex_cli", provider="ollama_local",
+                            model="local-model", account_id=None, expected_generation=2,
+                            confirmed_remove_ids=["d5"], codex_executable=executable,
+                        )
+
+                stopped = subprocess.CompletedProcess([], 1, "", "")
+                cases = (
+                    (
+                        "lease",
+                        patch.object(server_module, "agent_lease_status", return_value={"state": "claimed"}),
+                        patch.object(server_module, "run_tmux", return_value=stopped),
+                        patch.object(server_module, "pool_home_processes", return_value=[]),
+                        "fleet_agent_lease_active",
+                    ),
+                    (
+                        "running",
+                        patch.object(server_module, "agent_lease_status", return_value={"state": "unclaimed"}),
+                        patch.object(
+                            server_module, "run_tmux",
+                            return_value=subprocess.CompletedProcess([], 0, "", ""),
+                        ),
+                        patch.object(server_module, "pool_home_processes", return_value=[]),
+                        "fleet_agent_running",
+                    ),
+                    (
+                        "tmux-unknown",
+                        patch.object(server_module, "agent_lease_status", return_value={"state": "unclaimed"}),
+                        patch.object(
+                            server_module, "run_tmux",
+                            return_value=subprocess.CompletedProcess([], COMMAND_TIMEOUT_RETURN_CODE, "", ""),
+                        ),
+                        patch.object(server_module, "pool_home_processes", return_value=[]),
+                        "fleet_agent_tmux_unknown",
+                    ),
+                    (
+                        "process-unknown",
+                        patch.object(server_module, "agent_lease_status", return_value={"state": "unclaimed"}),
+                        patch.object(server_module, "run_tmux", return_value=stopped),
+                        patch.object(server_module, "pool_home_processes", return_value=None),
+                        "fleet_agent_process_unknown",
+                    ),
+                    (
+                        "process-active",
+                        patch.object(server_module, "agent_lease_status", return_value={"state": "unclaimed"}),
+                        patch.object(server_module, "run_tmux", return_value=stopped),
+                        patch.object(server_module, "pool_home_processes", return_value=[{"pid": 1}]),
+                        "fleet_agent_process_active",
+                    ),
+                )
+                for name, lease_patch, tmux_patch, process_patch, error in cases:
+                    with self.subTest(name=name), lease_patch, tmux_patch, process_patch:
+                        with self.assertRaisesRegex(AgentError, error):
+                            server_module.fleet_series_apply(
+                                prefix="d", count=3, runner="codex_cli", provider="ollama_local",
+                                model="local-model", account_id=None, expected_generation=2,
+                                confirmed_remove_ids=["d4", "d5"], codex_executable=executable,
+                            )
+                    self.assertEqual(server_module.current_fleet_service().load().generation, 2)
+                    self.assertTrue(all((pool / f"d{ordinal}").is_dir() for ordinal in range(1, 6)))
+
+    def test_fleet_series_shrink_rejects_unknown_content_and_home_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d", count=5, runner="codex_cli", provider="ollama_local",
+                    model="local-model", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                extra = pool / "d5" / "unknown"
+                extra.write_text("block", encoding="utf-8")
+                with patch.object(server_module, "agent_lease_status", return_value={"state": "unclaimed"}), patch.object(
+                    server_module, "run_tmux", return_value=stopped
+                ), patch.object(server_module, "pool_home_processes", return_value=[]):
+                    with self.assertRaisesRegex(AgentError, "fleet_home_content_invalid"):
+                        server_module.fleet_series_apply(
+                            prefix="d", count=3, runner="codex_cli", provider="ollama_local",
+                            model="local-model", account_id=None, expected_generation=2,
+                            confirmed_remove_ids=["d4", "d5"], codex_executable=executable,
+                        )
+                extra.unlink()
+
+                moved = pool / "moved"
+
+                def swap_home(home: Path):
+                    self.assertFalse(server_module._POOL_ROOT_LOCK_STACK.get())
+                    if home.name == "d5" and not moved.exists():
+                        os.rename(home, moved)
+                        shutil.copytree(moved, home)
+                    return []
+
+                with patch.object(server_module, "agent_lease_status", return_value={"state": "unclaimed"}), patch.object(
+                    server_module, "run_tmux", return_value=stopped
+                ), patch.object(server_module, "pool_home_processes", side_effect=swap_home):
+                    with self.assertRaisesRegex(AgentError, "fleet_home_changed"):
+                        server_module.fleet_series_apply(
+                            prefix="d", count=3, runner="codex_cli", provider="ollama_local",
+                            model="local-model", account_id=None, expected_generation=2,
+                            confirmed_remove_ids=["d4", "d5"], codex_executable=executable,
+                        )
+                shutil.rmtree(pool / "d5")
+                os.rename(moved, pool / "d5")
+
+    def test_fleet_series_shrink_rolls_back_cas_then_removes_tail_descending(self) -> None:
+        from codex_master.fleet_service import FleetConflictError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d", count=5, runner="codex_cli", provider="ollama_local",
+                    model="local-model", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                untouched = {
+                    str(path.relative_to(pool)): (
+                        path.stat().st_ino,
+                        path.stat().st_mtime_ns,
+                        hashlib.sha256(path.read_bytes()).hexdigest(),
+                    )
+                    for ordinal in range(1, 4)
+                    for path in (pool / f"d{ordinal}").iterdir()
+                }
+                service = server_module.current_fleet_service()
+                with patch.object(service, "commit_snapshot", side_effect=FleetConflictError("generation_conflict")), patch.object(
+                    server_module, "current_fleet_service", return_value=service
+                ), patch.object(server_module, "agent_lease_status", return_value={"state": "unclaimed"}), patch.object(
+                    server_module, "run_tmux", return_value=stopped
+                ), patch.object(server_module, "pool_home_processes", return_value=[]):
+                    with self.assertRaisesRegex(AgentError, "generation_conflict"):
+                        server_module.fleet_series_apply(
+                            prefix="d", count=3, runner="codex_cli", provider="ollama_local",
+                            model="local-model", account_id=None, expected_generation=2,
+                            confirmed_remove_ids=["d4", "d5"], codex_executable=executable,
+                        )
+                self.assertTrue(all((pool / f"d{ordinal}").is_dir() for ordinal in range(1, 6)))
+                self.assertFalse(any(path.name.startswith(server_module.FLEET_TOMBSTONE_PREFIX) for path in pool.iterdir()))
+
+                real_rename = os.rename
+
+                def ordered_rename(src, dst, *args, **kwargs):
+                    if src == "d5":
+                        self.assertTrue((pool / "d4").exists())
+                    elif src == "d4":
+                        self.assertFalse((pool / "d5").exists())
+                    return real_rename(src, dst, *args, **kwargs)
+
+                with patch.object(server_module, "agent_lease_status", return_value={"state": "unclaimed"}), patch.object(
+                    server_module, "run_tmux", return_value=stopped
+                ), patch.object(server_module, "pool_home_processes", return_value=[]), patch.object(
+                    server_module.os, "rename", side_effect=ordered_rename
+                ):
+                    result = server_module.fleet_series_apply(
+                        prefix="d", count=3, runner="codex_cli", provider="ollama_local",
+                        model="local-model", account_id=None, expected_generation=2,
+                        confirmed_remove_ids=["d4", "d5"], codex_executable=executable,
+                    )
+
+                current = {
+                    str(path.relative_to(pool)): (
+                        path.stat().st_ino,
+                        path.stat().st_mtime_ns,
+                        hashlib.sha256(path.read_bytes()).hexdigest(),
+                    )
+                    for ordinal in range(1, 4)
+                    for path in (pool / f"d{ordinal}").iterdir()
+                }
+            self.assertEqual(result["removed_count"], 2)
+            self.assertEqual(untouched, current)
+            self.assertFalse((pool / "d4").exists())
+            self.assertFalse((pool / "d5").exists())
+
+    def test_fleet_series_delete_requires_disabled_series_yes_and_all_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d", count=2, runner="codex_cli", provider="ollama_local",
+                    model="local-model", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                with self.assertRaisesRegex(AgentError, "series_must_be_disabled"):
+                    server_module.fleet_series_delete(
+                        prefix="d", expected_generation=2,
+                        confirmed_remove_ids=["d1", "d2"], yes=True,
+                    )
+                server_module.fleet_series_disable(prefix="d", expected_generation=2)
+                with self.assertRaisesRegex(AgentError, "fleet_series_delete_confirmation_required"):
+                    server_module.fleet_series_delete(
+                        prefix="d", expected_generation=3,
+                        confirmed_remove_ids=["d1", "d2"], yes=False,
+                    )
+                with self.assertRaisesRegex(AgentError, "remove_confirmation_required"):
+                    server_module.fleet_series_delete(
+                        prefix="d", expected_generation=3,
+                        confirmed_remove_ids=["d2"], yes=True,
+                    )
+                with patch.object(server_module, "agent_lease_status", return_value={"state": "unclaimed"}), patch.object(
+                    server_module, "run_tmux", return_value=stopped
+                ), patch.object(server_module, "pool_home_processes", return_value=[]):
+                    result = server_module.fleet_series_delete(
+                        prefix="d", expected_generation=3,
+                        confirmed_remove_ids=["d1", "d2"], yes=True,
+                    )
+                self.assertEqual(server_module.current_fleet_service().load().series, ())
+
+            self.assertEqual(result["removed_count"], 2)
+            self.assertFalse((pool / "d1").exists())
+            self.assertFalse((pool / "d2").exists())
+
+    def test_fleet_series_disabled_definition_materializes_only_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                disabled = server_module.fleet_series_apply(
+                    prefix="d", count=2, runner="codex_cli", provider="ollama_local",
+                    model="local-model", account_id=None, enabled=False,
+                    expected_generation=1,
+                )
+                self.assertFalse(pool.exists())
+
+                enabled = server_module.fleet_series_apply(
+                    prefix="d", count=2, runner="codex_cli", provider="ollama_local",
+                    model="local-model", account_id=None, enabled=True,
+                    expected_generation=2, codex_executable=executable,
+                )
+
+            self.assertEqual(disabled["created_count"], 0)
+            self.assertEqual(enabled["created_count"], 2)
+            self.assertTrue((pool / "d1" / "codex").is_file())
+            self.assertTrue((pool / "d2" / "config.toml").is_file())
+
+    def test_fleet_series_managed_update_requires_disabled_and_restores_on_cas(self) -> None:
+        from codex_master.fleet_service import FleetConflictError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                    model="old-model", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                with self.assertRaisesRegex(AgentError, "series_must_be_disabled"):
+                    server_module.fleet_series_apply(
+                        prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                        model="new-model", account_id=None, enabled=False,
+                        expected_generation=2, codex_executable=executable,
+                    )
+                server_module.fleet_series_disable(prefix="d", expected_generation=2)
+                before = {
+                    path.name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+                    for path in (pool / "d1").iterdir()
+                }
+                service = server_module.current_fleet_service()
+                with patch.object(service, "commit_snapshot", side_effect=FleetConflictError("generation_conflict")), patch.object(
+                    server_module, "current_fleet_service", return_value=service
+                ), patch.object(server_module, "agent_lease_status", return_value={"state": "unclaimed"}), patch.object(
+                    server_module, "run_tmux", return_value=stopped
+                ), patch.object(server_module, "pool_home_processes", return_value=[]):
+                    with self.assertRaisesRegex(AgentError, "generation_conflict"):
+                        server_module.fleet_series_apply(
+                            prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                            model="new-model", account_id=None, enabled=False,
+                            expected_generation=3, codex_executable=executable,
+                        )
+                restored = {
+                    path.name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+                    for path in (pool / "d1").iterdir()
+                }
+                self.assertEqual(restored, before)
+
+                with patch.object(server_module, "agent_lease_status", return_value={"state": "unclaimed"}), patch.object(
+                    server_module, "run_tmux", return_value=stopped
+                ), patch.object(server_module, "pool_home_processes", return_value=[]):
+                    result = server_module.fleet_series_apply(
+                        prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                        model="new-model", account_id=None, enabled=False,
+                        expected_generation=3, codex_executable=executable,
+                    )
+
+            self.assertEqual(result["updated_count"], 1)
+            self.assertEqual(tomllib.loads((pool / "d1" / "config.toml").read_text())["model"], "new-model")
+            self.assertEqual(
+                json.loads((pool / "d1" / server_module.FLEET_AGENT_MARKER_FILE).read_text())["model"],
+                "new-model",
+            )
+
+    def test_fleet_series_create_rejects_existing_home_and_unsafe_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            pool.mkdir()
+            foreign = pool / "d1"
+            foreign.mkdir()
+            sentinel = foreign / "sentinel"
+            sentinel.write_text("untouched", encoding="utf-8")
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            alias = root / "runner-link"
+            alias.symlink_to(executable)
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ):
+                with self.assertRaisesRegex(AgentError, "fleet_executable_invalid"):
+                    server_module.fleet_series_apply(
+                        prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                        model="local-model", account_id=None, expected_generation=1,
+                        codex_executable=alias,
+                    )
+                with self.assertRaisesRegex(AgentError, "fleet_create_target_exists"):
+                    server_module.fleet_series_apply(
+                        prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                        model="local-model", account_id=None, expected_generation=1,
+                        codex_executable=executable,
+                    )
+
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "untouched")
+            self.assertFalse((pool / server_module.FLEET_POOL_MARKER_FILE).exists())
+
+    def test_fleet_series_cleanup_failure_keeps_new_registry_and_tombstone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d", count=2, runner="codex_cli", provider="ollama_local",
+                    model="local-model", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                with patch.object(server_module, "agent_lease_status", return_value={"state": "unclaimed"}), patch.object(
+                    server_module, "run_tmux", return_value=stopped
+                ), patch.object(server_module, "pool_home_processes", return_value=[]), patch.object(
+                    server_module, "remove_agent_pool_entry", return_value="skipped"
+                ):
+                    result = server_module.fleet_series_apply(
+                        prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                        model="local-model", account_id=None, expected_generation=2,
+                        confirmed_remove_ids=["d2"], codex_executable=executable,
+                    )
+                stored = server_module.current_fleet_service().load()
+
+            self.assertTrue(result["cleanup_pending"])
+            self.assertEqual(stored.generation, 3)
+            self.assertEqual(stored.series[0].count, 1)
+            self.assertFalse((pool / "d2").exists())
+            self.assertEqual(
+                len([path for path in pool.iterdir() if path.name.startswith(server_module.FLEET_TOMBSTONE_PREFIX)]),
+                1,
+            )
+
+    def test_fleet_series_lifecycle_uses_registry_snapshot_when_runtime_pointer_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ):
+                previous = server_module.swap_agent_inventory(None)
+                try:
+                    server_module.fleet_series_apply(
+                        prefix="d", count=2, runner="codex_cli", provider="ollama_local",
+                        model="local-model", account_id=None, expected_generation=1,
+                        codex_executable=executable,
+                    )
+                    server_module.swap_agent_inventory(None)
+                    with patch.object(server_module, "agent_lease_status", wraps=server_module.agent_lease_status), patch.object(
+                        server_module, "run_tmux", return_value=stopped
+                    ), patch.object(server_module, "pool_home_processes", return_value=[]):
+                        result = server_module.fleet_series_apply(
+                            prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                            model="local-model", account_id=None, expected_generation=2,
+                            confirmed_remove_ids=["d2"], codex_executable=executable,
+                        )
+                finally:
+                    server_module.swap_agent_inventory(previous)
+
+            self.assertEqual(result["removed_count"], 1)
+
+    def test_fleet_series_publish_failure_after_cas_never_restores_old_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d", count=2, runner="codex_cli", provider="ollama_local",
+                    model="local-model", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                with patch.object(server_module, "agent_lease_status", return_value={"state": "unclaimed"}), patch.object(
+                    server_module, "run_tmux", return_value=stopped
+                ), patch.object(server_module, "pool_home_processes", return_value=[]), patch.object(
+                    server_module,
+                    "publish_agent_inventory",
+                    side_effect=AgentError("publish unavailable"),
+                ):
+                    with self.assertRaisesRegex(AgentError, "fleet_inventory_publish_failed"):
+                        server_module.fleet_series_apply(
+                            prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                            model="local-model", account_id=None, expected_generation=2,
+                            confirmed_remove_ids=["d2"], codex_executable=executable,
+                        )
+                stored = server_module.current_fleet_service().load()
+
+            self.assertEqual(stored.generation, 3)
+            self.assertEqual(stored.series[0].count, 1)
+            self.assertFalse((pool / "d2").exists())
+            self.assertEqual(
+                len([path for path in pool.iterdir() if path.name.startswith(server_module.FLEET_TOMBSTONE_PREFIX)]),
+                1,
+            )
+
+    def test_fleet_series_partial_home_write_rolls_back_owned_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            real_write = server_module.write_private_new_bytes
+
+            def fail_config(path: Path, data: bytes, mode: int = 0o600, *, dir_fd=None):
+                if path.name == "config.toml":
+                    raise AgentError("synthetic_write_failure")
+                return real_write(path, data, mode=mode, dir_fd=dir_fd)
+
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), patch.object(server_module, "write_private_new_bytes", side_effect=fail_config):
+                with self.assertRaisesRegex(AgentError, "fleet_materialization_failed"):
+                    server_module.fleet_series_apply(
+                        prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                        model="local-model", account_id=None, expected_generation=1,
+                        codex_executable=executable,
+                    )
+                stored = server_module.current_fleet_service().load()
+
+            self.assertEqual(stored.generation, 1)
+            self.assertFalse((pool / "d1").exists())
+
+    def test_fleet_series_tombstone_os_error_is_fixed_and_restores_staged_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d", count=3, runner="codex_cli", provider="ollama_local",
+                    model="local-model", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                real_rename = os.rename
+
+                def fail_second(src, dst, *args, **kwargs):
+                    if src == "d2":
+                        raise OSError("backend detail must stay private")
+                    return real_rename(src, dst, *args, **kwargs)
+
+                with patch.object(server_module, "agent_lease_status", return_value={"state": "unclaimed"}), patch.object(
+                    server_module, "run_tmux", return_value=stopped
+                ), patch.object(server_module, "pool_home_processes", return_value=[]), patch.object(
+                    server_module.os, "rename", side_effect=fail_second
+                ):
+                    with self.assertRaises(AgentError) as raised:
+                        server_module.fleet_series_apply(
+                            prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                            model="local-model", account_id=None, expected_generation=2,
+                            confirmed_remove_ids=["d2", "d3"], codex_executable=executable,
+                        )
+
+            self.assertEqual(str(raised.exception), "fleet_tombstone_stage_failed")
+            self.assertTrue((pool / "d2").is_dir())
+            self.assertTrue((pool / "d3").is_dir())
+
+    def test_fleet_series_runner_switch_partial_write_restores_old_managed_files(self) -> None:
+        from datetime import datetime, timezone
+
+        from codex_master.fleet_registry import (
+            AuthKind,
+            FleetAccount,
+            FleetSnapshot,
+            LimitState,
+            Provider,
+            SecretState,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                    model="old-model", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                server_module.fleet_series_disable(prefix="d", expected_generation=2)
+                service = server_module.current_fleet_service()
+                current = service.load()
+                account = FleetAccount(
+                    "target", "Target", Provider.GEMINI_API, AuthKind.API_KEY,
+                    SecretState.CONFIGURED, LimitState.READY, True, None,
+                    datetime.now(timezone.utc).isoformat(), None,
+                )
+                service.commit_snapshot(
+                    FleetSnapshot(1, 4, (account,), current.series),
+                    expected_generation=3,
+                )
+                before = {
+                    path.name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+                    for path in (pool / "d1").iterdir()
+                }
+                real_replace = server_module.replace_private_bytes
+
+                def fail_settings(path: Path, data: bytes, mode: int = 0o600, **kwargs):
+                    if path.name == "settings.json":
+                        raise AgentError("synthetic_update_failure")
+                    return real_replace(path, data, mode=mode, **kwargs)
+
+                with patch.object(server_module, "agent_lease_status", return_value={"state": "unclaimed"}), patch.object(
+                    server_module, "run_tmux", return_value=stopped
+                ), patch.object(server_module, "pool_home_processes", return_value=[]), patch.object(
+                    server_module, "replace_private_bytes", side_effect=fail_settings
+                ):
+                    with self.assertRaisesRegex(AgentError, "fleet_managed_update_failed"):
+                        server_module.fleet_series_apply(
+                            prefix="d", count=1, runner="gemini_cli", provider="gemini_api",
+                            model="new-model", account_id="target", enabled=False,
+                            expected_generation=4, gemini_executable=executable,
+                        )
+                after = {
+                    path.name: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+                    for path in (pool / "d1").iterdir()
+                }
+                self.assertEqual(after, before)
+                with patch.object(server_module, "agent_lease_status", return_value={"state": "unclaimed"}), patch.object(
+                    server_module, "run_tmux", return_value=stopped
+                ), patch.object(server_module, "pool_home_processes", return_value=[]):
+                    switched_result = server_module.fleet_series_apply(
+                        prefix="d", count=1, runner="gemini_cli", provider="gemini_api",
+                        model="new-model", account_id="target", enabled=False,
+                        expected_generation=4, gemini_executable=executable,
+                    )
+                switched_names = {path.name for path in (pool / "d1").iterdir()}
+
+            self.assertEqual(after, before)
+            self.assertNotIn("gemini", after)
+            self.assertNotIn("settings.json", after)
+            self.assertEqual(switched_result["updated_count"], 1)
+            self.assertIn("gemini", switched_names)
+            self.assertIn("settings.json", switched_names)
+            self.assertNotIn("codex", switched_names)
+            self.assertNotIn("config.toml", switched_names)
 
     @patch("codex_master.server.status_agent")
     def test_multi_agent_status_results_are_paged_for_broad_selectors(self, mock_status_agent) -> None:
@@ -11472,6 +12293,29 @@ class ServerHelpersTest(unittest.TestCase):
             (process / "environ").write_bytes(b"CODEX_HOME=a1\0")
             (process / "status").write_text("Name:\tsleep\nState:\tS (sleeping)\nPPid:\t1\n", encoding="utf-8")
             (process / "cwd").symlink_to(work, target_is_directory=True)
+
+            processes = server_module.pool_home_processes(home, proc_root)
+
+        self.assertIsNotNone(processes)
+        self.assertEqual([item["pid"] for item in processes], [100])
+
+    def test_pool_home_processes_detects_gemini_cli_home(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home = root / "pool" / "d1"
+            home.mkdir(parents=True)
+            proc_root = root / "proc"
+            process = proc_root / "100"
+            process.mkdir(parents=True)
+            (process / "environ").write_bytes(
+                f"GEMINI_CLI_HOME={home}\0".encode("utf-8")
+            )
+            (process / "status").write_text(
+                "Name:\tgemini\nState:\tS (sleeping)\nPPid:\t1\n",
+                encoding="utf-8",
+            )
 
             processes = server_module.pool_home_processes(home, proc_root)
 

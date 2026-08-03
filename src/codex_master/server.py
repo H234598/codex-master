@@ -44,6 +44,8 @@ from codex_master.fleet_registry import (
     build_inventory,
     normalize_fleet_document,
     plan_series_apply,
+    plan_series_delete,
+    plan_series_disable,
 )
 from codex_master.fleet_service import FleetConflictError, FleetPaths, FleetPrivateIO, FleetService
 
@@ -712,11 +714,13 @@ def _legacy_fleet_analysis(*, include_running: bool) -> tuple[FleetSnapshot | No
         auth_by_series[prefix] = auth_status
 
     running: set[str] = set()
+    running_unknown = False
     if include_running:
         try:
             running = set(managed_applet_inventory(inventory)["running_agents"])
         except AgentError:
-            running = set()
+            running_unknown = True
+            reason_codes.append("legacy_running_unknown")
 
     for prefix in inventory.series_prefixes:
         ids = inventory.by_series[f"{prefix}-series"]
@@ -724,7 +728,7 @@ def _legacy_fleet_analysis(*, include_running: bool) -> tuple[FleetSnapshot | No
             {
                 "prefix": prefix,
                 "agent_count": len(ids),
-                "running_count": sum(agent in running for agent in ids),
+                "running_count": None if running_unknown else sum(agent in running for agent in ids),
                 "auth_status": auth_by_series[prefix],
             }
         )
@@ -768,7 +772,11 @@ def _legacy_fleet_analysis(*, include_running: bool) -> tuple[FleetSnapshot | No
         "representable": snapshot is not None,
         "agent_count": min(len(inventory.agent_ids), MAX_POOL_AGENTS),
         "series_count": min(len(inventory.series_prefixes), MAX_POOL_SERIES),
-        "running_count": min(len(running & set(inventory.agent_ids)), MAX_POOL_AGENTS),
+        "running_count": (
+            None
+            if running_unknown
+            else min(len(running & set(inventory.agent_ids)), MAX_POOL_AGENTS)
+        ),
         "reason_codes": reason_codes,
         "series": series_rows,
     }
@@ -3535,8 +3543,13 @@ def current_fleet_service() -> FleetService:
 
 
 @contextlib.contextmanager
-def agent_lifecycle_lock(agent: str, *, timeout_seconds: float | None = None) -> Any:
-    agent = canonical_agent_id(agent)
+def agent_lifecycle_lock(
+    agent: str,
+    *,
+    timeout_seconds: float | None = None,
+    snapshot: InventorySnapshot | None = None,
+) -> Any:
+    agent = canonical_agent_id(agent, snapshot=snapshot)
     held_locks = _LIFECYCLE_LOCK_STACK.get()
     if agent in held_locks:
         yield
@@ -3764,8 +3777,8 @@ def pool_root_lock(root: Path) -> Any:
                 pass
 
 
-def agent_lease_path(agent: str) -> Path:
-    agent = canonical_agent_id(agent)
+def agent_lease_path(agent: str, snapshot: InventorySnapshot | None = None) -> Path:
+    agent = canonical_agent_id(agent, snapshot=snapshot)
     return LEASE_DIR / f"{agent}.json"
 
 
@@ -4407,9 +4420,12 @@ def age_seconds_from_utc(value: Any, *, now: float | None = None) -> int | None:
     return max(0, int(current - timestamp))
 
 
-def read_agent_lease_record(agent: str) -> dict[str, Any] | None:
-    agent = canonical_agent_id(agent)
-    candidate_paths = [agent_lease_path(agent)]
+def read_agent_lease_record(
+    agent: str,
+    snapshot: InventorySnapshot | None = None,
+) -> dict[str, Any] | None:
+    agent = canonical_agent_id(agent, snapshot=snapshot)
+    candidate_paths = [agent_lease_path(agent, snapshot=snapshot)]
     candidate_paths.extend(LEASE_DIR / f"{legacy_agent}.json" for legacy_agent in sorted(agent_record_aliases(agent) - {agent}))
     for path in candidate_paths:
         if not path_present_no_follow(path):
@@ -4431,8 +4447,12 @@ def read_agent_lease_record(agent: str) -> dict[str, Any] | None:
     return None
 
 
-def public_agent_lease(agent: str, record: dict[str, Any] | None = None) -> dict[str, Any]:
-    agent = canonical_agent_id(agent)
+def public_agent_lease(
+    agent: str,
+    record: dict[str, Any] | None = None,
+    snapshot: InventorySnapshot | None = None,
+) -> dict[str, Any]:
+    agent = canonical_agent_id(agent, snapshot=snapshot)
     now = time.time()
     valid_expiry = True
     if not record:
@@ -4540,12 +4560,21 @@ def stopped_foreign_lease_recovery_status(
     }
 
 
-def agent_lease_status(agent: str, *, initialize_state: bool = True) -> dict[str, Any]:
-    agent = canonical_agent_id(agent)
+def agent_lease_status(
+    agent: str,
+    *,
+    initialize_state: bool = True,
+    snapshot: InventorySnapshot | None = None,
+) -> dict[str, Any]:
+    agent = canonical_agent_id(agent, snapshot=snapshot)
     if initialize_state:
         ensure_state()
     try:
-        return public_agent_lease(agent, read_agent_lease_record(agent))
+        return public_agent_lease(
+            agent,
+            read_agent_lease_record(agent, snapshot=snapshot),
+            snapshot=snapshot,
+        )
     except AgentError:
         return {
             "agent": agent,
@@ -5800,7 +5829,9 @@ def proc_is_codex_like(status: dict[str, str], argv: list[str]) -> bool:
         name == "codex"
         or name == "codex-code-mode-host"
         or name == "codex-code-mode"
+        or name == "gemini"
         or argv0_name == "codex"
+        or argv0_name == "gemini"
     ):
         return True
     if argv0_name not in {"node", "nodejs"} or len(argv) < 2:
@@ -5840,7 +5871,11 @@ def proc_is_codex_like(status: dict[str, str], argv: list[str]) -> bool:
     if not entrypoint:
         return False
     parts = Path(entrypoint.lower()).parts
-    return any(left == "@openai" and right == "codex" for left, right in zip(parts, parts[1:]))
+    return any(
+        (left == "@openai" and right == "codex")
+        or (left == "@google" and right == "gemini-cli")
+        for left, right in zip(parts, parts[1:])
+    )
 
 
 def resolve_proc_cwd(pid_dir: Path) -> tuple[Path | None, bool]:
@@ -5909,7 +5944,7 @@ def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[di
                 except (OSError, RuntimeError):
                     matches_home = False
         else:
-            configured_home = env.get("CODEX_HOME", "")
+            configured_home = env.get("CODEX_HOME", "") or env.get("GEMINI_CLI_HOME", "")
             if configured_home:
                 try:
                     configured_path = Path(configured_home).expanduser()
@@ -6043,7 +6078,7 @@ def pool_home_processes(home: Path, proc_root: Path = Path("/proc")) -> list[dic
             if proc_is_codex_like(status, argv):
                 return None
         else:
-            configured_home = env.get("CODEX_HOME", "")
+            configured_home = env.get("CODEX_HOME", "") or env.get("GEMINI_CLI_HOME", "")
             if configured_home:
                 try:
                     configured_path = Path(configured_home).expanduser()
@@ -14300,6 +14335,12 @@ def _fleet_write_root_marker(root_fd: int) -> None:
         raise AgentError("fleet_pool_marker_invalid")
 
 
+class _FleetPartialHomeError(Exception):
+    def __init__(self, home_stat: os.stat_result) -> None:
+        self.home_stat = home_stat
+        super().__init__("fleet_partial_home")
+
+
 def _fleet_create_home(
     root_fd: int,
     agent_id: str,
@@ -14320,16 +14361,61 @@ def _fleet_create_home(
     try:
         home_fd = os.open(agent_id, flags, dir_fd=root_fd)
         os.fchmod(home_fd, 0o700)
+        home_stat = os.fstat(home_fd)
         for name, (content, mode) in artifacts["files"].items():
             write_private_new_bytes(Path(name), content, mode=mode, dir_fd=home_fd)
-        return os.fstat(home_fd)
-    except AgentError:
-        raise
-    except OSError as exc:
-        raise AgentError("fleet_home_create_failed") from exc
+        return home_stat
+    except Exception as exc:
+        if home_fd >= 0:
+            raise _FleetPartialHomeError(os.fstat(home_fd)) from exc
+        if isinstance(exc, AgentError):
+            raise
+        raise AgentError("fleet_home_create_failed") from None
     finally:
         if home_fd >= 0:
             os.close(home_fd)
+
+
+def _fleet_created_home_unchanged(
+    root: Path,
+    agent_id: str,
+    expected_home: os.stat_result,
+    artifacts: dict[str, Any],
+) -> bool:
+    home = root / agent_id
+    try:
+        current_home = home.lstat()
+        if (
+            not source_identity_matches(current_home, expected_home)
+            or not stat_module.S_ISDIR(current_home.st_mode)
+            or stat_module.S_ISLNK(current_home.st_mode)
+            or stat_module.S_IMODE(current_home.st_mode) != 0o700
+        ):
+            return False
+        home_fd = open_directory_no_follow_matching(
+            home,
+            current_home,
+            error_text="fleet_create_rollback_diverged",
+            changed_text="fleet_create_rollback_diverged",
+        )
+        try:
+            names = set(os.listdir(home_fd))
+            if not names <= set(artifacts["files"]):
+                return False
+            pinned = Path(f"/proc/self/fd/{home_fd}")
+            for name in names:
+                content, mode = artifacts["files"][name]
+                _fleet_read_exact_file(
+                    pinned / name,
+                    content,
+                    mode,
+                    "fleet_create_rollback_diverged",
+                )
+            return True
+        finally:
+            os.close(home_fd)
+    except (AgentError, OSError):
+        return False
 
 
 def _fleet_rollback_created(
@@ -14345,12 +14431,12 @@ def _fleet_rollback_created(
             error_text="fleet_create_rollback_diverged",
         ) as root:
             for agent_id, expected_home, artifacts in reversed(created):
-                try:
-                    current = _fleet_verify_home(root, agent_id, artifacts, exact_contents=True)
-                except AgentError:
-                    clean = False
-                    continue
-                if not source_identity_matches(current, expected_home):
+                if not _fleet_created_home_unchanged(
+                    root,
+                    agent_id,
+                    expected_home,
+                    artifacts,
+                ):
                     clean = False
                     continue
                 if remove_agent_pool_entry(root / agent_id) != "removed":
@@ -14375,6 +14461,531 @@ def _fleet_publish_stored(service: FleetService, stored: FleetSnapshot) -> None:
         raise AgentError("fleet_inventory_publish_failed") from None
 
 
+def _fleet_tmux_state(session: str) -> str:
+    try:
+        result = run_tmux(["has-session", "-t", session], check=False)
+    except Exception:
+        return "unknown"
+    if result.returncode == 0:
+        return "running"
+    if result.returncode == 1:
+        return "stopped"
+    return "unknown"
+
+
+def _fleet_managed_home_state(
+    root: Path,
+    agent: AgentDescriptor,
+    *,
+    entry_name: str | None = None,
+    strict_contents: bool,
+) -> os.stat_result:
+    home = root / (entry_name or agent.agent_id)
+    try:
+        home_stat = home.lstat()
+    except OSError as exc:
+        raise AgentError("fleet_home_content_invalid") from exc
+    if (
+        not stat_module.S_ISDIR(home_stat.st_mode)
+        or stat_module.S_ISLNK(home_stat.st_mode)
+        or stat_module.S_IMODE(home_stat.st_mode) != 0o700
+    ):
+        raise AgentError("fleet_home_content_invalid")
+    home_fd = open_directory_no_follow_matching(
+        home,
+        home_stat,
+        error_text="fleet_home_content_invalid",
+        changed_text="fleet_home_content_invalid",
+    )
+    try:
+        pinned = Path(f"/proc/self/fd/{home_fd}")
+        marker_bytes = pool_read_private_bytes(
+            pinned / FLEET_AGENT_MARKER_FILE,
+            MAX_POOL_SPEC_BYTES,
+            "fleet_home_content_invalid",
+        )
+        try:
+            marker = json.loads(marker_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise AgentError("fleet_home_content_invalid") from None
+        expected_fields = {
+            "schema_version",
+            "kind",
+            "agent_id",
+            "prefix",
+            "runner",
+            "provider",
+            "model",
+            "managed_files",
+            "files",
+        }
+        wrapper_name = "codex" if agent.runner is RunnerKind.CODEX_CLI else "gemini"
+        config_name = "config.toml" if agent.runner is RunnerKind.CODEX_CLI else "settings.json"
+        expected_files = {wrapper_name, config_name}
+        if (
+            not isinstance(marker, dict)
+            or set(marker) != expected_fields
+            or marker.get("schema_version") != 1
+            or marker.get("kind") != "codex_master_fleet_agent"
+            or marker.get("agent_id") != agent.agent_id
+            or marker.get("prefix") != agent.series_prefix
+            or marker.get("runner") != agent.runner.value
+            or marker.get("provider") != agent.provider.value
+            or marker.get("model") != agent.model
+            or not isinstance(marker.get("managed_files"), list)
+            or set(marker["managed_files"]) != expected_files
+            or not isinstance(marker.get("files"), dict)
+            or set(marker["files"]) != expected_files
+        ):
+            raise AgentError("fleet_home_content_invalid")
+        for name in expected_files:
+            digest = marker["files"].get(name)
+            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise AgentError("fleet_home_content_invalid")
+            mode = 0o700 if name == wrapper_name else 0o600
+            try:
+                file_stat = (pinned / name).lstat()
+            except OSError as exc:
+                raise AgentError("fleet_home_content_invalid") from exc
+            if (
+                not stat_module.S_ISREG(file_stat.st_mode)
+                or getattr(file_stat, "st_nlink", 1) != 1
+                or stat_module.S_IMODE(file_stat.st_mode) != mode
+            ):
+                raise AgentError("fleet_home_content_invalid")
+            content = pool_read_private_bytes(
+                pinned / name,
+                MAX_POOL_SPEC_BYTES,
+                "fleet_home_content_invalid",
+                expected_target_stat=file_stat,
+            )
+            if not hmac.compare_digest(hashlib.sha256(content).hexdigest(), digest):
+                raise AgentError("fleet_home_content_invalid")
+        names = set(os.listdir(home_fd))
+        allowed = {FLEET_AGENT_MARKER_FILE, *expected_files, "auth.json"}
+        if strict_contents and not names <= allowed:
+            raise AgentError("fleet_home_content_invalid")
+        if "auth.json" in names:
+            auth_stat = os.stat("auth.json", dir_fd=home_fd, follow_symlinks=False)
+            if (
+                not stat_module.S_ISREG(auth_stat.st_mode)
+                or getattr(auth_stat, "st_nlink", 1) != 1
+            ):
+                raise AgentError("fleet_home_content_invalid")
+        return home_stat
+    except OSError as exc:
+        raise AgentError("fleet_home_content_invalid") from exc
+    finally:
+        os.close(home_fd)
+
+
+@contextlib.contextmanager
+def _fleet_idle_agent_locks(
+    inventory: InventorySnapshot,
+    agent_ids_to_check: list[str],
+) -> Any:
+    pinned: dict[str, os.stat_result] = {}
+    with pool_agent_lifecycle_locks(agent_ids_to_check):
+        for agent_id in sorted(agent_ids_to_check):
+            agent = inventory.agents[agent_id]
+            try:
+                home_stat = agent.home.lstat()
+            except OSError as exc:
+                raise AgentError("fleet_home_content_invalid") from exc
+            if not stat_module.S_ISDIR(home_stat.st_mode) or stat_module.S_ISLNK(home_stat.st_mode):
+                raise AgentError("fleet_home_content_invalid")
+            pinned[agent_id] = home_stat
+            lease = agent_lease_status(
+                agent_id,
+                initialize_state=False,
+                snapshot=inventory,
+            )
+            if lease.get("state") not in {"unclaimed", "expired"}:
+                raise AgentError("fleet_agent_lease_active")
+            tmux_state = _fleet_tmux_state(agent.session)
+            if tmux_state == "running":
+                raise AgentError("fleet_agent_running")
+            if tmux_state != "stopped":
+                raise AgentError("fleet_agent_tmux_unknown")
+            processes = pool_home_processes(agent.home)
+            if processes is None:
+                raise AgentError("fleet_agent_process_unknown")
+            if processes:
+                raise AgentError("fleet_agent_process_active")
+        yield pinned
+
+
+def _fleet_restore_tombstones(staged: list[dict[str, Any]]) -> bool:
+    if not staged:
+        return True
+    try:
+        agent_ids_to_restore = [item["agent"].agent_id for item in staged]
+        with pool_agent_lifecycle_locks(
+            agent_ids_to_restore,
+            snapshot=staged[0]["inventory"],
+        ), pool_root_lock(
+            AGENT_POOL_ROOT
+        ), pool_root_operation(
+            AGENT_POOL_ROOT,
+            ensure=False,
+            error_text="fleet_tombstone_rollback_diverged",
+        ) as root:
+            root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                for item in reversed(staged):
+                    agent = item["agent"]
+                    tombstone = item["tombstone"]
+                    current = _fleet_managed_home_state(
+                        root,
+                        agent,
+                        entry_name=tombstone,
+                        strict_contents=True,
+                    )
+                    if not source_identity_matches(current, item["home_stat"]):
+                        return False
+                    try:
+                        os.stat(agent.agent_id, dir_fd=root_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        return False
+                    os.rename(
+                        tombstone,
+                        agent.agent_id,
+                        src_dir_fd=root_fd,
+                        dst_dir_fd=root_fd,
+                    )
+            finally:
+                os.close(root_fd)
+    except (AgentError, OSError):
+        return False
+    return True
+
+
+def _fleet_stage_tombstones(
+    inventory: InventorySnapshot,
+    agent_ids_to_remove: list[str],
+) -> list[dict[str, Any]]:
+    staged: list[dict[str, Any]] = []
+    try:
+        with _fleet_idle_agent_locks(inventory, agent_ids_to_remove) as pinned:
+            with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+                AGENT_POOL_ROOT,
+                ensure=False,
+                error_text="fleet_pool_root_invalid",
+            ) as root:
+                _fleet_root_marker_state(root)
+                root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    ordered = sorted(
+                        agent_ids_to_remove,
+                        key=lambda item: inventory.agents[item].ordinal,
+                        reverse=True,
+                    )
+                    for agent_id in ordered:
+                        agent = inventory.agents[agent_id]
+                        current = _fleet_managed_home_state(
+                            root,
+                            agent,
+                            strict_contents=True,
+                        )
+                        if not source_identity_matches(current, pinned[agent_id]):
+                            raise AgentError("fleet_home_changed")
+                        tombstone = f"{FLEET_TOMBSTONE_PREFIX}{uuid.uuid4().hex}"
+                        try:
+                            os.stat(tombstone, dir_fd=root_fd, follow_symlinks=False)
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            raise AgentError("fleet_tombstone_collision")
+                        try:
+                            os.rename(
+                                agent_id,
+                                tombstone,
+                                src_dir_fd=root_fd,
+                                dst_dir_fd=root_fd,
+                            )
+                        except OSError as exc:
+                            raise AgentError("fleet_tombstone_stage_failed") from exc
+                        tombstone_stat = os.stat(
+                            tombstone,
+                            dir_fd=root_fd,
+                            follow_symlinks=False,
+                        )
+                        if not source_identity_matches(tombstone_stat, current):
+                            raise AgentError("fleet_home_changed")
+                        staged.append(
+                            {
+                                "agent": agent,
+                                "inventory": inventory,
+                                "tombstone": tombstone,
+                                "home_stat": current,
+                            }
+                        )
+                finally:
+                    os.close(root_fd)
+    except Exception:
+        if staged and not _fleet_restore_tombstones(staged):
+            raise AgentError("fleet_tombstone_rollback_diverged") from None
+        raise
+    return staged
+
+
+def _fleet_cleanup_tombstones(staged: list[dict[str, Any]]) -> bool:
+    cleanup_pending = False
+    if not staged:
+        return cleanup_pending
+    try:
+        with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+            AGENT_POOL_ROOT,
+            ensure=False,
+            error_text="fleet_cleanup_pending",
+        ) as root:
+            for item in staged:
+                try:
+                    current = _fleet_managed_home_state(
+                        root,
+                        item["agent"],
+                        entry_name=item["tombstone"],
+                        strict_contents=True,
+                    )
+                    if not source_identity_matches(current, item["home_stat"]):
+                        cleanup_pending = True
+                        continue
+                    if remove_agent_pool_entry(root / item["tombstone"]) != "removed":
+                        cleanup_pending = True
+                except AgentError:
+                    cleanup_pending = True
+    except AgentError:
+        cleanup_pending = True
+    return cleanup_pending
+
+
+def _fleet_commit_staged_removal(
+    service: FleetService,
+    planned: FleetSnapshot,
+    *,
+    expected_generation: int,
+    inventory: InventorySnapshot,
+    agent_ids_to_remove: list[str],
+) -> tuple[FleetSnapshot, bool]:
+    staged = _fleet_stage_tombstones(inventory, agent_ids_to_remove)
+    try:
+        stored = service.commit_snapshot(planned, expected_generation=expected_generation)
+    except Exception as exc:
+        if not _fleet_restore_tombstones(staged):
+            raise AgentError("fleet_tombstone_rollback_diverged") from None
+        if isinstance(exc, FleetConflictError):
+            raise AgentError("generation_conflict") from None
+        raise AgentError("fleet_registry_commit_failed") from None
+    _fleet_publish_stored(service, stored)
+    return stored, _fleet_cleanup_tombstones(staged)
+
+
+def _fleet_home_file_snapshot(home_fd: int, name: str) -> tuple[bytes, int, os.stat_result]:
+    pinned = Path(f"/proc/self/fd/{home_fd}") / name
+    try:
+        current = os.stat(name, dir_fd=home_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise AgentError("fleet_home_content_invalid") from exc
+    if not stat_module.S_ISREG(current.st_mode) or getattr(current, "st_nlink", 1) != 1:
+        raise AgentError("fleet_home_content_invalid")
+    return (
+        pool_read_private_bytes(
+            pinned,
+            MAX_POOL_SPEC_BYTES,
+            "fleet_home_content_invalid",
+            expected_target_stat=current,
+        ),
+        stat_module.S_IMODE(current.st_mode),
+        current,
+    )
+
+
+def _fleet_restore_managed_updates(backups: list[dict[str, Any]]) -> bool:
+    if not backups:
+        return True
+    try:
+        ids = [item["old_agent"].agent_id for item in backups]
+        with pool_agent_lifecycle_locks(
+            ids,
+            snapshot=backups[0]["inventory"],
+        ), pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+            AGENT_POOL_ROOT,
+            ensure=False,
+            error_text="fleet_update_rollback_diverged",
+        ) as root:
+            for item in reversed(backups):
+                agent_id = item["old_agent"].agent_id
+                home = root / agent_id
+                try:
+                    current_home = home.lstat()
+                except OSError:
+                    return False
+                if not source_identity_matches(current_home, item["home_stat"]):
+                    return False
+                home_fd = open_directory_no_follow_matching(
+                    home,
+                    current_home,
+                    error_text="fleet_update_rollback_diverged",
+                    changed_text="fleet_update_rollback_diverged",
+                )
+                try:
+                    old_files = item["old_files"]
+                    new_files = item["new_files"]
+                    for name in set(old_files) | set(new_files):
+                        try:
+                            current_stat = os.stat(name, dir_fd=home_fd, follow_symlinks=False)
+                        except FileNotFoundError:
+                            if (name in old_files) is not (name in new_files):
+                                continue
+                            return False
+                        except OSError:
+                            return False
+                        if not stat_module.S_ISREG(current_stat.st_mode) or getattr(current_stat, "st_nlink", 1) != 1:
+                            return False
+                        current_bytes = pool_read_private_bytes(
+                            Path(f"/proc/self/fd/{home_fd}") / name,
+                            MAX_POOL_SPEC_BYTES,
+                            "fleet_update_rollback_diverged",
+                            expected_target_stat=current_stat,
+                        )
+                        known = []
+                        if name in old_files:
+                            known.append(old_files[name][0])
+                        if name in new_files:
+                            known.append(new_files[name][0])
+                        if current_bytes not in known:
+                            return False
+                    for name in set(new_files) - set(old_files):
+                        try:
+                            os.unlink(name, dir_fd=home_fd)
+                        except FileNotFoundError:
+                            pass
+                        except OSError:
+                            return False
+                    pinned_home = Path(f"/proc/self/fd/{home_fd}")
+                    for name, (content, mode, _stat) in old_files.items():
+                        replace_private_bytes(pinned_home / name, content, mode=mode)
+                finally:
+                    os.close(home_fd)
+                _fleet_managed_home_state(
+                    root,
+                    item["old_agent"],
+                    strict_contents=True,
+                )
+    except (AgentError, OSError):
+        return False
+    return True
+
+
+def _fleet_apply_managed_update(
+    service: FleetService,
+    current: FleetSnapshot,
+    planned: FleetSnapshot,
+    existing: FleetSeries,
+    candidate: FleetSeries,
+    *,
+    expected_generation: int,
+    codex_executable: Path | None,
+    gemini_executable: Path | None,
+) -> FleetSnapshot:
+    if existing.enabled:
+        raise AgentError("series_must_be_disabled")
+    if existing.count != candidate.count:
+        raise AgentError("fleet_managed_update_requires_stable_count")
+    old_inventory = build_inventory(current, AGENT_POOL_ROOT)
+    new_inventory = build_inventory(planned, AGENT_POOL_ROOT)
+    ids = list(old_inventory.by_series[f"{existing.prefix}-series"])
+    backups: list[dict[str, Any]] = []
+    try:
+        with _fleet_pinned_executable(
+            candidate.runner,
+            codex_executable=codex_executable,
+            gemini_executable=gemini_executable,
+        ) as executable:
+            new_artifacts = {
+                agent_id: _fleet_home_artifacts(new_inventory.agents[agent_id], executable)
+                for agent_id in ids
+            }
+            with _fleet_idle_agent_locks(old_inventory, ids) as pinned:
+                with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+                    AGENT_POOL_ROOT,
+                    ensure=False,
+                    error_text="fleet_pool_root_invalid",
+                ) as root:
+                    _fleet_root_marker_state(root)
+                    for agent_id in ids:
+                        old_agent = old_inventory.agents[agent_id]
+                        new_agent = new_inventory.agents[agent_id]
+                        current_home = _fleet_managed_home_state(
+                            root,
+                            old_agent,
+                            strict_contents=True,
+                        )
+                        if not source_identity_matches(current_home, pinned[agent_id]):
+                            raise AgentError("fleet_home_changed")
+                        home_fd = open_directory_no_follow_matching(
+                            root / agent_id,
+                            current_home,
+                            error_text="fleet_home_changed",
+                            changed_text="fleet_home_changed",
+                        )
+                        try:
+                            old_wrapper = "codex" if old_agent.runner is RunnerKind.CODEX_CLI else "gemini"
+                            old_config = "config.toml" if old_agent.runner is RunnerKind.CODEX_CLI else "settings.json"
+                            old_names = {old_wrapper, old_config, FLEET_AGENT_MARKER_FILE}
+                            old_files = {
+                                name: _fleet_home_file_snapshot(home_fd, name)
+                                for name in old_names
+                            }
+                            new_files = new_artifacts[agent_id]["files"]
+                            backup = {
+                                "old_agent": old_agent,
+                                "new_agent": new_agent,
+                                "inventory": old_inventory,
+                                "home_stat": current_home,
+                                "old_files": old_files,
+                                "new_files": new_files,
+                            }
+                            backups.append(backup)
+                            pinned_home = Path(f"/proc/self/fd/{home_fd}")
+                            for name, (content, mode) in new_files.items():
+                                try:
+                                    replace_private_bytes(pinned_home / name, content, mode=mode)
+                                except Exception:
+                                    raise AgentError("fleet_managed_update_failed") from None
+                            for name in old_names - set(new_files):
+                                expected_old = old_files[name][2]
+                                latest = os.stat(name, dir_fd=home_fd, follow_symlinks=False)
+                                if not source_identity_with_snapshot_matches(latest, expected_old):
+                                    raise AgentError("fleet_home_changed")
+                                os.unlink(name, dir_fd=home_fd)
+                        finally:
+                            os.close(home_fd)
+                        _fleet_managed_home_state(
+                            root,
+                            new_agent,
+                            strict_contents=True,
+                        )
+    except Exception as exc:
+        if backups and not _fleet_restore_managed_updates(backups):
+            raise AgentError("fleet_update_rollback_diverged") from None
+        if isinstance(exc, AgentError):
+            raise
+        raise AgentError("fleet_managed_update_failed") from None
+    try:
+        stored = service.commit_snapshot(planned, expected_generation=expected_generation)
+    except Exception as exc:
+        if not _fleet_restore_managed_updates(backups):
+            raise AgentError("fleet_update_rollback_diverged") from None
+        if isinstance(exc, FleetConflictError):
+            raise AgentError("generation_conflict") from None
+        raise AgentError("fleet_registry_commit_failed") from None
+    _fleet_publish_stored(service, stored)
+    return stored
+
+
 def fleet_series_apply(
     *,
     prefix: str,
@@ -14390,7 +15001,7 @@ def fleet_series_apply(
     gemini_executable: Path | None = None,
 ) -> dict[str, Any]:
     service = current_fleet_service()
-    plan, _current, planned, existing, candidate = _fleet_series_plan_with_service(
+    plan, current, planned, existing, candidate = _fleet_series_plan_with_service(
         service,
         prefix=prefix,
         count=count,
@@ -14402,22 +15013,79 @@ def fleet_series_apply(
         expected_generation=expected_generation,
         confirmed_remove_ids=confirmed_remove_ids,
     )
-    if plan["remove_count"]:
-        raise AgentError("fleet_series_remove_not_supported")
-    if plan["update_count"]:
-        raise AgentError("fleet_series_update_not_supported")
-    build_inventory(planned, AGENT_POOL_ROOT)
+    planned_inventory = build_inventory(planned, AGENT_POOL_ROOT)
     old_count = existing.count if existing is not None else 0
+    managed_changed = existing is not None and (
+        existing.runner is not candidate.runner
+        or existing.provider is not candidate.provider
+        or existing.model != candidate.model
+    )
+    if managed_changed:
+        stored = _fleet_apply_managed_update(
+            service,
+            current,
+            planned,
+            existing,
+            candidate,
+            expected_generation=expected_generation,
+            codex_executable=codex_executable,
+            gemini_executable=gemini_executable,
+        )
+        return {
+            "mutation_performed": True,
+            "generation": stored.generation,
+            "created_count": 0,
+            "kept_count": 0,
+            "updated_count": candidate.count,
+            "removed_count": 0,
+            "cleanup_pending": False,
+            "pool_root": "not_returned",
+            "raw_output": "not_returned",
+        }
+    enabling = existing is not None and not existing.enabled and candidate.enabled
+    registry_only = (
+        (existing is None and not candidate.enabled)
+        or (
+            existing is not None
+            and old_count == candidate.count
+            and plan["update_count"] > 0
+            and not enabling
+        )
+    )
+    if registry_only:
+        try:
+            stored = service.commit_snapshot(planned, expected_generation=expected_generation)
+        except FleetConflictError:
+            raise AgentError("generation_conflict") from None
+        except Exception:
+            raise AgentError("fleet_registry_commit_failed") from None
+        _fleet_publish_stored(service, stored)
+        return {
+            "mutation_performed": True,
+            "generation": stored.generation,
+            "created_count": 0,
+            "kept_count": candidate.count if existing is not None else 0,
+            "updated_count": plan["update_count"],
+            "removed_count": 0,
+            "cleanup_pending": False,
+            "pool_root": "not_returned",
+            "raw_output": "not_returned",
+        }
+
     create_ids = (
         [f"{candidate.prefix}{ordinal}" for ordinal in range(old_count + 1, candidate.count + 1)]
         if candidate.enabled
         else []
     )
     keep_ids = (
-        [f"{candidate.prefix}{ordinal}" for ordinal in range(1, old_count + 1)]
+        [f"{candidate.prefix}{ordinal}" for ordinal in range(1, min(old_count, candidate.count) + 1)]
         if candidate.enabled
         else []
     )
+    remove_ids = [
+        f"{candidate.prefix}{ordinal}"
+        for ordinal in range(candidate.count + 1, old_count + 1)
+    ]
     artifacts: dict[str, dict[str, Any]] = {}
     created: list[tuple[str, os.stat_result, dict[str, Any]]] = []
     try:
@@ -14432,40 +15100,74 @@ def fleet_series_apply(
         )
         with executable_context as executable:
             if executable is not None:
-                inventory = build_inventory(planned, AGENT_POOL_ROOT)
                 for agent_id in (*keep_ids, *create_ids):
                     artifacts[agent_id] = _fleet_home_artifacts(
-                        inventory.agents[agent_id],
+                        planned_inventory.agents[agent_id],
                         executable,
                     )
-            with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
-                AGENT_POOL_ROOT,
-                ensure=True,
-                error_text="fleet_pool_root_invalid",
-            ) as root:
-                marker_present = _fleet_root_marker_state(root)
-                for agent_id in keep_ids:
-                    _fleet_verify_home(root, agent_id, artifacts[agent_id], exact_contents=False)
-                for agent_id in create_ids:
-                    if path_present_no_follow(root / agent_id):
-                        raise AgentError("fleet_create_target_exists")
-                root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-                try:
-                    if not marker_present:
-                        _fleet_write_root_marker(root_fd)
+            if keep_ids or create_ids:
+                with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+                    AGENT_POOL_ROOT,
+                    ensure=True,
+                    error_text="fleet_pool_root_invalid",
+                ) as root:
+                    marker_present = _fleet_root_marker_state(root)
+                    if enabling:
+                        for agent_id in tuple(keep_ids):
+                            if not path_present_no_follow(root / agent_id):
+                                keep_ids.remove(agent_id)
+                                create_ids.append(agent_id)
+                    for agent_id in keep_ids:
+                        _fleet_verify_home(root, agent_id, artifacts[agent_id], exact_contents=False)
                     for agent_id in create_ids:
-                        home_stat = _fleet_create_home(root_fd, agent_id, artifacts[agent_id])
-                        created.append((agent_id, home_stat, artifacts[agent_id]))
-                    for agent_id, _home_stat, item_artifacts in created:
-                        _fleet_verify_home(root, agent_id, item_artifacts, exact_contents=True)
-                finally:
-                    os.close(root_fd)
+                        if path_present_no_follow(root / agent_id):
+                            raise AgentError("fleet_create_target_exists")
+                    root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                    try:
+                        if not marker_present:
+                            _fleet_write_root_marker(root_fd)
+                        for agent_id in create_ids:
+                            try:
+                                home_stat = _fleet_create_home(
+                                    root_fd,
+                                    agent_id,
+                                    artifacts[agent_id],
+                                )
+                            except _FleetPartialHomeError as exc:
+                                created.append((agent_id, exc.home_stat, artifacts[agent_id]))
+                                raise AgentError("fleet_materialization_failed") from None
+                            created.append((agent_id, home_stat, artifacts[agent_id]))
+                        for agent_id, _home_stat, item_artifacts in created:
+                            _fleet_verify_home(root, agent_id, item_artifacts, exact_contents=True)
+                    finally:
+                        os.close(root_fd)
     except Exception as exc:
         if created and not _fleet_rollback_created(created):
             raise AgentError("fleet_create_rollback_diverged") from None
         if isinstance(exc, AgentError):
             raise
         raise AgentError("fleet_materialization_failed") from None
+
+    if remove_ids:
+        old_inventory = build_inventory(current, AGENT_POOL_ROOT)
+        stored, cleanup_pending = _fleet_commit_staged_removal(
+            service,
+            planned,
+            expected_generation=expected_generation,
+            inventory=old_inventory,
+            agent_ids_to_remove=remove_ids,
+        )
+        return {
+            "mutation_performed": True,
+            "generation": stored.generation,
+            "created_count": 0,
+            "kept_count": len(keep_ids),
+            "updated_count": plan["update_count"],
+            "removed_count": len(remove_ids),
+            "cleanup_pending": cleanup_pending,
+            "pool_root": "not_returned",
+            "raw_output": "not_returned",
+        }
 
     try:
         stored = service.commit_snapshot(planned, expected_generation=expected_generation)
@@ -14481,9 +15183,84 @@ def fleet_series_apply(
         "generation": stored.generation,
         "created_count": len(create_ids),
         "kept_count": len(keep_ids),
-        "updated_count": 0,
+        "updated_count": plan["update_count"],
         "removed_count": 0,
         "cleanup_pending": False,
+        "pool_root": "not_returned",
+        "raw_output": "not_returned",
+    }
+
+
+def fleet_series_disable(*, prefix: str, expected_generation: int) -> dict[str, Any]:
+    service = current_fleet_service()
+    try:
+        current = service.load()
+        planned = plan_series_disable(
+            current,
+            prefix,
+            expected_generation=expected_generation,
+        )
+        build_inventory(planned, AGENT_POOL_ROOT)
+        stored = service.commit_snapshot(planned, expected_generation=expected_generation)
+    except FleetConflictError:
+        raise AgentError("generation_conflict") from None
+    except FleetValidationError as exc:
+        raise AgentError(str(exc)) from None
+    except AgentError:
+        raise
+    except Exception:
+        raise AgentError("fleet_registry_commit_failed") from None
+    _fleet_publish_stored(service, stored)
+    return {
+        "mutation_performed": True,
+        "generation": stored.generation,
+        "disabled": True,
+        "pool_root": "not_returned",
+        "raw_output": "not_returned",
+    }
+
+
+def fleet_series_delete(
+    *,
+    prefix: str,
+    expected_generation: int,
+    confirmed_remove_ids: list[str],
+    yes: bool = False,
+) -> dict[str, Any]:
+    service = current_fleet_service()
+    try:
+        current = service.load()
+        planned = plan_series_delete(
+            current,
+            prefix,
+            expected_generation=expected_generation,
+        )
+    except FleetValidationError as exc:
+        raise AgentError(str(exc)) from None
+    existing = next(item for item in current.series if item.prefix == prefix)
+    if not yes:
+        raise AgentError("fleet_series_delete_confirmation_required")
+    expected_ids = [f"{prefix}{ordinal}" for ordinal in range(1, existing.count + 1)]
+    if (
+        not isinstance(confirmed_remove_ids, list)
+        or len(confirmed_remove_ids) != len(expected_ids)
+        or frozenset(confirmed_remove_ids) != frozenset(expected_ids)
+    ):
+        raise AgentError("remove_confirmation_required")
+    build_inventory(planned, AGENT_POOL_ROOT)
+    old_inventory = build_inventory(current, AGENT_POOL_ROOT)
+    stored, cleanup_pending = _fleet_commit_staged_removal(
+        service,
+        planned,
+        expected_generation=expected_generation,
+        inventory=old_inventory,
+        agent_ids_to_remove=expected_ids,
+    )
+    return {
+        "mutation_performed": True,
+        "generation": stored.generation,
+        "removed_count": len(expected_ids),
+        "cleanup_pending": cleanup_pending,
         "pool_root": "not_returned",
         "raw_output": "not_returned",
     }
@@ -15711,12 +16488,21 @@ def agent_pool_copy_auth(
 
 
 @contextlib.contextmanager
-def pool_agent_lifecycle_locks(agents: list[str]) -> Any:
-    known_agents = set(all_agent_ids())
+def pool_agent_lifecycle_locks(
+    agents: list[str],
+    *,
+    snapshot: InventorySnapshot | None = None,
+) -> Any:
+    known_agents = set((snapshot or current_agent_inventory()).agent_ids)
     with contextlib.ExitStack() as stack:
         for agent in sorted(agents):
             if agent in known_agents:
-                stack.enter_context(agent_lifecycle_lock(agent))
+                lock = (
+                    agent_lifecycle_lock(agent)
+                    if snapshot is None
+                    else agent_lifecycle_lock(agent, snapshot=snapshot)
+                )
+                stack.enter_context(lock)
         yield
 
 
