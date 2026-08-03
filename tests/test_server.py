@@ -2631,15 +2631,21 @@ class ServerHelpersTest(unittest.TestCase):
             (Provider.OLLAMA_LOCAL, RunnerKind.CODEX_CLI, "CODEX_HOME", ()),
             (Provider.HUGGINGFACE_INFERENCE, RunnerKind.CODEX_CLI, "CODEX_HOME", ("HF_TOKEN",)),
         )
-        secret_keys = ("OPENAI_API_KEY", "GEMINI_API_KEY", "HF_TOKEN", "CODEX_ACCESS_TOKEN")
+        secret_keys = (
+            "OPENAI_API_KEY", "GEMINI_API_KEY", "HF_TOKEN", "CODEX_ACCESS_TOKEN",
+            "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT",
+            "GOOGLE_CLOUD_LOCATION", "GOOGLE_GENAI_USE_VERTEXAI",
+        )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             executable = root / "runner"
             executable.write_text(
                 "#!/bin/sh\n"
-                "printf '%s\\n' \"${CODEX_HOME-unset}\" \"${GEMINI_CLI_HOME-unset}\"\n"
+                "printf '%s\\n' \"${CODEX_HOME-unset}\" \"${GEMINI_CLI_HOME-unset}\" \"${HOME-unset}\"\n"
                 "printf '%s\\n' \"${OPENAI_API_KEY-unset}\" \"${GEMINI_API_KEY-unset}\" "
-                "\"${HF_TOKEN-unset}\" \"${CODEX_ACCESS_TOKEN-unset}\" \"$1\"\n",
+                "\"${HF_TOKEN-unset}\" \"${CODEX_ACCESS_TOKEN-unset}\" \"${GOOGLE_API_KEY-unset}\" "
+                "\"${GOOGLE_APPLICATION_CREDENTIALS-unset}\" \"${GOOGLE_CLOUD_PROJECT-unset}\" "
+                "\"${GOOGLE_CLOUD_LOCATION-unset}\" \"${GOOGLE_GENAI_USE_VERTEXAI-unset}\" \"$1\"\n",
                 encoding="utf-8",
             )
             executable.chmod(0o700)
@@ -2678,12 +2684,14 @@ class ServerHelpersTest(unittest.TestCase):
                     lines = completed.stdout.splitlines()
                     self.assertEqual(lines[0 if home_key == "CODEX_HOME" else 1], str(home))
                     self.assertEqual(lines[1 if home_key == "CODEX_HOME" else 0], "unset")
-                    values = dict(zip(secret_keys, lines[2:6]))
+                    if runner is RunnerKind.GEMINI_CLI:
+                        self.assertEqual(lines[2], str(home))
+                    values = dict(zip(secret_keys, lines[3 : 3 + len(secret_keys)]))
                     self.assertEqual(
                         {key for key, value in values.items() if value != "unset"},
                         set(retained),
                     )
-                    self.assertEqual(lines[6], "argument with spaces")
+                    self.assertEqual(lines[3 + len(secret_keys)], "argument with spaces")
                     self.assertNotIn("account", wrapper.read_text(encoding="utf-8"))
 
     def test_fleet_minimal_config_matches_runner_and_provider_contract(self) -> None:
@@ -2701,16 +2709,24 @@ class ServerHelpersTest(unittest.TestCase):
             gemini_name, gemini_text = server_module.fleet_minimal_config(
                 agent(Provider.GEMINI_API, RunnerKind.GEMINI_CLI)
             )
-            self.assertEqual(gemini_name, "settings.json")
+            self.assertEqual(gemini_name, ".gemini/settings.json")
             self.assertEqual(
                 json.loads(gemini_text),
                 {
+                    "advanced": {
+                        "autoConfigureMemory": False,
+                        "ignoreLocalEnv": True,
+                    },
                     "general": {
+                        "defaultApprovalMode": "default",
                         "enableAutoUpdate": False,
                         "enableAutoUpdateNotification": False,
                     },
                     "privacy": {"usageStatisticsEnabled": False},
-                    "security": {"auth": {"enforcedType": "gemini-api-key"}},
+                    "security": {
+                        "auth": {"enforcedType": "gemini-api-key"},
+                        "disableYoloMode": True,
+                    },
                 },
             )
 
@@ -2744,6 +2760,72 @@ class ServerHelpersTest(unittest.TestCase):
                         )
                     else:
                         self.assertNotIn("model_providers", config)
+
+    def test_fleet_gemini_materialization_is_recursive_private_and_exact(self) -> None:
+        from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pool = root / "pool"
+            pool.mkdir(mode=0o700)
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            agent = AgentDescriptor(
+                "d1", "d", 1, "D 1", RunnerKind.GEMINI_CLI, Provider.GEMINI_API,
+                "gemini-3-flash-preview", "gemini-project-1", pool / "d1", "session", True,
+            )
+            artifacts = server_module._fleet_home_artifacts(agent, executable)
+            root_fd = os.open(pool, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                server_module._fleet_create_home(root_fd, "d1", artifacts)
+            finally:
+                os.close(root_fd)
+
+            home = pool / "d1"
+            expected_files = {
+                "gemini",
+                "settings.json",
+                ".gemini/settings.json",
+                ".gemini/policies/codex-master.toml",
+            }
+            marker = json.loads(
+                (home / server_module.FLEET_AGENT_MARKER_FILE).read_text(encoding="utf-8")
+            )
+            self.assertEqual(set(marker["files"]), expected_files)
+            self.assertEqual(set(marker["managed_files"]), expected_files)
+            self.assertEqual(
+                json.loads((home / "settings.json").read_text(encoding="utf-8")),
+                {"advanced": {"autoConfigureMemory": False}},
+            )
+            core = json.loads((home / ".gemini/settings.json").read_text(encoding="utf-8"))
+            self.assertTrue(core["advanced"]["ignoreLocalEnv"])
+            self.assertFalse(core["advanced"]["autoConfigureMemory"])
+            self.assertTrue(core["security"]["disableYoloMode"])
+            self.assertEqual(core["general"]["defaultApprovalMode"], "default")
+            policy = tomllib.loads(
+                (home / ".gemini/policies/codex-master.toml").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                policy,
+                {"rule": [{"toolName": "run_shell_command", "decision": "deny", "priority": 999}]},
+            )
+            for directory in (home, home / ".gemini", home / ".gemini/policies"):
+                current = directory.stat()
+                self.assertEqual(current.st_uid, os.geteuid())
+                self.assertEqual(stat.S_IMODE(current.st_mode), 0o700)
+            for relative in (*expected_files, server_module.FLEET_AGENT_MARKER_FILE):
+                current = (home / relative).stat()
+                self.assertEqual(current.st_uid, os.geteuid())
+                self.assertEqual(
+                    stat.S_IMODE(current.st_mode),
+                    0o700 if relative == "gemini" else 0o600,
+                )
+            server_module._fleet_verify_home(pool, "d1", artifacts, exact_contents=True)
+            server_module._fleet_managed_home_state(pool, agent, strict_contents=True)
+            (home / ".gemini/policies/foreign.toml").write_text("foreign = true\n", encoding="utf-8")
+            with self.assertRaisesRegex(AgentError, "fleet_home_content_invalid"):
+                server_module._fleet_managed_home_state(pool, agent, strict_contents=True)
 
     def test_fleet_series_apply_creates_marked_homes_and_publishes_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2921,14 +3003,19 @@ class ServerHelpersTest(unittest.TestCase):
                     model="model", account_id="first", expected_generation=2,
                     gemini_executable=executable,
                 )
-                before = {
-                    path.name: (
-                        path.stat().st_ino,
-                        path.stat().st_mtime_ns,
-                        hashlib.sha256(path.read_bytes()).hexdigest(),
-                    )
-                    for path in (pool / "d1").iterdir()
-                }
+                home = pool / "d1"
+
+                def home_snapshot():
+                    return {
+                        path.relative_to(home).as_posix(): (
+                            path.stat().st_ino,
+                            path.stat().st_mtime_ns,
+                            hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None,
+                        )
+                        for path in home.rglob("*")
+                    }
+
+                before = home_snapshot()
 
                 with patch.object(
                     server_module, "run_tmux", side_effect=AssertionError("tmux I/O attempted")
@@ -2943,14 +3030,7 @@ class ServerHelpersTest(unittest.TestCase):
                         gemini_executable=executable,
                     )
 
-                after = {
-                    path.name: (
-                        path.stat().st_ino,
-                        path.stat().st_mtime_ns,
-                        hashlib.sha256(path.read_bytes()).hexdigest(),
-                    )
-                    for path in (pool / "d1").iterdir()
-                }
+                after = home_snapshot()
                 self.assertEqual(result["updated_count"], 0)
                 self.assertEqual(before, after)
                 self.assertEqual(
@@ -2965,14 +3045,7 @@ class ServerHelpersTest(unittest.TestCase):
                         gemini_executable=executable,
                     )
                 self.assertEqual(service.load().generation, 4)
-                after_rejection = {
-                    path.name: (
-                        path.stat().st_ino,
-                        path.stat().st_mtime_ns,
-                        hashlib.sha256(path.read_bytes()).hexdigest(),
-                    )
-                    for path in (pool / "d1").iterdir()
-                }
+                after_rejection = home_snapshot()
                 self.assertEqual(after, after_rejection)
 
     def test_fleet_series_disable_changes_only_registry_and_inventory(self) -> None:
@@ -3368,8 +3441,10 @@ class ServerHelpersTest(unittest.TestCase):
             state = root / "state"
             pool = root / "pool"
             pool.mkdir()
+            pool.chmod(0o700)
             foreign = pool / "d1"
             foreign.mkdir()
+            foreign.chmod(0o700)
             sentinel = foreign / "sentinel"
             sentinel.write_text("untouched", encoding="utf-8")
             executable = root / "runner"
@@ -4397,6 +4472,58 @@ class ServerHelpersTest(unittest.TestCase):
                     self.assertEqual(snapshot(pool, ("d1", "d2")), before)
                     self.assertFalse((pool / "d3").exists())
 
+    def test_fleet_managed_rollback_refuses_modified_backup_snapshot(self) -> None:
+        from codex_master.fleet_service import FleetConflictError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None), patch.object(
+                server_module, "agent_lease_status", return_value={"state": "unclaimed"}
+            ), patch.object(server_module, "run_tmux", return_value=stopped), patch.object(
+                server_module, "pool_home_processes", return_value=[]
+            ):
+                server_module.fleet_series_apply(
+                    prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                    model="old", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                server_module.fleet_series_disable(prefix="d", expected_generation=2)
+                service = server_module.current_fleet_service()
+                modified_backup = None
+
+                def modify_backup_then_conflict(*_args, **_kwargs):
+                    nonlocal modified_backup
+                    modified_backup = next(
+                        path for path in pool.iterdir()
+                        if path.name.startswith(f"{server_module.FLEET_TOMBSTONE_PREFIX}backup-")
+                    )
+                    config = modified_backup / "config.toml"
+                    current = config.stat()
+                    os.utime(config, ns=(current.st_atime_ns, current.st_mtime_ns + 1))
+                    raise FleetConflictError("generation_conflict")
+
+                with patch.object(service, "commit_snapshot", side_effect=modify_backup_then_conflict), patch.object(
+                    server_module, "current_fleet_service", return_value=service
+                ):
+                    with self.assertRaisesRegex(AgentError, "fleet_update_rollback_diverged"):
+                        server_module.fleet_series_apply(
+                            prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                            model="new", account_id=None, enabled=False, expected_generation=3,
+                            codex_executable=executable,
+                        )
+
+                self.assertIsNotNone(modified_backup)
+                self.assertTrue(modified_backup.is_dir())
+                self.assertFalse((pool / "d1").exists())
+
     def test_fleet_runner_swap_in_commit_hook_fails_closed_after_authoritative_cas(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4451,6 +4578,57 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(stored.series[0].model, "new")
             self.assertEqual(inventory.agents["d1"].model, "new")
 
+    def test_fleet_runner_swap_in_publish_hook_fails_closed_after_authoritative_cas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            replacement = root / "replacement"
+            executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+            replacement.write_text("#!/usr/bin/bash\nexit 9\n", encoding="utf-8")
+            executable.chmod(0o700)
+            replacement.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None), patch.object(
+                server_module, "agent_lease_status", return_value={"state": "unclaimed"}
+            ), patch.object(server_module, "run_tmux", return_value=stopped), patch.object(
+                server_module, "pool_home_processes", return_value=[]
+            ):
+                server_module.fleet_series_apply(
+                    prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                    model="old", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                server_module.fleet_series_disable(prefix="d", expected_generation=2)
+                real_publish = server_module.publish_agent_inventory
+                swapped = False
+
+                def publish_then_swap(inventory):
+                    nonlocal swapped
+                    real_publish(inventory)
+                    if not swapped:
+                        executable.rename(root / "original-runner")
+                        replacement.rename(executable)
+                        swapped = True
+
+                with patch.object(server_module, "publish_agent_inventory", side_effect=publish_then_swap):
+                    with self.assertRaisesRegex(AgentError, "fleet_executable_changed_after_cas"):
+                        server_module.fleet_series_apply(
+                            prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                            model="new", account_id=None, enabled=False, expected_generation=3,
+                            codex_executable=executable,
+                        )
+                stored = server_module.current_fleet_service().load()
+                inventory = server_module.current_agent_inventory()
+
+            self.assertTrue(swapped)
+            self.assertEqual(stored.generation, 4)
+            self.assertEqual(stored.series[0].model, "new")
+            self.assertEqual(inventory.agents["d1"].model, "new")
+
     def test_fleet_registry_only_delete_race_compensates_registry_and_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4496,6 +4674,113 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(stored.generation, 4)
             self.assertEqual(stored.series[0].prefix, "d")
             self.assertEqual(inventory.agent_ids, ("d1", "d2"))
+
+    def test_fleet_registry_delete_holds_home_reservations_through_inventory_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                    model="local", account_id=None, enabled=False, expected_generation=1,
+                )
+                real_publish = server_module.publish_agent_inventory
+                blocked = False
+
+                def publish_while_reserved(inventory):
+                    nonlocal blocked
+                    try:
+                        (pool / "d1").mkdir()
+                    except FileExistsError:
+                        blocked = True
+                    real_publish(inventory)
+
+                with patch.object(server_module, "publish_agent_inventory", side_effect=publish_while_reserved):
+                    result = server_module.fleet_series_delete(
+                        prefix="d", expected_generation=2,
+                        confirmed_remove_ids=["d1"], yes=True,
+                    )
+                stored = server_module.current_fleet_service().load()
+                inventory = server_module.current_agent_inventory()
+
+            self.assertTrue(blocked)
+            self.assertFalse((pool / "d1").exists())
+            self.assertEqual(stored.series, ())
+            self.assertEqual(inventory.agent_ids, ())
+            self.assertTrue(result["cleanup_pending"])
+
+    def test_fleet_apply_persist_then_raise_keeps_authoritative_materialization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                service = server_module.current_fleet_service()
+                real_commit = service.commit_snapshot
+
+                def persist_then_raise(*args, **kwargs):
+                    real_commit(*args, **kwargs)
+                    raise OSError("injected post-persist failure")
+
+                with patch.object(service, "commit_snapshot", side_effect=persist_then_raise), patch.object(
+                    server_module, "current_fleet_service", return_value=service
+                ):
+                    with self.assertRaisesRegex(AgentError, "fleet_registry_commit_failed_after_cas"):
+                        server_module.fleet_series_apply(
+                            prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                            model="local", account_id=None, expected_generation=1,
+                            codex_executable=executable,
+                        )
+                stored = service.load()
+                inventory = server_module.current_agent_inventory()
+
+            self.assertEqual(stored.generation, 2)
+            self.assertEqual(stored.series[0].prefix, "d")
+            self.assertEqual(inventory.agent_ids, ("d1",))
+            self.assertTrue((pool / "d1").is_dir())
+
+    def test_fleet_delete_persist_then_raise_keeps_authoritative_registry_and_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                    model="local", account_id=None, enabled=False, expected_generation=1,
+                )
+                service = server_module.current_fleet_service()
+                real_commit = service.commit_snapshot
+
+                def persist_then_raise(*args, **kwargs):
+                    real_commit(*args, **kwargs)
+                    raise OSError("injected post-persist failure")
+
+                with patch.object(service, "commit_snapshot", side_effect=persist_then_raise), patch.object(
+                    server_module, "current_fleet_service", return_value=service
+                ):
+                    with self.assertRaisesRegex(AgentError, "fleet_registry_commit_failed_after_cas"):
+                        server_module.fleet_series_delete(
+                            prefix="d", expected_generation=2,
+                            confirmed_remove_ids=["d1"], yes=True,
+                        )
+                stored = service.load()
+                inventory = server_module.current_agent_inventory()
+
+            self.assertEqual(stored.generation, 3)
+            self.assertEqual(stored.series, ())
+            self.assertEqual(inventory.agent_ids, ())
+            self.assertFalse((pool / "d1").exists())
 
     def test_fleet_post_cas_cleanup_oserror_becomes_cleanup_pending(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4578,6 +4863,202 @@ class ServerHelpersTest(unittest.TestCase):
 
             self.assertTrue(changed)
             self.assertTrue((pool / "d2").is_dir())
+
+    def test_fleet_marker_open_then_unlink_is_rejected_by_opened_fd_link_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            real_open = os.open
+            unlinked = False
+
+            def unlink_after_marker_open(path, flags, *args, **kwargs):
+                nonlocal unlinked
+                fd = real_open(path, flags, *args, **kwargs)
+                if (
+                    not unlinked
+                    and path == server_module.FLEET_AGENT_MARKER_FILE
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    os.unlink(path, dir_fd=kwargs["dir_fd"])
+                    unlinked = True
+                return fd
+
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d", count=2, runner="codex_cli", provider="ollama_local",
+                    model="local", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                with patch.object(server_module, "agent_lease_status", return_value={"state": "unclaimed"}), patch.object(
+                    server_module, "run_tmux", return_value=stopped
+                ), patch.object(server_module, "pool_home_processes", return_value=[]), patch.object(
+                    server_module.os, "open", side_effect=unlink_after_marker_open
+                ):
+                    with self.assertRaisesRegex(AgentError, "fleet_home_content_invalid"):
+                        server_module.fleet_series_apply(
+                            prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                            model="local", account_id=None, expected_generation=2,
+                            confirmed_remove_ids=["d2"], codex_executable=executable,
+                        )
+
+            self.assertTrue(unlinked)
+            self.assertTrue((pool / "d2").is_dir())
+
+    def test_fleet_registry_only_uses_concrete_materialization_sets_and_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d", count=2, runner="codex_cli", provider="ollama_local",
+                    model="local", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                (pool / "d2").rename(pool / f"{server_module.FLEET_TOMBSTONE_PREFIX}missing")
+                planned = server_module.fleet_series_plan(
+                    prefix="d", count=2, runner="codex_cli", provider="ollama_local",
+                    model="local", account_id=None, expected_generation=2,
+                )
+                applied = server_module.fleet_series_apply(
+                    prefix="d", count=2, runner="codex_cli", provider="ollama_local",
+                    model="local", account_id=None, expected_generation=2,
+                    codex_executable=executable,
+                )
+
+            self.assertEqual((planned["create_count"], planned["keep_count"]), (1, 1))
+            self.assertEqual((applied["created_count"], applied["kept_count"]), (1, 1))
+            self.assertTrue((pool / "d2").is_dir())
+
+        for partial in (False, True):
+            with self.subTest(partial=partial), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                state = root / "state"
+                pool = root / "pool"
+                executable = root / "runner"
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o700)
+                with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                    server_module, "AGENT_POOL_ROOT", pool
+                ), server_module.temporary_agent_inventory(None):
+                    if partial:
+                        server_module.fleet_series_apply(
+                            prefix="d", count=2, runner="codex_cli", provider="ollama_local",
+                            model="local", account_id=None, expected_generation=1,
+                            codex_executable=executable,
+                        )
+                        server_module.fleet_series_disable(prefix="d", expected_generation=2)
+                        (pool / "d2").rename(
+                            pool / f"{server_module.FLEET_TOMBSTONE_PREFIX}partial"
+                        )
+                        generation = 3
+                    else:
+                        server_module.fleet_series_apply(
+                            prefix="d", count=2, runner="codex_cli", provider="ollama_local",
+                            model="local", account_id=None, enabled=False, expected_generation=1,
+                        )
+                        generation = 2
+                    planned = server_module.fleet_series_plan(
+                        prefix="d", count=2, runner="codex_cli", provider="ollama_local",
+                        model="local", account_id=None, enabled=False,
+                        expected_generation=generation,
+                    )
+                    applied = server_module.fleet_series_apply(
+                        prefix="d", count=2, runner="codex_cli", provider="ollama_local",
+                        model="local", account_id=None, enabled=False,
+                        expected_generation=generation,
+                    )
+
+                expected_keep = 1 if partial else 0
+                self.assertEqual(
+                    (planned["create_count"], planned["keep_count"], planned["update_count"], planned["remove_count"]),
+                    (0, expected_keep, 0, 0),
+                )
+                self.assertEqual(
+                    (applied["created_count"], applied["kept_count"], applied["updated_count"], applied["removed_count"]),
+                    (0, expected_keep, 0, 0),
+                )
+
+    def test_fleet_pool_and_existing_homes_require_owner_private_directories_before_apply(self) -> None:
+        for unsafe_entry in ("pool", "home"):
+            with self.subTest(unsafe_entry=unsafe_entry), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                state = root / "state"
+                pool = root / "pool"
+                executable = root / "runner"
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o700)
+                with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                    server_module, "AGENT_POOL_ROOT", pool
+                ), server_module.temporary_agent_inventory(None):
+                    server_module.fleet_series_apply(
+                        prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                        model="local", account_id=None, expected_generation=1,
+                        codex_executable=executable,
+                    )
+                    target = pool if unsafe_entry == "pool" else pool / "d1"
+                    target.chmod(0o755)
+                    with self.assertRaisesRegex(AgentError, "fleet_home_state_unknown"):
+                        server_module.fleet_series_apply(
+                            prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                            model="local", account_id=None, expected_generation=2,
+                            codex_executable=executable,
+                        )
+                    stored = server_module.current_fleet_service().load()
+
+                self.assertEqual(stored.generation, 2)
+                self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+
+    def test_fleet_committed_create_rename_postcheck_failure_quarantines_final_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            real_stat = os.stat
+            failed = False
+
+            def fail_final_postcheck(path, *args, **kwargs):
+                nonlocal failed
+                if path == "d1" and kwargs.get("dir_fd") is not None and not failed:
+                    failed = True
+                    raise OSError("injected target postcheck failure")
+                return real_stat(path, *args, **kwargs)
+
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), patch.object(server_module.os, "stat", side_effect=fail_final_postcheck):
+                with self.assertRaisesRegex(AgentError, "fleet_materialization_failed"):
+                    server_module.fleet_series_apply(
+                        prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                        model="local", account_id=None, expected_generation=1,
+                        codex_executable=executable,
+                    )
+                stored = server_module.current_fleet_service().load()
+
+            quarantines = [
+                path for path in pool.iterdir()
+                if path.name.startswith(server_module.FLEET_TOMBSTONE_PREFIX)
+            ]
+            self.assertTrue(failed)
+            self.assertFalse((pool / "d1").exists())
+            self.assertEqual(stored.generation, 1)
+            self.assertEqual(len(quarantines), 1)
+            self.assertTrue(quarantines[0].is_dir())
 
     @patch("codex_master.server.status_agent")
     def test_multi_agent_status_results_are_paged_for_broad_selectors(self, mock_status_agent) -> None:

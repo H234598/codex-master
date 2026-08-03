@@ -78,10 +78,13 @@ def test_gemini_runner_is_headless_jsonl_and_home_isolated(tmp_path: Path) -> No
 
     assert plan.mode == "headless_job"
     assert plan.argv == (
-        "/usr/local/bin/gemini", "-p", "-", "--output-format", "stream-json",
-        "--model", "gemini-3-flash-preview",
+        "/usr/local/bin/gemini", "--output-format", "stream-json", "--model",
+        "gemini-3-flash-preview",
     )
-    assert plan.env["GEMINI_CLI_HOME"].endswith("gemini-project-1")
+    assert plan.env == {
+        "HOME": str(tmp_path / "agents" / "d1"),
+        "GEMINI_CLI_HOME": str(tmp_path / "agents" / "d1"),
+    }
     assert plan.secret_env_name == "GEMINI_API_KEY"
     assert "OPENAI_API_KEY" in plan.unset_env
     assert {"GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT",

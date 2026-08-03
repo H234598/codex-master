@@ -32,7 +32,7 @@ import tomllib
 import uuid
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from codex_master import __version__
 from codex_master.fleet_registry import (
@@ -13983,8 +13983,18 @@ def fleet_wrapper_text(
     taskset_executable: Path = FLEET_TASKSET_EXECUTABLE,
     true_executable: Path = FLEET_TRUE_EXECUTABLE,
 ) -> str:
-    home_variable = "CODEX_HOME" if agent.runner is RunnerKind.CODEX_CLI else "GEMINI_CLI_HOME"
-    other_home_variable = "GEMINI_CLI_HOME" if home_variable == "CODEX_HOME" else "CODEX_HOME"
+    if agent.runner is RunnerKind.CODEX_CLI:
+        home_lines = (
+            f"export CODEX_HOME={shlex.quote(str(agent.home))}",
+            "unset GEMINI_CLI_HOME",
+        )
+    else:
+        quoted_home = shlex.quote(str(agent.home))
+        home_lines = (
+            f"export HOME={quoted_home}",
+            f"export GEMINI_CLI_HOME={quoted_home}",
+            "unset CODEX_HOME",
+        )
     retained = {
         Provider.OPENAI_API: {"OPENAI_API_KEY"},
         Provider.GEMINI_API: {"GEMINI_API_KEY"},
@@ -13995,6 +14005,11 @@ def fleet_wrapper_text(
         "GEMINI_API_KEY",
         "HF_TOKEN",
         "CODEX_ACCESS_TOKEN",
+        "GOOGLE_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_GENAI_USE_VERTEXAI",
     }
     unset_variables = " ".join(sorted(secret_variables - retained))
     executable_word = shlex.quote(str(executable))
@@ -14005,8 +14020,7 @@ def fleet_wrapper_text(
             f"#!{bash_executable}",
             "set -euo pipefail",
             "",
-            f"export {home_variable}={shlex.quote(str(agent.home))}",
-            f"unset {other_home_variable}",
+            *home_lines,
             f"unset {unset_variables}",
             f"if {taskset_word} --cpu-list 4-10 {true_word} >/dev/null 2>&1; then",
             f'  exec {taskset_word} --cpu-list 4-10 {executable_word} "$@"',
@@ -14020,14 +14034,22 @@ def fleet_wrapper_text(
 def fleet_minimal_config(agent: AgentDescriptor) -> tuple[str, str]:
     if agent.runner is RunnerKind.GEMINI_CLI:
         document = {
+            "advanced": {
+                "autoConfigureMemory": False,
+                "ignoreLocalEnv": True,
+            },
             "general": {
+                "defaultApprovalMode": "default",
                 "enableAutoUpdate": False,
                 "enableAutoUpdateNotification": False,
             },
             "privacy": {"usageStatisticsEnabled": False},
-            "security": {"auth": {"enforcedType": "gemini-api-key"}},
+            "security": {
+                "auth": {"enforcedType": "gemini-api-key"},
+                "disableYoloMode": True,
+            },
         }
-        return "settings.json", json.dumps(document, indent=2, sort_keys=True) + "\n"
+        return ".gemini/settings.json", json.dumps(document, indent=2, sort_keys=True) + "\n"
 
     lines = [
         f"model = {json.dumps(agent.model)}",
@@ -14093,8 +14115,7 @@ def _fleet_plan_materialized_ids(prefix: str, count: int) -> set[str]:
         return set()
     except OSError as exc:
         raise AgentError("fleet_home_state_unknown") from exc
-    if not stat_module.S_ISDIR(root_stat.st_mode) or stat_module.S_ISLNK(root_stat.st_mode):
-        raise AgentError("fleet_home_state_unknown")
+    _fleet_private_directory_stat(root_stat, "fleet_home_state_unknown")
     root_fd = open_directory_no_follow_matching(
         AGENT_POOL_ROOT,
         root_stat,
@@ -14111,8 +14132,7 @@ def _fleet_plan_materialized_ids(prefix: str, count: int) -> set[str]:
                 continue
             except OSError as exc:
                 raise AgentError("fleet_home_state_unknown") from exc
-            if not stat_module.S_ISDIR(current.st_mode) or stat_module.S_ISLNK(current.st_mode):
-                raise AgentError("fleet_home_state_unknown")
+            _fleet_private_directory_stat(current, "fleet_home_state_unknown")
             present.add(agent_id)
     finally:
         os.close(root_fd)
@@ -14446,6 +14466,22 @@ def _fleet_home_artifacts(
         ),
         config_name: (config_text.encode("utf-8"), 0o600),
     }
+    if agent.runner is RunnerKind.GEMINI_CLI:
+        bootstrap = {"advanced": {"autoConfigureMemory": False}}
+        policy = "\n".join(
+            (
+                "[[rule]]",
+                'toolName = "run_shell_command"',
+                'decision = "deny"',
+                "priority = 999",
+                "",
+            )
+        )
+        files["settings.json"] = (
+            (json.dumps(bootstrap, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+            0o600,
+        )
+        files[".gemini/policies/codex-master.toml"] = (policy.encode("utf-8"), 0o600)
     marker = {
         "schema_version": 1,
         "kind": "codex_master_fleet_agent",
@@ -14474,6 +14510,175 @@ def _fleet_artifact_files(artifacts: dict[str, Any]) -> dict[str, tuple[bytes, i
     return {**artifacts["files"], **artifacts.get("extra_files", {})}
 
 
+def _fleet_private_directory_stat(current: os.stat_result, error: str) -> None:
+    if (
+        not stat_module.S_ISDIR(current.st_mode)
+        or stat_module.S_ISLNK(current.st_mode)
+        or current.st_uid != os.geteuid()
+        or stat_module.S_IMODE(current.st_mode) != 0o700
+    ):
+        raise AgentError(error)
+
+
+def _fleet_artifact_directories(files: Mapping[str, Any]) -> set[str]:
+    directories: set[str] = set()
+    for name in files:
+        path = Path(name)
+        if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+            raise AgentError("fleet_artifact_path_invalid")
+        current = path.parent
+        while current != Path("."):
+            directories.add(current.as_posix())
+            current = current.parent
+    return directories
+
+
+def _fleet_open_artifact_parent(
+    home_fd: int,
+    name: str,
+    *,
+    create: bool,
+    error: str,
+) -> tuple[int, str]:
+    path = Path(name)
+    if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+        raise AgentError(error)
+    try:
+        current_fd = os.dup(home_fd)
+        for part in path.parts[:-1]:
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            next_fd = os.open(part, flags, dir_fd=current_fd)
+            try:
+                _fleet_private_directory_stat(os.fstat(next_fd), error)
+            except Exception:
+                os.close(next_fd)
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd, path.parts[-1]
+    except Exception as exc:
+        if "current_fd" in locals():
+            try:
+                os.close(current_fd)
+            except OSError:
+                pass
+        if isinstance(exc, AgentError):
+            raise
+        raise AgentError(error) from exc
+
+
+def _fleet_tree_entries(directory_fd: int, error: str) -> tuple[set[str], set[str]]:
+    files: set[str] = set()
+    directories: set[str] = set()
+    entry_count = 0
+
+    def visit(current_fd: int, prefix: str, depth: int) -> None:
+        nonlocal entry_count
+        if depth > 8:
+            raise AgentError(error)
+        _fleet_private_directory_stat(os.fstat(current_fd), error)
+        for name in os.listdir(current_fd):
+            entry_count += 1
+            if entry_count > 128 or not isinstance(name, str) or name in {"", ".", ".."} or "/" in name:
+                raise AgentError(error)
+            relative = f"{prefix}/{name}" if prefix else name
+            current = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
+            if stat_module.S_ISDIR(current.st_mode) and not stat_module.S_ISLNK(current.st_mode):
+                _fleet_private_directory_stat(current, error)
+                flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                child_fd = os.open(name, flags, dir_fd=current_fd)
+                try:
+                    _fleet_private_directory_stat(os.fstat(child_fd), error)
+                    directories.add(relative)
+                    visit(child_fd, relative, depth + 1)
+                finally:
+                    os.close(child_fd)
+            elif (
+                stat_module.S_ISREG(current.st_mode)
+                and getattr(current, "st_nlink", 1) == 1
+                and current.st_uid == os.geteuid()
+            ):
+                files.add(relative)
+            else:
+                raise AgentError(error)
+
+    try:
+        visit(directory_fd, "", 0)
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError(error) from exc
+    return files, directories
+
+
+def _fleet_read_private_file_at(
+    home_fd: int,
+    name: str,
+    mode: int,
+    error: str,
+) -> tuple[bytes, os.stat_result]:
+    parent_fd, basename = _fleet_open_artifact_parent(home_fd, name, create=False, error=error)
+    fd = -1
+    try:
+        current = os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat_module.S_ISREG(current.st_mode)
+            or getattr(current, "st_nlink", 1) != 1
+            or current.st_uid != os.geteuid()
+            or stat_module.S_IMODE(current.st_mode) != mode
+        ):
+            raise AgentError(error)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(basename, flags, dir_fd=parent_fd)
+        opened = os.fstat(fd)
+        if (
+            not source_identity_with_snapshot_matches(opened, current)
+            or not stat_module.S_ISREG(opened.st_mode)
+            or getattr(opened, "st_nlink", 1) != 1
+            or opened.st_uid != os.geteuid()
+            or stat_module.S_IMODE(opened.st_mode) != mode
+        ):
+            raise AgentError(error)
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            data = handle.read(MAX_POOL_SPEC_BYTES + 1)
+        if len(data) > MAX_POOL_SPEC_BYTES:
+            raise AgentError(error)
+        return data, opened
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError(error) from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(parent_fd)
+
+
+def _fleet_read_exact_file_at(
+    home_fd: int,
+    name: str,
+    expected: bytes,
+    mode: int,
+    error: str,
+) -> os.stat_result:
+    data, opened = _fleet_read_private_file_at(home_fd, name, mode, error)
+    if data != expected:
+        raise AgentError(error)
+    return opened
+
+
 def _fleet_read_exact_file(path: Path, expected: bytes, mode: int, error: str) -> os.stat_result:
     try:
         current = path.lstat()
@@ -14482,6 +14687,7 @@ def _fleet_read_exact_file(path: Path, expected: bytes, mode: int, error: str) -
     if (
         not stat_module.S_ISREG(current.st_mode)
         or getattr(current, "st_nlink", 1) != 1
+        or current.st_uid != os.geteuid()
         or stat_module.S_IMODE(current.st_mode) != mode
     ):
         raise AgentError(error)
@@ -14509,12 +14715,7 @@ def _fleet_verify_home(
         home_stat = home.lstat()
     except OSError as exc:
         raise AgentError("fleet_home_verification_failed") from exc
-    if (
-        not stat_module.S_ISDIR(home_stat.st_mode)
-        or stat_module.S_ISLNK(home_stat.st_mode)
-        or stat_module.S_IMODE(home_stat.st_mode) != 0o700
-    ):
-        raise AgentError("fleet_home_verification_failed")
+    _fleet_private_directory_stat(home_stat, "fleet_home_verification_failed")
     home_fd = open_directory_no_follow_matching(
         home,
         home_stat,
@@ -14523,12 +14724,20 @@ def _fleet_verify_home(
     )
     try:
         artifact_files = _fleet_artifact_files(artifacts)
-        if exact_contents and set(os.listdir(home_fd)) != set(artifact_files):
+        actual_files, actual_directories = _fleet_tree_entries(
+            home_fd,
+            "fleet_home_verification_failed",
+        )
+        expected_directories = _fleet_artifact_directories(artifact_files)
+        if exact_contents:
+            if actual_files != set(artifact_files) or actual_directories != expected_directories:
+                raise AgentError("fleet_home_verification_failed")
+        elif not set(artifact_files) <= actual_files or not expected_directories <= actual_directories:
             raise AgentError("fleet_home_verification_failed")
-        pinned_home = Path(f"/proc/self/fd/{home_fd}")
         for name, (content, mode) in artifact_files.items():
-            _fleet_read_exact_file(
-                pinned_home / name,
+            _fleet_read_exact_file_at(
+                home_fd,
+                name,
                 content,
                 mode,
                 "fleet_home_verification_failed",
@@ -14597,30 +14806,92 @@ def _fleet_create_home(
         home_fd = os.open(staging_name, flags, dir_fd=root_fd)
         os.fchmod(home_fd, 0o700)
         home_stat = os.fstat(home_fd)
+        _fleet_private_directory_stat(home_stat, "fleet_home_verification_failed")
         artifact_files = _fleet_artifact_files(artifacts)
         for name, (content, mode) in artifact_files.items():
-            write_private_new_bytes(Path(name), content, mode=mode, dir_fd=home_fd)
-        expected_names = set(artifact_files)
-        if set(os.listdir(home_fd)) != expected_names:
+            parent_fd, basename = _fleet_open_artifact_parent(
+                home_fd,
+                name,
+                create=True,
+                error="fleet_home_verification_failed",
+            )
+            try:
+                write_private_new_bytes(Path(basename), content, mode=mode, dir_fd=parent_fd)
+            finally:
+                os.close(parent_fd)
+        actual_files, actual_directories = _fleet_tree_entries(
+            home_fd,
+            "fleet_home_verification_failed",
+        )
+        if (
+            actual_files != set(artifact_files)
+            or actual_directories != _fleet_artifact_directories(artifact_files)
+        ):
             raise AgentError("fleet_home_verification_failed")
-        pinned = Path(f"/proc/self/fd/{home_fd}")
         for name, (content, mode) in artifact_files.items():
-            _fleet_read_exact_file(pinned / name, content, mode, "fleet_home_verification_failed")
+            _fleet_read_exact_file_at(
+                home_fd,
+                name,
+                content,
+                mode,
+                "fleet_home_verification_failed",
+            )
         _fleet_revalidate_artifact_executables(artifacts)
     except Exception as exc:
         partial_stat = os.fstat(home_fd) if home_fd >= 0 else created_stat
-        raise _FleetPartialHomeError(staging_name, partial_stat) from exc
-    finally:
         if home_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(home_fd)
+        raise _FleetPartialHomeError(staging_name, partial_stat) from exc
+
+    published = False
+
+    def mark_published() -> None:
+        nonlocal published
+        published = True
+
+    try:
+        _fleet_rename_noreplace_at(
+            root_fd,
+            staging_name,
+            agent_id,
+            home_stat,
+            "fleet_home_publish_failed",
+            collision_text="fleet_create_target_exists",
+            committed=mark_published,
+        )
+    except AgentError as exc:
+        if not published:
+            with contextlib.suppress(OSError):
+                os.close(home_fd)
+            raise
+        quarantine = f"{FLEET_TOMBSTONE_PREFIX}create-{uuid.uuid4().hex}"
+        quarantined = False
+
+        def mark_quarantined() -> None:
+            nonlocal quarantined
+            quarantined = True
+
+        try:
+            _fleet_rename_noreplace_at(
+                root_fd,
+                agent_id,
+                quarantine,
+                os.fstat(home_fd),
+                "fleet_create_rollback_diverged",
+                collision_text="fleet_create_rollback_diverged",
+                committed=mark_quarantined,
+            )
+        except AgentError:
+            if not quarantined:
+                with contextlib.suppress(OSError):
+                    os.close(home_fd)
+                raise AgentError("fleet_create_rollback_diverged") from None
+        with contextlib.suppress(OSError):
             os.close(home_fd)
-    _fleet_rename_noreplace_at(
-        root_fd,
-        staging_name,
-        agent_id,
-        home_stat,
-        "fleet_home_publish_failed",
-        collision_text="fleet_create_target_exists",
-    )
+        raise _FleetPartialHomeError(quarantine, home_stat) from exc
+    with contextlib.suppress(OSError):
+        os.close(home_fd)
     return home_stat
 
 
@@ -14635,11 +14906,10 @@ def _fleet_created_home_unchanged(
         current_home = home.lstat()
         if (
             not source_identity_matches(current_home, expected_home)
-            or not stat_module.S_ISDIR(current_home.st_mode)
-            or stat_module.S_ISLNK(current_home.st_mode)
-            or stat_module.S_IMODE(current_home.st_mode) != 0o700
+            or current_home.st_uid != os.geteuid()
         ):
             return False
+        _fleet_private_directory_stat(current_home, "fleet_create_rollback_diverged")
         home_fd = open_directory_no_follow_matching(
             home,
             current_home,
@@ -14647,15 +14917,21 @@ def _fleet_created_home_unchanged(
             changed_text="fleet_create_rollback_diverged",
         )
         try:
-            names = set(os.listdir(home_fd))
             artifact_files = _fleet_artifact_files(artifacts)
-            if not names <= set(artifact_files):
+            actual_files, actual_directories = _fleet_tree_entries(
+                home_fd,
+                "fleet_create_rollback_diverged",
+            )
+            if (
+                not actual_files <= set(artifact_files)
+                or not actual_directories <= _fleet_artifact_directories(artifact_files)
+            ):
                 return False
-            pinned = Path(f"/proc/self/fd/{home_fd}")
-            for name in names:
+            for name in actual_files:
                 content, mode = artifact_files[name]
-                _fleet_read_exact_file(
-                    pinned / name,
+                _fleet_read_exact_file_at(
+                    home_fd,
+                    name,
                     content,
                     mode,
                     "fleet_create_rollback_diverged",
@@ -14678,6 +14954,7 @@ def _fleet_rollback_created(
             AGENT_POOL_ROOT,
             ensure=False,
             error_text="fleet_create_rollback_diverged",
+            require_private=True,
         ) as root:
             root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
             try:
@@ -14724,6 +15001,22 @@ def _fleet_publish_stored(service: FleetService, stored: FleetSnapshot) -> None:
         raise AgentError("fleet_inventory_publish_failed") from None
 
 
+def _fleet_reconcile_commit_exception(
+    service: FleetService,
+    current: FleetSnapshot,
+    planned: FleetSnapshot,
+) -> tuple[str, FleetSnapshot]:
+    try:
+        reloaded = service.load()
+    except Exception:
+        raise AgentError("fleet_registry_commit_diverged") from None
+    if reloaded == planned:
+        return "planned", reloaded
+    if reloaded == current:
+        return "current", reloaded
+    raise AgentError("fleet_registry_commit_diverged")
+
+
 def _fleet_tmux_state(session: str) -> str:
     try:
         result = run_tmux(["has-session", "-t", session], check=False)
@@ -14748,12 +15041,7 @@ def _fleet_managed_home_state(
         home_stat = home.lstat()
     except OSError as exc:
         raise AgentError("fleet_home_content_invalid") from exc
-    if (
-        not stat_module.S_ISDIR(home_stat.st_mode)
-        or stat_module.S_ISLNK(home_stat.st_mode)
-        or stat_module.S_IMODE(home_stat.st_mode) != 0o700
-    ):
-        raise AgentError("fleet_home_content_invalid")
+    _fleet_private_directory_stat(home_stat, "fleet_home_content_invalid")
     home_fd = open_directory_no_follow_matching(
         home,
         home_stat,
@@ -14761,27 +15049,11 @@ def _fleet_managed_home_state(
         changed_text="fleet_home_content_invalid",
     )
     try:
-        pinned = Path(f"/proc/self/fd/{home_fd}")
-        try:
-            marker_stat = os.stat(
-                FLEET_AGENT_MARKER_FILE,
-                dir_fd=home_fd,
-                follow_symlinks=False,
-            )
-        except OSError as exc:
-            raise AgentError("fleet_home_content_invalid") from exc
-        if (
-            not stat_module.S_ISREG(marker_stat.st_mode)
-            or getattr(marker_stat, "st_nlink", 1) != 1
-            or stat_module.S_IMODE(marker_stat.st_mode) != 0o600
-        ):
-            raise AgentError("fleet_home_content_invalid")
-        marker_bytes = pool_read_private_bytes(
-            pinned / FLEET_AGENT_MARKER_FILE,
-            MAX_POOL_SPEC_BYTES,
+        marker_bytes, _marker_stat = _fleet_read_private_file_at(
+            home_fd,
+            FLEET_AGENT_MARKER_FILE,
+            0o600,
             "fleet_home_content_invalid",
-            expected_target_stat=marker_stat,
-            expected_mode=0o600,
         )
         try:
             marker = json.loads(marker_bytes.decode("utf-8"))
@@ -14799,8 +15071,16 @@ def _fleet_managed_home_state(
             "files",
         }
         wrapper_name = "codex" if agent.runner is RunnerKind.CODEX_CLI else "gemini"
-        config_name = "config.toml" if agent.runner is RunnerKind.CODEX_CLI else "settings.json"
-        expected_files = {wrapper_name, config_name}
+        expected_files = (
+            {wrapper_name, "config.toml"}
+            if agent.runner is RunnerKind.CODEX_CLI
+            else {
+                wrapper_name,
+                "settings.json",
+                ".gemini/settings.json",
+                ".gemini/policies/codex-master.toml",
+            }
+        )
         if (
             not isinstance(marker, dict)
             or set(marker) != expected_fields
@@ -14822,35 +15102,32 @@ def _fleet_managed_home_state(
             if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
                 raise AgentError("fleet_home_content_invalid")
             mode = 0o700 if name == wrapper_name else 0o600
-            try:
-                file_stat = (pinned / name).lstat()
-            except OSError as exc:
-                raise AgentError("fleet_home_content_invalid") from exc
-            if (
-                not stat_module.S_ISREG(file_stat.st_mode)
-                or getattr(file_stat, "st_nlink", 1) != 1
-                or stat_module.S_IMODE(file_stat.st_mode) != mode
-            ):
-                raise AgentError("fleet_home_content_invalid")
-            content = pool_read_private_bytes(
-                pinned / name,
-                MAX_POOL_SPEC_BYTES,
+            content, _file_stat = _fleet_read_private_file_at(
+                home_fd,
+                name,
+                mode,
                 "fleet_home_content_invalid",
-                expected_target_stat=file_stat,
             )
             if not hmac.compare_digest(hashlib.sha256(content).hexdigest(), digest):
                 raise AgentError("fleet_home_content_invalid")
-        names = set(os.listdir(home_fd))
-        allowed = {FLEET_AGENT_MARKER_FILE, *expected_files, "auth.json"}
-        if strict_contents and not names <= allowed:
+        actual_files, actual_directories = _fleet_tree_entries(
+            home_fd,
+            "fleet_home_content_invalid",
+        )
+        allowed_files = {FLEET_AGENT_MARKER_FILE, *expected_files, "auth.json"}
+        expected_directories = _fleet_artifact_directories({name: None for name in expected_files})
+        if strict_contents and (
+            not actual_files <= allowed_files
+            or actual_directories != expected_directories
+        ):
             raise AgentError("fleet_home_content_invalid")
-        if "auth.json" in names:
-            auth_stat = os.stat("auth.json", dir_fd=home_fd, follow_symlinks=False)
-            if (
-                not stat_module.S_ISREG(auth_stat.st_mode)
-                or getattr(auth_stat, "st_nlink", 1) != 1
-            ):
-                raise AgentError("fleet_home_content_invalid")
+        if "auth.json" in actual_files:
+            _fleet_read_private_file_at(
+                home_fd,
+                "auth.json",
+                0o600,
+                "fleet_home_content_invalid",
+            )
         return home_stat
     except OSError as exc:
         raise AgentError("fleet_home_content_invalid") from exc
@@ -14871,8 +15148,7 @@ def _fleet_idle_agent_locks(
                 home_stat = agent.home.lstat()
             except OSError as exc:
                 raise AgentError("fleet_home_content_invalid") from exc
-            if not stat_module.S_ISDIR(home_stat.st_mode) or stat_module.S_ISLNK(home_stat.st_mode):
-                raise AgentError("fleet_home_content_invalid")
+            _fleet_private_directory_stat(home_stat, "fleet_home_content_invalid")
             pinned[agent_id] = home_stat
             lease = agent_lease_status(
                 agent_id,
@@ -14902,6 +15178,7 @@ def _fleet_rename_noreplace_at(
     error_text: str,
     *,
     collision_text: str | None = None,
+    committed: Callable[[], None] | None = None,
 ) -> None:
     try:
         current = os.stat(source, dir_fd=root_fd, follow_symlinks=False)
@@ -14927,6 +15204,8 @@ def _fleet_rename_noreplace_at(
         if current_errno == errno.EEXIST and collision_text is not None:
             raise AgentError(collision_text)
         raise AgentError(error_text)
+    if committed is not None:
+        committed()
     try:
         renamed = os.stat(target, dir_fd=root_fd, follow_symlinks=False)
     except OSError as exc:
@@ -14949,6 +15228,7 @@ def _fleet_restore_tombstones(staged: list[dict[str, Any]]) -> bool:
             AGENT_POOL_ROOT,
             ensure=False,
             error_text="fleet_tombstone_rollback_diverged",
+            require_private=True,
         ) as root:
             root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
             try:
@@ -14989,6 +15269,7 @@ def _fleet_stage_tombstones(
                 AGENT_POOL_ROOT,
                 ensure=False,
                 error_text="fleet_pool_root_invalid",
+                require_private=True,
             ) as root:
                 if not _fleet_root_marker_state(root):
                     raise AgentError("fleet_pool_marker_required")
@@ -15009,6 +15290,12 @@ def _fleet_stage_tombstones(
                         if not source_identity_matches(current, pinned[agent_id]):
                             raise AgentError("fleet_home_changed")
                         tombstone = f"{FLEET_TOMBSTONE_PREFIX}{uuid.uuid4().hex}"
+                        staged_item = {
+                            "agent": agent,
+                            "inventory": inventory,
+                            "tombstone": tombstone,
+                            "home_stat": current,
+                        }
                         try:
                             _fleet_rename_noreplace_at(
                                 root_fd,
@@ -15017,6 +15304,7 @@ def _fleet_stage_tombstones(
                                 current,
                                 "fleet_tombstone_stage_failed",
                                 collision_text="fleet_tombstone_collision",
+                                committed=lambda item=staged_item: staged.append(item),
                             )
                         except AgentError:
                             raise
@@ -15027,14 +15315,6 @@ def _fleet_stage_tombstones(
                         )
                         if not source_identity_matches(tombstone_stat, current):
                             raise AgentError("fleet_home_changed")
-                        staged.append(
-                            {
-                                "agent": agent,
-                                "inventory": inventory,
-                                "tombstone": tombstone,
-                                "home_stat": current,
-                            }
-                        )
                 finally:
                     os.close(root_fd)
     except Exception:
@@ -15055,6 +15335,7 @@ def _fleet_reserve_absent_homes(agent_ids: list[str]) -> list[dict[str, Any]]:
             AGENT_POOL_ROOT,
             ensure=True,
             error_text="fleet_pool_root_invalid",
+            require_private=True,
         ) as root:
             root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
             try:
@@ -15075,6 +15356,7 @@ def _fleet_reserve_absent_homes(agent_ids: list[str]) -> list[dict[str, Any]]:
                         home_stat = os.stat(staging, dir_fd=root_fd, follow_symlinks=False)
                     except OSError as exc:
                         raise AgentError("fleet_registry_delete_reservation_failed") from exc
+                    reservation = {"agent_id": agent_id, "home_stat": home_stat}
                     _fleet_rename_noreplace_at(
                         root_fd,
                         staging,
@@ -15082,8 +15364,8 @@ def _fleet_reserve_absent_homes(agent_ids: list[str]) -> list[dict[str, Any]]:
                         home_stat,
                         "fleet_registry_delete_reservation_failed",
                         collision_text="fleet_registry_delete_raced",
+                        committed=lambda item=reservation: reservations.append(item),
                     )
-                    reservations.append({"agent_id": agent_id, "home_stat": home_stat})
             finally:
                 os.close(root_fd)
     except Exception:
@@ -15102,6 +15384,7 @@ def _fleet_release_reservations(reservations: list[dict[str, Any]]) -> bool:
             AGENT_POOL_ROOT,
             ensure=False,
             error_text="fleet_registry_delete_raced",
+            require_private=True,
         ) as root:
             root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
             try:
@@ -15168,14 +15451,18 @@ def _fleet_compensate_registry_delete(
             replacement,
             expected_generation=deleted.generation,
         )
-        _fleet_publish_stored(service, restored)
     except Exception:
-        raise AgentError("fleet_registry_delete_diverged") from None
+        state, reloaded = _fleet_reconcile_commit_exception(service, deleted, replacement)
+        if state != "planned":
+            raise AgentError("fleet_registry_delete_diverged") from None
+        restored = reloaded
+    _fleet_publish_stored(service, restored)
     return restored
 
 
 def _fleet_commit_staged_removal(
     service: FleetService,
+    current: FleetSnapshot,
     planned: FleetSnapshot,
     *,
     expected_generation: int,
@@ -15186,6 +15473,10 @@ def _fleet_commit_staged_removal(
     try:
         stored = service.commit_snapshot(planned, expected_generation=expected_generation)
     except Exception as exc:
+        state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
+        if state == "planned":
+            _fleet_publish_stored(service, reloaded)
+            raise AgentError("fleet_registry_commit_failed_after_cas") from None
         if not _fleet_restore_tombstones(staged):
             raise AgentError("fleet_tombstone_rollback_diverged") from None
         if isinstance(exc, FleetConflictError):
@@ -15219,6 +15510,62 @@ def _fleet_home_file_snapshot(home_fd: int, name: str) -> tuple[bytes, int, os.s
     )
 
 
+def _fleet_snapshot_metadata(current: os.stat_result) -> tuple[int, ...]:
+    return (
+        current.st_dev,
+        current.st_ino,
+        current.st_mode,
+        current.st_uid,
+        current.st_gid,
+        current.st_nlink,
+        current.st_size,
+        current.st_mtime_ns,
+    )
+
+
+def _fleet_home_tree_snapshot(home_fd: int) -> dict[str, tuple[tuple[int, ...], str | None]]:
+    error = "fleet_home_content_invalid"
+    files, directories = _fleet_tree_entries(home_fd, error)
+    snapshot: dict[str, tuple[tuple[int, ...], str | None]] = {
+        "": (_fleet_snapshot_metadata(os.fstat(home_fd)), None)
+    }
+    for name in sorted(directories):
+        parent_fd, basename = _fleet_open_artifact_parent(
+            home_fd,
+            name,
+            create=False,
+            error=error,
+        )
+        try:
+            current = os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
+            _fleet_private_directory_stat(current, error)
+            snapshot[name] = (_fleet_snapshot_metadata(current), None)
+        finally:
+            os.close(parent_fd)
+    for name in sorted(files):
+        parent_fd, basename = _fleet_open_artifact_parent(
+            home_fd,
+            name,
+            create=False,
+            error=error,
+        )
+        try:
+            current = os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
+        finally:
+            os.close(parent_fd)
+        content, opened = _fleet_read_private_file_at(
+            home_fd,
+            name,
+            stat_module.S_IMODE(current.st_mode),
+            error,
+        )
+        snapshot[name] = (
+            _fleet_snapshot_metadata(opened),
+            hashlib.sha256(content).hexdigest(),
+        )
+    return snapshot
+
+
 def _fleet_restore_managed_updates(backups: list[dict[str, Any]]) -> bool:
     if not backups:
         return True
@@ -15231,6 +15578,7 @@ def _fleet_restore_managed_updates(backups: list[dict[str, Any]]) -> bool:
             AGENT_POOL_ROOT,
             ensure=False,
             error_text="fleet_update_rollback_diverged",
+            require_private=True,
         ) as root:
             root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
             try:
@@ -15243,6 +15591,17 @@ def _fleet_restore_managed_updates(backups: list[dict[str, Any]]) -> bool:
                     )
                     if not source_identity_matches(current, item["home_stat"]):
                         return False
+                    backup_fd = open_directory_no_follow_matching(
+                        root / item["backup"],
+                        current,
+                        error_text="fleet_update_rollback_diverged",
+                        changed_text="fleet_update_rollback_diverged",
+                    )
+                    try:
+                        if _fleet_home_tree_snapshot(backup_fd) != item["snapshot"]:
+                            return False
+                    finally:
+                        os.close(backup_fd)
                     _fleet_rename_noreplace_at(
                         root_fd,
                         item["backup"],
@@ -15306,6 +15665,7 @@ def _fleet_apply_managed_update(
                     AGENT_POOL_ROOT,
                     ensure=not (update_ids or remove_ids),
                     error_text="fleet_pool_root_invalid",
+                    require_private=True,
                 ) as root:
                     marker_present = _fleet_root_marker_state(root)
                     if not marker_present and (update_ids or remove_ids):
@@ -15339,9 +15699,17 @@ def _fleet_apply_managed_update(
                                     new_artifacts[agent_id]["extra_files"] = {
                                         "auth.json": (auth_bytes, auth_mode)
                                     }
+                                backup_snapshot = _fleet_home_tree_snapshot(home_fd)
                             finally:
                                 os.close(home_fd)
                             backup = f"{FLEET_TOMBSTONE_PREFIX}backup-{uuid.uuid4().hex}"
+                            backup_item = {
+                                "old_agent": old_agent,
+                                "inventory": old_inventory,
+                                "backup": backup,
+                                "home_stat": current_home,
+                                "snapshot": backup_snapshot,
+                            }
                             _fleet_rename_noreplace_at(
                                 root_fd,
                                 agent_id,
@@ -15349,14 +15717,7 @@ def _fleet_apply_managed_update(
                                 current_home,
                                 "fleet_managed_update_failed",
                                 collision_text="fleet_tombstone_collision",
-                            )
-                            backups.append(
-                                {
-                                    "old_agent": old_agent,
-                                    "inventory": old_inventory,
-                                    "backup": backup,
-                                    "home_stat": current_home,
-                                }
+                                committed=lambda item=backup_item: backups.append(item),
                             )
                             try:
                                 home_stat = _fleet_create_home(
@@ -15408,6 +15769,12 @@ def _fleet_apply_managed_update(
                             if not source_identity_matches(current_home, pinned[agent_id]):
                                 raise AgentError("fleet_home_changed")
                             tombstone = f"{FLEET_TOMBSTONE_PREFIX}{uuid.uuid4().hex}"
+                            staged_item = {
+                                "agent": old_agent,
+                                "inventory": old_inventory,
+                                "tombstone": tombstone,
+                                "home_stat": current_home,
+                            }
                             _fleet_rename_noreplace_at(
                                 root_fd,
                                 agent_id,
@@ -15415,14 +15782,7 @@ def _fleet_apply_managed_update(
                                 current_home,
                                 "fleet_tombstone_stage_failed",
                                 collision_text="fleet_tombstone_collision",
-                            )
-                            staged.append(
-                                {
-                                    "agent": old_agent,
-                                    "inventory": old_inventory,
-                                    "tombstone": tombstone,
-                                    "home_stat": current_home,
-                                }
+                                committed=lambda item=staged_item: staged.append(item),
                             )
                     finally:
                         os.close(root_fd)
@@ -15436,6 +15796,19 @@ def _fleet_apply_managed_update(
         try:
             stored = service.commit_snapshot(planned, expected_generation=expected_generation)
         except Exception as exc:
+            state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
+            if state == "planned":
+                try:
+                    build_artifacts.validate()  # type: ignore[attr-defined]
+                except AgentError:
+                    _fleet_publish_stored(service, reloaded)
+                    raise AgentError("fleet_executable_changed_after_cas") from None
+                _fleet_publish_stored(service, reloaded)
+                try:
+                    build_artifacts.validate()  # type: ignore[attr-defined]
+                except AgentError:
+                    raise AgentError("fleet_executable_changed_after_cas") from None
+                raise AgentError("fleet_registry_commit_failed_after_cas") from None
             if not rollback():
                 raise AgentError("fleet_update_rollback_diverged") from None
             if isinstance(exc, FleetConflictError):
@@ -15447,6 +15820,10 @@ def _fleet_apply_managed_update(
             _fleet_publish_stored(service, stored)
             raise AgentError("fleet_executable_changed_after_cas") from None
         _fleet_publish_stored(service, stored)
+        try:
+            build_artifacts.validate()  # type: ignore[attr-defined]
+        except AgentError:
+            raise AgentError("fleet_executable_changed_after_cas") from None
     cleanup_pending = bool(backups or staged)
     try:
         cleanup_pending = _fleet_cleanup_tombstones(staged) or cleanup_pending
@@ -15516,34 +15893,37 @@ def fleet_series_apply(
             "raw_output": "not_returned",
         }
     enabling = existing is not None and not existing.enabled and candidate.enabled
-    registry_only = (
+    registry_only = not any(
+        materialization[name]
+        for name in ("create_ids", "update_ids", "remove_ids")
+    ) and (
         (existing is None and not candidate.enabled)
-        or (
-            managed_changed
-            and not any(plan[name] for name in ("create_count", "update_count", "remove_count"))
-        )
+        or managed_changed
         or (
             existing is not None
             and old_count == candidate.count
-            and not managed_changed
             and not enabling
         )
     )
     if registry_only:
         try:
             stored = service.commit_snapshot(planned, expected_generation=expected_generation)
-        except FleetConflictError:
-            raise AgentError("generation_conflict") from None
-        except Exception:
+        except Exception as exc:
+            state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
+            if state == "planned":
+                _fleet_publish_stored(service, reloaded)
+                raise AgentError("fleet_registry_commit_failed_after_cas") from None
+            if isinstance(exc, FleetConflictError):
+                raise AgentError("generation_conflict") from None
             raise AgentError("fleet_registry_commit_failed") from None
         _fleet_publish_stored(service, stored)
         return {
             "mutation_performed": True,
             "generation": stored.generation,
             "created_count": 0,
-            "kept_count": candidate.count if existing is not None else 0,
-            "updated_count": plan["update_count"],
-            "removed_count": 0,
+            "kept_count": len(materialization["keep_ids"]),
+            "updated_count": len(materialization["update_ids"]),
+            "removed_count": len(materialization["remove_ids"]),
             "cleanup_pending": False,
             "pool_root": "not_returned",
             "raw_output": "not_returned",
@@ -15575,6 +15955,7 @@ def fleet_series_apply(
                     AGENT_POOL_ROOT,
                     ensure=True,
                     error_text="fleet_pool_root_invalid",
+                    require_private=True,
                 ) as root:
                     marker_present = _fleet_root_marker_state(root)
                     if not marker_present and remove_ids:
@@ -15627,6 +16008,21 @@ def fleet_series_apply(
         try:
             stored = service.commit_snapshot(planned, expected_generation=expected_generation)
         except Exception as exc:
+            state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
+            if state == "planned":
+                if build_artifacts is not None:
+                    try:
+                        build_artifacts.validate()  # type: ignore[attr-defined]
+                    except AgentError:
+                        _fleet_publish_stored(service, reloaded)
+                        raise AgentError("fleet_executable_changed_after_cas") from None
+                _fleet_publish_stored(service, reloaded)
+                if build_artifacts is not None:
+                    try:
+                        build_artifacts.validate()  # type: ignore[attr-defined]
+                    except AgentError:
+                        raise AgentError("fleet_executable_changed_after_cas") from None
+                raise AgentError("fleet_registry_commit_failed_after_cas") from None
             clean = _fleet_rollback_created(created)
             if staged and not _fleet_restore_tombstones(staged):
                 clean = False
@@ -15642,6 +16038,11 @@ def fleet_series_apply(
                 _fleet_publish_stored(service, stored)
                 raise AgentError("fleet_executable_changed_after_cas") from None
         _fleet_publish_stored(service, stored)
+        if build_artifacts is not None:
+            try:
+                build_artifacts.validate()  # type: ignore[attr-defined]
+            except AgentError:
+                raise AgentError("fleet_executable_changed_after_cas") from None
     cleanup_pending = bool(staged)
     try:
         cleanup_pending = _fleet_cleanup_tombstones(staged) or cleanup_pending
@@ -15672,14 +16073,21 @@ def fleet_series_disable(*, prefix: str, expected_generation: int) -> dict[str, 
             expected_generation=expected_generation,
         )
         build_inventory(planned, AGENT_POOL_ROOT)
-        stored = service.commit_snapshot(planned, expected_generation=expected_generation)
-    except FleetConflictError:
-        raise AgentError("generation_conflict") from None
     except FleetValidationError as exc:
         raise AgentError(str(exc)) from None
     except AgentError:
         raise
     except Exception:
+        raise AgentError("fleet_registry_commit_failed") from None
+    try:
+        stored = service.commit_snapshot(planned, expected_generation=expected_generation)
+    except Exception as exc:
+        state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
+        if state == "planned":
+            _fleet_publish_stored(service, reloaded)
+            raise AgentError("fleet_registry_commit_failed_after_cas") from None
+        if isinstance(exc, FleetConflictError):
+            raise AgentError("generation_conflict") from None
         raise AgentError("fleet_registry_commit_failed") from None
     _fleet_publish_stored(service, stored)
     return {
@@ -15725,16 +16133,23 @@ def fleet_series_delete(
         try:
             stored = service.commit_snapshot(planned, expected_generation=expected_generation)
         except Exception as exc:
+            state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
+            if state == "planned":
+                _fleet_publish_stored(service, reloaded)
+                if not _fleet_release_reservations(reservations):
+                    _fleet_compensate_registry_delete(service, current, reloaded)
+                    raise AgentError("fleet_registry_delete_raced") from None
+                raise AgentError("fleet_registry_commit_failed_after_cas") from None
             released = _fleet_release_reservations(reservations)
             if not released:
                 raise AgentError("fleet_registry_delete_raced") from None
             if isinstance(exc, FleetConflictError):
                 raise AgentError("generation_conflict") from None
             raise AgentError("fleet_registry_commit_failed") from None
+        _fleet_publish_stored(service, stored)
         if not _fleet_release_reservations(reservations):
             _fleet_compensate_registry_delete(service, current, stored)
             raise AgentError("fleet_registry_delete_raced") from None
-        _fleet_publish_stored(service, stored)
         return {
             "mutation_performed": True,
             "generation": stored.generation,
@@ -15746,6 +16161,7 @@ def fleet_series_delete(
     old_inventory = build_inventory(current, AGENT_POOL_ROOT)
     stored, cleanup_pending = _fleet_commit_staged_removal(
         service,
+        current,
         planned,
         expected_generation=expected_generation,
         inventory=old_inventory,
@@ -16294,7 +16710,7 @@ def pool_read_private_bytes(
     if (
         stat_module.S_ISLNK(current.st_mode)
         or not stat_module.S_ISREG(current.st_mode)
-        or getattr(current, "st_nlink", 1) > 1
+        or getattr(current, "st_nlink", 1) != 1
         or current.st_size > max_bytes
     ):
         os.close(parent_fd)
@@ -16315,7 +16731,7 @@ def pool_read_private_bytes(
             )
             or stat_module.S_ISLNK(opened.st_mode)
             or not stat_module.S_ISREG(opened.st_mode)
-            or getattr(opened, "st_nlink", 1) > 1
+            or getattr(opened, "st_nlink", 1) != 1
             or opened.st_size > max_bytes
             or (expected_mode is not None and stat_module.S_IMODE(opened.st_mode) != expected_mode)
         ):
@@ -16632,6 +17048,7 @@ def pool_root_operation(
     error_text: str,
     expected_parent_stat: os.stat_result | None = None,
     expected_root_stat: os.stat_result | None = None,
+    require_private: bool = False,
 ) -> Any:
     if expected_parent_stat is None:
         try:
@@ -16652,6 +17069,8 @@ def pool_root_operation(
     else:
         root_stat = expected_root_stat
 
+    if require_private and root_stat is not None:
+        _fleet_private_directory_stat(root_stat, error_text)
     if ensure:
         ensure_private_dir(root)
     elif parent_stat is None or root_stat is None:
@@ -16666,6 +17085,8 @@ def pool_root_operation(
             root_stat = root.lstat()
         except OSError as exc:
             raise AgentError(error_text) from exc
+    if require_private:
+        _fleet_private_directory_stat(root_stat, error_text)
 
     parent_fd = -1
     root_fd = -1
@@ -16683,6 +17104,8 @@ def pool_root_operation(
             changed_text=error_text,
             dir_fd=parent_fd,
         )
+        if require_private:
+            _fleet_private_directory_stat(os.fstat(root_fd), error_text)
         operation_root = Path(f"/proc/self/fd/{root_fd}")
         yield operation_root
     finally:

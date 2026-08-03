@@ -118,8 +118,8 @@ def build_runner_plan(agent: AgentDescriptor, executable: Path) -> RunnerPlan:
     if agent.provider is Provider.GEMINI_API and agent.runner is RunnerKind.GEMINI_CLI and agent.account_id:
         return RunnerPlan(
             "headless_job",
-            (command, "-p", "-", "--output-format", "stream-json", "--model", agent.model),
-            MappingProxyType({"GEMINI_CLI_HOME": str(agent.home.parent / ".accounts" / agent.account_id)}),
+            (command, "--output-format", "stream-json", "--model", agent.model),
+            MappingProxyType({"HOME": str(agent.home), "GEMINI_CLI_HOME": str(agent.home)}),
             _plan_env("GEMINI_API_KEY"), "GEMINI_API_KEY",
         )
     _fail("invalid_agent")
