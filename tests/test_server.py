@@ -9,6 +9,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+import tomllib
 import unittest
 from pathlib import Path
 import os
@@ -16,6 +17,7 @@ from typing import Any
 from unittest.mock import Mock, patch
 
 import codex_master.server as server_module
+from codex_master import __version__
 
 from codex_master.server import (
     AgentError,
@@ -4301,7 +4303,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.53")
+        self.assertEqual(result["expected_tag"], "v0.9.58")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -4314,6 +4316,17 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("local_tags_without_github_release", result["warnings"])
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
+
+    def test_repo_release_metadata_matches_and_supersedes_known_installed_plugin(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        plugin = json.loads((root / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        project_version = project["project"]["version"]
+        plugin_base_version = plugin["version"].split("+", 1)[0]
+
+        self.assertEqual(project_version, __version__)
+        self.assertEqual(plugin_base_version, project_version)
+        self.assertGreater(tuple(int(part) for part in project_version.split(".")), (0, 9, 57))
 
     @patch("codex_master.server.codex_client_mcp_config_status")
     def test_master_timeout_policy_reports_unbounded_claim_wait_without_paths(self, mock_client_config) -> None:
