@@ -10,6 +10,8 @@ const ByteArray = imports.byteArray;
 const LABEL = "Flottenmanagement";
 const UUID = "codex-master@H234598";
 const APPLET_STATUS_TIMEOUT_MILLISECONDS = 10 * 1000;
+const APPLET_ACTION_TIMEOUT_MILLISECONDS = 120 * 1000;
+const CONTROL_CENTER_LAUNCH_TIMEOUT_MILLISECONDS = 10 * 1000;
 const APPLET_STDOUT_LIMIT_BYTES = 64 * 1024;
 const APPLET_STDERR_LIMIT_BYTES = 8 * 1024;
 const APPLET_STATUS_CHUNK_BYTES = 1024;
@@ -27,12 +29,17 @@ const APPLET_ERROR_LOG_LIMIT = 8;
 const APPLET_IMMEDIATE_EXIT_WAIT_LIMIT = 2;
 const APPLET_SAFE_PATH = "/usr/bin:/bin";
 const APPLET_STATUS_COMMAND = "applet-status";
+const APPLET_ACTION_COMMAND = "applet-action";
 const APPLET_STATUS_SCHEMA_VERSION = 2;
 let appletErrorLogCount = 0;
 const APPLET_STATUS_REQUIRED_FIELDS = [
     "schema_version", "mode", "counts", "agents", "native_agents", "raw_output",
 ];
 const APPLET_STATUS_REQUIRED_ROW_FIELDS = [
+    "agent", "activity_state", "backend_state", "control_state", "auth_state", "identity_state", "lease_state",
+    "allowed_action", "context_token", "limit_state", "blocked_until_utc",
+];
+const APPLET_STATUS_BASE_ROW_STRING_FIELDS = [
     "agent", "activity_state", "backend_state", "control_state", "auth_state", "identity_state", "lease_state",
 ];
 const APPLET_STATUS_REQUIRED_COUNTS = ["tracked", "running", "sleeping", "overflow"];
@@ -56,6 +63,8 @@ const APPLET_STATUS_VALID_STRINGS = {
         auth_state: new Set(["ready", "blocked", "unknown"]),
         identity_state: new Set(["verified", "unverified", "stopped", "unknown"]),
         lease_state: new Set(["unclaimed", "held", "expired", "unreadable"]),
+        allowed_action: new Set(["start", "stop", "none"]),
+        limit_state: new Set(["clear", "blocked", "unknown"]),
     },
     native: {
         bridge_state: new Set(["ready", "disabled", "degraded", "unavailable"]),
@@ -131,6 +140,12 @@ FlottenmanagementApplet.prototype = {
         this._statusActiveState = null;
         this._statusViewState = "initializing";
         this._backgroundRefreshSource = 0;
+        this._launcherInFlight = false;
+        this._actionInFlight = false;
+        this._armedAction = null;
+        this._actionsAwaitingRefresh = false;
+        this._startActionBinding = null;
+        this._stopActionBindings = Array(MAX_TRACKED_AGENTS).fill(null);
         this._trackedAgents = APPLET_STATUS_AGENTS.slice();
         this.trackedAgentsSetting = DEFAULT_TRACKED_AGENTS_TEXT;
         this.refreshOnOpenSetting = DEFAULT_REFRESH_ON_OPEN;
@@ -147,6 +162,12 @@ FlottenmanagementApplet.prototype = {
         this._statusRowItems = [];
         this._nativeSubmenuItem = null;
         this._nativeBeeRowItems = [];
+        this._quickControlSubmenuItem = null;
+        this._startActionItem = null;
+        this._stopActionItems = [];
+        this._confirmationDetailItem = null;
+        this._confirmationConfirmItem = null;
+        this._confirmationCancelItem = null;
         this._menuCleanupState = {};
         this._signalConnections = [];
         this.menu = null;
@@ -183,6 +204,10 @@ FlottenmanagementApplet.prototype = {
         });
         this.menu.addMenuItem(settingsItem);
 
+        const controlCenterItem = new PopupMenu.PopupMenuItem("Steuerzentrale öffnen");
+        this._connectTracked(controlCenterItem, "activate", () => this._launchControlCenter());
+        this.menu.addMenuItem(controlCenterItem);
+
         this._statusSummaryItem = new PopupMenu.PopupMenuItem("", { reactive: false });
         this.menu.addMenuItem(this._statusSummaryItem);
         for (let index = 0; index < MAX_TRACKED_AGENTS; index += 1) {
@@ -190,6 +215,26 @@ FlottenmanagementApplet.prototype = {
             this._statusRowItems.push(rowItem);
             this.menu.addMenuItem(rowItem);
         }
+
+        this._quickControlSubmenuItem = new PopupMenu.PopupSubMenuMenuItem("Schnellsteuerung");
+        this.menu.addMenuItem(this._quickControlSubmenuItem);
+        this._startActionItem = new PopupMenu.PopupMenuItem("Biene starten");
+        this._connectTracked(this._startActionItem, "activate", () => this._armStartAction());
+        this._quickControlSubmenuItem.menu.addMenuItem(this._startActionItem);
+        for (let index = 0; index < MAX_TRACKED_AGENTS; index += 1) {
+            const rowItem = new PopupMenu.PopupMenuItem("Biene stoppen");
+            this._connectTracked(rowItem, "activate", () => this._armStopAction(index));
+            this._stopActionItems.push(rowItem);
+            this._quickControlSubmenuItem.menu.addMenuItem(rowItem);
+        }
+        this._confirmationDetailItem = new PopupMenu.PopupMenuItem("", { reactive: false });
+        this._quickControlSubmenuItem.menu.addMenuItem(this._confirmationDetailItem);
+        this._confirmationConfirmItem = new PopupMenu.PopupMenuItem("Bestätigen");
+        this._connectTracked(this._confirmationConfirmItem, "activate", () => this._confirmArmedAction());
+        this._quickControlSubmenuItem.menu.addMenuItem(this._confirmationConfirmItem);
+        this._confirmationCancelItem = new PopupMenu.PopupMenuItem("Abbrechen");
+        this._connectTracked(this._confirmationCancelItem, "activate", () => this._cancelArmedAction());
+        this._quickControlSubmenuItem.menu.addMenuItem(this._confirmationCancelItem);
 
         this._nativeSubmenuItem = new PopupMenu.PopupSubMenuMenuItem("Native Bienen");
         this.menu.addMenuItem(this._nativeSubmenuItem);
@@ -287,6 +332,8 @@ FlottenmanagementApplet.prototype = {
         this._settingsValid = valid;
         if (previousAgents !== this._trackedAgents.join(",")) {
             this._statusLastGood = null;
+            this._armedAction = null;
+            this._clearActionBindings();
             this._statusViewState = "initializing";
             if (this._statusInFlight) this._statusPendingRefresh = true;
         }
@@ -346,21 +393,134 @@ FlottenmanagementApplet.prototype = {
         ];
     },
 
+    _launchControlCenter() {
+        if (this._removed || this._statusInFlight) return;
+        this._startStatusRefresh({ kind: "launcher" });
+    },
+
+    _controlCenterArgv() {
+        const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
+        return [home + "/.local/bin/codex-master-mcp", "control-center"];
+    },
+
+    _appletActionArgv(actionRequest) {
+        if (
+            !actionRequest
+            || !["start", "stop"].includes(actionRequest.action)
+            || !this._isCanonicalManagedAgentId(actionRequest.agent)
+            || !this._isValidContextToken(actionRequest.contextToken)
+        ) {
+            throw new Error("Invalid applet action request");
+        }
+        const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
+        return [
+            home + "/.local/bin/codex-master-mcp",
+            APPLET_ACTION_COMMAND,
+            actionRequest.action,
+            actionRequest.agent,
+            actionRequest.contextToken,
+        ];
+    },
+
+    _clearActionBindings() {
+        this._startActionBinding = null;
+        for (let index = 0; index < this._stopActionBindings.length; index += 1) {
+            this._stopActionBindings[index] = null;
+        }
+    },
+
+    _updateActionBindings(payload) {
+        this._clearActionBindings();
+        if (!payload) return;
+        let stopIndex = 0;
+        for (const row of payload.agents) {
+            if (row.allowed_action === "start") {
+                this._startActionBinding = {
+                    action: "start",
+                    agent: row.agent,
+                    contextToken: row.context_token,
+                };
+            } else if (row.allowed_action === "stop" && stopIndex < this._stopActionBindings.length) {
+                this._stopActionBindings[stopIndex] = {
+                    action: "stop",
+                    agent: row.agent,
+                    contextToken: row.context_token,
+                };
+                stopIndex += 1;
+            }
+        }
+    },
+
+    _armStartAction() {
+        this._armAction(this._startActionBinding);
+    },
+
+    _armStopAction(index) {
+        this._armAction(this._stopActionBindings[index]);
+    },
+
+    _armAction(binding) {
+        if (
+            this._removed
+            || this._statusInFlight
+            || this._actionInFlight
+            || this._launcherInFlight
+            || this._actionsAwaitingRefresh
+            || !binding
+            || !["start", "stop"].includes(binding.action)
+            || !this._isCanonicalManagedAgentId(binding.agent)
+            || !this._isValidContextToken(binding.contextToken)
+        ) return;
+        this._armedAction = {
+            action: binding.action,
+            agent: binding.agent,
+            contextToken: binding.contextToken,
+        };
+        this._renderStatusSafely();
+    },
+
+    _cancelArmedAction() {
+        if (this._removed || this._actionInFlight) return;
+        this._armedAction = null;
+        this._renderStatusSafely();
+    },
+
+    _confirmArmedAction() {
+        if (
+            this._removed
+            || this._statusInFlight
+            || this._actionInFlight
+            || this._launcherInFlight
+            || !this._armedAction
+        ) return;
+        const request = this._armedAction;
+        this._armedAction = null;
+        this._statusLastGood = null;
+        this._clearActionBindings();
+        this._actionsAwaitingRefresh = true;
+        this._startStatusRefresh(request);
+    },
+
     _refreshStatus() {
+        if (this._actionInFlight || this._launcherInFlight) return;
         if (this._statusInFlight) {
-            this._statusPendingRefresh = true;
+            if (!this._actionsAwaitingRefresh) this._statusPendingRefresh = true;
             return;
         }
         this._startStatusRefresh();
     },
 
-    _startStatusRefresh() {
+    _startStatusRefresh(request = null) {
         if (this._removed) return;
+        const commandKind = request && request.kind === "launcher" ? "launcher" : request ? "action" : "status";
+        const actionRequest = commandKind === "action" ? request : null;
 
         const generation = ++this._statusGeneration;
         let process;
         try {
-            const argv = this._trackedStatusArgv();
+            const argv = commandKind === "launcher"
+                ? this._controlCenterArgv()
+                : actionRequest ? this._appletActionArgv(actionRequest) : this._trackedStatusArgv();
             const launcher = Gio.SubprocessLauncher.new(
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
             );
@@ -368,7 +528,14 @@ FlottenmanagementApplet.prototype = {
             process = launcher.spawnv(argv);
         } catch (_error) {
             this._statusInFlight = false;
-            this._markRefreshFailed();
+            this._actionInFlight = false;
+            if (commandKind === "action") {
+                this._actionsAwaitingRefresh = true;
+                this._renderStatusSafely();
+                this._startStatusRefresh();
+            } else {
+                if (commandKind === "status") this._markRefreshFailed();
+            }
             return;
         }
 
@@ -381,6 +548,8 @@ FlottenmanagementApplet.prototype = {
 
         const state = {
             generation,
+            commandKind,
+            actionRequest,
             process,
             cancellable,
             cancellableCancelled: false,
@@ -410,7 +579,11 @@ FlottenmanagementApplet.prototype = {
         this._statusActiveState = state;
         this._statusActiveGeneration = generation;
         this._statusInFlight = true;
-        this._statusViewState = this._statusLastGood ? "refreshing" : "initializing";
+        this._actionInFlight = commandKind === "action";
+        this._launcherInFlight = commandKind === "launcher";
+        if (commandKind === "status") {
+            this._statusViewState = this._statusLastGood ? "refreshing" : "initializing";
+        }
         this._renderStatusSafely();
 
         const requestForceExit = (stateArg) => {
@@ -442,7 +615,7 @@ FlottenmanagementApplet.prototype = {
             requestCancel(stateArg);
             stateArg.discardOutput = true;
             this._clearStatusBuffers(stateArg);
-            this._markRefreshFailed();
+            if (stateArg.commandKind === "status") this._markRefreshFailed();
         };
 
         const attemptFinalize = (stateArg) => {
@@ -635,7 +808,11 @@ FlottenmanagementApplet.prototype = {
         try {
             const timeoutSource = GLib.timeout_add(
                 GLib.PRIORITY_DEFAULT,
-                APPLET_STATUS_TIMEOUT_MILLISECONDS,
+                commandKind === "action"
+                    ? APPLET_ACTION_TIMEOUT_MILLISECONDS
+                    : commandKind === "launcher"
+                        ? CONTROL_CENTER_LAUNCH_TIMEOUT_MILLISECONDS
+                        : APPLET_STATUS_TIMEOUT_MILLISECONDS,
                 () => {
                     if (this._removed) {
                         state.timeoutSource = 0;
@@ -685,7 +862,12 @@ FlottenmanagementApplet.prototype = {
             failRefresh(state);
         }
         if (!state.stdoutDone) {
-            readStream(state, "stdout", stdoutStream, APPLET_STDOUT_LIMIT_BYTES);
+            readStream(
+                state,
+                "stdout",
+                stdoutStream,
+                commandKind === "status" ? APPLET_STDOUT_LIMIT_BYTES : APPLET_STDERR_LIMIT_BYTES
+            );
         }
         if (!state.stderrDone) {
             readStream(state, "stderr", stderrStream, APPLET_STDERR_LIMIT_BYTES);
@@ -743,6 +925,47 @@ FlottenmanagementApplet.prototype = {
         this._statusActiveGeneration = 0;
         this._statusActiveState = null;
         this._activeStatusProcess = null;
+
+        if (state.commandKind === "launcher") {
+            this._clearStatusBuffers(state);
+            this._launcherInFlight = false;
+            this._statusPendingRefresh = false;
+            if (state.timeoutSource) {
+                GLib.source_remove(state.timeoutSource);
+                state.timeoutSource = 0;
+            }
+            return;
+        }
+
+        if (state.commandKind === "action") {
+            let actionCompleted = false;
+            if (!state.timedOut && !state.waitFailed && !state.streamFailed && !state.stdoutLimitExceeded && !state.stderrLimitExceeded) {
+                const payload = state.process ? this._collectProcessPayload(state) : null;
+                let processSuccessful = false;
+                try {
+                    processSuccessful = state.process && state.process.get_successful();
+                } catch (_error) {
+                    processSuccessful = false;
+                }
+                actionCompleted = processSuccessful && this._isValidAppletActionPayload(payload, state.actionRequest);
+            }
+            this._clearStatusBuffers(state);
+            this._actionInFlight = false;
+            this._armedAction = null;
+            this._actionsAwaitingRefresh = true;
+            this._statusPendingRefresh = false;
+            this._setMenuItemText(
+                this._confirmationDetailItem,
+                actionCompleted ? "Aktion abgeschlossen · Status wird geprüft" : "Ausgang unbekannt · Status wird geprüft"
+            );
+            this._renderStatusSafely();
+            if (state.timeoutSource) {
+                GLib.source_remove(state.timeoutSource);
+                state.timeoutSource = 0;
+            }
+            if (!this._removed) this._startStatusRefresh();
+            return;
+        }
 
         let applied = false;
         if (!state.timedOut && !state.waitFailed && !state.streamFailed && !state.stdoutLimitExceeded && !state.stderrLimitExceeded) {
@@ -802,8 +1025,21 @@ FlottenmanagementApplet.prototype = {
             return false;
         }
         this._statusLastGood = payload;
+        this._armedAction = null;
+        this._actionsAwaitingRefresh = false;
+        this._updateActionBindings(payload);
         this._statusViewState = "ready";
         return this._renderStatusSafely();
+    },
+
+    _isValidAppletActionPayload(payload, request) {
+        if (!payload || typeof payload !== "object" || !request) return false;
+        if (!this._hasExactFields(payload, ["agent", "action", "status", "state", "raw_output"])) return false;
+        return payload.agent === request.agent
+            && payload.action === request.action
+            && payload.status === "completed"
+            && payload.state === (request.action === "start" ? "running" : "sleeping")
+            && payload.raw_output === APPLET_STATUS_RAW_OUTPUT;
     },
 
     _isValidAppletStatusPayload(payload) {
@@ -822,12 +1058,15 @@ FlottenmanagementApplet.prototype = {
 
         if (!Array.isArray(payload.agents) || payload.agents.length > MAX_TRACKED_AGENTS) return false;
         const agents = new Set();
+        let startOfferCount = 0;
         for (const row of payload.agents) {
             if (!row || typeof row !== "object") return false;
             if (!this._hasExactFields(row, APPLET_STATUS_REQUIRED_ROW_FIELDS)) return false;
-            for (const field of APPLET_STATUS_REQUIRED_ROW_FIELDS) {
+            for (const field of APPLET_STATUS_BASE_ROW_STRING_FIELDS) {
                 if (typeof row[field] !== "string" || row[field].length === 0) return false;
             }
+            if (typeof row.context_token !== "string") return false;
+            if (row.blocked_until_utc !== null && !this._isValidUtcTimestamp(row.blocked_until_utc)) return false;
             if (!this._isCanonicalManagedAgentId(row.agent)) return false;
             if (agents.has(row.agent)) return false;
             agents.add(row.agent);
@@ -837,8 +1076,13 @@ FlottenmanagementApplet.prototype = {
             if (!this._isValidStateSet("row", "auth_state", row.auth_state)) return false;
             if (!this._isValidStateSet("row", "identity_state", row.identity_state)) return false;
             if (!this._isValidStateSet("row", "lease_state", row.lease_state)) return false;
+            if (!this._isValidStateSet("row", "allowed_action", row.allowed_action)) return false;
+            if (!this._isValidStateSet("row", "limit_state", row.limit_state)) return false;
             if (!this._isValidAppletStatusRow(row)) return false;
+            if (!this._isValidAppletActionOffer(row)) return false;
+            if (row.allowed_action === "start") startOfferCount += 1;
         }
+        if (startOfferCount > 1) return false;
 
         if (payload.counts.tracked !== payload.agents.length) return false;
         const expectedCounts = {
@@ -878,6 +1122,36 @@ FlottenmanagementApplet.prototype = {
 
         const expectedControlState = this._deriveControlStateForAppletRow(row);
         return row.control_state === expectedControlState;
+    },
+
+    _isValidContextToken(value) {
+        return typeof value === "string"
+            && value.length >= 3
+            && value.length <= 512
+            && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
+    },
+
+    _isValidAppletActionOffer(row) {
+        const isErrorRow = row.activity_state === "unknown" && row.backend_state === "error";
+        if (row.allowed_action === "none") {
+            return row.context_token === ""
+                && (!isErrorRow || (row.limit_state === "unknown" && row.blocked_until_utc === null));
+        }
+        if (!this._isValidContextToken(row.context_token) || isErrorRow) return false;
+        if (row.allowed_action === "start") {
+            return row.activity_state === "sleeping"
+                && row.backend_state === "ok"
+                && row.control_state === "ready"
+                && row.auth_state === "ready"
+                && row.identity_state === "stopped"
+                && ["unclaimed", "expired"].includes(row.lease_state)
+                && row.limit_state === "clear";
+        }
+        return row.allowed_action === "stop"
+            && row.activity_state === "running"
+            && row.backend_state === "ok"
+            && row.identity_state === "verified"
+            && ["unclaimed", "expired"].includes(row.lease_state);
     },
 
     _deriveControlStateForAppletRow(row) {
@@ -973,6 +1247,8 @@ FlottenmanagementApplet.prototype = {
 
     _markRefreshFailed() {
         if (this._removed) return;
+        this._armedAction = null;
+        this._clearActionBindings();
         this._statusViewState = this._statusLastGood ? "stale" : "unavailable";
         this._renderStatusSafely();
     },
@@ -1020,7 +1296,7 @@ FlottenmanagementApplet.prototype = {
         const stale = this._statusViewState === "stale" ? " · veraltet" : "";
         const unavailable = this._statusViewState === "unavailable" ? " · nicht verfügbar" : "";
         const configuration = this._settingsValid ? "" : "Konfigurationsfehler · ";
-        const summary = `${configuration}Aktivität: ${activity} · Backend: ${backend} · Modus: Nur Lesen${stale}${unavailable}`;
+        const summary = `${configuration}Aktivität: ${activity} · Backend: ${backend} · Modus: Schnellsteuerung${stale}${unavailable}`;
         this.set_applet_tooltip(summary);
         this._setMenuItemText(this._statusSummaryItem, summary);
 
@@ -1031,12 +1307,79 @@ FlottenmanagementApplet.prototype = {
                 this._setMenuItemVisible(item, false);
                 continue;
             }
-            const text = `${row.agent}: ${this._stateLabel("activity", row.activity_state)} · Backend ${this._stateLabel("backend", row.backend_state)} · Steuerung ${this._stateLabel("control", row.control_state)}`;
+            let limit = "";
+            if (row.limit_state === "blocked") {
+                limit = row.blocked_until_utc
+                    ? ` · Limit bis ${row.blocked_until_utc}`
+                    : " · Limit blockiert";
+            } else if (row.limit_state === "unknown") {
+                limit = " · Limit unbekannt";
+            }
+            const text = `${row.agent}: ${this._stateLabel("activity", row.activity_state)} · Backend ${this._stateLabel("backend", row.backend_state)} · Steuerung ${this._stateLabel("control", row.control_state)}${limit}`;
             this._setMenuItemText(item, text);
             this._setMenuItemVisible(item, true);
         }
 
+        this._renderQuickControl(payload);
         this._renderNativeStatus(payload ? payload.native_agents : null);
+    },
+
+    _renderQuickControl(payload) {
+        if (!this._quickControlSubmenuItem) return;
+        this._setMenuItemVisible(this._startActionItem, false);
+        for (const item of this._stopActionItems) this._setMenuItemVisible(item, false);
+        this._setMenuItemVisible(this._confirmationDetailItem, false);
+        this._setMenuItemVisible(this._confirmationConfirmItem, false);
+        this._setMenuItemVisible(this._confirmationCancelItem, false);
+
+        if (this._actionInFlight) {
+            const action = this._statusActiveState && this._statusActiveState.actionRequest;
+            const label = action
+                ? `${action.action === "start" ? "Start" : "Stop"} ${action.agent} läuft · kein automatischer Retry`
+                : "Aktion läuft · kein automatischer Retry";
+            this._setMenuItemText(this._quickControlSubmenuItem, "Schnellsteuerung (läuft)");
+            this._setMenuItemText(this._confirmationDetailItem, label);
+            this._setMenuItemVisible(this._confirmationDetailItem, true);
+            return;
+        }
+        if (this._actionsAwaitingRefresh) {
+            this._setMenuItemText(this._quickControlSubmenuItem, "Schnellsteuerung (Statusprüfung)");
+            this._setMenuItemText(this._confirmationDetailItem, "Ausgang wird read-only geprüft");
+            this._setMenuItemVisible(this._confirmationDetailItem, true);
+            return;
+        }
+        if (this._armedAction) {
+            const verb = this._armedAction.action === "start" ? "starten" : "stoppen";
+            this._setMenuItemText(this._quickControlSubmenuItem, "Schnellsteuerung (Bestätigung)");
+            this._setMenuItemText(this._confirmationDetailItem, `${this._armedAction.agent} wirklich ${verb}?`);
+            this._setMenuItemText(this._confirmationConfirmItem, `Ja, ${this._armedAction.agent} ${verb}`);
+            this._setMenuItemVisible(this._confirmationDetailItem, true);
+            this._setMenuItemVisible(this._confirmationConfirmItem, true);
+            this._setMenuItemVisible(this._confirmationCancelItem, true);
+            return;
+        }
+
+        let stopCount = 0;
+        for (let index = 0; index < this._stopActionBindings.length; index += 1) {
+            const binding = this._stopActionBindings[index];
+            if (!binding) continue;
+            this._setMenuItemText(this._stopActionItems[index], `${binding.agent} stoppen`);
+            this._setMenuItemVisible(this._stopActionItems[index], true);
+            stopCount += 1;
+        }
+        if (this._startActionBinding) {
+            this._setMenuItemText(this._startActionItem, `${this._startActionBinding.agent} starten`);
+            this._setMenuItemVisible(this._startActionItem, true);
+        }
+        const actionCount = (this._startActionBinding ? 1 : 0) + stopCount;
+        this._setMenuItemText(
+            this._quickControlSubmenuItem,
+            actionCount > 0 ? `Schnellsteuerung (${actionCount})` : "Schnellsteuerung"
+        );
+        if (actionCount === 0) {
+            this._setMenuItemText(this._confirmationDetailItem, "Keine sichere Schnellaktion verfügbar");
+            this._setMenuItemVisible(this._confirmationDetailItem, true);
+        }
     },
 
     _renderNativeStatus(nativeAgents) {
@@ -1232,6 +1575,11 @@ FlottenmanagementApplet.prototype = {
         let success = true;
         let statusClean = true;
         this._statusLastGood = null;
+        this._armedAction = null;
+        this._actionInFlight = false;
+        this._launcherInFlight = false;
+        this._actionsAwaitingRefresh = false;
+        this._clearActionBindings();
         if (this._backgroundRefreshSource) {
             try {
                 GLib.source_remove(this._backgroundRefreshSource);
@@ -1340,6 +1688,14 @@ FlottenmanagementApplet.prototype = {
                 this._statusRowItems = [];
                 this._nativeSubmenuItem = null;
                 this._nativeBeeRowItems = [];
+                this._quickControlSubmenuItem = null;
+                this._startActionItem = null;
+                this._stopActionItems = [];
+                this._confirmationDetailItem = null;
+                this._confirmationConfirmItem = null;
+                this._confirmationCancelItem = null;
+                this._startActionBinding = null;
+                this._stopActionBindings = [];
             }
             this._cleanupComplete = statusClean && settingsClean && signalsClean && appletMenuClean && contextMenuClean;
         }

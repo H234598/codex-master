@@ -14,6 +14,7 @@ import contextvars
 import datetime as _dt
 import fcntl
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -199,6 +200,12 @@ MAX_POOL_SERIES = 26
 MAX_POOL_SHARED_ASSETS = 40
 MAX_POOL_RUNTIME_DIRS = 40
 MAX_APPLET_AGENTS = 6
+APPLET_ACTION_KEY_FILE = STATE_ROOT / "applet-action.key"
+APPLET_ACTION_KEY_BYTES = 32
+APPLET_ACTION_KEY_TEXT_BYTES = 44
+APPLET_ACTION_TOKEN_TTL_SECONDS = 30
+MAX_APPLET_ACTION_TOKEN_CHARS = 512
+APPLET_ACTION_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
 NATIVE_AGENT_REGISTRY_FILE = STATE_ROOT / "native-agents.json"
 NATIVE_AGENT_REGISTRY_LOCK_FILE = LOCK_DIR / "native-agents.lock"
 MAX_NATIVE_AGENT_RECORDS = 64
@@ -1229,6 +1236,260 @@ def applet_remaining_timeout(deadline: float) -> float:
     return min(APPLET_TMUX_TIMEOUT_SECONDS, remaining)
 
 
+def ensure_applet_action_key() -> bytes:
+    ensure_private_dir(STATE_ROOT)
+    try:
+        APPLET_ACTION_KEY_FILE.lstat()
+    except FileNotFoundError:
+        encoded = base64.urlsafe_b64encode(os.urandom(APPLET_ACTION_KEY_BYTES))
+        write_private_new_bytes(APPLET_ACTION_KEY_FILE, encoded, mode=0o600)
+    except OSError as exc:
+        raise AgentError("applet action key is unavailable") from exc
+    return read_applet_action_key()
+
+
+def read_applet_action_key() -> bytes:
+    try:
+        key_stat = APPLET_ACTION_KEY_FILE.lstat()
+    except OSError as exc:
+        raise AgentError("applet action key is unavailable") from exc
+    if (
+        not stat_module.S_ISREG(key_stat.st_mode)
+        or stat_module.S_ISLNK(key_stat.st_mode)
+        or getattr(key_stat, "st_nlink", 1) > 1
+        or key_stat.st_uid != os.geteuid()
+        or stat_module.S_IMODE(key_stat.st_mode) != 0o600
+        or key_stat.st_size != APPLET_ACTION_KEY_TEXT_BYTES
+    ):
+        raise AgentError("applet action key is unavailable")
+    encoded = read_private_regular_text(
+        APPLET_ACTION_KEY_FILE,
+        APPLET_ACTION_KEY_TEXT_BYTES,
+        "applet action key is unavailable",
+    )
+    if not re.fullmatch(r"[A-Za-z0-9_-]{43}=", encoded):
+        raise AgentError("applet action key is unavailable")
+    try:
+        key = base64.b64decode(encoded, altchars=b"-_", validate=True)
+    except (ValueError, base64.binascii.Error) as exc:
+        raise AgentError("applet action key is unavailable") from exc
+    if len(key) != APPLET_ACTION_KEY_BYTES:
+        raise AgentError("applet action key is unavailable")
+    return key
+
+
+def _applet_token_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _applet_token_decode(text: str) -> bytes:
+    if not isinstance(text, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", text):
+        raise AgentError("applet context token is invalid")
+    padding = "=" * (-len(text) % 4)
+    try:
+        decoded = base64.b64decode(text + padding, altchars=b"-_", validate=True)
+    except (ValueError, base64.binascii.Error) as exc:
+        raise AgentError("applet context token is invalid") from exc
+    if _applet_token_encode(decoded) != text:
+        raise AgentError("applet context token is invalid")
+    return decoded
+
+
+def applet_action_fingerprint(state: dict[str, Any]) -> str:
+    try:
+        encoded = json.dumps(state, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    except (TypeError, ValueError, RecursionError, UnicodeError) as exc:
+        raise AgentError("applet action state is invalid") from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def applet_action_fingerprint_for(action: str, state: dict[str, Any]) -> str:
+    if action == "start":
+        selected = state
+    elif action == "stop":
+        selected = {
+            key: state.get(key)
+            for key in (
+                "agent",
+                "activity_state",
+                "backend_state",
+                "identity_state",
+                "lease_state",
+                "run_marker",
+            )
+        }
+    else:
+        raise AgentError("applet action is invalid")
+    return applet_action_fingerprint(selected)
+
+
+def issue_applet_action_token(
+    action: str,
+    agent: str,
+    state: dict[str, Any],
+    key: bytes,
+    *,
+    now: float | None = None,
+) -> str:
+    if action not in {"start", "stop"}:
+        raise AgentError("applet action is invalid")
+    agent = normalize_applet_agents([agent])[0]
+    if not isinstance(key, bytes) or len(key) != APPLET_ACTION_KEY_BYTES:
+        raise AgentError("applet action key is unavailable")
+    issued_at = int(time.time() if now is None else now)
+    claims = {
+        "a": action,
+        "e": issued_at + APPLET_ACTION_TOKEN_TTL_SECONDS,
+        "f": applet_action_fingerprint_for(action, state),
+        "g": agent,
+        "i": issued_at,
+        "v": 1,
+    }
+    payload = json.dumps(claims, sort_keys=True, separators=(",", ":")).encode("ascii")
+    encoded_payload = _applet_token_encode(payload)
+    signature = hmac.new(key, encoded_payload.encode("ascii"), hashlib.sha256).digest()
+    token = f"{encoded_payload}.{_applet_token_encode(signature)}"
+    if len(token) > MAX_APPLET_ACTION_TOKEN_CHARS:
+        raise AgentError("applet context token is invalid")
+    return token
+
+
+def validate_applet_action_token(
+    token: str,
+    key: bytes,
+    *,
+    now: float | None = None,
+) -> dict[str, Any]:
+    if (
+        not isinstance(token, str)
+        or not token
+        or len(token) > MAX_APPLET_ACTION_TOKEN_CHARS
+        or not APPLET_ACTION_TOKEN_RE.fullmatch(token)
+    ):
+        raise AgentError("applet context token is invalid")
+    if not isinstance(key, bytes) or len(key) != APPLET_ACTION_KEY_BYTES:
+        raise AgentError("applet action key is unavailable")
+    encoded_payload, encoded_signature = token.split(".", 1)
+    supplied_signature = _applet_token_decode(encoded_signature)
+    expected_signature = hmac.new(key, encoded_payload.encode("ascii"), hashlib.sha256).digest()
+    if len(supplied_signature) != len(expected_signature) or not hmac.compare_digest(
+        supplied_signature,
+        expected_signature,
+    ):
+        raise AgentError("applet context token is invalid")
+    try:
+        claims = json.loads(_applet_token_decode(encoded_payload))
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
+        raise AgentError("applet context token is invalid") from exc
+    if not isinstance(claims, dict) or set(claims) != {"a", "e", "f", "g", "i", "v"}:
+        raise AgentError("applet context token is invalid")
+    if (
+        claims.get("v") != 1
+        or claims.get("a") not in {"start", "stop"}
+        or not isinstance(claims.get("g"), str)
+        or claims["g"] not in AGENTS
+        or not isinstance(claims.get("f"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", claims["f"])
+        or isinstance(claims.get("i"), bool)
+        or not isinstance(claims.get("i"), int)
+        or isinstance(claims.get("e"), bool)
+        or not isinstance(claims.get("e"), int)
+        or claims["e"] - claims["i"] != APPLET_ACTION_TOKEN_TTL_SECONDS
+    ):
+        raise AgentError("applet context token is invalid")
+    timestamp = time.time() if now is None else now
+    if claims["i"] > timestamp + 5:
+        raise AgentError("applet context token is invalid")
+    if claims["e"] < timestamp:
+        raise AgentError("applet context token expired")
+    return claims
+
+
+def applet_limit_observation(usage: Any) -> tuple[str, str | None]:
+    if not isinstance(usage, dict):
+        return "unknown", None
+    blocked_until = usage.get("blocked_until_utc")
+    if blocked_until is not None and (
+        not isinstance(blocked_until, str) or parse_utc_timestamp(blocked_until) is None
+    ):
+        blocked_until = None
+    if usage.get("blocked") is True:
+        return "blocked", blocked_until
+    if usage.get("blocked") is False and usage.get("state") in {"clear", "ok", "released"}:
+        return "clear", blocked_until
+    return "unknown", blocked_until
+
+
+def applet_capacity_observation(admission: Any) -> dict[str, Any] | None:
+    if not isinstance(admission, dict):
+        return None
+    allowed = admission.get("allowed")
+    available_slots = admission.get("available_slots")
+    reason_codes = admission.get("reason_codes")
+    if (
+        not isinstance(allowed, bool)
+        or (
+            available_slots is not None
+            and (isinstance(available_slots, bool) or not isinstance(available_slots, int) or available_slots < 0)
+        )
+        or not isinstance(reason_codes, list)
+        or any(not isinstance(reason, str) or reason not in RESOURCE_REASON_CODES for reason in reason_codes)
+    ):
+        return None
+    return {
+        "allowed": allowed,
+        "available_slots": available_slots,
+        "reason_codes": sorted(set(reason_codes)),
+    }
+
+
+def applet_action_state(
+    row: dict[str, Any],
+    usage: Any,
+    admission: Any = None,
+    *,
+    run_marker: str | None = None,
+) -> dict[str, Any]:
+    limit_state, blocked_until = applet_limit_observation(usage)
+    return {
+        "agent": row.get("agent"),
+        "activity_state": row.get("activity_state"),
+        "backend_state": row.get("backend_state"),
+        "control_state": row.get("control_state"),
+        "auth_state": row.get("auth_state"),
+        "identity_state": row.get("identity_state"),
+        "lease_state": row.get("lease_state"),
+        "limit_state": limit_state,
+        "blocked_until_utc": blocked_until,
+        "capacity": applet_capacity_observation(admission),
+        "run_marker": run_marker if isinstance(run_marker, str) and len(run_marker) <= 128 else None,
+    }
+
+
+def applet_action_allowed(action: str, state: dict[str, Any]) -> bool:
+    if action == "start":
+        capacity = state.get("capacity")
+        return (
+            state.get("activity_state") == "sleeping"
+            and state.get("backend_state") == "ok"
+            and state.get("control_state") == "ready"
+            and state.get("auth_state") == "ready"
+            and state.get("identity_state") == "stopped"
+            and state.get("lease_state") in {"unclaimed", "expired"}
+            and state.get("limit_state") == "clear"
+            and isinstance(capacity, dict)
+            and capacity.get("allowed") is True
+        )
+    if action == "stop":
+        return (
+            state.get("activity_state") == "running"
+            and state.get("backend_state") == "ok"
+            and state.get("identity_state") == "verified"
+            and state.get("lease_state") in {"unclaimed", "expired"}
+        )
+    return False
+
+
 def pane_pid_from_text(text: str) -> int | None:
     if not text.isascii() or not text.isdigit():
         return None
@@ -1359,6 +1620,87 @@ def applet_error_row(agent: str) -> dict[str, Any]:
     }
 
 
+def applet_action_rows(
+    rows: list[dict[str, Any]],
+    *,
+    running_count: int | None = None,
+    deadline: float,
+) -> list[dict[str, Any]]:
+    try:
+        key = read_applet_action_key()
+    except AgentError:
+        key = None
+    start_offered = False
+    admission: dict[str, Any] | None = None
+    admission_checked = False
+    decorated: list[dict[str, Any]] = []
+    for row in rows:
+        if time.monotonic() >= deadline:
+            decorated.append(
+                {
+                    **row,
+                    "allowed_action": "none",
+                    "context_token": "",
+                    "limit_state": "unknown",
+                    "blocked_until_utc": None,
+                }
+            )
+            continue
+        meta = read_meta(row["agent"])
+        run_marker = meta.get("run_id") if not meta.get("meta_error") else None
+        try:
+            usage = codex_usage_watchdog_status(
+                row["agent"],
+                include_assignment_history=False,
+            )
+        except AgentError:
+            usage = None
+        action = "none"
+        if (
+            key is not None
+            and not start_offered
+            and row.get("activity_state") == "sleeping"
+            and row.get("control_state") == "ready"
+        ):
+            if not admission_checked:
+                admission_checked = True
+                try:
+                    admission = spawn_admission_decision(
+                        1,
+                        running_agents_override=running_count,
+                    )
+                except AgentError:
+                    admission = None
+            candidate_state = applet_action_state(row, usage, admission, run_marker=run_marker)
+            if applet_action_allowed("start", candidate_state):
+                action = "start"
+                start_offered = True
+        state = applet_action_state(
+            row,
+            usage,
+            admission if action == "start" else None,
+            run_marker=run_marker,
+        )
+        if action == "none" and key is not None and applet_action_allowed("stop", state):
+            action = "stop"
+        context_token = ""
+        if action != "none" and key is not None:
+            try:
+                context_token = issue_applet_action_token(action, row["agent"], state, key)
+            except AgentError:
+                action = "none"
+        decorated.append(
+            {
+                **row,
+                "allowed_action": action,
+                "context_token": context_token,
+                "limit_state": state["limit_state"],
+                "blocked_until_utc": state["blocked_until_utc"],
+            }
+        )
+    return decorated
+
+
 def normalize_applet_schema_version(schema_version: Any) -> int:
     if isinstance(schema_version, bool) or not isinstance(schema_version, int):
         raise AgentError("schema_version must be an integer")
@@ -1469,6 +1811,12 @@ def applet_status_v2(agents: Any) -> dict[str, Any]:
         except AgentError:
             rows.append(applet_error_row(agent))
 
+    rows = applet_action_rows(
+        rows,
+        running_count=len(running_agents),
+        deadline=deadline,
+    )
+
     try:
         native_agents = native_agent_status()
     except AgentError:
@@ -1499,6 +1847,60 @@ def applet_status(agents: Any, schema_version: Any = 1) -> dict[str, Any]:
     if normalized_schema_version == 1:
         return applet_status_v1(agents)
     return applet_status_v2(agents)
+
+
+def applet_action(action: Any, agent: Any, context_token: Any) -> dict[str, Any]:
+    if not isinstance(action, str) or action not in {"start", "stop"}:
+        raise AgentError("applet action is invalid")
+    if not isinstance(agent, str):
+        raise AgentError("applet agent is invalid")
+    agent = normalize_applet_agents([agent])[0]
+    if not isinstance(context_token, str):
+        raise AgentError("applet context token is invalid")
+    with agent_lifecycle_lock(agent, timeout_seconds=APPLET_TMUX_TIMEOUT_SECONDS):
+        key = read_applet_action_key()
+        claims = validate_applet_action_token(context_token, key)
+        if claims["a"] != action or claims["g"] != agent:
+            raise AgentError("applet context token is invalid")
+        deadline = time.monotonic() + APPLET_STATUS_TIMEOUT_SECONDS
+        row = applet_agent_observation(agent, deadline=deadline)
+        try:
+            usage = codex_usage_watchdog_status(agent, include_assignment_history=False)
+        except AgentError:
+            usage = None
+        admission = spawn_admission_decision(1) if action == "start" else None
+        meta = read_meta(agent)
+        run_marker = meta.get("run_id") if not meta.get("meta_error") else None
+        state = applet_action_state(row, usage, admission, run_marker=run_marker)
+        if not hmac.compare_digest(claims["f"], applet_action_fingerprint_for(action, state)):
+            raise AgentError("applet context token is stale")
+        if not applet_action_allowed(action, state):
+            raise AgentError("applet action is no longer allowed")
+
+        if action == "start":
+            result = _start_agent_with_lease_unlocked(
+                agent,
+                cwd=str(Path.home()),
+            )
+            final_state = "running" if result.get("status") in {"started", "already_running"} else "unknown"
+        else:
+            _claim_agent_unlocked(agent, ttl_seconds=60)
+            try:
+                result = _stop_agent_unlocked(agent)
+            except Exception:
+                with contextlib.suppress(AgentError):
+                    current_lease = agent_lease_status(agent)
+                    if current_lease.get("held_by_this_server"):
+                        _release_agent_unlocked(agent, force=True)
+                raise
+            final_state = "sleeping" if result.get("status") in {"stopped", "not_running"} else "unknown"
+        return {
+            "agent": agent,
+            "action": action,
+            "status": "completed" if final_state != "unknown" else "unknown",
+            "state": final_state,
+            "raw_output": "not_returned",
+        }
 
 
 def single_agent_id(agent: str, tool_name: str) -> str:
@@ -2902,7 +3304,7 @@ def _managed_tmux_session_count() -> int | None:
         return None
 
 
-def system_resource_snapshot() -> dict[str, Any]:
+def system_resource_snapshot(*, running_agents_override: int | None = None) -> dict[str, Any]:
     load_per_cpu: float | None = None
     available_memory_percent: float | None = None
     available_memory_mib: float | None = None
@@ -2930,7 +3332,16 @@ def system_resource_snapshot() -> dict[str, Any]:
     else:
         available_memory_percent, available_memory_mib = memory
 
-    running_agents = _managed_tmux_session_count()
+    if running_agents_override is None:
+        running_agents = _managed_tmux_session_count()
+    elif (
+        isinstance(running_agents_override, int)
+        and not isinstance(running_agents_override, bool)
+        and running_agents_override >= 0
+    ):
+        running_agents = running_agents_override
+    else:
+        running_agents = None
     if running_agents is None:
         reason_codes.append("session_metrics_unavailable")
 
@@ -2974,9 +3385,17 @@ def _admission_result(
     }
 
 
-def spawn_admission_decision(required_slots: int = 1) -> dict[str, Any]:
+def spawn_admission_decision(
+    required_slots: int = 1,
+    *,
+    running_agents_override: int | None = None,
+) -> dict[str, Any]:
     required_slots = normalize_int_field(required_slots, field="required_slots", minimum=1, maximum=6)
-    snapshot = system_resource_snapshot()
+    snapshot = (
+        system_resource_snapshot()
+        if running_agents_override is None
+        else system_resource_snapshot(running_agents_override=running_agents_override)
+    )
     policy = spawn_resource_policy()
     if not _valid_spawn_policy(policy):
         return _admission_result(
@@ -10886,6 +11305,7 @@ def _install_unlocked(
         wrapper_self_test = mcp_command_startup_self_test(wrapper)
         if not wrapper_self_test["ok"]:
             raise AgentError("repo wrapper failed MCP startup self-test")
+    ensure_applet_action_key()
 
     install_path = normalize_install_path(install_path)
     expected_parent_stat = ensure_real_parent(
@@ -14773,6 +15193,10 @@ def main_cli(argv: list[str]) -> int:
     p_applet_status = sub.add_parser("applet-status")
     p_applet_status.add_argument("agents", nargs="*")
     p_applet_status.add_argument("--schema-version", type=int, default=1)
+    p_applet_action = sub.add_parser("applet-action", help=argparse.SUPPRESS)
+    p_applet_action.add_argument("action", choices=("start", "stop"))
+    p_applet_action.add_argument("agent")
+    p_applet_action.add_argument("context_token")
 
     p_pool = sub.add_parser("pool")
     pool_sub = p_pool.add_subparsers(dest="pool_command", required=True)
@@ -15189,6 +15613,8 @@ def main_cli(argv: list[str]) -> int:
                     {"agents": args.agents, "schema_version": args.schema_version},
                 )
             )
+        if args.command == "applet-action":
+            return print_json(applet_action(args.action, args.agent, args.context_token))
         if args.command == "pool":
             common = {"spec": args.spec, "target_dir": args.target_dir, "codex_bin": args.codex_bin}
             if args.pool_command == "validate":

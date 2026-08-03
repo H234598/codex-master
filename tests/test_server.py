@@ -16584,6 +16584,295 @@ class AppletStatusContractTest(unittest.TestCase):
         )
         self.assertNotIn("SECRET_NATIVE_STATUS", json.dumps(payload, sort_keys=True))
 
+    @patch(
+        "codex_master.server.native_agent_status",
+        return_value={
+            "bridge_state": "ready",
+            "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
+            "agents": [],
+            "truncated": False,
+        },
+    )
+    @patch(
+        "codex_master.server.run_tmux",
+        return_value=subprocess.CompletedProcess(["tmux"], 0, "\n", ""),
+    )
+    @patch("codex_master.server.spawn_admission_decision")
+    @patch("codex_master.server.codex_usage_watchdog_status")
+    @patch("codex_master.server.read_applet_action_key", return_value=b"k" * 32)
+    @patch("codex_master.server.applet_agent_observation")
+    def test_applet_status_schema_v2_offers_one_start_and_safe_stops(
+        self,
+        mock_observation,
+        _mock_read_key,
+        mock_usage,
+        mock_admission,
+        _mock_run_tmux,
+        _mock_native_status,
+    ) -> None:
+        mock_observation.side_effect = [
+            self._row("a1"),
+            self._row("b1"),
+            self._row("c1", activity="running", identity="verified"),
+        ]
+        mock_usage.return_value = {
+            "state": "ok",
+            "blocked": False,
+            "blocked_until_utc": None,
+        }
+        mock_admission.return_value = {
+            "allowed": True,
+            "required_slots": 1,
+            "available_slots": 5,
+            "reason_codes": [],
+            "raw_output": "not_returned",
+        }
+
+        payload = applet_status(["a1", "b1", "c1"], schema_version=2)
+
+        self.assertEqual([row["allowed_action"] for row in payload["agents"]], ["start", "none", "stop"])
+        self.assertRegex(payload["agents"][0]["context_token"], r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
+        self.assertEqual(payload["agents"][1]["context_token"], "")
+        self.assertEqual(payload["agents"][2]["limit_state"], "clear")
+        self.assertIsNone(payload["agents"][2]["blocked_until_utc"])
+        self.assertEqual(
+            set(payload["agents"][0]),
+            {
+                "agent",
+                "activity_state",
+                "backend_state",
+                "control_state",
+                "auth_state",
+                "identity_state",
+                "lease_state",
+                "allowed_action",
+                "context_token",
+                "limit_state",
+                "blocked_until_utc",
+            },
+        )
+
+    @patch(
+        "codex_master.server.native_agent_status",
+        return_value={
+            "bridge_state": "ready",
+            "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
+            "agents": [],
+            "truncated": False,
+        },
+    )
+    @patch(
+        "codex_master.server.run_tmux",
+        return_value=subprocess.CompletedProcess(["tmux"], 0, "\n", ""),
+    )
+    @patch("codex_master.server.spawn_admission_decision")
+    @patch("codex_master.server.codex_usage_watchdog_status")
+    @patch("codex_master.server.read_applet_action_key", return_value=b"k" * 32)
+    @patch("codex_master.server.applet_agent_observation")
+    def test_applet_status_schema_v2_account_limit_blocks_start_and_reports_reset(
+        self,
+        mock_observation,
+        _mock_read_key,
+        mock_usage,
+        mock_admission,
+        _mock_run_tmux,
+        _mock_native_status,
+    ) -> None:
+        mock_observation.return_value = self._row("a1")
+        mock_usage.return_value = {
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": "2026-08-03T15:00:00+00:00",
+        }
+        mock_admission.return_value = {
+            "allowed": True,
+            "required_slots": 1,
+            "available_slots": 5,
+            "reason_codes": [],
+            "raw_output": "not_returned",
+        }
+
+        payload = applet_status(["a1"], schema_version=2)
+
+        row = payload["agents"][0]
+        self.assertEqual(row["limit_state"], "blocked")
+        self.assertEqual(row["blocked_until_utc"], "2026-08-03T15:00:00+00:00")
+        self.assertEqual(row["allowed_action"], "none")
+        self.assertEqual(row["context_token"], "")
+
+    def test_applet_action_token_rejects_tampering_and_expiry(self) -> None:
+        state = {
+            "agent": "a1",
+            "activity_state": "sleeping",
+            "backend_state": "ok",
+            "control_state": "ready",
+            "auth_state": "ready",
+            "identity_state": "stopped",
+            "lease_state": "unclaimed",
+            "limit_state": "clear",
+            "blocked_until_utc": None,
+            "capacity": {"allowed": True, "available_slots": 5, "reason_codes": []},
+        }
+        token = server_module.issue_applet_action_token("start", "a1", state, b"k" * 32, now=1000.0)
+
+        claims = server_module.validate_applet_action_token(token, b"k" * 32, now=1001.0)
+        self.assertEqual(claims["a"], "start")
+        self.assertEqual(claims["g"], "a1")
+        with self.assertRaisesRegex(AgentError, "context token is invalid"):
+            server_module.validate_applet_action_token(token[:-1] + ("A" if token[-1] != "A" else "B"), b"k" * 32, now=1001.0)
+        with self.assertRaisesRegex(AgentError, "context token expired"):
+            server_module.validate_applet_action_token(token, b"k" * 32, now=1100.0)
+
+    @patch("codex_master.server.agent_lifecycle_lock", return_value=contextlib.nullcontext())
+    @patch("codex_master.server.read_applet_action_key", return_value=b"k" * 32)
+    @patch("codex_master.server.spawn_admission_decision")
+    @patch("codex_master.server.codex_usage_watchdog_status")
+    @patch("codex_master.server.applet_agent_observation")
+    def test_applet_action_rejects_stale_state_before_mutation(
+        self,
+        mock_observation,
+        mock_usage,
+        mock_admission,
+        _mock_read_key,
+        _mock_lifecycle_lock,
+    ) -> None:
+        offered = self._row("a1")
+        mock_usage.return_value = {"state": "ok", "blocked": False, "blocked_until_utc": None}
+        mock_admission.return_value = {
+            "allowed": True,
+            "required_slots": 1,
+            "available_slots": 5,
+            "reason_codes": [],
+            "raw_output": "not_returned",
+        }
+        state = server_module.applet_action_state(offered, mock_usage.return_value, mock_admission.return_value)
+        token = server_module.issue_applet_action_token("start", "a1", state, b"k" * 32)
+        mock_observation.return_value = {**offered, "lease_state": "held", "control_state": "blocked"}
+
+        with patch("codex_master.server._start_agent_with_lease_unlocked") as mock_start:
+            with self.assertRaisesRegex(AgentError, "context token is stale"):
+                server_module.applet_action("start", "a1", token)
+
+        mock_start.assert_not_called()
+
+    def test_applet_action_key_is_private_and_rejects_hardlinks_and_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            key_path = Path(temp_dir) / "applet-action.key"
+            with patch.object(server_module, "APPLET_ACTION_KEY_FILE", key_path):
+                key = server_module.ensure_applet_action_key()
+                self.assertEqual(len(key), 32)
+                self.assertEqual(stat.S_IMODE(key_path.stat().st_mode), 0o600)
+
+                os.chmod(key_path, 0o644)
+                with self.assertRaisesRegex(AgentError, "key is unavailable"):
+                    server_module.read_applet_action_key()
+                os.chmod(key_path, 0o600)
+
+                hardlink = key_path.with_name("hardlink")
+                os.link(key_path, hardlink)
+                with self.assertRaisesRegex(AgentError, "key is unavailable"):
+                    server_module.read_applet_action_key()
+                hardlink.unlink()
+
+                key_path.unlink()
+                key_path.symlink_to("target")
+                with self.assertRaisesRegex(AgentError, "key is unavailable"):
+                    server_module.read_applet_action_key()
+
+    @patch("codex_master.server.agent_lifecycle_lock", return_value=contextlib.nullcontext())
+    @patch("codex_master.server.read_applet_action_key", return_value=b"k" * 32)
+    @patch("codex_master.server.read_meta", return_value={})
+    @patch("codex_master.server.spawn_admission_decision")
+    @patch("codex_master.server.codex_usage_watchdog_status")
+    @patch("codex_master.server.applet_agent_observation")
+    @patch("codex_master.server._start_agent_with_lease_unlocked")
+    def test_applet_start_delegates_to_existing_safe_path_with_no_prompt_or_override(
+        self,
+        mock_start,
+        mock_observation,
+        mock_usage,
+        mock_admission,
+        _mock_meta,
+        _mock_read_key,
+        mock_lifecycle_lock,
+    ) -> None:
+        row = self._row("a1")
+        usage = {"state": "ok", "blocked": False, "blocked_until_utc": None}
+        admission = {
+            "allowed": True,
+            "required_slots": 1,
+            "available_slots": 5,
+            "reason_codes": [],
+            "raw_output": "not_returned",
+        }
+        mock_observation.return_value = row
+        mock_usage.return_value = usage
+        mock_admission.return_value = admission
+        mock_start.return_value = {"status": "started"}
+        state = server_module.applet_action_state(row, usage, admission, run_marker=None)
+        token = server_module.issue_applet_action_token("start", "a1", state, b"k" * 32)
+
+        result = server_module.applet_action("start", "a1", token)
+
+        self.assertEqual(
+            result,
+            {
+                "agent": "a1",
+                "action": "start",
+                "status": "completed",
+                "state": "running",
+                "raw_output": "not_returned",
+            },
+        )
+        mock_start.assert_called_once_with("a1", cwd=str(Path.home()))
+        mock_lifecycle_lock.assert_called_once_with("a1", timeout_seconds=1.0)
+
+    @patch("codex_master.server.agent_lifecycle_lock", return_value=contextlib.nullcontext())
+    @patch("codex_master.server.read_applet_action_key", return_value=b"k" * 32)
+    @patch("codex_master.server.read_meta", return_value={"run_id": "run-1"})
+    @patch("codex_master.server.codex_usage_watchdog_status")
+    @patch("codex_master.server.applet_agent_observation")
+    @patch("codex_master.server._claim_agent_unlocked")
+    @patch("codex_master.server._stop_agent_unlocked")
+    def test_applet_stop_remains_available_during_account_limit_and_uses_transient_lease(
+        self,
+        mock_stop,
+        mock_claim,
+        mock_observation,
+        mock_usage,
+        _mock_meta,
+        _mock_read_key,
+        _mock_lifecycle_lock,
+    ) -> None:
+        row = self._row(
+            "a1",
+            activity="running",
+            backend="ok",
+            control="blocked",
+            auth="blocked",
+            identity="verified",
+        )
+        usage = {
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": "2026-08-03T15:00:00+00:00",
+        }
+        mock_observation.return_value = row
+        mock_usage.return_value = usage
+        mock_claim.return_value = {"status": "claimed"}
+        mock_stop.return_value = {"status": "stopped"}
+        offered_usage = {"state": "clear", "blocked": False, "blocked_until_utc": None}
+        state = server_module.applet_action_state(row, offered_usage, run_marker="run-1")
+        token = server_module.issue_applet_action_token("stop", "a1", state, b"k" * 32)
+
+        result = server_module.applet_action("stop", "a1", token)
+
+        self.assertEqual(result["state"], "sleeping")
+        mock_claim.assert_called_once_with("a1", ttl_seconds=60)
+        mock_stop.assert_called_once_with("a1")
+        self.assertNotIn("lease", result)
+        self.assertNotIn("account", json.dumps(result, sort_keys=True))
+
     def test_applet_status_schema_v1_rejects_empty_agents(self) -> None:
         with self.assertRaisesRegex(AgentError, "1 to 6"):
             applet_status([], schema_version=1)
@@ -17274,6 +17563,28 @@ class CliLifecycleTest(unittest.TestCase):
         payload = json.loads(mock_print.call_args.args[0])
         self.assertIn("error", payload)
         self.assertNotIn("sk-verysecret-token-1234", mock_print.call_args.args[0])
+
+    @patch("codex_master.server.print_json")
+    @patch("codex_master.server.applet_action")
+    def test_cli_applet_action_uses_internal_facade_not_mcp_tool_catalog(
+        self,
+        mock_applet_action,
+        mock_print_json,
+    ) -> None:
+        mock_applet_action.return_value = {
+            "agent": "a1",
+            "action": "start",
+            "status": "completed",
+            "state": "running",
+            "raw_output": "not_returned",
+        }
+        mock_print_json.return_value = 0
+
+        result = main_cli(["applet-action", "start", "a1", "cGF5bG9hZA.c2ln"])
+
+        self.assertEqual(result, 0)
+        mock_applet_action.assert_called_once_with("start", "a1", "cGF5bG9hZA.c2ln")
+        self.assertNotIn("applet_action", {tool["name"] for tool in server_module.TOOLS})
 
     @patch("codex_master.server.print_json")
     @patch("codex_master.server.call_tool", return_value={"results": [], "raw_output": "not_returned"})

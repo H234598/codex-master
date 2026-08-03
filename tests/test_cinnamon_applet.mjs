@@ -60,6 +60,10 @@ function samplePayload() {
         auth_state: "ready",
         identity_state: "unverified",
         lease_state: "unclaimed",
+        allowed_action: "none",
+        context_token: "",
+        limit_state: "clear",
+        blocked_until_utc: null,
       },
       {
         agent: "b1",
@@ -69,6 +73,10 @@ function samplePayload() {
         auth_state: "ready",
         identity_state: "stopped",
         lease_state: "unclaimed",
+        allowed_action: "start",
+        context_token: "c3RhcnQ.c2ln",
+        limit_state: "clear",
+        blocked_until_utc: null,
       },
     ],
     native_agents: {
@@ -125,6 +133,7 @@ function loadApplet() {
   let home = "/home/tester";
   let timeoutId = 1;
   let createdNativeRows = 0;
+  let createdQuickControlRows = 0;
 
   const TextEncoder = globalThis.TextEncoder;
   function makeLabel(text) {
@@ -183,7 +192,8 @@ function loadApplet() {
       this.menu = new AppletPopupMenu();
       const originalAddMenuItem = this.menu.addMenuItem.bind(this.menu);
       this.menu.addMenuItem = (item) => {
-        createdNativeRows += 1;
+        if (label === "Native Bienen") createdNativeRows += 1;
+        if (label === "Schnellsteuerung") createdQuickControlRows += 1;
         originalAddMenuItem(item);
       };
     }
@@ -508,6 +518,8 @@ function loadApplet() {
     SubprocessFlags: {
       STDOUT_PIPE: 1,
       STDERR_PIPE: 2,
+      STDOUT_SILENCE: 4,
+      STDERR_SILENCE: 8,
     },
     Cancellable: FakeCancellable,
   };
@@ -571,6 +583,7 @@ function loadApplet() {
     failSettingsFinalizes(count) { settingsFinalizeFailures = count; },
     setProcessFactory(factory) { pendingFactories.push(factory); },
     createdNativeRows() { return createdNativeRows; },
+    createdQuickControlRows() { return createdQuickControlRows; },
     resetFactories() { pendingFactories.length = 0; },
     setSetting(key, value) {
       const settings = settingsInstances.at(-1);
@@ -874,6 +887,46 @@ test("builds fixed mcp argv and validierte ids", async () => {
   ]) {
     assert.ok(launch.unsetCalls.includes(key), `strips ${key}`);
   }
+});
+
+test("control-center launcher uses fixed sanitized argv and never overlaps status", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const controlCenterItem = applet.menu.items[2];
+
+  assert.equal(getMenuItemText(controlCenterItem), "Steuerzentrale öffnen");
+  controlCenterItem.activate();
+  assert.equal(fixture.subprocesses.length, 1);
+  assert.deepEqual(Array.from(fixture.launcherSpawns[0].argv), [
+    "/home/tester/.local/bin/codex-master-mcp",
+    "control-center",
+  ]);
+  assert.deepEqual(Array.from(fixture.launcherSpawns[0].envCalls), [
+    { key: "PATH", value: "/usr/bin:/bin", overwrite: true },
+    { key: "HOME", value: "/home/tester", overwrite: true },
+  ]);
+  applet.menu.items[0].activate();
+  controlCenterItem.activate();
+  assert.equal(fixture.subprocesses.length, 1, "launcher is single-flight with status and itself");
+
+  fixture.subprocesses[0].emitDone();
+  assert.equal(applet._launcherInFlight, false);
+  applet.menu.items[0].activate();
+  assert.equal(fixture.subprocesses.length, 2);
+});
+
+test("removal terminates tracked control-center launcher", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  applet.menu.items[2].activate();
+  const launcher = fixture.subprocesses[0];
+
+  applet.on_applet_removed_from_panel();
+
+  assert.equal(applet._cleanupComplete, true);
+  assert.equal(applet._launcherInFlight, false);
+  assert.equal(launcher.forceExitCount, 1);
+  assert.equal(fixture.activeTimers().length, 0);
 });
 
 test("argv preparation failure stays inside refresh callback", () => {
@@ -1805,6 +1858,10 @@ test("exact python error row is accepted and aggregates to python unavailable sn
         auth_state: "unknown",
         identity_state: "unknown",
         lease_state: "unreadable",
+        allowed_action: "none",
+        context_token: "",
+        limit_state: "unknown",
+        blocked_until_utc: null,
       },
       {
         agent: "b1",
@@ -1814,6 +1871,10 @@ test("exact python error row is accepted and aggregates to python unavailable sn
         auth_state: "unknown",
         identity_state: "unknown",
         lease_state: "unreadable",
+        allowed_action: "none",
+        context_token: "",
+        limit_state: "unknown",
+        blocked_until_utc: null,
       },
     ],
     native_agents: {
@@ -1851,6 +1912,10 @@ test("exact python error row mixed with a normal row is accepted", () => {
         auth_state: "unknown",
         identity_state: "unknown",
         lease_state: "unreadable",
+        allowed_action: "none",
+        context_token: "",
+        limit_state: "unknown",
+        blocked_until_utc: null,
       },
       {
         agent: "b1",
@@ -1860,6 +1925,10 @@ test("exact python error row mixed with a normal row is accepted", () => {
         auth_state: "ready",
         identity_state: "stopped",
         lease_state: "unclaimed",
+        allowed_action: "start",
+        context_token: "c3RhcnQ.c2ln",
+        limit_state: "clear",
+        blocked_until_utc: null,
       },
     ],
     native_agents: {
@@ -1897,6 +1966,10 @@ test("exact python stopped-orphan row is accepted", () => {
     auth_state: "ready",
     identity_state: "unverified",
     lease_state: "unclaimed",
+    allowed_action: "none",
+    context_token: "",
+    limit_state: "clear",
+    blocked_until_utc: null,
   });
 });
 
@@ -2582,7 +2655,7 @@ test("scalar setting normalization never writes through Cinnamon bindings", () =
   }
 });
 
-test("read-only UI keeps title and separates activity backend and stale state", () => {
+test("quick-control UI keeps title and separates activity backend and stale state", () => {
   const fixture = loadApplet();
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
   const payload = samplePayload();
@@ -2591,12 +2664,15 @@ test("read-only UI keeps title and separates activity backend and stale state", 
   assert.equal(applet.labels.at(-1), "Flottenmanagement");
   assert.match(applet.tooltips.at(-1), /Aktivität/);
   assert.match(applet.tooltips.at(-1), /Backend/);
-  assert.match(applet.tooltips.at(-1), /Nur Lesen/);
-  assert.match(getMenuItemText(applet._statusSummaryItem), /Nur Lesen/);
+  assert.match(applet.tooltips.at(-1), /Schnellsteuerung/);
+  assert.match(getMenuItemText(applet._statusSummaryItem), /Schnellsteuerung/);
   assert.equal(applet._statusRowItems.filter((item) => item.actor.visible).length, 2);
   assert.ok(getMenuItemText(applet._statusRowItems[0]).startsWith("a1:"));
   assert.ok(getMenuItemText(applet._statusRowItems[1]).startsWith("b1:"));
-  assert.ok(!applet.menu.items.some((item) => /Start|Stop|Interrupt/.test(getMenuItemText(item))));
+  assert.equal(getMenuItemText(applet._quickControlSubmenuItem), "Schnellsteuerung (1)");
+  assert.equal(getMenuItemText(applet._startActionItem), "b1 starten");
+  assert.equal(applet._startActionItem.actor.visible, true);
+  assert.ok(!applet.menu.items.some((item) => /Interrupt/.test(getMenuItemText(item))));
 
   applet._markRefreshFailed();
   assert.match(getMenuItemText(applet._statusSummaryItem), /veraltet/i);
@@ -2606,6 +2682,160 @@ test("read-only UI keeps title and separates activity backend and stale state", 
   assert.equal(applet._statusLastGood, null, "fleet change clears old fleet snapshot");
   assert.equal(applet._statusRowItems.filter((item) => item.actor.visible).length, 1);
   assert.ok(getMenuItemText(applet._statusRowItems[0]).startsWith("a2:"));
+});
+
+test("quick control preallocates fixed rows and validates one start plus safe stops", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const payload = samplePayload();
+  payload.agents[0] = {
+    ...payload.agents[0],
+    backend_state: "ok",
+    control_state: "ready",
+    identity_state: "verified",
+    allowed_action: "stop",
+    context_token: "c3RvcA.c2ln",
+  };
+
+  assert.equal(applet._maybeApplyStatusPayload(payload), true);
+  assert.equal(fixture.createdQuickControlRows(), 10);
+  assert.equal(getMenuItemText(applet._quickControlSubmenuItem), "Schnellsteuerung (2)");
+  assert.equal(getMenuItemText(applet._startActionItem), "b1 starten");
+  assert.equal(getMenuItemText(applet._stopActionItems[0]), "a1 stoppen");
+  assert.equal(applet._stopActionItems.filter((item) => item.actor.visible).length, 1);
+
+  const duplicateStart = JSON.parse(JSON.stringify(payload));
+  duplicateStart.agents[0] = {
+    ...duplicateStart.agents[1],
+    agent: "a1",
+    context_token: "YW5kZXJl.c2ln",
+  };
+  realignCounts(duplicateStart);
+  assert.equal(applet._maybeApplyStatusPayload(duplicateStart), false);
+
+  const malformedToken = JSON.parse(JSON.stringify(payload));
+  malformedToken.agents[1].context_token = "attacker token";
+  assert.equal(applet._maybeApplyStatusPayload(malformedToken), false);
+});
+
+test("start confirmation launches one fixed action argv then exactly one status refresh", async () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const initial = samplePayload();
+  const refreshed = samplePayload();
+  refreshed.agents[1] = {
+    ...refreshed.agents[1],
+    activity_state: "running",
+    identity_state: "verified",
+    allowed_action: "stop",
+    context_token: "c3RvcA.c2ln",
+  };
+  realignCounts(refreshed);
+  queuePayloadProcess(fixture, {
+    agent: "b1",
+    action: "start",
+    status: "completed",
+    state: "running",
+    raw_output: "not_returned",
+  });
+  queuePayloadProcessV2(fixture, refreshed);
+
+  assert.equal(applet._maybeApplyStatusPayload(initial), true);
+  applet._startActionItem.activate();
+  assert.equal(fixture.subprocesses.length, 0, "arming never mutates");
+  assert.match(getMenuItemText(applet._confirmationDetailItem), /b1 wirklich starten/);
+  assert.equal(applet._confirmationConfirmItem.actor.visible, true);
+
+  applet._confirmationConfirmItem.activate();
+  assert.equal(fixture.subprocesses.length, 1);
+  assert.deepEqual(Array.from(fixture.launcherSpawns[0].argv).slice(1), [
+    "applet-action",
+    "start",
+    "b1",
+    "c3RhcnQ.c2ln",
+  ]);
+  applet.menu.items[0].activate();
+  assert.equal(fixture.subprocesses.length, 1, "manual refresh cannot overlap mutation");
+
+  fixture.subprocesses[0].emitDone();
+  await Promise.resolve();
+  assert.equal(fixture.subprocesses.length, 2, "one read-only refresh follows mutation");
+  assert.equal(fixture.launcherSpawns[1].argv[1], "applet-status");
+  applet.menu.items[0].activate();
+  assert.equal(applet._statusPendingRefresh, false, "post-action refresh is never duplicated");
+  fixture.subprocesses[1].emitDone();
+  await Promise.resolve();
+
+  assert.equal(fixture.subprocesses.length, 2);
+  assert.equal(applet._actionInFlight, false);
+  assert.equal(applet._actionsAwaitingRefresh, false);
+  assert.equal(applet._statusLastGood.agents[1].activity_state, "running");
+});
+
+test("confirmation cancel and mutation timeout never retry", async () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  assert.equal(applet._maybeApplyStatusPayload(samplePayload()), true);
+
+  applet._startActionItem.activate();
+  applet._confirmationCancelItem.activate();
+  assert.equal(fixture.subprocesses.length, 0);
+  assert.equal(applet._armedAction, null);
+
+  queuePayloadProcess(fixture, { ignored: true }, { holdEof: true });
+  queuePayloadProcessV2(fixture, samplePayload());
+  applet._startActionItem.activate();
+  applet._confirmationConfirmItem.activate();
+  assert.equal(fixture.subprocesses.length, 1);
+  fixture.runTimeouts();
+  assert.equal(fixture.subprocesses[0].forceExitCount, 1);
+  fixture.subprocesses[0].stdout.releaseEof();
+  fixture.subprocesses[0].stderr.releaseEof();
+  fixture.subprocesses[0].emitDone();
+  await Promise.resolve();
+
+  assert.equal(
+    fixture.launcherSpawns.filter((launch) => launch.argv[1] === "applet-action").length,
+    1,
+    "timeout never retries mutation"
+  );
+  assert.equal(fixture.launcherSpawns.filter((launch) => launch.argv[1] === "applet-status").length, 1);
+});
+
+test("quick-control object identities survive 500 renders and action removal", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const submenu = applet._quickControlSubmenuItem;
+  const startItem = applet._startActionItem;
+  const stopItems = applet._stopActionItems.slice();
+  const confirmItems = [
+    applet._confirmationDetailItem,
+    applet._confirmationConfirmItem,
+    applet._confirmationCancelItem,
+  ];
+
+  for (let cycle = 0; cycle < 500; cycle += 1) {
+    assert.equal(applet._maybeApplyStatusPayload(samplePayload()), true);
+  }
+  assert.equal(applet._quickControlSubmenuItem, submenu);
+  assert.equal(applet._startActionItem, startItem);
+  assert.deepEqual(applet._stopActionItems, stopItems);
+  assert.deepEqual(
+    [applet._confirmationDetailItem, applet._confirmationConfirmItem, applet._confirmationCancelItem],
+    confirmItems
+  );
+  assert.equal(fixture.createdQuickControlRows(), 10);
+
+  queuePayloadProcess(fixture, { ignored: true }, { holdEof: true });
+  applet._startActionItem.activate();
+  applet._confirmationConfirmItem.activate();
+  applet.on_applet_removed_from_panel();
+  assert.equal(applet._cleanupComplete, true);
+  assert.equal(applet._quickControlSubmenuItem, null);
+  assert.equal(applet._stopActionItems.length, 0);
+  assert.equal(applet._armedAction, null);
+  assert.equal(applet._actionInFlight, false);
+  assert.equal(fixture.activeTimers().length, 0);
 });
 
 test("schema v2 allocates one native submenu with six stable child rows", () => {
