@@ -118,6 +118,8 @@ CONTROL_CENTER_ENV_KEYS = frozenset(
         "XDG_CURRENT_DESKTOP",
         "XDG_SESSION_DESKTOP",
         "XDG_SESSION_TYPE",
+        "DESKTOP_STARTUP_ID",
+        "XDG_ACTIVATION_TOKEN",
         "LANG",
         "LANGUAGE",
         "LC_ALL",
@@ -11527,7 +11529,7 @@ def fleet_desktop_entry_bytes(install_path: Path) -> bytes:
         "Type=Application\n"
         "Name=Flottenmanagement\n"
         "Comment=Codex-Flotte steuern und verwalten\n"
-        f'Exec="{command}" control-center\n'
+        f'Exec="{command}" control-center-launch\n'
         "Icon=utilities-system-monitor\n"
         "Terminal=false\n"
         "Categories=System;\n"
@@ -11752,11 +11754,18 @@ def _is_generated_fleet_desktop_entry(data: bytes) -> bool:
         "StartupNotify=true\n",
     ]:
         return False
-    match = re.fullmatch(r'Exec="([^"\r\n]+)" control-center\n', lines[4])
+    match = re.fullmatch(
+        r'Exec="([^"\r\n]+)" (control-center(?:-launch)?)\n', lines[4]
+    )
     if match is None:
         return False
     try:
-        return fleet_desktop_entry_bytes(Path(match.group(1))) == data
+        expected = fleet_desktop_entry_bytes(Path(match.group(1)))
+        if match.group(2) == "control-center":
+            expected = expected.replace(
+                b" control-center-launch\n", b" control-center\n"
+            )
+        return expected == data
     except AgentError:
         return False
 

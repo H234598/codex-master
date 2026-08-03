@@ -22,11 +22,24 @@ class FleetDesktopEntryTest(unittest.TestCase):
             "Type=Application\n"
             "Name=Flottenmanagement\n"
             "Comment=Codex-Flotte steuern und verwalten\n"
-            'Exec="/home/user/Codex Fleet/bin/codex-master-mcp" control-center\n'
+            'Exec="/home/user/Codex Fleet/bin/codex-master-mcp" control-center-launch\n'
             "Icon=utilities-system-monitor\n"
             "Terminal=false\n"
             "Categories=System;\n"
             "StartupNotify=true\n",
+        )
+
+    def test_recognizes_legacy_generated_entry_only_for_safe_cleanup(self) -> None:
+        command = Path("/home/user/.local/bin/codex-master-mcp")
+        current = server.fleet_desktop_entry_bytes(command)
+        legacy = current.replace(b" control-center-launch\n", b" control-center\n")
+
+        self.assertTrue(server._is_generated_fleet_desktop_entry(current))
+        self.assertTrue(server._is_generated_fleet_desktop_entry(legacy))
+        self.assertFalse(
+            server._is_generated_fleet_desktop_entry(
+                legacy.replace(b"StartupNotify=true", b"StartupNotify=false")
+            )
         )
 
     def test_rejects_relative_or_control_character_command_path(self) -> None:

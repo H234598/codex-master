@@ -138,6 +138,8 @@ function loadApplet() {
     "DISPLAY",
     "DBUS_SESSION_BUS_ADDRESS",
     "XDG_RUNTIME_DIR",
+    "DESKTOP_STARTUP_ID",
+    "XDG_ACTIVATION_TOKEN",
     "LANG",
     "PATH",
     "HOME",
@@ -923,7 +925,14 @@ test("builds fixed mcp argv and validierte ids", async () => {
   ]) {
     assert.ok(launch.unsetCalls.includes(key), `strips ${key}`);
   }
-  for (const key of ["DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "LANG"]) {
+  for (const key of [
+    "DISPLAY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_RUNTIME_DIR",
+    "DESKTOP_STARTUP_ID",
+    "XDG_ACTIVATION_TOKEN",
+    "LANG",
+  ]) {
     assert.ok(!launch.unsetCalls.includes(key), `preserves allowlisted ${key}`);
   }
 });
