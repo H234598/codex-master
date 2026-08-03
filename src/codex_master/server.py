@@ -611,10 +611,11 @@ def agent_config(
     agent: str,
     snapshot: InventorySnapshot | None = None,
 ) -> Mapping[str, Any]:
-    with _ACTIVE_AGENT_INVENTORY_LOCK:
-        active = _ACTIVE_AGENT_INVENTORY
-    selected = active if snapshot is None else snapshot
-    if selected is None or (snapshot is not None and snapshot is not active):
+    selected = snapshot
+    if selected is None:
+        with _ACTIVE_AGENT_INVENTORY_LOCK:
+            selected = _ACTIVE_AGENT_INVENTORY
+    if selected is None:
         try:
             return AGENTS[agent]
         except KeyError:
@@ -649,8 +650,18 @@ def series_agent_ids(
         raise AgentError("unknown Agentinnen series selector") from None
 
 
+def pinned_legacy_agent_configs() -> Mapping[str, Mapping[str, Any]]:
+    configs: dict[str, Mapping[str, Any]] = {}
+    for agent, config in AGENTS.items():
+        if not isinstance(config, Mapping):
+            raise AgentError("legacy_agent_inventory_invalid")
+        configs[agent] = MappingProxyType(dict(config))
+    return MappingProxyType(configs)
+
+
 def _legacy_fleet_analysis(*, include_running: bool) -> tuple[FleetSnapshot | None, dict[str, Any]]:
-    inventory = legacy_agent_inventory()
+    legacy_configs = pinned_legacy_agent_configs()
+    inventory = legacy_agent_inventory(legacy_configs)
     reason_codes: list[str] = []
     series_rows: list[dict[str, Any]] = []
     auth_by_series: dict[str, str] = {}
@@ -671,7 +682,7 @@ def _legacy_fleet_analysis(*, include_running: bool) -> tuple[FleetSnapshot | No
 
         states: list[dict[str, Any]] = []
         for agent in ids:
-            config = agent_config(agent, inventory)
+            config = legacy_configs[agent]
             home = Path(config["home"])
             candidate_root = home.parent
             if pool_root is None:
@@ -682,7 +693,7 @@ def _legacy_fleet_analysis(*, include_running: bool) -> tuple[FleetSnapshot | No
                 reason_codes.append("legacy_runner_override")
             if config["session"] != f"codex_agent_{agent}_mcp":
                 reason_codes.append("legacy_session_override")
-            states.append(agent_auth_status(agent))
+            states.append(agent_auth_status(agent, snapshot=inventory))
 
         if all(state.get("authenticated") is True for state in states):
             auth_status = "configured"
@@ -696,7 +707,7 @@ def _legacy_fleet_analysis(*, include_running: bool) -> tuple[FleetSnapshot | No
     running: set[str] = set()
     if include_running:
         try:
-            running = set(managed_applet_inventory()["running_agents"])
+            running = set(managed_applet_inventory(inventory)["running_agents"])
         except AgentError:
             running = set()
 
@@ -1691,15 +1702,18 @@ def ordinal_agent_id(
     return agent
 
 
-def canonical_agent_id(agent: str) -> str:
+def canonical_agent_id(
+    agent: str,
+    snapshot: InventorySnapshot | None = None,
+) -> str:
     normalized = normalize_agent_selector_text(agent)
-    snapshot = current_agent_inventory()
+    inventory = snapshot or current_agent_inventory()
     if normalized.isdecimal():
-        return ordinal_agent_id(normalized, snapshot=snapshot)
-    if normalized in snapshot.agents:
+        return ordinal_agent_id(normalized, snapshot=inventory)
+    if normalized in inventory.agents:
         return normalized
     alias = LEGACY_AGENT_ALIASES.get(normalized)
-    if alias in snapshot.agents:
+    if alias in inventory.agents:
         return alias
     raise AgentError("unknown agent; expected a concrete id like a1, b1, c1 or a selector like both/all/a-series")
 
@@ -1753,8 +1767,9 @@ def normalize_applet_agents(agents: Any, *, allow_empty: bool = False) -> list[s
         value = normalize_agent_selector_text(agent)
         if value in seen:
             raise AgentError("applet_agents must not contain duplicates")
-        if value not in snapshot.agents:
-            raise AgentError("applet_agents only accepts concrete tracked agent ids")
+        descriptor = snapshot.agents.get(value)
+        if descriptor is None or not descriptor.enabled:
+            raise AgentError("applet_agents only accepts concrete enabled agent ids")
         normalized.append(value)
         seen.add(value)
     return normalized
@@ -2033,8 +2048,8 @@ def pane_pid_from_text(text: str) -> int | None:
     return value if value > 0 and text == str(value) else None
 
 
-def managed_applet_inventory() -> dict[str, Any]:
-    snapshot = current_agent_inventory()
+def managed_applet_inventory(snapshot: InventorySnapshot | None = None) -> dict[str, Any]:
+    selected = snapshot or current_agent_inventory()
     inventory = run_tmux(
         ["list-sessions", "-F", "#{session_name}"],
         check=False,
@@ -2043,7 +2058,9 @@ def managed_applet_inventory() -> dict[str, Any]:
     if inventory.returncode != 0:
         raise AgentError("applet status backend unavailable")
     session_to_agent = {
-        agent_config(agent, snapshot)["session"]: agent for agent in snapshot.agent_ids
+        agent_config(agent, selected)["session"]: agent
+        for agent in selected.agent_ids
+        if selected.agents[agent].enabled
     }
     ordered_running: list[str] = []
     seen: set[str] = set()
@@ -2053,7 +2070,7 @@ def managed_applet_inventory() -> dict[str, Any]:
             continue
         seen.add(agent)
         ordered_running.append(agent)
-    ordered_running.sort(key=snapshot.positions.__getitem__)
+    ordered_running.sort(key=selected.positions.__getitem__)
     visible_running = ordered_running[:MAX_APPLET_AGENTS]
     return {
         "running_agents": ordered_running,
@@ -4834,9 +4851,13 @@ def auth_access_token_state(value: Any) -> str:
     return "expired" if expiry <= time.time() else "unexpired"
 
 
-def agent_auth_status(agent: str) -> dict[str, Any]:
-    agent = canonical_agent_id(agent)
-    auth_file = agent_config(agent)["home"] / "auth.json"
+def agent_auth_status(
+    agent: str,
+    snapshot: InventorySnapshot | None = None,
+) -> dict[str, Any]:
+    inventory = snapshot or current_agent_inventory()
+    agent = canonical_agent_id(agent, snapshot=inventory)
+    auth_file = agent_config(agent, inventory)["home"] / "auth.json"
     token_state = "unknown"
     auth_mode = "unknown"
     try:

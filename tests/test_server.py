@@ -2209,6 +2209,47 @@ class ServerHelpersTest(unittest.TestCase):
         finally:
             server_module.swap_agent_inventory(original)
 
+    def test_agent_config_uses_explicit_captured_snapshot_after_publish_race(self) -> None:
+        from codex_master.fleet_registry import build_inventory, normalize_fleet_document
+
+        def inventory(prefix: str, root: Path):
+            fleet = normalize_fleet_document(
+                {
+                    "schema_version": 1,
+                    "generation": 1,
+                    "accounts": [],
+                    "series": [
+                        {
+                            "prefix": prefix,
+                            "display_name": prefix.upper(),
+                            "count": 1,
+                            "runner": "codex_cli",
+                            "provider": "ollama_local",
+                            "model": "local-model",
+                            "account_id": None,
+                            "enabled": True,
+                        }
+                    ],
+                }
+            )
+            return build_inventory(fleet, root)
+
+        first = inventory("d", Path("/captured"))
+        second = inventory("e", Path("/published"))
+        original = server_module.swap_agent_inventory(first)
+        try:
+            captured = server_module.current_agent_inventory()
+            server_module.publish_agent_inventory(second)
+
+            config = server_module.agent_config("d1", captured)
+
+            self.assertEqual(config["label"], "D 1")
+            self.assertEqual(config["home"], Path("/captured/d1"))
+            self.assertEqual(config["runner"], Path("/captured/d1/codex"))
+            self.assertEqual(config["session"], "codex_agent_d1_mcp")
+        finally:
+            server_module.swap_agent_inventory(original)
+
     def test_current_inventory_follows_legacy_agents_patch_without_override(self) -> None:
         config = {
             "label": "Patched D1",
@@ -2257,6 +2298,70 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(server_module.agent_ids("all"), ["b1", "d1"])
             self.assertEqual(server_module.canonical_agent_id("a1"), "a1")
             self.assertEqual(server_module.agent_ids("a-series"), [])
+
+    def test_applet_normalizer_rejects_known_but_disabled_agent(self) -> None:
+        from codex_master.fleet_registry import build_inventory, normalize_fleet_document
+
+        fleet = normalize_fleet_document(
+            {
+                "schema_version": 1,
+                "generation": 1,
+                "accounts": [],
+                "series": [
+                    {
+                        "prefix": "d",
+                        "display_name": "D",
+                        "count": 1,
+                        "runner": "codex_cli",
+                        "provider": "ollama_local",
+                        "model": "local-model",
+                        "account_id": None,
+                        "enabled": False,
+                    }
+                ],
+            }
+        )
+        inventory = build_inventory(fleet, Path("/inventory"))
+        with server_module.temporary_agent_inventory(inventory):
+            self.assertEqual(server_module.canonical_agent_id("d1"), "d1")
+            with self.assertRaisesRegex(AgentError, "concrete enabled agent ids"):
+                server_module.normalize_applet_agents(["d1"])
+
+    def test_applet_inventory_omits_running_session_for_disabled_agent(self) -> None:
+        from codex_master.fleet_registry import build_inventory, normalize_fleet_document
+
+        fleet = normalize_fleet_document(
+            {
+                "schema_version": 1,
+                "generation": 1,
+                "accounts": [],
+                "series": [
+                    {
+                        "prefix": prefix,
+                        "display_name": prefix.upper(),
+                        "count": 1,
+                        "runner": "codex_cli",
+                        "provider": "ollama_local",
+                        "model": "local-model",
+                        "account_id": None,
+                        "enabled": prefix == "e",
+                    }
+                    for prefix in ("d", "e")
+                ],
+            }
+        )
+        inventory = build_inventory(fleet, Path("/inventory"))
+        sessions = "codex_agent_d1_mcp\ncodex_agent_e1_mcp\n"
+        with server_module.temporary_agent_inventory(inventory), patch.object(
+            server_module,
+            "run_tmux",
+            return_value=subprocess.CompletedProcess([], 0, sessions, ""),
+        ):
+            result = server_module.managed_applet_inventory()
+
+        self.assertEqual(result["running_agents"], ["e1"])
+        self.assertEqual(result["visible_running_agents"], ["e1"])
+        self.assertEqual(result["overflow"], 0)
 
     def test_legacy_migration_dry_run_is_redacted_and_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2327,16 +2432,80 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertNotIn(str(root), public_text)
             self.assertNotIn(secret, public_text)
 
+    def test_legacy_migration_uses_pinned_legacy_inventory_with_foreign_active_snapshot(self) -> None:
+        from codex_master.fleet_registry import build_inventory, normalize_fleet_document
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "pool" / "a1"
+            home.mkdir(parents=True)
+            sentinel = home / "sentinel"
+            sentinel.write_text("unchanged", encoding="utf-8")
+            legacy_agents = {
+                "a1": {
+                    "label": "A1",
+                    "runner": home / "codex",
+                    "home": home,
+                    "session": "codex_agent_a1_mcp",
+                }
+            }
+            active_fleet = normalize_fleet_document(
+                {
+                    "schema_version": 1,
+                    "generation": 9,
+                    "accounts": [],
+                    "series": [
+                        {
+                            "prefix": "d",
+                            "display_name": "D",
+                            "count": 1,
+                            "runner": "codex_cli",
+                            "provider": "ollama_local",
+                            "model": "local-model",
+                            "account_id": None,
+                            "enabled": True,
+                        }
+                    ],
+                }
+            )
+            active = build_inventory(active_fleet, root / "active")
+            before = sentinel.read_bytes()
+            with server_module.temporary_agent_inventory(active), patch.dict(
+                server_module.AGENTS, legacy_agents, clear=True
+            ), patch.object(
+                server_module,
+                "run_tmux",
+                return_value=subprocess.CompletedProcess([], 0, "codex_agent_a1_mcp\n", ""),
+            ):
+                projected = server_module.legacy_fleet_snapshot()
+                result = server_module.legacy_fleet_migration_dry_run()
+
+                self.assertIs(server_module.current_agent_inventory(), active)
+
+            self.assertEqual([account.account_id for account in projected.accounts], ["legacy-a"])
+            self.assertEqual(projected.series[0].prefix, "a")
+            self.assertEqual(projected.series[0].count, 1)
+            self.assertTrue(result["representable"])
+            self.assertEqual(result["running_count"], 1)
+            self.assertEqual(result["series"][0]["auth_status"], "missing")
+            self.assertEqual(sentinel.read_bytes(), before)
+            self.assertNotIn(str(root), json.dumps(result, sort_keys=True))
+
     def test_legacy_migration_rejects_overrides_gaps_and_mixed_auth_without_activation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             pool = root / "pool"
 
-            def config(agent: str, *, home: Path | None = None) -> dict[str, Any]:
+            def config(
+                agent: str,
+                *,
+                home: Path | None = None,
+                runner: Path | None = None,
+            ) -> dict[str, Any]:
                 agent_home = home or pool / agent
                 return {
                     "label": agent.upper(),
-                    "runner": agent_home / "codex",
+                    "runner": runner or agent_home / "codex",
                     "home": agent_home,
                     "session": f"codex_agent_{agent}_mcp",
                 }
@@ -2344,6 +2513,7 @@ class ServerHelpersTest(unittest.TestCase):
             cases = (
                 ({"a1": config("a1", home=pool / "custom")}, "legacy_home_override"),
                 ({"a1": config("a1"), "a3": config("a3")}, "legacy_id_gap"),
+                ({"a1": config("a1", runner=pool / "custom-runner")}, "legacy_runner_override"),
             )
             for agents, reason in cases:
                 with self.subTest(reason=reason), server_module.temporary_agent_inventory(None), patch.dict(
