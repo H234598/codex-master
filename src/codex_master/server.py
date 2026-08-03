@@ -45,6 +45,7 @@ LOCK_DIR = STATE_ROOT / "locks"
 LEASE_DIR = STATE_ROOT / "leases"
 ASSIGNMENT_LOG = STATE_ROOT / "assignments.jsonl"
 SELECTOR_POLICY_FILE = STATE_ROOT / "selector-policy.json"
+TEAMLEADER_REGISTRY_FILE = STATE_ROOT / "teamleaders.json"
 LEGACY_META_DIR = LEGACY_STATE_ROOT / "meta"
 DEFAULT_AGENT_MODEL = "gpt-5.4-mini"
 DEFAULT_AGENT_MODEL_EFFORT = "medium"
@@ -128,6 +129,7 @@ MAX_GIT_REF_TEXT = 200
 MAX_ASSIGNMENT_ID = 200
 MAX_LIVE_DATA_TOPIC = 400
 MAX_RPC_MESSAGE_BYTES = 1024 * 1024
+MAX_TOOL_CATALOG_BYTES = 1024 * 1024
 MAX_ERROR_CHARS = 1200
 MAX_META_BYTES = 64 * 1024
 RESOURCE_MEMINFO_PATH = Path("/proc/meminfo")
@@ -158,6 +160,11 @@ MAX_POOL_SPEC_BYTES = 256 * 1024
 MAX_PLUGIN_CACHE_VERSIONS = 20
 MAX_PLUGIN_CACHE_RETAINED_VERSIONS = 5
 MAX_SELECTOR_POLICY_BYTES = 4096
+MAX_TEAMLEADER_REGISTRY_BYTES = 16 * 1024
+MAX_TEAMLEADER_PRINCIPALS = 64
+TEAMLEADER_REGISTRY_SCHEMA_VERSION = 1
+TEAMLEADER_PRINCIPAL_RE = re.compile(r"^[0-9a-f]{64}$")
+MAX_TEAMLEADER_ANCESTORS = 32
 MAX_PAGED_OFFSET = 10_000_000
 PLUGIN_CACHE_ALLOWED_FILES = (".app.json", ".mcp.json", "README.md", "codex-agent-pool.json", "pyproject.toml")
 PLUGIN_CACHE_ALLOWED_DIRS = (
@@ -1070,6 +1077,191 @@ def assert_install_context_allows_master_registration() -> None:
     context = codex_home_context()
     if context["home_kind"] == "managed_agent_home":
         raise AgentError("refusing to register Master MCP inside a managed Agentin home")
+
+
+def active_codex_home_path() -> Path:
+    configured = os.environ.get("CODEX_HOME")
+    return normalized_compare_path(Path(configured).expanduser() if configured else Path.home() / ".codex")
+
+
+def teamleader_principal_digest(codex_home: Path) -> str:
+    normalized = normalized_compare_path(codex_home)
+    material = b"codex-master-teamleader-v1\0" + os.fsencode(str(normalized))
+    return hashlib.sha256(material).hexdigest()
+
+
+def _decode_teamleader_registry(text: str) -> set[str]:
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise AgentError("teamleader registry is unavailable") from exc
+    if not isinstance(payload, dict) or set(payload) != {"schema_version", "principals"}:
+        raise AgentError("teamleader registry is unavailable")
+    principals = payload.get("principals")
+    if payload.get("schema_version") != TEAMLEADER_REGISTRY_SCHEMA_VERSION or not isinstance(principals, list):
+        raise AgentError("teamleader registry is unavailable")
+    if len(principals) > MAX_TEAMLEADER_PRINCIPALS:
+        raise AgentError("teamleader registry is unavailable")
+    if any(not isinstance(item, str) or not TEAMLEADER_PRINCIPAL_RE.fullmatch(item) for item in principals):
+        raise AgentError("teamleader registry is unavailable")
+    if len(set(principals)) != len(principals):
+        raise AgentError("teamleader registry is unavailable")
+    return set(principals)
+
+
+def _read_teamleader_principals_strict(*, missing_ok: bool) -> set[str]:
+    try:
+        registry_stat = TEAMLEADER_REGISTRY_FILE.lstat()
+    except FileNotFoundError:
+        if missing_ok:
+            return set()
+        raise AgentError("teamleader registry is unavailable")
+    except OSError as exc:
+        raise AgentError("teamleader registry is unavailable") from exc
+    if (
+        not stat_module.S_ISREG(registry_stat.st_mode)
+        or stat_module.S_ISLNK(registry_stat.st_mode)
+        or getattr(registry_stat, "st_nlink", 1) > 1
+        or registry_stat.st_uid != os.geteuid()
+        or stat_module.S_IMODE(registry_stat.st_mode) != 0o600
+        or registry_stat.st_size > MAX_TEAMLEADER_REGISTRY_BYTES
+    ):
+        raise AgentError("teamleader registry is unavailable")
+    text = read_private_regular_text(
+        TEAMLEADER_REGISTRY_FILE,
+        MAX_TEAMLEADER_REGISTRY_BYTES,
+        "teamleader registry is unavailable",
+    )
+    return _decode_teamleader_registry(text)
+
+
+def read_teamleader_principals() -> set[str]:
+    try:
+        return _read_teamleader_principals_strict(missing_ok=True)
+    except AgentError:
+        return set()
+
+
+def enroll_current_teamleader() -> dict[str, Any]:
+    assert_install_context_allows_master_registration()
+    codex_home = active_codex_home_path()
+    ensure_private_dir(codex_home)
+    try:
+        home_stat = codex_home.lstat()
+    except OSError as exc:
+        raise AgentError("teamleader CODEX_HOME is unavailable") from exc
+    if (
+        not stat_module.S_ISDIR(home_stat.st_mode)
+        or stat_module.S_ISLNK(home_stat.st_mode)
+        or home_stat.st_uid != os.geteuid()
+        or not directory_chain_is_real_no_symlink(codex_home)
+    ):
+        raise AgentError("teamleader CODEX_HOME is unavailable")
+    principals = _read_teamleader_principals_strict(missing_ok=True)
+    digest = teamleader_principal_digest(codex_home)
+    changed = digest not in principals
+    if changed:
+        if len(principals) >= MAX_TEAMLEADER_PRINCIPALS:
+            raise AgentError("teamleader registry capacity reached")
+        principals.add(digest)
+        document = {
+            "schema_version": TEAMLEADER_REGISTRY_SCHEMA_VERSION,
+            "principals": sorted(principals),
+        }
+        encoded = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        ensure_private_dir(STATE_ROOT)
+        replace_private_bytes(TEAMLEADER_REGISTRY_FILE, encoded, mode=0o600)
+    return {
+        "authorized": True,
+        "role": "teamleader",
+        "changed": changed,
+        "visible_tool_count": len(TOOLS),
+        "raw_output": "not_returned",
+    }
+
+
+def revoke_current_teamleader() -> dict[str, Any]:
+    assert_install_context_allows_master_registration()
+    digest = teamleader_principal_digest(active_codex_home_path())
+    principals = _read_teamleader_principals_strict(missing_ok=True)
+    changed = digest in principals
+    if changed:
+        principals.remove(digest)
+        document = {
+            "schema_version": TEAMLEADER_REGISTRY_SCHEMA_VERSION,
+            "principals": sorted(principals),
+        }
+        encoded = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        replace_private_bytes(TEAMLEADER_REGISTRY_FILE, encoded, mode=0o600)
+    return {
+        "authorized": False,
+        "role": "non_teamleader",
+        "changed": changed,
+        "visible_tool_count": 0,
+        "raw_output": "not_returned",
+    }
+
+
+def managed_home_in_process_ancestry(
+    *,
+    start_pid: int | None = None,
+    proc_root: Path = Path("/proc"),
+) -> bool | None:
+    pid = os.getppid() if start_pid is None else start_pid
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    seen: set[int] = set()
+    for _index in range(MAX_TEAMLEADER_ANCESTORS):
+        if pid in seen or pid <= 0:
+            return None
+        seen.add(pid)
+        pid_dir = proc_root / str(pid)
+        status = read_proc_status(pid_dir)
+        if not status:
+            return None
+        uid_parts = status.get("Uid", "").split()
+        if not uid_parts or not uid_parts[0].isdigit():
+            return None
+        if int(uid_parts[0]) != os.geteuid():
+            return False
+        ppid_parts = status.get("PPid", "").split()
+        if not ppid_parts or not ppid_parts[0].isdigit():
+            return None
+        parent = int(ppid_parts[0])
+        if status.get("Name") == "systemd" and parent == 1:
+            return False
+        env = read_proc_environ(pid_dir)
+        if env is None:
+            return None
+        configured_home = env.get("CODEX_HOME")
+        if configured_home and classify_codex_home(configured_home)["home_kind"] == "managed_agent_home":
+            return True
+        if parent <= 0:
+            return False
+        pid = parent
+    return None
+
+
+def master_tool_access_status() -> dict[str, Any]:
+    context = codex_home_context()
+    authorized = False
+    ancestry_managed = managed_home_in_process_ancestry()
+    if context["home_kind"] != "managed_agent_home" and ancestry_managed is False:
+        digest = teamleader_principal_digest(active_codex_home_path())
+        authorized = digest in read_teamleader_principals()
+    return {
+        "authorized": authorized,
+        "role": "teamleader" if authorized else "non_teamleader",
+        "visible_tool_count": len(TOOLS) if authorized else 0,
+        "raw_output": "not_returned",
+    }
+
+
+def require_teamleader_tool_access() -> dict[str, Any]:
+    status = master_tool_access_status()
+    if not status["authorized"]:
+        raise AgentError("teamleader authorization required")
+    return status
 
 
 def normalize_agent_selector_text(agent: str) -> str:
@@ -11301,10 +11493,17 @@ def _install_unlocked(
     if not is_regular_executable_no_symlink(wrapper):
         raise AgentError("repo wrapper is not executable")
     startup_self_test: dict[str, Any] = {"requested": register, "status": "skipped", "raw_output": "not_returned"}
+    teamleader_enrollment: dict[str, Any] | None = None
     if register:
-        wrapper_self_test = mcp_command_startup_self_test(wrapper)
-        if not wrapper_self_test["ok"]:
-            raise AgentError("repo wrapper failed MCP startup self-test")
+        teamleader_enrollment = enroll_current_teamleader()
+        try:
+            wrapper_self_test = mcp_command_startup_self_test(wrapper)
+            if not wrapper_self_test["ok"]:
+                raise AgentError("repo wrapper failed MCP startup self-test")
+        except Exception:
+            if teamleader_enrollment.get("changed"):
+                revoke_current_teamleader()
+            raise
     ensure_applet_action_key()
 
     install_path = normalize_install_path(install_path)
@@ -11413,6 +11612,7 @@ def _install_unlocked(
     except Exception:
         mcp_restore_error: Exception | None = None
         config_restore_error: Exception | None = None
+        teamleader_restore_error: Exception | None = None
         if registration_added or registration_removed:
             try:
                 if registration_added:
@@ -11430,6 +11630,11 @@ def _install_unlocked(
                 restore_mcp_startup_timeout_snapshot(startup_timeout_snapshot)
             except Exception as restore_exc:
                 config_restore_error = restore_exc
+        if teamleader_enrollment is not None and teamleader_enrollment.get("changed"):
+            try:
+                revoke_current_teamleader()
+            except Exception as restore_exc:
+                teamleader_restore_error = restore_exc
         rollback_install = symlink_status != "already_installed" and (
             not previous_install_present or previous_install_target_text is not None
         )
@@ -11445,6 +11650,8 @@ def _install_unlocked(
                 raise AgentError("could_not_restore_install_symlink") from restore_exc
         if mcp_restore_error is not None:
             raise AgentError("could_not_restore_mcp_registration") from mcp_restore_error
+        if teamleader_restore_error is not None:
+            raise AgentError("could_not_restore_teamleader_registry") from teamleader_restore_error
         if config_restore_error is not None:
             raise AgentError("could_not_restore_codex_config") from config_restore_error
         raise
@@ -11538,7 +11745,18 @@ def _uninstall_unlocked(
                 raise AgentError("could_not_restore_install_symlink") from restore_exc
         raise
 
-    return {"ok": True, "mcp": mcp_status, "symlink": symlink_status, "raw_output": "not_returned"}
+    teamleader_status = "preserved"
+    if unregister and mcp_status == "removed":
+        revoked = revoke_current_teamleader()
+        teamleader_status = "removed" if revoked["changed"] else "not_registered"
+
+    return {
+        "ok": True,
+        "mcp": mcp_status,
+        "symlink": symlink_status,
+        "teamleader": teamleader_status,
+        "raw_output": "not_returned",
+    }
 
 
 def uninstall(
@@ -14720,6 +14938,25 @@ def call_validated_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     return call_tool(validated_name, validated_args)
 
 
+def call_teamleader_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    require_teamleader_tool_access()
+    return call_validated_tool(name, args)
+
+
+def teamleader_tool_catalog() -> list[dict[str, Any]]:
+    require_teamleader_tool_access()
+    try:
+        encoded = json.dumps(TOOLS, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    except (TypeError, ValueError, RecursionError, UnicodeError) as exc:
+        raise AgentError("teamleader tool catalog is invalid") from exc
+    if len(encoded) > MAX_TOOL_CATALOG_BYTES:
+        raise AgentError("teamleader tool catalog is invalid")
+    snapshot = json.loads(encoded)
+    if not isinstance(snapshot, list):
+        raise AgentError("teamleader tool catalog is invalid")
+    return snapshot
+
+
 def validate_schema_value(field: str, value: Any, schema: dict[str, Any]) -> None:
     value_type = schema.get("type")
     if value_type == "string":
@@ -14762,6 +14999,8 @@ def validate_schema_value(field: str, value: Any, schema: dict[str, Any]) -> Non
         if isinstance(item_schema, dict):
             for index, item in enumerate(value):
                 validate_schema_value(f"{field}[{index}]", item, item_schema)
+        return
+    raise AgentError(f"{field} uses an unsupported schema type")
 
 
 def rpc_result(message_id: Any, result: Any) -> dict[str, Any]:
@@ -14772,7 +15011,7 @@ def rpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": message_id, "error": {"code": code, "message": safe_error_text(message)}}
 
 
-def handle_rpc(msg: dict[str, Any]) -> dict[str, Any] | None:
+def handle_rpc(msg: dict[str, Any], *, enforce_master_role: bool = False) -> dict[str, Any] | None:
     if not isinstance(msg, dict):
         raise AgentError("RPC message must be an object")
     message_id = msg.get("id")
@@ -14823,13 +15062,18 @@ def handle_rpc(msg: dict[str, Any]) -> dict[str, Any] | None:
             )
         )
     if method == "tools/list":
-        return reply(rpc_result(message_id, {"tools": TOOLS}))
+        tools = TOOLS
+        if enforce_master_role:
+            tools = teamleader_tool_catalog() if master_tool_access_status()["authorized"] else []
+        return reply(rpc_result(message_id, {"tools": tools}))
     if method == "resources/list":
         return reply(rpc_result(message_id, {"resources": []}))
     if method == "prompts/list":
         return reply(rpc_result(message_id, {"prompts": []}))
     if method == "tools/call":
         try:
+            if enforce_master_role:
+                require_teamleader_tool_access()
             params = msg.get("params", {})
             if params is None:
                 params = {}
@@ -14931,7 +15175,7 @@ def serve_mcp() -> int:
             msg = read_message()
             if msg is None:
                 return 0
-            response = handle_rpc(msg)
+            response = handle_rpc(msg, enforce_master_role=True)
             if response is not None:
                 write_message(response)
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -15684,7 +15928,7 @@ def main_cli(argv: list[str]) -> int:
         if args.command == "doctor":
             return print_json(doctor())
         if args.command == "tools":
-            return print_json({"tools": TOOLS})
+            return print_json({"tools": teamleader_tool_catalog()})
     except Exception as exc:
         print(json.dumps(public_error_payload(exc), indent=2, sort_keys=True))
         return 1
