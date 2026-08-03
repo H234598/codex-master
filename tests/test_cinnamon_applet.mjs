@@ -761,6 +761,39 @@ test("single removal retries transient menu cleanup failures", () => {
   }
 });
 
+test("native submenu references survive failed main menu cleanup retry", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const menu = applet.menu;
+  const manager = applet.menuManager;
+  const nativeSubmenuItem = applet._nativeSubmenuItem;
+  const nativeBeeRowItems = applet._nativeBeeRowItems.slice();
+  menu.failDestroyCount = 2;
+
+  applet.on_applet_removed_from_panel();
+
+  assert.equal(applet._cleanupComplete, false);
+  assert.equal(applet._nativeSubmenuItem, nativeSubmenuItem);
+  assert.equal(applet._nativeBeeRowItems.length, 6);
+  for (let index = 0; index < nativeBeeRowItems.length; index += 1) {
+    assert.equal(applet._nativeBeeRowItems[index], nativeBeeRowItems[index]);
+  }
+  assert.equal(nativeSubmenuItem.menu.destroyCount, 0);
+  assert.equal(manager.destroyCount, 1);
+
+  applet.on_applet_removed_from_panel();
+
+  assert.equal(applet._cleanupComplete, true);
+  assert.equal(applet._nativeSubmenuItem, null);
+  assert.equal(applet._nativeBeeRowItems.length, 0);
+  assert.equal(nativeSubmenuItem.menu.destroyCount, 1);
+  assert.equal(manager.destroyCount, 1);
+
+  applet.on_applet_removed_from_panel();
+  assert.equal(nativeSubmenuItem.menu.destroyCount, 1);
+  assert.equal(manager.destroyCount, 1);
+});
+
 test("removal releases status actor wrapper references", () => {
   const fixture = loadApplet();
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
@@ -2603,6 +2636,51 @@ test("schema v2 allocates one native submenu with six stable child rows", () => 
   assert.equal(applet._nativeBeeRowItems[5], nativeRowItems?.[5]);
   assert.ok(getMenuItemText(applet._statusRowItems[0]).startsWith("a1:"));
   assert.ok(getMenuItemText(applet._statusRowItems[1]).startsWith("b1:"));
+});
+
+test("native submenu keeps six object identities across 500 v2 render cycles", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const readyPayload = samplePayload();
+  readyPayload.native_agents.counts.active = 1;
+  readyPayload.native_agents.agents = [sampleNativeAgent()];
+  const degradedPayload = samplePayload();
+  degradedPayload.native_agents.bridge_state = "degraded";
+  const nativeSubmenuItem = applet._nativeSubmenuItem;
+  const nativeBeeRowItems = applet._nativeBeeRowItems.slice();
+
+  for (let cycle = 0; cycle < 500; cycle += 1) {
+    const payload = cycle % 2 === 0 ? readyPayload : degradedPayload;
+    assert.equal(applet._maybeApplyStatusPayload(payload), true, `cycle ${cycle}`);
+  }
+
+  assert.equal(applet._nativeSubmenuItem, nativeSubmenuItem);
+  assert.equal(applet._nativeBeeRowItems.length, 6);
+  for (let index = 0; index < nativeBeeRowItems.length; index += 1) {
+    assert.equal(applet._nativeBeeRowItems[index], nativeBeeRowItems[index]);
+  }
+  assert.equal(fixture.createdNativeRows(), 6);
+});
+
+test("native overflow reuses sixth row without allocating a seventh", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const payload = samplePayload();
+  payload.native_agents = {
+    bridge_state: "ready",
+    counts: { active: 7, unconfirmed: 0, overflow: 1 },
+    agents: Array.from({ length: 6 }, (_value, index) => sampleNativeAgent({
+      display_id: `agent_0${index + 1}`,
+    })),
+    truncated: true,
+  };
+
+  assert.equal(applet._maybeApplyStatusPayload(payload), true);
+  assert.equal(getMenuItemText(applet._nativeSubmenuItem), "Native Bienen (7)");
+  assert.equal(applet._nativeBeeRowItems.filter((item) => item.actor.visible).length, 6);
+  assert.equal(getMenuItemText(applet._nativeBeeRowItems[5]), "+1 weitere Native Bienen");
+  assert.equal(applet._nativeBeeRowItems[6], undefined);
+  assert.equal(fixture.createdNativeRows(), 6);
 });
 
 test("schema v2 bridge degradation keeps managed rows and shows native diagnostic", () => {
