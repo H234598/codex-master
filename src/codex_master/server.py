@@ -2695,6 +2695,7 @@ def read_private_regular_text(
     error_text: str,
     *,
     expected_parent_stat: os.stat_result | None = None,
+    expected_target_stat: os.stat_result | None = None,
 ) -> str:
     max_bytes = max(1, int(max_bytes))
     parent_fd = -1
@@ -2731,6 +2732,13 @@ def read_private_regular_text(
             opened_stat = os.fstat(fd)
             if (
                 not source_identity_matches(opened_stat, current_stat)
+                or (
+                    expected_target_stat is not None
+                    and not source_identity_with_snapshot_matches(
+                        opened_stat,
+                        expected_target_stat,
+                    )
+                )
                 or not stat_module.S_ISREG(opened_stat.st_mode)
                 or getattr(opened_stat, "st_nlink", 1) > 1
                 or opened_stat.st_size > max_bytes
@@ -2757,7 +2765,10 @@ def read_private_regular_text(
         raise AgentError(error_text) from exc
 
 
-def _fleet_optional_parent_stat(path: Path, error_text: str) -> os.stat_result | None:
+def _fleet_optional_stats(
+    path: Path,
+    error_text: str,
+) -> tuple[os.stat_result, os.stat_result] | None:
     try:
         parent_stat = path.parent.lstat()
     except OSError as exc:
@@ -2771,7 +2782,7 @@ def _fleet_optional_parent_stat(path: Path, error_text: str) -> os.stat_result |
             changed_text=error_text,
         )
         try:
-            os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            target_stat = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError:
             return None
         except OSError as exc:
@@ -2781,18 +2792,20 @@ def _fleet_optional_parent_stat(path: Path, error_text: str) -> os.stat_result |
     finally:
         if parent_fd >= 0:
             os.close(parent_fd)
-    return parent_stat
+    return parent_stat, target_stat
 
 
 def fleet_read_optional_private_text(path: Path, max_bytes: int, error_text: str) -> str | None:
-    parent_stat = _fleet_optional_parent_stat(path, error_text)
-    if parent_stat is None:
+    stats = _fleet_optional_stats(path, error_text)
+    if stats is None:
         return None
+    parent_stat, target_stat = stats
     return read_private_regular_text(
         path,
         max_bytes,
         error_text,
         expected_parent_stat=parent_stat,
+        expected_target_stat=target_stat,
     )
 
 
@@ -13984,6 +13997,7 @@ def pool_read_private_bytes(
     error_text: str,
     *,
     expected_parent_stat: os.stat_result | None = None,
+    expected_target_stat: os.stat_result | None = None,
 ) -> bytes:
     parent_fd = -1
     try:
@@ -14019,6 +14033,10 @@ def pool_read_private_bytes(
         opened = os.fstat(fd)
         if (
             not source_identity_matches(opened, current)
+            or (
+                expected_target_stat is not None
+                and not source_identity_with_snapshot_matches(opened, expected_target_stat)
+            )
             or stat_module.S_ISLNK(opened.st_mode)
             or not stat_module.S_ISREG(opened.st_mode)
             or getattr(opened, "st_nlink", 1) > 1
@@ -14043,14 +14061,16 @@ def pool_read_private_bytes(
 
 
 def fleet_read_optional_private_bytes(path: Path, max_bytes: int, error_text: str) -> bytes | None:
-    parent_stat = _fleet_optional_parent_stat(path, error_text)
-    if parent_stat is None:
+    stats = _fleet_optional_stats(path, error_text)
+    if stats is None:
         return None
+    parent_stat, target_stat = stats
     return pool_read_private_bytes(
         path,
         max_bytes,
         error_text,
         expected_parent_stat=parent_stat,
+        expected_target_stat=target_stat,
     )
 
 

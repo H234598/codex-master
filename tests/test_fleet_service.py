@@ -583,6 +583,7 @@ def test_optional_private_read_rejects_parent_swap(
         error_text: str,
         *,
         expected_parent_stat=None,
+        expected_target_stat=None,
     ):
         os.rename(paths.root, moved)
         io.ensure_dir(paths.root)
@@ -592,9 +593,54 @@ def test_optional_private_read_rejects_parent_swap(
             max_bytes,
             error_text,
             expected_parent_stat=expected_parent_stat,
+            expected_target_stat=expected_target_stat,
         )
 
     monkeypatch.setattr(server, function_name, swap_parent_then_read)
+
+    with pytest.raises(server.AgentError, match="read_error"):
+        if reader == "text":
+            io.read_text(paths.registry, 1024, "read_error")
+        else:
+            io.read_bytes(paths.registry, 1024, "read_error")
+
+
+@pytest.mark.parametrize("reader", ["text", "bytes"])
+def test_optional_private_read_rejects_target_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: str,
+) -> None:
+    from codex_master import server
+    from codex_master.fleet_service import FleetPaths
+
+    paths = FleetPaths.from_state_root(tmp_path)
+    io = server.build_fleet_private_io(paths)
+    io.ensure_dir(paths.root)
+    io.replace_text(paths.registry, "before")
+    replacement = tmp_path / "replacement"
+    replacement.write_text("after")
+    function_name = "read_private_regular_text" if reader == "text" else "pool_read_private_bytes"
+    real_read = getattr(server, function_name)
+
+    def swap_target_then_read(
+        path: Path,
+        max_bytes: int,
+        error_text: str,
+        *,
+        expected_parent_stat=None,
+        expected_target_stat=None,
+    ):
+        os.replace(replacement, paths.registry)
+        return real_read(
+            path,
+            max_bytes,
+            error_text,
+            expected_parent_stat=expected_parent_stat,
+            expected_target_stat=expected_target_stat,
+        )
+
+    monkeypatch.setattr(server, function_name, swap_target_then_read)
 
     with pytest.raises(server.AgentError, match="read_error"):
         if reader == "text":
