@@ -253,7 +253,8 @@ def parse_gemini_jsonl(lines: Iterable[str]) -> GeminiStreamResult:
             complete = True
             content = _response_part(raw.get("response"))
             if content is not None:
-                if len(content.encode("utf-8")) > MAX_GEMINI_RESPONSE_BYTES:
+                response_bytes += len(content.encode("utf-8"))
+                if response_bytes > MAX_GEMINI_RESPONSE_BYTES:
                     _fail("gemini_response_too_large")
                 final_response = content
             stats = _mapping(raw.get("stats"))

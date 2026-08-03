@@ -154,6 +154,15 @@ def test_gemini_parser_rejects_more_than_ten_thousand_events() -> None:
         parse_gemini_jsonl(lines)
 
 
+def test_gemini_parser_enforces_one_response_budget_across_chunks_and_result() -> None:
+    response_part = "x" * 700_000
+    with pytest.raises(FleetRunnerError):
+        parse_gemini_jsonl([
+            '{"type":"message","role":"assistant","content":"' + response_part + '"}',
+            '{"type":"result","response":"' + response_part + '"}',
+        ])
+
+
 def test_gemini_parser_returns_data_minimized_structured_provider_error() -> None:
     result = parse_gemini_jsonl([
         '{"type":"error","error":{"code":429,"status":"RESOURCE_EXHAUSTED",'
