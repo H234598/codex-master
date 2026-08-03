@@ -333,6 +333,15 @@ def action_block_reason(row: AgentRow, action: str) -> str | None:
     return "Aktion durch Sicherheitsvertrag gesperrt"
 
 
+def row_summary(row: AgentRow) -> str:
+    assignment = row.last_assignment_at_utc or "keiner"
+    return (
+        f"{row.agent} · {row.activity_state} · Auth {row.auth_state} · "
+        f"Lease {row.lease_state} · Limit {row.limit_state} · Rolle {row.role}\n"
+        f"Letzter Auftrag: {assignment}"
+    )
+
+
 class ControlCenterWindow:
     def __init__(self, Gtk: Any, GLib: Any, application: Any) -> None:
         self.Gtk = Gtk
@@ -435,11 +444,7 @@ class ControlCenterWindow:
         for row in page.rows:
             item = self.Gtk.ListBoxRow()
             box = self.Gtk.Box(orientation=self.Gtk.Orientation.HORIZONTAL, spacing=12)
-            summary = (
-                f"{row.agent} · {row.activity_state} · Auth {row.auth_state} · "
-                f"Lease {row.lease_state} · Limit {row.limit_state} · Rolle {row.role}"
-            )
-            label = self.Gtk.Label(label=summary)
+            label = self.Gtk.Label(label=row_summary(row))
             label.set_xalign(0.0)
             box.pack_start(label, True, True, 0)
             for action, title in (("stop", "Stoppen"), ("start", "Starten")):

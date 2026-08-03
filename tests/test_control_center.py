@@ -115,6 +115,7 @@ class ControlCenterViewModelTest(unittest.TestCase):
         clear = control_center.normalize_status_page(self._page(self._status_result())).rows[0]
         self.assertIsNone(control_center.action_block_reason(clear, "start"))
         self.assertEqual(control_center.action_block_reason(clear, "stop"), "Biene läuft nicht")
+        self.assertIn("Letzter Auftrag: 2026-08-03T12:00:00+00:00", control_center.row_summary(clear))
 
         blocked = control_center.normalize_status_page(self._page(self._status_result(blocked=True))).rows[0]
         self.assertEqual(
