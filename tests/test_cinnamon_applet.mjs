@@ -676,6 +676,23 @@ test("signal connection failures do not escape or retain invalid handles", () =>
   }
 });
 
+test("removal drops signal handles Cinnamon already disconnected", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+
+  for (const connection of applet._signalConnections) {
+    connection.target.handlers.delete(connection.id);
+    connection.target.disconnect = () => { throw new Error("connection is undefined"); };
+  }
+
+  applet.on_applet_removed_from_panel();
+
+  assert.equal(applet._cleanupComplete, true);
+  assert.equal(applet._signalConnections.length, 0);
+  assert.equal(applet.menu, null);
+  assert.equal(applet.menuManager, null);
+});
+
 test("single removal retries transient menu cleanup failures", () => {
   for (const failure of ["close", "remove", "menu-destroy", "manager-destroy"]) {
     const { main } = loadApplet();

@@ -1006,7 +1006,7 @@ FlottenmanagementApplet.prototype = {
 
     _disconnectTrackedSignals() {
         const connections = this._signalConnections;
-        const remaining = [];
+        this._signalConnections = [];
         for (const connection of connections) {
             try {
                 if (connection.target && typeof connection.target.disconnect === "function") {
@@ -1014,11 +1014,9 @@ FlottenmanagementApplet.prototype = {
                 }
             } catch (error) {
                 this._logCleanupError(error);
-                remaining.push(connection);
             }
         }
-        this._signalConnections = remaining;
-        return remaining.length === 0;
+        return true;
     },
 
     _cleanupMenuResource(menuProperty, managerProperty) {
