@@ -21,19 +21,24 @@ const DEFAULT_REFRESH_INTERVAL_SECONDS = 60;
 const MIN_REFRESH_INTERVAL_SECONDS = 15;
 const MAX_REFRESH_INTERVAL_SECONDS = 3600;
 const MAX_TRACKED_AGENTS = 6;
+const MAX_NATIVE_BEES = 6;
 const MAX_TRACKED_AGENTS_SETTING_CHARS = 128;
 const APPLET_ERROR_LOG_LIMIT = 8;
 const APPLET_IMMEDIATE_EXIT_WAIT_LIMIT = 2;
 const APPLET_SAFE_PATH = "/usr/bin:/bin";
 const APPLET_STATUS_COMMAND = "applet-status";
+const APPLET_STATUS_SCHEMA_VERSION = 2;
 let appletErrorLogCount = 0;
 const APPLET_STATUS_REQUIRED_FIELDS = [
-    "schema_version", "mode", "activity_state", "backend_state", "control_state", "counts", "agents", "raw_output",
+    "schema_version", "mode", "counts", "agents", "native_agents", "raw_output",
 ];
 const APPLET_STATUS_REQUIRED_ROW_FIELDS = [
     "agent", "activity_state", "backend_state", "control_state", "auth_state", "identity_state", "lease_state",
 ];
-const APPLET_STATUS_REQUIRED_COUNTS = ["tracked", "running", "sleeping", "ready", "blocked", "issues"];
+const APPLET_STATUS_REQUIRED_COUNTS = ["tracked", "running", "sleeping", "overflow"];
+const APPLET_STATUS_REQUIRED_NATIVE_FIELDS = ["bridge_state", "counts", "agents", "truncated"];
+const APPLET_STATUS_REQUIRED_NATIVE_COUNTS = ["active", "unconfirmed", "overflow"];
+const APPLET_STATUS_REQUIRED_NATIVE_AGENT_FIELDS = ["display_id", "agent_type", "activity_state", "updated_at_utc"];
 const APPLET_STATUS_RAW_OUTPUT = "not_returned";
 const APPLET_STATUS_ERROR_ROW = {
     activity_state: "unknown",
@@ -44,11 +49,6 @@ const APPLET_STATUS_ERROR_ROW = {
     lease_state: "unreadable",
 };
 const APPLET_STATUS_VALID_STRINGS = {
-    snapshot: {
-        activity_state: new Set(["running", "sleeping", "unknown", "mixed"]),
-        backend_state: new Set(["ok", "degraded", "unavailable"]),
-        control_state: new Set(["ready", "blocked", "unknown", "mixed"]),
-    },
     row: {
         activity_state: new Set(["running", "sleeping", "unknown"]),
         backend_state: new Set(["ok", "degraded", "error"]),
@@ -56,6 +56,10 @@ const APPLET_STATUS_VALID_STRINGS = {
         auth_state: new Set(["ready", "blocked", "unknown"]),
         identity_state: new Set(["verified", "unverified", "stopped", "unknown"]),
         lease_state: new Set(["unclaimed", "held", "expired", "unreadable"]),
+    },
+    native: {
+        bridge_state: new Set(["ready", "disabled", "degraded", "unavailable"]),
+        activity_state: new Set(["active", "unconfirmed"]),
     },
 };
 const APPLET_STATUS_LABELS = {
@@ -76,6 +80,16 @@ const APPLET_STATUS_LABELS = {
         blocked: "blockiert",
         mixed: "gemischt",
         unknown: "unbekannt",
+    },
+    nativeActivity: {
+        active: "aktiv",
+        unconfirmed: "unbestätigt",
+    },
+    nativeBridge: {
+        ready: "bereit",
+        disabled: "deaktiviert",
+        degraded: "eingeschränkt",
+        unavailable: "nicht verfügbar",
     },
 };
 const APPLET_INVALID_ENV_VARS = [
@@ -131,6 +145,8 @@ FlottenmanagementApplet.prototype = {
         this._settingsCleanupPending = null;
         this._statusSummaryItem = null;
         this._statusRowItems = [];
+        this._nativeSubmenuItem = null;
+        this._nativeBeeRowItems = [];
         this._menuCleanupState = {};
         this._signalConnections = [];
         this.menu = null;
@@ -173,6 +189,14 @@ FlottenmanagementApplet.prototype = {
             const rowItem = new PopupMenu.PopupMenuItem("", { reactive: false });
             this._statusRowItems.push(rowItem);
             this.menu.addMenuItem(rowItem);
+        }
+
+        this._nativeSubmenuItem = new PopupMenu.PopupSubMenuMenuItem("Native Bienen");
+        this.menu.addMenuItem(this._nativeSubmenuItem);
+        for (let index = 0; index < MAX_NATIVE_BEES; index += 1) {
+            const rowItem = new PopupMenu.PopupMenuItem("", { reactive: false });
+            this._nativeBeeRowItems.push(rowItem);
+            this._nativeSubmenuItem.menu.addMenuItem(rowItem);
         }
 
         this._initializeSettings(instance_id);
@@ -313,7 +337,13 @@ FlottenmanagementApplet.prototype = {
 
     _trackedStatusArgv() {
         const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
-        return [home + "/.local/bin/codex-master-mcp", APPLET_STATUS_COMMAND, ...this._trackedAgents];
+        return [
+            home + "/.local/bin/codex-master-mcp",
+            APPLET_STATUS_COMMAND,
+            "--schema-version",
+            String(APPLET_STATUS_SCHEMA_VERSION),
+            ...this._trackedAgents,
+        ];
     },
 
     _refreshStatus() {
@@ -779,16 +809,18 @@ FlottenmanagementApplet.prototype = {
     _isValidAppletStatusPayload(payload) {
         if (!payload || typeof payload !== "object") return false;
         if (!this._hasExactFields(payload, APPLET_STATUS_REQUIRED_FIELDS)) return false;
-        if (payload.schema_version !== 1) return false;
+        if (payload.schema_version !== APPLET_STATUS_SCHEMA_VERSION) return false;
         if (payload.mode !== "read_only") return false;
         if (payload.raw_output !== APPLET_STATUS_RAW_OUTPUT) return false;
 
-        for (const field of ["activity_state", "backend_state", "control_state"]) {
-            if (typeof payload[field] !== "string") return false;
-            if (!this._isValidStateSet("snapshot", field, payload[field])) return false;
+        if (typeof payload.counts !== "object" || payload.counts === null) return false;
+        if (!this._hasExactFields(payload.counts, APPLET_STATUS_REQUIRED_COUNTS)) return false;
+        for (const key of APPLET_STATUS_REQUIRED_COUNTS) {
+            const value = payload.counts[key];
+            if (!Number.isInteger(value) || value < 0) return false;
         }
 
-        if (!Array.isArray(payload.agents) || payload.agents.length !== this._trackedAgents.length) return false;
+        if (!Array.isArray(payload.agents) || payload.agents.length > MAX_TRACKED_AGENTS) return false;
         const agents = new Set();
         for (const row of payload.agents) {
             if (!row || typeof row !== "object") return false;
@@ -796,7 +828,8 @@ FlottenmanagementApplet.prototype = {
             for (const field of APPLET_STATUS_REQUIRED_ROW_FIELDS) {
                 if (typeof row[field] !== "string" || row[field].length === 0) return false;
             }
-            if (this._trackedAgents.indexOf(row.agent) === -1) return false;
+            if (!this._isCanonicalManagedAgentId(row.agent)) return false;
+            if (agents.has(row.agent)) return false;
             agents.add(row.agent);
             if (!this._isValidStateSet("row", "activity_state", row.activity_state)) return false;
             if (!this._isValidStateSet("row", "backend_state", row.backend_state)) return false;
@@ -806,51 +839,16 @@ FlottenmanagementApplet.prototype = {
             if (!this._isValidStateSet("row", "lease_state", row.lease_state)) return false;
             if (!this._isValidAppletStatusRow(row)) return false;
         }
-        if (agents.size !== this._trackedAgents.length) return false;
 
-        if (typeof payload.counts !== "object" || payload.counts === null) return false;
-        if (!this._hasExactFields(payload.counts, APPLET_STATUS_REQUIRED_COUNTS)) return false;
-        for (const key of APPLET_STATUS_REQUIRED_COUNTS) {
-            const value = payload.counts[key];
-            if (!Number.isInteger(value) || value < 0) return false;
-        }
         if (payload.counts.tracked !== payload.agents.length) return false;
-        if (payload.counts.running + payload.counts.sleeping > payload.counts.tracked) return false;
-        if (payload.counts.ready + payload.counts.blocked > payload.counts.tracked) return false;
-        if (payload.counts.issues > payload.counts.tracked) return false;
-
-        const activityStates = payload.agents.map((row) => row.activity_state);
-        const backendStates = payload.agents.map((row) => row.backend_state);
-        const controlStates = payload.agents.map((row) => row.control_state);
         const expectedCounts = {
             tracked: payload.agents.length,
-            running: activityStates.filter((state) => state === "running").length,
-            sleeping: activityStates.filter((state) => state === "sleeping").length,
-            ready: controlStates.filter((state) => state === "ready").length,
-            blocked: controlStates.filter((state) => state === "blocked").length,
-            issues: payload.agents.filter(
-                (row) => row.backend_state !== "ok" || row.control_state !== "ready"
-            ).length,
+            running: payload.agents.filter((row) => row.activity_state === "running").length + payload.counts.overflow,
+            sleeping: payload.agents.filter((row) => row.activity_state === "sleeping").length,
+            overflow: payload.counts.overflow,
         };
         if (APPLET_STATUS_REQUIRED_COUNTS.some((key) => payload.counts[key] !== expectedCounts[key])) return false;
-
-        const expectedActivity = activityStates.every((state) => state === "running")
-            ? "running"
-            : activityStates.every((state) => state === "sleeping")
-                ? "sleeping"
-                : activityStates.every((state) => state === "unknown") ? "unknown" : "mixed";
-        const expectedBackend = backendStates.every((state) => state === "ok")
-            ? "ok"
-            : backendStates.every((state) => state === "error") ? "unavailable" : "degraded";
-        const expectedControl = controlStates.every((state) => state === "ready")
-            ? "ready"
-            : controlStates.every((state) => state === "blocked")
-                ? "blocked"
-                : controlStates.every((state) => state === "unknown") ? "unknown" : "mixed";
-        if (payload.activity_state !== expectedActivity) return false;
-        if (payload.backend_state !== expectedBackend) return false;
-        if (payload.control_state !== expectedControl) return false;
-        return true;
+        return this._isValidNativeAgentSnapshot(payload.native_agents);
     },
 
     _isValidAppletStatusRow(row) {
@@ -893,6 +891,74 @@ FlottenmanagementApplet.prototype = {
             return "ready";
         }
         return "unknown";
+    },
+
+    _isCanonicalManagedAgentId(value) {
+        return typeof value === "string" && /^[abc](?:[1-9]|[1-9][0-9]|100)$/.test(value);
+    },
+
+    _isValidNativeSafeString(value) {
+        return typeof value === "string" && /^[A-Za-z0-9_-]{1,32}$/.test(value);
+    },
+
+    _isValidUtcTimestamp(value) {
+        if (typeof value !== "string" || value.length < 20 || value.length > 40) return false;
+        if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|\+00:00)$/.test(value)) return false;
+        return Number.isFinite(Date.parse(value));
+    },
+
+    _isValidNativeAgentSnapshot(nativeAgents) {
+        if (!nativeAgents || typeof nativeAgents !== "object") return false;
+        if (!this._hasExactFields(nativeAgents, APPLET_STATUS_REQUIRED_NATIVE_FIELDS)) return false;
+        if (!this._isValidStateSet("native", "bridge_state", nativeAgents.bridge_state)) return false;
+        if (typeof nativeAgents.counts !== "object" || nativeAgents.counts === null) return false;
+        if (!this._hasExactFields(nativeAgents.counts, APPLET_STATUS_REQUIRED_NATIVE_COUNTS)) return false;
+        for (const key of APPLET_STATUS_REQUIRED_NATIVE_COUNTS) {
+            if (!Number.isInteger(nativeAgents.counts[key]) || nativeAgents.counts[key] < 0) return false;
+        }
+        if (typeof nativeAgents.truncated !== "boolean") return false;
+        if (!Array.isArray(nativeAgents.agents) || nativeAgents.agents.length > MAX_NATIVE_BEES) return false;
+
+        const displayIds = new Set();
+        let activeCount = 0;
+        let unconfirmedCount = 0;
+        for (const row of nativeAgents.agents) {
+            if (!row || typeof row !== "object") return false;
+            if (!this._hasExactFields(row, APPLET_STATUS_REQUIRED_NATIVE_AGENT_FIELDS)) return false;
+            if (!this._isValidNativeSafeString(row.display_id)) return false;
+            if (!this._isValidNativeSafeString(row.agent_type)) return false;
+            if (!this._isValidStateSet("native", "activity_state", row.activity_state)) return false;
+            if (!this._isValidUtcTimestamp(row.updated_at_utc)) return false;
+            if (displayIds.has(row.display_id)) return false;
+            displayIds.add(row.display_id);
+            if (row.activity_state === "active") activeCount += 1;
+            else unconfirmedCount += 1;
+        }
+
+        if (activeCount > nativeAgents.counts.active) return false;
+        if (unconfirmedCount > nativeAgents.counts.unconfirmed) return false;
+        const totalCount = nativeAgents.counts.active + nativeAgents.counts.unconfirmed;
+        if (totalCount !== nativeAgents.agents.length + nativeAgents.counts.overflow) return false;
+        if (nativeAgents.truncated !== (nativeAgents.counts.overflow > 0)) return false;
+        return true;
+    },
+
+    _deriveSnapshotActivity(rows) {
+        if (!rows || rows.length === 0) return "unknown";
+        const activityStates = rows.map((row) => row.activity_state);
+        return activityStates.every((state) => state === "running")
+            ? "running"
+            : activityStates.every((state) => state === "sleeping")
+                ? "sleeping"
+                : activityStates.every((state) => state === "unknown") ? "unknown" : "mixed";
+    },
+
+    _deriveSnapshotBackend(rows) {
+        if (!rows || rows.length === 0) return "unavailable";
+        const backendStates = rows.map((row) => row.backend_state);
+        return backendStates.every((state) => state === "ok")
+            ? "ok"
+            : backendStates.every((state) => state === "error") ? "unavailable" : "degraded";
     },
 
     _hasExactFields(value, requiredFields) {
@@ -943,8 +1009,14 @@ FlottenmanagementApplet.prototype = {
         if (this._removed) return;
         this.set_applet_label(LABEL);
         const payload = this._statusLastGood;
-        const activity = this._stateLabel("activity", payload ? payload.activity_state : "unknown");
-        const backend = this._stateLabel("backend", payload ? payload.backend_state : "unavailable");
+        const managedRows = payload ? payload.agents : this._trackedAgents.map((agent) => ({
+            agent,
+            activity_state: "unknown",
+            backend_state: "error",
+            control_state: "unknown",
+        }));
+        const activity = this._stateLabel("activity", this._deriveSnapshotActivity(managedRows));
+        const backend = this._stateLabel("backend", this._deriveSnapshotBackend(managedRows));
         const stale = this._statusViewState === "stale" ? " · veraltet" : "";
         const unavailable = this._statusViewState === "unavailable" ? " · nicht verfügbar" : "";
         const configuration = this._settingsValid ? "" : "Konfigurationsfehler · ";
@@ -952,20 +1024,55 @@ FlottenmanagementApplet.prototype = {
         this.set_applet_tooltip(summary);
         this._setMenuItemText(this._statusSummaryItem, summary);
 
-        const rows = payload ? payload.agents : this._trackedAgents.map((agent) => ({
-            agent,
-            activity_state: "unknown",
-            backend_state: "error",
-            control_state: "unknown",
-        }));
         for (let index = 0; index < this._statusRowItems.length; index += 1) {
             const item = this._statusRowItems[index];
-            const row = rows[index];
+            const row = managedRows[index];
             if (!row) {
                 this._setMenuItemVisible(item, false);
                 continue;
             }
             const text = `${row.agent}: ${this._stateLabel("activity", row.activity_state)} · Backend ${this._stateLabel("backend", row.backend_state)} · Steuerung ${this._stateLabel("control", row.control_state)}`;
+            this._setMenuItemText(item, text);
+            this._setMenuItemVisible(item, true);
+        }
+
+        this._renderNativeStatus(payload ? payload.native_agents : null);
+    },
+
+    _renderNativeStatus(nativeAgents) {
+        if (!this._nativeSubmenuItem) return;
+
+        let title = "Native Bienen";
+        const rows = [];
+        if (!nativeAgents) {
+            rows.push("Native Bridge nicht verfügbar");
+        } else if (nativeAgents.bridge_state !== "ready") {
+            rows.push(`Native Bridge ${this._stateLabel("nativeBridge", nativeAgents.bridge_state)}`);
+        } else {
+            const total = nativeAgents.counts.active + nativeAgents.counts.unconfirmed;
+            if (total > 0) title = `Native Bienen (${total})`;
+            if (nativeAgents.agents.length === 0) {
+                rows.push("Keine aktiven Native Bienen");
+            } else {
+                for (const agent of nativeAgents.agents) {
+                    rows.push(
+                        `${agent.agent_type} · ${this._stateLabel("nativeActivity", agent.activity_state)} · ${agent.display_id}`
+                    );
+                }
+                if (nativeAgents.counts.overflow > 0 && rows.length === MAX_NATIVE_BEES) {
+                    rows[MAX_NATIVE_BEES - 1] = `+${nativeAgents.counts.overflow} weitere Native Bienen`;
+                }
+            }
+        }
+
+        this._setMenuItemText(this._nativeSubmenuItem, title);
+        for (let index = 0; index < this._nativeBeeRowItems.length; index += 1) {
+            const item = this._nativeBeeRowItems[index];
+            const text = rows[index];
+            if (!text) {
+                this._setMenuItemVisible(item, false);
+                continue;
+            }
             this._setMenuItemText(item, text);
             this._setMenuItemVisible(item, true);
         }
@@ -1231,6 +1338,8 @@ FlottenmanagementApplet.prototype = {
             if (appletMenuClean) {
                 this._statusSummaryItem = null;
                 this._statusRowItems = [];
+                this._nativeSubmenuItem = null;
+                this._nativeBeeRowItems = [];
             }
             this._cleanupComplete = statusClean && settingsClean && signalsClean && appletMenuClean && contextMenuClean;
         }

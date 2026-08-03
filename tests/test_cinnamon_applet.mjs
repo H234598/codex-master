@@ -35,20 +35,21 @@ function makeInvalidUtf8PayloadBytes(payload, replaceAt = null) {
   return bytes;
 }
 
+function getMenuItemText(item) {
+  if (!item) return "";
+  if (item.label && typeof item.label.text === "string") return item.label.text;
+  return typeof item.label === "string" ? item.label : "";
+}
+
 function samplePayload() {
   return {
-    schema_version: 1,
+    schema_version: 2,
     mode: "read_only",
-    activity_state: "mixed",
-    backend_state: "degraded",
-    control_state: "mixed",
     counts: {
       tracked: 2,
       running: 1,
       sleeping: 1,
-      ready: 1,
-      blocked: 1,
-      issues: 1,
+      overflow: 0,
     },
     agents: [
       {
@@ -70,33 +71,39 @@ function samplePayload() {
         lease_state: "unclaimed",
       },
     ],
+    native_agents: {
+      bridge_state: "ready",
+      counts: {
+        active: 0,
+        unconfirmed: 0,
+        overflow: 0,
+      },
+      agents: [],
+      truncated: false,
+    },
     raw_output: "not_returned",
+  };
+}
+
+function sampleNativeAgent(overrides = {}) {
+  return {
+    display_id: "019fc541",
+    agent_type: "explorer",
+    activity_state: "active",
+    updated_at_utc: "1970-01-01T00:16:40+00:00",
+    ...overrides,
   };
 }
 
 function realignCounts(payload) {
   const activityStates = payload.agents.map((row) => row.activity_state);
-  const controlStates = payload.agents.map((row) => row.control_state);
-  const backendStates = payload.agents.map((row) => row.backend_state);
   payload.counts.running = activityStates.filter((state) => state === "running").length;
   payload.counts.sleeping = activityStates.filter((state) => state === "sleeping").length;
-  payload.counts.ready = controlStates.filter((state) => state === "ready").length;
-  payload.counts.blocked = controlStates.filter((state) => state === "blocked").length;
-  payload.counts.issues = payload.agents.filter(
-    (row) => row.backend_state !== "ok" || row.control_state !== "ready",
-  ).length;
   payload.counts.tracked = payload.agents.length;
-  if (activityStates.every((state) => state === "running")) payload.activity_state = "running";
-  else if (activityStates.every((state) => state === "sleeping")) payload.activity_state = "sleeping";
-  else if (activityStates.every((state) => state === "unknown")) payload.activity_state = "unknown";
-  else payload.activity_state = "mixed";
-  if (backendStates.every((state) => state === "ok")) payload.backend_state = "ok";
-  else if (backendStates.every((state) => state === "error")) payload.backend_state = "unavailable";
-  else payload.backend_state = "degraded";
-  if (controlStates.every((state) => state === "ready")) payload.control_state = "ready";
-  else if (controlStates.every((state) => state === "blocked")) payload.control_state = "blocked";
-  else if (controlStates.every((state) => state === "unknown")) payload.control_state = "unknown";
-  else payload.control_state = "mixed";
+}
+
+function queuePayloadProcessV2(fixture, payload, options) {
+  queuePayloadProcess(fixture, payload, options);
 }
 
 function loadApplet() {
@@ -117,8 +124,17 @@ function loadApplet() {
   };
   let home = "/home/tester";
   let timeoutId = 1;
+  let createdNativeRows = 0;
 
   const TextEncoder = globalThis.TextEncoder;
+  function makeLabel(text) {
+    return {
+      text,
+      set_text(value) {
+        this.text = value;
+      },
+    };
+  }
   class TextApplet {}
   TextApplet.prototype._init = function () {
     this.labels = [];
@@ -136,7 +152,7 @@ function loadApplet() {
 
   class PopupMenuItem {
     constructor(label, options = {}) {
-      this.label = label;
+      this.label = makeLabel(label);
       this.reactive = options.reactive !== false;
       this.actor = {
         visible: true,
@@ -158,6 +174,22 @@ function loadApplet() {
           handler.callback();
         }
       }
+    }
+  }
+
+  class PopupSubMenuMenuItem extends PopupMenuItem {
+    constructor(label, options = {}) {
+      super(label, options);
+      this.menu = new AppletPopupMenu();
+      const originalAddMenuItem = this.menu.addMenuItem.bind(this.menu);
+      this.menu.addMenuItem = (item) => {
+        createdNativeRows += 1;
+        originalAddMenuItem(item);
+      };
+    }
+
+    destroy() {
+      this.menu.destroy();
     }
   }
 
@@ -194,6 +226,11 @@ function loadApplet() {
       if (this.failDestroyCount > 0) {
         this.failDestroyCount -= 1;
         throw new Error("injected destroy failure");
+      }
+      for (const item of this.items) {
+        if (item && typeof item.destroy === "function") {
+          item.destroy();
+        }
       }
       this.destroyed = true;
     }
@@ -486,7 +523,7 @@ function loadApplet() {
       mainloop: Mainloop,
       ui: {
         applet: { TextApplet, AppletPopupMenu },
-        popupMenu: { PopupMenuItem, PopupMenuManager },
+        popupMenu: { PopupMenuItem, PopupSubMenuMenuItem, PopupMenuManager },
         settings: Settings,
       },
       misc: { util: { spawn(args) {
@@ -533,6 +570,7 @@ function loadApplet() {
     rejectSettingsBinding(key) { settingsBindFailures.add(key); },
     failSettingsFinalizes(count) { settingsFinalizeFailures = count; },
     setProcessFactory(factory) { pendingFactories.push(factory); },
+    createdNativeRows() { return createdNativeRows; },
     resetFactories() { pendingFactories.length = 0; },
     setSetting(key, value) {
       const settings = settingsInstances.at(-1);
@@ -774,8 +812,10 @@ test("builds fixed mcp argv and validierte ids", async () => {
   const launch = launcherSpawns.at(-1);
   assert.equal(launch.argv[0], "/tmp/home/.local/bin/codex-master-mcp");
   assert.equal(launch.argv[1], "applet-status");
-  assert.equal(launch.argv[2], "a1");
-  assert.equal(launch.argv[3], "b1");
+  assert.equal(launch.argv[2], "--schema-version");
+  assert.equal(launch.argv[3], "2");
+  assert.equal(launch.argv[4], "a1");
+  assert.equal(launch.argv[5], "b1");
   assert.deepEqual(Array.from(launch.envCalls), [
     { key: "PATH", value: "/usr/bin:/bin", overwrite: true },
     { key: "HOME", value: "/tmp/home", overwrite: true },
@@ -844,7 +884,11 @@ test("single-flight keeps one pending refresh", async () => {
   });
   fixture.setProcessFactory(() => {
     const payload = samplePayload();
-    payload.activity_state = "running";
+    payload.agents[1].activity_state = "running";
+    payload.agents[1].backend_state = "ok";
+    payload.agents[1].control_state = "ready";
+    payload.agents[1].identity_state = "verified";
+    realignCounts(payload);
     return {
       forceExitCount: 0,
       waitCallbacks: [],
@@ -1294,7 +1338,11 @@ test("invalid utf8/json/schema/types do not overwrite last-good", async () => {
 test("stale generation callback cannot overwrite fresh result", async () => {
   const fixture = loadApplet();
   const newer = samplePayload();
-  newer.activity_state = "running";
+  newer.agents[1].activity_state = "running";
+  newer.agents[1].backend_state = "ok";
+  newer.agents[1].control_state = "ready";
+  newer.agents[1].identity_state = "verified";
+  realignCounts(newer);
   fixture.setProcessFactory(() => {
     return {
       forceExitCount: 0,
@@ -1330,7 +1378,7 @@ test("stale generation callback cannot overwrite fresh result", async () => {
     stdoutLimitExceeded: false,
     stderrLimitExceeded: false,
   });
-  assert.equal(applet._statusLastGood.activity_state, "running");
+  assert.equal(applet._statusLastGood.counts.running, 2);
 });
 
 test("readers run via async before wait completion", async () => {
@@ -1376,7 +1424,7 @@ test("readers run via async before wait completion", async () => {
 
   proc.waitCallbacks.at(-1)(proc, null);
   await Promise.resolve();
-  assert.equal(applet._statusLastGood.schema_version, 1);
+  assert.equal(applet._statusLastGood.schema_version, 2);
 });
 
 test("finalize waits for wait + both stream EOFs", async () => {
@@ -1418,7 +1466,7 @@ test("finalize waits for wait + both stream EOFs", async () => {
 
   process.releaseEof();
   await Promise.resolve();
-  assert.equal(applet._statusLastGood.schema_version, 1);
+  assert.equal(applet._statusLastGood.schema_version, 2);
 });
 
 test("timeout cancels inherited pipes that outlive a confirmed process exit", () => {
@@ -1463,7 +1511,7 @@ test("timeout removal failure defers finalization to timer without wedging", () 
   assert.equal(process.forceExitCount, 0);
   assert.equal(applet._statusInFlight, false);
   assert.equal(applet._statusActiveState, null);
-  assert.equal(applet._statusLastGood.schema_version, 1);
+  assert.equal(applet._statusLastGood.schema_version, 2);
   assert.equal(fixture.activeTimers("timeout").length, 0);
 });
 
@@ -1491,15 +1539,13 @@ test("reentrant timeout callback during finalization cannot remove a live applet
   assert.equal(applet._cleanupComplete, false);
   assert.notEqual(applet.menu, null);
   assert.equal(applet._statusActiveState, null);
-  assert.equal(applet._statusLastGood.schema_version, 1);
+  assert.equal(applet._statusLastGood.schema_version, 2);
   assert.equal(fixture.activeTimers("timeout").length, 0);
 });
 
 test("real backend payload with sleeping and expired states is accepted", async () => {
   const fixture = loadApplet();
   const payload = samplePayload();
-  payload.activity_state = "sleeping";
-  payload.backend_state = "ok";
   payload.agents[0].activity_state = "sleeping";
   payload.agents[0].control_state = "ready";
   payload.agents[0].auth_state = "ready";
@@ -1534,7 +1580,7 @@ test("real backend payload with sleeping and expired states is accepted", async 
   fixture.subprocesses[0].emitDone();
   await Promise.resolve();
 
-  assert.equal(applet._statusLastGood.activity_state, "sleeping");
+  assert.equal(applet._statusLastGood.counts.sleeping, 2);
   assert.equal(applet._statusLastGood.agents[1].lease_state, "expired");
 });
 
@@ -1677,9 +1723,7 @@ test("reader callback/finish exception triggers stream failure and no payload", 
 test("validator rejects missing snapshot state fields", async () => {
   const fixture = loadApplet();
   const payload = samplePayload();
-  delete payload.activity_state;
-  delete payload.backend_state;
-  delete payload.control_state;
+  delete payload.native_agents;
   fixture.setProcessFactory(() => ({
     forceExitCount: 0,
     waitCallbacks: [],
@@ -1711,18 +1755,13 @@ test("exact python error row is accepted and aggregates to python unavailable sn
   const fixture = loadApplet();
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
   const payload = {
-    schema_version: 1,
+    schema_version: 2,
     mode: "read_only",
-    activity_state: "unknown",
-    backend_state: "unavailable",
-    control_state: "unknown",
     counts: {
       tracked: 2,
       running: 0,
       sleeping: 0,
-      ready: 0,
-      blocked: 0,
-      issues: 2,
+      overflow: 0,
     },
     agents: [
       {
@@ -1744,32 +1783,31 @@ test("exact python error row is accepted and aggregates to python unavailable sn
         lease_state: "unreadable",
       },
     ],
+    native_agents: {
+      bridge_state: "ready",
+      counts: { active: 0, unconfirmed: 0, overflow: 0 },
+      agents: [],
+      truncated: false,
+    },
     raw_output: "not_returned",
   };
 
   assert.equal(applet._maybeApplyStatusPayload(payload), true);
-  assert.equal(applet._statusLastGood.activity_state, "unknown");
-  assert.equal(applet._statusLastGood.backend_state, "unavailable");
-  assert.equal(applet._statusLastGood.control_state, "unknown");
-  assert.equal(applet._statusLastGood.counts.issues, 2);
+  assert.equal(applet._statusLastGood.counts.running, 0);
+  assert.equal(applet._statusLastGood.counts.sleeping, 0);
 });
 
 test("exact python error row mixed with a normal row is accepted", () => {
   const fixture = loadApplet();
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
   const payload = {
-    schema_version: 1,
+    schema_version: 2,
     mode: "read_only",
-    activity_state: "mixed",
-    backend_state: "degraded",
-    control_state: "mixed",
     counts: {
       tracked: 2,
       running: 0,
       sleeping: 1,
-      ready: 1,
-      blocked: 0,
-      issues: 1,
+      overflow: 0,
     },
     agents: [
       {
@@ -1791,31 +1829,22 @@ test("exact python error row mixed with a normal row is accepted", () => {
         lease_state: "unclaimed",
       },
     ],
+    native_agents: {
+      bridge_state: "ready",
+      counts: { active: 0, unconfirmed: 0, overflow: 0 },
+      agents: [],
+      truncated: false,
+    },
     raw_output: "not_returned",
   };
 
   assert.equal(applet._maybeApplyStatusPayload(payload), true);
-  assert.deepEqual(
-    {
-      activity_state: applet._statusLastGood.activity_state,
-      backend_state: applet._statusLastGood.backend_state,
-      control_state: applet._statusLastGood.control_state,
-      counts: applet._statusLastGood.counts,
-    },
-    {
-      activity_state: "mixed",
-      backend_state: "degraded",
-      control_state: "mixed",
-      counts: {
-        tracked: 2,
-        running: 0,
-        sleeping: 1,
-        ready: 1,
-        blocked: 0,
-        issues: 1,
-      },
-    },
-  );
+  assert.deepEqual(applet._statusLastGood.counts, {
+    tracked: 2,
+    running: 0,
+    sleeping: 1,
+    overflow: 0,
+  });
 });
 
 test("exact python stopped-orphan row is accepted", () => {
@@ -1826,7 +1855,7 @@ test("exact python stopped-orphan row is accepted", () => {
   realignCounts(payload);
 
   assert.equal(applet._maybeApplyStatusPayload(payload), true);
-  assert.equal(applet._statusLastGood.activity_state, "sleeping");
+  assert.equal(applet._statusLastGood.counts.sleeping, 2);
   assert.deepEqual(applet._statusLastGood.agents[0], {
     agent: "a1",
     activity_state: "sleeping",
@@ -1899,7 +1928,7 @@ test("validator rejects syntactically valid but backend-impossible row combinati
 
   for (const { name, payload } of cases) {
     assert.equal(applet._maybeApplyStatusPayload(payload), false, name);
-    assert.equal(applet._statusLastGood?.schema_version, 1);
+    assert.equal(applet._statusLastGood?.schema_version, 2);
   }
 });
 
@@ -1913,10 +1942,10 @@ test("validator rejects missing/invalid counts, raw_output and duplicate/foreign
   badNegative.counts.running = -1;
 
   const badFraction = JSON.parse(JSON.stringify(good));
-  badFraction.counts.ready = 1.2;
+  badFraction.counts.overflow = 1.2;
 
   const badAgent = JSON.parse(JSON.stringify(good));
-  badAgent.agents[0].agent = "a3";
+  badAgent.agents[0].agent = "z1";
 
   const badDup = JSON.parse(JSON.stringify(good));
   badDup.agents[1].agent = "a1";
@@ -1933,27 +1962,22 @@ test("validator rejects missing/invalid counts, raw_output and duplicate/foreign
   const badRowAggregateState = JSON.parse(JSON.stringify(good));
   badRowAggregateState.agents[0].control_state = "mixed";
 
-  const badMissingAgent = JSON.parse(JSON.stringify(good));
-  badMissingAgent.agents.pop();
-  badMissingAgent.counts.tracked = 1;
-
   const badTrackedCount = JSON.parse(JSON.stringify(good));
   badTrackedCount.counts.tracked = 1;
 
   const badRunningCount = JSON.parse(JSON.stringify(good));
   badRunningCount.counts.running = 0;
 
-  const badIssueCount = JSON.parse(JSON.stringify(good));
-  badIssueCount.counts.issues = 0;
+  const badNativeCount = JSON.parse(JSON.stringify(good));
+  badNativeCount.native_agents.counts.active = 1;
 
-  const badActivityAggregate = JSON.parse(JSON.stringify(good));
-  badActivityAggregate.activity_state = "running";
+  const badNativeTimestamp = JSON.parse(JSON.stringify(good));
+  badNativeTimestamp.native_agents.counts.unconfirmed = 1;
+  badNativeTimestamp.native_agents.agents = [sampleNativeAgent({ activity_state: "unconfirmed", updated_at_utc: "1970-01-01T00:16:41+02:00" })];
 
-  const badBackendAggregate = JSON.parse(JSON.stringify(good));
-  badBackendAggregate.backend_state = "ok";
-
-  const badControlAggregate = JSON.parse(JSON.stringify(good));
-  badControlAggregate.control_state = "ready";
+  const badNativeDisplay = JSON.parse(JSON.stringify(good));
+  badNativeDisplay.native_agents.counts.active = 1;
+  badNativeDisplay.native_agents.agents = [sampleNativeAgent({ display_id: "bad/id" })];
 
   const { main } = fixture;
   const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
@@ -1969,13 +1993,11 @@ test("validator rejects missing/invalid counts, raw_output and duplicate/foreign
     { name: "top-level extra", payload: badTopLevelExtra },
     { name: "row extra", payload: badRowExtra },
     { name: "row aggregate state", payload: badRowAggregateState },
-    { name: "missing requested agent", payload: badMissingAgent },
     { name: "tracked count mismatch", payload: badTrackedCount },
     { name: "running count mismatch", payload: badRunningCount },
-    { name: "issue count mismatch", payload: badIssueCount },
-    { name: "activity aggregate mismatch", payload: badActivityAggregate },
-    { name: "backend aggregate mismatch", payload: badBackendAggregate },
-    { name: "control aggregate mismatch", payload: badControlAggregate },
+    { name: "native count mismatch", payload: badNativeCount },
+    { name: "native timestamp", payload: badNativeTimestamp },
+    { name: "native display id", payload: badNativeDisplay },
   ];
 
   for (const invalid of bads) {
@@ -2084,7 +2106,7 @@ test("packet accessor exceptions fail closed and refresh recovers", async () => 
   statusItem.activate();
   fixture.subprocesses[1].emitDone();
   await Promise.resolve();
-  assert.equal(applet._statusLastGood.schema_version, 1);
+  assert.equal(applet._statusLastGood.schema_version, 2);
 });
 
 test("pipe accessor exceptions fail closed and refresh recovers", async () => {
@@ -2121,7 +2143,7 @@ test("pipe accessor exceptions fail closed and refresh recovers", async () => {
   statusItem.activate();
   fixture.subprocesses[1].emitDone();
   await Promise.resolve();
-  assert.equal(applet._statusLastGood.schema_version, 1);
+  assert.equal(applet._statusLastGood.schema_version, 2);
 });
 
 test("process success accessor exceptions fail closed and pending refresh recovers", async () => {
@@ -2158,7 +2180,7 @@ test("process success accessor exceptions fail closed and pending refresh recove
 
   fixture.subprocesses[1].emitDone();
   await Promise.resolve();
-  assert.equal(applet._statusLastGood.schema_version, 1);
+  assert.equal(applet._statusLastGood.schema_version, 2);
   assert.equal(applet._statusViewState, "ready");
 });
 
@@ -2432,16 +2454,16 @@ test("settings parser canonicalizes bounded concrete ids and never launches atta
   fixture.setSetting("tracked-agents", " A2, b3, a2, C100 ");
   assert.deepEqual(Array.from(applet._trackedAgents), ["a2", "b3", "c100"]);
   applet.menu.items[0].activate();
-  assert.deepEqual(Array.from(fixture.launcherSpawns.at(-1).argv.slice(2)), ["a2", "b3", "c100"]);
+  assert.deepEqual(Array.from(fixture.launcherSpawns.at(-1).argv.slice(4)), ["a2", "b3", "c100"]);
 
   fixture.setSetting("tracked-agents", "a1;--force /tmp/owned");
   assert.deepEqual(Array.from(applet._trackedAgents), ["a1", "b1"]);
   assert.equal(applet._settingsValid, false);
-  assert.match(applet._statusSummaryItem.label, /Konfiguration/);
+  assert.match(getMenuItemText(applet._statusSummaryItem), /Konfiguration/);
   applet.menu.items[0].activate();
   fixture.subprocesses[0].emitDone();
   const argv = fixture.launcherSpawns.at(-1).argv;
-  assert.deepEqual(Array.from(argv.slice(2)), ["a1", "b1"]);
+  assert.deepEqual(Array.from(argv.slice(4)), ["a1", "b1"]);
   assert.ok(!argv.join(" ").includes("--force"));
   assert.ok(!argv.join(" ").includes("/tmp/owned"));
   fixture.setSetting("background-refresh", true);
@@ -2471,7 +2493,7 @@ test("rejected settings binding finalizes partial settings and fails closed", ()
   assert.equal(applet._settingsValid, false);
   assert.deepEqual(Array.from(applet._trackedAgents), ["a1", "b1"]);
   assert.equal(fixture.activeTimers("background").length, 0);
-  assert.match(applet._statusSummaryItem.label, /Konfiguration/);
+  assert.match(getMenuItemText(applet._statusSummaryItem), /Konfiguration/);
 });
 
 test("failed partial settings finalization stays owned and retryable", () => {
@@ -2537,20 +2559,79 @@ test("read-only UI keeps title and separates activity backend and stale state", 
   assert.match(applet.tooltips.at(-1), /Aktivität/);
   assert.match(applet.tooltips.at(-1), /Backend/);
   assert.match(applet.tooltips.at(-1), /Nur Lesen/);
-  assert.match(applet._statusSummaryItem.label, /Nur Lesen/);
+  assert.match(getMenuItemText(applet._statusSummaryItem), /Nur Lesen/);
   assert.equal(applet._statusRowItems.filter((item) => item.actor.visible).length, 2);
-  assert.ok(applet._statusRowItems[0].label.startsWith("a1:"));
-  assert.ok(applet._statusRowItems[1].label.startsWith("b1:"));
-  assert.ok(!applet.menu.items.some((item) => /Start|Stop|Interrupt/.test(item.label)));
+  assert.ok(getMenuItemText(applet._statusRowItems[0]).startsWith("a1:"));
+  assert.ok(getMenuItemText(applet._statusRowItems[1]).startsWith("b1:"));
+  assert.ok(!applet.menu.items.some((item) => /Start|Stop|Interrupt/.test(getMenuItemText(item))));
 
   applet._markRefreshFailed();
-  assert.match(applet._statusSummaryItem.label, /veraltet/i);
+  assert.match(getMenuItemText(applet._statusSummaryItem), /veraltet/i);
   assert.equal(applet.labels.at(-1), "Flottenmanagement");
 
   fixture.setSetting("tracked-agents", "a2");
   assert.equal(applet._statusLastGood, null, "fleet change clears old fleet snapshot");
   assert.equal(applet._statusRowItems.filter((item) => item.actor.visible).length, 1);
-  assert.ok(applet._statusRowItems[0].label.startsWith("a2:"));
+  assert.ok(getMenuItemText(applet._statusRowItems[0]).startsWith("a2:"));
+});
+
+test("schema v2 allocates one native submenu with six stable child rows", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const payload = samplePayload();
+  payload.native_agents.counts.active = 1;
+  payload.native_agents.counts.unconfirmed = 1;
+  payload.native_agents.agents = [
+    sampleNativeAgent(),
+    sampleNativeAgent({
+      display_id: "agent_02",
+      agent_type: "worker",
+      activity_state: "unconfirmed",
+      updated_at_utc: "1970-01-01T00:16:41Z",
+    }),
+  ];
+
+  const nativeRowItems = applet._nativeBeeRowItems?.slice();
+
+  assert.equal(applet._maybeApplyStatusPayload(payload), true);
+  assert.equal(getMenuItemText(applet._nativeSubmenuItem), "Native Bienen (2)");
+  assert.equal(applet._nativeBeeRowItems.length, 6);
+  assert.equal(getMenuItemText(applet._nativeBeeRowItems[0]), "explorer · aktiv · 019fc541");
+  assert.equal(getMenuItemText(applet._nativeBeeRowItems[1]), "worker · unbestätigt · agent_02");
+  assert.equal(fixture.createdNativeRows(), 6);
+  assert.equal(applet._nativeBeeRowItems[0], nativeRowItems?.[0]);
+  assert.equal(applet._nativeBeeRowItems[5], nativeRowItems?.[5]);
+  assert.ok(getMenuItemText(applet._statusRowItems[0]).startsWith("a1:"));
+  assert.ok(getMenuItemText(applet._statusRowItems[1]).startsWith("b1:"));
+});
+
+test("schema v2 bridge degradation keeps managed rows and shows native diagnostic", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const payload = samplePayload();
+  payload.native_agents = {
+    bridge_state: "degraded",
+    counts: { active: 0, unconfirmed: 0, overflow: 0 },
+    agents: [],
+    truncated: false,
+  };
+
+  assert.equal(applet._maybeApplyStatusPayload(payload), true);
+  assert.ok(getMenuItemText(applet._statusRowItems[0]).startsWith("a1:"));
+  assert.equal(getMenuItemText(applet._nativeSubmenuItem), "Native Bienen");
+  assert.match(getMenuItemText(applet._nativeBeeRowItems[0]), /eingeschränkt/i);
+  assert.equal(applet._nativeBeeRowItems[1].actor.visible, false);
+});
+
+test("argv uses schema-version 2 before validated pinned ids", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+
+  fixture.setSetting("tracked-agents", " A2, b3, a2, C100 ");
+  applet.menu.items[0].activate();
+
+  const argv = Array.from(fixture.launcherSpawns.at(-1).argv);
+  assert.deepEqual(argv.slice(1), ["applet-status", "--schema-version", "2", "a2", "b3", "c100"]);
 });
 
 test("refresh-on-open and bounded opt-in background timer preserve single-flight", () => {
@@ -2588,7 +2669,7 @@ test("background timer registration failure does not prevent applet load", () =>
   assert.equal(applet._backgroundRefreshSource, 0);
   assert.equal(fixture.activeTimers("background").length, 0);
   assert.equal(applet._settingsValid, false);
-  assert.match(applet._statusSummaryItem.label, /Konfigurationsfehler/);
+  assert.match(getMenuItemText(applet._statusSummaryItem), /Konfigurationsfehler/);
 });
 
 test("invalid background timer source ids fail settings closed", () => {
@@ -2602,7 +2683,7 @@ test("invalid background timer source ids fail settings closed", () => {
     assert.equal(applet._backgroundRefreshSource, 0);
     assert.equal(fixture.activeTimers("background").length, 0);
     assert.equal(applet._settingsValid, false);
-    assert.match(applet._statusSummaryItem.label, /Konfigurationsfehler/);
+    assert.match(getMenuItemText(applet._statusSummaryItem), /Konfigurationsfehler/);
   }
 });
 
@@ -2633,14 +2714,14 @@ test("failed refresh keeps last-good visibly stale", () => {
 
   statusItem.activate();
   fixture.subprocesses[0].emitDone();
-  assert.equal(applet._statusLastGood.activity_state, payload.activity_state);
-  assert.doesNotMatch(applet._statusSummaryItem.label, /veraltet/i);
+  assert.equal(JSON.stringify(applet._statusLastGood), JSON.stringify(payload));
+  assert.doesNotMatch(getMenuItemText(applet._statusSummaryItem), /veraltet/i);
 
   queuePayloadProcess(fixture, payload, { exitCode: 1 });
   statusItem.activate();
   fixture.subprocesses[1].emitDone();
-  assert.equal(applet._statusLastGood.activity_state, payload.activity_state);
-  assert.match(applet._statusSummaryItem.label, /veraltet/i);
+  assert.equal(JSON.stringify(applet._statusLastGood), JSON.stringify(payload));
+  assert.match(getMenuItemText(applet._statusSummaryItem), /veraltet/i);
 });
 
 test("removal during stream timeout and pending refresh tears down once", () => {
@@ -3008,7 +3089,7 @@ test("hostile settings matrix never reaches argv or background work", () => {
     assert.equal(applet._settingsValid, false, JSON.stringify(value));
     assert.deepEqual(Array.from(applet._trackedAgents), ["a1", "b1"], JSON.stringify(value));
     assert.deepEqual(
-      Array.from(fixture.launcherSpawns.at(-1).argv.slice(2)),
+      Array.from(fixture.launcherSpawns.at(-1).argv.slice(4)),
       ["a1", "b1"],
       JSON.stringify(value),
     );
@@ -3058,7 +3139,7 @@ test("hostile backend matrix is rejected without retaining attacker data", async
     assert.equal(applet._statusLastGood, null);
     assert.ok(!JSON.stringify({
       lastGood: applet._statusLastGood,
-      summary: applet._statusSummaryItem.label,
+      summary: getMenuItemText(applet._statusSummaryItem),
     }).includes("SECRET_PROMPT"));
   }
 });
