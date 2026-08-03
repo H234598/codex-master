@@ -188,6 +188,16 @@ MAX_POOL_SERIES = 26
 MAX_POOL_SHARED_ASSETS = 40
 MAX_POOL_RUNTIME_DIRS = 40
 MAX_APPLET_AGENTS = 6
+NATIVE_AGENT_REGISTRY_FILE = STATE_ROOT / "native-agents.json"
+NATIVE_AGENT_REGISTRY_LOCK_FILE = LOCK_DIR / "native-agents.lock"
+MAX_NATIVE_AGENT_RECORDS = 64
+MAX_NATIVE_AGENT_REGISTRY_BYTES = 64 * 1024
+MAX_NATIVE_APPLET_AGENTS = 6
+NATIVE_AGENT_ACTIVE_SECONDS = 7.2
+NATIVE_AGENT_RETENTION_SECONDS = 86.4
+NATIVE_AGENT_LOCK_TIMEOUT_SECONDS = 0.1
+NATIVE_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+NATIVE_AGENT_TYPE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 APPLET_STATUS_TIMEOUT_SECONDS = 8.0
 APPLET_TMUX_TIMEOUT_SECONDS = 1.0
 AGENT_SERIES = ("a", "b", "c")
@@ -2196,6 +2206,9 @@ def open_private_regular_update(path: Path) -> Any:
 _LIFECYCLE_LOCK_STACK: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
     "codex_master_lifecycle_lock_stack", default=()
 )
+_NATIVE_AGENT_REGISTRY_LOCK_STACK: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "codex_master_native_agent_registry_lock_stack", default=()
+)
 _PLUGIN_CACHE_LOCK_HELD: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "codex_master_plugin_cache_lock_held", default=False
 )
@@ -2252,6 +2265,55 @@ def agent_lifecycle_lock(agent: str, *, timeout_seconds: float | None = None) ->
         finally:
             if token is not None:
                 _LIFECYCLE_LOCK_STACK.reset(token)
+            if lock_acquired:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+
+
+@contextlib.contextmanager
+def native_agent_registry_lock(
+    *, timeout_seconds: float = NATIVE_AGENT_LOCK_TIMEOUT_SECONDS
+) -> Any:
+    held_locks = _NATIVE_AGENT_REGISTRY_LOCK_STACK.get()
+    if "native-agents" in held_locks:
+        yield
+        return
+    try:
+        timeout_seconds_f = float(timeout_seconds)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise AgentError("native agent registry lock timeout must be a finite number") from exc
+    if not math.isfinite(timeout_seconds_f) or timeout_seconds_f < 0:
+        raise AgentError("native agent registry lock timeout must be a finite number")
+    deadline = time.monotonic() + timeout_seconds_f if timeout_seconds_f > 0 else None
+    ensure_private_dir(STATE_ROOT)
+    ensure_private_dir(LOCK_DIR)
+    lock_path = NATIVE_AGENT_REGISTRY_LOCK_FILE
+    with open_private_regular_update(lock_path) as fh:
+        token = None
+        lock_acquired = False
+        try:
+            if deadline is None:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            else:
+                while True:
+                    try:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise AgentError("could not acquire native agent registry lock")
+                        time.sleep(min(0.01, remaining))
+            lock_acquired = True
+            token = _NATIVE_AGENT_REGISTRY_LOCK_STACK.set((*held_locks, "native-agents"))
+            yield
+        except OSError as exc:
+            raise AgentError("could not acquire native agent registry lock") from exc
+        finally:
+            if token is not None:
+                _NATIVE_AGENT_REGISTRY_LOCK_STACK.reset(token)
             if lock_acquired:
                 try:
                     fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
@@ -2397,6 +2459,227 @@ def lease_utc(timestamp: float | int | None) -> str | None:
         return _dt.datetime.fromtimestamp(float(timestamp), _dt.timezone.utc).isoformat()
     except (OverflowError, OSError, TypeError, ValueError):
         return None
+
+
+def _normalize_native_agent_timestamp(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        timestamp = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if not math.isfinite(timestamp):
+        return None
+    return timestamp
+
+
+def _native_agent_registry_payload() -> dict[str, Any]:
+    return {"schema_version": 1, "agents": []}
+
+
+def _validate_native_agent_identifier(name: str, pattern: re.Pattern[str]) -> bool:
+    return isinstance(name, str) and bool(pattern.fullmatch(name))
+
+
+def _native_agent_registry_is_stale(last_update: float, now: float) -> bool:
+    return now - last_update > NATIVE_AGENT_RETENTION_SECONDS
+
+
+def _native_agent_normalize_registry(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("schema_version") != 1 or not isinstance(payload.get("agents"), list):
+        return _native_agent_registry_payload()
+    normalized: list[dict[str, Any]] = []
+    for candidate in payload["agents"]:
+        if not isinstance(candidate, dict):
+            continue
+        session_id = candidate.get("session_id")
+        agent_id = candidate.get("agent_id")
+        agent_type = candidate.get("agent_type")
+        activity_state = candidate.get("activity_state")
+        updated_at = candidate.get("updated_at")
+        if not _validate_native_agent_identifier(session_id, NATIVE_AGENT_ID_RE):
+            continue
+        if not _validate_native_agent_identifier(agent_id, NATIVE_AGENT_ID_RE):
+            continue
+        if not _validate_native_agent_identifier(agent_type, NATIVE_AGENT_TYPE_RE):
+            continue
+        if activity_state not in ("active", "unconfirmed"):
+            continue
+        updated_at_ts = _normalize_native_agent_timestamp(updated_at)
+        if updated_at_ts is None:
+            continue
+        normalized.append(
+            {
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "agent_type": agent_type,
+                "activity_state": activity_state,
+                "updated_at": updated_at_ts,
+            }
+        )
+    return {"schema_version": 1, "agents": normalized}
+
+
+def _read_native_agent_registry() -> tuple[dict[str, Any], str]:
+    payload: dict[str, Any] = _native_agent_registry_payload()
+    degraded = False
+    try:
+        raw = read_private_regular_text(
+            NATIVE_AGENT_REGISTRY_FILE,
+            MAX_NATIVE_AGENT_REGISTRY_BYTES,
+            "native agent registry state must be a regular file within the size limit",
+        )
+    except AgentError:
+        return payload, "degraded"
+    try:
+        loaded = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return payload, "degraded"
+    if not isinstance(loaded, dict):
+        return payload, "degraded"
+    normalized = _native_agent_normalize_registry(loaded)
+    if normalized != loaded:
+        degraded = True
+    return normalized, "degraded" if degraded else "ready"
+
+
+def _write_native_agent_registry(payload: dict[str, Any]) -> None:
+    safe_payload = _native_agent_normalize_registry(payload)
+    safe_payload["agents"] = safe_payload["agents"][:MAX_NATIVE_AGENT_RECORDS]
+    replace_private_text(
+        NATIVE_AGENT_REGISTRY_FILE,
+        json.dumps(safe_payload, sort_keys=True) + "\n",
+    )
+
+
+def record_native_agent_event(payload: Any, *, now: float | None = None) -> None:
+    if not isinstance(payload, dict):
+        return
+    event_name = payload.get("hook_event_name")
+    timestamp = _normalize_native_agent_timestamp(now)
+    if now is not None and timestamp is None:
+        return
+    if timestamp is None:
+        timestamp = time.time()
+    session_id = payload.get("session_id")
+    agent_id = payload.get("agent_id")
+    agent_type = payload.get("agent_type")
+    if not _validate_native_agent_identifier(session_id, NATIVE_AGENT_ID_RE):
+        return
+    if event_name not in {"SubagentStart", "SubagentStop", "SessionEnd"}:
+        return
+    if event_name != "SessionEnd" and not _validate_native_agent_identifier(agent_id, NATIVE_AGENT_ID_RE):
+        return
+    if event_name in {"SubagentStop", "SessionEnd"} and not _validate_native_agent_identifier(agent_id, NATIVE_AGENT_ID_RE):
+        if event_name == "SubagentStop":
+            return
+    if event_name != "SessionEnd" and not _validate_native_agent_identifier(agent_type, NATIVE_AGENT_TYPE_RE):
+        return
+
+    with native_agent_registry_lock():
+        registry, _state = _read_native_agent_registry()
+        current = registry["agents"]
+        if event_name == "SubagentStart":
+            for record in current:
+                if record["session_id"] == session_id and record["agent_id"] == agent_id:
+                    record["agent_type"] = agent_type
+                    record["activity_state"] = "active"
+                    record["updated_at"] = timestamp
+                    break
+            else:
+                current.append(
+                    {
+                        "session_id": session_id,
+                        "agent_id": agent_id,
+                        "agent_type": agent_type,
+                        "activity_state": "active",
+                        "updated_at": timestamp,
+                    }
+                )
+            if len(current) > MAX_NATIVE_AGENT_RECORDS:
+                current[:] = current[-MAX_NATIVE_AGENT_RECORDS:]
+            _write_native_agent_registry(registry)
+            return
+        if event_name == "SubagentStop":
+            next_records = [
+                record
+                for record in current
+                if not (
+                    record["session_id"] == session_id and record["agent_id"] == agent_id
+                )
+            ]
+            registry["agents"] = next_records
+            _write_native_agent_registry(registry)
+            return
+        if event_name == "SessionEnd":
+            changed = False
+            for record in current:
+                if record["session_id"] == session_id:
+                    record["activity_state"] = "unconfirmed"
+                    changed = True
+            if changed:
+                _write_native_agent_registry(registry)
+            return
+
+
+def native_agent_status(*, now: float | None = None) -> dict[str, Any]:
+    timestamp = _normalize_native_agent_timestamp(now)
+    if timestamp is None:
+        timestamp = time.time()
+    try:
+        with native_agent_registry_lock():
+            registry, bridge_state = _read_native_agent_registry()
+            if bridge_state == "degraded":
+                return {
+                    "bridge_state": bridge_state,
+                    "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
+                    "agents": [],
+                    "truncated": False,
+                }
+            records = registry["agents"]
+            kept: list[dict[str, Any]] = []
+            for record in records:
+                if _native_agent_registry_is_stale(record["updated_at"], timestamp):
+                    continue
+                stale = timestamp - record["updated_at"] > NATIVE_AGENT_ACTIVE_SECONDS
+                agent_state = "unconfirmed" if stale else record["activity_state"]
+                copied = {
+                    "display_id": str(record["agent_id"])[:8],
+                    "agent_type": record["agent_type"],
+                    "activity_state": agent_state,
+                    "updated_at_utc": _dt.datetime.fromtimestamp(record["updated_at"], _dt.timezone.utc).isoformat(),
+                }
+                kept.append(copied)
+
+            active_count = 0
+            unconfirmed_count = 0
+            for record in records:
+                if _native_agent_registry_is_stale(record["updated_at"], timestamp):
+                    continue
+                if timestamp - record["updated_at"] > NATIVE_AGENT_ACTIVE_SECONDS:
+                    unconfirmed_count += 1
+                elif record["activity_state"] == "active":
+                    active_count += 1
+                else:
+                    unconfirmed_count += 1
+            overflow = max(0, len(kept) - MAX_NATIVE_APPLET_AGENTS)
+            return {
+                "bridge_state": bridge_state,
+                "counts": {
+                    "active": active_count,
+                    "unconfirmed": unconfirmed_count,
+                    "overflow": overflow,
+                },
+                "agents": kept[:MAX_NATIVE_APPLET_AGENTS],
+                "truncated": overflow > 0,
+            }
+    except AgentError:
+        return {
+            "bridge_state": "degraded",
+            "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
+            "agents": [],
+            "truncated": False,
+        }
 
 
 def normalize_int_field(value: Any, *, field: str, minimum: int, maximum: int) -> int:

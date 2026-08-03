@@ -1,4 +1,5 @@
 import base64
+import contextlib
 import hashlib
 import io
 import json
@@ -20825,6 +20826,259 @@ class AgentPoolManagementTest(unittest.TestCase):
             self.assertIn("pool spec must be a readable regular file within the size limit", payload_text)
             self.assertNotIn(str(tmp), payload_text)
             self.assertNotIn("agents-secret", payload_text)
+
+
+class NativeAgentRegistryTest(unittest.TestCase):
+    def test_native_agent_lifecycle_and_data_sparsity(self) -> None:
+        start = {
+            "hook_event_name": "SubagentStart",
+            "session_id": "thr_parent",
+            "agent_id": "019fc541-a1e2-7a63-a4bf-b307fcb78457",
+            "agent_type": "explorer",
+            "transcript_path": "/SECRET/parent.jsonl",
+            "last_assistant_message": "SECRET_MESSAGE",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
+                server_module.record_native_agent_event(start, now=1_000.0)
+                self.assertEqual(
+                    server_module.native_agent_status(now=1_001.0),
+                    {
+                        "bridge_state": "ready",
+                        "counts": {"active": 1, "unconfirmed": 0, "overflow": 0},
+                        "agents": [
+                            {
+                                "display_id": "019fc541",
+                                "agent_type": "explorer",
+                                "activity_state": "active",
+                                "updated_at_utc": "1970-01-01T00:16:40+00:00",
+                            }
+                        ],
+                        "truncated": False,
+                    },
+                )
+                stored = server_module.NATIVE_AGENT_REGISTRY_FILE.read_text(encoding="utf-8")
+                self.assertNotIn("SECRET", stored)
+                self.assertNotIn("transcript", stored)
+
+    def test_subagent_stop_removes_matching_parent_and_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
+                for event in (
+                    {"hook_event_name": "SubagentStart", "session_id": "s1", "agent_id": "a-1", "agent_type": "explorer"},
+                    {"hook_event_name": "SubagentStart", "session_id": "s1", "agent_id": "a-2", "agent_type": "explorer"},
+                    {"hook_event_name": "SubagentStart", "session_id": "s2", "agent_id": "a-1", "agent_type": "planner"},
+                ):
+                    server_module.record_native_agent_event(event, now=1_000.0)
+
+                server_module.record_native_agent_event(
+                    {"hook_event_name": "SubagentStop", "session_id": "s1", "agent_id": "a-1"},
+                    now=1_001.0,
+                )
+                status = server_module.native_agent_status(now=1_001.0)
+                self.assertEqual(
+                    {record["display_id"] for record in status["agents"]},
+                    {"a-2"[:8], "a-1"[:8]},
+                )
+
+    def test_session_end_marks_matching_children_unconfirmed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
+                for index in range(2):
+                    server_module.record_native_agent_event(
+                        {
+                            "hook_event_name": "SubagentStart",
+                            "session_id": "s-parent",
+                            "agent_id": f"a-{index}",
+                            "agent_type": "explorer",
+                        },
+                        now=1_000.0 + index,
+                    )
+                server_module.record_native_agent_event({"hook_event_name": "SessionEnd", "session_id": "s-parent"}, now=1_008.0)
+                status = server_module.native_agent_status(now=1_008.5)
+                self.assertEqual({entry["activity_state"] for entry in status["agents"]}, {"unconfirmed"})
+
+    def test_status_marks_stale_and_prunes_retention(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
+                server_module.record_native_agent_event(
+                    {"hook_event_name": "SubagentStart", "session_id": "s", "agent_id": "agent", "agent_type": "worker"},
+                    now=1000.0,
+                )
+                stale = server_module.native_agent_status(now=1_007.201)
+                self.assertEqual(stale["agents"][0]["activity_state"], "unconfirmed")
+                dropped = server_module.native_agent_status(now=1_086.401)
+                self.assertEqual(dropped["agents"], [])
+
+    def test_status_limits_public_lines_and_overflow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
+                for index in range(7):
+                    server_module.record_native_agent_event(
+                        {
+                            "hook_event_name": "SubagentStart",
+                            "session_id": f"session-{index}",
+                            "agent_id": f"agent-{index}",
+                            "agent_type": "worker",
+                        },
+                        now=1_000.0,
+                    )
+
+                status = server_module.native_agent_status(now=1_001.0)
+                self.assertEqual(len(status["agents"]), 6)
+                self.assertEqual(status["counts"]["active"], 7)
+                self.assertEqual(status["counts"]["overflow"], 1)
+
+    def test_registry_limits_to_sixty_four_records_before_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
+                for index in range(65):
+                    server_module.record_native_agent_event(
+                        {
+                            "hook_event_name": "SubagentStart",
+                            "session_id": f"session-{index}",
+                            "agent_id": f"agent-{index}-x",
+                            "agent_type": "worker",
+                        },
+                        now=1_000.0 + index,
+                    )
+
+                stored = json.loads(record_path.read_text(encoding="utf-8"))
+                self.assertEqual(stored["schema_version"], 1)
+                self.assertEqual(len(stored["agents"]), 64)
+
+    def test_invalid_inputs_do_not_mutate_registry(self) -> None:
+        invalid_payloads = [
+            {"hook_event_name": "SubagentStart", "session_id": "*", "agent_id": "a1", "agent_type": "worker"},
+            {"hook_event_name": "SubagentStart", "session_id": "s1", "agent_id": "a1", "agent_type": "*"},
+            {"hook_event_name": "UnknownEvent", "session_id": "s1", "agent_id": "a1", "agent_type": "worker"},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
+                seed = {
+                    "hook_event_name": "SubagentStart",
+                    "session_id": "s1",
+                    "agent_id": "agent-1",
+                    "agent_type": "worker",
+                }
+                server_module.record_native_agent_event(seed, now=1_000.0)
+                baseline = record_path.read_text(encoding="utf-8")
+
+                for payload in invalid_payloads:
+                    with self.subTest(payload=payload):
+                        server_module.record_native_agent_event(payload, now=1_001.0)
+                        self.assertEqual(record_path.read_text(encoding="utf-8"), baseline)
+
+                for invalid_now in (True, float("nan")):
+                    with self.subTest(now=invalid_now):
+                        server_module.record_native_agent_event(seed, now=invalid_now)
+                        self.assertEqual(record_path.read_text(encoding="utf-8"), baseline)
+
+    def test_native_agent_status_hardening(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            state.mkdir(parents=True)
+            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            ):
+                target = state / "outside.json"
+                target.write_text("{}", encoding="utf-8")
+                symlink = state / "native-agents.json"
+                symlink.symlink_to(target)
+
+                with patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", symlink):
+                    result = server_module.native_agent_status()
+                self.assertEqual(result["bridge_state"], "degraded")
+                self.assertNotIn(str(tmpdir), json.dumps(result))
+
+                real = state / "real-native-agents.json"
+                real.write_text("{}", encoding="utf-8")
+                hardlink = state / "hardlink-native-agents.json"
+                if not hasattr(os, "link"):
+                    self.skipTest("hard links unavailable")
+                os.link(real, hardlink)
+                with patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", hardlink):
+                    result = server_module.native_agent_status()
+                self.assertEqual(result["bridge_state"], "degraded")
+                self.assertNotIn(str(tmpdir), json.dumps(result))
+
+                large = state / "oversized-native-agents.json"
+                large.write_bytes(b"x" * (server_module.MAX_NATIVE_AGENT_REGISTRY_BYTES + 1))
+                with patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", large):
+                    result = server_module.native_agent_status()
+                self.assertEqual(result["bridge_state"], "degraded")
+
+            with native_agent_lock_blocked(record_path):
+                with patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path):
+                    blocked = server_module.native_agent_status()
+                self.assertEqual(blocked["bridge_state"], "degraded")
+
+
+@contextlib.contextmanager
+def native_agent_lock_blocked(path: Path) -> Any:
+    lock = threading.Event()
+    release = threading.Event()
+
+    def holder() -> None:
+        with server_module.native_agent_registry_lock():
+            lock.set()
+            release.wait(2)
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    if not lock.wait(2):
+        raise AssertionError("native agent registry lock holder did not start")
+    try:
+        yield
+    finally:
+        release.set()
+        thread.join(2)
 
 if __name__ == "__main__":
     unittest.main()
