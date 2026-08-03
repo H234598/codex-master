@@ -1,9 +1,12 @@
 import json
+import sys
 import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
 from codex_master import control_center
+from codex_master.control_catalog import RISK_BY_TOOL
 from codex_master.server import AgentError
 
 
@@ -111,6 +114,14 @@ class ControlCenterViewModelTest(unittest.TestCase):
                 with self.assertRaisesRegex(AgentError, "filter"):
                     control_center.status_query(invalid, 0)
 
+    def test_every_runtime_tool_has_stable_functional_category(self) -> None:
+        categories = {control_center.tool_category(name) for name in RISK_BY_TOOL}
+        self.assertEqual(
+            categories,
+            {"Aufträge", "Serien", "Auth & Limits", "Agentinnen", "Diagnose"},
+        )
+        self.assertEqual(control_center.tool_category("agent_pool_copy_auth"), "Auth & Limits")
+
     def test_action_block_reason_explains_safety_gate(self) -> None:
         clear = control_center.normalize_status_page(self._page(self._status_result())).rows[0]
         self.assertIsNone(control_center.action_block_reason(clear, "start"))
@@ -171,13 +182,87 @@ class ControlCenterControllerTest(unittest.TestCase):
         self.assertIn("error", results[0])
         self.assertTrue(controller.close())
 
+    def test_tool_result_text_drops_private_fields_and_bounds_shape(self) -> None:
+        text = control_center.bounded_public_result_text(
+            {
+                "ok": True,
+                "token": "SECRET_TOKEN",
+                "nested": {"backend_account_id": "PRIVATE_ACCOUNT", "status": "ready"},
+                "many": list(range(500)),
+            }
+        )
+        self.assertIn('"status": "ready"', text)
+        self.assertNotIn("SECRET_TOKEN", text)
+        self.assertNotIn("PRIVATE_ACCOUNT", text)
+        self.assertLessEqual(len(text), control_center.MAX_RESULT_CHARS)
+
+    def test_subprocess_dispatcher_decodes_one_bounded_rpc_response(self) -> None:
+        child = (
+            "import json,sys;"
+            "request=json.loads(sys.stdin.readline());"
+            "payload={'ok':True,'name':request['params']['name']};"
+            "result={'content':[{'type':'text','text':json.dumps(payload)}],'isError':False};"
+            "print(json.dumps({'jsonrpc':'2.0','id':1,'result':result}))"
+        )
+        dispatcher = control_center.SubprocessToolDispatcher(
+            argv=[sys.executable, "-c", child],
+            timeout_seconds=2,
+        )
+        self.assertEqual(dispatcher("agent_status", {}), {"ok": True, "name": "agent_status"})
+
+    def test_subprocess_dispatcher_kills_hung_backend_at_deadline(self) -> None:
+        dispatcher = control_center.SubprocessToolDispatcher(
+            argv=[sys.executable, "-c", "import time; time.sleep(30)"],
+            timeout_seconds=0.05,
+        )
+        started = time.monotonic()
+        with self.assertRaisesRegex(AgentError, "outcome unknown after timeout"):
+            dispatcher("agent_status", {})
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_controller_forwards_cancel_to_killable_dispatcher(self) -> None:
+        class CancelDispatch:
+            def __call__(self, _name, _args):
+                return {"ok": True}
+
+            def cancel(self):
+                return True
+
+        controller = control_center.OperationController(
+            dispatch=CancelDispatch(),
+            schedule=lambda callback, *args: callback(*args),
+        )
+        self.assertTrue(controller.cancel())
+        self.assertTrue(controller.close())
+
+    def test_controller_cancel_terminates_real_child_and_reports_unknown(self) -> None:
+        completed = threading.Event()
+        results = []
+        dispatcher = control_center.SubprocessToolDispatcher(
+            argv=[sys.executable, "-c", "import time; time.sleep(30)"],
+            timeout_seconds=30,
+        )
+        controller = control_center.OperationController(
+            dispatch=dispatcher,
+            schedule=lambda callback, *args: callback(*args),
+        )
+        self.assertTrue(controller.submit("agent_status", {}, lambda result: (results.append(result), completed.set())))
+        deadline = time.monotonic() + 2
+        while not controller.cancel() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(completed.wait(2))
+        self.assertIn("outcome unknown after cancellation", results[0]["error"])
+        self.assertTrue(controller.close())
+
 
 class ControlCenterCliTest(unittest.TestCase):
     @patch("codex_master.control_center.launch_gtk_application", return_value=0)
+    @patch("codex_master.control_center.require_teamleader_tool_access")
     @patch("codex_master.control_center.assert_install_context_allows_master_registration")
-    def test_run_checks_main_context_then_launches(self, mock_context, mock_launch) -> None:
+    def test_run_checks_main_context_and_role_then_launches(self, mock_context, mock_access, mock_launch) -> None:
         self.assertEqual(control_center.run_control_center([]), 0)
         mock_context.assert_called_once_with()
+        mock_access.assert_called_once_with()
         mock_launch.assert_called_once_with([])
 
     @patch("codex_master.control_center.load_gtk", side_effect=RuntimeError("GTK unavailable"))

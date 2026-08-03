@@ -6,18 +6,35 @@ remain headless-testable.
 
 from __future__ import annotations
 
+import contextlib
+import json
+import os
 import re
+import secrets
+import signal
+import subprocess
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from codex_master.control_catalog import (
+    CatalogError,
+    FieldDescriptor,
+    FieldKind,
+    Risk,
+    ToolDescriptor,
+    compile_catalog,
+    effective_risk,
+    serialize_arguments,
+)
 from codex_master.server import (
     AgentError,
     assert_install_context_allows_master_registration,
-    call_validated_tool,
     public_error_payload,
+    require_teamleader_tool_access,
+    teamleader_tool_catalog,
 )
 
 
@@ -25,6 +42,14 @@ APPLICATION_ID = "de.teladi.CodexMaster.ControlCenter"
 PAGE_SIZE = 20
 MAX_FILTER_CHARS = 64
 MAX_PAGE_ROWS = 20
+MAX_RESULT_DEPTH = 6
+MAX_RESULT_ITEMS = 200
+MAX_RESULT_CHARS = 16_000
+MAX_RESULT_STRING_CHARS = 400
+MAX_BACKEND_STDOUT_BYTES = 1024 * 1024
+MAX_BACKEND_STDERR_BYTES = 64 * 1024
+DEFAULT_BACKEND_TIMEOUT_SECONDS = 180
+MAX_BACKEND_TIMEOUT_SECONDS = 660
 AGENT_ID_RE = re.compile(r"^[abc](?:[1-9]|[1-9][0-9]|100)$")
 SERIES_FILTER_RE = re.compile(r"^[abc]$")
 STATUS_PAGE_FIELDS = {
@@ -36,6 +61,63 @@ STATUS_PAGE_FIELDS = {
     "truncated",
     "raw_output",
 }
+PRIVATE_RESULT_KEYS = frozenset(
+    {
+        "access_token",
+        "api_key",
+        "authorization",
+        "backend_account_id",
+        "context",
+        "cwd",
+        "home",
+        "password",
+        "prompt",
+        "raw_log",
+        "response_output",
+        "runner",
+        "secret",
+        "session",
+        "task",
+        "text",
+        "token",
+    }
+)
+LONG_TEXT_FIELDS = frozenset({"context", "forbidden", "prompt", "task", "text"})
+TOOL_CATEGORIES = (
+    "Alle",
+    "Aufträge",
+    "Serien",
+    "Auth & Limits",
+    "Agentinnen",
+    "Diagnose",
+)
+
+
+def tool_category(name: str) -> str:
+    if name.startswith("agent_assign") or name in {
+        "agent_claim",
+        "agent_interrupt",
+        "agent_last_assignment_status",
+        "agent_release",
+        "agent_report_request",
+        "agent_scope_check",
+        "agent_send",
+    }:
+        return "Aufträge"
+    if name in {
+        "agent_selector_policy",
+        "agent_selector_preview",
+        "agent_spawn_offers",
+        "agent_start",
+        "agent_stop",
+        "fleet_watchdog",
+    }:
+        return "Serien"
+    if name in {"agent_routing_decision", "usage_watchdog", "agent_pool_copy_auth"}:
+        return "Auth & Limits"
+    if name.startswith("agent_pool_"):
+        return "Agentinnen"
+    return "Diagnose"
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,14 +297,196 @@ def status_query(filter_text: Any, page: Any) -> dict[str, Any]:
     }
 
 
+def bounded_public_result_text(payload: Any) -> str:
+    remaining = [MAX_RESULT_ITEMS]
+
+    def clean(value: Any, depth: int) -> Any:
+        if remaining[0] <= 0 or depth > MAX_RESULT_DEPTH:
+            return "<begrenzt>"
+        remaining[0] -= 1
+        if value is None or isinstance(value, bool):
+            return value
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, float):
+            return value if value == value and abs(value) != float("inf") else "<ungültige Zahl>"
+        if isinstance(value, str):
+            return value[:MAX_RESULT_STRING_CHARS]
+        if isinstance(value, list):
+            return [clean(item, depth + 1) for item in value[:MAX_RESULT_ITEMS]]
+        if isinstance(value, dict):
+            result: dict[str, Any] = {}
+            for key, item in list(value.items())[:MAX_RESULT_ITEMS]:
+                if remaining[0] <= 0:
+                    break
+                if not isinstance(key, str) or not key or len(key) > 80:
+                    continue
+                normalized = key.lower()
+                if normalized in PRIVATE_RESULT_KEYS or normalized.endswith(("_token", "_secret", "_password", "_path")):
+                    continue
+                result[key] = clean(item, depth + 1)
+            return result
+        return "<nicht darstellbar>"
+
+    text = json.dumps(clean(payload, 0), ensure_ascii=False, indent=2, sort_keys=True)
+    if len(text) > MAX_RESULT_CHARS:
+        return text[: MAX_RESULT_CHARS - 13] + "\n<begrenzt>\n"
+    return text
+
+
+def backend_timeout_seconds(tool_name: str, args: dict[str, Any]) -> int:
+    if tool_name == "agent_wait":
+        requested = args.get("timeout_seconds", 120)
+        if isinstance(requested, int) and not isinstance(requested, bool):
+            return min(MAX_BACKEND_TIMEOUT_SECONDS, max(30, requested + 30))
+    if tool_name in {"agent_pool_copy_auth", "agent_pool_destroy_pool", "agent_pool_install"}:
+        return 600
+    return DEFAULT_BACKEND_TIMEOUT_SECONDS
+
+
+class SubprocessToolDispatcher:
+    def __init__(
+        self,
+        *,
+        argv: list[str] | None = None,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        self._argv = list(argv) if argv is not None else [str(Path.home() / ".local/bin/codex-master-mcp")]
+        self._timeout_seconds = timeout_seconds
+        self._instance_id = f"control-center-{secrets.token_hex(16)}"
+        self._lock = threading.Lock()
+        self._process: subprocess.Popen[bytes] | None = None
+        self._cancel_requested = False
+
+    def _environment(self) -> dict[str, str]:
+        allowed = {
+            "CODEX_AGENT_MCP_STATE",
+            "CODEX_HOME",
+            "CODEX_MASTER_MCP_STATE",
+            "DISPLAY",
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "LOGNAME",
+            "PATH",
+            "PYTHONPATH",
+            "TMPDIR",
+            "USER",
+            "WAYLAND_DISPLAY",
+            "XDG_RUNTIME_DIR",
+        }
+        env = {key: value for key, value in os.environ.items() if key in allowed}
+        env["CODEX_MASTER_MCP_INSTANCE_ID"] = self._instance_id
+        return env
+
+    def __call__(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": tool_name, "arguments": args},
+        }
+        encoded = (json.dumps(request, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+        timeout = self._timeout_seconds
+        if timeout is None:
+            timeout = float(backend_timeout_seconds(tool_name, args))
+        process: subprocess.Popen[bytes] | None = None
+        cancelled = False
+        try:
+            process = subprocess.Popen(
+                self._argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=self._environment(),
+                start_new_session=True,
+            )
+            with self._lock:
+                self._process = process
+                self._cancel_requested = False
+            stdout, stderr = process.communicate(input=encoded, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            if process is not None:
+                self._kill_process_group(process)
+                process.communicate()
+            raise AgentError("control-center backend outcome unknown after timeout") from exc
+        except OSError as exc:
+            raise AgentError("control-center backend is unavailable") from exc
+        finally:
+            with self._lock:
+                cancelled = self._cancel_requested
+                self._cancel_requested = False
+                if self._process is process:
+                    self._process = None
+        if len(stdout) > MAX_BACKEND_STDOUT_BYTES or len(stderr) > MAX_BACKEND_STDERR_BYTES:
+            raise AgentError("control-center backend output exceeded limit")
+        if process.returncode != 0:
+            if cancelled:
+                raise AgentError("control-center backend outcome unknown after cancellation")
+            raise AgentError("control-center backend failed")
+        return self._decode_response(stdout)
+
+    @staticmethod
+    def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            with contextlib.suppress(OSError):
+                process.kill()
+
+    def cancel(self) -> bool:
+        with self._lock:
+            process = self._process
+        if process is None or process.poll() is not None:
+            return False
+        with self._lock:
+            if self._process is not process:
+                return False
+            self._cancel_requested = True
+        self._kill_process_group(process)
+        return True
+
+    @staticmethod
+    def _decode_response(raw: bytes) -> dict[str, Any]:
+        try:
+            response = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+            raise AgentError("control-center backend returned invalid response") from exc
+        if not isinstance(response, dict) or response.get("jsonrpc") != "2.0" or response.get("id") != 1:
+            raise AgentError("control-center backend returned invalid response")
+        result = response.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("isError"), bool):
+            raise AgentError("control-center backend returned invalid response")
+        content = result.get("content")
+        if (
+            not isinstance(content, list)
+            or len(content) != 1
+            or not isinstance(content[0], dict)
+            or content[0].get("type") != "text"
+            or not isinstance(content[0].get("text"), str)
+        ):
+            raise AgentError("control-center backend returned invalid response")
+        try:
+            payload = json.loads(content[0]["text"])
+        except (json.JSONDecodeError, RecursionError) as exc:
+            raise AgentError("control-center backend returned invalid response") from exc
+        if not isinstance(payload, dict):
+            raise AgentError("control-center backend returned invalid response")
+        if result["isError"] and "error" not in payload:
+            return {"error": "control-center backend rejected request"}
+        return payload
+
+
 class OperationController:
     def __init__(
         self,
         *,
-        dispatch: Callable[[str, dict[str, Any]], dict[str, Any]] = call_validated_tool,
+        dispatch: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
         schedule: Callable[..., Any],
     ) -> None:
-        self._dispatch = dispatch
+        self._dispatch = dispatch or SubprocessToolDispatcher()
         self._schedule = schedule
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="codex-master-control")
         self._lock = threading.Lock()
@@ -296,6 +560,10 @@ class OperationController:
         self._executor.shutdown(wait=False, cancel_futures=True)
         return True
 
+    def cancel(self) -> bool:
+        cancel = getattr(self._dispatch, "cancel", None)
+        return bool(cancel()) if callable(cancel) else False
+
 
 def load_gtk() -> tuple[Any, Any]:
     try:
@@ -349,6 +617,15 @@ class ControlCenterWindow:
         self.page = 0
         self.last_page: StatusPage | None = None
         self.controller = OperationController(schedule=GLib.idle_add)
+        self.tool_inputs: dict[str, tuple[FieldDescriptor, Any, Any, str]] = {}
+        self.visible_tools: tuple[ToolDescriptor, ...] = ()
+        self.selected_tool: ToolDescriptor | None = None
+        try:
+            self.tool_catalog = compile_catalog(teamleader_tool_catalog())
+            self.catalog_error = None
+        except (AgentError, CatalogError) as exc:
+            self.tool_catalog = ()
+            self.catalog_error = str(public_error_payload(exc).get("error", "Katalog nicht verfügbar"))[:160]
         self.window = Gtk.ApplicationWindow(application=application)
         self.window.set_title("Flottenmanagement – Steuerzentrale")
         self.window.set_default_size(980, 640)
@@ -385,7 +662,10 @@ class ControlCenterWindow:
         self.status_label = Gtk.Label(label="Bereit")
         self.status_label.set_xalign(0.0)
         outer.pack_start(self.status_label, False, False, 0)
-        self.window.add(outer)
+        self.notebook = Gtk.Notebook()
+        self.notebook.append_page(outer, Gtk.Label(label="Übersicht"))
+        self.notebook.append_page(self._build_tools_page(), Gtk.Label(label="Werkzeuge"))
+        self.window.add(self.notebook)
 
     def show(self) -> None:
         self.window.show_all()
@@ -396,7 +676,340 @@ class ControlCenterWindow:
         self.previous_button.set_sensitive(not busy and self.page > 0)
         self.next_button.set_sensitive(not busy and bool(self.last_page and self.last_page.truncated))
         self.search.set_sensitive(not busy)
+        if hasattr(self, "tool_run_button"):
+            self.tool_run_button.set_sensitive(
+                not busy and bool(self.selected_tool and self.selected_tool.enabled)
+            )
         self.status_label.set_text(text[:200])
+
+    def _build_tools_page(self) -> Any:
+        Gtk = self.Gtk
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        outer.set_border_width(12)
+
+        selectors = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.tool_category_combo = Gtk.ComboBoxText()
+        for category in TOOL_CATEGORIES:
+            self.tool_category_combo.append_text(category)
+        self.tool_category_combo.set_active(0)
+        self.tool_category_combo.connect("changed", lambda _combo: self._refresh_tool_selector())
+        selectors.pack_start(self.tool_category_combo, False, False, 0)
+        self.tool_selector = Gtk.ComboBoxText()
+        self.tool_selector.connect("changed", lambda _combo: self._tool_selection_changed())
+        selectors.pack_start(self.tool_selector, True, True, 0)
+        outer.pack_start(selectors, False, False, 0)
+
+        self.tool_risk_label = Gtk.Label(label="")
+        self.tool_risk_label.set_xalign(0.0)
+        outer.pack_start(self.tool_risk_label, False, False, 0)
+        self.tool_description_label = Gtk.Label(label="")
+        self.tool_description_label.set_xalign(0.0)
+        self.tool_description_label.set_line_wrap(True)
+        outer.pack_start(self.tool_description_label, False, False, 0)
+
+        form_scroller = Gtk.ScrolledWindow()
+        form_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.tool_form = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        form_scroller.add(self.tool_form)
+        outer.pack_start(form_scroller, True, True, 0)
+
+        action_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.tool_run_button = Gtk.Button.new_with_label("Ausführen")
+        self.tool_run_button.connect("clicked", lambda _button: self._run_selected_tool())
+        action_row.pack_end(self.tool_run_button, False, False, 0)
+        self.tool_status_label = Gtk.Label(label="Bereit")
+        self.tool_status_label.set_xalign(0.0)
+        action_row.pack_start(self.tool_status_label, True, True, 0)
+        outer.pack_start(action_row, False, False, 0)
+
+        result_scroller = Gtk.ScrolledWindow()
+        result_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        result_scroller.set_min_content_height(150)
+        self.tool_result = Gtk.TextView()
+        self.tool_result.set_editable(False)
+        self.tool_result.set_cursor_visible(False)
+        self.tool_result.set_monospace(True)
+        result_scroller.add(self.tool_result)
+        outer.pack_start(result_scroller, False, True, 0)
+
+        if self.catalog_error:
+            self.tool_status_label.set_text(f"Katalogfehler: {self.catalog_error}")
+            self.tool_run_button.set_sensitive(False)
+        else:
+            self._refresh_tool_selector()
+        return outer
+
+    def _refresh_tool_selector(self) -> None:
+        selected = self.tool_category_combo.get_active_text() or "Alle"
+        self.visible_tools = tuple(
+            tool for tool in self.tool_catalog if selected == "Alle" or tool_category(tool.name) == selected
+        )
+        self.tool_selector.remove_all()
+        for index, tool in enumerate(self.visible_tools):
+            suffix = "" if tool.enabled else " · gesperrt"
+            self.tool_selector.append(str(index), f"{tool.name} · {tool.risk.value}{suffix}")
+        self.tool_selector.set_active(0 if self.visible_tools else -1)
+        if not self.visible_tools:
+            self.selected_tool = None
+            self.tool_run_button.set_sensitive(False)
+
+    def _tool_selection_changed(self) -> None:
+        active = self.tool_selector.get_active_id()
+        try:
+            index = int(active) if active is not None else -1
+        except ValueError:
+            index = -1
+        self.selected_tool = self.visible_tools[index] if 0 <= index < len(self.visible_tools) else None
+        self._render_tool_form()
+
+    def _clear_tool_form(self) -> None:
+        for child in self.tool_form.get_children():
+            self.tool_form.remove(child)
+        self.tool_inputs.clear()
+
+    def _render_tool_form(self) -> None:
+        self._clear_tool_form()
+        tool = self.selected_tool
+        if tool is None:
+            self.tool_description_label.set_text("")
+            self.tool_risk_label.set_text("")
+            self.tool_run_button.set_sensitive(False)
+            return
+        self.tool_description_label.set_text(tool.description)
+        risk_text = f"Risiko: {tool.risk.value}"
+        if tool.disabled_reason:
+            risk_text += f" · gesperrt: {tool.disabled_reason}"
+        self.tool_risk_label.set_text(risk_text)
+        self.tool_run_button.set_sensitive(tool.enabled and not self.controller.busy)
+        if not tool.fields:
+            empty = self.Gtk.Label(label="Keine Argumente")
+            empty.set_xalign(0.0)
+            self.tool_form.pack_start(empty, False, False, 0)
+        for field in tool.fields:
+            self._add_tool_field(field)
+        self.tool_form.show_all()
+
+    def _add_tool_field(self, field: FieldDescriptor) -> None:
+        Gtk = self.Gtk
+        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        heading = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        label = Gtk.Label(label=f"{field.name}{' *' if field.required else ''}")
+        label.set_xalign(0.0)
+        heading.pack_start(label, True, True, 0)
+        use_field = Gtk.CheckButton.new_with_label("verwenden")
+        use_field.set_active(field.required)
+        use_field.set_sensitive(not field.required)
+        heading.pack_end(use_field, False, False, 0)
+        row.pack_start(heading, False, False, 0)
+        if field.description:
+            description = Gtk.Label(label=field.description)
+            description.set_xalign(0.0)
+            description.set_line_wrap(True)
+            row.pack_start(description, False, False, 0)
+
+        widget: Any
+        widget_kind: str
+        if field.enum:
+            widget = Gtk.ComboBoxText()
+            for index, value in enumerate(field.enum):
+                widget.append(str(index), str(value))
+            default_index = field.enum.index(field.default) if field.has_default and field.default in field.enum else 0
+            widget.set_active(default_index)
+            widget_kind = "enum"
+        elif field.kind is FieldKind.BOOLEAN:
+            widget = Gtk.CheckButton.new_with_label("aktiv")
+            widget.set_active(bool(field.default) if field.has_default else False)
+            widget_kind = "boolean"
+        elif field.kind is FieldKind.INTEGER and field.minimum is not None and field.maximum is not None:
+            adjustment = Gtk.Adjustment(
+                value=int(field.default) if field.has_default else field.minimum,
+                lower=field.minimum,
+                upper=field.maximum,
+                step_increment=1,
+                page_increment=10,
+                page_size=0,
+            )
+            widget = Gtk.SpinButton(adjustment=adjustment, climb_rate=1, digits=0)
+            widget_kind = "integer_spin"
+        elif field.kind is FieldKind.INTEGER:
+            widget = Gtk.Entry()
+            widget.set_max_length(32)
+            if field.has_default:
+                widget.set_text(str(field.default))
+            widget_kind = "integer_entry"
+        elif field.kind is FieldKind.STRING_ARRAY or field.name in LONG_TEXT_FIELDS:
+            widget = Gtk.TextView()
+            widget.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            if field.has_default:
+                default = "\n".join(field.default) if isinstance(field.default, tuple) else str(field.default)
+                widget.get_buffer().set_text(default)
+            field_scroller = Gtk.ScrolledWindow()
+            field_scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+            field_scroller.set_min_content_height(80)
+            field_scroller.add(widget)
+            row.pack_start(field_scroller, False, True, 0)
+            widget_kind = "string_array" if field.kind is FieldKind.STRING_ARRAY else "text"
+            self.tool_inputs[field.name] = (field, use_field, widget, widget_kind)
+            self.tool_form.pack_start(row, False, False, 0)
+            return
+        else:
+            widget = Gtk.Entry()
+            widget.set_max_length(field.max_length or 12_000)
+            if field.has_default:
+                widget.set_text(str(field.default))
+            widget_kind = "text"
+        row.pack_start(widget, False, False, 0)
+        self.tool_inputs[field.name] = (field, use_field, widget, widget_kind)
+        self.tool_form.pack_start(row, False, False, 0)
+
+    def _read_tool_arguments(self, tool: ToolDescriptor) -> dict[str, Any]:
+        values: dict[str, Any] = {}
+        for name, (field, use_field, widget, widget_kind) in self.tool_inputs.items():
+            if not use_field.get_active():
+                continue
+            if widget_kind == "enum":
+                active = widget.get_active_id()
+                if active is None:
+                    raise CatalogError(f"{name} ist nicht ausgewählt")
+                values[name] = field.enum[int(active)]
+            elif widget_kind == "boolean":
+                values[name] = bool(widget.get_active())
+            elif widget_kind == "integer_spin":
+                values[name] = int(widget.get_value_as_int())
+            elif widget_kind == "integer_entry":
+                raw = widget.get_text()
+                if not isinstance(raw, str) or not re.fullmatch(r"-?[0-9]+", raw):
+                    raise CatalogError(f"{name} muss Ganzzahl sein")
+                values[name] = int(raw)
+            elif widget_kind in {"text", "string_array"} and hasattr(widget, "get_buffer"):
+                buffer = widget.get_buffer()
+                raw = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True)
+                values[name] = [line for line in raw.splitlines() if line] if widget_kind == "string_array" else raw
+            else:
+                values[name] = widget.get_text()
+        return serialize_arguments(tool, values)
+
+    def _set_tool_result(self, payload: Any) -> None:
+        self.tool_result.get_buffer().set_text(bounded_public_result_text(payload))
+
+    def _confirm_message(self, text: str) -> bool:
+        dialog = self.Gtk.MessageDialog(
+            transient_for=self.window,
+            modal=True,
+            message_type=self.Gtk.MessageType.WARNING,
+            buttons=self.Gtk.ButtonsType.OK_CANCEL,
+            text=text,
+        )
+        response = dialog.run()
+        dialog.destroy()
+        return response == self.Gtk.ResponseType.OK
+
+    def _confirm_destructive(self, tool: ToolDescriptor) -> bool:
+        phrase = f"AUSFÜHREN {tool.name}"
+        dialog = self.Gtk.Dialog(title="Destruktive Aktion", transient_for=self.window, modal=True)
+        dialog.add_button("Abbrechen", self.Gtk.ResponseType.CANCEL)
+        dialog.add_button("Ausführen", self.Gtk.ResponseType.OK)
+        box = dialog.get_content_area()
+        box.set_spacing(8)
+        box.add(self.Gtk.Label(label=f"Zur Bestätigung exakt eingeben:\n{phrase}"))
+        entry = self.Gtk.Entry()
+        entry.set_max_length(len(phrase))
+        box.add(entry)
+        dialog.show_all()
+        response = dialog.run()
+        accepted = response == self.Gtk.ResponseType.OK and entry.get_text() == phrase
+        dialog.destroy()
+        return accepted
+
+    def _confirm_tool_run(self, tool: ToolDescriptor, risk: Risk, argument_count: int) -> bool:
+        if risk is Risk.READ_ONLY:
+            return True
+        if risk is Risk.MUTATING:
+            return self._confirm_message(f"{tool.name} mit {argument_count} Argument(en) ausführen?")
+        if risk is Risk.BROAD:
+            preview = self._confirm_message(
+                f"Breite Aktion {tool.name}\nArgumente: {argument_count}\nZusammenfassung geprüft?"
+            )
+            return preview and self._confirm_message(f"{tool.name} jetzt wirklich ausführen?")
+        if risk is Risk.DESTRUCTIVE:
+            return self._confirm_destructive(tool)
+        return False
+
+    def _run_selected_tool(self) -> None:
+        tool = self.selected_tool
+        if tool is None or not tool.enabled:
+            return
+        try:
+            arguments = self._read_tool_arguments(tool)
+            risk = effective_risk(tool, arguments)
+        except (CatalogError, ValueError, OverflowError) as exc:
+            self.tool_status_label.set_text(f"Formularfehler: {str(exc)[:160]}")
+            return
+        if tool.name == "agent_pool_destroy_pool":
+            if not self._confirm_message("Poolstatus als verpflichtende Vorschau laden?"):
+                self.tool_status_label.set_text("Aktion abgebrochen")
+                return
+            preview_arguments = {
+                key: value for key, value in arguments.items() if key in {"spec", "target_dir", "codex_bin"}
+            }
+            self._set_busy(True, "Pool-Löschvorschau wird geladen …")
+            self.tool_status_label.set_text("Pool-Löschvorschau wird geladen …")
+            if not self.controller.submit(
+                "agent_pool_status",
+                preview_arguments,
+                lambda result, selected=tool, selected_args=arguments: self._destroy_preview_finished(
+                    selected, selected_args, result
+                ),
+            ):
+                self._set_busy(True, "Backendoperation läuft bereits")
+            return
+        if not self._confirm_tool_run(tool, risk, len(arguments)):
+            self.tool_status_label.set_text("Aktion abgebrochen")
+            return
+        self._set_busy(True, f"Werkzeug {tool.name} läuft …")
+        self.tool_status_label.set_text(f"{tool.name} läuft …")
+        if not self.controller.submit(
+            tool.name,
+            arguments,
+            lambda result, selected=tool, selected_risk=risk: self._tool_finished(selected, selected_risk, result),
+        ):
+            self._set_busy(True, "Backendoperation läuft bereits")
+
+    def _destroy_preview_finished(
+        self,
+        tool: ToolDescriptor,
+        arguments: dict[str, Any],
+        preview: dict[str, Any],
+    ) -> None:
+        self._set_tool_result(preview)
+        if "error" in preview:
+            self._set_busy(False, "Pool-Löschvorschau fehlgeschlagen")
+            self.tool_status_label.set_text("Pool-Löschvorschau fehlgeschlagen")
+            return
+        self._set_busy(False, "Pool-Löschvorschau geladen")
+        self.tool_status_label.set_text("Pool-Löschvorschau geladen")
+        if not self._confirm_destructive(tool):
+            self.tool_status_label.set_text("Aktion nach Vorschau abgebrochen")
+            return
+        self._set_busy(True, f"Werkzeug {tool.name} läuft …")
+        self.tool_status_label.set_text(f"{tool.name} läuft …")
+        if not self.controller.submit(
+            tool.name,
+            arguments,
+            lambda result, selected=tool: self._tool_finished(selected, Risk.DESTRUCTIVE, result),
+        ):
+            self._set_busy(True, "Backendoperation läuft bereits")
+
+    def _tool_finished(self, tool: ToolDescriptor, risk: Risk, result: dict[str, Any]) -> None:
+        self._set_tool_result(result)
+        if "error" in result:
+            self._set_busy(False, f"{tool.name}: fehlgeschlagen")
+            self.tool_status_label.set_text(f"{tool.name}: fehlgeschlagen")
+            return
+        self._set_busy(False, f"{tool.name}: abgeschlossen")
+        self.tool_status_label.set_text(f"{tool.name}: abgeschlossen")
+        if risk is not Risk.READ_ONLY:
+            self.refresh()
 
     def _filter_text(self) -> str:
         value = self.search.get_text()
@@ -493,7 +1106,10 @@ class ControlCenterWindow:
 
     def _on_delete(self, _window: Any, _event: Any) -> bool:
         if not self.controller.close():
-            self.status_label.set_text("Backendoperation läuft; Fenster bleibt bis Abschluss geöffnet")
+            cancelled = self.controller.cancel()
+            detail = "Abbruch angefordert" if cancelled else "warte auf begrenztes Backendzeitlimit"
+            self.status_label.set_text(f"Backendoperation läuft; {detail}")
+            self.tool_status_label.set_text(f"Backendoperation läuft; {detail}")
             return True
         return False
 
@@ -522,4 +1138,5 @@ def launch_gtk_application(args: list[str]) -> int:
 
 def run_control_center(args: list[str] | None = None) -> int:
     assert_install_context_allows_master_registration()
+    require_teamleader_tool_access()
     return launch_gtk_application(list(args or []))
