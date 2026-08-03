@@ -10,6 +10,7 @@ from typing import ContextManager
 
 from .fleet_registry import (
     FleetAccount,
+    FleetSeries,
     FleetSnapshot,
     LimitState,
     SecretState,
@@ -458,13 +459,43 @@ class FleetService:
         )
         if series is None or not series.enabled:
             return AccountGateDecision(False, "account_disabled", None, snapshot.generation)
-        if agent.account_id is None:
+        return self._account_decision(
+            snapshot,
+            account_id=agent.account_id,
+            provider=agent.provider,
+        )
+
+    def series_gate(self, series: FleetSeries) -> AccountGateDecision:
+        snapshot = self.load()
+        if not series.enabled:
+            return AccountGateDecision(
+                False,
+                "series_disabled",
+                series.account_id,
+                snapshot.generation,
+            )
+        return self._account_decision(
+            snapshot,
+            account_id=series.account_id,
+            provider=series.provider,
+        )
+
+    def _account_decision(
+        self,
+        snapshot: FleetSnapshot,
+        *,
+        account_id: str | None,
+        provider: object,
+    ) -> AccountGateDecision:
+        if account_id is None:
             return AccountGateDecision(True, "ready", None, snapshot.generation)
         account = next(
-            (item for item in snapshot.accounts if item.account_id == agent.account_id),
+            (item for item in snapshot.accounts if item.account_id == account_id),
             None,
         )
-        if account is None or not account.enabled or account.limit_state is LimitState.DISABLED:
+        if account is not None and account.provider is not provider:
+            reason = "account_provider_mismatch"
+        elif account is None or not account.enabled or account.limit_state is LimitState.DISABLED:
             reason = "account_disabled"
         elif account.secret_state is SecretState.MISSING:
             reason = "secret_missing"
@@ -482,7 +513,7 @@ class FleetService:
             reason = "probe_stale"
         else:
             reason = "ready"
-        return AccountGateDecision(reason == "ready", reason, account.account_id, snapshot.generation)
+        return AccountGateDecision(reason == "ready", reason, account_id, snapshot.generation)
 
     def _probe_is_fresh(self, value: str | None) -> bool:
         if value is None:

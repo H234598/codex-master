@@ -371,6 +371,77 @@ def test_account_gate_uses_fixed_priority_codes(
     assert decision.generation == 2
 
 
+@pytest.mark.parametrize(
+    ("account", "want"),
+    [
+        (_account(), "secret_missing"),
+        (
+            _account(
+                secret_state=SecretState.CONFIGURED,
+                limit_state=LimitState.LIMITED,
+            ),
+            "limit_active",
+        ),
+        (
+            replace(
+                _account(
+                    secret_state=SecretState.CONFIGURED,
+                    limit_state=LimitState.READY,
+                ),
+                last_probe_at_utc="2026-08-03T11:44:59Z",
+            ),
+            "probe_stale",
+        ),
+    ],
+)
+def test_series_gate_rejects_unready_account_bound_candidate(
+    tmp_path: Path,
+    account: FleetAccount,
+    want: str,
+) -> None:
+    service, _ = _service(tmp_path, FleetSnapshot(1, 2, (account,), ()))
+
+    decision = service.series_gate(_series())
+
+    assert decision.allowed is False
+    assert decision.reason == want
+    assert decision.account_id == "shared"
+    assert decision.generation == 2
+
+
+def test_series_gate_allows_accountless_ollama_and_marks_disabled_series(
+    tmp_path: Path,
+) -> None:
+    service, _ = _service(tmp_path)
+
+    ollama = service.series_gate(_series(account_id=None))
+    disabled = service.series_gate(_series(account_id=None, enabled=False))
+
+    assert ollama.allowed is True
+    assert ollama.reason == "ready"
+    assert ollama.account_id is None
+    assert disabled.allowed is False
+    assert disabled.reason == "series_disabled"
+    assert disabled.account_id is None
+    assert {ollama.generation, disabled.generation} == {1}
+
+
+def test_series_gate_rejects_candidate_account_provider_mismatch(tmp_path: Path) -> None:
+    service, _ = _service(tmp_path, FleetSnapshot(1, 2, (_account(),), ()))
+    candidate = replace(
+        _series(),
+        runner=RunnerKind.CODEX_CLI,
+        provider=Provider.OPENAI_API,
+    )
+
+    decision = service.series_gate(candidate)
+
+    assert decision.allowed is False
+    assert decision.reason == "account_provider_mismatch"
+    assert decision.account_id == "shared"
+    assert decision.generation == 2
+
+
 def test_disabled_or_unknown_series_fails_closed(tmp_path: Path) -> None:
     service, _ = _service(
         tmp_path,

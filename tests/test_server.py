@@ -2550,6 +2550,297 @@ class ServerHelpersTest(unittest.TestCase):
                     server_module.legacy_fleet_snapshot()
                 self.assertIsNone(server_module.swap_agent_inventory(None))
 
+    def test_fleet_series_plan_is_redacted_and_read_only_for_initial_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), patch.object(
+                server_module,
+                "run_tmux",
+                side_effect=AssertionError("external probe attempted"),
+            ):
+                result = server_module.fleet_series_plan(
+                    prefix="d",
+                    count=3,
+                    runner="codex_cli",
+                    provider="ollama_local",
+                    model="local-model",
+                    account_id=None,
+                    expected_generation=1,
+                )
+
+            self.assertEqual(
+                result,
+                {
+                    "mutation_performed": False,
+                    "generation": 1,
+                    "next_generation": 2,
+                    "create_count": 3,
+                    "keep_count": 0,
+                    "update_count": 0,
+                    "remove_count": 0,
+                    "confirmation_required": False,
+                    "pool_root": "not_returned",
+                    "raw_output": "not_returned",
+                },
+            )
+            self.assertFalse(state.exists())
+            self.assertFalse(pool.exists())
+
+    def test_fleet_wrapper_executes_pinned_binary_with_provider_environment(self) -> None:
+        from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
+
+        cases = (
+            (Provider.OPENAI_CHATGPT, RunnerKind.CODEX_CLI, "CODEX_HOME", ()),
+            (Provider.OPENAI_API, RunnerKind.CODEX_CLI, "CODEX_HOME", ("OPENAI_API_KEY",)),
+            (Provider.GEMINI_API, RunnerKind.GEMINI_CLI, "GEMINI_CLI_HOME", ("GEMINI_API_KEY",)),
+            (Provider.OLLAMA_LOCAL, RunnerKind.CODEX_CLI, "CODEX_HOME", ()),
+            (Provider.HUGGINGFACE_INFERENCE, RunnerKind.CODEX_CLI, "CODEX_HOME", ("HF_TOKEN",)),
+        )
+        secret_keys = ("OPENAI_API_KEY", "GEMINI_API_KEY", "HF_TOKEN", "CODEX_ACCESS_TOKEN")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "runner"
+            executable.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"${CODEX_HOME-unset}\" \"${GEMINI_CLI_HOME-unset}\"\n"
+                "printf '%s\\n' \"${OPENAI_API_KEY-unset}\" \"${GEMINI_API_KEY-unset}\" "
+                "\"${HF_TOKEN-unset}\" \"${CODEX_ACCESS_TOKEN-unset}\" \"$1\"\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+            for provider, runner, home_key, retained in cases:
+                with self.subTest(provider=provider.value):
+                    home = root / provider.value
+                    agent = AgentDescriptor(
+                        "d1",
+                        "d",
+                        1,
+                        "D 1",
+                        runner,
+                        provider,
+                        "model",
+                        "account" if retained else None,
+                        home,
+                        "session",
+                        True,
+                    )
+                    wrapper = root / f"wrapper-{provider.value}"
+                    wrapper.write_text(
+                        server_module.fleet_wrapper_text(agent, executable),
+                        encoding="utf-8",
+                    )
+                    wrapper.chmod(0o700)
+                    env = {**os.environ, **{key: f"set-{key}" for key in secret_keys}}
+
+                    completed = subprocess.run(
+                        [str(wrapper), "argument with spaces"],
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                        env=env,
+                    )
+
+                    lines = completed.stdout.splitlines()
+                    self.assertEqual(lines[0 if home_key == "CODEX_HOME" else 1], str(home))
+                    self.assertEqual(lines[1 if home_key == "CODEX_HOME" else 0], "unset")
+                    values = dict(zip(secret_keys, lines[2:6]))
+                    self.assertEqual(
+                        {key for key, value in values.items() if value != "unset"},
+                        set(retained),
+                    )
+                    self.assertEqual(lines[6], "argument with spaces")
+                    self.assertNotIn("account", wrapper.read_text(encoding="utf-8"))
+
+    def test_fleet_minimal_config_matches_runner_and_provider_contract(self) -> None:
+        from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def agent(provider: Provider, runner: RunnerKind) -> AgentDescriptor:
+                return AgentDescriptor(
+                    "d1", "d", 1, "D 1", runner, provider, "chosen-model", None,
+                    root / provider.value, "session", True,
+                )
+
+            gemini_name, gemini_text = server_module.fleet_minimal_config(
+                agent(Provider.GEMINI_API, RunnerKind.GEMINI_CLI)
+            )
+            self.assertEqual(gemini_name, "settings.json")
+            self.assertEqual(
+                json.loads(gemini_text),
+                {
+                    "general": {
+                        "enableAutoUpdate": False,
+                        "enableAutoUpdateNotification": False,
+                    },
+                    "privacy": {"usageStatisticsEnabled": False},
+                    "security": {"auth": {"enforcedType": "gemini-api-key"}},
+                },
+            )
+
+            expected = {
+                Provider.OPENAI_CHATGPT: None,
+                Provider.OPENAI_API: None,
+                Provider.OLLAMA_LOCAL: "ollama",
+                Provider.HUGGINGFACE_INFERENCE: "huggingface",
+            }
+            for provider, model_provider in expected.items():
+                with self.subTest(provider=provider.value):
+                    filename, text = server_module.fleet_minimal_config(
+                        agent(provider, RunnerKind.CODEX_CLI)
+                    )
+                    config = tomllib.loads(text)
+                    self.assertEqual(filename, "config.toml")
+                    self.assertEqual(config["model"], "chosen-model")
+                    self.assertEqual(config["approval_policy"], "never")
+                    self.assertEqual(config["sandbox_mode"], "danger-full-access")
+                    self.assertEqual(config.get("model_provider"), model_provider)
+                    self.assertEqual(next(iter(config["projects"].values())), {"trust_level": "trusted"})
+                    if provider is Provider.HUGGINGFACE_INFERENCE:
+                        self.assertEqual(
+                            config["model_providers"]["huggingface"],
+                            {
+                                "name": "Hugging Face",
+                                "base_url": "https://router.huggingface.co/v1",
+                                "env_key": "HF_TOKEN",
+                                "wire_api": "responses",
+                            },
+                        )
+                    else:
+                        self.assertNotIn("model_providers", config)
+
+    def test_fleet_series_apply_creates_marked_homes_and_publishes_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                result = server_module.fleet_series_apply(
+                    prefix="d",
+                    count=3,
+                    runner="codex_cli",
+                    provider="ollama_local",
+                    model="local-model",
+                    account_id=None,
+                    expected_generation=1,
+                    codex_executable=executable,
+                )
+                inventory = server_module.current_agent_inventory()
+
+            self.assertEqual(result["generation"], 2)
+            self.assertEqual(result["created_count"], 3)
+            self.assertEqual(inventory.agent_ids, ("d1", "d2", "d3"))
+            self.assertEqual(stat.S_IMODE(pool.stat().st_mode), 0o700)
+            self.assertEqual(
+                json.loads((pool / server_module.FLEET_POOL_MARKER_FILE).read_text()),
+                {"kind": "codex_master_fleet_pool", "schema_version": 1},
+            )
+            for agent_id in inventory.agent_ids:
+                home = pool / agent_id
+                marker_path = home / server_module.FLEET_AGENT_MARKER_FILE
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                self.assertEqual(stat.S_IMODE(home.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(marker_path.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE((home / "codex").stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE((home / "config.toml").stat().st_mode), 0o600)
+                self.assertEqual(marker["agent_id"], agent_id)
+                self.assertEqual(set(marker["files"]), {"codex", "config.toml"})
+                self.assertTrue(all(re.fullmatch(r"[0-9a-f]{64}", value) for value in marker["files"].values()))
+                self.assertFalse(
+                    {"account_id", "generation", "executable", "home", "auth"} & set(marker)
+                )
+
+    def test_fleet_series_grow_only_creates_tail_and_keeps_existing_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+
+            def fingerprints(agent_ids: tuple[str, ...]) -> dict[str, tuple[int, int, str]]:
+                result: dict[str, tuple[int, int, str]] = {}
+                for agent_id in agent_ids:
+                    for path in sorted((pool / agent_id).iterdir()):
+                        current = path.stat()
+                        result[f"{agent_id}/{path.name}"] = (
+                            current.st_ino,
+                            current.st_mtime_ns,
+                            hashlib.sha256(path.read_bytes()).hexdigest(),
+                        )
+                return result
+
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d", count=3, runner="codex_cli", provider="ollama_local",
+                    model="local-model", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                before = fingerprints(("d1", "d2", "d3"))
+
+                result = server_module.fleet_series_apply(
+                    prefix="d", count=5, runner="codex_cli", provider="ollama_local",
+                    model="local-model", account_id=None, expected_generation=2,
+                    codex_executable=executable,
+                )
+                after = fingerprints(("d1", "d2", "d3"))
+
+            self.assertEqual(result["created_count"], 2)
+            self.assertEqual(result["kept_count"], 3)
+            self.assertEqual(before, after)
+            self.assertEqual(
+                sorted(path.name for path in pool.iterdir() if path.is_dir()),
+                ["d1", "d2", "d3", "d4", "d5"],
+            )
+
+    def test_fleet_series_cas_conflict_removes_only_unchanged_new_homes(self) -> None:
+        from codex_master.fleet_service import FleetConflictError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ):
+                service = server_module.current_fleet_service()
+
+                def conflict(*_args, **_kwargs):
+                    shutil.rmtree(pool / "d2")
+                    (pool / "d2").mkdir()
+                    (pool / "d2" / "foreign").write_text("untouched", encoding="utf-8")
+                    raise FleetConflictError("generation_conflict")
+
+                with patch.object(service, "commit_snapshot", side_effect=conflict), patch.object(
+                    server_module, "current_fleet_service", return_value=service
+                ):
+                    with self.assertRaisesRegex(AgentError, "fleet_create_rollback_diverged"):
+                        server_module.fleet_series_apply(
+                            prefix="d", count=2, runner="codex_cli", provider="ollama_local",
+                            model="local-model", account_id=None, expected_generation=1,
+                            codex_executable=executable,
+                        )
+
+                self.assertEqual(service.load().generation, 1)
+            self.assertFalse((pool / "d1").exists())
+            self.assertEqual((pool / "d2" / "foreign").read_text(encoding="utf-8"), "untouched")
+
     @patch("codex_master.server.status_agent")
     def test_multi_agent_status_results_are_paged_for_broad_selectors(self, mock_status_agent) -> None:
         mock_status_agent.side_effect = lambda agent: {
