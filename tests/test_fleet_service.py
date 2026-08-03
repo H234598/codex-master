@@ -426,6 +426,31 @@ def test_series_gate_allows_accountless_ollama_and_marks_disabled_series(
     assert {ollama.generation, disabled.generation} == {1}
 
 
+@pytest.mark.parametrize(
+    ("provider", "runner", "allowed", "reason"),
+    [
+        (Provider.GEMINI_API, RunnerKind.GEMINI_CLI, False, "account_required"),
+        (Provider.OPENAI_API, RunnerKind.CODEX_CLI, False, "account_required"),
+        (Provider.HUGGINGFACE_INFERENCE, RunnerKind.CODEX_CLI, False, "account_required"),
+        (Provider.OLLAMA_LOCAL, RunnerKind.CODEX_CLI, True, "ready"),
+    ],
+)
+def test_series_gate_allows_accountless_series_only_for_local_ollama(
+    tmp_path: Path,
+    provider: Provider,
+    runner: RunnerKind,
+    allowed: bool,
+    reason: str,
+) -> None:
+    service, _ = _service(tmp_path)
+    candidate = replace(_series(account_id=None), provider=provider, runner=runner)
+
+    decision = service.series_gate(candidate)
+
+    assert decision.allowed is allowed
+    assert decision.reason == reason
+
+
 def test_series_gate_rejects_candidate_account_provider_mismatch(tmp_path: Path) -> None:
     service, _ = _service(tmp_path, FleetSnapshot(1, 2, (_account(),), ()))
     candidate = replace(

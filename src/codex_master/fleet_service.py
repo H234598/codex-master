@@ -13,6 +13,7 @@ from .fleet_registry import (
     FleetSeries,
     FleetSnapshot,
     LimitState,
+    Provider,
     SecretState,
     build_inventory,
     fleet_document,
@@ -465,8 +466,13 @@ class FleetService:
             provider=agent.provider,
         )
 
-    def series_gate(self, series: FleetSeries) -> AccountGateDecision:
-        snapshot = self.load()
+    def series_gate(
+        self,
+        series: FleetSeries,
+        *,
+        snapshot: FleetSnapshot | None = None,
+    ) -> AccountGateDecision:
+        snapshot = snapshot or self.load()
         if not series.enabled:
             return AccountGateDecision(
                 False,
@@ -488,7 +494,8 @@ class FleetService:
         provider: object,
     ) -> AccountGateDecision:
         if account_id is None:
-            return AccountGateDecision(True, "ready", None, snapshot.generation)
+            reason = "ready" if provider is Provider.OLLAMA_LOCAL else "account_required"
+            return AccountGateDecision(reason == "ready", reason, None, snapshot.generation)
         account = next(
             (item for item in snapshot.accounts if item.account_id == account_id),
             None,
