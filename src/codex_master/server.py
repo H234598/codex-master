@@ -225,7 +225,7 @@ SERIES_AGENT_IDS = {
 AGENT_SELECTOR_DESCRIPTION = (
     "Agentin selector: a1..a100, b1..b100, c1..c100; legacy aliases a/b; "
     "numeric ordinal selectors 1=a1, 2=b1, 3=a2 by default; "
-    "group selectors both, all, a-series, b-series, c-series."
+    "group selectors active, both, all, a-series, b-series, c-series."
 )
 DEFAULT_AGENTIN_BASE_NAMES = (
     "Mila",
@@ -263,6 +263,7 @@ WATCHDOG_REQUIRED_HARDENING_DIRECTIVES = (
     "KeyringMode=private",
     "NoNewPrivileges=yes",
     "PrivateTmp=yes",
+    "BindReadOnlyPaths=-/tmp/tmux-%U",
     "PrivateDevices=yes",
     "ProtectClock=yes",
     "ProtectControlGroups=yes",
@@ -518,7 +519,6 @@ def public_error_payload(exc: Exception) -> dict[str, Any]:
 def ensure_state() -> None:
     for path in (STATE_ROOT, RAW_DIR, META_DIR, LOCK_DIR, LEASE_DIR):
         ensure_private_dir(path)
-    prune_raw_logs()
 
 
 def ensure_private_dir(path: Path) -> None:
@@ -1186,6 +1186,8 @@ def agent_record_aliases(agent: str) -> set[str]:
 
 def agent_ids(agent: str) -> list[str]:
     normalized = normalize_agent_selector_text(agent)
+    if normalized == "active":
+        return list(managed_applet_inventory()["running_agents"])
     if normalized == "all":
         return list(AGENTS)
     if normalized == "both":
@@ -4153,14 +4155,53 @@ def latest_managed_raw_log(agent: str, *, include_legacy: bool = True) -> Path |
     return newest[0] if len(newest) == 1 else None
 
 
+def raw_log_candidate_agents(running_agents: set[str]) -> list[str]:
+    candidates = {agent for agent in running_agents if agent in AGENTS}
+
+    for metadata_dir in (META_DIR, LEGACY_META_DIR):
+        if not is_real_directory_no_symlink(metadata_dir):
+            continue
+        try:
+            entries = tuple(metadata_dir.iterdir())
+        except OSError:
+            continue
+        for path in entries:
+            if not path.name.endswith(".json"):
+                continue
+            name = path.name[:-5]
+            candidate = name if name in AGENTS else LEGACY_AGENT_ALIASES.get(name)
+            if candidate in AGENTS:
+                candidates.add(candidate)
+
+    for raw_dir in managed_raw_dirs():
+        if not is_real_directory_no_symlink(raw_dir):
+            continue
+        try:
+            entries = tuple(raw_dir.iterdir())
+        except OSError:
+            continue
+        for path in entries:
+            if not path.name.endswith(".log"):
+                continue
+            _prefix, separator, name = path.name[:-4].rpartition("-")
+            if not separator:
+                continue
+            candidate = name if name in AGENTS else LEGACY_AGENT_ALIASES.get(name)
+            if candidate in AGENTS:
+                candidates.add(candidate)
+
+    return sorted(candidates)
+
+
 def protected_raw_log_paths() -> set[Path]:
     protected: set[Path] = set()
-    for agent in AGENTS:
-        record_agent = LEGACY_AGENT_ALIASES.get(agent, agent)
-        if record_agent not in AGENTS:
-            record_agent = agent
-        raw_log = read_meta(record_agent).get("raw_log")
-        identity = allowed_agent_raw_log_identity(record_agent, raw_log)
+    try:
+        running_agents = set(managed_applet_inventory()["running_agents"])
+    except AgentError:
+        running_agents = set()
+    for agent in raw_log_candidate_agents(running_agents):
+        raw_log = read_meta(agent).get("raw_log")
+        identity = allowed_agent_raw_log_identity(agent, raw_log)
         if (
             identity is not None
             and identity[1] is not None
@@ -4169,10 +4210,10 @@ def protected_raw_log_paths() -> set[Path]:
             protected.add(identity[0])
             continue
         recovered = latest_managed_raw_log(
-            record_agent,
+            agent,
             include_legacy=raw_log_identity_is_legacy(identity),
         )
-        if recovered is not None and tmux_alive(AGENTS[agent]["session"]):
+        if recovered is not None and agent in running_agents:
             protected.add(recovered)
     return protected
 
@@ -5197,9 +5238,15 @@ def _start_agent_unlocked(
         runner_execution_path = open_runner_execution_path(agent, runner, runner_stat)
         run_id = f"{now_id()}-{agent}"
         raw_log = RAW_DIR / f"{run_id}.log"
+        raw_log_created = False
         try:
             write_private_new_bytes(raw_log, b"")
+            raw_log_created = True
+            prune_raw_logs()
         except Exception:
+            if raw_log_created:
+                with contextlib.suppress(Exception):
+                    cleanup_failed_start(session, raw_log, kill_session=False)
             close_runner_execution_fd(agent)
             raise
 
@@ -14453,9 +14500,7 @@ def read_message() -> dict[str, Any] | None:
 
 
 def write_message(message: dict[str, Any]) -> None:
-    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
-    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii"))
-    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.write(json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n")
     sys.stdout.buffer.flush()
 
 

@@ -325,7 +325,7 @@ python3 -m codex_master.server claim b --forever --poll-interval-seconds 30
 python3 -m codex_master.server claim b --no-wait
 python3 -m codex_master.server claim b --no-recover-stopped
 python3 -m codex_master.server wait a --timeout-seconds 120 --poll-interval-seconds 30
-python3 -m codex_master.server watchdog all --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 15 --action stop --manage-unclaimed --quiet
+python3 -m codex_master.server watchdog active --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 15 --action stop --manage-unclaimed --quiet
 python3 -m codex_master.server capabilities all --agents-limit 30
 python3 -m codex_master.server skills all --agents-limit 30
 python3 -m codex_master.server skills a --include-names --limit 20 --names-offset 20 --plugins-offset 20 --plugins-limit 20
@@ -584,9 +584,10 @@ failed. Verify the installed files and CLI first; do not interpret ordinary
   `systemd/user/codex-master-watchdog.service` and
   `systemd/user/codex-master-watchdog.timer`
 - the user service runs with conservative hardening directives:
-  empty `CapabilityBoundingSet`, private keyring/tmp/devices, kernel and clock
-  protections, read-only system hierarchy, explicit write access only to the
-  managed state and user runtime directories, no IP sockets, no namespaces,
+  empty `CapabilityBoundingSet`, private keyring/tmp/devices, a read-only bind
+  of the user's tmux socket directory, kernel and clock protections, read-only
+  system hierarchy, explicit write access only to the managed state and user
+  runtime directories, no IP sockets, no namespaces,
   `NoNewPrivileges`, `MemoryDenyWriteExecute`, native syscall architecture,
   and `UMask=0077`; it intentionally keeps normal user home read access because
   the watchdog needs Codex config, tmux IPC, and managed state files

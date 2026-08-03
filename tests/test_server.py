@@ -2127,6 +2127,18 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(agent_ids("4"), ["b2"])
         self.assertEqual(agent_ids("200"), ["b100"])
 
+    def test_active_selector_uses_single_managed_inventory_snapshot(self) -> None:
+        inventory = {
+            "running_agents": ["c1", "a2"],
+            "visible_running_agents": ["c1", "a2"],
+            "overflow": 0,
+        }
+        with patch("codex_master.server.managed_applet_inventory", return_value=inventory) as mock_inventory:
+            selected = agent_ids("active")
+
+        self.assertEqual(selected, ["c1", "a2"])
+        mock_inventory.assert_called_once_with()
+
     @patch("codex_master.server.status_agent")
     def test_multi_agent_status_results_are_paged_for_broad_selectors(self, mock_status_agent) -> None:
         mock_status_agent.side_effect = lambda agent: {
@@ -4737,7 +4749,8 @@ class ServerHelpersTest(unittest.TestCase):
             ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
                 "codex_master.server.META_DIR", root / "meta"
             ), patch("codex_master.server.read_meta", return_value={"raw_log": str(invalid)}), patch(
-                "codex_master.server.tmux_alive", return_value=True
+                "codex_master.server.managed_applet_inventory",
+                return_value={"running_agents": ["a"], "visible_running_agents": ["a"], "overflow": 0},
             ):
                 server_module.prune_raw_logs(max_files=1)
             active_exists = active.is_file()
@@ -4765,7 +4778,10 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.RAW_DIR", raw_dir
             ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
                 "codex_master.server.META_DIR", root / "meta"
-            ), patch("codex_master.server.tmux_alive", return_value=True):
+            ), patch(
+                "codex_master.server.managed_applet_inventory",
+                return_value={"running_agents": ["a"], "visible_running_agents": ["a"], "overflow": 0},
+            ):
                 result = server_module.prune_raw_logs(max_files=1)
 
             self.assertEqual(result["deleted_count"], 0)
@@ -4870,6 +4886,19 @@ class ServerHelpersTest(unittest.TestCase):
         with patch("sys.stdin", FakeStdin(data)):
             self.assertEqual(read_message(), message)
 
+    def test_write_message_uses_newline_delimited_stdio_framing(self) -> None:
+        payload = {"jsonrpc": "2.0", "id": 1, "result": {"text": "café"}}
+        stdout = Mock()
+        stdout.buffer = io.BytesIO()
+
+        with patch("sys.stdout", stdout):
+            server_module.write_message(payload)
+
+        self.assertEqual(
+            stdout.buffer.getvalue(),
+            json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8") + b"\n",
+        )
+
     def test_serve_mcp_maps_parse_and_invalid_request_errors(self) -> None:
         with patch("codex_master.server.ensure_state"), patch(
             "codex_master.server.read_message",
@@ -4885,6 +4914,15 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(serve_mcp(), 0)
 
         self.assertEqual(mock_write.call_args_list[0].args[0]["error"], {"code": -32600, "message": "Invalid Request"})
+
+    def test_ensure_state_does_not_run_synchronous_log_maintenance(self) -> None:
+        with patch("codex_master.server.ensure_private_dir") as mock_ensure_dir, patch(
+            "codex_master.server.prune_raw_logs"
+        ) as mock_prune:
+            ensure_state()
+
+        self.assertEqual(mock_ensure_dir.call_count, 5)
+        mock_prune.assert_not_called()
 
     def test_mcp_tool_call_error_is_structured(self) -> None:
         response = handle_rpc(
@@ -9601,6 +9639,50 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(log_names, ["log-2.log", "log-3.log"])
         self.assertTrue(all(size <= 80 for size in log_sizes))
 
+    def test_protected_raw_logs_only_inspects_agents_with_runtime_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "raw"
+            meta_dir = root / "meta"
+            legacy_meta_dir = root / "legacy-meta"
+            raw_dir.mkdir()
+            meta_dir.mkdir()
+            legacy_meta_dir.mkdir()
+            (meta_dir / "b1.json").write_text("{}\n", encoding="utf-8")
+            (raw_dir / "20260803T000000000000Z-c1.log").write_text("active\n", encoding="utf-8")
+            agents = {
+                name: {"session": f"session-{name}", "home": root / name}
+                for name in ("a1", "b1", "c1", "c2")
+            }
+            inspected: list[str] = []
+
+            def fake_read_meta(agent: str) -> dict[str, Any]:
+                inspected.append(agent)
+                return {}
+
+            inventory = {
+                "running_agents": ["c2"],
+                "visible_running_agents": ["c2"],
+                "overflow": 0,
+            }
+            with patch.dict("codex_master.server.AGENTS", agents, clear=True), patch(
+                "codex_master.server.RAW_DIR", raw_dir
+            ), patch("codex_master.server.LEGACY_STATE_ROOT", root / "legacy"), patch(
+                "codex_master.server.META_DIR", meta_dir
+            ), patch("codex_master.server.LEGACY_META_DIR", legacy_meta_dir), patch(
+                "codex_master.server.managed_applet_inventory", return_value=inventory
+            ) as mock_inventory, patch("codex_master.server.tmux_alive") as mock_tmux_alive, patch(
+                "codex_master.server.read_meta", side_effect=fake_read_meta
+            ), patch(
+                "codex_master.server.latest_managed_raw_log", return_value=None
+            ):
+                server_module.protected_raw_log_paths()
+
+        self.assertEqual(inspected, ["b1", "c1", "c2"])
+        self.assertNotIn("a1", inspected)
+        mock_inventory.assert_called_once_with()
+        mock_tmux_alive.assert_not_called()
+
     def test_prune_raw_logs_unlinks_symlinks_without_touching_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             raw_dir = Path(tmpdir) / "raw"
@@ -13720,7 +13802,9 @@ class ServerHelpersTest(unittest.TestCase):
                     "external_processes_truncated": False,
                     "raw_output": "not_returned",
                 },
-            ), patch("codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION):
+            ), patch("codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION), patch(
+                "codex_master.server.prune_raw_logs"
+            ) as mock_prune:
                 result = start_agent("a", cwd=tmpdir)
 
             raw_log_path = str(raw_dir / "fixed-a.log")
@@ -13728,6 +13812,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["raw_log"], "not_returned")
         self.assertNotIn(raw_log_path, json.dumps(result, sort_keys=True))
         self.assertEqual(mock_write_meta.call_args.args[1]["raw_log"], raw_log_path)
+        mock_prune.assert_called_once_with()
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.write_meta")
@@ -13791,6 +13876,8 @@ class ServerHelpersTest(unittest.TestCase):
         new_session_targets: list[str] = []
 
         def fake_run_tmux(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if args[0] == "list-sessions":
+                return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
             if args[0] == "new-session":
                 target = args[args.index("-s") + 1]
                 new_session_targets.append(target)
@@ -17097,6 +17184,7 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertIn("KeyringMode=private", text)
         self.assertIn("NoNewPrivileges=yes", text)
         self.assertIn("PrivateTmp=yes", text)
+        self.assertIn("BindReadOnlyPaths=-/tmp/tmux-%U", text)
         self.assertIn("PrivateDevices=yes", text)
         self.assertIn("ProtectClock=yes", text)
         self.assertIn("ProtectControlGroups=yes", text)
@@ -17117,6 +17205,8 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertIn("UMask=0077", text)
         self.assertIn("--report-grace-seconds 15", text)
         self.assertIn("--action stop", text)
+        self.assertIn("watchdog active", text)
+        self.assertNotIn("watchdog all", text)
         self.assertIn("--quiet", text)
 
     @patch("codex_master.server.print_json")
