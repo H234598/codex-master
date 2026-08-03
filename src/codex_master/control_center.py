@@ -676,7 +676,23 @@ class OperationController:
             result = future.result()
         except Exception as exc:
             result = public_error_payload(exc)
-        self._schedule(self._deliver, generation, callback, result)
+        try:
+            source_id = self._schedule(self._deliver, generation, callback, result)
+        except BaseException:
+            self._close_after_schedule_failure(generation)
+            return
+        if isinstance(source_id, bool) or not isinstance(source_id, int) or source_id <= 0:
+            self._close_after_schedule_failure(generation)
+
+    def _close_after_schedule_failure(self, generation: int) -> None:
+        with self._lock:
+            if self._closed or generation != self._generation:
+                return
+            self._busy = False
+            self._closed = True
+            self._closing = True
+            self._generation += 1
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def _deliver(
         self,
@@ -684,12 +700,18 @@ class OperationController:
         callback: Callable[[dict[str, Any]], Any],
         result: dict[str, Any],
     ) -> bool:
+        close_after_delivery = False
         with self._lock:
             if self._closed or generation != self._generation:
                 return False
             self._busy = False
             if self._closing:
-                return False
+                self._closed = True
+                self._generation += 1
+                close_after_delivery = True
+        if close_after_delivery:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            return False
         callback(result)
         return False
 
@@ -1271,9 +1293,17 @@ class ControlCenterWindow:
             if not self._close_poll_id:
                 try:
                     source_id = self.GLib.timeout_add(50, self._poll_close)
-                    self._close_poll_id = source_id if isinstance(source_id, int) and source_id > 0 else 0
+                    self._close_poll_id = (
+                        source_id
+                        if not isinstance(source_id, bool)
+                        and isinstance(source_id, int)
+                        and source_id > 0
+                        else 0
+                    )
                 except Exception:
                     self._close_poll_id = 0
+                if not self._close_poll_id:
+                    return False
             return True
 
     def _poll_close(self) -> bool:

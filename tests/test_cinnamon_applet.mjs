@@ -406,6 +406,7 @@ function loadApplet() {
         : new FakeSubprocess({ argv, stdout: [], stderr: [] });
       this.spawnRequests.push({
         argv,
+        flags: this.flags,
         envCalls: [...this.envCalls],
         unsetCalls: [...this.unsetCalls],
         process,
@@ -510,8 +511,9 @@ function loadApplet() {
 
   const Gio = {
     SubprocessLauncher: {
-      new: function () {
+      new: function (flags) {
         const launcher = new FakeSubprocessLauncher();
+        launcher.flags = flags;
         return launcher;
       },
     },
@@ -889,7 +891,7 @@ test("builds fixed mcp argv and validierte ids", async () => {
   }
 });
 
-test("control-center launcher uses fixed sanitized argv and never overlaps status", () => {
+test("control-center launcher uses fixed sanitized argv and no backend resources", () => {
   const fixture = loadApplet();
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
   const controlCenterItem = applet.menu.items[2];
@@ -901,21 +903,40 @@ test("control-center launcher uses fixed sanitized argv and never overlaps statu
     "/home/tester/.local/bin/codex-master-mcp",
     "control-center",
   ]);
+  assert.equal(
+    fixture.launcherSpawns[0].flags,
+    fixture.Gio.SubprocessFlags.STDOUT_SILENCE | fixture.Gio.SubprocessFlags.STDERR_SILENCE,
+  );
+  assert.equal(fixture.subprocesses[0].waitCallbacks.length, 1, "launcher exit is reaped asynchronously");
   assert.deepEqual(Array.from(fixture.launcherSpawns[0].envCalls), [
     { key: "PATH", value: "/usr/bin:/bin", overwrite: true },
     { key: "HOME", value: "/home/tester", overwrite: true },
   ]);
-  applet.menu.items[0].activate();
-  controlCenterItem.activate();
-  assert.equal(fixture.subprocesses.length, 1, "launcher is single-flight with status and itself");
-
-  fixture.subprocesses[0].emitDone();
   assert.equal(applet._launcherInFlight, false);
+  assert.equal(fixture.activeTimers("timeout").length, 0);
   applet.menu.items[0].activate();
   assert.equal(fixture.subprocesses.length, 2);
+  controlCenterItem.activate();
+  assert.equal(fixture.subprocesses.length, 2, "status single-flight blocks another launch");
 });
 
-test("removal terminates tracked control-center launcher", () => {
+test("control-center launcher is persistent and never receives a backend timeout", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const controlCenterItem = applet.menu.items[2];
+
+  controlCenterItem.activate();
+  const process = fixture.subprocesses[0];
+
+  assert.equal(applet._launcherInFlight, false);
+  assert.equal(fixture.activeTimers("timeout").length, 0);
+  fixture.runTimeouts();
+  assert.equal(process.forceExitCount, 0);
+  applet.menu.items[0].activate();
+  assert.equal(fixture.subprocesses.length, 2, "status remains usable while GTK stays open");
+});
+
+test("removal leaves detached control-center alive without retaining resources", () => {
   const fixture = loadApplet();
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
   applet.menu.items[2].activate();
@@ -925,7 +946,7 @@ test("removal terminates tracked control-center launcher", () => {
 
   assert.equal(applet._cleanupComplete, true);
   assert.equal(applet._launcherInFlight, false);
-  assert.equal(launcher.forceExitCount, 1);
+  assert.equal(launcher.forceExitCount, 0);
   assert.equal(fixture.activeTimers().length, 0);
 });
 

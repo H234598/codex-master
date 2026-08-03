@@ -2856,7 +2856,10 @@ def write_private_new_bytes(
         try:
             os.fchmod(fd, mode)
         except PermissionError:
-            pass
+            if stat_module.S_IMODE(os.fstat(fd).st_mode) != stat_module.S_IMODE(mode):
+                raise AgentError("private state temp file mode could not be set")
+        if stat_module.S_IMODE(os.fstat(fd).st_mode) != stat_module.S_IMODE(mode):
+            raise AgentError("private state temp file mode could not be set")
         with os.fdopen(fd, "wb") as fh:
             fd = -1
             fh.write(data)

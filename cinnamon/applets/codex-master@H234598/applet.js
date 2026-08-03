@@ -11,7 +11,6 @@ const LABEL = "Flottenmanagement";
 const UUID = "codex-master@H234598";
 const APPLET_STATUS_TIMEOUT_MILLISECONDS = 10 * 1000;
 const APPLET_ACTION_TIMEOUT_MILLISECONDS = 120 * 1000;
-const CONTROL_CENTER_LAUNCH_TIMEOUT_MILLISECONDS = 10 * 1000;
 const APPLET_STDOUT_LIMIT_BYTES = 64 * 1024;
 const APPLET_STDERR_LIMIT_BYTES = 8 * 1024;
 const APPLET_STATUS_CHUNK_BYTES = 1024;
@@ -394,8 +393,26 @@ FlottenmanagementApplet.prototype = {
     },
 
     _launchControlCenter() {
-        if (this._removed || this._statusInFlight) return;
-        this._startStatusRefresh({ kind: "launcher" });
+        if (this._removed || this._statusInFlight || this._actionInFlight || this._launcherInFlight) return;
+        this._launcherInFlight = true;
+        try {
+            const launcher = Gio.SubprocessLauncher.new(
+                Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE
+            );
+            this._sanitizeLauncherEnvironment(launcher);
+            const process = launcher.spawnv(this._controlCenterArgv());
+            process.wait_async(null, (_proc, result) => {
+                try {
+                    if (typeof process.wait_finish === "function") process.wait_finish(result);
+                } catch (_error) {
+                    // Window exit is not an applet status operation.
+                }
+            });
+        } catch (_error) {
+            // Missing launcher fails locally without creating Cinnamon work.
+        } finally {
+            this._launcherInFlight = false;
+        }
     },
 
     _controlCenterArgv() {
@@ -512,15 +529,13 @@ FlottenmanagementApplet.prototype = {
 
     _startStatusRefresh(request = null) {
         if (this._removed) return;
-        const commandKind = request && request.kind === "launcher" ? "launcher" : request ? "action" : "status";
+        const commandKind = request ? "action" : "status";
         const actionRequest = commandKind === "action" ? request : null;
 
         const generation = ++this._statusGeneration;
         let process;
         try {
-            const argv = commandKind === "launcher"
-                ? this._controlCenterArgv()
-                : actionRequest ? this._appletActionArgv(actionRequest) : this._trackedStatusArgv();
+            const argv = actionRequest ? this._appletActionArgv(actionRequest) : this._trackedStatusArgv();
             const launcher = Gio.SubprocessLauncher.new(
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
             );
@@ -580,7 +595,6 @@ FlottenmanagementApplet.prototype = {
         this._statusActiveGeneration = generation;
         this._statusInFlight = true;
         this._actionInFlight = commandKind === "action";
-        this._launcherInFlight = commandKind === "launcher";
         if (commandKind === "status") {
             this._statusViewState = this._statusLastGood ? "refreshing" : "initializing";
         }
@@ -810,9 +824,7 @@ FlottenmanagementApplet.prototype = {
                 GLib.PRIORITY_DEFAULT,
                 commandKind === "action"
                     ? APPLET_ACTION_TIMEOUT_MILLISECONDS
-                    : commandKind === "launcher"
-                        ? CONTROL_CENTER_LAUNCH_TIMEOUT_MILLISECONDS
-                        : APPLET_STATUS_TIMEOUT_MILLISECONDS,
+                    : APPLET_STATUS_TIMEOUT_MILLISECONDS,
                 () => {
                     if (this._removed) {
                         state.timeoutSource = 0;
@@ -925,17 +937,6 @@ FlottenmanagementApplet.prototype = {
         this._statusActiveGeneration = 0;
         this._statusActiveState = null;
         this._activeStatusProcess = null;
-
-        if (state.commandKind === "launcher") {
-            this._clearStatusBuffers(state);
-            this._launcherInFlight = false;
-            this._statusPendingRefresh = false;
-            if (state.timeoutSource) {
-                GLib.source_remove(state.timeoutSource);
-                state.timeoutSource = 0;
-            }
-            return;
-        }
 
         if (state.commandKind === "action") {
             let actionCompleted = false;

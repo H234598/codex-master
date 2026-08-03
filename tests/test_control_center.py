@@ -151,7 +151,7 @@ class ControlCenterControllerTest(unittest.TestCase):
 
         controller = control_center.OperationController(
             dispatch=dispatch,
-            schedule=lambda callback, *args: callback(*args),
+            schedule=lambda callback, *args: (callback(*args), 1)[1],
         )
         self.assertTrue(controller.submit("agent_status", {"agent": "a1"}, lambda result: (results.append(result), completed.set())))
         self.assertTrue(started.wait(1))
@@ -173,7 +173,7 @@ class ControlCenterControllerTest(unittest.TestCase):
 
         controller = control_center.OperationController(
             dispatch=dispatch,
-            schedule=lambda callback, *args: callback(*args),
+            schedule=lambda callback, *args: (callback(*args), 1)[1],
         )
         self.assertTrue(controller.submit("agent_status", {}, lambda result: (results.append(result), completed.set())))
         self.assertTrue(completed.wait(2))
@@ -261,7 +261,7 @@ class ControlCenterControllerTest(unittest.TestCase):
 
         controller = control_center.OperationController(
             dispatch=CancelDispatch(),
-            schedule=lambda callback, *args: callback(*args),
+            schedule=lambda callback, *args: (callback(*args), 1)[1],
         )
         self.assertTrue(controller.submit("agent_status", {}, lambda _result: completed.set()))
         self.assertTrue(started.wait(1))
@@ -278,7 +278,7 @@ class ControlCenterControllerTest(unittest.TestCase):
         )
         controller = control_center.OperationController(
             dispatch=dispatcher,
-            schedule=lambda callback, *args: callback(*args),
+            schedule=lambda callback, *args: (callback(*args), 1)[1],
         )
         self.assertTrue(controller.submit("agent_status", {}, lambda result: (results.append(result), completed.set())))
         deadline = time.monotonic() + 2
@@ -314,7 +314,7 @@ class ControlCenterControllerTest(unittest.TestCase):
 
         controller = control_center.OperationController(
             dispatch=dispatch,
-            schedule=lambda callback, *args: callback(*args),
+            schedule=lambda callback, *args: (callback(*args), 1)[1],
         )
 
         def callback(_result):
@@ -332,6 +332,32 @@ class ControlCenterControllerTest(unittest.TestCase):
         self.assertFalse(controller.busy)
         self.assertFalse(callback_called.is_set())
         self.assertTrue(controller.close())
+
+    def test_scheduler_registration_failure_releases_controller(self) -> None:
+        for schedule in (
+            lambda _callback, *_args: 0,
+            lambda _callback, *_args: (_ for _ in ()).throw(
+                RuntimeError("injected scheduler failure")
+            ),
+        ):
+            callback_called = threading.Event()
+            controller = control_center.OperationController(
+                dispatch=lambda _name, _args: {"ok": True},
+                schedule=schedule,
+            )
+
+            self.assertTrue(
+                controller.submit(
+                    "agent_status", {}, lambda _result: callback_called.set()
+                )
+            )
+            deadline = time.monotonic() + 2
+            while controller.busy and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            self.assertFalse(controller.busy)
+            self.assertFalse(callback_called.is_set())
+            self.assertTrue(controller.close())
 
     def test_window_close_retries_cancel_then_destroys_after_backend_cleanup(self) -> None:
         class Controller:
@@ -383,6 +409,29 @@ class ControlCenterControllerTest(unittest.TestCase):
         self.assertFalse(view._on_delete(None, None))
         view.GLib.source_remove.assert_called_once_with(9)
         self.assertEqual(view._close_poll_id, 0)
+
+    def test_window_close_does_not_wedge_when_close_timer_registration_fails(self) -> None:
+        for failure in (0, RuntimeError("injected close timer failure")):
+            controller = Mock()
+            controller.close.return_value = False
+            controller.cancel.return_value = True
+            view = control_center.ControlCenterWindow.__new__(
+                control_center.ControlCenterWindow
+            )
+            view.controller = controller
+            view.GLib = Mock()
+            if isinstance(failure, Exception):
+                view.GLib.timeout_add.side_effect = failure
+            else:
+                view.GLib.timeout_add.return_value = failure
+            view.window = Mock()
+            view.status_label = Mock()
+            view.tool_status_label = Mock()
+            view._close_poll_id = 0
+
+            self.assertFalse(view._on_delete(None, None))
+            self.assertEqual(view._close_poll_id, 0)
+            controller.cancel.assert_called_once_with()
 
 
 class ControlCenterCliTest(unittest.TestCase):

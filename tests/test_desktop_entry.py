@@ -216,6 +216,27 @@ class FleetDesktopEntryTest(unittest.TestCase):
 
             self.assertFalse(path.exists())
 
+    def test_desktop_mode_failure_preserves_previous_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "applications" / "fleet.desktop"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"old desktop\n")
+            path.chmod(0o644)
+
+            with (
+                patch(
+                    "codex_master.server.os.fchmod",
+                    side_effect=PermissionError("injected mode failure"),
+                ),
+                self.assertRaisesRegex(server.AgentError, "temp file mode"),
+            ):
+                server.install_fleet_desktop_entry(
+                    Path("/usr/bin/codex-master-mcp"), path
+                )
+
+            self.assertEqual(path.read_bytes(), b"old desktop\n")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+
     def test_keyboard_interrupt_after_replace_restores_previous_absence(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "applications" / "fleet.desktop"
