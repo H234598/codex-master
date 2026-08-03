@@ -157,7 +157,6 @@ class ControlCenterControllerTest(unittest.TestCase):
         self.assertTrue(started.wait(1))
         self.assertTrue(controller.busy)
         self.assertFalse(controller.submit("agent_stop", {"agent": "a1"}, lambda _result: None))
-        self.assertFalse(controller.close())
 
         release.set()
         self.assertTrue(completed.wait(2))
@@ -243,18 +242,31 @@ class ControlCenterControllerTest(unittest.TestCase):
             dispatcher("agent_status", {})
 
     def test_controller_forwards_cancel_to_killable_dispatcher(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        completed = threading.Event()
+
         class CancelDispatch:
+            def prepare(self):
+                return None
+
             def __call__(self, _name, _args):
+                started.set()
+                release.wait(2)
                 return {"ok": True}
 
             def cancel(self):
+                release.set()
                 return True
 
         controller = control_center.OperationController(
             dispatch=CancelDispatch(),
             schedule=lambda callback, *args: callback(*args),
         )
+        self.assertTrue(controller.submit("agent_status", {}, lambda _result: completed.set()))
+        self.assertTrue(started.wait(1))
         self.assertTrue(controller.cancel())
+        self.assertTrue(completed.wait(2))
         self.assertTrue(controller.close())
 
     def test_controller_cancel_terminates_real_child_and_reports_unknown(self) -> None:
@@ -275,6 +287,102 @@ class ControlCenterControllerTest(unittest.TestCase):
         self.assertTrue(completed.wait(2))
         self.assertIn("outcome unknown after cancellation", results[0]["error"])
         self.assertTrue(controller.close())
+
+    def test_subprocess_dispatcher_honors_prepared_cancel_without_poisoning_idle(self) -> None:
+        dispatcher = control_center.SubprocessToolDispatcher(
+            argv=[sys.executable, "-c", "import time; time.sleep(30)"],
+            timeout_seconds=30,
+        )
+
+        self.assertFalse(dispatcher.cancel())
+        dispatcher.prepare()
+        self.assertTrue(dispatcher.cancel())
+        started = time.monotonic()
+        with self.assertRaisesRegex(AgentError, "outcome unknown after cancellation"):
+            dispatcher("agent_status", {})
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_close_state_suppresses_callback_and_followup_dispatch(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        callback_called = threading.Event()
+
+        def dispatch(_name, _args):
+            started.set()
+            release.wait(2)
+            return {"ok": True}
+
+        controller = control_center.OperationController(
+            dispatch=dispatch,
+            schedule=lambda callback, *args: callback(*args),
+        )
+
+        def callback(_result):
+            callback_called.set()
+            controller.submit("agent_stop", {"agent": "a1"}, lambda _next: None)
+
+        self.assertTrue(controller.submit("agent_status", {}, callback))
+        self.assertTrue(started.wait(1))
+        self.assertFalse(controller.close())
+        self.assertFalse(controller.submit("agent_stop", {"agent": "a1"}, lambda _result: None))
+        release.set()
+        deadline = time.monotonic() + 2
+        while controller.busy and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(controller.busy)
+        self.assertFalse(callback_called.is_set())
+        self.assertTrue(controller.close())
+
+    def test_window_close_retries_cancel_then_destroys_after_backend_cleanup(self) -> None:
+        class Controller:
+            busy = True
+            close_calls = 0
+            cancel_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+                return self.close_calls > 1 and not self.busy
+
+            def cancel(self):
+                self.cancel_calls += 1
+                return True
+
+        callbacks = []
+        view = control_center.ControlCenterWindow.__new__(control_center.ControlCenterWindow)
+        view.controller = Controller()
+        view.GLib = Mock()
+        view.GLib.timeout_add.side_effect = lambda _delay, callback: callbacks.append(callback) or 7
+        view.window = Mock()
+        view.status_label = Mock()
+        view.tool_status_label = Mock()
+        view._close_poll_id = 0
+
+        self.assertTrue(view._on_delete(None, None))
+        self.assertEqual(view._close_poll_id, 7)
+        self.assertEqual(view.controller.cancel_calls, 1)
+        self.assertTrue(callbacks[0]())
+        self.assertEqual(view.controller.cancel_calls, 2)
+        view.controller.busy = False
+        self.assertFalse(callbacks[0]())
+        view.window.destroy.assert_called_once_with()
+
+    def test_second_window_close_removes_pending_close_timer(self) -> None:
+        controller = Mock()
+        controller.close.side_effect = [False, True]
+        controller.cancel.return_value = True
+        view = control_center.ControlCenterWindow.__new__(control_center.ControlCenterWindow)
+        view.controller = controller
+        view.GLib = Mock()
+        view.GLib.timeout_add.return_value = 9
+        view.window = Mock()
+        view.status_label = Mock()
+        view.tool_status_label = Mock()
+        view._close_poll_id = 0
+
+        self.assertTrue(view._on_delete(None, None))
+        self.assertFalse(view._on_delete(None, None))
+        view.GLib.source_remove.assert_called_once_with(9)
+        self.assertEqual(view._close_poll_id, 0)
 
 
 class ControlCenterCliTest(unittest.TestCase):

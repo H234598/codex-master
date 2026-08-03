@@ -359,6 +359,20 @@ class SubprocessToolDispatcher:
         self._lock = threading.Lock()
         self._process: subprocess.Popen[bytes] | None = None
         self._cancel_requested = False
+        self._state = "idle"
+
+    def prepare(self) -> None:
+        with self._lock:
+            if self._state != "idle":
+                raise AgentError("control-center backend is busy")
+            self._state = "pending"
+            self._cancel_requested = False
+
+    def abort_prepare(self) -> None:
+        with self._lock:
+            if self._state == "pending":
+                self._state = "idle"
+                self._cancel_requested = False
 
     def _environment(self) -> dict[str, str]:
         allowed = {
@@ -382,18 +396,30 @@ class SubprocessToolDispatcher:
         return env
 
     def __call__(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
-        request = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": tool_name, "arguments": args},
-        }
-        encoded = (json.dumps(request, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
-        if len(encoded) > MAX_BACKEND_STDOUT_BYTES:
-            raise AgentError("control-center backend request exceeded limit")
-        timeout = self._timeout_seconds
-        if timeout is None:
-            timeout = float(backend_timeout_seconds(tool_name, args))
+        try:
+            request = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": args},
+            }
+            encoded = (json.dumps(request, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+            if len(encoded) > MAX_BACKEND_STDOUT_BYTES:
+                raise AgentError("control-center backend request exceeded limit")
+            timeout = self._timeout_seconds
+            if timeout is None:
+                timeout = float(backend_timeout_seconds(tool_name, args))
+        except BaseException:
+            self.abort_prepare()
+            raise
+        with self._lock:
+            if self._state == "idle":
+                self._state = "active"
+                self._cancel_requested = False
+            elif self._state == "pending":
+                self._state = "active"
+            else:
+                raise AgentError("control-center backend is busy")
         process: subprocess.Popen[bytes] | None = None
         cancelled = False
         try:
@@ -407,7 +433,10 @@ class SubprocessToolDispatcher:
             )
             with self._lock:
                 self._process = process
-                self._cancel_requested = False
+                cancel_before_exchange = self._cancel_requested
+            if cancel_before_exchange:
+                self._kill_process_group(process)
+                raise AgentError("control-center backend outcome unknown after cancellation")
             stdout, stderr = self._bounded_exchange(process, encoded, timeout)
         except subprocess.TimeoutExpired as exc:
             if process is not None:
@@ -443,6 +472,7 @@ class SubprocessToolDispatcher:
                 self._cancel_requested = False
                 if self._process is process:
                     self._process = None
+                self._state = "idle"
         if process.returncode != 0:
             if cancelled:
                 raise AgentError("control-center backend outcome unknown after cancellation")
@@ -470,13 +500,14 @@ class SubprocessToolDispatcher:
 
     def cancel(self) -> bool:
         with self._lock:
-            process = self._process
-        if process is None or process.poll() is not None:
-            return False
-        with self._lock:
-            if self._process is not process:
+            if self._state == "idle":
                 return False
+            process = self._process
             self._cancel_requested = True
+        if process is None:
+            return True
+        if process.poll() is not None:
+            return False
         self._kill_process_group(process)
         return True
 
@@ -592,6 +623,7 @@ class OperationController:
         self._lock = threading.Lock()
         self._busy = False
         self._closed = False
+        self._closing = False
         self._generation = 0
 
     @property
@@ -606,12 +638,22 @@ class OperationController:
         callback: Callable[[dict[str, Any]], Any],
     ) -> bool:
         with self._lock:
-            if self._closed or self._busy:
+            if self._closed or self._closing or self._busy:
                 return False
+            prepare = getattr(self._dispatch, "prepare", None)
+            if callable(prepare):
+                prepare()
             self._busy = True
             self._generation += 1
             generation = self._generation
-        future = self._executor.submit(self._execute, tool_name, dict(args))
+            try:
+                future = self._executor.submit(self._execute, tool_name, dict(args))
+            except Exception:
+                abort_prepare = getattr(self._dispatch, "abort_prepare", None)
+                if callable(abort_prepare):
+                    abort_prepare()
+                self._busy = False
+                raise
         future.add_done_callback(lambda done: self._finished(generation, callback, done))
         return True
 
@@ -646,21 +688,28 @@ class OperationController:
             if self._closed or generation != self._generation:
                 return False
             self._busy = False
+            if self._closing:
+                return False
         callback(result)
         return False
 
     def close(self) -> bool:
         with self._lock:
-            if self._busy:
-                return False
             if self._closed:
                 return True
+            if self._busy:
+                self._closing = True
+                return False
             self._closed = True
+            self._closing = True
             self._generation += 1
         self._executor.shutdown(wait=False, cancel_futures=True)
         return True
 
     def cancel(self) -> bool:
+        with self._lock:
+            if not self._busy:
+                return False
         cancel = getattr(self._dispatch, "cancel", None)
         return bool(cancel()) if callable(cancel) else False
 
@@ -720,6 +769,7 @@ class ControlCenterWindow:
         self.tool_inputs: dict[str, tuple[FieldDescriptor, Any, Any, str]] = {}
         self.visible_tools: tuple[ToolDescriptor, ...] = ()
         self.selected_tool: ToolDescriptor | None = None
+        self._close_poll_id = 0
         try:
             self.tool_catalog = compile_catalog(teamleader_tool_catalog())
             self.catalog_error = None
@@ -1205,12 +1255,36 @@ class ControlCenterWindow:
         self.refresh()
 
     def _on_delete(self, _window: Any, _event: Any) -> bool:
-        if not self.controller.close():
+        if self.controller.close():
+            if self._close_poll_id:
+                try:
+                    self.GLib.source_remove(self._close_poll_id)
+                except Exception:
+                    pass
+                self._close_poll_id = 0
+            return False
+        else:
             cancelled = self.controller.cancel()
             detail = "Abbruch angefordert" if cancelled else "warte auf begrenztes Backendzeitlimit"
             self.status_label.set_text(f"Backendoperation läuft; {detail}")
             self.tool_status_label.set_text(f"Backendoperation läuft; {detail}")
+            if not self._close_poll_id:
+                try:
+                    source_id = self.GLib.timeout_add(50, self._poll_close)
+                    self._close_poll_id = source_id if isinstance(source_id, int) and source_id > 0 else 0
+                except Exception:
+                    self._close_poll_id = 0
             return True
+
+    def _poll_close(self) -> bool:
+        if self.controller.busy:
+            self.controller.cancel()
+            return True
+        if not self.controller.close():
+            self.controller.cancel()
+            return True
+        self._close_poll_id = 0
+        self.window.destroy()
         return False
 
 
