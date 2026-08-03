@@ -189,6 +189,9 @@ DEFAULT_TMUX_TIMEOUT_SECONDS = 10
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
 DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS = 10
 RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS = 120
+FLEET_DESKTOP_ENTRY_NAME = "de.teladi.CodexMaster.ControlCenter.desktop"
+MAX_FLEET_DESKTOP_ENTRY_BYTES = 16 * 1024
+FLEET_DESKTOP_COMMAND_RE = re.compile(r"^/[-A-Za-z0-9._+@/ ]+$")
 AGENT_POOL_ROOT = Path(os.environ.get("CODEX_AGENT_POOL_ROOT", "~/.codex-agents")).expanduser()
 POOL_SPEC_FILE = "codex-agent-pool.json"
 POOL_MARKER_FILE = ".codex-agent-pool-installed.json"
@@ -2857,7 +2860,7 @@ def write_private_new_bytes(
         with os.fdopen(fd, "wb") as fh:
             fd = -1
             fh.write(data)
-    except Exception:
+    except BaseException:
         if fd >= 0:
             os.close(fd)
         try:
@@ -11479,11 +11482,423 @@ def doctor() -> dict[str, Any]:
     return {"ok": all(check["ok"] for check in checks), "checks": checks, "raw_output": "not_returned"}
 
 
+def fleet_desktop_entry_path() -> Path:
+    configured = os.environ.get("XDG_DATA_HOME")
+    configured_root = Path(configured).expanduser() if configured else None
+    root = configured_root if configured_root is not None and configured_root.is_absolute() else Path.home() / ".local" / "share"
+    return root / "applications" / FLEET_DESKTOP_ENTRY_NAME
+
+
+def fleet_desktop_entry_bytes(install_path: Path) -> bytes:
+    command = str(install_path)
+    if (
+        not install_path.is_absolute()
+        or not command
+        or not command.isascii()
+        or "=" in command
+        or len(command) > MAX_PATH_TEXT
+        or any(ord(char) < 32 or ord(char) == 127 for char in command)
+        or not FLEET_DESKTOP_COMMAND_RE.fullmatch(command)
+    ):
+        raise AgentError("desktop command path is invalid")
+    return (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=Flottenmanagement\n"
+        "Comment=Codex-Flotte steuern und verwalten\n"
+        f'Exec="{command}" control-center\n'
+        "Icon=utilities-system-monitor\n"
+        "Terminal=false\n"
+        "Categories=System;\n"
+        "StartupNotify=true\n"
+    ).encode("utf-8")
+
+
+def _validate_fleet_desktop_stat(current: os.stat_result) -> None:
+    if (
+        not stat_module.S_ISREG(current.st_mode)
+        or getattr(current, "st_nlink", 1) != 1
+        or current.st_uid != os.getuid()
+        or stat_module.S_IMODE(current.st_mode) & 0o022
+        or current.st_size > MAX_FLEET_DESKTOP_ENTRY_BYTES
+    ):
+        raise AgentError("desktop entry is unsafe")
+
+
+def _fleet_desktop_directory_stat_is_safe(current: Any) -> bool:
+    trusted_owner = current.st_uid in {0, os.getuid()}
+    writable_by_others = stat_module.S_IMODE(current.st_mode) & 0o022
+    sticky = bool(current.st_mode & stat_module.S_ISVTX)
+    return bool(
+        stat_module.S_ISDIR(current.st_mode)
+        and trusted_owner
+        and (not writable_by_others or sticky)
+    )
+
+
+def _open_secure_fleet_desktop_parent_chain(
+    path: Path,
+    expected_stat: os.stat_result,
+) -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(path.anchor, flags)
+        for part in path.parts[1:]:
+            child_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child_fd
+            current = os.fstat(fd)
+            if not _fleet_desktop_directory_stat_is_safe(current):
+                raise AgentError("desktop entry parent is unsafe")
+        opened = os.fstat(fd)
+        if not source_identity_matches(opened, expected_stat):
+            raise AgentError("desktop entry parent changed unexpectedly")
+        result = fd
+        fd = -1
+        return result
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError("desktop entry parent is unsafe") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _open_fleet_desktop_parent(path: Path, *, create: bool) -> int:
+    if not path.is_absolute():
+        raise AgentError("desktop entry parent is unsafe")
+    if create:
+        ensure_directory_chain_no_symlink(path.parent, "desktop entry parent is unsafe")
+    elif not directory_chain_is_real_no_symlink(path.parent):
+        raise AgentError("desktop entry parent is unsafe")
+    try:
+        parent_stat = path.parent.lstat()
+    except OSError as exc:
+        raise AgentError("desktop entry parent is unsafe") from exc
+    if (
+        stat_module.S_ISLNK(parent_stat.st_mode)
+        or not stat_module.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != os.getuid()
+        or stat_module.S_IMODE(parent_stat.st_mode) & 0o022
+    ):
+        raise AgentError("desktop entry parent is unsafe")
+    return _open_secure_fleet_desktop_parent_chain(
+        path.parent,
+        parent_stat,
+    )
+
+
+def _read_fleet_desktop_entry(path: Path) -> tuple[bytes, os.stat_result] | None:
+    try:
+        path.parent.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise AgentError("desktop entry parent is unsafe") from exc
+    if not directory_chain_is_real_no_symlink(path.parent):
+        raise AgentError("desktop entry parent is unsafe")
+    parent_fd = _open_fleet_desktop_parent(path, create=False)
+    fd = -1
+    try:
+        try:
+            current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise AgentError("desktop entry could not be inspected") from exc
+        _validate_fleet_desktop_stat(current)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(path.name, flags, dir_fd=parent_fd)
+            opened = os.fstat(fd)
+            if not source_identity_with_snapshot_matches(opened, current):
+                raise AgentError("desktop entry changed unexpectedly")
+            _validate_fleet_desktop_stat(opened)
+            with os.fdopen(fd, "rb") as fh:
+                fd = -1
+                data = fh.read(MAX_FLEET_DESKTOP_ENTRY_BYTES + 1)
+            latest = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except AgentError:
+            raise
+        except OSError as exc:
+            raise AgentError("desktop entry could not be read") from exc
+        if len(data) > MAX_FLEET_DESKTOP_ENTRY_BYTES:
+            raise AgentError("desktop entry is unsafe")
+        if not source_identity_with_snapshot_matches(latest, opened):
+            raise AgentError("desktop entry changed unexpectedly")
+        return data, latest
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(parent_fd)
+
+
+def _replace_fleet_desktop_entry(
+    path: Path,
+    data: bytes,
+    mode: int,
+    expected_existing_stat: os.stat_result | None,
+) -> None:
+    parent_fd = _open_fleet_desktop_parent(path, create=True)
+    try:
+        replace_private_bytes(
+            Path(f"/proc/self/fd/{parent_fd}") / path.name,
+            data,
+            mode=mode,
+            expected_existing_stat=expected_existing_stat,
+        )
+    finally:
+        os.close(parent_fd)
+
+
+def verify_fleet_desktop_entry(
+    install_path: Path,
+    desktop_path: Path | None = None,
+) -> dict[str, Any]:
+    path = desktop_path or fleet_desktop_entry_path()
+    expected = fleet_desktop_entry_bytes(install_path)
+    current = _read_fleet_desktop_entry(path)
+    ok = bool(
+        current is not None
+        and current[0] == expected
+        and stat_module.S_IMODE(current[1].st_mode) == 0o644
+    )
+    return {"ok": ok, "path": PATH_NOT_RETURNED, "path_state": "set", "raw_output": "not_returned"}
+
+
+def _is_generated_fleet_desktop_entry(data: bytes) -> bool:
+    try:
+        lines = data.decode("ascii").splitlines(keepends=True)
+    except UnicodeDecodeError:
+        return False
+    if len(lines) != 9:
+        return False
+    if lines[:4] != [
+        "[Desktop Entry]\n",
+        "Type=Application\n",
+        "Name=Flottenmanagement\n",
+        "Comment=Codex-Flotte steuern und verwalten\n",
+    ] or lines[5:] != [
+        "Icon=utilities-system-monitor\n",
+        "Terminal=false\n",
+        "Categories=System;\n",
+        "StartupNotify=true\n",
+    ]:
+        return False
+    match = re.fullmatch(r'Exec="([^"\r\n]+)" control-center\n', lines[4])
+    if match is None:
+        return False
+    try:
+        return fleet_desktop_entry_bytes(Path(match.group(1))) == data
+    except AgentError:
+        return False
+
+
+def rollback_fleet_desktop_snapshot(snapshot: dict[str, Any]) -> None:
+    if not snapshot.get("changed"):
+        return
+    if snapshot.get("operation") == "remove":
+        restore_removed_fleet_desktop_entry(snapshot)
+    else:
+        restore_fleet_desktop_entry(snapshot)
+
+
+def restore_fleet_desktop_entry(snapshot: dict[str, Any]) -> None:
+    if not snapshot.get("changed"):
+        return
+    path = snapshot["path"]
+    installed_stat = snapshot["installed_stat"]
+    current = _read_fleet_desktop_entry(path)
+    if current is None or not source_identity_with_snapshot_matches(current[1], installed_stat):
+        raise AgentError("desktop entry changed unexpectedly")
+    previous_data = snapshot["previous_data"]
+    if previous_data is not None:
+        _replace_fleet_desktop_entry(path, previous_data, snapshot["previous_mode"], current[1])
+        restored = _read_fleet_desktop_entry(path)
+        if (
+            restored is None
+            or restored[0] != previous_data
+            or stat_module.S_IMODE(restored[1].st_mode) != snapshot["previous_mode"]
+        ):
+            raise AgentError("desktop entry restore could not be verified")
+        snapshot["changed"] = False
+        return
+    parent_fd = _open_fleet_desktop_parent(path, create=False)
+    try:
+        latest = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not source_identity_with_snapshot_matches(latest, current[1]):
+            raise AgentError("desktop entry changed unexpectedly")
+        os.unlink(path.name, dir_fd=parent_fd)
+    except FileNotFoundError as exc:
+        raise AgentError("desktop entry changed unexpectedly") from exc
+    finally:
+        os.close(parent_fd)
+    snapshot["changed"] = False
+
+
+def install_fleet_desktop_entry(
+    install_path: Path,
+    desktop_path: Path | None = None,
+    *,
+    snapshot_sink: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    snapshot = snapshot_sink if snapshot_sink is not None else {}
+    snapshot.clear()
+    snapshot["changed"] = False
+    path = desktop_path or fleet_desktop_entry_path()
+    expected = fleet_desktop_entry_bytes(install_path)
+    previous = _read_fleet_desktop_entry(path)
+    if (
+        previous is not None
+        and previous[0] == expected
+        and stat_module.S_IMODE(previous[1].st_mode) == 0o644
+    ):
+        return (
+            {"requested": True, "status": "already_installed", "verified": True},
+            snapshot,
+        )
+    snapshot.update(
+        {
+            "changed": True,
+            "operation": "install",
+            "path": path,
+            "previous_data": previous[0] if previous is not None else None,
+            "previous_mode": stat_module.S_IMODE(previous[1].st_mode) if previous is not None else None,
+        }
+    )
+    try:
+        _replace_fleet_desktop_entry(path, expected, 0o644, previous[1] if previous is not None else None)
+        installed = _read_fleet_desktop_entry(path)
+        if installed is None:
+            raise AgentError("desktop entry installation could not be verified")
+        snapshot["installed_stat"] = installed[1]
+        if not verify_fleet_desktop_entry(install_path, path)["ok"]:
+            raise AgentError("desktop entry installation could not be verified")
+    except BaseException:
+        try:
+            current = _read_fleet_desktop_entry(path)
+            previous_unchanged = bool(
+                previous is not None
+                and current is not None
+                and source_identity_with_snapshot_matches(current[1], previous[1])
+                and current[0] == previous[0]
+            )
+            if current is not None and current[0] == expected and stat_module.S_IMODE(current[1].st_mode) == 0o644:
+                snapshot["installed_stat"] = current[1]
+                restore_fleet_desktop_entry(snapshot)
+            elif current is None and previous is not None:
+                _replace_fleet_desktop_entry(path, previous[0], stat_module.S_IMODE(previous[1].st_mode), None)
+                restored = _read_fleet_desktop_entry(path)
+                if (
+                    restored is None
+                    or restored[0] != previous[0]
+                    or stat_module.S_IMODE(restored[1].st_mode) != stat_module.S_IMODE(previous[1].st_mode)
+                ):
+                    raise AgentError("desktop entry restore could not be verified")
+                snapshot["changed"] = False
+            elif not previous_unchanged and not (current is None and previous is None):
+                raise AgentError("desktop entry changed unexpectedly")
+            else:
+                snapshot["changed"] = False
+        except Exception as restore_exc:
+            raise AgentError("could_not_restore_desktop_entry") from restore_exc
+        raise
+    return {"requested": True, "status": "installed", "verified": True}, snapshot
+
+
+def remove_fleet_desktop_entry(
+    install_path: Path,
+    desktop_path: Path | None = None,
+    *,
+    snapshot_sink: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    snapshot = snapshot_sink if snapshot_sink is not None else {}
+    snapshot.clear()
+    snapshot["changed"] = False
+    path = desktop_path or fleet_desktop_entry_path()
+    current = _read_fleet_desktop_entry(path)
+    if current is None:
+        return {"requested": True, "status": "missing"}, snapshot
+    try:
+        expected = fleet_desktop_entry_bytes(install_path)
+    except AgentError as exc:
+        if str(exc) != "desktop command path is invalid" or not _is_generated_fleet_desktop_entry(current[0]):
+            if str(exc) == "desktop command path is invalid":
+                return {"requested": True, "status": "left_in_place_different_content"}, snapshot
+            raise
+        expected = current[0]
+    if current[0] != expected or stat_module.S_IMODE(current[1].st_mode) != 0o644:
+        return {"requested": True, "status": "left_in_place_different_content"}, snapshot
+    snapshot.update(
+        {
+            "changed": True,
+            "operation": "remove",
+            "path": path,
+            "previous_data": current[0],
+            "previous_mode": stat_module.S_IMODE(current[1].st_mode),
+        }
+    )
+    try:
+        parent_fd = _open_fleet_desktop_parent(path, create=False)
+        try:
+            latest = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not source_identity_with_snapshot_matches(latest, current[1]):
+                raise AgentError("desktop entry changed unexpectedly")
+            os.unlink(path.name, dir_fd=parent_fd)
+        except FileNotFoundError as exc:
+            raise AgentError("desktop entry changed unexpectedly") from exc
+        finally:
+            os.close(parent_fd)
+    except BaseException:
+        try:
+            after = _read_fleet_desktop_entry(path)
+            if after is None:
+                restore_removed_fleet_desktop_entry(snapshot)
+            elif not (
+                source_identity_with_snapshot_matches(after[1], current[1])
+                and after[0] == current[0]
+                and stat_module.S_IMODE(after[1].st_mode) == stat_module.S_IMODE(current[1].st_mode)
+            ):
+                raise AgentError("desktop entry changed unexpectedly")
+            else:
+                snapshot["changed"] = False
+        except Exception as restore_exc:
+            raise AgentError("could_not_restore_desktop_entry") from restore_exc
+        raise
+    return {"requested": True, "status": "removed"}, snapshot
+
+
+def restore_removed_fleet_desktop_entry(snapshot: dict[str, Any]) -> None:
+    if not snapshot.get("changed"):
+        return
+    path = snapshot["path"]
+    if _read_fleet_desktop_entry(path) is not None:
+        raise AgentError("desktop entry changed unexpectedly")
+    _replace_fleet_desktop_entry(path, snapshot["previous_data"], snapshot["previous_mode"], None)
+    restored = _read_fleet_desktop_entry(path)
+    if (
+        restored is None
+        or restored[0] != snapshot["previous_data"]
+        or stat_module.S_IMODE(restored[1].st_mode) != snapshot["previous_mode"]
+    ):
+        raise AgentError("desktop entry restore could not be verified")
+    snapshot["changed"] = False
+
+
 def _install_enrolled_unlocked(
     register: bool = True,
     force: bool = False,
     install_path: Path = DEFAULT_INSTALL_PATH,
     sync_plugin_cache: bool = True,
+    install_desktop: bool = False,
 ) -> dict[str, Any]:
     wrapper = repo_wrapper_path()
     if not path_present_no_follow(wrapper):
@@ -11548,7 +11963,28 @@ def _install_enrolled_unlocked(
     registration_removed = False
     registration_added = False
     startup_timeout_snapshot: dict[str, Any] | None = None
+    desktop_install: dict[str, Any] = {"requested": install_desktop, "status": "skipped", "verified": False}
+    desktop_snapshot: dict[str, Any] | None = {"changed": False} if install_desktop else None
     try:
+        if install_desktop:
+            try:
+                desktop_install, _ = install_fleet_desktop_entry(
+                    install_path,
+                    snapshot_sink=desktop_snapshot,
+                )
+            except AgentError as exc:
+                if str(exc) != "desktop command path is invalid":
+                    raise
+                stale_entry, _ = remove_fleet_desktop_entry(
+                    install_path,
+                    snapshot_sink=desktop_snapshot,
+                )
+                desktop_install = {
+                    "requested": True,
+                    "status": "skipped_unsupported_command_path",
+                    "verified": False,
+                    "stale_entry": stale_entry["status"],
+                }
         if register:
             startup_self_test = {"requested": True, **mcp_command_startup_self_test(install_path)}
             if not startup_self_test["ok"]:
@@ -11603,6 +12039,7 @@ def _install_enrolled_unlocked(
     except BaseException:
         mcp_restore_error: Exception | None = None
         config_restore_error: Exception | None = None
+        desktop_restore_error: Exception | None = None
         if registration_added or registration_removed:
             try:
                 if registration_added:
@@ -11620,6 +12057,11 @@ def _install_enrolled_unlocked(
                 restore_mcp_startup_timeout_snapshot(startup_timeout_snapshot)
             except Exception as restore_exc:
                 config_restore_error = restore_exc
+        if desktop_snapshot is not None:
+            try:
+                rollback_fleet_desktop_snapshot(desktop_snapshot)
+            except Exception as restore_exc:
+                desktop_restore_error = restore_exc
         rollback_install = symlink_status != "already_installed" and (
             not previous_install_present or previous_install_target_text is not None
         )
@@ -11637,6 +12079,8 @@ def _install_enrolled_unlocked(
             raise AgentError("could_not_restore_mcp_registration") from mcp_restore_error
         if config_restore_error is not None:
             raise AgentError("could_not_restore_codex_config") from config_restore_error
+        if desktop_restore_error is not None:
+            raise AgentError("could_not_restore_desktop_entry") from desktop_restore_error
         raise
     return {
         "ok": True,
@@ -11649,6 +12093,7 @@ def _install_enrolled_unlocked(
         "startup_self_test": startup_self_test,
         "mcp": registration,
         "plugin_cache_install": plugin_cache_install,
+        "desktop_entry": desktop_install,
         "raw_output": "not_returned",
     }
 
@@ -11658,6 +12103,7 @@ def _install_unlocked(
     force: bool = False,
     install_path: Path = DEFAULT_INSTALL_PATH,
     sync_plugin_cache: bool = True,
+    install_desktop: bool = False,
 ) -> dict[str, Any]:
     enrollment: dict[str, Any] | None = None
     if register:
@@ -11669,6 +12115,7 @@ def _install_unlocked(
             force=force,
             install_path=install_path,
             sync_plugin_cache=sync_plugin_cache,
+            install_desktop=install_desktop,
         )
     except BaseException:
         if enrollment is not None and enrollment.get("changed"):
@@ -11684,6 +12131,7 @@ def install(
     force: bool = False,
     install_path: Path = DEFAULT_INSTALL_PATH,
     sync_plugin_cache: bool = True,
+    install_desktop: bool = False,
 ) -> dict[str, Any]:
     with install_lock():
         return _install_unlocked(
@@ -11691,6 +12139,7 @@ def install(
             force=force,
             install_path=install_path,
             sync_plugin_cache=sync_plugin_cache,
+            install_desktop=install_desktop,
         )
 
 
@@ -11698,6 +12147,7 @@ def _uninstall_unlocked(
     unregister: bool = True,
     remove_symlink: bool = False,
     install_path: Path = DEFAULT_INSTALL_PATH,
+    remove_desktop: bool = False,
 ) -> dict[str, Any]:
     install_path = normalize_install_path(install_path)
     mcp_status = "skipped"
@@ -11706,6 +12156,8 @@ def _uninstall_unlocked(
     wrapper: Path | None = None
     symlink_removed = False
     registration_removed = False
+    desktop_removal: dict[str, Any] = {"requested": remove_desktop, "status": "skipped"}
+    desktop_snapshot: dict[str, Any] | None = {"changed": False} if remove_desktop else None
     if remove_symlink:
         wrapper = repo_wrapper_path()
         try:
@@ -11727,6 +12179,11 @@ def _uninstall_unlocked(
             symlink_removed = symlink_status == "removed"
 
     try:
+        if remove_desktop:
+            desktop_removal, _ = remove_fleet_desktop_entry(
+                install_path,
+                snapshot_sink=desktop_snapshot,
+            )
         if unregister:
             current = check_mcp_registration(install_path)
             if current.get("lookup_status") == "unavailable":
@@ -11748,6 +12205,12 @@ def _uninstall_unlocked(
             teamleader_status = "removed" if revoked["changed"] else "not_registered"
     except BaseException:
         symlink_restore_error: Exception | None = None
+        desktop_restore_error: Exception | None = None
+        if desktop_snapshot is not None:
+            try:
+                rollback_fleet_desktop_snapshot(desktop_snapshot)
+            except Exception as restore_exc:
+                desktop_restore_error = restore_exc
         if symlink_removed and wrapper is not None and expected_parent_stat is not None:
             try:
                 if install_path.exists() or install_path.is_symlink():
@@ -11771,6 +12234,8 @@ def _uninstall_unlocked(
             raise AgentError("could_not_restore_mcp_registration") from registration_restore_error
         if symlink_restore_error is not None:
             raise AgentError("could_not_restore_install_symlink") from symlink_restore_error
+        if desktop_restore_error is not None:
+            raise AgentError("could_not_restore_desktop_entry") from desktop_restore_error
         raise
 
     return {
@@ -11778,6 +12243,7 @@ def _uninstall_unlocked(
         "mcp": mcp_status,
         "symlink": symlink_status,
         "teamleader": teamleader_status,
+        "desktop_entry": desktop_removal,
         "raw_output": "not_returned",
     }
 
@@ -11786,12 +12252,14 @@ def uninstall(
     unregister: bool = True,
     remove_symlink: bool = False,
     install_path: Path = DEFAULT_INSTALL_PATH,
+    remove_desktop: bool = False,
 ) -> dict[str, Any]:
     with install_lock():
         return _uninstall_unlocked(
             unregister=unregister,
             remove_symlink=remove_symlink,
             install_path=install_path,
+            remove_desktop=remove_desktop,
         )
 
 
@@ -15938,6 +16406,7 @@ def main_cli(argv: list[str]) -> int:
                     force=args.force,
                     install_path=Path(args.path),
                     sync_plugin_cache=not args.no_plugin_cache,
+                    install_desktop=True,
                 )
             )
         if args.command == "uninstall":
@@ -15946,6 +16415,7 @@ def main_cli(argv: list[str]) -> int:
                     unregister=not args.keep_registration,
                     remove_symlink=args.remove_symlink,
                     install_path=Path(args.path),
+                    remove_desktop=args.remove_symlink,
                 )
             )
         if args.command == "doctor":
