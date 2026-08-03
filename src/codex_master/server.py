@@ -15014,7 +15014,7 @@ def _fleet_reconcile_commit_exception(
         return "planned", reloaded
     if reloaded == current:
         return "current", reloaded
-    raise AgentError("fleet_registry_commit_diverged")
+    return "diverged", reloaded
 
 
 def _fleet_tmux_state(session: str) -> str:
@@ -15133,6 +15133,29 @@ def _fleet_managed_home_state(
         raise AgentError("fleet_home_content_invalid") from exc
     finally:
         os.close(home_fd)
+
+
+def _fleet_validate_materialized_series_homes(
+    snapshot: FleetSnapshot,
+    series: FleetSeries,
+) -> None:
+    inventory = build_inventory(snapshot, AGENT_POOL_ROOT)
+    with pool_root_lock(AGENT_POOL_ROOT):
+        present_ids = _fleet_plan_materialized_ids(series.prefix, series.count)
+        if not present_ids:
+            return
+        with pool_root_operation(
+            AGENT_POOL_ROOT,
+            ensure=False,
+            error_text="fleet_home_state_unknown",
+            require_private=True,
+        ) as root:
+            for agent_id in sorted(present_ids):
+                _fleet_managed_home_state(
+                    root,
+                    inventory.agents[agent_id],
+                    strict_contents=True,
+                )
 
 
 @contextlib.contextmanager
@@ -15258,6 +15281,16 @@ def _fleet_restore_tombstones(staged: list[dict[str, Any]]) -> bool:
     return True
 
 
+def _fleet_restore_registered_tombstones(
+    staged: list[dict[str, Any]],
+    authoritative: FleetSnapshot,
+) -> bool:
+    registered_ids = set(build_inventory(authoritative, AGENT_POOL_ROOT).agent_ids)
+    return _fleet_restore_tombstones(
+        [item for item in staged if item["agent"].agent_id in registered_ids]
+    )
+
+
 def _fleet_stage_tombstones(
     inventory: InventorySnapshot,
     agent_ids_to_remove: list[str],
@@ -15353,10 +15386,20 @@ def _fleet_reserve_absent_homes(agent_ids: list[str]) -> list[dict[str, Any]]:
                     staging = f"{FLEET_TOMBSTONE_PREFIX}reservation-{uuid.uuid4().hex}"
                     try:
                         os.mkdir(staging, 0o700, dir_fd=root_fd)
+                        reservation: dict[str, Any] = {
+                            "agent_id": agent_id,
+                            "entry_name": staging,
+                            "home_stat": None,
+                        }
+                        reservations.append(reservation)
                         home_stat = os.stat(staging, dir_fd=root_fd, follow_symlinks=False)
+                        reservation["home_stat"] = home_stat
                     except OSError as exc:
                         raise AgentError("fleet_registry_delete_reservation_failed") from exc
-                    reservation = {"agent_id": agent_id, "home_stat": home_stat}
+
+                    def mark_reserved(item: dict[str, Any] = reservation) -> None:
+                        item["entry_name"] = item["agent_id"]
+
                     _fleet_rename_noreplace_at(
                         root_fd,
                         staging,
@@ -15364,13 +15407,13 @@ def _fleet_reserve_absent_homes(agent_ids: list[str]) -> list[dict[str, Any]]:
                         home_stat,
                         "fleet_registry_delete_reservation_failed",
                         collision_text="fleet_registry_delete_raced",
-                        committed=lambda item=reservation: reservations.append(item),
+                        committed=mark_reserved,
                     )
             finally:
                 os.close(root_fd)
     except Exception:
-        if reservations:
-            _fleet_release_reservations(reservations)
+        if reservations and not _fleet_release_reservations(reservations):
+            raise AgentError("fleet_registry_delete_reservation_diverged") from None
         raise
     return reservations
 
@@ -15389,16 +15432,24 @@ def _fleet_release_reservations(reservations: list[dict[str, Any]]) -> bool:
             root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
             try:
                 for item in reservations:
+                    entry_name = item.get("entry_name", item["agent_id"])
+                    expected_home = item.get("home_stat")
+                    if expected_home is None:
+                        clean = False
+                        continue
                     try:
                         current = os.stat(
-                            item["agent_id"],
+                            entry_name,
                             dir_fd=root_fd,
                             follow_symlinks=False,
                         )
                     except OSError:
                         clean = False
                         continue
-                    if not source_identity_matches(current, item["home_stat"]):
+                    if not source_identity_matches(current, expected_home):
+                        clean = False
+                        continue
+                    if entry_name != item["agent_id"]:
                         clean = False
                         continue
                     try:
@@ -15453,6 +15504,9 @@ def _fleet_compensate_registry_delete(
         )
     except Exception:
         state, reloaded = _fleet_reconcile_commit_exception(service, deleted, replacement)
+        if state == "diverged":
+            _fleet_publish_stored(service, reloaded)
+            raise AgentError("fleet_registry_delete_diverged") from None
         if state != "planned":
             raise AgentError("fleet_registry_delete_diverged") from None
         restored = reloaded
@@ -15477,6 +15531,11 @@ def _fleet_commit_staged_removal(
         if state == "planned":
             _fleet_publish_stored(service, reloaded)
             raise AgentError("fleet_registry_commit_failed_after_cas") from None
+        if state == "diverged":
+            if not _fleet_restore_registered_tombstones(staged, reloaded):
+                raise AgentError("fleet_tombstone_rollback_diverged") from None
+            _fleet_publish_stored(service, reloaded)
+            raise AgentError("fleet_registry_commit_diverged") from None
         if not _fleet_restore_tombstones(staged):
             raise AgentError("fleet_tombstone_rollback_diverged") from None
         if isinstance(exc, FleetConflictError):
@@ -15809,6 +15868,11 @@ def _fleet_apply_managed_update(
                 except AgentError:
                     raise AgentError("fleet_executable_changed_after_cas") from None
                 raise AgentError("fleet_registry_commit_failed_after_cas") from None
+            if state == "diverged":
+                if staged and not _fleet_restore_registered_tombstones(staged, reloaded):
+                    raise AgentError("fleet_tombstone_rollback_diverged") from None
+                _fleet_publish_stored(service, reloaded)
+                raise AgentError("fleet_registry_commit_diverged") from None
             if not rollback():
                 raise AgentError("fleet_update_rollback_diverged") from None
             if isinstance(exc, FleetConflictError):
@@ -15906,6 +15970,7 @@ def fleet_series_apply(
         )
     )
     if registry_only:
+        _fleet_validate_materialized_series_homes(planned, candidate)
         try:
             stored = service.commit_snapshot(planned, expected_generation=expected_generation)
         except Exception as exc:
@@ -15913,6 +15978,9 @@ def fleet_series_apply(
             if state == "planned":
                 _fleet_publish_stored(service, reloaded)
                 raise AgentError("fleet_registry_commit_failed_after_cas") from None
+            if state == "diverged":
+                _fleet_publish_stored(service, reloaded)
+                raise AgentError("fleet_registry_commit_diverged") from None
             if isinstance(exc, FleetConflictError):
                 raise AgentError("generation_conflict") from None
             raise AgentError("fleet_registry_commit_failed") from None
@@ -16023,6 +16091,11 @@ def fleet_series_apply(
                     except AgentError:
                         raise AgentError("fleet_executable_changed_after_cas") from None
                 raise AgentError("fleet_registry_commit_failed_after_cas") from None
+            if state == "diverged":
+                if staged and not _fleet_restore_registered_tombstones(staged, reloaded):
+                    raise AgentError("fleet_tombstone_rollback_diverged") from None
+                _fleet_publish_stored(service, reloaded)
+                raise AgentError("fleet_registry_commit_diverged") from None
             clean = _fleet_rollback_created(created)
             if staged and not _fleet_restore_tombstones(staged):
                 clean = False
@@ -16073,6 +16146,8 @@ def fleet_series_disable(*, prefix: str, expected_generation: int) -> dict[str, 
             expected_generation=expected_generation,
         )
         build_inventory(planned, AGENT_POOL_ROOT)
+        planned_series = next(item for item in planned.series if item.prefix == prefix)
+        _fleet_validate_materialized_series_homes(planned, planned_series)
     except FleetValidationError as exc:
         raise AgentError(str(exc)) from None
     except AgentError:
@@ -16086,6 +16161,9 @@ def fleet_series_disable(*, prefix: str, expected_generation: int) -> dict[str, 
         if state == "planned":
             _fleet_publish_stored(service, reloaded)
             raise AgentError("fleet_registry_commit_failed_after_cas") from None
+        if state == "diverged":
+            _fleet_publish_stored(service, reloaded)
+            raise AgentError("fleet_registry_commit_diverged") from None
         if isinstance(exc, FleetConflictError):
             raise AgentError("generation_conflict") from None
         raise AgentError("fleet_registry_commit_failed") from None
@@ -16130,26 +16208,28 @@ def fleet_series_delete(
     present_ids = _fleet_plan_materialized_ids(prefix, existing.count)
     if not present_ids:
         reservations = _fleet_reserve_absent_homes(expected_ids)
+        stored: FleetSnapshot | None = None
         try:
-            stored = service.commit_snapshot(planned, expected_generation=expected_generation)
-        except Exception as exc:
-            state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
-            if state == "planned":
-                _fleet_publish_stored(service, reloaded)
-                if not _fleet_release_reservations(reservations):
-                    _fleet_compensate_registry_delete(service, current, reloaded)
-                    raise AgentError("fleet_registry_delete_raced") from None
-                raise AgentError("fleet_registry_commit_failed_after_cas") from None
-            released = _fleet_release_reservations(reservations)
-            if not released:
+            try:
+                stored = service.commit_snapshot(planned, expected_generation=expected_generation)
+            except Exception as exc:
+                state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
+                if state == "planned":
+                    stored = reloaded
+                    _fleet_publish_stored(service, reloaded)
+                    raise AgentError("fleet_registry_commit_failed_after_cas") from None
+                if state == "diverged":
+                    _fleet_publish_stored(service, reloaded)
+                    raise AgentError("fleet_registry_commit_diverged") from None
+                if isinstance(exc, FleetConflictError):
+                    raise AgentError("generation_conflict") from None
+                raise AgentError("fleet_registry_commit_failed") from None
+            _fleet_publish_stored(service, stored)
+        finally:
+            if not _fleet_release_reservations(reservations):
+                if stored == planned:
+                    _fleet_compensate_registry_delete(service, current, stored)
                 raise AgentError("fleet_registry_delete_raced") from None
-            if isinstance(exc, FleetConflictError):
-                raise AgentError("generation_conflict") from None
-            raise AgentError("fleet_registry_commit_failed") from None
-        _fleet_publish_stored(service, stored)
-        if not _fleet_release_reservations(reservations):
-            _fleet_compensate_registry_delete(service, current, stored)
-            raise AgentError("fleet_registry_delete_raced") from None
         return {
             "mutation_performed": True,
             "generation": stored.generation,
