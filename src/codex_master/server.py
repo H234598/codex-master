@@ -15378,6 +15378,51 @@ def _fleet_publish_stored(service: FleetService, stored: FleetSnapshot) -> None:
         raise AgentError("fleet_inventory_publish_failed") from None
 
 
+def _fleet_publish_recovery_commit(
+    service: FleetService,
+    stored: FleetSnapshot,
+    transaction: _FleetRecoveryTransaction | None,
+) -> None:
+    if transaction is None:
+        _fleet_publish_stored(service, stored)
+        return
+    try:
+        authoritative = service.load()
+    except Exception:
+        raise AgentError("fleet_inventory_publish_failed") from None
+    if authoritative.generation != stored.generation:
+        raise AgentError("fleet_inventory_publish_failed")
+    if transaction.journal.phase is RecoveryPhase.MATERIALIZING:
+        transaction.advance(RecoveryPhase.CAS_PENDING)
+    if transaction.journal.phase is RecoveryPhase.CAS_PENDING:
+        transaction.advance(
+            RecoveryPhase.RECONCILING,
+            authoritative_generation=authoritative.generation,
+        )
+    if transaction.journal.phase is RecoveryPhase.RECONCILING:
+        if not _fleet_verify_authoritative_materialization(
+            authoritative,
+            transaction.journal,
+        ):
+            raise AgentError("fleet_inventory_publish_failed")
+        transaction.advance(
+            RecoveryPhase.VERIFIED,
+            authoritative_generation=authoritative.generation,
+        )
+    if transaction.journal.phase is not RecoveryPhase.VERIFIED:
+        raise AgentError("fleet_inventory_publish_failed")
+    with _fleet_active_recovery_transaction(transaction):
+        _fleet_publish_stored(service, authoritative)
+    transaction.advance(
+        RecoveryPhase.PUBLISHED,
+        authoritative_generation=authoritative.generation,
+    )
+    transaction.advance(
+        RecoveryPhase.COMPLETE,
+        authoritative_generation=authoritative.generation,
+    )
+
+
 def _fleet_reconcile_commit_exception(
     service: FleetService,
     current: FleetSnapshot,
@@ -15655,7 +15700,31 @@ def _fleet_verify_authoritative_materialization(
         if action.kind is RecoveryActionKind.RETAIN_QUARANTINE:
             continue
         if action.kind is RecoveryActionKind.RELEASE_RESERVATION:
-            if _fleet_private_directory_exists(AGENT_POOL_ROOT / entry.agent_id):
+            reservation = AGENT_POOL_ROOT / entry.agent_id
+            try:
+                reservation_stat = reservation.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+            if (
+                entry.target_identity is None
+                or not source_identity_matches(reservation_stat, entry.target_identity)
+            ):
+                return False
+            try:
+                reservation_fd = open_directory_no_follow_matching(
+                    reservation,
+                    reservation_stat,
+                    error_text="fleet_registry_delete_reservation_diverged",
+                    changed_text="fleet_registry_delete_reservation_diverged",
+                )
+                try:
+                    if os.listdir(reservation_fd):
+                        return False
+                finally:
+                    os.close(reservation_fd)
+            except (AgentError, OSError):
                 return False
             continue
         if action.descriptor_state is DescriptorState.NEW:
@@ -16267,6 +16336,12 @@ def _fleet_reserve_absent_homes(
                         collision_text="fleet_registry_delete_raced",
                         committed=mark_reserved,
                     )
+                    if transaction is not None and staging_index is not None:
+                        transaction.record_entry_phase(
+                            staging_index,
+                            EntryPhase.PUBLIC,
+                            target_identity=_snapshot_file_identity(home_stat),
+                        )
             finally:
                 os.close(root_fd)
     except Exception:
@@ -16389,15 +16464,24 @@ def _fleet_commit_staged_removal(
         transaction=transaction,
         planned_tombstones=planned_tombstones,
     )
+    if transaction is not None:
+        transaction.advance(RecoveryPhase.CAS_PENDING)
     try:
         stored = service.commit_snapshot(planned, expected_generation=expected_generation)
     except Exception as exc:
         state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
         if state == "planned":
             staged = []
-            _fleet_publish_stored(service, reloaded)
+            _fleet_publish_recovery_commit(service, reloaded, transaction)
+            if transaction is not None:
+                _fleet_remove_complete_recovery_journal(transaction.journal)
             raise AgentError("fleet_registry_commit_failed_after_cas") from None
         if state == "diverged":
+            if transaction is not None:
+                transaction.advance(
+                    RecoveryPhase.RECONCILING,
+                    authoritative_generation=reloaded.generation,
+                )
             reconciled = _fleet_reconcile_divergent_materialization(
                 current,
                 planned,
@@ -16407,7 +16491,9 @@ def _fleet_commit_staged_removal(
             )
             if not reconciled:
                 raise AgentError("fleet_registry_commit_diverged") from None
-            _fleet_publish_stored(service, reloaded)
+            _fleet_publish_recovery_commit(service, reloaded, transaction)
+            if transaction is not None:
+                _fleet_remove_complete_recovery_journal(transaction.journal)
             staged = []
             raise AgentError("fleet_registry_commit_diverged") from None
         if not _fleet_restore_tombstones(staged):
@@ -16418,7 +16504,7 @@ def _fleet_commit_staged_removal(
             raise AgentError("generation_conflict") from None
         staged = []
         raise AgentError("fleet_registry_commit_failed") from None
-    _fleet_publish_stored(service, stored)
+    _fleet_publish_recovery_commit(service, stored, transaction)
     try:
         cleanup_pending = _fleet_cleanup_tombstones(staged)
     except Exception:
@@ -16595,9 +16681,16 @@ def _fleet_reconcile_divergent_materialization(
     if transaction is None:
         return False
 
-    entries = tuple(transaction.journal.entries)
+    try:
+        persisted = _fleet_load_recovery_journal(transaction.paths)
+    except AgentError:
+        return False
+    if persisted is None:
+        return False
+    entries = tuple(persisted.entries)
     if not entries:
-        return True
+        return False
+    transaction.journal = persisted
 
     authoritative_inventory = build_inventory(authoritative, AGENT_POOL_ROOT)
     authoritative_fingerprints = {
@@ -16609,7 +16702,7 @@ def _fleet_reconcile_divergent_materialization(
         for entry in entries
         for agent_id in [entry.agent_id]
     }
-    plan = plan_reconciliation(transaction.journal, authoritative_fingerprints)
+    plan = plan_reconciliation(persisted, authoritative_fingerprints)
     errors, blocking = _fleet_execute_recovery_plan(
         transaction,
         plan,
@@ -17479,6 +17572,7 @@ def fleet_series_delete(
         build_inventory(planned, AGENT_POOL_ROOT)
         present_ids = _fleet_plan_materialized_ids(prefix, existing.count)
         if not present_ids:
+            old_inventory = build_inventory(current, AGENT_POOL_ROOT)
             planned_tombstones: dict[str, tuple[str, int]] = {}
             prepared_entries: list[RecoveryEntry] = []
             for agent_id in expected_ids:
@@ -17487,10 +17581,12 @@ def fleet_series_delete(
                 planned_tombstones[agent_id] = (hidden_name, entry_index)
                 prepared_entries.append(
                     RecoveryEntry(
-                        kind=MutationKind.TOMBSTONE,
+                        kind=MutationKind.RESERVATION,
                         agent_id=agent_id,
                         hidden_name=hidden_name,
-                        old_descriptor_fingerprint=None,
+                        old_descriptor_fingerprint=descriptor_fingerprint(
+                            old_inventory.agents[agent_id]
+                        ),
                         new_descriptor_fingerprint=None,
                         old_materialization_fingerprint=None,
                         new_materialization_fingerprint=None,
@@ -17513,6 +17609,7 @@ def fleet_series_delete(
                 transaction=active_tx,
                 planned_reservations=planned_tombstones,
             )
+            active_tx.advance(RecoveryPhase.CAS_PENDING)
             stored: FleetSnapshot | None = None
             try:
                 try:
@@ -17521,7 +17618,7 @@ def fleet_series_delete(
                     state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
                     if state == "planned":
                         stored = reloaded
-                        _fleet_publish_stored(service, reloaded)
+                        _fleet_publish_recovery_commit(service, reloaded, active_tx)
                         raise AgentError("fleet_registry_commit_failed_after_cas") from None
                     if state == "diverged":
                         descriptor_states = _fleet_descriptor_reconciliation_states(
@@ -17541,37 +17638,19 @@ def fleet_series_delete(
                             for descriptor_state in descriptor_states.values()
                         ):
                             raise AgentError("fleet_registry_commit_diverged") from None
-                        _fleet_publish_stored(service, reloaded)
+                        _fleet_publish_recovery_commit(service, reloaded, active_tx)
                         raise AgentError("fleet_registry_commit_diverged") from None
                     if isinstance(exc, FleetConflictError):
                         raise AgentError("generation_conflict") from None
                     raise AgentError("fleet_registry_commit_failed") from None
-                _fleet_publish_stored(service, stored)
-                if active_tx.journal.phase is RecoveryPhase.MATERIALIZING:
-                    active_tx.advance(RecoveryPhase.CAS_PENDING)
-                if active_tx.journal.phase is RecoveryPhase.CAS_PENDING:
-                    active_tx.advance(
-                        RecoveryPhase.RECONCILING,
-                        authoritative_generation=stored.generation,
-                    )
-                active_tx.advance(
-                    RecoveryPhase.VERIFIED,
-                    authoritative_generation=stored.generation,
-                )
-                active_tx.advance(
-                    RecoveryPhase.PUBLISHED,
-                    authoritative_generation=stored.generation,
-                )
-                active_tx.advance(
-                    RecoveryPhase.COMPLETE,
-                    authoritative_generation=stored.generation,
-                )
-                _fleet_remove_complete_recovery_journal(active_tx.journal)
+                _fleet_publish_recovery_commit(service, stored, active_tx)
             finally:
                 if not _fleet_release_reservations(reservations):
                     if stored == planned:
                         _fleet_compensate_registry_delete(service, current, stored)
                     raise AgentError("fleet_registry_delete_raced") from None
+                if active_tx.journal.phase is RecoveryPhase.COMPLETE:
+                    _fleet_remove_complete_recovery_journal(active_tx.journal)
             return {
                 "mutation_performed": True,
                 "generation": stored.generation,
@@ -17622,16 +17701,6 @@ def fleet_series_delete(
             planned_tombstones=planned_tombstones,
             transaction=active_tx,
         )
-        if active_tx.journal.phase is RecoveryPhase.MATERIALIZING:
-            active_tx.advance(RecoveryPhase.CAS_PENDING)
-        if active_tx.journal.phase is RecoveryPhase.CAS_PENDING:
-            active_tx.advance(
-                RecoveryPhase.RECONCILING,
-                authoritative_generation=stored.generation,
-            )
-        active_tx.advance(RecoveryPhase.VERIFIED, authoritative_generation=stored.generation)
-        active_tx.advance(RecoveryPhase.PUBLISHED, authoritative_generation=stored.generation)
-        active_tx.advance(RecoveryPhase.COMPLETE, authoritative_generation=stored.generation)
         _fleet_remove_complete_recovery_journal(active_tx.journal)
         return {
             "mutation_performed": True,

@@ -5262,11 +5262,15 @@ class ServerHelpersTest(unittest.TestCase):
                         )
                 stored = service.load()
                 inventory = server_module.current_agent_inventory()
+                recovery = server_module._fleet_load_recovery_journal(
+                    server_module.FleetPaths.from_state_root(state)
+                )
 
             self.assertEqual(stored.generation, 3)
             self.assertEqual(stored.series, ())
             self.assertEqual(inventory.agent_ids, ())
             self.assertFalse((pool / "d1").exists())
+            self.assertIsNone(recovery)
 
     def test_fleet_shrink_restores_staged_home_for_same_old_authoritative_descriptor(self) -> None:
         from codex_master.fleet_service import FleetConflictError
@@ -5843,14 +5847,21 @@ class ServerHelpersTest(unittest.TestCase):
             executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
             executable.chmod(0o700)
             stopped = subprocess.CompletedProcess([], 1, "", "")
-            observed: list[str] = []
+            observed: list[tuple[Any, Any, Any]] = []
 
             def inspect_then_mkdir(path: Path | str, mode: int = 0o777, *, dir_fd=None):
                 name = Path(path).name
                 if name.startswith(f"{server_module.FLEET_TOMBSTONE_PREFIX}reservation-"):
                     journal = server_module._fleet_load_recovery_journal()
                     self.assertIsNotNone(journal)
-                    observed.append(journal.entries[0].phase.value)
+                    entry = journal.entries[0]
+                    recovery_plan = server_module.plan_reconciliation(
+                        journal,
+                        {"d1": None},
+                    )
+                    observed.append(
+                        (entry.phase, entry.kind, recovery_plan.actions[0].kind)
+                    )
                 return real_mkdir(path, mode, dir_fd=dir_fd)
 
             real_mkdir = server_module.os.mkdir
@@ -5882,7 +5893,134 @@ class ServerHelpersTest(unittest.TestCase):
                     yes=True,
                 )
 
-            self.assertEqual(observed[0], server_module.EntryPhase.INTENT.value)
+            self.assertEqual(
+                observed[0],
+                (
+                    server_module.EntryPhase.INTENT,
+                    server_module.MutationKind.RESERVATION,
+                    server_module.RecoveryActionKind.RELEASE_RESERVATION,
+                ),
+            )
+
+    def test_fleet_series_delete_absent_publishes_verified_before_complete_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            publish_phases: list[Any] = []
+            cleanup_phases: list[Any] = []
+
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d",
+                    count=1,
+                    runner="codex_cli",
+                    provider="ollama_local",
+                    model="local",
+                    account_id=None,
+                    expected_generation=1,
+                    codex_executable=executable,
+                )
+                server_module.fleet_series_disable(prefix="d", expected_generation=2)
+                shutil.rmtree(pool / "d1")
+                real_publish = server_module.publish_agent_inventory
+                real_cleanup = server_module._fleet_release_reservations
+
+                def publish(inventory):
+                    journal = server_module._fleet_load_recovery_journal()
+                    publish_phases.append(None if journal is None else journal.phase)
+                    real_publish(inventory)
+
+                def cleanup(reservations):
+                    journal = server_module._fleet_load_recovery_journal()
+                    cleanup_phases.append(None if journal is None else journal.phase)
+                    return real_cleanup(reservations)
+
+                with patch.object(
+                    server_module,
+                    "publish_agent_inventory",
+                    side_effect=publish,
+                ), patch.object(
+                    server_module,
+                    "_fleet_release_reservations",
+                    side_effect=cleanup,
+                ):
+                    server_module.fleet_series_delete(
+                        prefix="d",
+                        expected_generation=3,
+                        confirmed_remove_ids=["d1"],
+                        yes=True,
+                    )
+
+            self.assertEqual(publish_phases, [server_module.RecoveryPhase.VERIFIED])
+            self.assertEqual(cleanup_phases, [server_module.RecoveryPhase.COMPLETE])
+
+    def test_fleet_series_delete_present_publishes_verified_before_complete_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            publish_phases: list[Any] = []
+            cleanup_phases: list[Any] = []
+
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None), patch.object(
+                server_module, "agent_lease_status", return_value={"state": "unclaimed"}
+            ), patch.object(server_module, "run_tmux", return_value=stopped), patch.object(
+                server_module, "pool_home_processes", return_value=[]
+            ):
+                server_module.fleet_series_apply(
+                    prefix="d",
+                    count=1,
+                    runner="codex_cli",
+                    provider="ollama_local",
+                    model="local",
+                    account_id=None,
+                    expected_generation=1,
+                    codex_executable=executable,
+                )
+                server_module.fleet_series_disable(prefix="d", expected_generation=2)
+                real_publish = server_module.publish_agent_inventory
+                real_cleanup = server_module._fleet_cleanup_tombstones
+
+                def publish(inventory):
+                    journal = server_module._fleet_load_recovery_journal()
+                    publish_phases.append(None if journal is None else journal.phase)
+                    real_publish(inventory)
+
+                def cleanup(staged):
+                    journal = server_module._fleet_load_recovery_journal()
+                    cleanup_phases.append(None if journal is None else journal.phase)
+                    return real_cleanup(staged)
+
+                with patch.object(
+                    server_module,
+                    "publish_agent_inventory",
+                    side_effect=publish,
+                ), patch.object(
+                    server_module,
+                    "_fleet_cleanup_tombstones",
+                    side_effect=cleanup,
+                ):
+                    server_module.fleet_series_delete(
+                        prefix="d",
+                        expected_generation=3,
+                        confirmed_remove_ids=["d1"],
+                        yes=True,
+                    )
+
+            self.assertEqual(publish_phases, [server_module.RecoveryPhase.VERIFIED])
+            self.assertEqual(cleanup_phases, [server_module.RecoveryPhase.COMPLETE])
 
     def test_fleet_series_delete_present_ids_stages_tombstone_with_intent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -541,3 +541,103 @@ def test_reconcile_disallows_legacy_inputs_without_persistent_journal() -> None:
         backups=[],
         staged=[],
     )
+
+
+def test_reconcile_uses_persisted_journal_when_transaction_memory_is_empty(
+    tmp_path: Path,
+) -> None:
+    import codex_master.server as server_module
+
+    entry = replace(
+        sample_entry(MutationKind.TOMBSTONE),
+        old_descriptor_fingerprint="4" * 64,
+        new_descriptor_fingerprint=None,
+    )
+    persisted = replace(
+        sample_journal(entry),
+        phase=RecoveryPhase.RECONCILING,
+        authoritative_generation=2,
+    )
+    paths = FleetPaths.from_state_root(tmp_path)
+    server_module._fleet_store_recovery_journal(persisted, paths)
+    transaction = server_module._FleetRecoveryTransaction(
+        paths,
+        replace(persisted, entries=()),
+    )
+    current = FleetSnapshot(1, 2, (), ())
+    planned = FleetSnapshot(1, 3, (), ())
+    observed: list[tuple[FleetRecoveryJournal, RecoveryPlan]] = []
+
+    def execute(actual_transaction, recovery_plan, authoritative):
+        assert authoritative == current
+        observed.append((actual_transaction.journal, recovery_plan))
+        return (), False
+
+    with patch.object(
+        server_module,
+        "_fleet_execute_recovery_plan",
+        side_effect=execute,
+    ):
+        assert server_module._fleet_reconcile_divergent_materialization(
+            current,
+            planned,
+            current,
+            transaction=transaction,
+        )
+
+    assert observed == [
+        (
+            persisted,
+            RecoveryPlan(
+                (
+                    RecoveryAction(
+                        RecoveryActionKind.RETAIN_QUARANTINE,
+                        0,
+                        "d1",
+                        DescriptorState.ABSENT,
+                    ),
+                ),
+                False,
+            ),
+        ),
+    ]
+    assert transaction.journal == persisted
+
+
+@pytest.mark.parametrize("persisted_state", ["missing", "invalid", "empty"])
+def test_reconcile_fails_closed_without_nonempty_persisted_journal(
+    tmp_path: Path,
+    persisted_state: str,
+) -> None:
+    import codex_master.server as server_module
+
+    journal = replace(
+        sample_journal(),
+        phase=RecoveryPhase.RECONCILING,
+        authoritative_generation=2,
+    )
+    paths = FleetPaths.from_state_root(tmp_path)
+    transaction = server_module._FleetRecoveryTransaction(paths, journal)
+    persisted = replace(journal, entries=()) if persisted_state == "empty" else None
+    load_error = AgentError("fleet_recovery_state_invalid") if persisted_state == "invalid" else None
+    current = FleetSnapshot(1, 2, (), ())
+    planned = FleetSnapshot(1, 3, (), ())
+
+    with patch.object(
+        server_module,
+        "_fleet_load_recovery_journal",
+        return_value=persisted,
+        side_effect=load_error,
+    ), patch.object(
+        server_module,
+        "_fleet_execute_recovery_plan",
+        return_value=((), False),
+    ) as execute:
+        assert not server_module._fleet_reconcile_divergent_materialization(
+            current,
+            planned,
+            current,
+            transaction=transaction,
+        )
+
+    execute.assert_not_called()
