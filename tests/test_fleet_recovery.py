@@ -741,8 +741,8 @@ def test_reconcile_uses_persisted_journal_when_transaction_memory_is_empty(
     assert transaction.journal == persisted
 
 
-@pytest.mark.parametrize("persisted_state", ["missing", "invalid", "empty"])
-def test_reconcile_fails_closed_without_nonempty_persisted_journal(
+@pytest.mark.parametrize("persisted_state", ["missing", "invalid"])
+def test_reconcile_fails_closed_without_persisted_journal(
     tmp_path: Path,
     persisted_state: str,
 ) -> None:
@@ -755,7 +755,7 @@ def test_reconcile_fails_closed_without_nonempty_persisted_journal(
     )
     paths = FleetPaths.from_state_root(tmp_path)
     transaction = server_module._FleetRecoveryTransaction(paths, journal)
-    persisted = replace(journal, entries=()) if persisted_state == "empty" else None
+    persisted = None
     load_error = AgentError("fleet_recovery_state_invalid") if persisted_state == "invalid" else None
     current = FleetSnapshot(1, 2, (), ())
     planned = FleetSnapshot(1, 3, (), ())
@@ -778,3 +778,34 @@ def test_reconcile_fails_closed_without_nonempty_persisted_journal(
         )
 
     execute.assert_not_called()
+
+
+def test_reconcile_accepts_persisted_empty_registry_only_journal(tmp_path: Path) -> None:
+    import codex_master.server as server_module
+
+    current = FleetSnapshot(1, 2, (), ())
+    planned = FleetSnapshot(1, 3, (), ())
+    journal = replace(
+        sample_journal(),
+        operation=RecoveryOperation.REGISTRY_ONLY,
+        phase=RecoveryPhase.RECONCILING,
+        authoritative_generation=current.generation,
+        entries=(),
+    )
+    paths = FleetPaths.from_state_root(tmp_path)
+    server_module._fleet_store_recovery_journal(journal, paths)
+    transaction = server_module._FleetRecoveryTransaction(paths, journal)
+
+    class _Service:
+        def load(self) -> FleetSnapshot:
+            return current
+
+    with patch.object(server_module, "current_fleet_service", return_value=_Service()):
+        assert server_module._fleet_reconcile_divergent_materialization(
+            current,
+            planned,
+            current,
+            transaction=transaction,
+        )
+
+    assert transaction.journal == journal

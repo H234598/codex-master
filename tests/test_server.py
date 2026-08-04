@@ -5852,6 +5852,252 @@ class ServerHelpersTest(unittest.TestCase):
 
             self.assertTrue(lock_calls, "fleet_series_apply should use fleet_mutation_lock")
 
+    def test_fleet_registry_only_apply_and_disable_persist_cas_pending_then_clear_journal(self) -> None:
+        from codex_master.fleet_recovery import RecoveryOperation, RecoveryPhase
+
+        for operation in ("apply", "disable"):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                state = root / "state"
+                pool = root / "pool"
+                executable = root / "runner"
+                executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o700)
+                with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                    server_module, "AGENT_POOL_ROOT", pool
+                ), server_module.temporary_agent_inventory(None):
+                    server_module.fleet_series_apply(
+                        prefix="d",
+                        count=1,
+                        runner="codex_cli",
+                        provider="ollama_local",
+                        model="local",
+                        account_id=None,
+                        expected_generation=1,
+                        codex_executable=executable,
+                    )
+                    service = server_module.current_fleet_service()
+                    paths = server_module.FleetPaths.from_state_root(state)
+                    real_commit_snapshot = service.commit_snapshot
+                    observed_journals: list[Any] = []
+
+                    def commit_snapshot(snapshot, *, expected_generation):
+                        observed_journals.append(
+                            server_module._fleet_load_recovery_journal(paths)
+                        )
+                        return real_commit_snapshot(
+                            snapshot,
+                            expected_generation=expected_generation,
+                        )
+
+                    with patch.object(
+                        server_module,
+                        "current_fleet_service",
+                        return_value=service,
+                    ), patch.object(
+                        service,
+                        "commit_snapshot",
+                        side_effect=commit_snapshot,
+                    ):
+                        if operation == "apply":
+                            result = server_module.fleet_series_apply(
+                                prefix="d",
+                                count=1,
+                                runner="codex_cli",
+                                provider="ollama_local",
+                                model="local",
+                                account_id=None,
+                                expected_generation=2,
+                                codex_executable=executable,
+                            )
+                        else:
+                            result = server_module.fleet_series_disable(
+                                prefix="d",
+                                expected_generation=2,
+                            )
+
+                    self.assertEqual(len(observed_journals), 1)
+                    journal = observed_journals[0]
+                    self.assertIsNotNone(journal)
+                    self.assertEqual(journal.operation, RecoveryOperation.REGISTRY_ONLY)
+                    self.assertEqual(journal.phase, RecoveryPhase.CAS_PENDING)
+                    self.assertEqual(journal.entries, ())
+                    self.assertEqual(journal.expected_generation, 2)
+                    self.assertEqual(journal.planned_generation, 3)
+                    self.assertEqual(result["generation"], 3)
+                    self.assertIsNone(server_module._fleet_load_recovery_journal(paths))
+                    inventory = server_module.current_agent_inventory()
+                    self.assertEqual(
+                        inventory,
+                        server_module.build_inventory(service.load(), pool),
+                    )
+                    self.assertEqual(inventory.agents["d1"].enabled, operation == "apply")
+
+    def test_fleet_registry_only_cas_classifies_planned_current_and_third_snapshots(self) -> None:
+        from dataclasses import replace
+
+        from codex_master.fleet_recovery import RecoveryOperation, RecoveryPhase
+        from codex_master.fleet_service import FleetConflictError
+
+        expected_errors = {
+            "planned": "fleet_registry_commit_failed_after_cas",
+            "current": "generation_conflict",
+            "third": "fleet_registry_commit_diverged",
+        }
+        for operation in ("apply", "disable"):
+            for cas_state in ("planned", "current", "third"):
+                with self.subTest(
+                    operation=operation,
+                    cas_state=cas_state,
+                ), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    state = root / "state"
+                    pool = root / "pool"
+                    executable = root / "runner"
+                    executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+                    executable.chmod(0o700)
+                    with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                        server_module, "AGENT_POOL_ROOT", pool
+                    ), server_module.temporary_agent_inventory(None):
+                        server_module.fleet_series_apply(
+                            prefix="d",
+                            count=1,
+                            runner="codex_cli",
+                            provider="ollama_local",
+                            model="local",
+                            account_id=None,
+                            expected_generation=1,
+                            codex_executable=executable,
+                        )
+                        service = server_module.current_fleet_service()
+                        paths = server_module.FleetPaths.from_state_root(state)
+                        current = service.load()
+                        before_inventory = server_module.current_agent_inventory()
+                        real_commit_snapshot = service.commit_snapshot
+                        commit_calls = 0
+                        candidates: list[Any] = []
+                        commit_journals: list[Any] = []
+                        third_snapshots: list[Any] = []
+
+                        def commit_snapshot(snapshot, *, expected_generation):
+                            nonlocal commit_calls
+                            commit_calls += 1
+                            candidates.append(snapshot)
+                            commit_journals.append(
+                                server_module._fleet_load_recovery_journal(paths)
+                            )
+                            if cas_state == "planned":
+                                real_commit_snapshot(
+                                    snapshot,
+                                    expected_generation=expected_generation,
+                                )
+                                raise OSError("persisted then raised")
+                            if cas_state == "current":
+                                raise FleetConflictError("generation_conflict")
+                            third = replace(
+                                snapshot,
+                                series=(
+                                    replace(snapshot.series[0], model="third-model"),
+                                ),
+                            )
+                            third_snapshots.append(third)
+                            real_commit_snapshot(
+                                third,
+                                expected_generation=expected_generation,
+                            )
+                            raise FleetConflictError("generation_conflict")
+
+                        publish_context = (
+                            patch.object(
+                                server_module,
+                                "_fleet_publish_stored",
+                                side_effect=AssertionError("third snapshot published"),
+                            )
+                            if cas_state == "third"
+                            else contextlib.nullcontext()
+                        )
+                        with patch.object(
+                            server_module,
+                            "current_fleet_service",
+                            return_value=service,
+                        ), patch.object(
+                            service,
+                            "commit_snapshot",
+                            side_effect=commit_snapshot,
+                        ), publish_context:
+                            with self.assertRaisesRegex(
+                                AgentError,
+                                expected_errors[cas_state],
+                            ):
+                                if operation == "apply":
+                                    server_module.fleet_series_apply(
+                                        prefix="d",
+                                        count=1,
+                                        runner="codex_cli",
+                                        provider="ollama_local",
+                                        model="local",
+                                        account_id=None,
+                                        expected_generation=2,
+                                        codex_executable=executable,
+                                    )
+                                else:
+                                    server_module.fleet_series_disable(
+                                        prefix="d",
+                                        expected_generation=2,
+                                    )
+
+                        self.assertEqual(commit_calls, 1)
+                        self.assertEqual(len(candidates), 1)
+                        self.assertEqual(len(commit_journals), 1)
+                        commit_journal = commit_journals[0]
+                        self.assertIsNotNone(commit_journal)
+                        self.assertEqual(
+                            commit_journal.operation,
+                            RecoveryOperation.REGISTRY_ONLY,
+                        )
+                        self.assertEqual(commit_journal.phase, RecoveryPhase.CAS_PENDING)
+                        self.assertEqual(commit_journal.entries, ())
+                        planned = candidates[0]
+                        authoritative = service.load()
+                        if cas_state == "planned":
+                            self.assertEqual(authoritative, planned)
+                            self.assertEqual(
+                                server_module.current_agent_inventory(),
+                                server_module.build_inventory(planned, pool),
+                            )
+                            self.assertIsNone(
+                                server_module._fleet_load_recovery_journal(paths)
+                            )
+                        elif cas_state == "current":
+                            self.assertEqual(authoritative, current)
+                            self.assertEqual(
+                                server_module.current_agent_inventory(),
+                                before_inventory,
+                            )
+                            self.assertIsNone(
+                                server_module._fleet_load_recovery_journal(paths)
+                            )
+                        else:
+                            self.assertEqual(authoritative, third_snapshots[0])
+                            self.assertEqual(authoritative.generation, planned.generation)
+                            self.assertEqual(
+                                server_module.current_agent_inventory(),
+                                before_inventory,
+                            )
+                            journal = server_module._fleet_load_recovery_journal(paths)
+                            self.assertIsNotNone(journal)
+                            self.assertEqual(journal.operation, RecoveryOperation.REGISTRY_ONLY)
+                            self.assertEqual(journal.phase, RecoveryPhase.DEGRADED)
+                            self.assertEqual(
+                                journal.authoritative_generation,
+                                authoritative.generation,
+                            )
+                            self.assertEqual(journal.entries, ())
+                            self.assertEqual(
+                                journal.blocking_error_codes,
+                                ("fleet_recovery_incomplete",),
+                            )
+
     def test_fleet_series_disable_wraps_mutation_lock(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "state"
