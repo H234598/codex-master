@@ -3,8 +3,10 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 import json
+import os
 
 import pytest
+from unittest.mock import patch
 
 from codex_master.fleet_recovery import (
     ArtifactDigest,
@@ -15,6 +17,7 @@ from codex_master.fleet_recovery import (
     FleetRecoveryJournal,
     MutationKind,
     RecoveryAction,
+    RecoveryPlan,
     RecoveryActionKind,
     RecoveryEntry,
     RecoveryOperation,
@@ -28,7 +31,35 @@ from codex_master.fleet_recovery import (
     recovery_document,
     advance_recovery_phase,
 )
-from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
+from codex_master.fleet_registry import AgentDescriptor, FleetSnapshot, Provider, RunnerKind
+from codex_master.server import AgentError, FleetPaths
+
+
+def prepare_unsafe_recovery_file(paths: FleetPaths, unsafe: str) -> None:
+    paths.root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    paths.root.chmod(0o700)
+    valid = (json.dumps(recovery_document(sample_journal())) + "\n").encode()
+    if unsafe == "symlink":
+        target = paths.root / "outside.json"
+        target.write_bytes(valid)
+        target.chmod(0o600)
+        paths.recovery.symlink_to(target)
+        return
+    if unsafe == "hardlink":
+        target = paths.root / "linked.json"
+        target.write_bytes(valid)
+        target.chmod(0o600)
+        os.link(target, paths.recovery)
+        return
+    if unsafe == "oversize":
+        paths.recovery.write_bytes(b"x" * (MAX_RECOVERY_DOCUMENT_BYTES + 1))
+        paths.recovery.chmod(0o600)
+        return
+    if unsafe == "mode":
+        paths.recovery.write_bytes(valid)
+        paths.recovery.chmod(0o644)
+        return
+    raise AssertionError(unsafe)
 
 
 def sample_entry(kind: MutationKind = MutationKind.CREATED) -> RecoveryEntry:
@@ -283,3 +314,91 @@ def test_advance_recovery_phase_rejects_blocking_errors_in_later_phases() -> Non
             authoritative_generation=journal.expected_generation + 1,
             blocking_error_codes=("fleet_update_rollback_diverged",),
         )
+
+
+def test_recovery_load_rejects_unsafe_journal(tmp_path: Path) -> None:
+    from codex_master.server import (
+        _fleet_load_recovery_journal,
+    )
+
+    paths = FleetPaths.from_state_root(tmp_path)
+    for unsafe in ["symlink", "hardlink", "oversize", "mode"]:
+        if paths.recovery.exists():
+            paths.recovery.unlink()
+        prepare_unsafe_recovery_file(paths, unsafe)
+        with pytest.raises(AgentError) as caught:
+            _fleet_load_recovery_journal(paths)
+        assert caught.value.args[0] == "fleet_recovery_state_invalid"
+
+
+def test_recovery_store_fsyncs_file_and_parent_before_success(tmp_path: Path) -> None:
+    from codex_master.server import (
+        _fleet_store_recovery_journal,
+        _fleet_load_recovery_journal as real_load,
+    )
+
+    calls: list[int] = []
+    paths = FleetPaths.from_state_root(tmp_path)
+    journal = sample_journal()
+
+    def fsync(fd: int) -> None:
+        calls.append(fd)
+
+    with patch.object(__import__("os"), "fsync", side_effect=fsync):
+        _fleet_store_recovery_journal(journal, paths)
+
+    loaded = real_load(paths)
+    assert loaded == journal
+    assert len(calls) == 2
+
+
+def test_reconciler_continues_every_mutation_class_after_first_failure(tmp_path: Path) -> None:
+    from codex_master.server import (
+        _fleet_execute_recovery_plan,
+        _FleetRecoveryTransaction,
+    )
+    from codex_master.fleet_recovery import RecoveryAction
+
+    entries = tuple(
+        replace(
+            sample_entry(kind),
+            agent_id=f"d{index}",
+            hidden_name=f".codex-fleet-remove-test-{index:032x}",
+        )
+        for index, kind in enumerate(MutationKind, 1)
+    )
+    journal = replace(
+        sample_journal(*entries),
+        phase=RecoveryPhase.RECONCILING,
+        authoritative_generation=3,
+    )
+    paths = FleetPaths.from_state_root(tmp_path)
+    transaction = _FleetRecoveryTransaction(paths, journal)
+    action_kinds = (
+        RecoveryActionKind.QUARANTINE_CREATED,
+        RecoveryActionKind.RESTORE_BACKUP,
+        RecoveryActionKind.RESTORE_TOMBSTONE,
+        RecoveryActionKind.RELEASE_RESERVATION,
+    )
+    plan = RecoveryPlan(
+        tuple(
+            RecoveryAction(action_kind, index, entries[index].agent_id, DescriptorState.OLD)
+            for index, action_kind in enumerate(action_kinds)
+        ),
+        False,
+    )
+    authoritative = FleetSnapshot(1, 3, (), ())
+    calls: list[RecoveryActionKind] = []
+
+    def execute(action, entry, authoritative_agent):
+        assert entry is entries[action.entry_index]
+        assert authoritative_agent is None
+        calls.append(action.kind)
+        return action.kind is not RecoveryActionKind.QUARANTINE_CREATED
+
+    with patch.object(__import__("codex_master.server", fromlist=["_fleet_execute_recovery_action"]), "_fleet_execute_recovery_action", side_effect=execute):
+        errors, blocking = _fleet_execute_recovery_plan(transaction, plan, authoritative)
+
+    assert calls == list(action_kinds)
+    assert blocking is True
+    assert "fleet_create_rollback_diverged" in errors

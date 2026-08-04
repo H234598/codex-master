@@ -55,6 +55,8 @@ class FleetPaths:
     secrets: Path = field(repr=False)
     limits: Path = field(repr=False)
     lock: Path = field(repr=False)
+    recovery: Path = field(repr=False)
+    mutation_lock: Path = field(repr=False)
 
     @classmethod
     def from_state_root(cls, root: Path) -> FleetPaths:
@@ -65,6 +67,8 @@ class FleetPaths:
             secrets=fleet_root / "secrets",
             limits=fleet_root / "limits.json",
             lock=fleet_root / "registry.lock",
+            recovery=fleet_root / "recovery.json",
+            mutation_lock=fleet_root / "mutation.lock",
         )
 
 

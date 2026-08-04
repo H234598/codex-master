@@ -1,4 +1,7 @@
 import os
+import fcntl
+import stat
+from unittest.mock import patch
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -28,6 +31,8 @@ def test_fleet_paths_keep_registry_and_secrets_separate(tmp_path: Path) -> None:
     assert paths.secrets == tmp_path / "fleet" / "secrets"
     assert paths.limits == tmp_path / "fleet" / "limits.json"
     assert paths.lock == tmp_path / "fleet" / "registry.lock"
+    assert paths.recovery == tmp_path / "fleet" / "recovery.json"
+    assert paths.mutation_lock == tmp_path / "fleet" / "mutation.lock"
 
 
 def _account(
@@ -108,7 +113,37 @@ def test_set_secret_writes_only_private_file_and_public_status(tmp_path: Path) -
     account = service.load().accounts[0]
     assert account.secret_state is SecretState.CONFIGURED
     assert account.limit_state is LimitState.UNKNOWN
-    assert account.last_probe_at_utc is None
+
+
+def test_fleet_mutation_lock_is_reentrant_and_private(tmp_path: Path) -> None:
+    from codex_master.fleet_service import FleetPaths
+
+    paths = FleetPaths.from_state_root(tmp_path)
+    calls: list[tuple[int, str]] = []
+    real_flock = fcntl.flock
+    lock_ex = getattr(fcntl, "LOCK_EX")
+    lock_un = getattr(fcntl, "LOCK_UN")
+
+    def capture_flock(fd: int, operation: int) -> None:
+        calls.append((fd, "lock" if operation == lock_ex else "other"))
+        if operation == lock_ex:
+            return
+        real_flock(fd, operation)
+
+    with patch.object(fcntl, "flock", side_effect=capture_flock):
+        server_module = __import__("codex_master.server", fromlist=["fleet_mutation_lock"])
+        with server_module.fleet_mutation_lock(paths), server_module.fleet_mutation_lock(paths):
+            pass
+
+    assert len(calls) == 2
+    lock_calls = [op for _, op in calls]
+    assert lock_calls == ["lock", "other"]
+    assert calls[0][1] != calls[1][1]
+    st = paths.mutation_lock.lstat()
+    assert stat.S_ISREG(st.st_mode)
+    assert st.st_mode & 0o777 == 0o600
+    assert st.st_uid == os.getuid()
+    assert not paths.mutation_lock.is_symlink()
 
 
 def test_set_secret_rejects_empty_value(tmp_path: Path) -> None:

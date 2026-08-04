@@ -5506,6 +5506,53 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual((applied["created_count"], applied["kept_count"]), (1, 1))
             self.assertTrue((pool / "d2").is_dir())
 
+    def test_created_home_has_durable_intent_before_mkdir(self) -> None:
+        observed: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "codex"
+            executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+
+            real_mkdir = server_module.os.mkdir
+
+            def inspect_then_mkdir(path: Path | str, mode=0o777, *, dir_fd=None):
+                from codex_master.server import _fleet_load_recovery_journal
+
+                journal = _fleet_load_recovery_journal()
+                if journal is not None and str(path).startswith(
+                    server_module.FLEET_TOMBSTONE_PREFIX
+                ):
+                    observed.append(journal.entries[0].phase.value)
+                return real_mkdir(path, mode, dir_fd=dir_fd)
+
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None), patch.object(
+                server_module,
+                "agent_lease_status",
+                return_value={"state": "unclaimed"},
+            ), patch.object(server_module, "run_tmux", return_value=stopped), patch.object(
+                server_module,
+                "pool_home_processes",
+                return_value=[],
+            ), patch.object(server_module.os, "mkdir", side_effect=inspect_then_mkdir):
+                server_module.fleet_series_apply(
+                    prefix="d",
+                    count=1,
+                    runner="codex_cli",
+                    provider="ollama_local",
+                    model="local",
+                    account_id=None,
+                    expected_generation=1,
+                    codex_executable=executable,
+                )
+
+            self.assertEqual(observed[0], "intent")
+
         for partial in (False, True):
             with self.subTest(partial=partial), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
