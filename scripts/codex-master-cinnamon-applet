@@ -1,0 +1,751 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import ast
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import selectors
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any
+
+
+UUID = "codex-master@H234598"
+DBUS_TIMEOUT_SECONDS = 10.0
+DBUS_OUTPUT_LIMIT_BYTES = 64 * 1024
+RELOAD_SIGNAL_TIMEOUT_SECONDS = 5.0
+REQUIRED_SOURCE_FILES = {"applet.js", "metadata.json", "settings-schema.json"}
+
+
+class InstallerError(RuntimeError):
+    pass
+
+
+def validate_owner_and_mode(value: os.stat_result, label: str) -> None:
+    if value.st_uid != os.geteuid():
+        raise InstallerError(f"{label} must be owned by the current user")
+    if value.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise InstallerError(f"{label} must not be group- or world-writable")
+
+
+def lexical_exists(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+def private_home() -> Path:
+    value = os.environ.get("HOME")
+    if not value:
+        raise InstallerError("HOME is required")
+    home = Path(value)
+    if not home.is_absolute():
+        raise InstallerError("HOME must be absolute")
+    return home
+
+
+def source_directory() -> Path:
+    return Path(__file__).resolve().parents[1] / "cinnamon" / "applets" / UUID
+
+
+def target_directory() -> Path:
+    return private_home() / ".local" / "share" / "cinnamon" / "applets" / UUID
+
+
+def rollback_directory(target: Path) -> Path:
+    return target.with_name(f"{UUID}.rollback")
+
+
+def retired_rollback_directory(target: Path) -> Path:
+    return target.with_name(f".{UUID}.retired")
+
+
+def reject_unfinished_swaps(parent: Path) -> None:
+    prefix = f".{UUID}.swap-"
+    try:
+        with os.scandir(parent) as entries:
+            if any(entry.name.startswith(prefix) for entry in entries):
+                raise InstallerError("unfinished rollback swap exists")
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise InstallerError("applet directory is unreadable") from exc
+
+
+@contextmanager
+def operation_lock(*, create_parent: bool):
+    parent = target_directory().parent
+    ensure_real_directory_chain(parent, create=create_parent)
+    lock_path = parent / f".{UUID}.lock"
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise InstallerError("installer lock must be a non-hardlinked regular file")
+        validate_owner_and_mode(opened, "installer lock")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise InstallerError("installer lock is unavailable") from exc
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    try:
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def ensure_real_directory_chain(path: Path, *, create: bool) -> None:
+    if not path.is_absolute():
+        raise InstallerError("directory chain must be absolute")
+    current = Path(path.anchor)
+    missing = False
+    for part in path.parts[1:]:
+        current /= part
+        if missing:
+            if create:
+                os.mkdir(current, 0o700)
+            continue
+        try:
+            current_stat = current.lstat()
+        except FileNotFoundError:
+            missing = True
+            if create:
+                os.mkdir(current, 0o700)
+            continue
+        except OSError as exc:
+            raise InstallerError("directory chain is unreadable") from exc
+        if stat.S_ISLNK(current_stat.st_mode) or not stat.S_ISDIR(current_stat.st_mode):
+            raise InstallerError("directory chain must contain only real directories")
+
+
+def hash_regular_file(path: Path, expected: os.stat_result) -> str:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    digest = hashlib.sha256()
+    try:
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)
+            or stat.S_IMODE(opened.st_mode) != stat.S_IMODE(expected.st_mode)
+        ):
+            raise InstallerError("file identity changed or is not a private regular file")
+        validate_owner_and_mode(opened, "opened file")
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    except OSError as exc:
+        raise InstallerError("regular file could not be read safely") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return digest.hexdigest()
+
+
+def scan_tree(root: Path, label: str) -> tuple[list[Path], dict[str, tuple[str, int]]]:
+    try:
+        root_stat = root.lstat()
+    except OSError as exc:
+        raise InstallerError(f"{label} is missing or unreadable") from exc
+    if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+        raise InstallerError(f"{label} must be a real directory")
+    validate_owner_and_mode(root_stat, label)
+
+    directories: list[Path] = []
+    files: dict[str, tuple[str, int]] = {}
+
+    def visit(directory: Path, relative: Path) -> None:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as exc:
+            raise InstallerError(f"{label} contains an unreadable directory") from exc
+        for entry in entries:
+            entry_path = directory / entry.name
+            entry_relative = relative / entry.name
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise InstallerError(f"{label} entry is unreadable") from exc
+            if stat.S_ISLNK(entry_stat.st_mode):
+                raise InstallerError(f"{label} must not contain symlinks")
+            if stat.S_ISDIR(entry_stat.st_mode):
+                validate_owner_and_mode(entry_stat, f"{label} directory")
+                directories.append(entry_relative)
+                visit(entry_path, entry_relative)
+                continue
+            if not stat.S_ISREG(entry_stat.st_mode) or entry_stat.st_nlink != 1:
+                raise InstallerError(f"{label} must contain only non-hardlinked regular files")
+            validate_owner_and_mode(entry_stat, f"{label} file")
+            files[str(entry_relative)] = (hash_regular_file(entry_path, entry_stat), stat.S_IMODE(entry_stat.st_mode))
+
+    visit(root, Path())
+    if not files:
+        raise InstallerError(f"{label} must not be empty")
+    return directories, files
+
+
+def validate_source(source: Path) -> tuple[list[Path], dict[str, tuple[str, int]]]:
+    directories, manifest = scan_tree(source, "source applet")
+    if not REQUIRED_SOURCE_FILES.issubset(manifest):
+        raise InstallerError("source applet is incomplete")
+    return directories, manifest
+
+
+def copy_file_checked(source: Path, destination: Path, expected_hash: str, mode: int) -> None:
+    source_stat = source.lstat()
+    if not stat.S_ISREG(source_stat.st_mode) or source_stat.st_nlink != 1:
+        raise InstallerError("source file changed before staging")
+    validate_owner_and_mode(source_stat, "source file")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    source_fd = os.open(source, flags)
+    destination_fd = -1
+    digest = hashlib.sha256()
+    try:
+        opened = os.fstat(source_fd)
+        if (
+            (opened.st_dev, opened.st_ino) != (source_stat.st_dev, source_stat.st_ino)
+            or stat.S_IMODE(opened.st_mode) != mode
+        ):
+            raise InstallerError("source file identity changed before staging")
+        validate_owner_and_mode(opened, "opened source file")
+        destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        while True:
+            chunk = os.read(source_fd, 64 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                view = view[written:]
+        os.fsync(destination_fd)
+        os.fchmod(destination_fd, mode & 0o777)
+    except OSError as exc:
+        raise InstallerError("source file could not be staged safely") from exc
+    finally:
+        if destination_fd >= 0:
+            os.close(destination_fd)
+        os.close(source_fd)
+    if digest.hexdigest() != expected_hash:
+        raise InstallerError("source file changed while staging")
+
+
+def stage_source(
+    source: Path,
+    parent: Path,
+    directories: list[Path],
+    manifest: dict[str, tuple[str, int]],
+) -> Path:
+    stage = Path(tempfile.mkdtemp(prefix=f".{UUID}.staging-", dir=parent))
+    os.chmod(stage, 0o700)
+    try:
+        for relative in directories:
+            (stage / relative).mkdir(mode=0o700)
+        for relative, (expected_hash, mode) in manifest.items():
+            copy_file_checked(source / relative, stage / relative, expected_hash, mode)
+        _directories, staged_manifest = scan_tree(stage, "staged applet")
+        if staged_manifest != manifest:
+            raise InstallerError("staged applet hash verification failed")
+        _directories, current_source = validate_source(source)
+        if current_source != manifest:
+            raise InstallerError("source applet changed during staging")
+        return stage
+    except Exception:
+        if lexical_exists(stage):
+            shutil.rmtree(stage)
+        raise
+
+
+def remove_validated_tree(path: Path, label: str) -> None:
+    scan_tree(path, label)
+    shutil.rmtree(path)
+
+
+def kill_and_wait(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        process.kill()
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired as exc:
+            raise InstallerError("gdbus process could not be reaped") from exc
+
+
+def cleanup_process(
+    process: subprocess.Popen[bytes], selector: selectors.BaseSelector | None = None
+) -> list[BaseException]:
+    errors: list[BaseException] = []
+    actions = []
+    if selector is not None:
+        actions.append(selector.close)
+    actions.append(lambda: kill_and_wait(process))
+    actions.extend(
+        pipe.close for pipe in (process.stdout, process.stderr) if pipe is not None and not pipe.closed
+    )
+    for action in actions:
+        try:
+            action()
+        except BaseException as exc:
+            errors.append(exc)
+    return errors
+
+
+def report_cleanup_errors(primary: BaseException | None, errors: list[BaseException]) -> None:
+    if not errors:
+        return
+    if primary is None:
+        primary = errors[0]
+        for error in errors[1:]:
+            primary.add_note(f"process cleanup also failed: {error}")
+        raise primary
+    for error in errors:
+        primary.add_note(f"process cleanup also failed: {error}")
+
+
+def selector_for_process(process: subprocess.Popen[bytes]) -> selectors.BaseSelector:
+    selector: selectors.BaseSelector | None = None
+    try:
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        return selector
+    except BaseException as primary:
+        report_cleanup_errors(primary, cleanup_process(process, selector))
+        raise
+
+
+def run_bounded(argv: list[str]) -> str:
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+        )
+    except OSError as exc:
+        raise InstallerError("gdbus is unavailable") from exc
+    if process.stdout is None or process.stderr is None:
+        error = InstallerError("gdbus pipes are unavailable")
+        report_cleanup_errors(error, cleanup_process(process))
+        raise error
+
+    selector = selector_for_process(process)
+    chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
+    total = 0
+    deadline = time.monotonic() + DBUS_TIMEOUT_SECONDS
+    operation_error: BaseException | None = None
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise InstallerError("gdbus timed out")
+            events = selector.select(min(remaining, 0.25))
+            if not events and process.poll() is not None:
+                events = [(key, selectors.EVENT_READ) for key in selector.get_map().values()]
+            for key, _mask in events:
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 4096)
+                except OSError as exc:
+                    raise InstallerError("gdbus output could not be read") from exc
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                total += len(chunk)
+                if total > DBUS_OUTPUT_LIMIT_BYTES:
+                    raise InstallerError("gdbus output exceeded limit")
+                chunks[key.data].append(chunk)
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            raise InstallerError("gdbus timed out") from exc
+    except BaseException as exc:
+        operation_error = exc
+        raise
+    finally:
+        report_cleanup_errors(operation_error, cleanup_process(process, selector))
+
+    stdout = b"".join(chunks["stdout"]).decode("utf-8", errors="replace")
+    stderr = b"".join(chunks["stderr"]).decode("utf-8", errors="replace")
+    if returncode != 0:
+        detail = stderr.strip()[:300] or "gdbus failed"
+        raise InstallerError(detail)
+    return stdout
+
+
+def cinnamon_call(method: str, *arguments: str) -> str:
+    argv = [
+        "gdbus",
+        "call",
+        "--session",
+        "--dest",
+        "org.Cinnamon",
+        "--object-path",
+        "/org/Cinnamon",
+        "--method",
+        f"org.Cinnamon.{method}",
+        *arguments,
+    ]
+    return run_bounded(argv)
+
+
+def reload_xlet() -> None:
+    argv = [
+        "gdbus",
+        "monitor",
+        "--session",
+        "--dest",
+        "org.Cinnamon",
+        "--object-path",
+        "/org/Cinnamon",
+    ]
+    try:
+        monitor_environment = os.environ.copy()
+        monitor_environment["LC_ALL"] = "C"
+        monitor = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            env=monitor_environment,
+        )
+    except OSError as exc:
+        raise InstallerError("gdbus monitor is unavailable") from exc
+    if monitor.stdout is None or monitor.stderr is None:
+        error = InstallerError("gdbus monitor pipes are unavailable")
+        report_cleanup_errors(error, cleanup_process(monitor))
+        raise error
+
+    selector = selector_for_process(monitor)
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+    total = 0
+
+    def read_events(events: list[tuple[selectors.SelectorKey, int]]) -> None:
+        nonlocal total
+        for key, _mask in events:
+            try:
+                chunk = os.read(key.fileobj.fileno(), 4096)
+            except OSError as exc:
+                raise InstallerError("gdbus reload monitor output could not be read") from exc
+            if not chunk:
+                selector.unregister(key.fileobj)
+                key.fileobj.close()
+                continue
+            total += len(chunk)
+            if total > DBUS_OUTPUT_LIMIT_BYTES:
+                raise InstallerError("gdbus reload monitor output exceeded limit")
+            if key.data == "stdout":
+                stdout_buffer.extend(chunk)
+            else:
+                stderr_buffer.extend(chunk)
+
+    def next_stdout_line(deadline: float) -> str:
+        while True:
+            newline = stdout_buffer.find(b"\n")
+            if newline >= 0:
+                line = bytes(stdout_buffer[:newline])
+                del stdout_buffer[: newline + 1]
+                return line.decode("utf-8", errors="replace")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise InstallerError("gdbus reload monitor timed out")
+            events = selector.select(min(remaining, 0.25))
+            if not events and monitor.poll() is not None:
+                events = [(key, selectors.EVENT_READ) for key in selector.get_map().values()]
+            read_events(events)
+            stdout_open = any(key.data == "stdout" for key in selector.get_map().values())
+            if not stdout_open and b"\n" not in stdout_buffer:
+                detail = stderr_buffer.decode("utf-8", errors="replace").strip()[:300]
+                raise InstallerError(detail or "gdbus reload monitor ended unexpectedly")
+
+    reload_error: BaseException | None = None
+    try:
+        ready_deadline = time.monotonic() + RELOAD_SIGNAL_TIMEOUT_SECONDS
+        while True:
+            line = next_stdout_line(ready_deadline)
+            if line == "Monitoring signals on object /org/Cinnamon owned by org.Cinnamon":
+                break
+
+        # ponytail: Cinnamon has no reload request ID; only a future nonce-bearing API can
+        # correlate a concurrent third-party reload of the same UUID.
+        stdout_buffer.clear()
+        while pending := selector.select(0):
+            read_events(pending)
+            stdout_buffer.clear()
+
+        cinnamon_call("ReloadXlet", UUID, "APPLET")
+        signal_deadline = time.monotonic() + RELOAD_SIGNAL_TIMEOUT_SECONDS
+        signal_prefix = "/org/Cinnamon: org.Cinnamon.XletAddedComplete "
+        success_payloads = {f"(true, '{UUID}')", f'(true, "{UUID}")'}
+        failure_payloads = {f"(false, '{UUID}')", f'(false, "{UUID}")'}
+        while True:
+            line = next_stdout_line(signal_deadline)
+            if not line.startswith(signal_prefix):
+                continue
+            payload = line[len(signal_prefix) :]
+            if payload in success_payloads:
+                return
+            if payload in failure_payloads:
+                raise InstallerError("Cinnamon reported that the applet failed to load")
+            if UUID in payload:
+                raise InstallerError("Cinnamon returned an invalid applet-load signal")
+    except BaseException as exc:
+        reload_error = exc
+        raise
+    finally:
+        report_cleanup_errors(reload_error, cleanup_process(monitor, selector))
+
+
+def verify_running() -> None:
+    output = cinnamon_call("GetRunningXletUUIDs", "applet").strip()
+    try:
+        reply = ([],) if output == "(@as [],)" else ast.literal_eval(output)
+    except (MemoryError, RecursionError, SyntaxError, TypeError, ValueError) as exc:
+        raise InstallerError("Cinnamon returned an invalid running-applet response") from exc
+    if (
+        not isinstance(reply, tuple)
+        or len(reply) != 1
+        or not isinstance(reply[0], list)
+        or not all(isinstance(item, str) for item in reply[0])
+    ):
+        raise InstallerError("Cinnamon returned an invalid running-applet response")
+    if UUID not in reply[0]:
+        raise InstallerError("Cinnamon does not report the applet as running")
+
+
+def verify_files(source: Path, target: Path) -> None:
+    _source_dirs, source_manifest = validate_source(source)
+    _target_dirs, target_manifest = scan_tree(target, "installed applet")
+    # ponytail: Source writers share no lock; add a generation protocol if changes after
+    # the final source read must be atomic with this verification result.
+    _current_source_dirs, current_source_manifest = validate_source(source)
+    if current_source_manifest != source_manifest:
+        raise InstallerError("source applet changed during verification")
+    if target_manifest != source_manifest:
+        raise InstallerError("installed applet differs from repository source")
+
+
+def restore_previous(target: Path, backup: Path, had_previous: bool) -> None:
+    if lexical_exists(target):
+        remove_validated_tree(target, "failed installed applet")
+    if had_previous:
+        scan_tree(backup, "rollback applet")
+        os.replace(backup, target)
+
+
+def install(*, dry_run: bool, no_reload: bool) -> dict[str, Any]:
+    source = source_directory()
+    directories, manifest = validate_source(source)
+    target = target_directory()
+    backup = rollback_directory(target)
+    retired_backup = retired_rollback_directory(target)
+    ensure_real_directory_chain(target.parent, create=False)
+    reject_unfinished_swaps(target.parent)
+    if lexical_exists(target):
+        scan_tree(target, "installed applet")
+    if lexical_exists(backup):
+        scan_tree(backup, "rollback applet")
+    if lexical_exists(retired_backup):
+        scan_tree(retired_backup, "unfinished rollback rotation")
+        raise InstallerError("unfinished rollback rotation exists")
+    if dry_run:
+        return {"ok": True, "action": "install", "dry_run": True, "uuid": UUID}
+
+    ensure_real_directory_chain(target.parent, create=True)
+    stage = stage_source(source, target.parent, directories, manifest)
+    had_previous = lexical_exists(target)
+    retired_backup_active = False
+    deployment_succeeded = False
+    install_error: Exception | None = None
+    try:
+        if had_previous and lexical_exists(backup):
+            if lexical_exists(retired_backup):
+                raise InstallerError("retired rollback path already exists")
+            retired_backup_active = True
+            os.replace(backup, retired_backup)
+        if had_previous:
+            os.replace(target, backup)
+        try:
+            os.replace(stage, target)
+            stage = Path()
+        except Exception:
+            if had_previous and lexical_exists(backup) and not lexical_exists(target):
+                os.replace(backup, target)
+            raise
+        try:
+            verify_files(source, target)
+            if not no_reload:
+                reload_xlet()
+                verify_running()
+        except Exception:
+            restore_previous(target, backup, had_previous)
+            if had_previous and not no_reload:
+                try:
+                    reload_xlet()
+                    verify_running()
+                except Exception as recovery_error:
+                    raise InstallerError(
+                        "installation failed; previous applet was restored but could not be reloaded"
+                    ) from recovery_error
+            raise
+        deployment_succeeded = True
+    except Exception as exc:
+        install_error = exc
+        raise
+    finally:
+        cleanup_errors: list[Exception] = []
+        try:
+            if stage != Path() and lexical_exists(stage):
+                remove_validated_tree(stage, "staged applet")
+        except Exception as exc:
+            cleanup_errors.append(exc)
+        try:
+            if retired_backup_active and lexical_exists(retired_backup):
+                if deployment_succeeded:
+                    remove_validated_tree(retired_backup, "retired rollback applet")
+                elif not lexical_exists(backup):
+                    os.replace(retired_backup, backup)
+        except Exception as exc:
+            cleanup_errors.append(exc)
+        if cleanup_errors:
+            if install_error is None:
+                raise cleanup_errors[0]
+            for cleanup_error in cleanup_errors:
+                install_error.add_note(f"installer cleanup also failed: {cleanup_error}")
+    return {"ok": True, "action": "install", "dry_run": False, "uuid": UUID, "rollback": lexical_exists(backup)}
+
+
+def swap_directories(first: Path, second: Path) -> None:
+    parent = first.parent
+    temporary = parent / f".{UUID}.swap-{os.getpid()}-{time.time_ns()}"
+    if lexical_exists(temporary):
+        raise InstallerError("rollback swap path already exists")
+    os.replace(first, temporary)
+    try:
+        os.replace(second, first)
+        os.replace(temporary, second)
+    except Exception as swap_error:
+        recovery_errors: list[Exception] = []
+        try:
+            if lexical_exists(first) and not lexical_exists(second):
+                os.replace(first, second)
+        except Exception as exc:
+            recovery_errors.append(exc)
+        try:
+            if lexical_exists(temporary) and not lexical_exists(first):
+                os.replace(temporary, first)
+        except Exception as exc:
+            recovery_errors.append(exc)
+        for recovery_error in recovery_errors:
+            swap_error.add_note(f"rollback swap recovery also failed: {recovery_error}")
+        raise
+
+
+def rollback(*, no_reload: bool) -> dict[str, Any]:
+    target = target_directory()
+    backup = rollback_directory(target)
+    retired_backup = retired_rollback_directory(target)
+    ensure_real_directory_chain(target.parent, create=False)
+    reject_unfinished_swaps(target.parent)
+    if not lexical_exists(target):
+        raise InstallerError("installed applet is missing")
+    if not lexical_exists(backup):
+        raise InstallerError("rollback applet is missing")
+    scan_tree(target, "installed applet")
+    scan_tree(backup, "rollback applet")
+    if lexical_exists(retired_backup):
+        scan_tree(retired_backup, "unfinished rollback rotation")
+        raise InstallerError("unfinished rollback rotation exists")
+    swap_directories(target, backup)
+    try:
+        if not no_reload:
+            reload_xlet()
+            verify_running()
+    except Exception:
+        swap_directories(target, backup)
+        if not no_reload:
+            try:
+                reload_xlet()
+                verify_running()
+            except Exception as recovery_error:
+                raise InstallerError(
+                    "rollback failed; current applet was restored but could not be reloaded"
+                ) from recovery_error
+        raise
+    return {"ok": True, "action": "rollback", "uuid": UUID}
+
+
+def verify() -> dict[str, Any]:
+    source = source_directory()
+    target = target_directory()
+    ensure_real_directory_chain(target.parent, create=False)
+    verify_files(source, target)
+    verify_running()
+    return {"ok": True, "action": "verify", "uuid": UUID}
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Install and verify the codex-master Cinnamon applet.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    install_parser = commands.add_parser("install")
+    install_parser.add_argument("--dry-run", action="store_true")
+    install_parser.add_argument("--no-reload", action="store_true")
+    commands.add_parser("verify")
+    rollback_parser = commands.add_parser("rollback")
+    rollback_parser.add_argument("--no-reload", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    os.umask(0o077)
+    args = parse_args(argv)
+    try:
+        if args.command == "install" and args.dry_run:
+            result = install(dry_run=True, no_reload=args.no_reload)
+        else:
+            with operation_lock(create_parent=args.command == "install"):
+                if args.command == "install":
+                    result = install(dry_run=False, no_reload=args.no_reload)
+                elif args.command == "verify":
+                    result = verify()
+                else:
+                    result = rollback(no_reload=args.no_reload)
+    except (InstallerError, OSError) as exc:
+        print(json.dumps({"ok": False, "error": str(exc)[:500]}, sort_keys=True), file=sys.stderr)
+        return 1
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
