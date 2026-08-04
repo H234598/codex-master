@@ -5611,11 +5611,14 @@ class ServerHelpersTest(unittest.TestCase):
             executable.chmod(0o700)
             stopped = subprocess.CompletedProcess([], 1, "", "")
             lock_calls: list[tuple[tuple, dict]] = []
+            lock_active = {"inside": False}
 
             @contextlib.contextmanager
             def capture_lock(*args: Any, **kwargs: Any):
                 lock_calls.append((args, kwargs))
+                lock_active["inside"] = True
                 yield
+                lock_active["inside"] = False
 
             with patch.object(server_module, "STATE_ROOT", state), patch.object(
                 server_module, "AGENT_POOL_ROOT", pool
@@ -5628,6 +5631,55 @@ class ServerHelpersTest(unittest.TestCase):
                 "pool_home_processes",
                 return_value=[],
             ), patch.object(server_module, "fleet_mutation_lock", side_effect=capture_lock):
+                from codex_master.server import (
+                    _fleet_create_home,
+                    FleetPaths,
+                    _fleet_load_recovery_journal,
+                )
+
+                real_create_home = _fleet_create_home
+
+                def create_home(*args: Any, **kwargs: Any):
+                    self.assertTrue(lock_active["inside"])
+                    return real_create_home(*args, **kwargs)
+
+                with patch.object(server_module, "_fleet_create_home", side_effect=create_home):
+                    server_module.fleet_series_apply(
+                        prefix="d",
+                        count=1,
+                        runner="codex_cli",
+                        provider="ollama_local",
+                        model="local",
+                        account_id=None,
+                        expected_generation=1,
+                        codex_executable=executable,
+                    )
+
+                self.assertIsNone(
+                    _fleet_load_recovery_journal(FleetPaths.from_state_root(state)),
+                )
+
+            self.assertTrue(lock_calls, "fleet_series_apply should use fleet_mutation_lock")
+
+    def test_fleet_series_disable_wraps_mutation_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            pool = Path(tmp) / "pool"
+            executable = Path(tmp) / "runner"
+            executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None), patch.object(
+                server_module,
+                "agent_lease_status",
+                return_value={"state": "unclaimed"},
+            ), patch.object(server_module, "run_tmux", return_value=stopped), patch.object(
+                server_module,
+                "pool_home_processes",
+                return_value=[],
+            ):
                 server_module.fleet_series_apply(
                     prefix="d",
                     count=1,
@@ -5639,10 +5691,102 @@ class ServerHelpersTest(unittest.TestCase):
                     codex_executable=executable,
                 )
 
-            self.assertTrue(lock_calls, "fleet_series_apply should use fleet_mutation_lock")
-            from codex_master.server import _fleet_load_recovery_journal
+            service = server_module.current_fleet_service()
+            lock_active = {"inside": False}
 
-            self.assertIsNone(_fleet_load_recovery_journal())
+            @contextlib.contextmanager
+            def capture_lock(*args: Any, **kwargs: Any):
+                lock_active["inside"] = True
+                yield
+                lock_active["inside"] = False
+
+            real_commit_snapshot = service.commit_snapshot
+
+            def commit_snapshot(*args: Any, **kwargs: Any):
+                self.assertTrue(lock_active["inside"])
+                return real_commit_snapshot(*args, **kwargs)
+
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None), patch.object(
+                server_module,
+                "agent_lease_status",
+                return_value={"state": "unclaimed"},
+            ), patch.object(server_module, "run_tmux", return_value=stopped), patch.object(
+                server_module, "pool_home_processes", return_value=[]
+            ), patch.object(server_module, "fleet_mutation_lock", side_effect=capture_lock), patch.object(
+                service,
+                "commit_snapshot",
+                side_effect=commit_snapshot,
+            ):
+                server_module.fleet_series_disable(prefix="d", expected_generation=2)
+
+    def test_fleet_series_delete_wraps_mutation_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            pool = Path(tmp) / "pool"
+            executable = Path(tmp) / "runner"
+            executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None), patch.object(
+                server_module,
+                "agent_lease_status",
+                return_value={"state": "unclaimed"},
+            ), patch.object(server_module, "run_tmux", return_value=stopped), patch.object(
+                server_module,
+                "pool_home_processes",
+                return_value=[],
+            ):
+                server_module.fleet_series_apply(
+                    prefix="d",
+                    count=1,
+                    runner="codex_cli",
+                    provider="ollama_local",
+                    model="local",
+                    account_id=None,
+                    expected_generation=1,
+                    codex_executable=executable,
+                )
+
+            service = server_module.current_fleet_service()
+            lock_active = {"inside": False}
+            confirmed = ["d1"]
+
+            @contextlib.contextmanager
+            def capture_lock(*args: Any, **kwargs: Any):
+                lock_active["inside"] = True
+                yield
+                lock_active["inside"] = False
+
+            real_commit_snapshot = service.commit_snapshot
+
+            def commit_snapshot(*args: Any, **kwargs: Any):
+                self.assertTrue(lock_active["inside"])
+                return real_commit_snapshot(*args, **kwargs)
+
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None), patch.object(
+                server_module,
+                "agent_lease_status",
+                return_value={"state": "unclaimed"},
+            ), patch.object(server_module, "run_tmux", return_value=stopped), patch.object(
+                server_module, "pool_home_processes", return_value=[]
+            ), patch.object(server_module, "fleet_mutation_lock", side_effect=capture_lock), patch.object(
+                service,
+                "commit_snapshot",
+                side_effect=commit_snapshot,
+            ):
+                server_module.fleet_series_disable(prefix="d", expected_generation=2)
+                server_module.fleet_series_delete(
+                    prefix="d",
+                    expected_generation=3,
+                    confirmed_remove_ids=confirmed,
+                    yes=True,
+                )
 
     def test_fleet_series_apply_normal_path_uses_preplanned_create_entry_name(self) -> None:
         observed: list[tuple[str, str]] = []

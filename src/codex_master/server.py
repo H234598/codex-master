@@ -3629,6 +3629,9 @@ def _fleet_remove_complete_recovery_journal(
             os.close(parent_fd)
 
 
+_REPLACE_ENTRY_NONE: object = object()
+
+
 class _FleetRecoveryTransaction:
     def __init__(self, paths: FleetPaths, journal: FleetRecoveryJournal) -> None:
         self.paths = paths
@@ -3669,11 +3672,18 @@ class _FleetRecoveryTransaction:
         index: int,
         phase: EntryPhase,
         *,
-        target_identity: FileIdentity | None = None,
-        source_identity: FileIdentity | None = None,
-        result_code: str | None = None,
+        target_identity: FileIdentity | None | object = _REPLACE_ENTRY_NONE,
+        source_identity: FileIdentity | None | object = _REPLACE_ENTRY_NONE,
+        result_code: str | None | object = _REPLACE_ENTRY_NONE,
     ) -> None:
         entries = list(self.journal.entries)
+        current_entry = entries[index]
+        if target_identity is _REPLACE_ENTRY_NONE:
+            target_identity = current_entry.target_identity
+        if source_identity is _REPLACE_ENTRY_NONE:
+            source_identity = current_entry.source_identity
+        if result_code is _REPLACE_ENTRY_NONE:
+            result_code = current_entry.result_code
         entries[index] = dataclass_replace(
             entries[index],
             phase=phase,
@@ -3682,7 +3692,6 @@ class _FleetRecoveryTransaction:
             result_code=result_code,
         )
         self._persist(dataclass_replace(self.journal, entries=tuple(entries)))
-
     def append_entry(self, entry: RecoveryEntry) -> int:
         entries = tuple(self.journal.entries) + (entry,)
         self._persist(dataclass_replace(self.journal, entries=entries))
@@ -10864,7 +10873,14 @@ def plugin_cache_status(root: Path | None = None, cache_root: Path | None = None
     return result
 
 
-def source_identity_matches(opened_stat: os.stat_result, expected_stat: os.stat_result) -> bool:
+def source_identity_matches(
+    opened_stat: os.stat_result,
+    expected_stat: os.stat_result | FileIdentity | None,
+) -> bool:
+    if expected_stat is None:
+        return False
+    if isinstance(expected_stat, FileIdentity):
+        return opened_stat.st_ino == expected_stat.ino and opened_stat.st_dev == expected_stat.dev
     return opened_stat.st_ino == expected_stat.st_ino and opened_stat.st_dev == expected_stat.st_dev
 
 
@@ -15346,6 +15362,12 @@ def _fleet_publish_stored(service: FleetService, stored: FleetSnapshot) -> None:
         raise AgentError("fleet_inventory_publish_failed")
     transaction = _FLEET_ACTIVE_RECOVERY_TRANSACTION.get()
     if isinstance(transaction, _FleetRecoveryTransaction):
+        if transaction.journal.phase not in (
+            RecoveryPhase.VERIFIED,
+            RecoveryPhase.PUBLISHED,
+            RecoveryPhase.COMPLETE,
+        ):
+            raise AgentError("fleet_inventory_publish_failed")
         if not _fleet_verify_authoritative_materialization(reloaded, transaction.journal):
             raise AgentError("fleet_inventory_publish_failed")
     try:
@@ -15370,15 +15392,14 @@ def _fleet_reconcile_commit_exception(
     return "diverged", reloaded
 
 
-def _fleet_recovery_action_error_code(action: RecoveryActionKind) -> str:
+def _fleet_recovery_action_error_code(action: RecoveryActionKind) -> str | None:
     return {
         RecoveryActionKind.QUARANTINE_CREATED: "fleet_create_rollback_diverged",
         RecoveryActionKind.VERIFY_CREATED: "fleet_recovery_incomplete",
         RecoveryActionKind.RESTORE_BACKUP: "fleet_update_rollback_diverged",
         RecoveryActionKind.RESTORE_TOMBSTONE: "fleet_tombstone_rollback_diverged",
         RecoveryActionKind.RELEASE_RESERVATION: "fleet_registry_delete_reservation_diverged",
-        RecoveryActionKind.RETAIN_QUARANTINE: "fleet_recovery_incomplete",
-    }.get(action, "fleet_recovery_incomplete")
+    }.get(action)
 
 
 @contextlib.contextmanager
@@ -15683,6 +15704,7 @@ def _fleet_execute_recovery_plan(
     authoritative: FleetSnapshot,
 ) -> tuple[tuple[str, ...], bool]:
     errors: list[str] = []
+    blocking = False
     try:
         authoritative = current_fleet_service().load()
     except Exception:
@@ -15701,17 +15723,28 @@ def _fleet_execute_recovery_plan(
         except (AgentError, OSError):
             ok = False
         if not ok:
-            errors.append(_fleet_recovery_action_error_code(action.kind))
+            code = _fleet_recovery_action_error_code(action.kind)
+            if code is not None:
+                errors.append(code)
         transaction.record_action_result(action.entry_index, ok)
-    if not recovery_plan.has_third and not _fleet_verify_authoritative_materialization(authoritative, transaction.journal):
+    if recovery_plan.has_third:
         errors.append("fleet_recovery_incomplete")
+        blocking = True
+    else:
+        authoritative = current_fleet_service().load()
+        if not _fleet_verify_authoritative_materialization(
+            authoritative,
+            transaction.journal,
+        ):
+            errors.append("fleet_recovery_incomplete")
+            blocking = True
     blocking_codes = {
         "fleet_create_rollback_diverged",
         "fleet_update_rollback_diverged",
         "fleet_tombstone_rollback_diverged",
         "fleet_registry_delete_reservation_diverged",
     }
-    blocking = any(code in blocking_codes for code in errors)
+    blocking = blocking or any(code in blocking_codes for code in errors)
     return tuple(dict.fromkeys(errors)), blocking
 
 
@@ -15728,6 +15761,22 @@ def _fleet_prepare_managed_update_recovery_entries(
     for agent_id in update_ids:
         old_agent = old_inventory.agents[agent_id]
         new_agent = planned_inventory.agents[agent_id]
+        entries.append(
+            RecoveryEntry(
+                kind=MutationKind.CREATED,
+                agent_id=agent_id,
+                hidden_name=f"{FLEET_TOMBSTONE_PREFIX}create-{uuid.uuid4().hex}",
+                old_descriptor_fingerprint=descriptor_fingerprint(old_agent),
+                new_descriptor_fingerprint=descriptor_fingerprint(new_agent),
+                old_materialization_fingerprint=None,
+                new_materialization_fingerprint=None,
+                source_identity=None,
+                target_identity=None,
+                manifest=(),
+                phase=EntryPhase.INTENT,
+                result_code=None,
+            )
+        )
         entries.append(
             RecoveryEntry(
                 kind=MutationKind.BACKUP,
@@ -16684,6 +16733,19 @@ def _fleet_apply_managed_update(
             clean = False
         return clean
 
+    def _advance_verified(target_generation: int | None = None) -> None:
+        if transaction is None:
+            return
+        if transaction.journal.phase is RecoveryPhase.CAS_PENDING:
+            transaction.advance(
+                RecoveryPhase.RECONCILING,
+                authoritative_generation=target_generation,
+            )
+        transaction.advance(
+            RecoveryPhase.VERIFIED,
+            authoritative_generation=target_generation,
+        )
+
     if transaction is not None:
         transaction.advance(RecoveryPhase.MATERIALIZING)
 
@@ -16769,16 +16831,35 @@ def _fleet_apply_managed_update(
                                     EntryPhase.INTENT,
                                     source_identity=_snapshot_file_identity(current_home),
                                 )
+                            create_index, create_entry = find_entry(agent_id, MutationKind.CREATED)
+                            create_hidden_name = (
+                                create_entry.hidden_name if create_entry is not None else None
+                            )
+                            if create_hidden_name is None:
+                                raise AgentError("fleet_recovery_state_invalid")
+                            if transaction is not None and create_index is not None:
+                                transaction.record_entry_phase(
+                                    create_index,
+                                    EntryPhase.INTENT,
+                                )
                             try:
                                 home_stat = _fleet_create_home(
                                     root_fd,
                                     agent_id,
                                     new_artifacts[agent_id],
+                                    hidden_name=create_hidden_name,
+                                    entry_index=create_index,
                                     transaction=transaction,
                                 )
                             except _FleetPartialHomeError:
                                 raise AgentError("fleet_materialization_failed") from None
-                            created.append((agent_id, home_stat, new_artifacts[agent_id], backup))
+                            if transaction is not None and create_index is not None:
+                                transaction.record_entry_phase(
+                                    create_index,
+                                    transaction.journal.entries[create_index].phase,
+                                    target_identity=_snapshot_file_identity(home_stat),
+                                )
+                            created.append((agent_id, home_stat, new_artifacts[agent_id], create_hidden_name))
                             _fleet_verify_home(
                                 root,
                                 agent_id,
@@ -16879,6 +16960,8 @@ def _fleet_apply_managed_update(
         except Exception as exc:
             state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
             if state == "planned":
+                if transaction is not None:
+                    _advance_verified(reloaded.generation)
                 try:
                     build_artifacts.validate()  # type: ignore[attr-defined]
                 except AgentError:
@@ -16910,6 +16993,8 @@ def _fleet_apply_managed_update(
                 )
                 if not reconciled:
                     raise AgentError("fleet_registry_commit_diverged") from None
+                if transaction is not None:
+                    _advance_verified(reloaded.generation)
                 _fleet_publish_stored(service, reloaded)
                 created = []
                 backups = []
@@ -16932,6 +17017,8 @@ def _fleet_apply_managed_update(
         try:
             build_artifacts.validate()  # type: ignore[attr-defined]
         except AgentError:
+            if transaction is not None:
+                _advance_verified(stored.generation)
             _fleet_publish_stored(service, stored)
             raise AgentError("fleet_executable_changed_after_cas") from None
         if transaction is not None:
@@ -17035,21 +17122,374 @@ def fleet_series_apply(
                 "pool_root": "not_returned",
                 "raw_output": "not_returned",
             }
-    enabling = existing is not None and not existing.enabled and candidate.enabled
-    registry_only = not any(
-        materialization[name]
-        for name in ("create_ids", "update_ids", "remove_ids")
-    ) and (
-        (existing is None and not candidate.enabled)
-        or managed_changed
-        or (
-            existing is not None
-            and old_count == candidate.count
-            and not enabling
+    with fleet_mutation_lock(FleetPaths.from_state_root(STATE_ROOT)):
+        enabling = existing is not None and not existing.enabled and candidate.enabled
+        registry_only = not any(
+            materialization[name]
+            for name in ("create_ids", "update_ids", "remove_ids")
+        ) and (
+            (existing is None and not candidate.enabled)
+            or managed_changed
+            or (
+                existing is not None
+                and old_count == candidate.count
+                and not enabling
+            )
         )
-    )
-    if registry_only:
-        _fleet_validate_materialized_series_homes(planned, candidate)
+        if registry_only:
+            _fleet_validate_materialized_series_homes(planned, candidate)
+            try:
+                stored = service.commit_snapshot(planned, expected_generation=expected_generation)
+            except Exception as exc:
+                state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
+                if state == "planned":
+                    _fleet_publish_stored(service, reloaded)
+                    raise AgentError("fleet_registry_commit_failed_after_cas") from None
+                if state == "diverged":
+                    _fleet_publish_stored(service, reloaded)
+                    raise AgentError("fleet_registry_commit_diverged") from None
+                if isinstance(exc, FleetConflictError):
+                    raise AgentError("generation_conflict") from None
+                raise AgentError("fleet_registry_commit_failed") from None
+            _fleet_publish_stored(service, stored)
+            return {
+                "mutation_performed": True,
+                "generation": stored.generation,
+                "created_count": 0,
+                "kept_count": len(materialization["keep_ids"]),
+                "updated_count": len(materialization["update_ids"]),
+                "removed_count": len(materialization["remove_ids"]),
+                "cleanup_pending": False,
+                "pool_root": "not_returned",
+                "raw_output": "not_returned",
+            }
+
+        create_ids = list(materialization["create_ids"])
+        keep_ids = list(materialization["keep_ids"])
+        update_ids = list(materialization["update_ids"])
+        remove_ids = list(materialization["remove_ids"])
+        verify_keep_ids = keep_ids if enabling else []
+        artifacts: dict[str, dict[str, Any]] = {}
+        created: list[tuple[str, os.stat_result, dict[str, Any]]] = []
+        staged: list[dict[str, Any]] = []
+        active_tx = None
+        preplanned_create_indexes: dict[str, int] = {}
+        preplanned_create_names: dict[str, str] = {}
+        planned_tombstone_indexes: dict[str, int] = {}
+        planned_tombstone_names: dict[str, str] = {}
+        if create_ids or update_ids or remove_ids:
+            prepared_entries: list[RecoveryEntry] = []
+            current_inventory = build_inventory(current, AGENT_POOL_ROOT)
+            for agent_id in create_ids:
+                hidden_name = f"{FLEET_TOMBSTONE_PREFIX}create-{uuid.uuid4().hex}"
+                new_agent = planned_inventory.agents[agent_id]
+                preplanned_create_indexes[agent_id] = len(prepared_entries)
+                preplanned_create_names[agent_id] = hidden_name
+                prepared_entries.append(
+                    RecoveryEntry(
+                        kind=MutationKind.CREATED,
+                        agent_id=agent_id,
+                        hidden_name=hidden_name,
+                        old_descriptor_fingerprint=None,
+                        new_descriptor_fingerprint=descriptor_fingerprint(new_agent),
+                        old_materialization_fingerprint=None,
+                        new_materialization_fingerprint=None,
+                        source_identity=None,
+                        target_identity=None,
+                        manifest=(),
+                        phase=EntryPhase.INTENT,
+                        result_code=None,
+                    )
+                )
+            for agent_id in remove_ids:
+                old_agent = current_inventory.agents[agent_id]
+                hidden_name = f"{FLEET_TOMBSTONE_PREFIX}tombstone-{uuid.uuid4().hex}"
+                planned_tombstone_indexes[agent_id] = len(prepared_entries)
+                planned_tombstone_names[agent_id] = hidden_name
+                prepared_entries.append(
+                    RecoveryEntry(
+                        kind=MutationKind.TOMBSTONE,
+                        agent_id=agent_id,
+                        hidden_name=hidden_name,
+                        old_descriptor_fingerprint=descriptor_fingerprint(old_agent),
+                        new_descriptor_fingerprint=None,
+                        old_materialization_fingerprint=None,
+                        new_materialization_fingerprint=None,
+                        source_identity=None,
+                        target_identity=None,
+                        manifest=(),
+                        phase=EntryPhase.INTENT,
+                        result_code=None,
+                    )
+                )
+            active_tx = _FleetRecoveryTransaction.begin(
+                RecoveryOperation.SERIES_APPLY,
+                current,
+                planned,
+                tuple(prepared_entries),
+            )
+        artifact_context = (
+            _fleet_artifact_builder(
+                candidate.runner,
+                codex_executable=codex_executable,
+                gemini_executable=gemini_executable,
+            )
+            if create_ids or verify_keep_ids
+            else contextlib.nullcontext(None)
+        )
+        with _fleet_active_recovery_transaction(active_tx):
+            with artifact_context as build_artifacts:
+                try:
+                    def _advance_verified(target_generation: int | None = None) -> None:
+                        if active_tx is None:
+                            return
+                        if active_tx.journal.phase is RecoveryPhase.CAS_PENDING:
+                            active_tx.advance(
+                                RecoveryPhase.RECONCILING,
+                                authoritative_generation=target_generation,
+                            )
+                        active_tx.advance(
+                            RecoveryPhase.VERIFIED,
+                            authoritative_generation=target_generation,
+                        )
+
+                    if active_tx is not None:
+                        active_tx.advance(RecoveryPhase.MATERIALIZING)
+                    if build_artifacts is not None:
+                        for agent_id in (*verify_keep_ids, *create_ids):
+                            artifacts[agent_id] = build_artifacts(planned_inventory.agents[agent_id])
+                    if verify_keep_ids or create_ids:
+                        with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+                            AGENT_POOL_ROOT,
+                            ensure=True,
+                            error_text="fleet_pool_root_invalid",
+                            require_private=True,
+                        ) as root:
+                            marker_present = _fleet_root_marker_state(root)
+                            if not marker_present and remove_ids:
+                                raise AgentError("fleet_pool_marker_required")
+                            for agent_id in verify_keep_ids:
+                                _fleet_verify_home(root, agent_id, artifacts[agent_id], exact_contents=False)
+                            for agent_id in keep_ids:
+                                _fleet_managed_home_state(
+                                    root,
+                                    planned_inventory.agents[agent_id],
+                                    strict_contents=True,
+                                )
+                            for agent_id in create_ids:
+                                if path_present_no_follow(root / agent_id):
+                                    raise AgentError("fleet_create_target_exists")
+                            root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                            try:
+                                if not marker_present:
+                                    _fleet_write_root_marker(root_fd)
+                                for agent_id in create_ids:
+                                    try:
+                                        home_stat = _fleet_create_home(
+                                            root_fd,
+                                            agent_id,
+                                            artifacts[agent_id],
+                                            hidden_name=preplanned_create_names[agent_id],
+                                            entry_index=preplanned_create_indexes[agent_id],
+                                            transaction=active_tx,
+                                        )
+                                    except _FleetPartialHomeError as exc:
+                                        raise AgentError("fleet_materialization_failed") from None
+                                    entry_index = preplanned_create_indexes[agent_id]
+                                    if active_tx is not None and entry_index is not None:
+                                        active_tx.record_entry_phase(
+                                            entry_index,
+                                            active_tx.journal.entries[entry_index].phase,
+                                            target_identity=_snapshot_file_identity(home_stat),
+                                        )
+                                    created.append(
+                                        (
+                                            agent_id,
+                                            home_stat,
+                                            artifacts[agent_id],
+                                            preplanned_create_names[agent_id],
+                                        )
+                                    )
+                                for created_item in created:
+                                    agent_id, _home_stat, item_artifacts = created_item[:3]
+                                    _fleet_verify_home(root, agent_id, item_artifacts, exact_contents=True)
+                            finally:
+                                os.close(root_fd)
+                    if remove_ids:
+                        staged = _fleet_stage_tombstones(
+                            build_inventory(current, AGENT_POOL_ROOT),
+                            remove_ids,
+                            transaction=active_tx,
+                            planned_tombstones={
+                                agent_id: (
+                                    planned_tombstone_names[agent_id],
+                                    planned_tombstone_indexes[agent_id],
+                                )
+                                for agent_id in planned_tombstone_names
+                            },
+                        )
+                    if build_artifacts is not None:
+                        build_artifacts.validate()  # type: ignore[attr-defined]
+                    try:
+                        if active_tx is not None and active_tx.journal.phase is RecoveryPhase.MATERIALIZING:
+                            active_tx.advance(RecoveryPhase.CAS_PENDING)
+                        stored = service.commit_snapshot(
+                            planned, expected_generation=expected_generation
+                        )
+                    except Exception as exc:
+                        reconciled_materialization = False
+                        state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
+                        if state == "planned":
+                            if active_tx is not None:
+                                _advance_verified(reloaded.generation)
+                            if build_artifacts is not None:
+                                try:
+                                    build_artifacts.validate()  # type: ignore[attr-defined]
+                                except AgentError:
+                                    _fleet_publish_stored(service, reloaded)
+                                    raise AgentError("fleet_executable_changed_after_cas") from None
+                            _fleet_publish_stored(service, reloaded)
+                            if build_artifacts is not None:
+                                try:
+                                    build_artifacts.validate()  # type: ignore[attr-defined]
+                                except AgentError:
+                                    created = []
+                                    staged = []
+                                    raise AgentError("fleet_executable_changed_after_cas") from None
+                            created = []
+                            staged = []
+                            raise AgentError("fleet_registry_commit_failed_after_cas") from None
+                        if state == "diverged":
+                            if active_tx is not None:
+                                active_tx.advance(
+                                    RecoveryPhase.RECONCILING,
+                                    authoritative_generation=reloaded.generation,
+                                )
+                            if reloaded.series == current.series and (
+                                created or staged
+                            ):
+                                reconciled_materialization = True
+                                reconciled = _fleet_reconcile_divergent_materialization(
+                                    current,
+                                    planned,
+                                    reloaded,
+                                    created=created,
+                                    staged=staged,
+                                    transaction=active_tx,
+                                )
+                                if not reconciled:
+                                    created = []
+                                    staged = []
+                                    raise AgentError("fleet_registry_commit_diverged") from None
+                                created = []
+                                staged = []
+                                if active_tx is not None:
+                                    _advance_verified(reloaded.generation)
+                            else:
+                                if not created:
+                                    created = []
+                                    staged = []
+                            raise AgentError("fleet_registry_commit_diverged") from None
+                        clean = _fleet_rollback_created(created)
+                        if staged and not reconciled_materialization and not _fleet_restore_tombstones(staged):
+                            clean = False
+                            staged = []
+                        if not clean:
+                            created = []
+                            staged = []
+                            raise AgentError("fleet_create_rollback_diverged") from None
+                        if isinstance(exc, FleetConflictError):
+                            created = []
+                            staged = []
+                            raise AgentError("generation_conflict") from None
+                        created = []
+                        staged = []
+                        raise AgentError("fleet_registry_commit_failed") from None
+                    if build_artifacts is not None:
+                        try:
+                            build_artifacts.validate()  # type: ignore[attr-defined]
+                        except AgentError:
+                            if active_tx is not None:
+                                _advance_verified(stored.generation)
+                            created = []
+                            staged = []
+                            _fleet_publish_stored(service, stored)
+                            raise AgentError("fleet_executable_changed_after_cas") from None
+                    try:
+                        if active_tx is not None:
+                            _advance_verified(stored.generation)
+                        _fleet_publish_stored(service, stored)
+                    except AgentError:
+                        created = []
+                        staged = []
+                        raise
+                    if build_artifacts is not None:
+                        try:
+                            build_artifacts.validate()  # type: ignore[attr-defined]
+                        except AgentError:
+                            if active_tx is not None:
+                                _fleet_remove_complete_recovery_journal(active_tx.journal)
+                            created = []
+                            staged = []
+                            raise AgentError("fleet_executable_changed_after_cas") from None
+                    if active_tx is not None:
+                        active_tx.advance(
+                            RecoveryPhase.PUBLISHED,
+                            authoritative_generation=stored.generation,
+                        )
+                        active_tx.advance(
+                            RecoveryPhase.COMPLETE,
+                            authoritative_generation=stored.generation,
+                        )
+                        _fleet_remove_complete_recovery_journal(active_tx.journal)
+                except Exception as exc:
+                    clean = _fleet_rollback_created(created)
+                    if staged and not _fleet_restore_tombstones(staged):
+                        clean = False
+                    if not clean:
+                        raise AgentError("fleet_create_rollback_diverged") from None
+                    if isinstance(exc, AgentError):
+                        raise
+                    raise AgentError("fleet_materialization_failed") from None
+        cleanup_pending = bool(staged)
+        try:
+            cleanup_pending = _fleet_cleanup_tombstones(staged) or cleanup_pending
+        except Exception:
+            cleanup_pending = True
+        if build_artifacts is not None:
+            cleanup_pending = build_artifacts.close_state["cleanup_pending"] or cleanup_pending  # type: ignore[attr-defined]
+        return {
+            "mutation_performed": True,
+            "generation": stored.generation,
+            "created_count": len(create_ids),
+            "kept_count": len(keep_ids),
+            "updated_count": plan["update_count"],
+            "removed_count": len(remove_ids),
+            "cleanup_pending": cleanup_pending,
+            "pool_root": "not_returned",
+            "raw_output": "not_returned",
+        }
+
+
+def fleet_series_disable(*, prefix: str, expected_generation: int) -> dict[str, Any]:
+    service = current_fleet_service()
+    with fleet_mutation_lock(FleetPaths.from_state_root(STATE_ROOT)):
+        try:
+            current = service.load()
+            planned = plan_series_disable(
+                current,
+                prefix,
+                expected_generation=expected_generation,
+            )
+            build_inventory(planned, AGENT_POOL_ROOT)
+            planned_series = next(item for item in planned.series if item.prefix == prefix)
+            _fleet_validate_materialized_series_homes(planned, planned_series)
+        except FleetValidationError as exc:
+            raise AgentError(str(exc)) from None
+        except AgentError:
+            raise
+        except Exception:
+            raise AgentError("fleet_registry_commit_failed") from None
         try:
             stored = service.commit_snapshot(planned, expected_generation=expected_generation)
         except Exception as exc:
@@ -17067,284 +17507,10 @@ def fleet_series_apply(
         return {
             "mutation_performed": True,
             "generation": stored.generation,
-            "created_count": 0,
-            "kept_count": len(materialization["keep_ids"]),
-            "updated_count": len(materialization["update_ids"]),
-            "removed_count": len(materialization["remove_ids"]),
-            "cleanup_pending": False,
+            "disabled": True,
             "pool_root": "not_returned",
             "raw_output": "not_returned",
         }
-
-    create_ids = list(materialization["create_ids"])
-    keep_ids = list(materialization["keep_ids"])
-    update_ids = list(materialization["update_ids"])
-    remove_ids = list(materialization["remove_ids"])
-    verify_keep_ids = keep_ids if enabling else []
-    artifacts: dict[str, dict[str, Any]] = {}
-    created: list[tuple[str, os.stat_result, dict[str, Any]]] = []
-    staged: list[dict[str, Any]] = []
-    active_tx = None
-    preplanned_create_indexes: dict[str, int] = {}
-    preplanned_create_names: dict[str, str] = {}
-    if create_ids or update_ids or remove_ids:
-        active_tx = _FleetRecoveryTransaction.begin(
-            RecoveryOperation.SERIES_APPLY,
-            current,
-            planned,
-            (),
-        )
-    artifact_context = (
-        _fleet_artifact_builder(
-            candidate.runner,
-            codex_executable=codex_executable,
-            gemini_executable=gemini_executable,
-        )
-        if create_ids or verify_keep_ids
-        else contextlib.nullcontext(None)
-    )
-    with _fleet_active_recovery_transaction(active_tx):
-        with artifact_context as build_artifacts:
-            try:
-                if build_artifacts is not None:
-                    for agent_id in (*verify_keep_ids, *create_ids):
-                        artifacts[agent_id] = build_artifacts(planned_inventory.agents[agent_id])
-                    for agent_id in create_ids:
-                        hidden_name = f"{FLEET_TOMBSTONE_PREFIX}create-{uuid.uuid4().hex}"
-                        preplanned_create_names[agent_id] = hidden_name
-                        new_agent = planned_inventory.agents[agent_id]
-                        preplanned_create_indexes[agent_id] = active_tx.append_entry(
-                            RecoveryEntry(
-                                kind=MutationKind.CREATED,
-                                agent_id=agent_id,
-                                hidden_name=hidden_name,
-                                old_descriptor_fingerprint=None,
-                                new_descriptor_fingerprint=descriptor_fingerprint(new_agent),
-                                old_materialization_fingerprint=None,
-                                new_materialization_fingerprint=None,
-                                source_identity=None,
-                                target_identity=None,
-                                manifest=(),
-                                phase=EntryPhase.INTENT,
-                                result_code=None,
-                            )
-                        )
-                if verify_keep_ids or create_ids:
-                    with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
-                        AGENT_POOL_ROOT,
-                        ensure=True,
-                        error_text="fleet_pool_root_invalid",
-                        require_private=True,
-                    ) as root:
-                        marker_present = _fleet_root_marker_state(root)
-                        if not marker_present and remove_ids:
-                            raise AgentError("fleet_pool_marker_required")
-                        for agent_id in verify_keep_ids:
-                            _fleet_verify_home(root, agent_id, artifacts[agent_id], exact_contents=False)
-                        for agent_id in keep_ids:
-                            _fleet_managed_home_state(
-                                root,
-                                planned_inventory.agents[agent_id],
-                                strict_contents=True,
-                            )
-                        for agent_id in create_ids:
-                            if path_present_no_follow(root / agent_id):
-                                raise AgentError("fleet_create_target_exists")
-                        root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-                        try:
-                            if not marker_present:
-                                _fleet_write_root_marker(root_fd)
-                            for agent_id in create_ids:
-                                try:
-                                    home_stat = _fleet_create_home(
-                                        root_fd,
-                                        agent_id,
-                                        artifacts[agent_id],
-                                        hidden_name=preplanned_create_names.get(agent_id),
-                                        entry_index=preplanned_create_indexes.get(agent_id),
-                                        transaction=active_tx,
-                                    )
-                                except _FleetPartialHomeError as exc:
-                                    raise AgentError("fleet_materialization_failed") from None
-                                entry_index = preplanned_create_indexes.get(agent_id)
-                                if active_tx is not None and entry_index is not None:
-                                    active_tx.record_entry_phase(
-                                        entry_index,
-                                        active_tx.journal.entries[entry_index].phase,
-                                        target_identity=_snapshot_file_identity(home_stat),
-                                    )
-                                created.append(
-                                    (
-                                        agent_id,
-                                        home_stat,
-                                        artifacts[agent_id],
-                                        preplanned_create_names.get(agent_id, ""),
-                                    )
-                                )
-                            for created_item in created:
-                                agent_id, _home_stat, item_artifacts = created_item[:3]
-                                _fleet_verify_home(root, agent_id, item_artifacts, exact_contents=True)
-                        finally:
-                            os.close(root_fd)
-                if remove_ids:
-                    staged = _fleet_stage_tombstones(
-                        build_inventory(current, AGENT_POOL_ROOT),
-                        remove_ids,
-                    )
-                if build_artifacts is not None:
-                    build_artifacts.validate()  # type: ignore[attr-defined]
-                try:
-                    stored = service.commit_snapshot(
-                        planned, expected_generation=expected_generation
-                    )
-                except Exception as exc:
-                    reconciled_materialization = False
-                    state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
-                    if state == "planned":
-                        if build_artifacts is not None:
-                            try:
-                                build_artifacts.validate()  # type: ignore[attr-defined]
-                            except AgentError:
-                                _fleet_publish_stored(service, reloaded)
-                                raise AgentError("fleet_executable_changed_after_cas") from None
-                        _fleet_publish_stored(service, reloaded)
-                        if build_artifacts is not None:
-                            try:
-                                build_artifacts.validate()  # type: ignore[attr-defined]
-                            except AgentError:
-                                created = []
-                                staged = []
-                                raise AgentError("fleet_executable_changed_after_cas") from None
-                        created = []
-                        staged = []
-                        raise AgentError("fleet_registry_commit_failed_after_cas") from None
-                    if state == "diverged":
-                        if reloaded.series == current.series and (
-                            created or staged
-                        ):
-                            reconciled_materialization = True
-                            reconciled = _fleet_reconcile_divergent_materialization(
-                                current,
-                                planned,
-                                reloaded,
-                                created=created,
-                                staged=staged,
-                            )
-                            if not reconciled:
-                                created = []
-                                staged = []
-                                raise AgentError("fleet_registry_commit_diverged") from None
-                            created = []
-                            staged = []
-                        else:
-                            if not created:
-                                created = []
-                                staged = []
-                        raise AgentError("fleet_registry_commit_diverged") from None
-                    clean = _fleet_rollback_created(created)
-                    if staged and not reconciled_materialization and not _fleet_restore_tombstones(staged):
-                        clean = False
-                        staged = []
-                    if not clean:
-                        created = []
-                        staged = []
-                        raise AgentError("fleet_create_rollback_diverged") from None
-                    if isinstance(exc, FleetConflictError):
-                        created = []
-                        staged = []
-                        raise AgentError("generation_conflict") from None
-                    created = []
-                    staged = []
-                    raise AgentError("fleet_registry_commit_failed") from None
-                if build_artifacts is not None:
-                    try:
-                        build_artifacts.validate()  # type: ignore[attr-defined]
-                    except AgentError:
-                        created = []
-                        staged = []
-                        _fleet_publish_stored(service, stored)
-                        raise AgentError("fleet_executable_changed_after_cas") from None
-                try:
-                    _fleet_publish_stored(service, stored)
-                except AgentError:
-                    created = []
-                    staged = []
-                    raise
-                if build_artifacts is not None:
-                    try:
-                        build_artifacts.validate()  # type: ignore[attr-defined]
-                    except AgentError:
-                        created = []
-                        staged = []
-                        raise AgentError("fleet_executable_changed_after_cas") from None
-            except Exception as exc:
-                clean = _fleet_rollback_created(created)
-                if staged and not _fleet_restore_tombstones(staged):
-                    clean = False
-                if not clean:
-                    raise AgentError("fleet_create_rollback_diverged") from None
-                if isinstance(exc, AgentError):
-                    raise
-                raise AgentError("fleet_materialization_failed") from None
-    cleanup_pending = bool(staged)
-    try:
-        cleanup_pending = _fleet_cleanup_tombstones(staged) or cleanup_pending
-    except Exception:
-        cleanup_pending = True
-    if build_artifacts is not None:
-        cleanup_pending = build_artifacts.close_state["cleanup_pending"] or cleanup_pending  # type: ignore[attr-defined]
-    return {
-        "mutation_performed": True,
-        "generation": stored.generation,
-        "created_count": len(create_ids),
-        "kept_count": len(keep_ids),
-        "updated_count": plan["update_count"],
-        "removed_count": len(remove_ids),
-        "cleanup_pending": cleanup_pending,
-        "pool_root": "not_returned",
-        "raw_output": "not_returned",
-    }
-
-
-def fleet_series_disable(*, prefix: str, expected_generation: int) -> dict[str, Any]:
-    service = current_fleet_service()
-    try:
-        current = service.load()
-        planned = plan_series_disable(
-            current,
-            prefix,
-            expected_generation=expected_generation,
-        )
-        build_inventory(planned, AGENT_POOL_ROOT)
-        planned_series = next(item for item in planned.series if item.prefix == prefix)
-        _fleet_validate_materialized_series_homes(planned, planned_series)
-    except FleetValidationError as exc:
-        raise AgentError(str(exc)) from None
-    except AgentError:
-        raise
-    except Exception:
-        raise AgentError("fleet_registry_commit_failed") from None
-    try:
-        stored = service.commit_snapshot(planned, expected_generation=expected_generation)
-    except Exception as exc:
-        state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
-        if state == "planned":
-            _fleet_publish_stored(service, reloaded)
-            raise AgentError("fleet_registry_commit_failed_after_cas") from None
-        if state == "diverged":
-            _fleet_publish_stored(service, reloaded)
-            raise AgentError("fleet_registry_commit_diverged") from None
-        if isinstance(exc, FleetConflictError):
-            raise AgentError("generation_conflict") from None
-        raise AgentError("fleet_registry_commit_failed") from None
-    _fleet_publish_stored(service, stored)
-    return {
-        "mutation_performed": True,
-        "generation": stored.generation,
-        "disabled": True,
-        "pool_root": "not_returned",
-        "raw_output": "not_returned",
-    }
 
 
 def fleet_series_delete(
@@ -17355,93 +17521,94 @@ def fleet_series_delete(
     yes: bool = False,
 ) -> dict[str, Any]:
     service = current_fleet_service()
-    try:
-        current = service.load()
-        planned = plan_series_delete(
-            current,
-            prefix,
-            expected_generation=expected_generation,
-        )
-    except FleetValidationError as exc:
-        raise AgentError(str(exc)) from None
-    existing = next(item for item in current.series if item.prefix == prefix)
-    if not yes:
-        raise AgentError("fleet_series_delete_confirmation_required")
-    expected_ids = [f"{prefix}{ordinal}" for ordinal in range(1, existing.count + 1)]
-    if (
-        not isinstance(confirmed_remove_ids, list)
-        or len(confirmed_remove_ids) != len(expected_ids)
-        or frozenset(confirmed_remove_ids) != frozenset(expected_ids)
-    ):
-        raise AgentError("remove_confirmation_required")
-    build_inventory(planned, AGENT_POOL_ROOT)
-    present_ids = _fleet_plan_materialized_ids(prefix, existing.count)
-    if not present_ids:
-        reservations = _fleet_reserve_absent_homes(expected_ids)
-        stored: FleetSnapshot | None = None
+    with fleet_mutation_lock(FleetPaths.from_state_root(STATE_ROOT)):
         try:
+            current = service.load()
+            planned = plan_series_delete(
+                current,
+                prefix,
+                expected_generation=expected_generation,
+            )
+        except FleetValidationError as exc:
+            raise AgentError(str(exc)) from None
+        existing = next(item for item in current.series if item.prefix == prefix)
+        if not yes:
+            raise AgentError("fleet_series_delete_confirmation_required")
+        expected_ids = [f"{prefix}{ordinal}" for ordinal in range(1, existing.count + 1)]
+        if (
+            not isinstance(confirmed_remove_ids, list)
+            or len(confirmed_remove_ids) != len(expected_ids)
+            or frozenset(confirmed_remove_ids) != frozenset(expected_ids)
+        ):
+            raise AgentError("remove_confirmation_required")
+        build_inventory(planned, AGENT_POOL_ROOT)
+        present_ids = _fleet_plan_materialized_ids(prefix, existing.count)
+        if not present_ids:
+            reservations = _fleet_reserve_absent_homes(expected_ids)
+            stored: FleetSnapshot | None = None
             try:
-                stored = service.commit_snapshot(planned, expected_generation=expected_generation)
-            except Exception as exc:
-                state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
-                if state == "planned":
-                    stored = reloaded
-                    _fleet_publish_stored(service, reloaded)
-                    raise AgentError("fleet_registry_commit_failed_after_cas") from None
-                if state == "diverged":
-                    descriptor_states = _fleet_descriptor_reconciliation_states(
-                        current,
-                        planned,
-                        reloaded,
-                        set(expected_ids),
-                    )
-                    reservations_released = _fleet_release_reservations(reservations)
-                    reservations.clear()
-                    if not reservations_released:
-                        raise AgentError(
-                            "fleet_registry_delete_reservation_diverged"
-                        ) from None
-                    if any(
-                        descriptor_state == "unknown"
-                        for descriptor_state in descriptor_states.values()
-                    ):
+                try:
+                    stored = service.commit_snapshot(planned, expected_generation=expected_generation)
+                except Exception as exc:
+                    state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
+                    if state == "planned":
+                        stored = reloaded
+                        _fleet_publish_stored(service, reloaded)
+                        raise AgentError("fleet_registry_commit_failed_after_cas") from None
+                    if state == "diverged":
+                        descriptor_states = _fleet_descriptor_reconciliation_states(
+                            current,
+                            planned,
+                            reloaded,
+                            set(expected_ids),
+                        )
+                        reservations_released = _fleet_release_reservations(reservations)
+                        reservations.clear()
+                        if not reservations_released:
+                            raise AgentError(
+                                "fleet_registry_delete_reservation_diverged"
+                            ) from None
+                        if any(
+                            descriptor_state == "unknown"
+                            for descriptor_state in descriptor_states.values()
+                        ):
+                            raise AgentError("fleet_registry_commit_diverged") from None
+                        _fleet_publish_stored(service, reloaded)
                         raise AgentError("fleet_registry_commit_diverged") from None
-                    _fleet_publish_stored(service, reloaded)
-                    raise AgentError("fleet_registry_commit_diverged") from None
-                if isinstance(exc, FleetConflictError):
-                    raise AgentError("generation_conflict") from None
-                raise AgentError("fleet_registry_commit_failed") from None
-            _fleet_publish_stored(service, stored)
-        finally:
-            if not _fleet_release_reservations(reservations):
-                if stored == planned:
-                    _fleet_compensate_registry_delete(service, current, stored)
-                raise AgentError("fleet_registry_delete_raced") from None
+                    if isinstance(exc, FleetConflictError):
+                        raise AgentError("generation_conflict") from None
+                    raise AgentError("fleet_registry_commit_failed") from None
+                _fleet_publish_stored(service, stored)
+            finally:
+                if not _fleet_release_reservations(reservations):
+                    if stored == planned:
+                        _fleet_compensate_registry_delete(service, current, stored)
+                    raise AgentError("fleet_registry_delete_raced") from None
+            return {
+                "mutation_performed": True,
+                "generation": stored.generation,
+                "removed_count": 0,
+                "cleanup_pending": True,
+                "pool_root": "not_returned",
+                "raw_output": "not_returned",
+            }
+        old_inventory = build_inventory(current, AGENT_POOL_ROOT)
+        stored, cleanup_pending = _fleet_commit_staged_removal(
+            service,
+            current,
+            planned,
+            expected_generation=expected_generation,
+            inventory=old_inventory,
+            agent_ids_to_remove=expected_ids,
+        )
         return {
             "mutation_performed": True,
             "generation": stored.generation,
-            "removed_count": 0,
-            "cleanup_pending": True,
+            "removed_count": len(expected_ids),
+            "cleanup_pending": cleanup_pending,
             "pool_root": "not_returned",
             "raw_output": "not_returned",
         }
-    old_inventory = build_inventory(current, AGENT_POOL_ROOT)
-    stored, cleanup_pending = _fleet_commit_staged_removal(
-        service,
-        current,
-        planned,
-        expected_generation=expected_generation,
-        inventory=old_inventory,
-        agent_ids_to_remove=expected_ids,
-    )
-    return {
-        "mutation_performed": True,
-        "generation": stored.generation,
-        "removed_count": len(expected_ids),
-        "cleanup_pending": cleanup_pending,
-        "pool_root": "not_returned",
-        "raw_output": "not_returned",
-    }
 
 
 def pool_expand_text(value: str) -> str:

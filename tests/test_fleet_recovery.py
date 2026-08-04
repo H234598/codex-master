@@ -466,5 +466,5 @@ def test_recovery_plan_execution_reloads_authoritative_snapshot_for_verify(tmp_p
             ):
                 _fleet_execute_recovery_plan(transaction, plan, authoritative)
 
-    assert service.load.call_count == 1
+    assert service.load.call_count == 2
     assert verified and verified[0] == reloaded
