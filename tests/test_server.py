@@ -5597,10 +5597,99 @@ class ServerHelpersTest(unittest.TestCase):
                     (planned["create_count"], planned["keep_count"], planned["update_count"], planned["remove_count"]),
                     (0, expected_keep, 0, 0),
                 )
-                self.assertEqual(
-                    (applied["created_count"], applied["kept_count"], applied["updated_count"], applied["removed_count"]),
-                    (0, expected_keep, 0, 0),
+            self.assertEqual(
+                (applied["created_count"], applied["kept_count"], applied["updated_count"], applied["removed_count"]),
+                (0, expected_keep, 0, 0),
+            )
+
+    def test_fleet_series_apply_normal_path_wraps_mutation_lock_and_clears_recovery_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            pool = Path(tmp) / "pool"
+            executable = Path(tmp) / "runner"
+            executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            lock_calls: list[tuple[tuple, dict]] = []
+
+            @contextlib.contextmanager
+            def capture_lock(*args: Any, **kwargs: Any):
+                lock_calls.append((args, kwargs))
+                yield
+
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None), patch.object(
+                server_module,
+                "agent_lease_status",
+                return_value={"state": "unclaimed"},
+            ), patch.object(server_module, "run_tmux", return_value=stopped), patch.object(
+                server_module,
+                "pool_home_processes",
+                return_value=[],
+            ), patch.object(server_module, "fleet_mutation_lock", side_effect=capture_lock):
+                server_module.fleet_series_apply(
+                    prefix="d",
+                    count=1,
+                    runner="codex_cli",
+                    provider="ollama_local",
+                    model="local",
+                    account_id=None,
+                    expected_generation=1,
+                    codex_executable=executable,
                 )
+
+            self.assertTrue(lock_calls, "fleet_series_apply should use fleet_mutation_lock")
+            from codex_master.server import _fleet_load_recovery_journal
+
+            self.assertIsNone(_fleet_load_recovery_journal())
+
+    def test_fleet_series_apply_normal_path_uses_preplanned_create_entry_name(self) -> None:
+        observed: list[tuple[str, str]] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            real_mkdir = server_module.os.mkdir
+
+            def inspect_then_mkdir(path: Path | str, mode=0o777, *, dir_fd=None):
+                real_name = Path(path).name
+                if real_name.startswith(server_module.FLEET_TOMBSTONE_PREFIX) and dir_fd is not None:
+                    from codex_master.server import _fleet_load_recovery_journal
+
+                    journal = _fleet_load_recovery_journal()
+                    if journal is not None and journal.entries:
+                        observed.append((real_name, journal.entries[0].phase.value))
+                return real_mkdir(path, mode, dir_fd=dir_fd)
+
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None), patch.object(
+                server_module,
+                "agent_lease_status",
+                return_value={"state": "unclaimed"},
+            ), patch.object(server_module, "run_tmux", return_value=stopped), patch.object(
+                server_module,
+                "pool_home_processes",
+                return_value=[],
+            ), patch.object(server_module.os, "mkdir", side_effect=inspect_then_mkdir):
+                server_module.fleet_series_apply(
+                    prefix="d",
+                    count=1,
+                    runner="codex_cli",
+                    provider="ollama_local",
+                    model="local",
+                    account_id=None,
+                    expected_generation=1,
+                    codex_executable=executable,
+                )
+
+            self.assertTrue(observed)
+            self.assertEqual(observed[0][1], "intent")
 
     def test_fleet_registry_only_identical_apply_validates_existing_home_before_cas(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

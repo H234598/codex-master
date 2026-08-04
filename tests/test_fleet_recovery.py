@@ -402,3 +402,69 @@ def test_reconciler_continues_every_mutation_class_after_first_failure(tmp_path:
     assert calls == list(action_kinds)
     assert blocking is True
     assert "fleet_create_rollback_diverged" in errors
+
+
+def test_recovery_plan_execution_reloads_authoritative_snapshot_for_verify(tmp_path: Path) -> None:
+    from codex_master.server import (
+        FLEET_TOMBSTONE_PREFIX,
+        _fleet_execute_recovery_plan,
+        _FleetRecoveryTransaction,
+        _fleet_verify_authoritative_materialization,
+    )
+    from codex_master.fleet_recovery import (
+        RecoveryAction,
+        RecoveryActionKind,
+        RecoveryPlan,
+        DescriptorState,
+    )
+    from unittest.mock import Mock
+
+    class _Service:
+        def __init__(self, snapshot: FleetSnapshot):
+            self.snapshot = snapshot
+            self.load = Mock(return_value=snapshot)
+
+    entries = (
+        replace(
+            sample_entry(MutationKind.CREATED),
+            agent_id="d1",
+            hidden_name=f"{FLEET_TOMBSTONE_PREFIX}create-verify",
+        ),
+    )
+    plan = RecoveryPlan(
+        (RecoveryAction(RecoveryActionKind.RETAIN_QUARANTINE, 0, "d1", DescriptorState.NEW),),
+        has_third=False,
+    )
+    journal = replace(
+        sample_journal(*entries),
+        phase=RecoveryPhase.RECONCILING,
+        authoritative_generation=1,
+    )
+    transaction = _FleetRecoveryTransaction(FleetPaths.from_state_root(tmp_path), journal)
+    authoritative = FleetSnapshot(1, 1, (), ())
+    reloaded = FleetSnapshot(1, 1, (), ())
+    service = _Service(reloaded)
+    verified: list[FleetSnapshot] = []
+
+    def execute(action, entry, authoritative_agent):
+        return True
+
+    with patch.object(
+        __import__("codex_master.server", fromlist=["current_fleet_service"]),
+        "current_fleet_service",
+        return_value=service,
+    ):
+        with patch.object(
+            __import__("codex_master.server", fromlist=["_fleet_execute_recovery_action"]),
+            "_fleet_execute_recovery_action",
+            side_effect=execute,
+        ):
+            with patch.object(
+                __import__("codex_master.server", fromlist=["_fleet_verify_authoritative_materialization"]),
+                "_fleet_verify_authoritative_materialization",
+                side_effect=lambda snapshot, actual: verified.append(snapshot) or _fleet_verify_authoritative_materialization(snapshot, actual),
+            ):
+                _fleet_execute_recovery_plan(transaction, plan, authoritative)
+
+    assert service.load.call_count == 1
+    assert verified and verified[0] == reloaded
