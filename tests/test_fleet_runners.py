@@ -78,7 +78,7 @@ def test_gemini_runner_is_headless_jsonl_and_home_isolated(tmp_path: Path) -> No
 
     assert plan.mode == "headless_job"
     assert plan.argv == (
-        "/usr/local/bin/gemini", "--ignore-env", "--output-format", "stream-json", "--model",
+        "/usr/local/bin/gemini", "--output-format", "stream-json", "--model",
         "gemini-3-flash-preview",
     )
     assert "-p" not in plan.argv
