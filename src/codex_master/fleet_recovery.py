@@ -277,6 +277,15 @@ def _entry(value: object) -> RecoveryEntry:
 
 
 def normalize_recovery_document(value: object) -> FleetRecoveryJournal:
+    try:
+        raw_payload = json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        _fail()
+    if len(raw_payload) > MAX_RECOVERY_DOCUMENT_BYTES:
+        _fail()
+
     raw = _exact_fields(value, ROOT_FIELDS)
     journal_id = raw["journal_id"]
     pool_digest = raw["pool_root_digest"]

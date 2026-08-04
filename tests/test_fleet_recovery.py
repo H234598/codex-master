@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+import json
 
 import pytest
 
@@ -18,6 +19,7 @@ from codex_master.fleet_recovery import (
     RecoveryEntry,
     RecoveryOperation,
     RecoveryPhase,
+    MAX_RECOVERY_DOCUMENT_BYTES,
     classify_descriptor,
     descriptor_fingerprint,
     materialization_fingerprint,
@@ -101,6 +103,27 @@ def test_recovery_document_rejects_invalid_contract(mutate) -> None:
 def test_recovery_document_rejects_more_than_one_thousand_entries() -> None:
     raw = recovery_document(sample_journal())
     raw["entries"] = [raw["entries"][0]] * 1001
+    with pytest.raises(FleetRecoveryValidationError) as caught:
+        normalize_recovery_document(raw)
+    assert caught.value.code == "invalid_fleet_recovery"
+
+
+def test_recovery_document_rejects_oversize_documents() -> None:
+    artifact_manifest = tuple(
+        ArtifactDigest(
+            f"segment{i}/" + ("x" * 180),
+            0o700,
+            "3" * 64,
+        )
+        for i in range(64)
+    )
+    raw_entry = sample_entry()
+    raw_entry = replace(raw_entry, manifest=artifact_manifest)
+    raw = recovery_document(sample_journal(*[raw_entry] * 1000))
+    payload = json.dumps(
+        raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+    assert len(payload) > MAX_RECOVERY_DOCUMENT_BYTES
     with pytest.raises(FleetRecoveryValidationError) as caught:
         normalize_recovery_document(raw)
     assert caught.value.code == "invalid_fleet_recovery"
