@@ -5942,10 +5942,11 @@ class ServerHelpersTest(unittest.TestCase):
         expected_errors = {
             "planned": "fleet_registry_commit_failed_after_cas",
             "current": "generation_conflict",
+            "current_error": "fleet_registry_commit_failed",
             "third": "fleet_registry_commit_diverged",
         }
         for operation in ("apply", "disable"):
-            for cas_state in ("planned", "current", "third"):
+            for cas_state in ("planned", "current", "current_error", "third"):
                 with self.subTest(
                     operation=operation,
                     cas_state=cas_state,
@@ -5994,6 +5995,8 @@ class ServerHelpersTest(unittest.TestCase):
                                 raise OSError("persisted then raised")
                             if cas_state == "current":
                                 raise FleetConflictError("generation_conflict")
+                            if cas_state == "current_error":
+                                raise OSError("commit failed before cas")
                             third = replace(
                                 snapshot,
                                 series=(
@@ -6068,7 +6071,7 @@ class ServerHelpersTest(unittest.TestCase):
                             self.assertIsNone(
                                 server_module._fleet_load_recovery_journal(paths)
                             )
-                        elif cas_state == "current":
+                        elif cas_state in {"current", "current_error"}:
                             self.assertEqual(authoritative, current)
                             self.assertEqual(
                                 server_module.current_agent_inventory(),
@@ -6097,6 +6100,159 @@ class ServerHelpersTest(unittest.TestCase):
                                 journal.blocking_error_codes,
                                 ("fleet_recovery_incomplete",),
                             )
+
+    def test_fleet_registry_only_publish_reload_rejects_same_generation_third_snapshot(self) -> None:
+        from dataclasses import replace
+
+        from codex_master.fleet_recovery import RecoveryPhase
+        from codex_master.fleet_registry import fleet_document
+        from codex_master.fleet_service import FleetConflictError
+
+        for cas_state in ("normal", "planned", "current"):
+            with self.subTest(cas_state=cas_state), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                state = root / "state"
+                pool = root / "pool"
+                executable = root / "runner"
+                executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o700)
+                with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                    server_module, "AGENT_POOL_ROOT", pool
+                ), server_module.temporary_agent_inventory(None):
+                    server_module.fleet_series_apply(
+                        prefix="d",
+                        count=1,
+                        runner="codex_cli",
+                        provider="ollama_local",
+                        model="local",
+                        account_id=None,
+                        expected_generation=1,
+                        codex_executable=executable,
+                    )
+                    service = server_module.current_fleet_service()
+                    paths = server_module.FleetPaths.from_state_root(state)
+                    current = service.load()
+                    before_inventory = server_module.current_agent_inventory()
+                    real_commit_snapshot = service.commit_snapshot
+                    real_load = service.load
+                    real_reconcile = server_module._fleet_reconcile_divergent_materialization
+                    commit_calls = 0
+                    swap_on_load = False
+                    third_snapshots: list[Any] = []
+
+                    def commit_snapshot(snapshot, *, expected_generation):
+                        nonlocal commit_calls, swap_on_load
+                        commit_calls += 1
+                        if cas_state == "current":
+                            third_snapshots.append(
+                                replace(
+                                    current,
+                                    series=(
+                                        replace(
+                                            current.series[0],
+                                            model="same-generation-third",
+                                        ),
+                                    ),
+                                )
+                            )
+                            raise FleetConflictError("generation_conflict")
+                        stored = real_commit_snapshot(
+                            snapshot,
+                            expected_generation=expected_generation,
+                        )
+                        third_snapshots.append(
+                            replace(
+                                stored,
+                                series=(
+                                    replace(
+                                        stored.series[0],
+                                        model="same-generation-third",
+                                    ),
+                                ),
+                            )
+                        )
+                        if cas_state == "normal":
+                            swap_on_load = True
+                            return stored
+                        raise OSError("persisted then raised")
+
+                    def load():
+                        nonlocal swap_on_load
+                        if swap_on_load:
+                            swap_on_load = False
+                            server_module._fleet_replace_private_text(
+                                paths.registry,
+                                json.dumps(
+                                    fleet_document(third_snapshots[0]),
+                                    indent=2,
+                                    sort_keys=True,
+                                )
+                                + "\n",
+                            )
+                        return real_load()
+
+                    def reconcile(*args, **kwargs):
+                        nonlocal swap_on_load
+                        reconciled = real_reconcile(*args, **kwargs)
+                        swap_on_load = True
+                        return reconciled
+
+                    reconcile_context = (
+                        patch.object(
+                            server_module,
+                            "_fleet_reconcile_divergent_materialization",
+                            side_effect=reconcile,
+                        )
+                        if cas_state != "normal"
+                        else contextlib.nullcontext()
+                    )
+                    with patch.object(
+                        server_module,
+                        "current_fleet_service",
+                        return_value=service,
+                    ), patch.object(
+                        service,
+                        "commit_snapshot",
+                        side_effect=commit_snapshot,
+                    ), patch.object(
+                        service,
+                        "load",
+                        side_effect=load,
+                    ), reconcile_context:
+                        with self.assertRaisesRegex(
+                            AgentError,
+                            "fleet_registry_commit_diverged",
+                        ):
+                            server_module.fleet_series_apply(
+                                prefix="d",
+                                count=1,
+                                runner="codex_cli",
+                                provider="ollama_local",
+                                model="local",
+                                account_id=None,
+                                expected_generation=2,
+                                codex_executable=executable,
+                            )
+
+                    authoritative = service.load()
+                    self.assertEqual(commit_calls, 1)
+                    self.assertEqual(authoritative, third_snapshots[0])
+                    self.assertEqual(
+                        server_module.current_agent_inventory(),
+                        before_inventory,
+                    )
+                    journal = server_module._fleet_load_recovery_journal(paths)
+                    self.assertIsNotNone(journal)
+                    self.assertEqual(journal.phase, RecoveryPhase.DEGRADED)
+                    self.assertEqual(journal.entries, ())
+                    self.assertEqual(
+                        journal.authoritative_generation,
+                        authoritative.generation,
+                    )
+                    self.assertEqual(
+                        journal.blocking_error_codes,
+                        ("fleet_recovery_incomplete",),
+                    )
 
     def test_fleet_series_disable_wraps_mutation_lock(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

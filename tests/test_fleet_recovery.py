@@ -809,3 +809,45 @@ def test_reconcile_accepts_persisted_empty_registry_only_journal(tmp_path: Path)
         )
 
     assert transaction.journal == journal
+
+
+@pytest.mark.parametrize(
+    "operation",
+    (
+        RecoveryOperation.SERIES_APPLY,
+        RecoveryOperation.SERIES_DISABLE,
+        RecoveryOperation.SERIES_DELETE,
+    ),
+)
+def test_reconcile_rejects_empty_non_registry_only_journal(
+    tmp_path: Path,
+    operation: RecoveryOperation,
+) -> None:
+    import codex_master.server as server_module
+
+    current = FleetSnapshot(1, 2, (), ())
+    planned = FleetSnapshot(1, 3, (), ())
+    journal = replace(
+        sample_journal(),
+        operation=operation,
+        phase=RecoveryPhase.RECONCILING,
+        authoritative_generation=current.generation,
+        entries=(),
+    )
+    paths = FleetPaths.from_state_root(tmp_path)
+    server_module._fleet_store_recovery_journal(journal, paths)
+    transaction = server_module._FleetRecoveryTransaction(paths, journal)
+
+    with patch.object(
+        server_module,
+        "_fleet_execute_recovery_plan",
+        return_value=((), False),
+    ) as execute:
+        assert not server_module._fleet_reconcile_divergent_materialization(
+            current,
+            planned,
+            current,
+            transaction=transaction,
+        )
+
+    execute.assert_not_called()

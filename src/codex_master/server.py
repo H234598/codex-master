@@ -15566,6 +15566,16 @@ def _fleet_publish_recovery_commit(
         authoritative = service.load()
     except Exception:
         raise AgentError("fleet_inventory_publish_failed") from None
+    if (
+        transaction.journal.operation is RecoveryOperation.REGISTRY_ONLY
+        and authoritative != stored
+    ):
+        transaction.advance(
+            RecoveryPhase.DEGRADED,
+            authoritative_generation=authoritative.generation,
+            blocking_error_codes=("fleet_recovery_incomplete",),
+        )
+        raise AgentError("fleet_registry_commit_diverged")
     if authoritative.generation != stored.generation:
         raise AgentError("fleet_inventory_publish_failed")
     if transaction.journal.phase is RecoveryPhase.MATERIALIZING:
@@ -16913,6 +16923,8 @@ def _fleet_reconcile_divergent_materialization(
     if persisted is None:
         return False
     entries = tuple(persisted.entries)
+    if not entries and persisted.operation is not RecoveryOperation.REGISTRY_ONLY:
+        return False
     transaction.journal = persisted
 
     authoritative_inventory = build_inventory(authoritative, AGENT_POOL_ROOT)
