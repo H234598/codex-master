@@ -15417,10 +15417,6 @@ def _fleet_publish_recovery_commit(
         RecoveryPhase.PUBLISHED,
         authoritative_generation=authoritative.generation,
     )
-    transaction.advance(
-        RecoveryPhase.COMPLETE,
-        authoritative_generation=authoritative.generation,
-    )
 
 
 def _fleet_reconcile_commit_exception(
@@ -16419,34 +16415,6 @@ def _fleet_release_reservations(reservations: list[dict[str, Any]]) -> bool:
     return clean
 
 
-def _fleet_compensate_registry_delete(
-    service: FleetService,
-    original: FleetSnapshot,
-    deleted: FleetSnapshot,
-) -> FleetSnapshot:
-    replacement = FleetSnapshot(
-        original.schema_version,
-        deleted.generation + 1,
-        original.accounts,
-        original.series,
-    )
-    try:
-        restored = service.commit_snapshot(
-            replacement,
-            expected_generation=deleted.generation,
-        )
-    except Exception:
-        state, reloaded = _fleet_reconcile_commit_exception(service, deleted, replacement)
-        if state == "diverged":
-            _fleet_publish_stored(service, reloaded)
-            raise AgentError("fleet_registry_delete_diverged") from None
-        if state != "planned":
-            raise AgentError("fleet_registry_delete_diverged") from None
-        restored = reloaded
-    _fleet_publish_stored(service, restored)
-    return restored
-
-
 def _fleet_commit_staged_removal(
     service: FleetService,
     current: FleetSnapshot,
@@ -16471,10 +16439,16 @@ def _fleet_commit_staged_removal(
     except Exception as exc:
         state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
         if state == "planned":
-            staged = []
             _fleet_publish_recovery_commit(service, reloaded, transaction)
-            if transaction is not None:
+            cleanup_complete = True
+            try:
+                _fleet_cleanup_tombstones(staged)
+            except Exception:
+                cleanup_complete = False
+            if transaction is not None and cleanup_complete:
+                transaction.advance(RecoveryPhase.COMPLETE)
                 _fleet_remove_complete_recovery_journal(transaction.journal)
+            staged = []
             raise AgentError("fleet_registry_commit_failed_after_cas") from None
         if state == "diverged":
             if transaction is not None:
@@ -16493,6 +16467,7 @@ def _fleet_commit_staged_removal(
                 raise AgentError("fleet_registry_commit_diverged") from None
             _fleet_publish_recovery_commit(service, reloaded, transaction)
             if transaction is not None:
+                transaction.advance(RecoveryPhase.COMPLETE)
                 _fleet_remove_complete_recovery_journal(transaction.journal)
             staged = []
             raise AgentError("fleet_registry_commit_diverged") from None
@@ -16505,10 +16480,14 @@ def _fleet_commit_staged_removal(
         staged = []
         raise AgentError("fleet_registry_commit_failed") from None
     _fleet_publish_recovery_commit(service, stored, transaction)
+    cleanup_complete = True
     try:
         cleanup_pending = _fleet_cleanup_tombstones(staged)
     except Exception:
         cleanup_pending = True
+        cleanup_complete = False
+    if transaction is not None and cleanup_complete:
+        transaction.advance(RecoveryPhase.COMPLETE)
     return stored, cleanup_pending
 
 
@@ -17621,18 +17600,16 @@ def fleet_series_delete(
                         _fleet_publish_recovery_commit(service, reloaded, active_tx)
                         raise AgentError("fleet_registry_commit_failed_after_cas") from None
                     if state == "diverged":
+                        active_tx.advance(
+                            RecoveryPhase.RECONCILING,
+                            authoritative_generation=reloaded.generation,
+                        )
                         descriptor_states = _fleet_descriptor_reconciliation_states(
                             current,
                             planned,
                             reloaded,
                             set(expected_ids),
                         )
-                        reservations_released = _fleet_release_reservations(reservations)
-                        reservations.clear()
-                        if not reservations_released:
-                            raise AgentError(
-                                "fleet_registry_delete_reservation_diverged"
-                            ) from None
                         if any(
                             descriptor_state == "unknown"
                             for descriptor_state in descriptor_states.values()
@@ -17646,10 +17623,9 @@ def fleet_series_delete(
                 _fleet_publish_recovery_commit(service, stored, active_tx)
             finally:
                 if not _fleet_release_reservations(reservations):
-                    if stored == planned:
-                        _fleet_compensate_registry_delete(service, current, stored)
                     raise AgentError("fleet_registry_delete_raced") from None
-                if active_tx.journal.phase is RecoveryPhase.COMPLETE:
+                if active_tx.journal.phase is RecoveryPhase.PUBLISHED:
+                    active_tx.advance(RecoveryPhase.COMPLETE)
                     _fleet_remove_complete_recovery_journal(active_tx.journal)
             return {
                 "mutation_performed": True,

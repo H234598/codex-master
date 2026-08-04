@@ -4675,7 +4675,7 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(stored.series[0].model, "new")
             self.assertEqual(inventory.agents["d1"].model, "new")
 
-    def test_fleet_registry_only_delete_race_compensates_registry_and_inventory(self) -> None:
+    def test_fleet_registry_only_delete_race_keeps_authoritative_registry_and_recovery_wal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             state = root / "state"
@@ -4704,7 +4704,11 @@ class ServerHelpersTest(unittest.TestCase):
                         foreign_stat = reserved.stat()
                     return real_commit(*args, **kwargs)
 
-                with patch.object(service, "commit_snapshot", side_effect=race_first_commit), patch.object(
+                with patch.object(
+                    service,
+                    "commit_snapshot",
+                    side_effect=race_first_commit,
+                ) as commit_snapshot, patch.object(
                     server_module, "current_fleet_service", return_value=service
                 ):
                     with self.assertRaisesRegex(AgentError, "fleet_registry_delete_raced"):
@@ -4714,12 +4718,18 @@ class ServerHelpersTest(unittest.TestCase):
                         )
                 stored = service.load()
                 inventory = server_module.current_agent_inventory()
+                recovery = server_module._fleet_load_recovery_journal(
+                    server_module.FleetPaths.from_state_root(state)
+                )
 
             self.assertTrue(raced)
+            commit_snapshot.assert_called_once()
             self.assertEqual((pool / "d1").stat().st_ino, foreign_stat.st_ino)
-            self.assertEqual(stored.generation, 4)
-            self.assertEqual(stored.series[0].prefix, "d")
+            self.assertEqual(stored.generation, 3)
+            self.assertEqual(stored.series, ())
             self.assertEqual(inventory.agent_ids, ("d1", "d2"))
+            self.assertIsNotNone(recovery)
+            self.assertEqual(recovery.phase, server_module.RecoveryPhase.RECONCILING)
 
     def test_fleet_registry_delete_holds_home_reservations_through_inventory_publish(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4758,7 +4768,7 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(inventory.agent_ids, ())
             self.assertTrue(result["cleanup_pending"])
 
-    def test_fleet_registry_delete_releases_reservations_before_old_descriptor_publish(self) -> None:
+    def test_fleet_registry_delete_publishes_old_descriptor_before_releasing_reservations(self) -> None:
         from codex_master.fleet_service import FleetConflictError
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -4775,7 +4785,8 @@ class ServerHelpersTest(unittest.TestCase):
                 service = server_module.current_fleet_service()
                 real_commit = service.commit_snapshot
                 real_publish = server_module.publish_agent_inventory
-                released_before_publish = False
+                published = False
+                cleanup_phases: list[Any] = []
 
                 def concurrent_snapshot_then_conflict(*_args, **_kwargs):
                     current = service.load()
@@ -4788,21 +4799,25 @@ class ServerHelpersTest(unittest.TestCase):
                     real_commit(concurrent, expected_generation=current.generation)
                     raise FleetConflictError("generation_conflict")
 
-                def publish_after_release(inventory):
-                    nonlocal released_before_publish
-                    try:
-                        (pool / "d1").mkdir()
-                    except FileExistsError:
-                        pass
-                    else:
-                        released_before_publish = True
-                        (pool / "d1").rmdir()
+                def publish_before_release(inventory):
+                    nonlocal published
                     real_publish(inventory)
+                    published = True
+
+                real_release = server_module._fleet_release_reservations
+
+                def release_after_publish(reservations):
+                    journal = server_module._fleet_load_recovery_journal()
+                    cleanup_phases.append(None if journal is None else journal.phase)
+                    self.assertTrue(published)
+                    return real_release(reservations)
 
                 with patch.object(service, "commit_snapshot", side_effect=concurrent_snapshot_then_conflict), patch.object(
                     server_module, "current_fleet_service", return_value=service
                 ), patch.object(
-                    server_module, "publish_agent_inventory", side_effect=publish_after_release
+                    server_module, "publish_agent_inventory", side_effect=publish_before_release
+                ), patch.object(
+                    server_module, "_fleet_release_reservations", side_effect=release_after_publish
                 ):
                     with self.assertRaisesRegex(AgentError, "fleet_registry_commit_diverged"):
                         server_module.fleet_series_delete(
@@ -4814,8 +4829,53 @@ class ServerHelpersTest(unittest.TestCase):
 
             self.assertEqual(stored.generation, 3)
             self.assertEqual(inventory.agents["d1"].model, "local")
-            self.assertTrue(released_before_publish)
+            self.assertEqual(cleanup_phases, [server_module.RecoveryPhase.PUBLISHED])
             self.assertFalse((pool / "d1").exists())
+
+    def test_fleet_registry_delete_cleanup_failure_keeps_published_wal_and_new_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                    model="local", account_id=None, enabled=False, expected_generation=1,
+                )
+                service = server_module.current_fleet_service()
+                with patch.object(
+                    server_module,
+                    "_fleet_release_reservations",
+                    return_value=False,
+                ), patch.object(
+                    service,
+                    "commit_snapshot",
+                    wraps=service.commit_snapshot,
+                ) as commit_snapshot, patch.object(
+                    server_module,
+                    "current_fleet_service",
+                    return_value=service,
+                ):
+                    with self.assertRaisesRegex(AgentError, "fleet_registry_delete_raced"):
+                        server_module.fleet_series_delete(
+                            prefix="d", expected_generation=2,
+                            confirmed_remove_ids=["d1"], yes=True,
+                        )
+                stored = server_module.current_fleet_service().load()
+                inventory = server_module.current_agent_inventory()
+                recovery = server_module._fleet_load_recovery_journal(
+                    server_module.FleetPaths.from_state_root(state)
+                )
+
+            commit_snapshot.assert_called_once()
+            self.assertEqual(stored.generation, 3)
+            self.assertEqual(stored.series, ())
+            self.assertEqual(inventory.agent_ids, ())
+            self.assertIsNotNone(recovery)
+            self.assertEqual(recovery.phase, server_module.RecoveryPhase.PUBLISHED)
+            self.assertEqual(recovery.authoritative_generation, stored.generation)
 
     def test_fleet_registry_delete_does_not_publish_third_descriptor_after_releasing_reservation(self) -> None:
         from codex_master.fleet_service import FleetConflictError
@@ -5957,8 +6017,13 @@ class ServerHelpersTest(unittest.TestCase):
                         yes=True,
                     )
 
+            recovery = server_module._fleet_load_recovery_journal(
+                server_module.FleetPaths.from_state_root(state)
+            )
+
             self.assertEqual(publish_phases, [server_module.RecoveryPhase.VERIFIED])
-            self.assertEqual(cleanup_phases, [server_module.RecoveryPhase.COMPLETE])
+            self.assertEqual(cleanup_phases, [server_module.RecoveryPhase.PUBLISHED])
+            self.assertIsNone(recovery)
 
     def test_fleet_series_delete_present_publishes_verified_before_complete_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6019,8 +6084,13 @@ class ServerHelpersTest(unittest.TestCase):
                         yes=True,
                     )
 
+            recovery = server_module._fleet_load_recovery_journal(
+                server_module.FleetPaths.from_state_root(state)
+            )
+
             self.assertEqual(publish_phases, [server_module.RecoveryPhase.VERIFIED])
-            self.assertEqual(cleanup_phases, [server_module.RecoveryPhase.COMPLETE])
+            self.assertEqual(cleanup_phases, [server_module.RecoveryPhase.PUBLISHED])
+            self.assertIsNone(recovery)
 
     def test_fleet_series_delete_present_ids_stages_tombstone_with_intent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
