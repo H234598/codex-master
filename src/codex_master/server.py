@@ -15138,7 +15138,9 @@ def _fleet_create_home(
 ) -> os.stat_result:
     _fleet_revalidate_artifact_executables(artifacts)
     if hidden_name is None:
-        if entry_index is not None and transaction is not None:
+        if transaction is not None:
+            if entry_index is None:
+                raise AgentError("fleet_recovery_state_invalid")
             raise AgentError("fleet_recovery_state_invalid")
         hidden_name = f"{FLEET_TOMBSTONE_PREFIX}create-{uuid.uuid4().hex}"
     if transaction is not None and entry_index is not None:
@@ -15731,7 +15733,11 @@ def _fleet_execute_recovery_plan(
         errors.append("fleet_recovery_incomplete")
         blocking = True
     else:
-        authoritative = current_fleet_service().load()
+        try:
+            authoritative = current_fleet_service().load()
+        except Exception:
+            errors.append("fleet_recovery_incomplete")
+            return tuple(dict.fromkeys(errors)), True
         if not _fleet_verify_authoritative_materialization(
             authoritative,
             transaction.journal,
@@ -16154,6 +16160,8 @@ def _fleet_stage_tombstones(
                         if not source_identity_matches(current, pinned[agent_id]):
                             raise AgentError("fleet_home_changed")
                         if planned_tombstones is None:
+                            if transaction is not None:
+                                raise AgentError("fleet_recovery_state_invalid")
                             tombstone = f"{FLEET_TOMBSTONE_PREFIX}{uuid.uuid4().hex}"
                             tombstone_index = None
                         else:
@@ -16226,6 +16234,8 @@ def _fleet_reserve_absent_homes(
                     else:
                         raise AgentError("fleet_registry_delete_raced")
                     if planned_reservations is None:
+                        if transaction is not None:
+                            raise AgentError("fleet_recovery_state_invalid")
                         staging = f"{FLEET_TOMBSTONE_PREFIX}reservation-{uuid.uuid4().hex}"
                         staging_index = None
                     else:
@@ -16370,8 +16380,15 @@ def _fleet_commit_staged_removal(
     expected_generation: int,
     inventory: InventorySnapshot,
     agent_ids_to_remove: list[str],
+    planned_tombstones: dict[str, tuple[str, int]] | None = None,
+    transaction: _FleetRecoveryTransaction | None = None,
 ) -> tuple[FleetSnapshot, bool]:
-    staged = _fleet_stage_tombstones(inventory, agent_ids_to_remove)
+    staged = _fleet_stage_tombstones(
+        inventory,
+        agent_ids_to_remove,
+        transaction=transaction,
+        planned_tombstones=planned_tombstones,
+    )
     try:
         stored = service.commit_snapshot(planned, expected_generation=expected_generation)
     except Exception as exc:
@@ -16386,6 +16403,7 @@ def _fleet_commit_staged_removal(
                 planned,
                 reloaded,
                 staged=staged,
+                transaction=transaction,
             )
             if not reconciled:
                 raise AgentError("fleet_registry_commit_diverged") from None
@@ -16574,109 +16592,26 @@ def _fleet_reconcile_divergent_materialization(
     staged: list[dict[str, Any]] | None = None,
     transaction: _FleetRecoveryTransaction | None = None,
 ) -> bool:
-    created = created or []
-    backups = backups or []
-    staged = staged or []
-    if not (created or backups or staged):
-        return True
+    if transaction is None:
+        return False
 
-    planned_inventory = build_inventory(planned, AGENT_POOL_ROOT)
-    current_inventory = build_inventory(current, AGENT_POOL_ROOT)
-    entries = list(transaction.journal.entries) if transaction is not None else []
-    for agent_id, _expected_home, _artifacts, hidden_name in created:
-        if not any(item.agent_id == agent_id for item in entries):
-            new_agent = planned_inventory.agents.get(agent_id)
-            old_agent = current_inventory.agents.get(agent_id)
-            entries.append(
-                RecoveryEntry(
-                    MutationKind.CREATED,
-                    agent_id,
-                    hidden_name,
-                    None if old_agent is None else descriptor_fingerprint(old_agent),
-                    None if new_agent is None else descriptor_fingerprint(new_agent),
-                    None,
-                    None,
-                    None,
-                    _snapshot_file_identity(_expected_home),
-                    (),
-                    EntryPhase.INTENT,
-                    None,
-                )
-            )
-
-    for item in backups:
-        agent_id = item["old_agent"].agent_id
-        if not any(i.agent_id == agent_id for i in entries):
-            new_agent = planned_inventory.agents.get(agent_id)
-            entries.append(
-                RecoveryEntry(
-                    MutationKind.BACKUP,
-                    agent_id,
-                    item["backup"],
-                    descriptor_fingerprint(item["old_agent"]),
-                    None if new_agent is None else descriptor_fingerprint(new_agent),
-                    None,
-                    None,
-                    _snapshot_file_identity(item["home_stat"]),
-                    None,
-                    (),
-                    EntryPhase.INTENT,
-                    None,
-                )
-            )
-
-    for item in staged:
-        agent_id = item["agent"].agent_id
-        if not any(i.agent_id == agent_id for i in entries):
-            old_agent = item["agent"]
-            entries.append(
-                RecoveryEntry(
-                    MutationKind.TOMBSTONE,
-                    agent_id,
-                    item["tombstone"],
-                    descriptor_fingerprint(old_agent),
-                    None,
-                    None,
-                    None,
-                    _snapshot_file_identity(item["home_stat"]),
-                    None,
-                    (),
-                    EntryPhase.INTENT,
-                    None,
-                )
-            )
-
+    entries = tuple(transaction.journal.entries)
     if not entries:
         return True
 
     authoritative_inventory = build_inventory(authoritative, AGENT_POOL_ROOT)
-    journal = FleetRecoveryJournal(
-        1,
-        uuid.uuid4().hex,
-        RecoveryOperation.SERIES_APPLY,
-        hashlib.sha256(_pool_root_digest_text(AGENT_POOL_ROOT).encode("utf-8")).hexdigest(),
-        current.generation,
-        authoritative.generation,
-        None,
-        RecoveryPhase.PREPARED,
-        tuple(entries),
-        (),
-    )
-    reconcile_transaction = _FleetRecoveryTransaction(
-        FleetPaths.from_state_root(STATE_ROOT),
-        journal,
-    )
     authoritative_fingerprints = {
         agent_id: (
             descriptor_fingerprint(authoritative_inventory.agents[agent_id])
             if agent_id in authoritative_inventory.agents
             else None
         )
-        for agent_id in {entry.agent_id for entry in entries}
+        for entry in entries
+        for agent_id in [entry.agent_id]
     }
-    plan = plan_reconciliation(reconcile_transaction.journal, authoritative_fingerprints)
+    plan = plan_reconciliation(transaction.journal, authoritative_fingerprints)
     errors, blocking = _fleet_execute_recovery_plan(
-        reconcile_transaction,
+        transaction,
         plan,
         authoritative,
     )
@@ -17544,7 +17479,40 @@ def fleet_series_delete(
         build_inventory(planned, AGENT_POOL_ROOT)
         present_ids = _fleet_plan_materialized_ids(prefix, existing.count)
         if not present_ids:
-            reservations = _fleet_reserve_absent_homes(expected_ids)
+            planned_tombstones: dict[str, tuple[str, int]] = {}
+            prepared_entries: list[RecoveryEntry] = []
+            for agent_id in expected_ids:
+                entry_index = len(prepared_entries)
+                hidden_name = f"{FLEET_TOMBSTONE_PREFIX}reservation-{uuid.uuid4().hex}"
+                planned_tombstones[agent_id] = (hidden_name, entry_index)
+                prepared_entries.append(
+                    RecoveryEntry(
+                        kind=MutationKind.TOMBSTONE,
+                        agent_id=agent_id,
+                        hidden_name=hidden_name,
+                        old_descriptor_fingerprint=None,
+                        new_descriptor_fingerprint=None,
+                        old_materialization_fingerprint=None,
+                        new_materialization_fingerprint=None,
+                        source_identity=None,
+                        target_identity=None,
+                        manifest=(),
+                        phase=EntryPhase.INTENT,
+                        result_code=None,
+                    )
+                )
+            active_tx = _FleetRecoveryTransaction.begin(
+                RecoveryOperation.SERIES_APPLY,
+                current,
+                planned,
+                tuple(prepared_entries),
+            )
+            active_tx.advance(RecoveryPhase.MATERIALIZING)
+            reservations = _fleet_reserve_absent_homes(
+                expected_ids,
+                transaction=active_tx,
+                planned_reservations=planned_tombstones,
+            )
             stored: FleetSnapshot | None = None
             try:
                 try:
@@ -17579,6 +17547,26 @@ def fleet_series_delete(
                         raise AgentError("generation_conflict") from None
                     raise AgentError("fleet_registry_commit_failed") from None
                 _fleet_publish_stored(service, stored)
+                if active_tx.journal.phase is RecoveryPhase.MATERIALIZING:
+                    active_tx.advance(RecoveryPhase.CAS_PENDING)
+                if active_tx.journal.phase is RecoveryPhase.CAS_PENDING:
+                    active_tx.advance(
+                        RecoveryPhase.RECONCILING,
+                        authoritative_generation=stored.generation,
+                    )
+                active_tx.advance(
+                    RecoveryPhase.VERIFIED,
+                    authoritative_generation=stored.generation,
+                )
+                active_tx.advance(
+                    RecoveryPhase.PUBLISHED,
+                    authoritative_generation=stored.generation,
+                )
+                active_tx.advance(
+                    RecoveryPhase.COMPLETE,
+                    authoritative_generation=stored.generation,
+                )
+                _fleet_remove_complete_recovery_journal(active_tx.journal)
             finally:
                 if not _fleet_release_reservations(reservations):
                     if stored == planned:
@@ -17593,6 +17581,37 @@ def fleet_series_delete(
                 "raw_output": "not_returned",
             }
         old_inventory = build_inventory(current, AGENT_POOL_ROOT)
+        planned_tombstones = {
+            agent_id: (
+                f"{FLEET_TOMBSTONE_PREFIX}tombstone-{uuid.uuid4().hex}",
+                index,
+            )
+            for index, agent_id in enumerate(expected_ids)
+        }
+        prepared_entries = tuple(
+            RecoveryEntry(
+                kind=MutationKind.TOMBSTONE,
+                agent_id=agent_id,
+                hidden_name=hidden_name,
+                old_descriptor_fingerprint=descriptor_fingerprint(old_inventory.agents[agent_id]),
+                new_descriptor_fingerprint=None,
+                old_materialization_fingerprint=None,
+                new_materialization_fingerprint=None,
+                source_identity=None,
+                target_identity=None,
+                manifest=(),
+                phase=EntryPhase.INTENT,
+                result_code=None,
+            )
+            for agent_id, (hidden_name, _) in planned_tombstones.items()
+        )
+        active_tx = _FleetRecoveryTransaction.begin(
+            RecoveryOperation.SERIES_APPLY,
+            current,
+            planned,
+            prepared_entries,
+        )
+        active_tx.advance(RecoveryPhase.MATERIALIZING)
         stored, cleanup_pending = _fleet_commit_staged_removal(
             service,
             current,
@@ -17600,7 +17619,20 @@ def fleet_series_delete(
             expected_generation=expected_generation,
             inventory=old_inventory,
             agent_ids_to_remove=expected_ids,
+            planned_tombstones=planned_tombstones,
+            transaction=active_tx,
         )
+        if active_tx.journal.phase is RecoveryPhase.MATERIALIZING:
+            active_tx.advance(RecoveryPhase.CAS_PENDING)
+        if active_tx.journal.phase is RecoveryPhase.CAS_PENDING:
+            active_tx.advance(
+                RecoveryPhase.RECONCILING,
+                authoritative_generation=stored.generation,
+            )
+        active_tx.advance(RecoveryPhase.VERIFIED, authoritative_generation=stored.generation)
+        active_tx.advance(RecoveryPhase.PUBLISHED, authoritative_generation=stored.generation)
+        active_tx.advance(RecoveryPhase.COMPLETE, authoritative_generation=stored.generation)
+        _fleet_remove_complete_recovery_journal(active_tx.journal)
         return {
             "mutation_performed": True,
             "generation": stored.generation,

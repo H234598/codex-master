@@ -468,3 +468,76 @@ def test_recovery_plan_execution_reloads_authoritative_snapshot_for_verify(tmp_p
 
     assert service.load.call_count == 2
     assert verified and verified[0] == reloaded
+
+
+def test_recovery_plan_execution_blocks_if_post_plan_load_fails(tmp_path: Path) -> None:
+    from codex_master.server import (
+        _fleet_execute_recovery_plan,
+        _FleetRecoveryTransaction,
+    )
+    from codex_master.fleet_registry import FleetSnapshot
+
+    entries = (replace(sample_entry(), agent_id="d1"),)
+    journal = replace(
+        sample_journal(*entries),
+        phase=RecoveryPhase.RECONCILING,
+        authoritative_generation=1,
+    )
+    transaction = _FleetRecoveryTransaction(
+        FleetPaths.from_state_root(tmp_path),
+        journal,
+    )
+    plan = RecoveryPlan(
+        (RecoveryAction(RecoveryActionKind.RETAIN_QUARANTINE, 0, "d1", DescriptorState.NEW),),
+        has_third=False,
+    )
+    authoritative = FleetSnapshot(1, 1, (), ())
+
+    class _Service:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def load(self) -> FleetSnapshot:
+            self.calls += 1
+            if self.calls == 1:
+                return authoritative
+            raise OSError("post-load failure")
+
+    service = _Service()
+    with patch.object(
+        __import__("codex_master.server", fromlist=["current_fleet_service"]),
+        "current_fleet_service",
+        return_value=service,
+    ):
+        with patch.object(
+            __import__("codex_master.server", fromlist=["_fleet_execute_recovery_action"]),
+            "_fleet_execute_recovery_action",
+            return_value=True,
+        ):
+            errors, blocking = _fleet_execute_recovery_plan(
+                transaction,
+                plan,
+                authoritative,
+            )
+
+    assert errors == ("fleet_recovery_incomplete",)
+    assert blocking is True
+
+
+def test_reconcile_disallows_legacy_inputs_without_persistent_journal() -> None:
+    from codex_master.server import (
+        _fleet_reconcile_divergent_materialization,
+    )
+    from codex_master.fleet_registry import FleetSnapshot
+
+    current = FleetSnapshot(1, 1, (), ())
+    planned = FleetSnapshot(1, 2, (), ())
+    authoritative = FleetSnapshot(1, 2, (), ())
+    assert not _fleet_reconcile_divergent_materialization(
+        current,
+        planned,
+        authoritative,
+        created=[],
+        backups=[],
+        staged=[],
+    )

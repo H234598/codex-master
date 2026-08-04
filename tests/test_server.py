@@ -2827,6 +2827,52 @@ class ServerHelpersTest(unittest.TestCase):
             with self.assertRaisesRegex(AgentError, "fleet_home_content_invalid"):
                 server_module._fleet_managed_home_state(pool, agent, strict_contents=True)
 
+    def test_fleet_create_home_without_planned_hidden_name_in_transaction_is_fail_closed(self) -> None:
+        from codex_master.fleet_registry import FleetSnapshot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            pool = Path(tmp) / "pool"
+            pool.mkdir(parents=True)
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                current = FleetSnapshot(1, 1, (), ())
+                planned = FleetSnapshot(1, 2, (), ())
+                active_tx = server_module._FleetRecoveryTransaction.begin(
+                    server_module.RecoveryOperation.SERIES_APPLY,
+                    current,
+                    planned,
+                    (
+                        server_module.RecoveryEntry(
+                            kind=server_module.MutationKind.CREATED,
+                            agent_id="d1",
+                            hidden_name=f"{server_module.FLEET_TOMBSTONE_PREFIX}create-forced",
+                            old_descriptor_fingerprint=None,
+                            new_descriptor_fingerprint="f" * 64,
+                            old_materialization_fingerprint=None,
+                            new_materialization_fingerprint="a" * 64,
+                            source_identity=None,
+                            target_identity=None,
+                            manifest=(),
+                            phase=server_module.EntryPhase.INTENT,
+                            result_code=None,
+                        ),
+                    ),
+                )
+                root_fd = os.open(pool, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    with self.assertRaisesRegex(AgentError, "fleet_recovery_state_invalid"):
+                        server_module._fleet_create_home(
+                            root_fd,
+                            "d1",
+                            {"files": {}, "executable_checks": ()},
+                            entry_index=None,
+                            transaction=active_tx,
+                        )
+                finally:
+                    os.close(root_fd)
+
     def test_fleet_series_apply_creates_marked_homes_and_publishes_inventory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -5787,6 +5833,118 @@ class ServerHelpersTest(unittest.TestCase):
                     confirmed_remove_ids=confirmed,
                     yes=True,
                 )
+
+    def test_fleet_series_delete_absent_ids_uses_preplanned_reservation_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            observed: list[str] = []
+
+            def inspect_then_mkdir(path: Path | str, mode: int = 0o777, *, dir_fd=None):
+                name = Path(path).name
+                if name.startswith(f"{server_module.FLEET_TOMBSTONE_PREFIX}reservation-"):
+                    journal = server_module._fleet_load_recovery_journal()
+                    self.assertIsNotNone(journal)
+                    observed.append(journal.entries[0].phase.value)
+                return real_mkdir(path, mode, dir_fd=dir_fd)
+
+            real_mkdir = server_module.os.mkdir
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None), patch.object(
+                server_module,
+                "agent_lease_status",
+                return_value={"state": "unclaimed"},
+            ), patch.object(server_module, "run_tmux", return_value=stopped), patch.object(
+                server_module, "pool_home_processes", return_value=[]
+            ), patch.object(server_module.os, "mkdir", side_effect=inspect_then_mkdir):
+                server_module.fleet_series_apply(
+                    prefix="d",
+                    count=1,
+                    runner="codex_cli",
+                    provider="ollama_local",
+                    model="local",
+                    account_id=None,
+                    expected_generation=1,
+                    codex_executable=executable,
+                )
+                server_module.fleet_series_disable(prefix="d", expected_generation=2)
+                shutil.rmtree(pool / "d1")
+                server_module.fleet_series_delete(
+                    prefix="d",
+                    expected_generation=3,
+                    confirmed_remove_ids=["d1"],
+                    yes=True,
+                )
+
+            self.assertEqual(observed[0], server_module.EntryPhase.INTENT.value)
+
+    def test_fleet_series_delete_present_ids_stages_tombstone_with_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            observed: list[str] = []
+            real_rename = server_module._fleet_rename_noreplace_at
+
+            def inspect_rename(
+                root_fd: int,
+                source: str,
+                target: str,
+                expected_source: os.stat_result,
+                error_text: str,
+                **kwargs: Any,
+            ) -> None:
+                if target.startswith(f"{server_module.FLEET_TOMBSTONE_PREFIX}tombstone-") and source == "d1":
+                    journal = server_module._fleet_load_recovery_journal()
+                    self.assertIsNotNone(journal)
+                    observed.append(journal.entries[0].phase.value)
+                return real_rename(
+                    root_fd,
+                    source,
+                    target,
+                    expected_source,
+                    error_text,
+                    **kwargs,
+                )
+
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None), patch.object(
+                server_module,
+                "agent_lease_status",
+                return_value={"state": "unclaimed"},
+            ), patch.object(server_module, "run_tmux", return_value=stopped), patch.object(
+                server_module, "pool_home_processes", return_value=[]
+            ), patch.object(server_module, "_fleet_rename_noreplace_at", side_effect=inspect_rename):
+                server_module.fleet_series_apply(
+                    prefix="d",
+                    count=1,
+                    runner="codex_cli",
+                    provider="ollama_local",
+                    model="local",
+                    account_id=None,
+                    expected_generation=1,
+                    codex_executable=executable,
+                )
+                server_module.fleet_series_disable(prefix="d", expected_generation=2)
+                server_module.fleet_series_delete(
+                    prefix="d",
+                    expected_generation=3,
+                    confirmed_remove_ids=["d1"],
+                    yes=True,
+                )
+
+            self.assertEqual(observed[0], server_module.EntryPhase.INTENT.value)
 
     def test_fleet_series_apply_normal_path_uses_preplanned_create_entry_name(self) -> None:
         observed: list[tuple[str, str]] = []
