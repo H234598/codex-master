@@ -301,7 +301,7 @@ def normalize_recovery_document(value: object) -> FleetRecoveryJournal:
         or len(entries_raw) > MAX_RECOVERY_ENTRIES
         or not isinstance(errors_raw, list)
         or len(errors_raw) > len(RESULT_CODES)
-        or any(error not in RESULT_CODES for error in errors_raw)
+        or any(not isinstance(error, str) or error not in RESULT_CODES for error in errors_raw)
         or errors_raw != sorted(set(errors_raw))
     ):
         _fail()
@@ -332,7 +332,7 @@ def normalize_recovery_document(value: object) -> FleetRecoveryJournal:
     )
 
 
-def recovery_document(journal: FleetRecoveryJournal) -> dict[str, object]:
+def _recovery_document(journal: FleetRecoveryJournal) -> dict[str, object]:
     def identity_document(identity: FileIdentity | None) -> dict[str, int] | None:
         if identity is None:
             return None
@@ -376,6 +376,16 @@ def recovery_document(journal: FleetRecoveryJournal) -> dict[str, object]:
         ],
         "blocking_error_codes": list(journal.blocking_error_codes),
     }
+
+
+def recovery_document(journal: FleetRecoveryJournal) -> dict[str, object]:
+    if not isinstance(journal, FleetRecoveryJournal):
+        _fail()
+    try:
+        raw = _recovery_document(journal)
+    except (AttributeError, TypeError, ValueError):
+        _fail()
+    return _recovery_document(normalize_recovery_document(raw))
 
 
 def _fingerprint(payload: object) -> str:

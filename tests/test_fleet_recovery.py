@@ -109,6 +109,29 @@ def test_recovery_document_rejects_unknown_fields() -> None:
     assert caught.value.code == "invalid_fleet_recovery"
 
 
+def test_recovery_document_rejects_foreign_blocking_error_code_types() -> None:
+    raw = recovery_document(sample_journal())
+    raw["blocking_error_codes"] = [[]]
+    with pytest.raises(FleetRecoveryValidationError) as caught:
+        normalize_recovery_document(raw)
+    assert caught.value.code == "invalid_fleet_recovery"
+
+
+@pytest.mark.parametrize(
+    "journal",
+    [
+        replace(sample_journal(), schema_version=2),
+        sample_journal(replace(sample_entry(), result_code="foreign_result_code")),
+    ],
+)
+def test_recovery_document_rejects_directly_constructed_invalid_journal(
+    journal: FleetRecoveryJournal,
+) -> None:
+    with pytest.raises(FleetRecoveryValidationError) as caught:
+        recovery_document(journal)
+    assert caught.value.code == "invalid_fleet_recovery"
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -150,7 +173,8 @@ def test_recovery_document_rejects_oversize_documents() -> None:
     )
     raw_entry = sample_entry()
     raw_entry = replace(raw_entry, manifest=artifact_manifest)
-    raw = recovery_document(sample_journal(*[raw_entry] * 1000))
+    raw = recovery_document(sample_journal(raw_entry))
+    raw["entries"] = raw["entries"] * 1000
     payload = json.dumps(
         raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
     ).encode("utf-8")
