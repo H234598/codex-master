@@ -1632,9 +1632,7 @@ def enabled_agent_series(snapshot: InventorySnapshot | None = None) -> tuple[str
 
 
 def default_selector_series(snapshot: InventorySnapshot | None = None) -> tuple[str, ...]:
-    active = enabled_agent_series(snapshot)
-    legacy = tuple(prefix for prefix in DEFAULT_ORDINAL_AGENT_SERIES if prefix in active)
-    return legacy or active[:2]
+    return enabled_agent_series(snapshot)
 
 
 def parse_selector_series_value(value: Any, *, field: str = "series") -> tuple[str, ...]:
@@ -1692,7 +1690,7 @@ def selector_policy_status() -> dict[str, Any]:
     series = selector_policy_series()
     return {
         "series": list(series),
-        "default_series": list(DEFAULT_ORDINAL_AGENT_SERIES),
+        "default_series": list(default_selector_series()),
         "env_override": AGENT_SELECTOR_SERIES_ENV,
         "env_override_active": bool(os.environ.get(AGENT_SELECTOR_SERIES_ENV)),
         "policy_file": PATH_NOT_RETURNED,
@@ -2249,6 +2247,17 @@ def applet_action_rows(
                 row["agent"],
                 include_assignment_history=False,
             )
+            routing_timeout_seconds = deadline - time.monotonic()
+            if routing_timeout_seconds <= 0:
+                raise AgentError("applet status deadline exceeded")
+            usage = codex_usage_status_with_routing(
+                row["agent"],
+                usage,
+                persist_account=False,
+                include_assignment_history=False,
+                force_policy_check=True,
+                routing_timeout_seconds=routing_timeout_seconds,
+            )
         except AgentError:
             usage = None
         action = "none"
@@ -2462,6 +2471,17 @@ def applet_action(action: Any, agent: Any, context_token: Any) -> dict[str, Any]
         row = applet_agent_observation(agent, deadline=deadline)
         try:
             usage = codex_usage_watchdog_status(agent, include_assignment_history=False)
+            routing_timeout_seconds = deadline - time.monotonic()
+            if routing_timeout_seconds <= 0:
+                raise AgentError("applet action deadline exceeded")
+            usage = codex_usage_status_with_routing(
+                agent,
+                usage,
+                persist_account=False,
+                include_assignment_history=False,
+                force_policy_check=True,
+                routing_timeout_seconds=routing_timeout_seconds,
+            )
         except AgentError:
             usage = None
         admission = spawn_admission_decision(1) if action == "start" else None
@@ -2558,7 +2578,7 @@ def run_command(
     check: bool = False,
     cwd: Path | str | None = None,
     env: dict[str, str] | None = None,
-    timeout: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    timeout: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
     pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     try:
@@ -5470,10 +5490,22 @@ def codex_usage_routing_decision(
     role: str,
     group_id: str | None = None,
     job_id: str | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     group_id = normalize_routing_context_id(group_id, field="group_id")
     job_id = normalize_routing_context_id(job_id, field="job_id")
+    if timeout_seconds is None:
+        command_timeout = float(CODEX_USAGE_DECISION_TIMEOUT_SECONDS)
+    elif (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
+        or timeout_seconds <= 0
+    ):
+        raise AgentError("codex-usage routing timeout is invalid")
+    else:
+        command_timeout = min(float(timeout_seconds), CODEX_USAGE_DECISION_TIMEOUT_SECONDS)
     auth_fd = open_agent_auth_fd(agent)
     try:
         command = [codex_usage_executable()]
@@ -5502,7 +5534,7 @@ def codex_usage_routing_decision(
             command.extend(["--job", job_id])
         cp = run_command(
             command,
-            timeout=CODEX_USAGE_DECISION_TIMEOUT_SECONDS,
+            timeout=command_timeout,
             pass_fds=(auth_fd,),
         )
     finally:
@@ -5510,15 +5542,20 @@ def codex_usage_routing_decision(
     combined_size = len(cp.stdout.encode("utf-8")) + len(cp.stderr.encode("utf-8"))
     if combined_size > MAX_CODEX_USAGE_DECISION_BYTES:
         raise AgentError("codex-usage routing output exceeded size limit")
-    if cp.returncode != 0:
-        detail, _changed = redact(trim_chars(cp.stderr.strip(), 300))
-        suffix = f": {detail}" if detail else ""
-        raise AgentError(f"codex-usage routing failed with exit {cp.returncode}{suffix}")
     try:
         payload = json.loads(cp.stdout)
     except json.JSONDecodeError as exc:
+        if cp.returncode != 0:
+            detail, _changed = redact(trim_chars(cp.stderr.strip(), 300))
+            suffix = f": {detail}" if detail else ""
+            raise AgentError(f"codex-usage routing failed with exit {cp.returncode}{suffix}") from None
         raise AgentError("codex-usage routing returned invalid JSON") from exc
-    return validate_codex_usage_routing_decision(payload, agent=agent, role=role)
+    decision = validate_codex_usage_routing_decision(payload, agent=agent, role=role)
+    if cp.returncode != 0 and decision["decision"] != "blocked":
+        detail, _changed = redact(trim_chars(cp.stderr.strip(), 300))
+        suffix = f": {detail}" if detail else ""
+        raise AgentError(f"codex-usage routing failed with exit {cp.returncode}{suffix}")
+    return decision
 
 
 def codex_usage_spark_health_update(
@@ -5596,8 +5633,8 @@ def validate_codex_usage_routing_decision(
         payload.get("backend_account_id"),
         field="codex-usage routing backend account id",
         max_chars=MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID,
-        required=True,
-    ) or ""
+        required=decision != "blocked",
+    )
     expected_model = {
         "spark": WRITE_AGENT_MODEL,
         "main": DEFAULT_AGENT_MODEL,
@@ -5611,7 +5648,7 @@ def validate_codex_usage_routing_decision(
         raise AgentError("codex-usage credits decision lacks explicit paid policy")
     if not isinstance(payload.get("paid_overage_allowed"), bool):
         raise AgentError("codex-usage paid policy is invalid")
-    return {
+    result = {
         "schema_version": 1,
         "account": payload["account"],
         "backend_account_id": backend_account_id,
@@ -5628,6 +5665,63 @@ def validate_codex_usage_routing_decision(
         ),
         "raw_output": "not_returned",
     }
+    threshold = payload.get("threshold_percent")
+    if threshold is not None:
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, (int, float))
+            or not math.isfinite(float(threshold))
+            or not 0 <= float(threshold) <= 100
+        ):
+            raise AgentError("codex-usage routing threshold is invalid")
+        result["threshold_percent"] = float(threshold)
+
+    remaining = payload.get("remaining")
+    normalized_remaining: dict[str, float] = {}
+    if remaining is not None:
+        if not isinstance(remaining, dict) or len(remaining) > 16:
+            raise AgentError("codex-usage routing remaining values are invalid")
+        for window, value in remaining.items():
+            if (
+                not isinstance(window, str)
+                or not window
+                or len(window) > 32
+                or isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not 0 <= float(value) <= 100
+            ):
+                raise AgentError("codex-usage routing remaining values are invalid")
+            normalized_remaining[window] = float(value)
+        if normalized_remaining:
+            result["remaining_percent"] = min(normalized_remaining.values())
+
+    resets = payload.get("resets")
+    normalized_resets: dict[str, tuple[float, str]] = {}
+    if resets is not None:
+        if not isinstance(resets, dict) or len(resets) > 16:
+            raise AgentError("codex-usage routing resets are invalid")
+        for window, value in resets.items():
+            parsed = parse_utc_timestamp(value)
+            if not isinstance(window, str) or not window or len(window) > 32 or parsed is None:
+                raise AgentError("codex-usage routing resets are invalid")
+            normalized_resets[window] = (parsed, value)
+    if decision == "blocked" and normalized_resets:
+        blocked_windows = set(normalized_resets)
+        if normalized_remaining and threshold is not None:
+            blocked_windows = {
+                window
+                for window, value in normalized_remaining.items()
+                if value <= float(threshold)
+            }
+        blocked_resets = [
+            normalized_resets[window]
+            for window in blocked_windows
+            if window in normalized_resets
+        ]
+        if blocked_resets:
+            result["blocked_until_utc"] = max(blocked_resets)[1]
+    return result
 
 
 def managed_raw_dirs() -> tuple[Path, ...]:
@@ -8031,6 +8125,8 @@ def codex_usage_status_with_routing(
     *,
     persist_account: bool = True,
     include_assignment_history: bool = True,
+    force_policy_check: bool = False,
+    routing_timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     needs_routing_check = (
         status.get("usage_status") in {"login_required", "partial", "error"}
@@ -8039,14 +8135,43 @@ def codex_usage_status_with_routing(
     needs_routing_check = needs_routing_check or (
         not status.get("blocked")
         and status.get("state") == "missing"
-        and status.get("account") == canonical_agent_id(agent)
+    )
+    needs_routing_check = needs_routing_check or (
+        force_policy_check and isinstance(status.get("account"), str)
     )
     if needs_routing_check:
         auth = agent_auth_status(agent)
-        if auth.get("authenticated"):
-            routing = codex_usage_routing_decision(agent, role="arbeitsbiene")
+        if auth.get("authenticated") or (
+            force_policy_check and auth.get("auth_state") == "access_token_expired"
+        ):
+            if routing_timeout_seconds is None:
+                routing = codex_usage_routing_decision(agent, role="arbeitsbiene")
+            else:
+                routing = codex_usage_routing_decision(
+                    agent,
+                    role="arbeitsbiene",
+                    timeout_seconds=routing_timeout_seconds,
+                )
             if persist_account:
                 remember_agent_usage_account(agent, routing.get("account"))
+            if routing.get("decision") == "blocked":
+                blocked = {
+                    **status,
+                    "agent": canonical_agent_id(agent),
+                    "account": routing.get("account"),
+                    "account_mapping": "routing",
+                    "state": "blocked",
+                    "blocked": True,
+                    "blocked_until_utc": routing.get("blocked_until_utc"),
+                    "reason": routing.get("reason") or "codex usage limit reached",
+                    "source": "routing_policy",
+                    "raw_output": "not_returned",
+                }
+                for field in ("remaining_percent", "threshold_percent"):
+                    if field in routing:
+                        blocked[field] = routing[field]
+                return blocked
+            if persist_account:
                 status = codex_usage_watchdog_status(
                     agent,
                     snapshot_account=routing.get("account"),
@@ -8058,14 +8183,15 @@ def codex_usage_status_with_routing(
                     snapshot_account=routing.get("account"),
                     include_assignment_history=include_assignment_history,
                 )
-            if routing.get("decision") == "blocked" and not status.get("blocked"):
-                reason = routing.get("reason") or "codex usage limit reached"
-                raise AgentError(f"agent {canonical_agent_id(agent)} is blocked by codex-usage routing: {reason}")
     return status
 
 
 def ensure_agent_not_blocked_by_codex_usage(agent: str) -> dict[str, Any]:
-    status = codex_usage_status_with_routing(agent, codex_usage_watchdog_status(agent))
+    status = codex_usage_status_with_routing(
+        agent,
+        codex_usage_watchdog_status(agent),
+        force_policy_check=True,
+    )
     if status.get("blocked"):
         blocked_until = status.get("blocked_until_utc")
         reason = status.get("reason") or "codex usage limit reached"
@@ -16442,7 +16568,7 @@ def _fleet_commit_staged_removal(
             _fleet_publish_recovery_commit(service, reloaded, transaction)
             cleanup_complete = True
             try:
-                _fleet_cleanup_tombstones(staged)
+                cleanup_complete = not _fleet_cleanup_tombstones(staged)
             except Exception:
                 cleanup_complete = False
             if transaction is not None and cleanup_complete:
@@ -16483,6 +16609,7 @@ def _fleet_commit_staged_removal(
     cleanup_complete = True
     try:
         cleanup_pending = _fleet_cleanup_tombstones(staged)
+        cleanup_complete = not cleanup_pending
     except Exception:
         cleanup_pending = True
         cleanup_complete = False
@@ -17622,9 +17749,9 @@ def fleet_series_delete(
                     raise AgentError("fleet_registry_commit_failed") from None
                 _fleet_publish_recovery_commit(service, stored, active_tx)
             finally:
-                if not _fleet_release_reservations(reservations):
-                    raise AgentError("fleet_registry_delete_raced") from None
                 if active_tx.journal.phase is RecoveryPhase.PUBLISHED:
+                    if not _fleet_release_reservations(reservations):
+                        raise AgentError("fleet_registry_delete_raced") from None
                     active_tx.advance(RecoveryPhase.COMPLETE)
                     _fleet_remove_complete_recovery_journal(active_tx.journal)
             return {

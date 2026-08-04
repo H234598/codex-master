@@ -92,7 +92,6 @@ from codex_master.server import (
     validate_codex_usage_routing_decision,
     DEFAULT_AGENT_MODEL,
     DEFAULT_AGENT_MODEL_EFFORT,
-    DEFAULT_ORDINAL_AGENT_SERIES,
     doctor,
     ensure_state,
     ensure_agent_not_blocked_by_codex_usage,
@@ -2123,9 +2122,9 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(len(agent_ids("all")), 300)
         self.assertEqual(agent_ids("1"), ["a1"])
         self.assertEqual(agent_ids("2"), ["b1"])
-        self.assertEqual(agent_ids("3"), ["a2"])
-        self.assertEqual(agent_ids("4"), ["b2"])
-        self.assertEqual(agent_ids("200"), ["b100"])
+        self.assertEqual(agent_ids("3"), ["c1"])
+        self.assertEqual(agent_ids("4"), ["a2"])
+        self.assertEqual(agent_ids("200"), ["b67"])
 
     def test_active_selector_uses_single_managed_inventory_snapshot(self) -> None:
         inventory = {
@@ -2294,7 +2293,7 @@ class ServerHelpersTest(unittest.TestCase):
             with self.assertRaisesRegex(AgentError, "unknown Agentinnen series"):
                 server_module.parse_selector_series_value("a")
             with patch.dict(os.environ, {server_module.AGENT_SELECTOR_SERIES_ENV: "stale"}, clear=False):
-                self.assertEqual(server_module.selector_policy_series(), ("b",))
+                self.assertEqual(server_module.selector_policy_series(), ("b", "d"))
             self.assertEqual(server_module.agent_ids("all"), ["b1", "d1"])
             self.assertEqual(server_module.canonical_agent_id("a1"), "a1")
             self.assertEqual(server_module.agent_ids("a-series"), [])
@@ -4711,7 +4710,7 @@ class ServerHelpersTest(unittest.TestCase):
                 ) as commit_snapshot, patch.object(
                     server_module, "current_fleet_service", return_value=service
                 ):
-                    with self.assertRaisesRegex(AgentError, "fleet_registry_delete_raced"):
+                    with self.assertRaisesRegex(AgentError, "fleet_inventory_publish_failed"):
                         server_module.fleet_series_delete(
                             prefix="d", expected_generation=2,
                             confirmed_remove_ids=["d1", "d2"], yes=True,
@@ -4877,7 +4876,79 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(recovery.phase, server_module.RecoveryPhase.PUBLISHED)
             self.assertEqual(recovery.authoritative_generation, stored.generation)
 
-    def test_fleet_registry_delete_does_not_publish_third_descriptor_after_releasing_reservation(self) -> None:
+    def test_fleet_registry_delete_keeps_absent_reservation_before_publish(self) -> None:
+        from codex_master.fleet_service import FleetConflictError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                server_module.fleet_series_apply(
+                    prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                    model="local", account_id=None, enabled=False, expected_generation=1,
+                )
+                service = server_module.current_fleet_service()
+                with patch.object(
+                    service,
+                    "commit_snapshot",
+                    side_effect=FleetConflictError("generation_conflict"),
+                ), patch.object(
+                    server_module, "current_fleet_service", return_value=service
+                ), patch.object(
+                    server_module, "_fleet_release_reservations", wraps=server_module._fleet_release_reservations
+                ) as release:
+                    with self.assertRaisesRegex(AgentError, "generation_conflict"):
+                        server_module.fleet_series_delete(
+                            prefix="d", expected_generation=2,
+                            confirmed_remove_ids=["d1"], yes=True,
+                        )
+                recovery = server_module._fleet_load_recovery_journal(
+                    server_module.FleetPaths.from_state_root(state)
+                )
+                release.assert_not_called()
+                self.assertIsNotNone(recovery)
+                self.assertEqual(recovery.phase, server_module.RecoveryPhase.CAS_PENDING)
+                self.assertTrue((pool / "d1").is_dir())
+
+    def test_fleet_registry_delete_cleanup_pending_keeps_published_wal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/usr/bin/bash\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            stopped = subprocess.CompletedProcess([], 1, "", "")
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None), patch.object(
+                server_module, "agent_lease_status", return_value={"state": "unclaimed"}
+            ), patch.object(server_module, "run_tmux", return_value=stopped), patch.object(
+                server_module, "pool_home_processes", return_value=[]
+            ):
+                server_module.fleet_series_apply(
+                    prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                    model="local", account_id=None, expected_generation=1,
+                    codex_executable=executable,
+                )
+                server_module.fleet_series_disable(prefix="d", expected_generation=2)
+                with patch.object(server_module, "_fleet_cleanup_tombstones", return_value=True):
+                    result = server_module.fleet_series_delete(
+                        prefix="d", expected_generation=3,
+                        confirmed_remove_ids=["d1"], yes=True,
+                    )
+                recovery = server_module._fleet_load_recovery_journal(
+                    server_module.FleetPaths.from_state_root(state)
+                )
+
+            self.assertTrue(result["cleanup_pending"])
+            self.assertIsNotNone(recovery)
+            self.assertEqual(recovery.phase, server_module.RecoveryPhase.PUBLISHED)
+
+    def test_fleet_registry_delete_keeps_reservation_for_unknown_third_descriptor(self) -> None:
         from codex_master.fleet_service import FleetConflictError
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -4927,13 +4998,18 @@ class ServerHelpersTest(unittest.TestCase):
                         )
                 stored = service.load()
                 inventory = server_module.current_agent_inventory()
+                recovery = server_module._fleet_load_recovery_journal(
+                    server_module.FleetPaths.from_state_root(state)
+                )
 
             self.assertEqual(stored.generation, 3)
             self.assertEqual(stored.series[0].display_name, "Concurrent D")
             self.assertEqual(inventory.agents["d1"].label, before.agents["d1"].label)
-            self.assertFalse((pool / "d1").exists())
+            self.assertTrue((pool / "d1").is_dir())
+            self.assertIsNotNone(recovery)
+            self.assertEqual(recovery.phase, server_module.RecoveryPhase.RECONCILING)
 
-    def test_fleet_registry_delete_releases_reservations_after_publish_failure(self) -> None:
+    def test_fleet_registry_delete_keeps_reservations_after_publish_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             state = root / "state"
@@ -4956,10 +5032,15 @@ class ServerHelpersTest(unittest.TestCase):
                             confirmed_remove_ids=["d1"], yes=True,
                         )
                 stored = server_module.current_fleet_service().load()
+                recovery = server_module._fleet_load_recovery_journal(
+                    server_module.FleetPaths.from_state_root(state)
+                )
 
             self.assertEqual(stored.generation, 3)
             self.assertEqual(stored.series, ())
-            self.assertFalse((pool / "d1").exists())
+            self.assertTrue((pool / "d1").is_dir())
+            self.assertIsNotNone(recovery)
+            self.assertEqual(recovery.phase, server_module.RecoveryPhase.VERIFIED)
 
     def test_fleet_registry_delete_tracks_reservation_mkdir_before_stat_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6090,7 +6171,8 @@ class ServerHelpersTest(unittest.TestCase):
 
             self.assertEqual(publish_phases, [server_module.RecoveryPhase.VERIFIED])
             self.assertEqual(cleanup_phases, [server_module.RecoveryPhase.PUBLISHED])
-            self.assertIsNone(recovery)
+            self.assertIsNotNone(recovery)
+            self.assertEqual(recovery.phase, server_module.RecoveryPhase.PUBLISHED)
 
     def test_fleet_series_delete_present_ids_stages_tombstone_with_intent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6437,7 +6519,8 @@ class ServerHelpersTest(unittest.TestCase):
                 persisted_status = call_tool("agent_selector_policy", {})
                 selected = [agent_ids(str(index))[0] for index in range(1, 7)]
 
-        self.assertEqual(default_status["series"], list(DEFAULT_ORDINAL_AGENT_SERIES))
+        self.assertEqual(default_status["series"], ["a", "b", "c"])
+        self.assertEqual(default_status["default_series"], ["a", "b", "c"])
         self.assertEqual([item["agent"] for item in preview["ordinal_mapping"]], ["a1", "b1", "c1", "a2", "b2", "c2"])
         self.assertEqual(changed["series"], ["a", "b", "c"])
         self.assertEqual(persisted_status["series"], ["a", "b", "c"])
@@ -12845,6 +12928,66 @@ class ServerHelpersTest(unittest.TestCase):
         route.assert_called_once_with("a1", role="arbeitsbiene")
         remember.assert_called_once_with("a1", "BW_Neu")
 
+    def test_usage_policy_block_overrides_clear_snapshot_and_reports_reset(self) -> None:
+        status = {
+            "agent": "a1",
+            "account": "BW_Privat",
+            "account_mapping": "routing",
+            "state": "clear",
+            "blocked": False,
+            "blocked_until_utc": None,
+            "source": "snapshot",
+        }
+        routing = {
+            "account": "BW_Privat",
+            "backend_account_id": "backend-private",
+            "decision": "blocked",
+            "model": None,
+            "reason": "main_limit_at_or_below_threshold",
+            "remaining_percent": 1.0,
+            "threshold_percent": 10.0,
+            "blocked_until_utc": "2026-08-15T15:20:23+02:00",
+        }
+        with patch(
+            "codex_master.server.agent_auth_status",
+            return_value={"authenticated": False, "auth_state": "access_token_expired"},
+        ), patch(
+            "codex_master.server.codex_usage_routing_decision", return_value=routing
+        ) as route, patch("codex_master.server.remember_agent_usage_account") as remember:
+            result = server_module.codex_usage_status_with_routing(
+                "a1",
+                status,
+                persist_account=False,
+                include_assignment_history=False,
+                force_policy_check=True,
+            )
+
+        self.assertTrue(result["blocked"])
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["source"], "routing_policy")
+        self.assertEqual(result["remaining_percent"], 1.0)
+        self.assertEqual(result["threshold_percent"], 10.0)
+        self.assertEqual(result["blocked_until_utc"], "2026-08-15T15:20:23+02:00")
+        route.assert_called_once_with("a1", role="arbeitsbiene")
+        remember.assert_not_called()
+
+    def test_usage_background_check_does_not_probe_expired_auth_without_force(self) -> None:
+        status = {
+            "agent": "a2",
+            "account": "BW_Privat",
+            "account_mapping": "fallback",
+            "state": "clear",
+            "blocked": False,
+        }
+        with patch(
+            "codex_master.server.agent_auth_status",
+            return_value={"authenticated": False, "auth_state": "access_token_expired"},
+        ), patch("codex_master.server.codex_usage_routing_decision") as route:
+            result = server_module.codex_usage_status_with_routing("a2", status)
+
+        self.assertIs(result, status)
+        route.assert_not_called()
+
     def test_remember_agent_usage_account_preserves_same_account_route(self) -> None:
         meta = {
             "routing": {
@@ -19178,6 +19321,76 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(decision["decision"], "spark")
 
+    def test_codex_usage_routing_accepts_structured_blocked_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            payload = {
+                "schema_version": 1,
+                "account": "BW_Privat",
+                "backend_account_id": "backend-private",
+                "role": "arbeitsbiene",
+                "decision": "blocked",
+                "model": None,
+                "reason": "main_limit_at_or_below_threshold",
+                "usage_state": "known",
+                "paid_overage_allowed": False,
+                "policy_source": "global",
+                "threshold_percent": 10.0,
+                "remaining": {"30d": 1.0},
+                "resets": {"30d": "2026-08-15T15:20:23+02:00"},
+            }
+            completed = subprocess.CompletedProcess(
+                ["codex-usage"], 2, json.dumps(payload), "account blocked"
+            )
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a1": {"label": "A1", "runner": home / "codex", "home": home, "session": "session-a1"}},
+                clear=False,
+            ), patch(
+                "codex_master.server.codex_usage_executable",
+                return_value="/usr/bin/codex-usage",
+            ), patch("codex_master.server.run_command", return_value=completed):
+                decision = codex_usage_routing_decision("a1", role="arbeitsbiene")
+
+        self.assertEqual(decision["decision"], "blocked")
+        self.assertEqual(decision["remaining_percent"], 1.0)
+        self.assertEqual(decision["blocked_until_utc"], "2026-08-15T15:20:23+02:00")
+
+    def test_codex_usage_routing_caps_subprocess_to_caller_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            (home / "auth.json").write_text("{}\n", encoding="utf-8")
+            payload = {
+                "schema_version": 1,
+                "account": "BW_Privat",
+                "backend_account_id": "backend-private",
+                "role": "arbeitsbiene",
+                "decision": "blocked",
+                "model": None,
+                "reason": "main_limit_at_or_below_threshold",
+                "usage_state": "known",
+                "paid_overage_allowed": False,
+                "policy_source": "global",
+            }
+            completed = subprocess.CompletedProcess(
+                ["codex-usage"], 2, json.dumps(payload), "account blocked"
+            )
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a1": {"label": "A1", "runner": home / "codex", "home": home, "session": "session-a1"}},
+                clear=False,
+            ), patch(
+                "codex_master.server.codex_usage_executable",
+                return_value="/usr/bin/codex-usage",
+            ), patch("codex_master.server.run_command", return_value=completed) as run:
+                decision = codex_usage_routing_decision(
+                    "a1", role="arbeitsbiene", timeout_seconds=0.25
+                )
+
+        self.assertEqual(decision["decision"], "blocked")
+        self.assertEqual(run.call_args.kwargs["timeout"], 0.25)
+
     def test_codex_usage_routing_rejects_unhashable_decision(self) -> None:
         with self.assertRaisesRegex(AgentError, "codex-usage routing decision is invalid"):
             validate_codex_usage_routing_decision(
@@ -19201,6 +19414,55 @@ class ServerHelpersTest(unittest.TestCase):
                 agent="a1",
                 role="arbeitsbiene",
             )
+
+    def test_codex_usage_routing_preserves_remaining_semantics_and_block_reset(self) -> None:
+        decision = validate_codex_usage_routing_decision(
+            {
+                "schema_version": 1,
+                "account": "BW_Privat",
+                "backend_account_id": "backend-private",
+                "role": "arbeitsbiene",
+                "decision": "blocked",
+                "model": None,
+                "reason": "main_limit_at_or_below_threshold",
+                "usage_state": "known",
+                "paid_overage_allowed": False,
+                "policy_source": "global",
+                "threshold_percent": 10.0,
+                "remaining": {"30d": 1.0, "weekly": 50.0},
+                "resets": {
+                    "30d": "2026-08-15T15:20:23+02:00",
+                    "weekly": "2026-08-11T04:57:12+02:00",
+                },
+            },
+            agent="a1",
+            role="arbeitsbiene",
+        )
+
+        self.assertEqual(decision["remaining_percent"], 1.0)
+        self.assertEqual(decision["threshold_percent"], 10.0)
+        self.assertEqual(decision["blocked_until_utc"], "2026-08-15T15:20:23+02:00")
+
+    def test_codex_usage_routing_accepts_blocked_account_without_backend_id(self) -> None:
+        decision = validate_codex_usage_routing_decision(
+            {
+                "schema_version": 1,
+                "account": "BW_Privat",
+                "backend_account_id": None,
+                "role": "arbeitsbiene",
+                "decision": "blocked",
+                "model": None,
+                "reason": "cache_invalidated",
+                "usage_state": "unknown",
+                "paid_overage_allowed": False,
+                "policy_source": "global",
+            },
+            agent="a2",
+            role="arbeitsbiene",
+        )
+
+        self.assertEqual(decision["decision"], "blocked")
+        self.assertIsNone(decision["backend_account_id"])
 
     def test_spark_health_update_is_bounded_and_uses_config(self) -> None:
         completed = subprocess.CompletedProcess(
@@ -20913,6 +21175,59 @@ class AppletStatusContractTest(unittest.TestCase):
         self.assertEqual(row["blocked_until_utc"], "2026-08-03T15:00:00+00:00")
         self.assertEqual(row["allowed_action"], "none")
         self.assertEqual(row["context_token"], "")
+
+    @patch("codex_master.server.read_meta", return_value={})
+    @patch("codex_master.server.read_applet_action_key", return_value=b"k" * 32)
+    @patch("codex_master.server.codex_usage_status_with_routing")
+    @patch("codex_master.server.codex_usage_watchdog_status")
+    def test_applet_rows_force_fresh_policy_without_persisting_account(
+        self,
+        mock_usage,
+        mock_policy,
+        _mock_read_key,
+        _mock_meta,
+    ) -> None:
+        raw = {
+            "agent": "a1",
+            "account": "BW_Privat",
+            "state": "clear",
+            "blocked": False,
+            "blocked_until_utc": None,
+        }
+        blocked = {
+            **raw,
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": "2026-08-15T15:20:23+02:00",
+        }
+        mock_usage.return_value = raw
+        mock_policy.return_value = blocked
+
+        rows = server_module.applet_action_rows(
+            [self._row("a1")],
+            running_count=0,
+            deadline=server_module.time.monotonic() + 10,
+        )
+
+        self.assertEqual(rows[0]["limit_state"], "blocked")
+        self.assertEqual(rows[0]["allowed_action"], "none")
+        mock_policy.assert_called_once()
+        self.assertEqual(mock_policy.call_args.args, ("a1", raw))
+        self.assertEqual(
+            {
+                key: value
+                for key, value in mock_policy.call_args.kwargs.items()
+                if key != "routing_timeout_seconds"
+            },
+            {
+                "persist_account": False,
+                "include_assignment_history": False,
+                "force_policy_check": True,
+            },
+        )
+        timeout = mock_policy.call_args.kwargs["routing_timeout_seconds"]
+        self.assertGreater(timeout, 0)
+        self.assertLessEqual(timeout, 10)
 
     def test_applet_action_token_rejects_tampering_and_expiry(self) -> None:
         state = {
