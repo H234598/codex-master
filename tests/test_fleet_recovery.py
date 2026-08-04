@@ -851,3 +851,49 @@ def test_reconcile_rejects_empty_non_registry_only_journal(
         )
 
     execute.assert_not_called()
+
+
+def test_registry_only_publish_rejects_different_generation_before_snapshot_divergence(
+    tmp_path: Path,
+) -> None:
+    import codex_master.server as server_module
+
+    current = FleetSnapshot(1, 2, (), ())
+    stored = FleetSnapshot(1, 3, (), ())
+    authoritative = FleetSnapshot(1, 4, (), ())
+    state = tmp_path / "state"
+    pool = tmp_path / "pool"
+    before_inventory = server_module.build_inventory(current, pool)
+
+    class _Service:
+        def load(self) -> FleetSnapshot:
+            return authoritative
+
+    with patch.object(server_module, "STATE_ROOT", state), patch.object(
+        server_module,
+        "AGENT_POOL_ROOT",
+        pool,
+    ), server_module.temporary_agent_inventory(before_inventory):
+        transaction = server_module._FleetRecoveryTransaction.begin(
+            RecoveryOperation.REGISTRY_ONLY,
+            current,
+            stored,
+            (),
+        )
+        transaction.advance(RecoveryPhase.MATERIALIZING)
+        transaction.advance(RecoveryPhase.CAS_PENDING)
+
+        with pytest.raises(AgentError) as caught:
+            server_module._fleet_publish_recovery_commit(
+                _Service(),
+                stored,
+                transaction,
+            )
+
+        assert str(caught.value) == "fleet_inventory_publish_failed"
+        persisted = server_module._fleet_load_recovery_journal(transaction.paths)
+        assert persisted == transaction.journal
+        assert persisted is not None
+        assert persisted.phase is RecoveryPhase.CAS_PENDING
+        assert persisted.blocking_error_codes == ()
+        assert server_module.current_agent_inventory() == before_inventory

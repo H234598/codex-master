@@ -15566,6 +15566,8 @@ def _fleet_publish_recovery_commit(
         authoritative = service.load()
     except Exception:
         raise AgentError("fleet_inventory_publish_failed") from None
+    if authoritative.generation != stored.generation:
+        raise AgentError("fleet_inventory_publish_failed")
     if (
         transaction.journal.operation is RecoveryOperation.REGISTRY_ONLY
         and authoritative != stored
@@ -15576,8 +15578,6 @@ def _fleet_publish_recovery_commit(
             blocking_error_codes=("fleet_recovery_incomplete",),
         )
         raise AgentError("fleet_registry_commit_diverged")
-    if authoritative.generation != stored.generation:
-        raise AgentError("fleet_inventory_publish_failed")
     if transaction.journal.phase is RecoveryPhase.MATERIALIZING:
         transaction.advance(RecoveryPhase.CAS_PENDING)
     if transaction.journal.phase is RecoveryPhase.CAS_PENDING:
