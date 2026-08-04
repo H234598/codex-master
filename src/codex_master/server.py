@@ -3477,8 +3477,16 @@ def _snapshot_file_identity(stat_result: os.stat_result | None) -> FileIdentity 
 def _fleet_load_recovery_journal(
     paths: FleetPaths | None = None,
 ) -> FleetRecoveryJournal | None:
+    loaded = _fleet_load_recovery_journal_with_identity(paths)
+    return loaded[0] if loaded is not None else None
+
+
+def _fleet_load_recovery_journal_with_identity(
+    paths: FleetPaths | None = None,
+) -> tuple[FleetRecoveryJournal, FileIdentity] | None:
     paths = paths or FleetPaths.from_state_root(STATE_ROOT)
     raw_text: str | None = None
+    identity: FileIdentity | None = None
     try:
         parent_stat = paths.root.lstat()
     except FileNotFoundError:
@@ -3517,6 +3525,7 @@ def _fleet_load_recovery_journal(
             opened = os.fstat(fd)
             if not source_identity_with_snapshot_matches(opened, target_stat):
                 raise AgentError("fleet_recovery_state_invalid")
+            identity = _snapshot_file_identity(opened)
             with os.fdopen(fd, "rb") as handle:
                 fd = -1
                 raw = handle.read(MAX_RECOVERY_DOCUMENT_BYTES + 1)
@@ -3536,9 +3545,12 @@ def _fleet_load_recovery_journal(
     except (json.JSONDecodeError, TypeError, UnicodeError) as exc:
         raise AgentError("fleet_recovery_state_invalid") from exc
     try:
-        return normalize_recovery_document(payload)
+        journal = normalize_recovery_document(payload)
     except Exception as exc:
         raise AgentError("fleet_recovery_state_invalid") from exc
+    if identity is None:
+        raise AgentError("fleet_recovery_state_invalid")
+    return journal, identity
 
 
 def _fleet_store_recovery_journal(
@@ -3566,6 +3578,7 @@ def _fleet_store_recovery_journal(
         raise AgentError("fleet_recovery_state_invalid") from exc
     parent_fd = -1
     tmp_fd = -1
+    tmp_identity: FileIdentity | None = None
     tmp_name = f".{paths.recovery.name}.{uuid.uuid4().hex}.tmp"
     try:
         parent_fd = open_directory_no_follow_matching(
@@ -3583,11 +3596,21 @@ def _fleet_store_recovery_journal(
             raise AgentError("fleet_recovery_state_invalid") from exc
         try:
             os.fchmod(tmp_fd, 0o600)
+            tmp_identity = _snapshot_file_identity(os.fstat(tmp_fd))
             with os.fdopen(tmp_fd, "wb") as handle:
                 tmp_fd = -1
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
+            current_tmp = os.stat(tmp_name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                tmp_identity is None
+                or not stat_module.S_ISREG(current_tmp.st_mode)
+                or getattr(current_tmp, "st_nlink", 1) != 1
+                or not source_identity_matches(current_tmp, tmp_identity)
+                or _snapshot_file_identity(current_tmp) != tmp_identity
+            ):
+                raise AgentError("fleet_recovery_state_invalid")
             os.replace(
                 tmp_name,
                 paths.recovery.name,
@@ -3604,9 +3627,19 @@ def _fleet_store_recovery_journal(
         if tmp_fd >= 0:
             with contextlib.suppress(OSError):
                 os.close(tmp_fd)
+        if parent_fd >= 0 and tmp_identity is not None:
+            try:
+                current_tmp = os.stat(tmp_name, dir_fd=parent_fd, follow_symlinks=False)
+                if (
+                    stat_module.S_ISREG(current_tmp.st_mode)
+                    and getattr(current_tmp, "st_nlink", 1) == 1
+                    and source_identity_matches(current_tmp, tmp_identity)
+                    and _snapshot_file_identity(current_tmp) == tmp_identity
+                ):
+                    os.unlink(tmp_name, dir_fd=parent_fd)
+            except OSError:
+                pass
         if parent_fd >= 0:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_name, dir_fd=parent_fd)
             os.close(parent_fd)
     try:
         if _fleet_load_recovery_journal(paths) != journal:
@@ -3622,7 +3655,13 @@ def _fleet_remove_complete_recovery_journal(
     if expected.phase is not RecoveryPhase.COMPLETE:
         return False
     paths = paths or FleetPaths.from_state_root(STATE_ROOT)
-    current = _fleet_load_recovery_journal(paths)
+    try:
+        loaded = _fleet_load_recovery_journal_with_identity(paths)
+    except AgentError:
+        return False
+    if loaded is None:
+        return False
+    current, expected_identity = loaded
     if current != expected:
         return False
     try:
@@ -3638,15 +3677,26 @@ def _fleet_remove_complete_recovery_journal(
             changed_text="fleet_recovery_state_invalid",
         )
         try:
+            latest = os.stat(paths.recovery.name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                not source_identity_matches(latest, expected_identity)
+                or _snapshot_file_identity(latest) != expected_identity
+            ):
+                return False
             os.unlink(paths.recovery.name, dir_fd=parent_fd)
         except FileNotFoundError:
             return False
+        try:
+            os.fsync(parent_fd)
+        except OSError:
+            return False
         return True
-    except OSError:
+    except (AgentError, OSError):
         return False
     finally:
         if parent_fd >= 0:
-            os.close(parent_fd)
+            with contextlib.suppress(OSError):
+                os.close(parent_fd)
 
 
 _REPLACE_ENTRY_NONE: object = object()

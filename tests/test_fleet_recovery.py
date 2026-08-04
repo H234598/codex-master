@@ -352,6 +352,119 @@ def test_recovery_store_fsyncs_file_and_parent_before_success(tmp_path: Path) ->
     assert len(calls) == 2
 
 
+def test_recovery_store_keeps_foreign_temp_swapped_before_replace(tmp_path: Path) -> None:
+    import codex_master.server as server_module
+
+    paths = FleetPaths.from_state_root(tmp_path)
+    journal = sample_journal()
+    foreign = replace(journal, journal_id="c" * 32)
+    foreign_payload = (
+        json.dumps(
+            recovery_document(foreign),
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    real_fsync = os.fsync
+    real_replace = os.replace
+    swapped = False
+
+    def swap_temp_during_fsync(fd: int) -> None:
+        nonlocal swapped
+        real_fsync(fd)
+        if swapped:
+            return
+        temp_paths = list(paths.root.glob(f".{paths.recovery.name}.*.tmp"))
+        assert len(temp_paths) == 1
+        foreign_path = paths.root / "foreign-recovery.tmp"
+        foreign_path.write_bytes(foreign_payload)
+        foreign_path.chmod(0o600)
+        real_replace(foreign_path, temp_paths[0])
+        swapped = True
+
+    with patch.object(server_module.os, "fsync", side_effect=swap_temp_during_fsync):
+        with pytest.raises(AgentError) as caught:
+            server_module._fleet_store_recovery_journal(journal, paths)
+
+    assert caught.value.args[0] == "fleet_recovery_state_invalid"
+    assert swapped is True
+    temp_paths = list(paths.root.glob(f".{paths.recovery.name}.*.tmp"))
+    assert len(temp_paths) == 1
+    assert temp_paths[0].read_bytes() == foreign_payload
+    assert not paths.recovery.exists()
+
+
+def test_recovery_remove_keeps_journal_swapped_after_load(tmp_path: Path) -> None:
+    import codex_master.server as server_module
+
+    paths = FleetPaths.from_state_root(tmp_path)
+    expected = replace(sample_journal(), phase=RecoveryPhase.COMPLETE)
+    foreign = replace(expected, journal_id="c" * 32)
+    server_module._fleet_store_recovery_journal(expected, paths)
+    foreign_path = paths.root / "foreign-recovery.json"
+    foreign_path.write_text(
+        json.dumps(
+            recovery_document(foreign),
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    foreign_path.chmod(0o600)
+    real_open_parent = server_module.open_directory_no_follow_matching
+    real_replace = os.replace
+    open_count = 0
+    swapped = False
+
+    def open_parent_then_swap(*args, **kwargs):
+        nonlocal open_count, swapped
+        open_count += 1
+        if open_count == 2:
+            real_replace(foreign_path, paths.recovery)
+            swapped = True
+        return real_open_parent(*args, **kwargs)
+
+    with patch.object(
+        server_module,
+        "open_directory_no_follow_matching",
+        side_effect=open_parent_then_swap,
+    ):
+        assert server_module._fleet_remove_complete_recovery_journal(expected, paths) is False
+
+    assert swapped is True
+    assert server_module._fleet_load_recovery_journal(paths) == foreign
+
+
+def test_recovery_remove_fails_closed_when_parent_fsync_fails(tmp_path: Path) -> None:
+    import codex_master.server as server_module
+
+    paths = FleetPaths.from_state_root(tmp_path)
+    expected = replace(sample_journal(), phase=RecoveryPhase.COMPLETE)
+    server_module._fleet_store_recovery_journal(expected, paths)
+
+    with patch.object(server_module.os, "fsync", side_effect=OSError("parent fsync failed")):
+        assert server_module._fleet_remove_complete_recovery_journal(expected, paths) is False
+
+    assert not paths.recovery.exists()
+
+
+def test_recovery_remove_complete_journal_unlinks_and_fsyncs_parent(tmp_path: Path) -> None:
+    import codex_master.server as server_module
+
+    paths = FleetPaths.from_state_root(tmp_path)
+    expected = replace(sample_journal(), phase=RecoveryPhase.COMPLETE)
+    server_module._fleet_store_recovery_journal(expected, paths)
+
+    assert server_module._fleet_remove_complete_recovery_journal(expected, paths) is True
+    assert not paths.recovery.exists()
+
+
 def test_reconciler_continues_every_mutation_class_after_first_failure(tmp_path: Path) -> None:
     from codex_master.server import (
         _fleet_execute_recovery_plan,
