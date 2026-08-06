@@ -13,6 +13,7 @@ from dataclasses import dataclass
 MAX_HEADLESS_STDOUT_BYTES = 1024 * 1024
 MAX_HEADLESS_STDERR_BYTES = 256 * 1024
 MAX_HEADLESS_TOTAL_BYTES = MAX_HEADLESS_STDOUT_BYTES + MAX_HEADLESS_STDERR_BYTES
+MAX_HEADLESS_TIMEOUT_SECONDS = 120 * 60
 HEADLESS_CANCEL_GRACE_SECONDS = 1.0
 HEADLESS_TERM_GRACE_SECONDS = 1.0
 HEADLESS_POLL_SECONDS = 0.02
@@ -254,7 +255,7 @@ def run_bounded_process(
     clock: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> HeadlessProcessResult:
-    if not 0 < timeout_seconds <= 900:
+    if not 0 < timeout_seconds <= MAX_HEADLESS_TIMEOUT_SECONDS:
         raise HeadlessJobError("headless_timeout_invalid")
     popen = popen_factory or subprocess.Popen
     process = job.process

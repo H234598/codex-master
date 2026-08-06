@@ -8,6 +8,8 @@ import time
 import pytest
 
 from codex_master.fleet_headless import (
+    HeadlessJobError,
+    MAX_HEADLESS_TIMEOUT_SECONDS,
     MAX_HEADLESS_STDERR_BYTES,
     MAX_HEADLESS_STDOUT_BYTES,
     HeadlessJob,
@@ -80,6 +82,25 @@ def test_bounded_process_reads_both_streams_and_only_prompt_enters_stdin() -> No
     assert process.stdin.prompt == b'{"task":"private"}'
     assert registry.status("d1")["raw_output"] == "not_returned"
     assert "private" not in repr(registry.status("d1"))
+
+
+def test_bounded_process_accepts_only_the_120_minute_timeout_cap() -> None:
+    process = FakeProcess(b"answer\n")
+    job, registry, _signals = make_job(process)
+    result = run_bounded_process(
+        job, ("/private/gemini",), "prompt", {}, registry,
+        timeout_seconds=MAX_HEADLESS_TIMEOUT_SECONDS,
+    )
+
+    assert result.returncode == 0
+
+    too_long_process = FakeProcess()
+    too_long_job, too_long_registry, _signals = make_job(too_long_process)
+    with pytest.raises(HeadlessJobError, match="headless_timeout_invalid"):
+        run_bounded_process(
+            too_long_job, ("/private/gemini",), "prompt", {}, too_long_registry,
+            timeout_seconds=MAX_HEADLESS_TIMEOUT_SECONDS + 1,
+        )
 
 
 def test_bounded_process_caps_each_stream_and_combined_output() -> None:

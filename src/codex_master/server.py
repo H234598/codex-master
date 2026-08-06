@@ -61,6 +61,7 @@ from codex_master.fleet_headless import (
     HeadlessJob,
     HeadlessJobRegistry,
     HeadlessProcessResult,
+    MAX_HEADLESS_TIMEOUT_SECONDS,
     run_bounded_process,
 )
 from codex_master.fleet_recovery import (
@@ -173,7 +174,6 @@ BASE_ARGS = [
 HEADLESS_JOBS = HeadlessJobRegistry()
 HEADLESS_META_KEY = "headless_job"
 DEFAULT_HEADLESS_TIMEOUT_SECONDS = 600
-MAX_HEADLESS_TIMEOUT_SECONDS = 900
 
 
 def agent_base_args(model: str, reasoning_effort: str) -> list[str]:
@@ -11090,6 +11090,17 @@ def master_timeout_policy() -> dict[str, Any]:
         "default_poll_interval_seconds": DEFAULT_WAIT_POLL_SECONDS,
         "maximum_poll_interval_seconds": MAX_WAIT_POLL_SECONDS,
     }
+    headless_assignment = {
+        "scope": "productive_headless_agent_assignments",
+        "applies_to": [
+            "agent_assign",
+            "agent_assign_readonly",
+            "agent_assign_live_data",
+            "agent_assign_write",
+        ],
+        "default_timeout_seconds": DEFAULT_HEADLESS_TIMEOUT_SECONDS,
+        "maximum_timeout_seconds": MAX_HEADLESS_TIMEOUT_SECONDS,
+    }
     send_input_readiness = {
         "scope": "send_and_assignment_tmux_input_readiness",
         "applies_to": [
@@ -11121,6 +11132,7 @@ def master_timeout_policy() -> dict[str, Any]:
         "agent_claim_wait": claim_wait,
         "stopped_lease_recovery": stopped_lease_recovery,
         "agent_wait": agent_wait,
+        "headless_assignment": headless_assignment,
         "send_input_readiness": send_input_readiness,
         "fleet_watchdog": watchdog,
         "agent_selector_policy": selector_policy_status(),
@@ -14906,7 +14918,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "master_timeout_policy",
-        "description": "Report data-sparse timeout and polling policy for MCP startup, Agentin claim retry, Agentin wait, send/assignment TUI input readiness, and watchdog supervision.",
+        "description": "Report data-sparse timeout and polling policy for MCP startup, Agentin claim retry, Agentin wait, productive headless assignments, send/assignment TUI input readiness, and watchdog supervision.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {

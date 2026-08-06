@@ -21,6 +21,7 @@ from codex_master.server import (
     DEFAULT_CLAIM_WAIT_FOREVER,
     DEFAULT_AGENT_LEASE_SECONDS,
     DEFAULT_MULTI_AGENT_RESULT_LIMIT,
+    DEFAULT_HEADLESS_TIMEOUT_SECONDS,
     DEFAULT_STOPPED_LEASE_RECOVERY_GRACE_SECONDS,
     MAX_ASSIGNMENT_LIST_ITEMS,
     MAX_ASSIGNMENT_LOG_BYTES,
@@ -29,6 +30,7 @@ from codex_master.server import (
     MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID,
     MAX_ERROR_CHARS,
     MAX_GIT_REF_TEXT,
+    MAX_HEADLESS_TIMEOUT_SECONDS,
     MAX_LIVE_DATA_TOPIC,
     MAX_META_BYTES,
     MAX_MULTI_AGENT_RESULT_LIMIT,
@@ -1159,6 +1161,16 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(MAX_WAIT_POLL_SECONDS, 900)
         self.assertEqual(wait_props["timeout_seconds"]["default"], DEFAULT_WAIT_SECONDS)
         self.assertEqual(wait_props["timeout_seconds"]["maximum"], MAX_WAIT_SECONDS)
+        self.assertEqual(MAX_HEADLESS_TIMEOUT_SECONDS, 7200)
+        for assign_props_for_tool in (assign_props, assign_readonly_props, assign_live_data_props, assign_write_props):
+            self.assertEqual(
+                assign_props_for_tool["timeout_seconds"]["maximum"],
+                MAX_HEADLESS_TIMEOUT_SECONDS,
+            )
+            self.assertEqual(
+                assign_props_for_tool["timeout_seconds"]["default"],
+                DEFAULT_HEADLESS_TIMEOUT_SECONDS,
+            )
         self.assertEqual(wait_props["poll_interval_seconds"]["default"], DEFAULT_WAIT_POLL_SECONDS)
         self.assertEqual(wait_props["poll_interval_seconds"]["maximum"], MAX_WAIT_POLL_SECONDS)
         self.assertEqual(DEFAULT_CLAIM_WAIT_FOREVER, True)
@@ -3581,6 +3593,17 @@ class ServerHelpersTest(unittest.TestCase):
         )
         self.assertTrue(result["stopped_lease_recovery"]["requires_agent_not_running"])
         self.assertEqual(result["agent_wait"]["maximum_timeout_seconds"], MAX_WAIT_SECONDS)
+        self.assertEqual(result["headless_assignment"]["maximum_timeout_seconds"], MAX_HEADLESS_TIMEOUT_SECONDS)
+        self.assertEqual(result["headless_assignment"]["default_timeout_seconds"], DEFAULT_HEADLESS_TIMEOUT_SECONDS)
+        self.assertEqual(
+            result["headless_assignment"]["applies_to"],
+            [
+                "agent_assign",
+                "agent_assign_readonly",
+                "agent_assign_live_data",
+                "agent_assign_write",
+            ],
+        )
         self.assertEqual(
             result["send_input_readiness"]["default_timeout_seconds"],
             DEFAULT_SEND_READY_TIMEOUT_SECONDS,
@@ -7121,13 +7144,15 @@ class ServerHelpersTest(unittest.TestCase):
             "codex_master.server.release_agent",
             return_value={"lease": {"state": "unclaimed", "held_by_this_server": False}},
         ) as mock_release:
-            result = fleet_watchdog("a")
+            with patch("codex_master.server.watchdog_release_identity_is_current", return_value=True) as mock_identity:
+                result = fleet_watchdog("a")
 
         payload = result["results"][0]
         self.assertEqual(payload["watchdog_state"], "skipped_not_running")
         mock_lease.assert_called_once_with("a1")
         mock_release.assert_called_once_with("a1", force=True)
         mock_write_meta.assert_called_once_with("a1", {})
+        mock_identity.assert_called_once_with("a1", expected_running=False)
 
     def test_fleet_watchdog_keeps_lease_when_stopped_home_process_remains(self) -> None:
         status = {

@@ -202,8 +202,10 @@ Gemini jobs use an agent-private `HOME`/`GEMINI_CLI_HOME`, stdin-only task
 input, bounded `stream-json` stdout/stderr, process-group cancellation, and
 role-specific approval (`plan` for Exploriererinnen, `auto_edit` for
 Arbeitsbienen). They do not use `yolo`, `-p -`, or Codex TUI markers. The
-assignment response is bounded and parsed; prompts, credentials, tool events,
-and raw output stay out of persistent metadata.
+assignment response is bounded and parsed. Prompts, credentials, tool events,
+and raw output stay out of persistent metadata; process output remains bounded.
+Productive headless assignments accept up to 7200 seconds (120 minutes) per
+call; the default remains 600 seconds.
 
 The GTK-free `fleet_control` view model and `control_center` controller enforce
 the same bounds and generation checks as the server; the optional GTK3 page is
@@ -338,8 +340,8 @@ Public, secret-free configuration examples live in
 - `master_watchdog_status`: diagnose systemd Fleetwatchdog health, installed
   unit hardening, and aggregate security-score status
 - `master_timeout_policy`: report effective timeout and polling policy for MCP
-  startup, Agentin claim retry, Agentin wait, watchdog supervision, and
-  hidden CLI lease identity source
+  startup, Agentin claim retry, Agentin wait, productive headless assignments,
+  watchdog supervision, and hidden CLI lease identity source
 - `agent_pool_validate`: validate a machine-readable Agentinnen pool spec
 - `agent_pool_install`: install or refresh sleeping Agentinnen homes from a spec
 - `agent_pool_status`: inspect data-sparse pool installation counts
@@ -597,6 +599,8 @@ session is available.
   stopped Agentinnen, no managed-home process, and sufficient idle evidence
 - keeps `agent_wait` separate as a bounded activity wait: default 120 seconds,
   maximum 600 seconds
+- reports productive headless assignments with a default of 600 seconds and a
+  maximum of 7200 seconds (120 minutes)
 - reports the `send`/`assign-*`/`report-request` TUI input-readiness gate:
   default 15 seconds, 0.5 second polling, visible input prompt required,
   fail-closed without paste via retryable `agent_input_not_ready`

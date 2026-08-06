@@ -16,7 +16,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 from unicodedata import category
 
 from .fleet_registry import AgentDescriptor, Provider, RunnerKind
-from .fleet_headless import HeadlessJob, HeadlessJobRegistry, run_bounded_process
+from .fleet_headless import MAX_HEADLESS_TIMEOUT_SECONDS, HeadlessJob, HeadlessJobRegistry, run_bounded_process
 
 
 MAX_GEMINI_LINE_BYTES = 1024 * 1024
@@ -560,7 +560,11 @@ def probe_gemini_cli(
             raise FleetRunnerError("runner_unavailable")
         if model is not None and _provider_model_name(model) is None:
             raise FleetRunnerError("model_unavailable")
-        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)) or not 0 < timeout_seconds <= 900:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not 0 < timeout_seconds <= MAX_HEADLESS_TIMEOUT_SECONDS
+        ):
             raise FleetRunnerError("runner_failed")
     except FleetRunnerError as exc:
         kind = "model_unavailable" if exc.args == ("model_unavailable",) else "provider_unavailable"
