@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "selection", "features", "reservation", "time", "freshness", "account_policies", "teamleader_allowlist", "account_allowlist", "operation_allowlist", "sp0_proactive"],
+  "properties": {
+    "$schema": {"type": "string"},
+    "schema_version": {"const": 1},
+    "selection": {"type": "object", "additionalProperties": false, "required": ["mode", "kill_switch"], "properties": {"mode": {"enum": ["disabled", "shadow", "enforced"]}, "kill_switch": {"type": "boolean"}}},
+    "features": {"type": "object", "additionalProperties": false, "required": ["account_grouping", "model_roles", "shadow_ranking", "auto_selection", "sp3_fairness", "sp2_secondary_model", "sp1_deadline", "sp0_passive", "sp0_proactive"], "properties": {"account_grouping": {"type": "boolean"}, "model_roles": {"type": "boolean"}, "shadow_ranking": {"type": "boolean"}, "auto_selection": {"type": "boolean"}, "sp3_fairness": {"type": "boolean"}, "sp2_secondary_model": {"type": "boolean"}, "sp1_deadline": {"type": "boolean"}, "sp0_passive": {"type": "boolean"}, "sp0_proactive": {"type": "boolean"}}},
+    "reservation": {"type": "object", "additionalProperties": false, "required": ["ttl_seconds", "retry_limit"], "properties": {"ttl_seconds": {"type": "integer", "minimum": 1}, "retry_limit": {"type": "integer", "minimum": 0}}},
+    "time": {"type": "object", "additionalProperties": false, "required": ["reset_tolerance_seconds", "max_clock_skew_seconds"], "properties": {"reset_tolerance_seconds": {"type": "integer", "minimum": 0}, "max_clock_skew_seconds": {"type": "integer", "minimum": 0}}},
+    "freshness": {"type": "object", "additionalProperties": false, "required": ["routing_seconds", "short_window_seconds", "long_window_seconds"], "properties": {"routing_seconds": {"type": "integer", "minimum": 1}, "short_window_seconds": {"type": "integer", "minimum": 1}, "long_window_seconds": {"type": "integer", "minimum": 1}}},
+    "account_policies": {"type": "object", "additionalProperties": {"type": "object", "additionalProperties": false, "required": ["max_parallel_bees", "capacity_weight_micro"], "properties": {"max_parallel_bees": {"type": "integer", "minimum": 1}, "capacity_weight_micro": {"type": "integer", "minimum": 0}}}},
+    "teamleader_allowlist": {"type": "array", "items": {"type": "string"}},
+    "account_allowlist": {"type": "array", "items": {"type": "string"}},
+    "operation_allowlist": {"type": "array", "items": {"type": "string"}},
+    "sp0_proactive": {"type": "object", "additionalProperties": false, "required": ["execute_enabled", "max_attempts_per_window", "retry_cooldown_seconds"], "properties": {"execute_enabled": {"type": "boolean"}, "max_attempts_per_window": {"type": "integer", "minimum": 1}, "retry_cooldown_seconds": {"type": "integer", "minimum": 0}}}
+  }
+}

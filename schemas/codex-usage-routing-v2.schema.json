@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "limit_windows"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "limit_windows": {"type": "array", "maxItems": 64, "items": {"type": "object", "additionalProperties": false, "required": ["window_id", "budget_key", "applies_to_model_ids", "applies_to_model_roles", "quantity_semantics", "quantity_unit", "quantity_value", "window_kind", "constraint_relation", "observed_at_utc", "source", "confidence", "includes_inflight_usage", "blocked", "exhausted"], "properties": {
+      "window_id": {"type": "string"}, "budget_key": {"type": "string"}, "applies_to_model_ids": {"type": "array", "items": {"type": "string"}}, "applies_to_model_roles": {"type": "array", "items": {"type": "string"}},
+      "quantity_semantics": {"enum": ["remaining", "consumed"]}, "quantity_unit": {"enum": ["percent", "tokens", "credits", "requests"]}, "quantity_value": {"type": "integer", "minimum": 0}, "capacity": {"type": ["integer", "null"], "minimum": 0}, "absolute_remaining": {"type": ["integer", "null"], "minimum": 0},
+      "window_kind": {"enum": ["rolling_5h", "rolling_unanchored", "fixed"]}, "constraint_relation": {"enum": ["conjunctive", "alternative"]}, "reset_at_utc": {"type": ["string", "null"]}, "reset_kind": {"enum": ["rolling", "fixed", "unanchored", null]}, "observed_at_utc": {"type": "string"}, "source": {"type": "string"}, "confidence": {"enum": ["verified", "observed", "unknown"]}, "includes_inflight_usage": {"type": "boolean"}, "blocked": {"type": "boolean"}, "exhausted": {"type": "boolean"}
+    }}
+  }
+}
+}

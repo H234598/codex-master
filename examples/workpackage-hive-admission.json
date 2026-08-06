@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "admission_id": "adm-example",
+  "request_id": "req-example",
+  "dispatch_id": "dsp-example",
+  "workpackage_id": "wp-example",
+  "assignment_intent_id": "aint-example",
+  "repo_id": "codex-master",
+  "principal_id": "specialist-example",
+  "parent_principal_id": "teamlead-example",
+  "grant_id": "grt-example",
+  "grant_digest": "sha256:synthetic",
+  "work_item_version": 1,
+  "scope": {"mode": "write", "paths": ["src/codex_master/hive/admission.py"], "canonical_digest": "sha256:synthetic"},
+  "resource": {"agent_id": "a17", "account_key": "hmac:private-synthetic", "budget_key": "standard", "model_id": "gpt-5.4-mini", "expected_usage_micro": 5000000},
+  "state": "reserved",
+  "created_at_utc": "2026-08-03T20:00:00Z",
+  "expires_at_utc": "2026-08-03T20:00:30Z",
+  "revision": 1
+}

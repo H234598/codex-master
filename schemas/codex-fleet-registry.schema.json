@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/H234598/codex-master/schemas/codex-fleet-registry.schema.json",
+  "title": "codex-master Fleet Registry",
+  "type": "object",
+  "required": ["schema_version", "generation", "accounts", "series"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": 1},
+    "generation": {"type": "integer", "minimum": 0},
+    "accounts": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/account"}},
+    "series": {"type": "array", "maxItems": 26, "items": {"$ref": "#/$defs/series"}}
+  },
+  "$defs": {
+    "safe_label": {
+      "type": "string", "minLength": 1, "maxLength": 120,
+      "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"
+    },
+    "timestamp": {
+      "type": ["string", "null"], "maxLength": 40,
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$"
+    },
+    "account": {
+      "type": "object",
+      "required": ["account_id", "label", "provider", "auth_kind", "enabled"],
+      "additionalProperties": false,
+      "properties": {
+        "account_id": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$"},
+        "label": {"$ref": "#/$defs/safe_label"},
+        "provider": {"enum": ["openai_chatgpt", "openai_api", "gemini_api", "huggingface_inference"]},
+        "auth_kind": {"enum": ["chatgpt_session", "api_key"]},
+        "secret_state": {"enum": ["missing", "configured", "invalid", "not_required"]},
+        "limit_state": {"enum": ["ready", "limited", "unknown", "probing", "disabled"]},
+        "enabled": {"type": "boolean"},
+        "reset_at_utc": {"$ref": "#/$defs/timestamp"},
+        "last_probe_at_utc": {"$ref": "#/$defs/timestamp"},
+        "limit_reason": {"type": ["string", "null"], "maxLength": 64, "pattern": "^[a-z][a-z0-9_]{0,63}$"}
+      },
+      "allOf": [
+        {"if": {"properties": {"provider": {"const": "openai_chatgpt"}}}, "then": {"properties": {"auth_kind": {"const": "chatgpt_session"}}}},
+        {"if": {"properties": {"provider": {"enum": ["openai_api", "gemini_api", "huggingface_inference"]}}}, "then": {"properties": {"auth_kind": {"const": "api_key"}}}}
+      ]
+    },
+    "series": {
+      "type": "object",
+      "required": ["prefix", "display_name", "count", "runner", "provider", "model", "account_id", "enabled"],
+      "additionalProperties": false,
+      "properties": {
+        "prefix": {"type": "string", "pattern": "^[a-z]$"},
+        "display_name": {"$ref": "#/$defs/safe_label"},
+        "count": {"type": "integer", "minimum": 1, "maximum": 100},
+        "runner": {"enum": ["codex_cli", "gemini_cli"]},
+        "provider": {"enum": ["openai_chatgpt", "openai_api", "gemini_api", "ollama_local", "huggingface_inference"]},
+        "model": {"type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"},
+        "account_id": {"type": ["string", "null"], "pattern": "^[a-z][a-z0-9-]{0,63}$"},
+        "enabled": {"type": "boolean"}
+      },
+      "allOf": [
+        {"if": {"properties": {"provider": {"const": "gemini_api"}}}, "then": {"properties": {"runner": {"const": "gemini_cli"}, "account_id": {"type": "string"}}}},
+        {"if": {"properties": {"provider": {"enum": ["openai_chatgpt", "openai_api", "huggingface_inference"]}}}, "then": {"properties": {"runner": {"const": "codex_cli"}, "account_id": {"type": "string"}}}},
+        {"if": {"properties": {"provider": {"const": "ollama_local"}}}, "then": {"properties": {"runner": {"const": "codex_cli"}, "account_id": {"type": "null"}}}}
+      ]
+    }
+  }
+}

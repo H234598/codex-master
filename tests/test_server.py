@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import os
 from typing import Any
@@ -1114,6 +1115,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("agent_assign_write", names)
         self.assertIn("agent_selector_policy", names)
         self.assertIn("agent_selector_preview", names)
+        self.assertIn("agent_selection_preview", names)
         self.assertIn("worktree_status", names)
         self.assertIn("commit_ready_check", names)
         self.assertIn("master_app_bridge_status", names)
@@ -1225,6 +1227,13 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(agent_ids("3"), ["a2"])
         self.assertEqual(agent_ids("4"), ["b2"])
         self.assertEqual(agent_ids("200"), ["b100"])
+
+    def test_published_both_selector_follows_ordinal_policy(self) -> None:
+        from codex_master import server as server_module
+
+        inventory = server_module.current_agent_inventory()
+        with patch.dict(os.environ, {server_module.AGENT_SELECTOR_SERIES_ENV: "c,a,b"}), server_module.temporary_agent_inventory(inventory):
+            self.assertEqual(server_module.agent_ids("both"), ["c1", "a1"])
 
     @patch("codex_master.server.status_agent")
     def test_multi_agent_status_results_are_paged_for_broad_selectors(self, mock_status_agent) -> None:
@@ -1340,6 +1349,148 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(selected, ["a1", "b1", "c1", "a2", "b2", "c2"])
         self.assertNotIn(tmpdir, json.dumps(changed, sort_keys=True))
 
+    def test_agent_selection_preview_uses_read_only_shadow_without_private_account_data(self) -> None:
+        from codex_master import server as server_module
+
+        inventory = server_module._legacy_inventory()
+        fleet_service = Mock()
+        fleet_service.load.return_value = server_module.FleetSnapshot(1, 7, (), ())
+        with patch.object(
+            server_module,
+            "published_agent_inventory",
+            return_value=(inventory, False),
+        ), patch.object(
+            server_module,
+            "_readonly_fleet_service",
+            return_value=fleet_service,
+        ), patch.object(
+            server_module,
+            "agent_auth_status",
+            return_value={"authenticated": True},
+        ), patch.object(
+            server_module,
+            "agent_lease_status",
+            return_value={"state": "unclaimed"},
+        ), patch.object(
+            server_module,
+            "read_codex_usage_snapshot",
+            return_value={},
+        ):
+            result = server_module.fleet_selection_preview(
+                series="a",
+                task_kind="simple",
+                admission_mode="shadow",
+                sp3=True,
+                limit=4,
+            )
+
+        self.assertEqual(result["candidate_count"], len(inventory.by_series["a-series"]))
+        self.assertEqual(result["selection"]["selected"], {
+            "agent": "a1",
+            "model": DEFAULT_AGENT_MODEL,
+            "band": "sp3",
+            "fairness_micro": 0,
+        })
+        self.assertTrue(result["admission"]["planned"])
+        self.assertFalse(result["admission"]["executable"])
+        serialized = json.dumps(result)
+        self.assertNotIn("account_key", serialized)
+        for descriptor in inventory.agents.values():
+            if descriptor.account_id:
+                self.assertNotIn(descriptor.account_id, serialized)
+
+    def test_agent_selection_preview_uses_current_usage_v2_for_sp1a(self) -> None:
+        from codex_master import server as server_module
+
+        now = datetime.now(timezone.utc)
+        observed = now.isoformat()
+        reset_5h = (now + timedelta(hours=2)).isoformat()
+        reset_weekly = (now + timedelta(days=3)).isoformat()
+        descriptor = server_module.AgentDescriptor(
+            "d1", "d", 1, "D 1", server_module.RunnerKind.GEMINI_CLI,
+            server_module.Provider.GEMINI_API, "auto", "BW_Work",
+            Path("/tmp/d1"), "codex_agent_d1_mcp", True,
+        )
+        inventory = server_module.InventorySnapshot(
+            ("d1",), {"d1": descriptor}, {"d-series": ("d1",)}, {"d1": 0}, ("d",)
+        )
+        fleet_service = Mock()
+        fleet_service.load.return_value = server_module.FleetSnapshot(1, 25, (), ())
+        fleet_service.account_gate.return_value = Mock(allowed=True, reason="ready")
+        snapshot = {
+            "account": "BW_Work",
+            "status": "ok",
+            "captured_at": observed,
+            "backend_used": "app-server",
+            "stale": False,
+            "main": {
+                "exhausted": False,
+                "windows": [
+                    {
+                        "name": "5h", "duration_seconds": 18000, "remaining": 81.0,
+                        "limit": 100.0, "percent": 81.0, "reset_at": reset_5h,
+                    },
+                    {
+                        "name": "weekly", "duration_seconds": 604800, "remaining": 53.0,
+                        "limit": 100.0, "percent": 53.0, "reset_at": reset_weekly,
+                    },
+                ],
+            },
+        }
+        with patch.object(
+            server_module,
+            "published_agent_inventory",
+            return_value=(inventory, True),
+        ), patch.object(
+            server_module,
+            "_readonly_fleet_service",
+            return_value=fleet_service,
+        ), patch.object(
+            server_module,
+            "agent_lease_status",
+            return_value={"state": "unclaimed"},
+        ), patch.object(
+            server_module,
+            "read_codex_usage_snapshot",
+            return_value=snapshot,
+        ):
+            result = server_module.fleet_selection_preview(
+                series="d",
+                task_kind="simple",
+                admission_mode="shadow",
+                sp1a=True,
+            )
+
+        self.assertEqual(result["usage"], {
+            "account_count": 1,
+            "observed_count": 1,
+            "sp1a_eligible_count": 1,
+            "blocked_count": 0,
+        })
+        self.assertEqual(result["selection"]["selected"]["agent"], "d1")
+        self.assertEqual(result["selection"]["selected"]["band"], "sp1a")
+        self.assertNotIn("BW_Work", json.dumps(result))
+
+    def test_agent_selection_preview_enforced_remains_closed_without_reservation(self) -> None:
+        from codex_master import server as server_module
+
+        inventory = server_module._legacy_inventory()
+        fleet_service = Mock()
+        fleet_service.load.return_value = server_module.FleetSnapshot(1, 7, (), ())
+        with patch.object(server_module, "published_agent_inventory", return_value=(inventory, False)), patch.object(
+            server_module, "_readonly_fleet_service", return_value=fleet_service
+        ), patch.object(server_module, "agent_auth_status", return_value={"authenticated": True}), patch.object(
+            server_module, "agent_lease_status", return_value={"state": "unclaimed"}
+        ), patch.object(server_module, "read_codex_usage_snapshot", return_value={}):
+            result = server_module.fleet_selection_preview(
+                series="a", task_kind="simple", admission_mode="enforced", sp3=True
+            )
+
+        self.assertFalse(result["admission"]["planned"])
+        self.assertFalse(result["admission"]["executable"])
+        self.assertEqual(result["admission"]["reason"], "admission_gate_blocked")
+        self.assertEqual(len(result["admission"]["missing_gates"]), 7)
+
     def test_agent_selector_policy_serializes_write_and_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "state"
@@ -1400,6 +1551,10 @@ class ServerHelpersTest(unittest.TestCase):
     def test_ordinal_selector_rejects_unbounded_integer_text(self) -> None:
         with self.assertRaisesRegex(AgentError, "ordinal selector is too long"):
             ordinal_agent_id("9" * 33)
+
+    def test_ordinal_selector_rejects_empty_series(self) -> None:
+        with self.assertRaisesRegex(AgentError, "at least one enabled"):
+            ordinal_agent_id("1", ())
 
     def test_agent_selector_errors_do_not_echo_request_values(self) -> None:
         unknown_agent = handle_rpc(
@@ -3381,7 +3536,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.9.53")
+        self.assertEqual(result["expected_tag"], "v0.10.0")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -3942,6 +4097,73 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(serve_mcp(), 0)
 
         self.assertEqual(mock_write.call_args_list[0].args[0]["error"], {"code": -32600, "message": "Invalid Request"})
+
+    def test_serve_mcp_restores_startup_inventory_after_disconnect(self) -> None:
+        from codex_master import server as server_module
+
+        startup_inventory = server_module.current_agent_inventory()
+        with server_module.temporary_agent_inventory(None), patch(
+            "codex_master.server.ensure_state"
+        ), patch("codex_master.server._fleet_initialize_recovery_startup_state"), patch(
+            "codex_master.server._publish_startup_fleet_inventory",
+            side_effect=lambda: server_module.publish_agent_inventory(startup_inventory),
+        ), patch("codex_master.server.read_message", return_value=None):
+            self.assertEqual(server_module.serve_mcp(), 0)
+            self.assertFalse(server_module.published_agent_inventory()[1])
+
+    def test_changed_legacy_agent_configuration_ignores_stale_published_inventory(self) -> None:
+        from codex_master import server as server_module
+
+        published = server_module.current_agent_inventory()
+        with server_module.temporary_agent_inventory(published), patch.dict(
+            "codex_master.server.AGENTS",
+            {"legacy": {"label": "Legacy", "home": Path("/tmp/legacy-home"), "runner": Path("/tmp/codex")}},
+            clear=True,
+        ):
+            inventory = server_module.current_agent_inventory()
+            _, is_published = server_module.published_agent_inventory()
+
+        self.assertEqual(inventory.agent_ids, ("legacy",))
+        self.assertFalse(is_published)
+
+    def test_readonly_fleet_service_cannot_quarantine_or_write(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as temporary:
+            state_root = Path(temporary)
+            fleet_root = state_root / "fleet"
+            fleet_root.mkdir(mode=0o700)
+            limits = fleet_root / "limits.json"
+            limits.write_text("{invalid", encoding="utf-8")
+            limits.chmod(0o600)
+            with patch.object(server_module, "STATE_ROOT", state_root):
+                service = server_module._readonly_fleet_service()
+                with self.assertRaisesRegex(ValueError, "invalid_fleet_limits"):
+                    service.load()
+                with self.assertRaisesRegex(AgentError, "fleet_registry_read_only"):
+                    service._io.replace_text(fleet_root / "blocked", "x")
+                self.assertFalse((fleet_root / "limits.recovery.json").exists())
+
+    def test_private_optional_bytes_reads_complete_bounded_artifact(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact = root / "artifact.bin"
+            expected = b"artifact-content" * 32
+            artifact.write_bytes(expected)
+            artifact.chmod(0o600)
+
+            self.assertEqual(
+                server_module.fleet_read_optional_private_bytes(
+                    artifact, len(expected), "artifact_error"
+                ),
+                expected,
+            )
+            with self.assertRaisesRegex(AgentError, "artifact_error"):
+                server_module.fleet_read_optional_private_bytes(
+                    artifact, len(expected) - 1, "artifact_error"
+                )
 
     def test_mcp_tool_call_error_is_structured(self) -> None:
         response = handle_rpc(
@@ -6193,15 +6415,22 @@ class ServerHelpersTest(unittest.TestCase):
             result = fleet_watchdog("a", dry_run=True)
 
         self.assertEqual(len(result["results"]), 1)
-        run_agent.assert_called_once_with(
-            "a1",
-            idle_seconds=DEFAULT_WATCHDOG_IDLE_SECONDS,
-            action="interrupt",
-            report_grace_seconds=DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS,
-            require_lease=True,
-            manage_unclaimed=False,
-            dry_run=True,
+        run_agent.assert_called_once()
+        call_args = run_agent.call_args
+        self.assertEqual(call_args.args, ("a1",))
+        self.assertEqual(
+            {key: value for key, value in call_args.kwargs.items() if key != "snapshot"},
+            {
+                "idle_seconds": DEFAULT_WATCHDOG_IDLE_SECONDS,
+                "action": "interrupt",
+                "report_grace_seconds": DEFAULT_WATCHDOG_REPORT_GRACE_SECONDS,
+                "require_lease": True,
+                "manage_unclaimed": False,
+                "dry_run": True,
+            },
         )
+        from codex_master.fleet_snapshot import FleetSnapshot as WatchdogSnapshot
+        self.assertIsInstance(call_args.kwargs["snapshot"], WatchdogSnapshot)
         lifecycle.assert_not_called()
 
     def test_fleet_watchdog_dry_run_does_not_initialize_state(self) -> None:
@@ -6697,7 +6926,9 @@ class ServerHelpersTest(unittest.TestCase):
             return_value={"held_by_this_server": True},
         ), patch(
             "codex_master.server.release_agent", return_value={"lease": {"state": "unclaimed"}}
-        ) as mock_release, patch("codex_master.server.update_watchdog_marker") as mock_update:
+        ) as mock_release, patch(
+            "codex_master.server.watchdog_release_identity_is_current", return_value=True
+        ) as mock_identity, patch("codex_master.server.update_watchdog_marker") as mock_update:
             result = fleet_watchdog("a")
 
         payload = result["results"][0]
@@ -6706,6 +6937,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(payload["held_by_this_server"])
         mock_release.assert_called_once_with("a1", force=True)
         mock_update.assert_called_once_with("a1", None)
+        mock_identity.assert_called_once_with("a1", expected_running=True)
 
     def test_fleet_watchdog_does_not_release_new_lease_during_stale_marker_cleanup(self) -> None:
         status = {
@@ -6843,7 +7075,9 @@ class ServerHelpersTest(unittest.TestCase):
         ) as mock_lease, patch(
             "codex_master.server.release_agent",
             return_value={"lease": {"state": "unclaimed", "held_by_this_server": False}},
-        ) as mock_release:
+        ) as mock_release, patch(
+            "codex_master.server.watchdog_release_identity_is_current", return_value=True
+        ) as mock_identity:
             result = fleet_watchdog("a", action="none")
 
         payload = result["results"][0]
@@ -6853,6 +7087,7 @@ class ServerHelpersTest(unittest.TestCase):
         mock_lease.assert_called_once_with("a1")
         mock_release.assert_called_once_with("a1", force=True)
         mock_write_meta.assert_called_once_with("a1", {})
+        mock_identity.assert_called_once_with("a1", expected_running=True)
 
     def test_fleet_watchdog_cleans_marker_when_agent_stops_during_report_grace(self) -> None:
         status = {
@@ -6998,6 +7233,180 @@ class ServerHelpersTest(unittest.TestCase):
                 self.assertEqual(status["state"], "blocked")
                 self.assertTrue(status["blocked"])
                 self.assertEqual(status["source"], "snapshot")
+
+    def test_codex_usage_reader_prefers_current_snapshot_over_legacy(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "codex-usage"
+            current = root / "current"
+            legacy = root / "snapshots"
+            current.mkdir(parents=True)
+            legacy.mkdir()
+            (current / "a1.json").write_text(
+                json.dumps({"account": "a1", "status": "ok", "captured_at": "2099-01-01T00:00:00+00:00"}),
+                encoding="utf-8",
+            )
+            (legacy / "a1.json").write_text(
+                json.dumps({"account": "a1", "status": "blocked", "blocked_until": "2099-01-02T00:00:00+00:00"}),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"XDG_DATA_HOME": tmpdir}, clear=False):
+                snapshot = server_module.read_codex_usage_snapshot("a1")
+
+        self.assertEqual(snapshot["status"], "ok")
+
+    def test_codex_usage_reader_does_not_fallback_after_invalid_current_snapshot(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "codex-usage"
+            current = root / "current"
+            legacy = root / "snapshots"
+            current.mkdir(parents=True)
+            legacy.mkdir()
+            (current / "a1.json").write_text("not-json", encoding="utf-8")
+            (legacy / "a1.json").write_text(
+                json.dumps({"account": "a1", "status": "ok"}),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"XDG_DATA_HOME": tmpdir}, clear=False):
+                with self.assertRaisesRegex(AgentError, "could_not_read_codex_usage_snapshot"):
+                    server_module.read_codex_usage_snapshot("a1")
+
+    def test_current_codex_usage_windows_are_normalized_without_private_fields(self) -> None:
+        from codex_master import server as server_module
+
+        snapshot = {
+            "account": "BW_Work",
+            "status": "ok",
+            "captured_at": "2099-01-01T00:00:00+00:00",
+            "backend_used": "app-server",
+            "backend_account_id": "private-account-id",
+            "backend_user_id": "private-user-id",
+            "source_urls": ["https://private.invalid"],
+            "stale": False,
+            "main": {
+                "exhausted": False,
+                "limit_reached": None,
+                "windows": [
+                    {
+                        "name": "5h",
+                        "duration_seconds": 18000,
+                        "remaining": 81.0,
+                        "limit": 100.0,
+                        "percent": 81.0,
+                        "reset_at": "2099-01-01T05:00:00+00:00",
+                    },
+                    {
+                        "name": "weekly",
+                        "duration_seconds": 604800,
+                        "remaining": 53.0,
+                        "limit": 100.0,
+                        "percent": 53.0,
+                        "reset_at": "2099-01-08T00:00:00+00:00",
+                    },
+                ],
+            },
+        }
+
+        state = server_module._codex_usage_watchdog_state_from_snapshot(snapshot, now=0)
+        usage = state["usage_v2"]
+        self.assertEqual(state["state"], "clear")
+        self.assertEqual(usage["schema_version"], 2)
+        self.assertEqual([item["window_kind"] for item in usage["limit_windows"]], ["rolling_5h", "fixed"])
+        self.assertEqual([item["quantity_value"] for item in usage["limit_windows"]], [81, 53])
+        self.assertTrue(all(isinstance(item["quantity_value"], int) for item in usage["limit_windows"]))
+        serialized_usage = json.dumps(usage)
+        for private_field in ("backend_account_id", "backend_user_id", "source_urls"):
+            self.assertNotIn(private_field, serialized_usage)
+        for private_value in ("private-account-id", "private-user-id", "https://private.invalid"):
+            self.assertNotIn(private_value, serialized_usage)
+
+    def test_current_codex_usage_accepts_absolute_window_counts(self) -> None:
+        from codex_master import server as server_module
+
+        snapshot = {
+            "account": "BW_Absolute",
+            "status": "ok",
+            "captured_at": "2099-01-01T00:00:00+00:00",
+            "backend_used": "app-server",
+            "stale": False,
+            "main": {
+                "windows": [
+                    {
+                        "name": "5h",
+                        "duration_seconds": 18000,
+                        "remaining": 8000,
+                        "limit": 10000,
+                        "reset_at": "2099-01-01T05:00:00+00:00",
+                    }
+                ],
+            },
+        }
+
+        state = server_module._codex_usage_watchdog_state_from_snapshot(snapshot, now=0)
+        window = state["usage_v2"]["limit_windows"][0]
+        self.assertEqual(window["quantity_value"], 80)
+        self.assertEqual(window["capacity"], 10000)
+        self.assertEqual(window["absolute_remaining"], 8000)
+
+    def test_current_codex_usage_exhausted_window_blocks_until_reset(self) -> None:
+        from codex_master import server as server_module
+
+        snapshot = {
+            "account": "BW_Nufker",
+            "status": "ok",
+            "captured_at": "2099-01-01T00:00:00+00:00",
+            "backend_used": "app-server",
+            "stale": False,
+            "main": {
+                "exhausted": True,
+                "windows": [
+                    {
+                        "name": "weekly",
+                        "duration_seconds": 604800,
+                        "remaining": 0.0,
+                        "limit": 100.0,
+                        "percent": 0.0,
+                        "reset_at": "2099-01-08T00:00:00+00:00",
+                    }
+                ],
+            },
+        }
+
+        state = server_module._codex_usage_watchdog_state_from_snapshot(snapshot, now=0)
+        self.assertEqual(state["state"], "blocked")
+        self.assertTrue(state["blocked"])
+        self.assertEqual(state["blocked_until_utc"], "2099-01-08T00:00:00+00:00")
+        self.assertEqual(state["reason"], "codex usage window exhausted")
+
+    def test_current_codex_usage_exhausted_past_reset_is_recovered(self) -> None:
+        from codex_master import server as server_module
+
+        snapshot = {
+            "account": "BW_Recovered",
+            "status": "ok",
+            "captured_at": "2099-01-01T00:00:00+00:00",
+            "main": {
+                "exhausted": True,
+                "windows": [
+                    {
+                        "name": "weekly",
+                        "duration_seconds": 604800,
+                        "remaining": 0.0,
+                        "limit": 100.0,
+                        "percent": 0.0,
+                        "reset_at": "2025-12-31T00:00:00+00:00",
+                    }
+                ],
+            },
+        }
+
+        state = server_module._codex_usage_watchdog_state_from_snapshot(snapshot, now=1767225600)
+
+        self.assertFalse(state["blocked"])
+        self.assertEqual(state["state"], "clear")
 
     def test_codex_usage_watchdog_status_reads_snapshot_for_routing_account(self) -> None:
         blocked = {
@@ -8381,7 +8790,7 @@ class ServerHelpersTest(unittest.TestCase):
             with self.assertRaisesRegex(AgentError, "tmux stop failed"):
                 usage_watchdog_agent("a1", dry_run=False)
 
-        mock_release.assert_called_once_with("a1", force=True)
+        mock_release.assert_not_called()
 
     def test_usage_watchdog_does_not_roll_back_renewed_lease_when_stop_fails(self) -> None:
         blocked_status = {
@@ -8943,6 +9352,18 @@ class ServerHelpersTest(unittest.TestCase):
 
             self.assertFalse((managed / "state.json").exists())
             self.assertFalse((root / "managed-original" / "state.json").exists())
+
+    def test_replace_private_bytes_fsyncs_temp_and_parent(self) -> None:
+        from codex_master import server as server_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "state.json"
+            calls: list[int] = []
+            with patch.object(server_module.os, "fsync", side_effect=lambda fd: calls.append(fd)):
+                server_module.replace_private_bytes(target, b"durable\n")
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "durable\n")
+            self.assertEqual(len(calls), 2)
 
     def test_pool_write_private_file_does_not_chmod_swapped_symlink_target(self) -> None:
         from codex_master import server as server_module
@@ -10697,6 +11118,9 @@ class ServerHelpersTest(unittest.TestCase):
 
         with patch("codex_master.server.RAW_DIR", Path("/tmp")), patch(
             "codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}
+        ), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={"process_count": 0},
         ), patch("codex_master.server.run_tmux") as mock_run_tmux:
             with self.assertRaisesRegex(AgentError, "routing failed"):
                 start_agent_with_lease("a", allow_unauthenticated=True)
@@ -14576,6 +15000,14 @@ class ServerHelpersTest(unittest.TestCase):
 
 
 class CliLifecycleTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # CLI lifecycle tests model the master process, not an Agentin home.
+        # Keep that explicit when the suite itself runs inside a managed Codex
+        # worker whose inherited CODEX_HOME points at the worker home.
+        codex_home_patch = patch.dict("os.environ", {"CODEX_HOME": ""}, clear=False)
+        codex_home_patch.start()
+        self.addCleanup(codex_home_patch.stop)
+
     def test_watchdog_systemd_service_keeps_hardening_directives(self) -> None:
         service = Path(__file__).resolve().parents[1] / "systemd" / "user" / "codex-master-watchdog.service"
         text = service.read_text(encoding="utf-8")
@@ -17788,6 +18220,8 @@ class AgentPoolManagementTest(unittest.TestCase):
             fake_codex.chmod(0o700)
 
             result = server_module.agent_pool_install(str(spec_path), target_dir=str(pool), codex_bin=str(fake_codex))
+            child_env = os.environ.copy()
+            child_env.pop("CODEX_AGENT_BIN", None)
             self.assertTrue(result["ok"])
             completed = subprocess.run(
                 [str(pool / "a1" / "codex")],
@@ -17795,6 +18229,7 @@ class AgentPoolManagementTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 timeout=5,
+                env=child_env,
             )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)

@@ -1,0 +1,7 @@
+{
+  "favoriteAgents": {
+    "type": "entry",
+    "default": "",
+    "description": "At most six concrete dispatch targets; the dynamic series menu is independent."
+  }
+}

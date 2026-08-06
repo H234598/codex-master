@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+node_bin="$(command -v node || true)"
+npm_bin="$(command -v npm || true)"
+if [[ -z "$node_bin" || -z "$npm_bin" ]]; then
+  echo '{"status":"failed","reason":"node_or_npm_missing"}'
+  exit 1
+fi
+
+if ! prefix="$("$npm_bin" config get prefix 2>/dev/null)"; then
+  echo '{"status":"failed","reason":"npm_prefix_unavailable"}'
+  exit 1
+fi
+if [[ -z "$prefix" || "$prefix" == "undefined" || "$prefix" != /* ]]; then
+  echo '{"status":"failed","reason":"npm_prefix_invalid"}'
+  exit 1
+fi
+if [[ -e "$prefix" && ! -d "$prefix" ]]; then
+  echo '{"status":"failed","reason":"npm_prefix_invalid"}'
+  exit 1
+fi
+prefix_parent="$prefix"
+while [[ ! -d "$prefix_parent" ]]; do
+  next_parent="$(dirname "$prefix_parent")"
+  if [[ "$next_parent" == "$prefix_parent" ]]; then
+    echo '{"status":"failed","reason":"npm_prefix_unavailable"}'
+    exit 1
+  fi
+  prefix_parent="$next_parent"
+done
+if [[ ! -w "$prefix_parent" && ! -w "$prefix" ]]; then
+  echo '{"status":"failed","reason":"npm_prefix_not_writable"}'
+  exit 1
+fi
+
+if ! "$npm_bin" install -g '@google/gemini-cli@latest' >&2; then
+  echo '{"status":"failed","reason":"npm_install_failed"}'
+  exit 1
+fi
+gemini_bin="$(command -v gemini || true)"
+if [[ -z "$gemini_bin" && -x "$prefix/bin/gemini" ]]; then
+  gemini_bin="$prefix/bin/gemini"
+fi
+if [[ -z "$gemini_bin" || ! -x "$gemini_bin" ]]; then
+  echo '{"status":"failed","reason":"gemini_missing_after_install"}'
+  exit 1
+fi
+if ! version="$("$gemini_bin" --version 2>/dev/null)"; then
+  echo '{"status":"failed","reason":"gemini_version_unavailable"}'
+  exit 1
+fi
+if [[ -z "$version" || ${#version} -gt 200 || "$version" =~ [[:cntrl:]] ]]; then
+  echo '{"status":"failed","reason":"gemini_version_unavailable"}'
+  exit 1
+fi
+version="${version//\\/\\\\}"
+version="${version//\"/\\\"}"
+printf '{"status":"installed","version":"%s"}\n' "$version"

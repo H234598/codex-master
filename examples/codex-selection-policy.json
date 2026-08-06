@@ -1,0 +1,14 @@
+{
+  "$schema": "../schemas/codex-selection-policy.schema.json",
+  "schema_version": 1,
+  "selection": {"mode": "shadow", "kill_switch": false},
+  "features": {"account_grouping": true, "model_roles": true, "shadow_ranking": true, "auto_selection": false, "sp3_fairness": false, "sp2_secondary_model": false, "sp1_deadline": false, "sp0_passive": false, "sp0_proactive": false},
+  "reservation": {"ttl_seconds": 30, "retry_limit": 3},
+  "time": {"reset_tolerance_seconds": 90, "max_clock_skew_seconds": 120},
+  "freshness": {"routing_seconds": 300, "short_window_seconds": 300, "long_window_seconds": 900},
+  "account_policies": {"synthetic-account-a": {"max_parallel_bees": 1, "capacity_weight_micro": 1000000}},
+  "teamleader_allowlist": ["synthetic-teamlead"],
+  "account_allowlist": ["synthetic-account-a"],
+  "operation_allowlist": ["assign"],
+  "sp0_proactive": {"execute_enabled": false, "max_attempts_per_window": 3, "retry_cooldown_seconds": 3600}
+}
