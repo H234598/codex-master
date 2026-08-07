@@ -11,10 +11,13 @@ import argparse
 import base64
 import contextlib
 import contextvars
+import ctypes
 import datetime as _dt
 from dataclasses import replace as dataclass_replace
+import errno
 import fcntl
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -51,6 +54,7 @@ from codex_master.fleet_registry import (
     plan_series_apply,
     plan_series_delete,
     plan_series_disable,
+    normalize_fleet_document,
 )
 from codex_master.fleet_snapshot import (
     FleetSnapshot as FleetWatchdogSnapshot,
@@ -65,15 +69,18 @@ from codex_master.fleet_headless import (
     run_bounded_process,
 )
 from codex_master.fleet_recovery import (
+    ArtifactDigest,
     EntryPhase,
     FileIdentity,
     FleetRecoveryJournal,
     MutationKind,
     RecoveryOperation,
     RecoveryEntry,
+    RecoveryAction,
     RecoveryActionKind,
     DescriptorState,
     RecoveryPhase,
+    RecoveryPlan,
     advance_recovery_phase,
     descriptor_fingerprint,
     MAX_RECOVERY_DOCUMENT_BYTES,
@@ -153,6 +160,7 @@ SELECTOR_POLICY_FILE = STATE_ROOT / "selector-policy.json"
 SELECTION_POLICY_FILE = STATE_ROOT / "hive" / "resources" / "selection-policy.json"
 ADMISSION_STATE_FILE = STATE_ROOT / "admission-state.json"
 ADMISSION_LOCK_FILE = STATE_ROOT / "admission-state.lock"
+TEAMLEADER_REGISTRY_FILE = STATE_ROOT / "teamleaders.json"
 LEGACY_META_DIR = LEGACY_STATE_ROOT / "meta"
 DEFAULT_AGENT_MODEL = "gpt-5.4-mini"
 DEFAULT_AGENT_MODEL_EFFORT = "medium"
@@ -219,6 +227,26 @@ MAX_AGENT_LEASE_SECONDS = 7200
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
 MCP_SERVER_NAME = "codex-master-mcp"
 DEFAULT_INSTALL_PATH = Path("~/.local/bin/codex-master-mcp").expanduser()
+CONTROL_CENTER_ENV_KEYS = frozenset(
+    {
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XAUTHORITY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_RUNTIME_DIR",
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_DESKTOP",
+        "XDG_SESSION_TYPE",
+        "DESKTOP_STARTUP_ID",
+        "XDG_ACTIVATION_TOKEN",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_MESSAGES",
+        "TZ",
+    }
+)
 MAX_SKILL_NAMES = 200
 MAX_CAPABILITY_PLUGINS = 20
 DEFAULT_MULTI_AGENT_RESULT_LIMIT = 30
@@ -245,8 +273,28 @@ MAX_GIT_REF_TEXT = 200
 MAX_ASSIGNMENT_ID = 200
 MAX_LIVE_DATA_TOPIC = 400
 MAX_RPC_MESSAGE_BYTES = 1024 * 1024
+MAX_TOOL_CATALOG_BYTES = 1024 * 1024
 MAX_ERROR_CHARS = 1200
 MAX_META_BYTES = 64 * 1024
+RESOURCE_MEMINFO_PATH = Path("/proc/meminfo")
+RESOURCE_MAX_LOAD_PER_CPU = 0.85
+RESOURCE_MIN_AVAILABLE_MEMORY_PERCENT = 20.0
+RESOURCE_MIN_AVAILABLE_MEMORY_MIB = 1024
+RESOURCE_MAX_RUNNING_AGENTS = 6
+SPAWN_OFFER_TTL_SECONDS = 5
+SPAWN_OFFER_RETRY_AFTER_SECONDS = 15
+RESOURCE_REASON_CODES = frozenset(
+    {
+        "cpu_metrics_unavailable",
+        "memory_metrics_unavailable",
+        "session_metrics_unavailable",
+        "policy_invalid",
+        "cpu_pressure_high",
+        "memory_pressure_high",
+        "running_agent_limit",
+        "insufficient_slots",
+    }
+)
 MAX_CODEX_USAGE_SNAPSHOT_BYTES = 64 * 1024
 MAX_CODEX_USAGE_DECISION_BYTES = 64 * 1024
 MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID = 512
@@ -256,16 +304,21 @@ MAX_POOL_SPEC_BYTES = 256 * 1024
 MAX_PLUGIN_CACHE_VERSIONS = 20
 MAX_PLUGIN_CACHE_RETAINED_VERSIONS = 5
 MAX_SELECTOR_POLICY_BYTES = 4096
+MAX_TEAMLEADER_REGISTRY_BYTES = 16 * 1024
+MAX_TEAMLEADER_PRINCIPALS = 64
+TEAMLEADER_REGISTRY_SCHEMA_VERSION = 1
+TEAMLEADER_PRINCIPAL_RE = re.compile(r"^[0-9a-f]{64}$")
+MAX_TEAMLEADER_ANCESTORS = 32
 MAX_PAGED_OFFSET = 10_000_000
 PLUGIN_CACHE_ALLOWED_FILES = (
     ".app.json", ".mcp.json", "README.md", "codex-agent-pool.json", "codex-agent-classes.json",
     "codex-hive.json", "codex-model-policy.json", "pyproject.toml",
 )
-PLUGIN_CACHE_ALLOWED_DIRS = (".codex-plugin", "bin", "docs", "examples", "schemas", "scripts", "skills", "src", "systemd")
+PLUGIN_CACHE_ALLOWED_DIRS = (".codex-plugin", "bin", "docs", "examples", "hooks", "schemas", "scripts", "skills", "src", "systemd")
 PLUGIN_CACHE_OPTIONAL_FILES = (
     "codex-agent-pool.json", "codex-agent-classes.json", "codex-hive.json", "codex-model-policy.json",
 )
-PLUGIN_CACHE_OPTIONAL_DIRS = ("docs", "examples", "schemas", "scripts")
+PLUGIN_CACHE_OPTIONAL_DIRS = ("docs", "examples", "hooks", "schemas", "scripts")
 PLUGIN_CACHE_EXCLUDED_NAMES = (".git", ".pytest_cache", ".mypy_cache", ".ruff_cache", "__pycache__")
 PLUGIN_CACHE_EXCLUDED_SUFFIXES = (".pyc", ".pyo", ".swp", ".swo", ".tmp", ".bak", ".orig", ".rej", "~")
 COMMAND_TIMEOUT_RETURN_CODE = 124
@@ -275,12 +328,19 @@ DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
 SERIES_DISABLE_TIMEOUT_SECONDS = 30.0
 DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS = 10
 RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS = 120
+FLEET_DESKTOP_ENTRY_NAME = "de.teladi.CodexMaster.ControlCenter.desktop"
+MAX_FLEET_DESKTOP_ENTRY_BYTES = 16 * 1024
+FLEET_DESKTOP_COMMAND_RE = re.compile(r"^/[-A-Za-z0-9._+@/ ]+$")
 AGENT_POOL_ROOT = Path(os.environ.get("CODEX_AGENT_POOL_ROOT", "~/.codex-agents")).expanduser()
 POOL_SPEC_FILE = "codex-agent-pool.json"
 POOL_MARKER_FILE = ".codex-agent-pool-installed.json"
 FLEET_POOL_MARKER_FILE = ".codex-fleet-pool.json"
 FLEET_AGENT_MARKER_FILE = ".codex-fleet-agent.json"
 MAX_FLEET_ARTIFACT_BYTES = 256 * 1024
+FLEET_TOMBSTONE_PREFIX = ".codex-fleet-remove-"
+FLEET_BASH_EXECUTABLE = Path("/usr/bin/bash")
+FLEET_TASKSET_EXECUTABLE = Path("/usr/bin/taskset")
+FLEET_TRUE_EXECUTABLE = Path("/usr/bin/true")
 POOL_SCHEMA_VERSION = 1
 FLEET_RECOVERY_GATED_OPERATIONS = frozenset(
     {
@@ -312,9 +372,28 @@ MAX_POOL_SERIES = 26
 MAX_FLEET_SERIES_COUNT = 100
 MAX_POOL_SHARED_ASSETS = 40
 MAX_POOL_RUNTIME_DIRS = 40
+MAX_APPLET_AGENTS = 6
+APPLET_ACTION_KEY_FILE = STATE_ROOT / "applet-action.key"
+APPLET_ACTION_KEY_BYTES = 32
+APPLET_ACTION_KEY_TEXT_BYTES = 44
+APPLET_ACTION_TOKEN_TTL_SECONDS = 30
+MAX_APPLET_ACTION_TOKEN_CHARS = 512
+APPLET_ACTION_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
+NATIVE_AGENT_REGISTRY_FILE = STATE_ROOT / "native-agents.json"
+NATIVE_AGENT_REGISTRY_LOCK_FILE = LOCK_DIR / "native-agents.lock"
+MAX_NATIVE_AGENT_RECORDS = 64
+MAX_NATIVE_AGENT_REGISTRY_BYTES = 64 * 1024
+MAX_NATIVE_APPLET_AGENTS = 6
+NATIVE_AGENT_ACTIVE_SECONDS = 2 * 60 * 60
+NATIVE_AGENT_RETENTION_SECONDS = 24 * 60 * 60
+NATIVE_AGENT_LOCK_TIMEOUT_SECONDS = 0.1
+NATIVE_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+NATIVE_AGENT_TYPE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+APPLET_STATUS_TIMEOUT_SECONDS = 8.0
+APPLET_TMUX_TIMEOUT_SECONDS = 1.0
 AGENT_SERIES = ("a", "b", "c")
 AGENTS_PER_SERIES = 100
-DEFAULT_ORDINAL_AGENT_SERIES = ("a", "b")
+DEFAULT_ORDINAL_AGENT_SERIES = ("a", "b", "c")
 AGENT_SELECTOR_SERIES_ENV = "CODEX_MASTER_AGENT_SELECTOR_SERIES"
 AGENT_IDS = tuple(f"{series}{index}" for series in AGENT_SERIES for index in range(1, AGENTS_PER_SERIES + 1))
 PRIMARY_AGENT_IDS = ("a1", "b1")
@@ -325,8 +404,8 @@ SERIES_AGENT_IDS = {
 }
 AGENT_SELECTOR_DESCRIPTION = (
     "Agentin selector: a1..a100, b1..b100, c1..c100; legacy aliases a/b; "
-    "numeric ordinal selectors 1=a1, 2=b1, 3=a2 by default; "
-    "group selectors both, all, a-series, b-series, c-series."
+    "numeric ordinal selectors 1=a1, 2=b1, 3=c1 by default; "
+    "group selectors active, both, all, a-series, b-series, c-series."
 )
 DEFAULT_AGENTIN_BASE_NAMES = (
     "Mila",
@@ -364,6 +443,7 @@ WATCHDOG_REQUIRED_HARDENING_DIRECTIVES = (
     "KeyringMode=private",
     "NoNewPrivileges=yes",
     "PrivateTmp=yes",
+    "BindReadOnlyPaths=-/tmp/tmux-%U",
     "PrivateDevices=yes",
     "ProtectClock=yes",
     "ProtectControlGroups=yes",
@@ -686,7 +766,13 @@ def temporary_agent_inventory(snapshot: InventorySnapshot | None):
 def agent_config(agent: str, snapshot: InventorySnapshot | None = None) -> Mapping[str, Any]:
     selected = snapshot
     if selected is None:
-        selected = current_agent_inventory()
+        with _ACTIVE_AGENT_INVENTORY_LOCK:
+            selected = _ACTIVE_AGENT_INVENTORY
+    if selected is None:
+        try:
+            return AGENTS[agent]
+        except KeyError:
+            raise AgentError("unknown agent") from None
     descriptor = selected.agents.get(agent)
     if descriptor is None:
         raise AgentError("unknown agent")
@@ -711,6 +797,150 @@ def series_agent_ids(selector: str, snapshot: InventorySnapshot | None = None) -
         return inventory.by_series[selector]
     except KeyError:
         raise AgentError("unknown Agentinnen series selector") from None
+
+
+def pinned_legacy_agent_configs() -> Mapping[str, Mapping[str, Any]]:
+    configs: dict[str, Mapping[str, Any]] = {}
+    for agent, config in AGENTS.items():
+        if not isinstance(config, Mapping):
+            raise AgentError("legacy_agent_inventory_invalid")
+        configs[agent] = MappingProxyType(dict(config))
+    return MappingProxyType(configs)
+
+
+def _legacy_fleet_analysis(*, include_running: bool) -> tuple[FleetSnapshot | None, dict[str, Any]]:
+    legacy_configs = pinned_legacy_agent_configs()
+    inventory = legacy_agent_inventory(legacy_configs)
+    with _ACTIVE_AGENT_INVENTORY_LOCK:
+        if (
+            _ACTIVE_AGENT_INVENTORY is not None
+            and _ACTIVE_AGENT_INVENTORY.agent_ids != inventory.agent_ids
+        ):
+            # A published fleet snapshot is authoritative while this read-only
+            # migration analysis examines a separately patched legacy config.
+            global _ACTIVE_AGENT_INVENTORY_FINGERPRINT
+            _ACTIVE_AGENT_INVENTORY_FINGERPRINT = _agent_config_fingerprint()
+    reason_codes: list[str] = []
+    series_rows: list[dict[str, Any]] = []
+    auth_by_series: dict[str, str] = {}
+    pool_root: Path | None = None
+
+    if len(inventory.agent_ids) > MAX_POOL_AGENTS or len(inventory.series_prefixes) > MAX_POOL_SERIES:
+        reason_codes.append("legacy_inventory_too_large")
+
+    for prefix in inventory.series_prefixes:
+        ids = inventory.by_series[f"{prefix}-series"]
+        if prefix not in DEFAULT_ORDINAL_AGENT_SERIES + ("c",):
+            reason_codes.append("legacy_series_unsupported")
+        if len(ids) > 100:
+            reason_codes.append("legacy_series_count_invalid")
+        expected_ids = tuple(f"{prefix}{ordinal}" for ordinal in range(1, len(ids) + 1))
+        if ids != expected_ids:
+            reason_codes.append("legacy_id_gap")
+
+        states: list[dict[str, Any]] = []
+        for agent in ids:
+            config = legacy_configs[agent]
+            home = Path(config["home"])
+            candidate_root = home.parent
+            if pool_root is None:
+                pool_root = candidate_root
+            if candidate_root != pool_root or home != pool_root / agent:
+                reason_codes.append("legacy_home_override")
+            if Path(config["runner"]) != home / "codex":
+                reason_codes.append("legacy_runner_override")
+            if config["session"] != f"codex_agent_{agent}_mcp":
+                reason_codes.append("legacy_session_override")
+            states.append(agent_auth_status(agent, snapshot=inventory))
+
+        if all(state.get("authenticated") is True for state in states):
+            auth_status = "configured"
+        elif all(state.get("auth_state") == "missing" for state in states):
+            auth_status = "missing"
+        else:
+            auth_status = "mixed"
+            reason_codes.append("legacy_auth_mixed")
+        auth_by_series[prefix] = auth_status
+
+    running: set[str] = set()
+    running_unknown = False
+    if include_running:
+        try:
+            running = set(managed_applet_inventory(inventory)["running_agents"])
+        except AgentError:
+            running_unknown = True
+            reason_codes.append("legacy_running_unknown")
+
+    for prefix in inventory.series_prefixes:
+        ids = inventory.by_series[f"{prefix}-series"]
+        series_rows.append(
+            {
+                "prefix": prefix,
+                "agent_count": len(ids),
+                "running_count": None if running_unknown else sum(agent in running for agent in ids),
+                "auth_status": auth_by_series[prefix],
+            }
+        )
+
+    reason_codes = list(dict.fromkeys(reason_codes))
+    snapshot = None
+    if not reason_codes:
+        snapshot = normalize_fleet_document(
+            {
+                "schema_version": 1,
+                "generation": 1,
+                "accounts": [
+                    {
+                        "account_id": f"legacy-{prefix}",
+                        "label": f"Legacy {prefix.upper()}",
+                        "provider": "openai_chatgpt",
+                        "auth_kind": "chatgpt_session",
+                        "secret_state": auth_by_series[prefix],
+                        "limit_state": "unknown",
+                        "enabled": True,
+                    }
+                    for prefix in inventory.series_prefixes
+                ],
+                "series": [
+                    {
+                        "prefix": prefix,
+                        "display_name": f"Codex Agentin {prefix.upper()}",
+                        "count": len(inventory.by_series[f"{prefix}-series"]),
+                        "runner": "codex_cli",
+                        "provider": "openai_chatgpt",
+                        "model": DEFAULT_AGENT_MODEL,
+                        "account_id": f"legacy-{prefix}",
+                        "enabled": True,
+                    }
+                    for prefix in inventory.series_prefixes
+                ],
+            }
+        )
+    return snapshot, {
+        "mutation_performed": False,
+        "representable": snapshot is not None,
+        "agent_count": min(len(inventory.agent_ids), MAX_POOL_AGENTS),
+        "series_count": min(len(inventory.series_prefixes), MAX_POOL_SERIES),
+        "running_count": (
+            None
+            if running_unknown
+            else min(len(running & set(inventory.agent_ids)), MAX_POOL_AGENTS)
+        ),
+        "reason_codes": reason_codes,
+        "series": series_rows,
+    }
+
+
+def legacy_fleet_snapshot() -> FleetSnapshot:
+    snapshot, _result = _legacy_fleet_analysis(include_running=False)
+    if snapshot is None:
+        raise AgentError("legacy_fleet_not_representable")
+    return snapshot
+
+
+def legacy_fleet_migration_dry_run() -> dict[str, Any]:
+    _snapshot, result = _legacy_fleet_analysis(include_running=True)
+    return result
 
 
 ANSI_RE = re.compile(
@@ -762,9 +992,17 @@ class AgentInputNotReadyError(AgentError):
         self.payload = payload
 
 
+class AgentCapacityError(AgentError):
+    """Raised when host resources cannot admit another managed Agentin."""
+
+    def __init__(self, message: str, payload: dict[str, Any]):
+        super().__init__(message)
+        self.payload = payload
+
+
 def public_error_payload(exc: Exception) -> dict[str, Any]:
     payload: dict[str, Any] = {"error": safe_error_text(exc)}
-    if isinstance(exc, (AgentBusyError, AgentInputNotReadyError, FleetRecoveryBlockedError)):
+    if isinstance(exc, (AgentBusyError, AgentInputNotReadyError, AgentCapacityError, FleetRecoveryBlockedError)):
         payload.update(exc.payload)
     return payload
 
@@ -1351,12 +1589,210 @@ def assert_install_context_allows_master_registration() -> None:
         raise AgentError("refusing to register Master MCP inside a managed Agentin home")
 
 
+def active_codex_home_path() -> Path:
+    configured = os.environ.get("CODEX_HOME")
+    return normalized_compare_path(Path(configured).expanduser() if configured else Path.home() / ".codex")
+
+
+def teamleader_principal_digest(codex_home: Path) -> str:
+    normalized = normalized_compare_path(codex_home)
+    material = b"codex-master-teamleader-v1\0" + os.fsencode(str(normalized))
+    return hashlib.sha256(material).hexdigest()
+
+
+def _decode_teamleader_registry(text: str) -> set[str]:
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise AgentError("teamleader registry is unavailable") from exc
+    if not isinstance(payload, dict) or set(payload) != {"schema_version", "principals"}:
+        raise AgentError("teamleader registry is unavailable")
+    principals = payload.get("principals")
+    if payload.get("schema_version") != TEAMLEADER_REGISTRY_SCHEMA_VERSION or not isinstance(principals, list):
+        raise AgentError("teamleader registry is unavailable")
+    if len(principals) > MAX_TEAMLEADER_PRINCIPALS:
+        raise AgentError("teamleader registry is unavailable")
+    if any(not isinstance(item, str) or not TEAMLEADER_PRINCIPAL_RE.fullmatch(item) for item in principals):
+        raise AgentError("teamleader registry is unavailable")
+    if len(set(principals)) != len(principals):
+        raise AgentError("teamleader registry is unavailable")
+    return set(principals)
+
+
+def _read_teamleader_principals_strict(*, missing_ok: bool) -> set[str]:
+    try:
+        registry_stat = TEAMLEADER_REGISTRY_FILE.lstat()
+    except FileNotFoundError:
+        if missing_ok:
+            return set()
+        raise AgentError("teamleader registry is unavailable")
+    except OSError as exc:
+        raise AgentError("teamleader registry is unavailable") from exc
+    if (
+        not stat_module.S_ISREG(registry_stat.st_mode)
+        or stat_module.S_ISLNK(registry_stat.st_mode)
+        or getattr(registry_stat, "st_nlink", 1) > 1
+        or registry_stat.st_uid != os.geteuid()
+        or stat_module.S_IMODE(registry_stat.st_mode) != 0o600
+        or registry_stat.st_size > MAX_TEAMLEADER_REGISTRY_BYTES
+    ):
+        raise AgentError("teamleader registry is unavailable")
+    text = read_private_regular_text(
+        TEAMLEADER_REGISTRY_FILE,
+        MAX_TEAMLEADER_REGISTRY_BYTES,
+        "teamleader registry is unavailable",
+    )
+    return _decode_teamleader_registry(text)
+
+
+def read_teamleader_principals() -> set[str]:
+    try:
+        return _read_teamleader_principals_strict(missing_ok=True)
+    except AgentError:
+        return set()
+
+
+def enroll_current_teamleader() -> dict[str, Any]:
+    assert_install_context_allows_master_registration()
+    codex_home = active_codex_home_path()
+    ensure_private_dir(codex_home)
+    try:
+        home_stat = codex_home.lstat()
+    except OSError as exc:
+        raise AgentError("teamleader CODEX_HOME is unavailable") from exc
+    if (
+        not stat_module.S_ISDIR(home_stat.st_mode)
+        or stat_module.S_ISLNK(home_stat.st_mode)
+        or home_stat.st_uid != os.geteuid()
+        or not directory_chain_is_real_no_symlink(codex_home)
+    ):
+        raise AgentError("teamleader CODEX_HOME is unavailable")
+    principals = _read_teamleader_principals_strict(missing_ok=True)
+    digest = teamleader_principal_digest(codex_home)
+    changed = digest not in principals
+    if changed:
+        if len(principals) >= MAX_TEAMLEADER_PRINCIPALS:
+            raise AgentError("teamleader registry capacity reached")
+        principals.add(digest)
+        document = {
+            "schema_version": TEAMLEADER_REGISTRY_SCHEMA_VERSION,
+            "principals": sorted(principals),
+        }
+        encoded = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        ensure_private_dir(STATE_ROOT)
+        replace_private_bytes(TEAMLEADER_REGISTRY_FILE, encoded, mode=0o600)
+    return {
+        "authorized": True,
+        "role": "teamleader",
+        "changed": changed,
+        "visible_tool_count": len(TOOLS),
+        "raw_output": "not_returned",
+    }
+
+
+def revoke_current_teamleader() -> dict[str, Any]:
+    assert_install_context_allows_master_registration()
+    digest = teamleader_principal_digest(active_codex_home_path())
+    principals = _read_teamleader_principals_strict(missing_ok=True)
+    changed = digest in principals
+    if changed:
+        principals.remove(digest)
+        document = {
+            "schema_version": TEAMLEADER_REGISTRY_SCHEMA_VERSION,
+            "principals": sorted(principals),
+        }
+        encoded = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        replace_private_bytes(TEAMLEADER_REGISTRY_FILE, encoded, mode=0o600)
+    return {
+        "authorized": False,
+        "role": "non_teamleader",
+        "changed": changed,
+        "visible_tool_count": 0,
+        "raw_output": "not_returned",
+    }
+
+
+def managed_home_in_process_ancestry(
+    *,
+    start_pid: int | None = None,
+    proc_root: Path = Path("/proc"),
+) -> bool | None:
+    pid = os.getppid() if start_pid is None else start_pid
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    seen: set[int] = set()
+    for _index in range(MAX_TEAMLEADER_ANCESTORS):
+        if pid in seen or pid <= 0:
+            return None
+        seen.add(pid)
+        pid_dir = proc_root / str(pid)
+        status = read_proc_status(pid_dir)
+        if not status:
+            return None
+        uid_parts = status.get("Uid", "").split()
+        if not uid_parts or not uid_parts[0].isdigit():
+            return None
+        if int(uid_parts[0]) != os.geteuid():
+            return False
+        ppid_parts = status.get("PPid", "").split()
+        if not ppid_parts or not ppid_parts[0].isdigit():
+            return None
+        parent = int(ppid_parts[0])
+        if status.get("Name") == "systemd" and parent == 1:
+            return False
+        env = read_proc_environ(pid_dir)
+        if env is None:
+            return None
+        configured_home = env.get("CODEX_HOME")
+        if configured_home and classify_codex_home(configured_home)["home_kind"] == "managed_agent_home":
+            return True
+        if parent <= 0:
+            return False
+        pid = parent
+    return None
+
+
+def master_tool_access_status() -> dict[str, Any]:
+    context = codex_home_context()
+    authorized = False
+    ancestry_managed = managed_home_in_process_ancestry()
+    if context["home_kind"] != "managed_agent_home" and ancestry_managed is False:
+        digest = teamleader_principal_digest(active_codex_home_path())
+        authorized = digest in read_teamleader_principals()
+    return {
+        "authorized": authorized,
+        "role": "teamleader" if authorized else "non_teamleader",
+        "visible_tool_count": len(TOOLS) if authorized else 0,
+        "raw_output": "not_returned",
+    }
+
+
+def require_teamleader_tool_access() -> dict[str, Any]:
+    status = master_tool_access_status()
+    if not status["authorized"]:
+        raise AgentError("teamleader authorization required")
+    return status
+
+
 def normalize_agent_selector_text(agent: str) -> str:
     return str(agent).strip().lower()
 
 
 def selector_policy_path() -> Path:
     return SELECTOR_POLICY_FILE
+
+
+def enabled_agent_series(snapshot: InventorySnapshot | None = None) -> tuple[str, ...]:
+    inventory = snapshot or current_agent_inventory()
+    return tuple(
+        prefix
+        for prefix in inventory.series_prefixes
+        if any(inventory.agents[agent].enabled for agent in inventory.by_series[f"{prefix}-series"])
+    )
+
+
+def default_selector_series(snapshot: InventorySnapshot | None = None) -> tuple[str, ...]:
+    return enabled_agent_series(snapshot)
 
 
 def parse_selector_series_value(value: Any, *, field: str = "series") -> tuple[str, ...]:
@@ -1390,9 +1826,13 @@ def parse_selector_series_value(value: Any, *, field: str = "series") -> tuple[s
 
 
 def selector_policy_series() -> tuple[str, ...]:
+    fallback = default_selector_series()
     env_value = os.environ.get(AGENT_SELECTOR_SERIES_ENV)
     if env_value:
-        return parse_selector_series_value(env_value, field=AGENT_SELECTOR_SERIES_ENV)
+        try:
+            return parse_selector_series_value(env_value, field=AGENT_SELECTOR_SERIES_ENV)
+        except AgentError:
+            pass
     inventory, published = published_agent_inventory()
     fallback = (
         tuple(
@@ -1429,7 +1869,7 @@ def selector_policy_status() -> dict[str, Any]:
     series = selector_policy_series()
     return {
         "series": list(series),
-        "default_series": list(DEFAULT_ORDINAL_AGENT_SERIES),
+        "default_series": list(default_selector_series()),
         "env_override": AGENT_SELECTOR_SERIES_ENV,
         "env_override_active": bool(os.environ.get(AGENT_SELECTOR_SERIES_ENV)),
         "policy_file": PATH_NOT_RETURNED,
@@ -1785,7 +2225,12 @@ def ordinal_mapping_preview(series: tuple[str, ...] | None = None, *, limit: int
     return preview
 
 
-def ordinal_agent_id(selector: str, series: tuple[str, ...] | None = None) -> str:
+def ordinal_agent_id(
+    selector: str,
+    series: tuple[str, ...] | None = None,
+    *,
+    snapshot: InventorySnapshot | None = None,
+) -> str:
     value = normalize_agent_selector_text(selector)
     if len(value) > MAX_AGENT_SELECTOR_TEXT:
         raise AgentError("ordinal selector is too long")
@@ -1800,17 +2245,20 @@ def ordinal_agent_id(selector: str, series: tuple[str, ...] | None = None) -> st
     series_index = (ordinal - 1) % len(selected_series)
     agent_index = ((ordinal - 1) // len(selected_series)) + 1
     agent = f"{selected_series[series_index]}{agent_index}"
-    inventory = current_agent_inventory()
+    inventory = snapshot or current_agent_inventory()
     if agent not in inventory.agents or not inventory.agents[agent].enabled:
         raise AgentError("ordinal selector resolves outside the installed Agentinnen pool")
     return agent
 
 
-def canonical_agent_id(agent: str) -> str:
+def canonical_agent_id(
+    agent: str,
+    snapshot: InventorySnapshot | None = None,
+) -> str:
     normalized = normalize_agent_selector_text(agent)
-    inventory = current_agent_inventory()
+    inventory = snapshot or current_agent_inventory()
     if normalized.isdecimal():
-        return ordinal_agent_id(normalized)
+        return ordinal_agent_id(normalized, snapshot=inventory)
     if normalized in inventory.agents:
         return normalized
     if normalized in LEGACY_AGENT_ALIASES and LEGACY_AGENT_ALIASES[normalized] in inventory.agents:
@@ -1826,6 +2274,8 @@ def agent_record_aliases(agent: str) -> set[str]:
 
 def agent_ids(agent: str) -> list[str]:
     normalized = normalize_agent_selector_text(agent)
+    if normalized == "active":
+        return list(managed_applet_inventory()["running_agents"])
     inventory, published = published_agent_inventory()
     if normalized == "all":
         return [agent_id for agent_id in inventory.agent_ids if inventory.agents[agent_id].enabled]
@@ -1845,7 +2295,7 @@ def agent_ids(agent: str) -> list[str]:
         if published:
             raise AgentError("unknown Agentinnen series selector")
         return [item for item in SERIES_AGENT_IDS[normalized] if item in AGENTS]
-    return [canonical_agent_id(normalized)]
+    return [canonical_agent_id(normalized, snapshot=inventory)]
 
 
 def single_agent_id(agent: str, tool_name: str) -> str:
@@ -1907,7 +2357,7 @@ def run_command(
     check: bool = False,
     cwd: Path | str | None = None,
     env: dict[str, str] | None = None,
-    timeout: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
+    timeout: float = DEFAULT_COMMAND_TIMEOUT_SECONDS,
     pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     try:
@@ -2427,11 +2877,22 @@ def replace_private_text(path: Path, text: str, mode: int = 0o600) -> None:
     replace_private_bytes(path, text.encode("utf-8"), mode=mode)
 
 
-def read_private_regular_text(path: Path, max_bytes: int, error_text: str) -> str:
+def read_private_regular_text(
+    path: Path,
+    max_bytes: int,
+    error_text: str,
+    *,
+    expected_parent_stat: os.stat_result | None = None,
+    expected_target_stat: os.stat_result | None = None,
+) -> str:
     max_bytes = max(1, int(max_bytes))
     parent_fd = -1
     try:
-        parent_stat = path.parent.lstat()
+        parent_stat = (
+            expected_parent_stat
+            if expected_parent_stat is not None
+            else path.parent.lstat()
+        )
         parent_fd = open_directory_no_follow_matching(
             path.parent,
             parent_stat,
@@ -2459,6 +2920,13 @@ def read_private_regular_text(path: Path, max_bytes: int, error_text: str) -> st
             opened_stat = os.fstat(fd)
             if (
                 not source_identity_matches(opened_stat, current_stat)
+                or (
+                    expected_target_stat is not None
+                    and not source_identity_with_snapshot_matches(
+                        opened_stat,
+                        expected_target_stat,
+                    )
+                )
                 or not stat_module.S_ISREG(opened_stat.st_mode)
                 or getattr(opened_stat, "st_nlink", 1) > 1
                 or opened_stat.st_size > max_bytes
@@ -2485,8 +2953,289 @@ def read_private_regular_text(path: Path, max_bytes: int, error_text: str) -> st
         raise AgentError(error_text) from exc
 
 
+def _fleet_optional_stats(
+    path: Path,
+    error_text: str,
+) -> tuple[os.stat_result, os.stat_result] | None:
+    try:
+        parent_stat = path.parent.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise AgentError(error_text) from exc
+    parent_fd = -1
+    try:
+        parent_fd = open_directory_no_follow_matching(
+            path.parent,
+            parent_stat,
+            error_text=error_text,
+            changed_text=error_text,
+        )
+        try:
+            target_stat = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise AgentError(error_text) from exc
+    except AgentError:
+        raise
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+    return parent_stat, target_stat
+
+
+def fleet_read_optional_private_text(path: Path, max_bytes: int, error_text: str) -> str | None:
+    stats = _fleet_optional_stats(path, error_text)
+    if stats is None:
+        return None
+    parent_stat, target_stat = stats
+    return read_private_regular_text(
+        path,
+        max_bytes,
+        error_text,
+        expected_parent_stat=parent_stat,
+        expected_target_stat=target_stat,
+    )
+
+
+def replace_private_bytes(
+    path: Path,
+    data: bytes,
+    mode: int = 0o600,
+    *,
+    expected_parent_stat: os.stat_result | None = None,
+    expected_existing_stat: os.stat_result | None | object = _EXPECTED_EXISTING_STAT_UNSET,
+) -> None:
+    parent = path.parent.expanduser()
+    if not parent.is_absolute():
+        parent = Path.cwd() / parent
+    parent = parent.absolute()
+    parent_parts = parent.parts
+    proc_parent_fd = None
+    if len(parent_parts) == 5 and parent_parts[:4] == ("/", "proc", "self", "fd") and parent_parts[4].isdigit():
+        proc_parent_fd = int(parent_parts[4])
+
+    parent_fd = -1
+    if proc_parent_fd is not None:
+        try:
+            parent_fd = os.dup(proc_parent_fd)
+            parent_stat = os.fstat(parent_fd)
+        except OSError as exc:
+            if parent_fd >= 0:
+                os.close(parent_fd)
+            raise AgentError("private state parent directories must be real directories") from exc
+        if not stat_module.S_ISDIR(parent_stat.st_mode):
+            os.close(parent_fd)
+            raise AgentError("private state parent directories must be real directories")
+    else:
+        parent_stat = expected_parent_stat
+        if parent_stat is None:
+            try:
+                parent_stat = parent.lstat()
+            except FileNotFoundError:
+                parent_stat = None
+            except OSError as exc:
+                raise AgentError("private state parent directories must be real directories") from exc
+            ensure_private_dir(parent)
+            if parent_stat is None:
+                try:
+                    parent_stat = parent.lstat()
+                except OSError as exc:
+                    raise AgentError("private state parent directories must be real directories") from exc
+        parent_fd = open_directory_no_follow_matching(
+            parent,
+            parent_stat,
+            error_text="private state parent directories must be real directories",
+            changed_text="private state parent directories changed unexpectedly",
+        )
+
+    tmp_name = f".{path.name}.{now_id()}.{uuid.uuid4().hex}.tmp"
+    tmp_path = parent / tmp_name
+    tmp_created = False
+    try:
+        write_private_new_bytes(tmp_path, data, mode=mode, dir_fd=parent_fd)
+        tmp_created = True
+        if expected_existing_stat is not _EXPECTED_EXISTING_STAT_UNSET:
+            try:
+                current = os.lstat(path.name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                current = None
+            except OSError as exc:
+                raise AgentError("private state path changed unexpectedly") from exc
+            if expected_existing_stat is None:
+                if current is not None:
+                    raise AgentError("private state path changed unexpectedly")
+            elif (
+                current is None
+                or not stat_module.S_ISREG(current.st_mode)
+                or getattr(current, "st_nlink", 1) != 1
+                or not source_identity_with_snapshot_matches(current, expected_existing_stat)
+            ):
+                raise AgentError("private state path changed unexpectedly")
+        os.replace(tmp_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        tmp_created = False
+        os.fsync(parent_fd)
+    finally:
+        if tmp_created:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name, dir_fd=parent_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def _fleet_replace_private_bytes(path: Path, data: bytes, mode: int) -> None:
+    error_text = "could_not_replace_fleet_private_file"
+    parent_stat = ensure_real_parent(path, error_text)
+    try:
+        existing_stat = path.lstat()
+    except FileNotFoundError:
+        existing_stat = None
+    except OSError as exc:
+        raise AgentError(error_text) from exc
+    if existing_stat is not None and (
+        not stat_module.S_ISREG(existing_stat.st_mode)
+        or getattr(existing_stat, "st_nlink", 1) > 1
+    ):
+        raise AgentError(error_text)
+    replace_private_bytes(
+        path,
+        data,
+        mode=mode,
+        expected_parent_stat=parent_stat,
+        expected_existing_stat=existing_stat,
+    )
+
+
+def _fleet_replace_private_text(path: Path, text: str) -> None:
+    _fleet_replace_private_bytes(path, text.encode("utf-8"), 0o600)
+
+
+def write_private_new_bytes(
+    path: Path,
+    data: bytes,
+    mode: int = 0o600,
+    *,
+    dir_fd: int | None = None,
+) -> None:
+    parent_fd = -1
+    effective_dir_fd = dir_fd
+    if dir_fd is None:
+        try:
+            parent_stat = path.parent.lstat()
+        except FileNotFoundError:
+            parent_stat = None
+        except OSError as exc:
+            raise AgentError("private state parent directories must be real directories") from exc
+        ensure_private_dir(path.parent)
+        if parent_stat is None:
+            try:
+                parent_stat = path.parent.lstat()
+            except OSError as exc:
+                raise AgentError("private state parent directories must be real directories") from exc
+        parent_fd = open_directory_no_follow_matching(
+            path.parent,
+            parent_stat,
+            error_text="private state parent directories must be real directories",
+            changed_text="private state parent directories changed unexpectedly",
+        )
+        effective_dir_fd = parent_fd
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        if effective_dir_fd is None:
+            fd = os.open(path, flags, 0o600)
+        else:
+            fd = os.open(path.name, flags, 0o600, dir_fd=effective_dir_fd)
+    except OSError as exc:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        raise AgentError("could not create private state temp file without following symlinks") from exc
+    try:
+        current_stat = os.fstat(fd)
+        if not stat_module.S_ISREG(current_stat.st_mode) or getattr(current_stat, "st_nlink", 1) > 1:
+            raise AgentError("private state temp path is not a regular file")
+        try:
+            os.fchmod(fd, mode)
+        except PermissionError:
+            if stat_module.S_IMODE(os.fstat(fd).st_mode) != stat_module.S_IMODE(mode):
+                raise AgentError("private state temp file mode could not be set")
+        if stat_module.S_IMODE(os.fstat(fd).st_mode) != stat_module.S_IMODE(mode):
+            raise AgentError("private state temp file mode could not be set")
+        with os.fdopen(fd, "wb") as fh:
+            fd = -1
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            if effective_dir_fd is None:
+                path.unlink()
+            else:
+                os.unlink(path.name, dir_fd=effective_dir_fd)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+def open_private_regular_update(path: Path) -> Any:
+    try:
+        parent_stat = path.parent.lstat()
+    except FileNotFoundError:
+        parent_stat = None
+    except OSError as exc:
+        raise AgentError("could not open private state file without following symlinks") from exc
+    ensure_private_dir(path.parent)
+    parent_fd = -1
+    try:
+        if parent_stat is None:
+            parent_stat = path.parent.lstat()
+        parent_fd = open_directory_no_follow_matching(
+            path.parent,
+            parent_stat,
+            error_text="could not open private state file without following symlinks",
+            changed_text="could not open private state file without following symlinks",
+        )
+    except (AgentError, OSError) as exc:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        raise AgentError("could not open private state file without following symlinks") from exc
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(path.name, flags, 0o600, dir_fd=parent_fd)
+    except OSError as exc:
+        raise AgentError("could not open private state file without following symlinks") from exc
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+    try:
+        current_stat = os.fstat(fd)
+        if not stat_module.S_ISREG(current_stat.st_mode) or getattr(current_stat, "st_nlink", 1) > 1:
+            raise AgentError("private state path is not a regular file")
+        try:
+            os.fchmod(fd, 0o600)
+        except PermissionError:
+            pass
+        return os.fdopen(fd, "r+b")
+    except Exception:
+        os.close(fd)
+        raise
+
+
 _LIFECYCLE_LOCK_STACK: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
     "codex_master_lifecycle_lock_stack", default=()
+)
+_NATIVE_AGENT_REGISTRY_LOCK_STACK: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "codex_master_native_agent_registry_lock_stack", default=()
 )
 _PLUGIN_CACHE_LOCK_HELD: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "codex_master_plugin_cache_lock_held", default=False
@@ -2499,8 +3248,13 @@ _AGENT_LIFECYCLE_THREAD_LOCKS_GUARD = threading.Lock()
 
 
 @contextlib.contextmanager
-def _agent_lifecycle_file_lock(agent: str, *, timeout_seconds: float | None = None) -> Any:
-    agent = canonical_agent_id(agent)
+def _agent_lifecycle_file_lock(
+    agent: str,
+    *,
+    timeout_seconds: float | None = None,
+    snapshot: InventorySnapshot | None = None,
+) -> Any:
+    agent = canonical_agent_id(agent, snapshot=snapshot)
     held_locks = _LIFECYCLE_LOCK_STACK.get()
     if agent in held_locks:
         yield
@@ -2554,8 +3308,13 @@ def _agent_lifecycle_file_lock(agent: str, *, timeout_seconds: float | None = No
 
 
 @contextlib.contextmanager
-def agent_lifecycle_lock(agent: str, *, timeout_seconds: float | None = None) -> Any:
-    agent = canonical_agent_id(agent)
+def agent_lifecycle_lock(
+    agent: str,
+    *,
+    timeout_seconds: float | None = None,
+    snapshot: InventorySnapshot | None = None,
+) -> Any:
+    agent = canonical_agent_id(agent, snapshot=snapshot)
     if timeout_seconds is not None:
         try:
             timeout_seconds = float(timeout_seconds)
@@ -2578,7 +3337,7 @@ def agent_lifecycle_lock(agent: str, *, timeout_seconds: float | None = None) ->
     if not acquired:
         raise AgentLifecycleLockBusyError(agent)
     try:
-        with _agent_lifecycle_file_lock(agent, timeout_seconds=remaining):
+        with _agent_lifecycle_file_lock(agent, timeout_seconds=remaining, snapshot=snapshot):
             yield
     finally:
         thread_lock.release()
@@ -2691,8 +3450,8 @@ def pool_root_lock(root: Path) -> Any:
                 pass
 
 
-def agent_lease_path(agent: str) -> Path:
-    agent = canonical_agent_id(agent)
+def agent_lease_path(agent: str, snapshot: InventorySnapshot | None = None) -> Path:
+    agent = canonical_agent_id(agent, snapshot=snapshot)
     return LEASE_DIR / f"{agent}.json"
 
 
@@ -2705,6 +3464,231 @@ def lease_utc(timestamp: float | int | None) -> str | None:
         return None
 
 
+def _normalize_native_agent_timestamp(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        timestamp = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if not math.isfinite(timestamp):
+        return None
+    return timestamp
+
+
+def _native_agent_registry_payload() -> dict[str, Any]:
+    return {"schema_version": 1, "agents": []}
+
+
+def _validate_native_agent_identifier(name: str, pattern: re.Pattern[str]) -> bool:
+    return isinstance(name, str) and bool(pattern.fullmatch(name))
+
+
+def _native_agent_registry_is_stale(last_update: float, now: float) -> bool:
+    return now - last_update > NATIVE_AGENT_RETENTION_SECONDS
+
+
+def _native_agent_normalize_registry(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("schema_version") != 1 or not isinstance(payload.get("agents"), list):
+        return _native_agent_registry_payload()
+    normalized: list[dict[str, Any]] = []
+    for candidate in payload["agents"]:
+        if not isinstance(candidate, dict):
+            continue
+        session_id = candidate.get("session_id")
+        agent_id = candidate.get("agent_id")
+        agent_type = candidate.get("agent_type")
+        activity_state = candidate.get("activity_state")
+        updated_at = candidate.get("updated_at")
+        if not _validate_native_agent_identifier(session_id, NATIVE_AGENT_ID_RE):
+            continue
+        if not _validate_native_agent_identifier(agent_id, NATIVE_AGENT_ID_RE):
+            continue
+        if not _validate_native_agent_identifier(agent_type, NATIVE_AGENT_TYPE_RE):
+            continue
+        if activity_state not in ("active", "unconfirmed"):
+            continue
+        updated_at_ts = _normalize_native_agent_timestamp(updated_at)
+        if updated_at_ts is None:
+            continue
+        normalized.append(
+            {
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "agent_type": agent_type,
+                "activity_state": activity_state,
+                "updated_at": updated_at_ts,
+            }
+        )
+    return {"schema_version": 1, "agents": normalized}
+
+
+def _read_native_agent_registry() -> tuple[dict[str, Any], str]:
+    payload: dict[str, Any] = _native_agent_registry_payload()
+    degraded = False
+    try:
+        raw = read_private_regular_text(
+            NATIVE_AGENT_REGISTRY_FILE,
+            MAX_NATIVE_AGENT_REGISTRY_BYTES,
+            "native agent registry state must be a regular file within the size limit",
+        )
+    except AgentError:
+        return payload, "degraded"
+    try:
+        loaded = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return payload, "degraded"
+    if not isinstance(loaded, dict):
+        return payload, "degraded"
+    normalized = _native_agent_normalize_registry(loaded)
+    if normalized != loaded:
+        degraded = True
+    return normalized, "degraded" if degraded else "ready"
+
+
+def _write_native_agent_registry(payload: dict[str, Any]) -> None:
+    safe_payload = _native_agent_normalize_registry(payload)
+    safe_payload["agents"] = safe_payload["agents"][:MAX_NATIVE_AGENT_RECORDS]
+    replace_private_text(
+        NATIVE_AGENT_REGISTRY_FILE,
+        json.dumps(safe_payload, sort_keys=True) + "\n",
+    )
+
+
+def record_native_agent_event(payload: Any, *, now: float | None = None) -> None:
+    if not isinstance(payload, dict):
+        return
+    event_name = payload.get("hook_event_name")
+    timestamp = _normalize_native_agent_timestamp(now)
+    if now is not None and timestamp is None:
+        return
+    if timestamp is None:
+        timestamp = time.time()
+    session_id = payload.get("session_id")
+    agent_id = payload.get("agent_id")
+    agent_type = payload.get("agent_type")
+    if not _validate_native_agent_identifier(session_id, NATIVE_AGENT_ID_RE):
+        return
+    if event_name not in {"SessionStart", "SubagentStart", "SubagentStop", "SessionEnd"}:
+        return
+    if event_name == "SessionStart":
+        with native_agent_registry_lock():
+            _write_native_agent_registry(_native_agent_registry_payload())
+        return
+    if event_name != "SessionEnd" and not _validate_native_agent_identifier(agent_id, NATIVE_AGENT_ID_RE):
+        return
+    if event_name in {"SubagentStop", "SessionEnd"} and not _validate_native_agent_identifier(agent_id, NATIVE_AGENT_ID_RE):
+        if event_name == "SubagentStop":
+            return
+    if event_name != "SessionEnd" and not _validate_native_agent_identifier(agent_type, NATIVE_AGENT_TYPE_RE):
+        return
+
+    with native_agent_registry_lock():
+        registry, _state = _read_native_agent_registry()
+        current = registry["agents"]
+        if event_name == "SubagentStart":
+            for record in current:
+                if record["session_id"] == session_id and record["agent_id"] == agent_id:
+                    record["agent_type"] = agent_type
+                    record["activity_state"] = "active"
+                    record["updated_at"] = timestamp
+                    break
+            else:
+                current.append(
+                    {
+                        "session_id": session_id,
+                        "agent_id": agent_id,
+                        "agent_type": agent_type,
+                        "activity_state": "active",
+                        "updated_at": timestamp,
+                    }
+                )
+            if len(current) > MAX_NATIVE_AGENT_RECORDS:
+                current[:] = current[-MAX_NATIVE_AGENT_RECORDS:]
+            _write_native_agent_registry(registry)
+            return
+        if event_name == "SubagentStop":
+            next_records = [
+                record
+                for record in current
+                if not (
+                    record["session_id"] == session_id and record["agent_id"] == agent_id
+                )
+            ]
+            registry["agents"] = next_records
+            _write_native_agent_registry(registry)
+            return
+        if event_name == "SessionEnd":
+            changed = False
+            for record in current:
+                if record["session_id"] == session_id:
+                    record["activity_state"] = "unconfirmed"
+                    changed = True
+            if changed:
+                _write_native_agent_registry(registry)
+            return
+
+
+def native_agent_status(*, now: float | None = None) -> dict[str, Any]:
+    timestamp = _normalize_native_agent_timestamp(now)
+    if timestamp is None:
+        timestamp = time.time()
+    try:
+        with native_agent_registry_lock():
+            registry, bridge_state = _read_native_agent_registry()
+            if bridge_state == "degraded":
+                return {
+                    "bridge_state": bridge_state,
+                    "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
+                    "agents": [],
+                    "truncated": False,
+                }
+            records = registry["agents"]
+            kept: list[dict[str, Any]] = []
+            for record in records:
+                if _native_agent_registry_is_stale(record["updated_at"], timestamp):
+                    continue
+                stale = timestamp - record["updated_at"] > NATIVE_AGENT_ACTIVE_SECONDS
+                agent_state = "unconfirmed" if stale else record["activity_state"]
+                copied = {
+                    "display_id": str(record["agent_id"])[:8],
+                    "agent_type": record["agent_type"],
+                    "activity_state": agent_state,
+                    "updated_at_utc": _dt.datetime.fromtimestamp(record["updated_at"], _dt.timezone.utc).isoformat(),
+                }
+                kept.append(copied)
+
+            active_count = 0
+            unconfirmed_count = 0
+            for record in records:
+                if _native_agent_registry_is_stale(record["updated_at"], timestamp):
+                    continue
+                if timestamp - record["updated_at"] > NATIVE_AGENT_ACTIVE_SECONDS:
+                    unconfirmed_count += 1
+                elif record["activity_state"] == "active":
+                    active_count += 1
+                else:
+                    unconfirmed_count += 1
+            overflow = max(0, len(kept) - MAX_NATIVE_APPLET_AGENTS)
+            return {
+                "bridge_state": bridge_state,
+                "counts": {
+                    "active": active_count,
+                    "unconfirmed": unconfirmed_count,
+                    "overflow": overflow,
+                },
+                "agents": kept[:MAX_NATIVE_APPLET_AGENTS],
+                "truncated": overflow > 0,
+            }
+    except AgentError:
+        return {
+            "bridge_state": "degraded",
+            "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
+            "agents": [],
+            "truncated": False,
+        }
+
+
 def normalize_int_field(value: Any, *, field: str, minimum: int, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise AgentError(f"{field} must be an integer")
@@ -2714,6 +3698,319 @@ def normalize_int_field(value: Any, *, field: str, minimum: int, maximum: int) -
     if number > maximum:
         raise AgentError(f"{field} must be <= {maximum}")
     return number
+
+
+def spawn_resource_policy() -> dict[str, Any]:
+    return {
+        "max_load_per_cpu": RESOURCE_MAX_LOAD_PER_CPU,
+        "min_available_memory_percent": RESOURCE_MIN_AVAILABLE_MEMORY_PERCENT,
+        "min_available_memory_mib": RESOURCE_MIN_AVAILABLE_MEMORY_MIB,
+        "max_running_agents": RESOURCE_MAX_RUNNING_AGENTS,
+        "raw_output": "not_returned",
+    }
+
+
+def _finite_resource_number(value: Any, *, minimum: float = 0.0) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value >= minimum
+    )
+
+
+def _resource_meminfo() -> tuple[float, float] | None:
+    try:
+        text = RESOURCE_MEMINFO_PATH.read_text(encoding="utf-8", errors="replace")
+    except (OSError, UnicodeError):
+        return None
+    values: dict[str, int] = {}
+    for line in text.splitlines():
+        key, separator, remainder = line.partition(":")
+        if separator == "" or key not in {"MemTotal", "MemAvailable"}:
+            continue
+        parts = remainder.strip().split()
+        if len(parts) != 2 or parts[1] != "kB":
+            continue
+        try:
+            value = int(parts[0])
+        except (TypeError, ValueError):
+            continue
+        if value < 0:
+            return None
+        values[key] = value
+    total_kib = values.get("MemTotal")
+    available_kib = values.get("MemAvailable")
+    if (
+        total_kib is None
+        or available_kib is None
+        or total_kib <= 0
+        or available_kib > total_kib
+    ):
+        return None
+    return available_kib / total_kib * 100.0, available_kib / 1024.0
+
+
+def _managed_tmux_session_count() -> int | None:
+    try:
+        completed = run_tmux(["list-sessions", "-F", "#{session_name}"], check=False)
+        if completed.returncode != 0:
+            if not (
+                type(completed.returncode) is int
+                and completed.returncode == 1
+                and isinstance(completed.stdout, str)
+                and completed.stdout == ""
+                and isinstance(completed.stderr, str)
+                and re.fullmatch(
+                    r"(?:no sessions|no server running on [^\r\n]+|"
+                    r"error connecting to [^\r\n]+ \(No such file or directory\))\n?",
+                    completed.stderr,
+                )
+            ):
+                return None
+            return 0
+        snapshot = current_agent_inventory()
+        configured_sessions = {
+            agent_config(agent, snapshot).get("session") for agent in snapshot.agent_ids
+        }
+        listed_sessions = {
+            line.strip() for line in completed.stdout.splitlines() if line.strip()
+        }
+        return len(configured_sessions & listed_sessions)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def system_resource_snapshot(*, running_agents_override: int | None = None) -> dict[str, Any]:
+    load_per_cpu: float | None = None
+    available_memory_percent: float | None = None
+    available_memory_mib: float | None = None
+    running_agents: int | None = None
+    reason_codes: list[str] = []
+
+    cpu_count = os.cpu_count()
+    try:
+        load1 = os.getloadavg()[0]
+    except (AttributeError, OSError, TypeError, ValueError):
+        load1 = None
+    if (
+        isinstance(cpu_count, int)
+        and not isinstance(cpu_count, bool)
+        and cpu_count > 0
+        and _finite_resource_number(load1)
+    ):
+        load_per_cpu = load1 / cpu_count
+    else:
+        reason_codes.append("cpu_metrics_unavailable")
+
+    memory = _resource_meminfo()
+    if memory is None:
+        reason_codes.append("memory_metrics_unavailable")
+    else:
+        available_memory_percent, available_memory_mib = memory
+
+    if running_agents_override is None:
+        running_agents = _managed_tmux_session_count()
+    elif (
+        isinstance(running_agents_override, int)
+        and not isinstance(running_agents_override, bool)
+        and running_agents_override >= 0
+    ):
+        running_agents = running_agents_override
+    else:
+        running_agents = None
+    if running_agents is None:
+        reason_codes.append("session_metrics_unavailable")
+
+    return {
+        "ok": not reason_codes,
+        "load_per_cpu": load_per_cpu,
+        "available_memory_percent": available_memory_percent,
+        "available_memory_mib": available_memory_mib,
+        "running_agents": running_agents,
+        "reason_codes": reason_codes,
+        "raw_output": "not_returned",
+    }
+
+
+def _valid_spawn_policy(policy: Any) -> bool:
+    return (
+        isinstance(policy, dict)
+        and _finite_resource_number(policy.get("max_load_per_cpu"), minimum=0.0)
+        and _finite_resource_number(policy.get("min_available_memory_percent"), minimum=0.0)
+        and policy["min_available_memory_percent"] <= 100.0
+        and _finite_resource_number(policy.get("min_available_memory_mib"), minimum=0.0)
+        and isinstance(policy.get("max_running_agents"), int)
+        and not isinstance(policy["max_running_agents"], bool)
+        and 1 <= policy["max_running_agents"] <= 6
+    )
+
+
+def _admission_result(
+    *,
+    required_slots: int,
+    allowed: bool,
+    available_slots: int | None,
+    reason_codes: list[str],
+) -> dict[str, Any]:
+    return {
+        "allowed": allowed,
+        "required_slots": required_slots,
+        "available_slots": available_slots,
+        "reason_codes": reason_codes,
+        "raw_output": "not_returned",
+    }
+
+
+def spawn_admission_decision(
+    required_slots: int = 1,
+    *,
+    running_agents_override: int | None = None,
+) -> dict[str, Any]:
+    required_slots = normalize_int_field(required_slots, field="required_slots", minimum=1, maximum=6)
+    snapshot = (
+        system_resource_snapshot()
+        if running_agents_override is None
+        else system_resource_snapshot(running_agents_override=running_agents_override)
+    )
+    policy = spawn_resource_policy()
+    if not _valid_spawn_policy(policy):
+        return _admission_result(
+            required_slots=required_slots,
+            allowed=False,
+            available_slots=None,
+            reason_codes=["policy_invalid"],
+        )
+    if not isinstance(snapshot, dict):
+        return _admission_result(
+            required_slots=required_slots,
+            allowed=False,
+            available_slots=None,
+            reason_codes=["cpu_metrics_unavailable", "memory_metrics_unavailable", "session_metrics_unavailable"],
+        )
+    if snapshot.get("ok") is not True:
+        reasons = [
+            reason
+            for reason in snapshot.get("reason_codes", [])
+            if reason in RESOURCE_REASON_CODES
+        ]
+        if not reasons:
+            reasons = [
+                "cpu_metrics_unavailable",
+                "memory_metrics_unavailable",
+                "session_metrics_unavailable",
+            ]
+        return _admission_result(
+            required_slots=required_slots,
+            allowed=False,
+            available_slots=None,
+            reason_codes=reasons,
+        )
+
+    reasons: list[str] = []
+    load_per_cpu = snapshot.get("load_per_cpu")
+    if not _finite_resource_number(load_per_cpu):
+        reasons.append("cpu_metrics_unavailable")
+    elif load_per_cpu > policy["max_load_per_cpu"]:
+        reasons.append("cpu_pressure_high")
+
+    memory_percent = snapshot.get("available_memory_percent")
+    memory_mib = snapshot.get("available_memory_mib")
+    if not _finite_resource_number(memory_percent) or not _finite_resource_number(memory_mib):
+        reasons.append("memory_metrics_unavailable")
+    else:
+        if memory_percent < policy["min_available_memory_percent"] or memory_mib < policy["min_available_memory_mib"]:
+            reasons.append("memory_pressure_high")
+
+    running_agents = snapshot.get("running_agents")
+    available_slots: int | None = None
+    if (
+        isinstance(running_agents, int)
+        and not isinstance(running_agents, bool)
+        and running_agents >= 0
+    ):
+        available_slots = policy["max_running_agents"] - running_agents
+        if running_agents >= policy["max_running_agents"]:
+            reasons.append("running_agent_limit")
+        elif available_slots < required_slots:
+            reasons.append("insufficient_slots")
+    else:
+        reasons.append("session_metrics_unavailable")
+
+    return _admission_result(
+        required_slots=required_slots,
+        allowed=not reasons,
+        available_slots=available_slots,
+        reason_codes=reasons,
+    )
+
+
+def require_spawn_capacity(required_slots: int = 1) -> dict[str, Any]:
+    admission = spawn_admission_decision(required_slots)
+    if admission.get("allowed") is True:
+        return admission
+    reason_codes = [
+        reason
+        for reason in admission.get("reason_codes", [])
+        if isinstance(reason, str) and reason in RESOURCE_REASON_CODES
+    ]
+    if not reason_codes:
+        reason_codes = ["session_metrics_unavailable"]
+    raise AgentCapacityError(
+        "capacity unavailable",
+        {
+            "error_code": "spawn_capacity_unavailable",
+            "retryable": True,
+            "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS,
+            "reason_codes": reason_codes,
+        },
+    )
+
+
+def _spawn_priority_routes() -> tuple[str, ...]:
+    configured = os.environ.get("CODEX_MASTER_SPAWN_PRIORITY")
+    if configured is None:
+        configured = "mcp_host"
+    routes: list[str] = []
+    seen: set[str] = set()
+    for item in configured.split(","):
+        route = item.strip()
+        if route and route not in seen:
+            routes.append(route)
+            seen.add(route)
+    return tuple(routes)
+
+
+def agent_spawn_offers(required_slots: int = 1) -> dict[str, Any]:
+    required_slots = normalize_int_field(required_slots, field="required_slots", minimum=1, maximum=6)
+    admission = spawn_admission_decision(required_slots)
+    routes = _spawn_priority_routes()
+    allowed = admission.get("allowed") is True
+    offers = [{"route": route} for route in routes if allowed and route == "mcp_host"]
+    offered_routes = {offer["route"] for offer in offers}
+    internal_reason_codes = admission.get("reason_codes")
+    reason_codes: list[str] = []
+    if not allowed and isinstance(internal_reason_codes, list):
+        reason_codes = [
+            reason
+            for reason in internal_reason_codes
+            if isinstance(reason, str) and reason in RESOURCE_REASON_CODES
+        ]
+    if not allowed and not reason_codes:
+        reason_codes = ["session_metrics_unavailable"]
+    retryable = not allowed
+    return {
+        "ok": allowed,
+        "offers": offers,
+        "offer_count": len(offers),
+        "unavailable_route_count": sum(route not in offered_routes for route in routes),
+        "ttl_seconds": SPAWN_OFFER_TTL_SECONDS,
+        "reservation": "none",
+        "retryable": retryable,
+        "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS if retryable else None,
+        "reason_codes": reason_codes,
+        "raw_output": "not_returned",
+    }
 
 
 def normalize_lease_seconds(value: Any) -> int:
@@ -2796,9 +4093,12 @@ def age_seconds_from_utc(value: Any, *, now: float | None = None) -> int | None:
     return max(0, int(current - timestamp))
 
 
-def read_agent_lease_record(agent: str) -> dict[str, Any] | None:
-    agent = canonical_agent_id(agent)
-    candidate_paths = [agent_lease_path(agent)]
+def read_agent_lease_record(
+    agent: str,
+    snapshot: InventorySnapshot | None = None,
+) -> dict[str, Any] | None:
+    agent = canonical_agent_id(agent, snapshot=snapshot)
+    candidate_paths = [agent_lease_path(agent, snapshot=snapshot)]
     candidate_paths.extend(LEASE_DIR / f"{legacy_agent}.json" for legacy_agent in sorted(agent_record_aliases(agent) - {agent}))
     for path in candidate_paths:
         if not path_present_no_follow(path):
@@ -2820,8 +4120,12 @@ def read_agent_lease_record(agent: str) -> dict[str, Any] | None:
     return None
 
 
-def public_agent_lease(agent: str, record: dict[str, Any] | None = None) -> dict[str, Any]:
-    agent = canonical_agent_id(agent)
+def public_agent_lease(
+    agent: str,
+    record: dict[str, Any] | None = None,
+    snapshot: InventorySnapshot | None = None,
+) -> dict[str, Any]:
+    agent = canonical_agent_id(agent, snapshot=snapshot)
     now = time.time()
     valid_expiry = True
     if not record:
@@ -2929,12 +4233,21 @@ def stopped_foreign_lease_recovery_status(
     }
 
 
-def agent_lease_status(agent: str, *, initialize_state: bool = True) -> dict[str, Any]:
-    agent = canonical_agent_id(agent)
+def agent_lease_status(
+    agent: str,
+    *,
+    initialize_state: bool = True,
+    snapshot: InventorySnapshot | None = None,
+) -> dict[str, Any]:
+    agent = canonical_agent_id(agent, snapshot=snapshot)
     if initialize_state:
         ensure_state()
     try:
-        return public_agent_lease(agent, read_agent_lease_record(agent))
+        return public_agent_lease(
+            agent,
+            read_agent_lease_record(agent, snapshot=snapshot),
+            snapshot=snapshot,
+        )
     except AgentError:
         return {
             "agent": agent,
@@ -3377,9 +4690,13 @@ def auth_access_token_state(value: Any) -> str:
     return "expired" if expiry <= time.time() else "unexpired"
 
 
-def agent_auth_status(agent: str) -> dict[str, Any]:
-    agent = canonical_agent_id(agent)
-    auth_file = agent_config(agent)["home"] / "auth.json"
+def agent_auth_status(
+    agent: str,
+    snapshot: InventorySnapshot | None = None,
+) -> dict[str, Any]:
+    inventory = snapshot or current_agent_inventory()
+    agent = canonical_agent_id(agent, snapshot=inventory)
+    auth_file = agent_config(agent, inventory)["home"] / "auth.json"
     token_state = "unknown"
     auth_mode = "unknown"
     try:
@@ -3514,10 +4831,22 @@ def codex_usage_routing_decision(
     role: str,
     group_id: str | None = None,
     job_id: str | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     group_id = normalize_routing_context_id(group_id, field="group_id")
     job_id = normalize_routing_context_id(job_id, field="job_id")
+    if timeout_seconds is None:
+        command_timeout = float(CODEX_USAGE_DECISION_TIMEOUT_SECONDS)
+    elif (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
+        or timeout_seconds <= 0
+    ):
+        raise AgentError("codex-usage routing timeout is invalid")
+    else:
+        command_timeout = min(float(timeout_seconds), CODEX_USAGE_DECISION_TIMEOUT_SECONDS)
     auth_fd = open_agent_auth_fd(agent)
     try:
         command = [codex_usage_executable()]
@@ -3546,7 +4875,7 @@ def codex_usage_routing_decision(
             command.extend(["--job", job_id])
         cp = run_command(
             command,
-            timeout=CODEX_USAGE_DECISION_TIMEOUT_SECONDS,
+            timeout=command_timeout,
             pass_fds=(auth_fd,),
         )
     finally:
@@ -3554,15 +4883,20 @@ def codex_usage_routing_decision(
     combined_size = len(cp.stdout.encode("utf-8")) + len(cp.stderr.encode("utf-8"))
     if combined_size > MAX_CODEX_USAGE_DECISION_BYTES:
         raise AgentError("codex-usage routing output exceeded size limit")
-    if cp.returncode != 0:
-        detail, _changed = redact(trim_chars(cp.stderr.strip(), 300))
-        suffix = f": {detail}" if detail else ""
-        raise AgentError(f"codex-usage routing failed with exit {cp.returncode}{suffix}")
     try:
         payload = json.loads(cp.stdout)
     except json.JSONDecodeError as exc:
+        if cp.returncode != 0:
+            detail, _changed = redact(trim_chars(cp.stderr.strip(), 300))
+            suffix = f": {detail}" if detail else ""
+            raise AgentError(f"codex-usage routing failed with exit {cp.returncode}{suffix}") from None
         raise AgentError("codex-usage routing returned invalid JSON") from exc
-    return validate_codex_usage_routing_decision(payload, agent=agent, role=role)
+    decision = validate_codex_usage_routing_decision(payload, agent=agent, role=role)
+    if cp.returncode != 0 and decision["decision"] != "blocked":
+        detail, _changed = redact(trim_chars(cp.stderr.strip(), 300))
+        suffix = f": {detail}" if detail else ""
+        raise AgentError(f"codex-usage routing failed with exit {cp.returncode}{suffix}")
+    return decision
 
 
 def codex_usage_spark_health_update(
@@ -3640,8 +4974,8 @@ def validate_codex_usage_routing_decision(
         payload.get("backend_account_id"),
         field="codex-usage routing backend account id",
         max_chars=MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID,
-        required=True,
-    ) or ""
+        required=decision != "blocked",
+    )
     expected_model = {
         "spark": WRITE_AGENT_MODEL,
         "main": DEFAULT_AGENT_MODEL,
@@ -3655,7 +4989,7 @@ def validate_codex_usage_routing_decision(
         raise AgentError("codex-usage credits decision lacks explicit paid policy")
     if not isinstance(payload.get("paid_overage_allowed"), bool):
         raise AgentError("codex-usage paid policy is invalid")
-    return {
+    result = {
         "schema_version": 1,
         "account": payload["account"],
         "backend_account_id": backend_account_id,
@@ -3672,6 +5006,63 @@ def validate_codex_usage_routing_decision(
         ),
         "raw_output": "not_returned",
     }
+    threshold = payload.get("threshold_percent")
+    if threshold is not None:
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, (int, float))
+            or not math.isfinite(float(threshold))
+            or not 0 <= float(threshold) <= 100
+        ):
+            raise AgentError("codex-usage routing threshold is invalid")
+        result["threshold_percent"] = float(threshold)
+
+    remaining = payload.get("remaining")
+    normalized_remaining: dict[str, float] = {}
+    if remaining is not None:
+        if not isinstance(remaining, dict) or len(remaining) > 16:
+            raise AgentError("codex-usage routing remaining values are invalid")
+        for window, value in remaining.items():
+            if (
+                not isinstance(window, str)
+                or not window
+                or len(window) > 32
+                or isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not 0 <= float(value) <= 100
+            ):
+                raise AgentError("codex-usage routing remaining values are invalid")
+            normalized_remaining[window] = float(value)
+        if normalized_remaining:
+            result["remaining_percent"] = min(normalized_remaining.values())
+
+    resets = payload.get("resets")
+    normalized_resets: dict[str, tuple[float, str]] = {}
+    if resets is not None:
+        if not isinstance(resets, dict) or len(resets) > 16:
+            raise AgentError("codex-usage routing resets are invalid")
+        for window, value in resets.items():
+            parsed = parse_utc_timestamp(value)
+            if not isinstance(window, str) or not window or len(window) > 32 or parsed is None:
+                raise AgentError("codex-usage routing resets are invalid")
+            normalized_resets[window] = (parsed, value)
+    if decision == "blocked" and normalized_resets:
+        blocked_windows = set(normalized_resets)
+        if normalized_remaining and threshold is not None:
+            blocked_windows = {
+                window
+                for window, value in normalized_remaining.items()
+                if value <= float(threshold)
+            }
+        blocked_resets = [
+            normalized_resets[window]
+            for window in blocked_windows
+            if window in normalized_resets
+        ]
+        if blocked_resets:
+            result["blocked_until_utc"] = max(blocked_resets)[1]
+    return result
 
 
 def managed_raw_dirs() -> tuple[Path, ...]:
@@ -3732,7 +5123,7 @@ def allowed_agent_raw_log_identity(agent: str, raw_log: Any) -> tuple[Path, os.s
     if not name.endswith(".log"):
         return None
     _prefix, separator, suffix = name[:-4].rpartition("-")
-    known_suffixes = set(AGENT_IDS) | set(LEGACY_AGENT_ALIASES)
+    known_suffixes = set(all_agent_ids()) | set(LEGACY_AGENT_ALIASES)
     if separator and suffix in known_suffixes and suffix not in agent_record_aliases(agent):
         return None
     return identity
@@ -3788,15 +5179,70 @@ def latest_managed_raw_log(agent: str, *, include_legacy: bool = True) -> Path |
     return newest[0] if len(newest) == 1 else None
 
 
+def raw_log_candidate_agents(running_agents: set[str]) -> list[str]:
+    snapshot = current_agent_inventory()
+    candidates = {agent for agent in running_agents if agent in snapshot.agents}
+
+    for metadata_dir in (META_DIR, LEGACY_META_DIR):
+        if not is_real_directory_no_symlink(metadata_dir):
+            continue
+        try:
+            entries = tuple(metadata_dir.iterdir())
+        except OSError:
+            continue
+        for path in entries:
+            if not path.name.endswith(".json"):
+                continue
+            name = path.name[:-5]
+            candidate = name if name in snapshot.agents else LEGACY_AGENT_ALIASES.get(name)
+            if candidate in snapshot.agents:
+                candidates.add(candidate)
+
+    for raw_dir in managed_raw_dirs():
+        if not is_real_directory_no_symlink(raw_dir):
+            continue
+        try:
+            entries = tuple(raw_dir.iterdir())
+        except OSError:
+            continue
+        for path in entries:
+            if not path.name.endswith(".log"):
+                continue
+            _prefix, separator, name = path.name[:-4].rpartition("-")
+            if not separator:
+                continue
+            candidate = name if name in snapshot.agents else LEGACY_AGENT_ALIASES.get(name)
+            if candidate in snapshot.agents:
+                candidates.add(candidate)
+
+    return sorted(candidates, key=snapshot.positions.__getitem__)
+
+
 def protected_raw_log_paths() -> set[Path]:
     protected: set[Path] = set()
-    inventory, _published = published_agent_inventory()
-    for agent in inventory.agent_ids:
-        record_agent = LEGACY_AGENT_ALIASES.get(agent, agent)
-        if record_agent not in inventory.agents:
-            record_agent = agent
-        raw_log = read_meta(record_agent).get("raw_log")
-        identity = allowed_agent_raw_log_identity(record_agent, raw_log)
+    has_artifacts = False
+    for metadata_dir in (META_DIR,):
+        if is_real_directory_no_symlink(metadata_dir):
+            try:
+                if any(path.name.endswith(".json") for path in metadata_dir.iterdir()):
+                    has_artifacts = True
+                    break
+            except OSError:
+                pass
+    if not has_artifacts and is_real_directory_no_symlink(RAW_DIR):
+        try:
+            has_artifacts = any(path.name.endswith(".log") for path in RAW_DIR.iterdir())
+        except OSError:
+            pass
+    if not has_artifacts:
+        return protected
+    try:
+        running_agents = set(managed_applet_inventory()["running_agents"])
+    except AgentError:
+        running_agents = set()
+    for agent in raw_log_candidate_agents(running_agents):
+        raw_log = read_meta(agent).get("raw_log")
+        identity = allowed_agent_raw_log_identity(agent, raw_log)
         if (
             identity is not None
             and identity[1] is not None
@@ -3805,10 +5251,10 @@ def protected_raw_log_paths() -> set[Path]:
             protected.add(identity[0])
             continue
         recovered = latest_managed_raw_log(
-            record_agent,
+            agent,
             include_legacy=raw_log_identity_is_legacy(identity),
         )
-        if recovered is not None and tmux_alive(agent_config(agent, inventory)["session"]):
+        if recovered is not None and agent in running_agents:
             protected.add(recovered)
     return protected
 
@@ -4175,15 +5621,57 @@ def read_proc_cmdline(pid_dir: Path) -> list[str]:
 
 def proc_is_codex_like(status: dict[str, str], argv: list[str]) -> bool:
     name = (status.get("Name") or "").lower()
-    argv_names = {Path(item).name.lower() for item in argv if item}
-    joined = "\0".join(argv).lower()
-    return (
+    argv0_name = Path(argv[0]).name.lower() if argv else ""
+    if (
         name == "codex"
         or name == "codex-code-mode-host"
         or name == "codex-code-mode"
-        or "codex" in argv_names
-        or "@openai/codex" in joined
-        or "node_modules/@openai/codex" in joined
+        or name == "gemini"
+        or argv0_name == "codex"
+        or argv0_name == "gemini"
+    ):
+        return True
+    if argv0_name not in {"node", "nodejs"} or len(argv) < 2:
+        return False
+    value_flags = (
+        "-r",
+        "--require",
+        "--loader",
+        "--experimental-loader",
+        "--import",
+        "-C",
+        "--conditions",
+    )
+    entrypoint: str | None = None
+    skip_next = False
+    for index, arg in enumerate(argv[1:], start=1):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--":
+            entrypoint = argv[index + 1] if index + 1 < len(argv) else None
+            break
+        if arg.startswith("--") and "=" in arg:
+            flag, _ = arg.split("=", 1)
+            if flag not in value_flags:
+                return False
+            continue
+        if arg in value_flags:
+            skip_next = True
+            continue
+        if arg == "--enable-source-maps":
+            continue
+        if arg.startswith("-"):
+            return False
+        entrypoint = arg
+        break
+    if not entrypoint:
+        return False
+    parts = Path(entrypoint.lower()).parts
+    return any(
+        (left == "@openai" and right == "codex")
+        or (left == "@google" and right == "gemini-cli")
+        for left, right in zip(parts, parts[1:])
     )
 
 
@@ -4253,7 +5741,7 @@ def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[di
                 except (OSError, RuntimeError):
                     matches_home = False
         else:
-            configured_home = env.get("CODEX_HOME", "")
+            configured_home = env.get("CODEX_HOME", "") or env.get("GEMINI_CLI_HOME", "")
             if configured_home:
                 try:
                     configured_path = Path(configured_home).expanduser()
@@ -4387,7 +5875,7 @@ def pool_home_processes(home: Path, proc_root: Path = Path("/proc")) -> list[dic
             if proc_is_codex_like(status, argv):
                 return None
         else:
-            configured_home = env.get("CODEX_HOME", "")
+            configured_home = env.get("CODEX_HOME", "") or env.get("GEMINI_CLI_HOME", "")
             if configured_home:
                 try:
                     configured_path = Path(configured_home).expanduser()
@@ -4447,18 +5935,35 @@ def agent_identity_guard(
     external_process_count = process_summary.get("external_process_count")
     managed_process_count = process_summary.get("managed_process_count")
     counts_available = all(
-        isinstance(value, int) and not isinstance(value, bool)
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= 0
         for value in (process_count, external_process_count, managed_process_count)
     )
+    if counts_available:
+        counts_available = (
+            managed_process_count + external_process_count <= process_count
+            and (managed_process_count > 0 or external_process_count == process_count)
+        )
     managed_process_ids = process_summary.get("managed_process_ids")
-    pane_process_identity_checked = running and "managed_process_ids" in process_summary
+    pane_process_identity_checked = running
     pane_process_identity_match: bool | None = None
     if pane_process_identity_checked:
+        managed_process_ids_valid = (
+            counts_available
+            and isinstance(managed_process_ids, list)
+            and managed_process_count <= len(managed_process_ids) <= process_count
+            and all(
+                isinstance(pid, int) and not isinstance(pid, bool) and pid > 0
+                for pid in managed_process_ids
+            )
+            and len(managed_process_ids) == len(set(managed_process_ids))
+        )
         pane_process_identity_match = (
-            isinstance(managed_process_ids, list)
-            and all(isinstance(pid, int) and not isinstance(pid, bool) for pid in managed_process_ids)
+            managed_process_ids_valid
             and isinstance(pane_process_id, int)
             and not isinstance(pane_process_id, bool)
+            and pane_process_id > 0
             and pane_process_id in managed_process_ids
         )
     if not counts_available:
@@ -4612,7 +6117,7 @@ def pane_pid(session: str) -> int | None:
     if cp.returncode != 0:
         return None
     text = cp.stdout.strip()
-    return int(text) if text.isdigit() else None
+    return pane_pid_from_text(text)
 
 
 def cleanup_failed_start(session: str, raw_log: Path, *, kill_session: bool) -> None:
@@ -4750,52 +6255,60 @@ def _start_agent_unlocked(
             "raw_output": "not_returned",
         }
 
-    process_summary = agent_home_process_summary(agent)
-    identity_guard = agent_identity_guard(False, process_summary)
-    if process_summary["external_process_count"] is None:
-        raise AgentError(f"agent {agent} CODEX_HOME process scan is unavailable; retry before starting")
-    if process_summary["external_process_count"]:
-        raise AgentError(
-            f"agent {agent} CODEX_HOME is already used by {process_summary['external_process_count']} external process(es); "
-            "stop them or use a separate CODEX_HOME before starting through codex-master-mcp"
-        )
-    if not identity_guard["ok"]:
-        raise AgentError(
-            f"agent {agent} CODEX_HOME is already used by {process_summary['managed_process_count']} "
-            "managed process(es) without the managed tmux session; stop the orphaned process(es) before starting "
-            "through codex-master-mcp"
-        )
+    with spawn_admission_lock():
+        require_spawn_capacity(1)
+        process_summary = agent_home_process_summary(agent)
+        identity_guard = agent_identity_guard(False, process_summary)
+        if process_summary["external_process_count"] is None:
+            raise AgentError(f"agent {agent} CODEX_HOME process scan is unavailable; retry before starting")
+        if process_summary["external_process_count"]:
+            raise AgentError(
+                f"agent {agent} CODEX_HOME is already used by {process_summary['external_process_count']} external process(es); "
+                "stop them or use a separate CODEX_HOME before starting through codex-master-mcp"
+            )
+        if not identity_guard["ok"]:
+            raise AgentError(
+                f"agent {agent} CODEX_HOME is already used by {process_summary['managed_process_count']} "
+                "managed process(es) without the managed tmux session; stop the orphaned process(es) before starting "
+                "through codex-master-mcp"
+            )
 
-    close_runner_execution_fd(agent)
-    cwd = bounded_text(cwd, field="cwd", max_chars=MAX_PATH_TEXT) if cwd is not None else None
-    prompt = bounded_text(prompt, field="prompt", max_chars=MAX_SEND_TEXT, strip=False) if prompt is not None else None
-    start_cwd = Path(cwd or os.getcwd()).expanduser().resolve()
-    if not start_cwd.exists() or not start_cwd.is_dir():
-        raise AgentError("cwd is not a directory")
-    reasoning_effort = model_reasoning_effort or (
-        WRITE_AGENT_MODEL_EFFORT if model == WRITE_AGENT_MODEL else DEFAULT_AGENT_MODEL_EFFORT
-    )
-    routed_args = agent_base_args(model, reasoning_effort)
-
-    runner_execution_path = open_runner_execution_path(agent, runner, runner_stat)
-    run_id = f"{now_id()}-{agent}"
-    raw_log = RAW_DIR / f"{run_id}.log"
-    try:
-        write_private_new_bytes(raw_log, b"")
-    except Exception:
         close_runner_execution_fd(agent)
-        raise
+        cwd = bounded_text(cwd, field="cwd", max_chars=MAX_PATH_TEXT) if cwd is not None else None
+        prompt = bounded_text(prompt, field="prompt", max_chars=MAX_SEND_TEXT, strip=False) if prompt is not None else None
+        start_cwd = Path(cwd or os.getcwd()).expanduser().resolve()
+        if not start_cwd.exists() or not start_cwd.is_dir():
+            raise AgentError("cwd is not a directory")
+        reasoning_effort = model_reasoning_effort or (
+            WRITE_AGENT_MODEL_EFFORT if model == WRITE_AGENT_MODEL else DEFAULT_AGENT_MODEL_EFFORT
+        )
+        routed_args = agent_base_args(model, reasoning_effort)
 
-    argv = [str(runner_execution_path), *routed_args]
-    if prompt:
-        argv.append(prompt)
+        runner_execution_path = open_runner_execution_path(agent, runner, runner_stat)
+        run_id = f"{now_id()}-{agent}"
+        raw_log = RAW_DIR / f"{run_id}.log"
+        raw_log_created = False
+        try:
+            write_private_new_bytes(raw_log, b"")
+            raw_log_created = True
+            prune_raw_logs()
+        except Exception:
+            if raw_log_created:
+                with contextlib.suppress(Exception):
+                    cleanup_failed_start(session, raw_log, kill_session=False)
+            close_runner_execution_fd(agent)
+            raise
 
-    command = "env CODEX_MASTER_MCP=1 CODEX_AGENT_MCP=1 " + shlex.join(argv)
-    try:
-        cp = run_tmux(["new-session", "-d", "-s", session, "-c", str(start_cwd), command], check=False)
-    except Exception:
-        close_runner_execution_fd(agent)
-        raise
+        argv = [str(runner_execution_path), *routed_args]
+        if prompt:
+            argv.append(prompt)
+
+        command = "env CODEX_MASTER_MCP=1 CODEX_AGENT_MCP=1 " + shlex.join(argv)
+        try:
+            cp = run_tmux(["new-session", "-d", "-s", session, "-c", str(start_cwd), command], check=False)
+        except Exception:
+            close_runner_execution_fd(agent)
+            raise
     if cp.returncode != 0:
         cleanup_failed_start(session, raw_log, kill_session=False)
         close_runner_execution_fd(agent)
@@ -6465,12 +7978,16 @@ def status_agent(
 def applet_status(
     selected_agents: list[str] | tuple[str, ...] | None = None,
     *,
-    schema_version: int = 3,
+    schema_version: int = 1,
 ) -> dict[str, Any]:
     """Return a bounded, read-only snapshot for the Cinnamon adapter."""
 
-    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in {2, 3}:
-        raise AgentError("unsupported_applet_schema")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in (1, 2, 3):
+        raise AgentError("schema_version must be 1, 2, or 3")
+    if schema_version == 1:
+        return applet_status_v1(selected_agents)
+    if schema_version == 2:
+        return applet_status_v2(selected_agents)
     inventory, _published = published_agent_inventory()
     selected = tuple(selected_agents or ())
     if len(selected) > MAX_FLEET_AGENTS:
@@ -6782,6 +8299,8 @@ def codex_usage_status_with_routing(
     *,
     persist_account: bool = True,
     include_assignment_history: bool = True,
+    force_policy_check: bool = False,
+    routing_timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     needs_routing_check = (
         status.get("usage_status") in {"login_required", "partial", "error"}
@@ -6790,14 +8309,43 @@ def codex_usage_status_with_routing(
     needs_routing_check = needs_routing_check or (
         not status.get("blocked")
         and status.get("state") == "missing"
-        and status.get("account") == canonical_agent_id(agent)
+    )
+    needs_routing_check = needs_routing_check or (
+        force_policy_check and isinstance(status.get("account"), str)
     )
     if needs_routing_check:
         auth = agent_auth_status(agent)
-        if auth.get("authenticated"):
-            routing = codex_usage_routing_decision(agent, role="arbeitsbiene")
+        if auth.get("authenticated") or (
+            force_policy_check and auth.get("auth_state") == "access_token_expired"
+        ):
+            if routing_timeout_seconds is None:
+                routing = codex_usage_routing_decision(agent, role="arbeitsbiene")
+            else:
+                routing = codex_usage_routing_decision(
+                    agent,
+                    role="arbeitsbiene",
+                    timeout_seconds=routing_timeout_seconds,
+                )
             if persist_account:
                 remember_agent_usage_account(agent, routing.get("account"))
+            if routing.get("decision") == "blocked":
+                blocked = {
+                    **status,
+                    "agent": canonical_agent_id(agent),
+                    "account": routing.get("account"),
+                    "account_mapping": "routing",
+                    "state": "blocked",
+                    "blocked": True,
+                    "blocked_until_utc": routing.get("blocked_until_utc"),
+                    "reason": routing.get("reason") or "codex usage limit reached",
+                    "source": "routing_policy",
+                    "raw_output": "not_returned",
+                }
+                for field in ("remaining_percent", "threshold_percent"):
+                    if field in routing:
+                        blocked[field] = routing[field]
+                return blocked
+            if persist_account:
                 status = codex_usage_watchdog_status(
                     agent,
                     snapshot_account=routing.get("account"),
@@ -6809,14 +8357,15 @@ def codex_usage_status_with_routing(
                     snapshot_account=routing.get("account"),
                     include_assignment_history=include_assignment_history,
                 )
-            if routing.get("decision") == "blocked" and not status.get("blocked"):
-                reason = routing.get("reason") or "codex usage limit reached"
-                raise AgentError(f"agent {canonical_agent_id(agent)} is blocked by codex-usage routing: {reason}")
     return status
 
 
 def ensure_agent_not_blocked_by_codex_usage(agent: str) -> dict[str, Any]:
-    status = codex_usage_status_with_routing(agent, codex_usage_watchdog_status(agent))
+    status = codex_usage_status_with_routing(
+        agent,
+        codex_usage_watchdog_status(agent),
+        force_policy_check=True,
+    )
     if status.get("blocked"):
         blocked_until = status.get("blocked_until_utc")
         reason = status.get("reason") or "codex usage limit reached"
@@ -8143,6 +9692,7 @@ def assignment_prompt(
     name: str | None,
     model: str,
     allow_subagents: bool,
+    subagent_admission: dict[str, Any] | None,
     requires_search: bool = False,
     live_data_topic: str | None = None,
 ) -> str:
@@ -8159,6 +9709,35 @@ def assignment_prompt(
             "Wenn aktuelle Daten nicht verfuegbar sind, nicht raten; als Tooling-/Zugriffslimit berichten.",
         ]
     search_block = bullet_block(search_lines)
+    subagents_permitted = bool(
+        allow_subagents
+        and isinstance(subagent_admission, dict)
+        and subagent_admission.get("allowed") is True
+    )
+    subagent_reason_codes = (
+        [
+            reason
+            for reason in subagent_admission.get("reason_codes", [])
+            if isinstance(reason, str) and reason in RESOURCE_REASON_CODES
+        ]
+        if isinstance(subagent_admission, dict) and isinstance(subagent_admission.get("reason_codes"), list)
+        else []
+    )
+    subagent_permission = "Darf eigene Subagentinnen starten: nein"
+    if subagents_permitted:
+        scope_limit = "nur lesend im Scope" if role == "exploriererin" else "nur innerhalb Scope und Schreibpfaden"
+        subagent_permission = f"Darf eigene Subagentinnen starten: ja, {scope_limit}"
+    subagent_lines = [subagent_permission]
+    if subagents_permitted:
+        subagent_lines.extend(
+            [
+                "Vor jedem Spawn frisch pruefen: load1 / logical_cpu_count <= 0.85.",
+                "Linux MemAvailable muss >= 20 % und >= 1024 MiB sein.",
+                "Fehlende oder ungueltige Messung bedeutet: nicht spawnen.",
+            ]
+        )
+    elif allow_subagents and subagent_reason_codes:
+        subagent_lines.append(f"Ressourcenfreigabe: {', '.join(subagent_reason_codes)}")
 
     if role == "exploriererin":
         return "\n".join(
@@ -8170,7 +9749,7 @@ def assignment_prompt(
                 f"Skill: {skill_line}",
                 f"Scope:\n{bullet_block(scope)}",
                 "Darf schreiben: nein",
-                f"Darf eigene Subagentinnen starten: {'ja, nur lesend im Scope' if allow_subagents else 'nein'}",
+                *subagent_lines,
                 f"Web-/Live-Daten:\n{search_block}",
                 f"Stabiler Kontext:\n{bullet_block(context)}",
                 f"Aufgabe: {task}",
@@ -8188,7 +9767,7 @@ def assignment_prompt(
             f"Skill: {skill_line}",
             f"Scope:\n{bullet_block(scope)}",
             f"Darf schreiben: ja, nur:\n{bullet_block(write_paths)}",
-            f"Darf eigene Subagentinnen starten: {'ja, nur innerhalb Scope und Schreibpfaden' if allow_subagents else 'nein'}",
+            *subagent_lines,
             f"Web-/Live-Daten:\n{search_block}",
             f"Stabiler Kontext:\n{bullet_block(context)}",
             f"Aktuelle Aufgabe: {task}",
@@ -8349,6 +9928,21 @@ def _assign_agent_unlocked(
         if model == WRITE_AGENT_MODEL
         else DEFAULT_AGENT_MODEL_EFFORT
     )
+    subagent_admission = spawn_admission_decision(1) if allow_subagents else None
+    subagents_permitted = bool(
+        allow_subagents
+        and isinstance(subagent_admission, dict)
+        and subagent_admission.get("allowed") is True
+    )
+    subagent_reason_codes = (
+        [
+            reason
+            for reason in subagent_admission.get("reason_codes", [])
+            if isinstance(reason, str) and reason in RESOURCE_REASON_CODES
+        ]
+        if isinstance(subagent_admission, dict) and isinstance(subagent_admission.get("reason_codes"), list)
+        else []
+    )
     prompt = assignment_prompt(
         agent=agent,
         role=role,
@@ -8361,6 +9955,7 @@ def _assign_agent_unlocked(
         name=name,
         model=model,
         allow_subagents=allow_subagents,
+        subagent_admission=subagent_admission,
         requires_search=requires_search,
         live_data_topic=live_data_topic,
     )
@@ -8408,7 +10003,13 @@ def _assign_agent_unlocked(
         "context_count": len(context),
         "forbidden_count": len(forbidden),
         "write_policy": "read_only" if role == "exploriererin" else "explicit_paths_only",
-        "allow_subagents": allow_subagents,
+        "allow_subagents": subagents_permitted,
+        "subagents": {
+            "requested": allow_subagents,
+            "permitted": subagents_permitted,
+            "policy": "resource_and_assignment_gated",
+            "reason_codes": subagent_reason_codes,
+        },
         "requires_search": requires_search,
         "live_data": {
             "required": requires_search,
@@ -8451,7 +10052,7 @@ def _assign_agent_unlocked(
         "scope_count": len(scope),
         "write_policy": "read_only" if role == "exploriererin" else "explicit_paths_only",
         "write_path_count": len(write_paths),
-        "subagents_allowed": allow_subagents,
+        "subagents_allowed": subagents_permitted,
         "requires_search": requires_search,
         "live_data": {
             "required": requires_search,
@@ -8498,6 +10099,7 @@ def sanitize_assignment_record(record: dict[str, Any]) -> dict[str, Any]:
             "forbidden_count",
             "write_policy",
             "allow_subagents",
+            "subagents",
             "requires_search",
             "live_data",
             "lease",
@@ -8530,7 +10132,8 @@ def sanitize_assignment_record(record: dict[str, Any]) -> dict[str, Any]:
             "raw_output",
         ),
         "skill": ("requested", "available", "match_count"),
-            "live_data": ("required", "topic_state", "raw_output"),
+        "subagents": ("requested", "permitted", "policy", "reason_codes"),
+        "live_data": ("required", "topic_state", "raw_output"),
         "lease": (
             "state",
             "holder",
@@ -8553,6 +10156,12 @@ def sanitize_assignment_record(record: dict[str, Any]) -> dict[str, Any]:
                 safe_value[nested_key] = "not_returned"
             elif isinstance(nested_value, str):
                 safe_value[nested_key] = redact(nested_value)[0]
+            elif nested_key == "reason_codes" and isinstance(nested_value, list):
+                safe_value[nested_key] = [
+                    reason
+                    for reason in nested_value
+                    if isinstance(reason, str) and reason in RESOURCE_REASON_CODES
+                ]
             elif nested_value is None or isinstance(nested_value, (bool, int)):
                 safe_value[nested_key] = nested_value
         sanitized[key] = safe_value
@@ -9434,7 +11043,16 @@ def remove_install_symlink_if_repo_wrapper(
             return "missing"
         except OSError as exc:
             raise AgentError("could_not_remove_install_symlink") from exc
-        if not source_identity_matches(latest, current) or not stat_module.S_ISLNK(latest.st_mode):
+        if (
+            not source_identity_with_snapshot_matches(latest, current)
+            or not stat_module.S_ISLNK(latest.st_mode)
+        ):
+            return "left_in_place_not_repo_wrapper"
+        try:
+            latest_target_text = os.readlink(install_path.name, dir_fd=parent_fd)
+        except OSError as exc:
+            raise AgentError("could_not_remove_install_symlink") from exc
+        if latest_target_text != target_text:
             return "left_in_place_not_repo_wrapper"
         try:
             os.unlink(install_path.name, dir_fd=parent_fd)
@@ -9814,7 +11432,14 @@ def plugin_cache_status(root: Path | None = None, cache_root: Path | None = None
     return result
 
 
-def source_identity_matches(opened_stat: os.stat_result, expected_stat: os.stat_result) -> bool:
+def source_identity_matches(
+    opened_stat: os.stat_result,
+    expected_stat: os.stat_result | FileIdentity | None,
+) -> bool:
+    if expected_stat is None:
+        return False
+    if isinstance(expected_stat, FileIdentity):
+        return opened_stat.st_ino == expected_stat.ino and opened_stat.st_dev == expected_stat.dev
     return opened_stat.st_ino == expected_stat.st_ino and opened_stat.st_dev == expected_stat.st_dev
 
 
@@ -11428,14 +13053,469 @@ def doctor() -> dict[str, Any]:
     return {"ok": all(check["ok"] for check in checks), "checks": checks, "raw_output": "not_returned"}
 
 
-def _install_unlocked(
+def fleet_desktop_entry_path() -> Path:
+    configured = os.environ.get("XDG_DATA_HOME")
+    configured_root = Path(configured).expanduser() if configured else None
+    root = configured_root if configured_root is not None and configured_root.is_absolute() else Path.home() / ".local" / "share"
+    return root / "applications" / FLEET_DESKTOP_ENTRY_NAME
+
+
+def fleet_desktop_entry_bytes(install_path: Path) -> bytes:
+    command = str(install_path)
+    if (
+        not install_path.is_absolute()
+        or not command
+        or not command.isascii()
+        or "=" in command
+        or len(command) > MAX_PATH_TEXT
+        or any(ord(char) < 32 or ord(char) == 127 for char in command)
+        or not FLEET_DESKTOP_COMMAND_RE.fullmatch(command)
+    ):
+        raise AgentError("desktop command path is invalid")
+    return (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=Flottenmanagement\n"
+        "Comment=Codex-Flotte steuern und verwalten\n"
+        f'Exec="{command}" control-center-launch\n'
+        "Icon=utilities-system-monitor\n"
+        "Terminal=false\n"
+        "Categories=System;\n"
+        "StartupNotify=true\n"
+    ).encode("utf-8")
+
+
+def launch_control_center_detached(
+    *,
+    command_path: Path = DEFAULT_INSTALL_PATH,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    require_teamleader_tool_access()
+    fleet_desktop_entry_bytes(command_path)
+    source = os.environ if environ is None else environ
+    child_env = {
+        key: value
+        for key, value in source.items()
+        if key in CONTROL_CENTER_ENV_KEYS
+        and isinstance(value, str)
+        and "\0" not in value
+        and len(value) <= 4096
+    }
+    child_env["PATH"] = "/usr/bin:/bin"
+    child_env["HOME"] = str(Path.home())
+    file_actions = (
+        (os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDONLY, 0),
+        (os.POSIX_SPAWN_OPEN, 1, os.devnull, os.O_WRONLY, 0),
+        (os.POSIX_SPAWN_OPEN, 2, os.devnull, os.O_WRONLY, 0),
+        (os.POSIX_SPAWN_CLOSEFROM, 3),
+    )
+    command = str(command_path)
+    try:
+        os.posix_spawn(
+            command,
+            [command, "control-center"],
+            child_env,
+            file_actions=file_actions,
+            setsid=True,
+        )
+    except OSError as exc:
+        raise AgentError("control-center launch failed") from exc
+    return {"status": "launched", "raw_output": "not_returned"}
+
+
+def _validate_fleet_desktop_stat(current: os.stat_result) -> None:
+    if (
+        not stat_module.S_ISREG(current.st_mode)
+        or getattr(current, "st_nlink", 1) != 1
+        or current.st_uid != os.getuid()
+        or stat_module.S_IMODE(current.st_mode) & 0o022
+        or current.st_size > MAX_FLEET_DESKTOP_ENTRY_BYTES
+    ):
+        raise AgentError("desktop entry is unsafe")
+
+
+def _fleet_desktop_directory_stat_is_safe(current: Any) -> bool:
+    trusted_owner = current.st_uid in {0, os.getuid()}
+    writable_by_others = stat_module.S_IMODE(current.st_mode) & 0o022
+    sticky = bool(current.st_mode & stat_module.S_ISVTX)
+    return bool(
+        stat_module.S_ISDIR(current.st_mode)
+        and trusted_owner
+        and (not writable_by_others or sticky)
+    )
+
+
+def _open_secure_fleet_desktop_parent_chain(
+    path: Path,
+    expected_stat: os.stat_result,
+) -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(path.anchor, flags)
+        for part in path.parts[1:]:
+            child_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child_fd
+            current = os.fstat(fd)
+            if not _fleet_desktop_directory_stat_is_safe(current):
+                raise AgentError("desktop entry parent is unsafe")
+        opened = os.fstat(fd)
+        if not source_identity_matches(opened, expected_stat):
+            raise AgentError("desktop entry parent changed unexpectedly")
+        result = fd
+        fd = -1
+        return result
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError("desktop entry parent is unsafe") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _open_fleet_desktop_parent(path: Path, *, create: bool) -> int:
+    if not path.is_absolute():
+        raise AgentError("desktop entry parent is unsafe")
+    if create:
+        ensure_directory_chain_no_symlink(path.parent, "desktop entry parent is unsafe")
+    elif not directory_chain_is_real_no_symlink(path.parent):
+        raise AgentError("desktop entry parent is unsafe")
+    try:
+        parent_stat = path.parent.lstat()
+    except OSError as exc:
+        raise AgentError("desktop entry parent is unsafe") from exc
+    if (
+        stat_module.S_ISLNK(parent_stat.st_mode)
+        or not stat_module.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != os.getuid()
+        or stat_module.S_IMODE(parent_stat.st_mode) & 0o022
+    ):
+        raise AgentError("desktop entry parent is unsafe")
+    return _open_secure_fleet_desktop_parent_chain(
+        path.parent,
+        parent_stat,
+    )
+
+
+def _read_fleet_desktop_entry(path: Path) -> tuple[bytes, os.stat_result] | None:
+    try:
+        path.parent.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise AgentError("desktop entry parent is unsafe") from exc
+    if not directory_chain_is_real_no_symlink(path.parent):
+        raise AgentError("desktop entry parent is unsafe")
+    parent_fd = _open_fleet_desktop_parent(path, create=False)
+    fd = -1
+    try:
+        try:
+            current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise AgentError("desktop entry could not be inspected") from exc
+        _validate_fleet_desktop_stat(current)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(path.name, flags, dir_fd=parent_fd)
+            opened = os.fstat(fd)
+            if not source_identity_with_snapshot_matches(opened, current):
+                raise AgentError("desktop entry changed unexpectedly")
+            _validate_fleet_desktop_stat(opened)
+            with os.fdopen(fd, "rb") as fh:
+                fd = -1
+                data = fh.read(MAX_FLEET_DESKTOP_ENTRY_BYTES + 1)
+            latest = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except AgentError:
+            raise
+        except OSError as exc:
+            raise AgentError("desktop entry could not be read") from exc
+        if len(data) > MAX_FLEET_DESKTOP_ENTRY_BYTES:
+            raise AgentError("desktop entry is unsafe")
+        if not source_identity_with_snapshot_matches(latest, opened):
+            raise AgentError("desktop entry changed unexpectedly")
+        return data, latest
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(parent_fd)
+
+
+def _replace_fleet_desktop_entry(
+    path: Path,
+    data: bytes,
+    mode: int,
+    expected_existing_stat: os.stat_result | None,
+) -> None:
+    parent_fd = _open_fleet_desktop_parent(path, create=True)
+    try:
+        replace_private_bytes(
+            Path(f"/proc/self/fd/{parent_fd}") / path.name,
+            data,
+            mode=mode,
+            expected_existing_stat=expected_existing_stat,
+        )
+    finally:
+        os.close(parent_fd)
+
+
+def verify_fleet_desktop_entry(
+    install_path: Path,
+    desktop_path: Path | None = None,
+) -> dict[str, Any]:
+    path = desktop_path or fleet_desktop_entry_path()
+    expected = fleet_desktop_entry_bytes(install_path)
+    current = _read_fleet_desktop_entry(path)
+    ok = bool(
+        current is not None
+        and current[0] == expected
+        and stat_module.S_IMODE(current[1].st_mode) == 0o644
+    )
+    return {"ok": ok, "path": PATH_NOT_RETURNED, "path_state": "set", "raw_output": "not_returned"}
+
+
+def _is_generated_fleet_desktop_entry(data: bytes) -> bool:
+    try:
+        lines = data.decode("ascii").splitlines(keepends=True)
+    except UnicodeDecodeError:
+        return False
+    if len(lines) != 9:
+        return False
+    if lines[:4] != [
+        "[Desktop Entry]\n",
+        "Type=Application\n",
+        "Name=Flottenmanagement\n",
+        "Comment=Codex-Flotte steuern und verwalten\n",
+    ] or lines[5:] != [
+        "Icon=utilities-system-monitor\n",
+        "Terminal=false\n",
+        "Categories=System;\n",
+        "StartupNotify=true\n",
+    ]:
+        return False
+    match = re.fullmatch(
+        r'Exec="([^"\r\n]+)" (control-center(?:-launch)?)\n', lines[4]
+    )
+    if match is None:
+        return False
+    try:
+        expected = fleet_desktop_entry_bytes(Path(match.group(1)))
+        if match.group(2) == "control-center":
+            expected = expected.replace(
+                b" control-center-launch\n", b" control-center\n"
+            )
+        return expected == data
+    except AgentError:
+        return False
+
+
+def rollback_fleet_desktop_snapshot(snapshot: dict[str, Any]) -> None:
+    if not snapshot.get("changed"):
+        return
+    if snapshot.get("operation") == "remove":
+        restore_removed_fleet_desktop_entry(snapshot)
+    else:
+        restore_fleet_desktop_entry(snapshot)
+
+
+def restore_fleet_desktop_entry(snapshot: dict[str, Any]) -> None:
+    if not snapshot.get("changed"):
+        return
+    path = snapshot["path"]
+    installed_stat = snapshot["installed_stat"]
+    current = _read_fleet_desktop_entry(path)
+    if current is None or not source_identity_with_snapshot_matches(current[1], installed_stat):
+        raise AgentError("desktop entry changed unexpectedly")
+    previous_data = snapshot["previous_data"]
+    if previous_data is not None:
+        _replace_fleet_desktop_entry(path, previous_data, snapshot["previous_mode"], current[1])
+        restored = _read_fleet_desktop_entry(path)
+        if (
+            restored is None
+            or restored[0] != previous_data
+            or stat_module.S_IMODE(restored[1].st_mode) != snapshot["previous_mode"]
+        ):
+            raise AgentError("desktop entry restore could not be verified")
+        snapshot["changed"] = False
+        return
+    parent_fd = _open_fleet_desktop_parent(path, create=False)
+    try:
+        latest = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not source_identity_with_snapshot_matches(latest, current[1]):
+            raise AgentError("desktop entry changed unexpectedly")
+        os.unlink(path.name, dir_fd=parent_fd)
+    except FileNotFoundError as exc:
+        raise AgentError("desktop entry changed unexpectedly") from exc
+    finally:
+        os.close(parent_fd)
+    snapshot["changed"] = False
+
+
+def install_fleet_desktop_entry(
+    install_path: Path,
+    desktop_path: Path | None = None,
+    *,
+    snapshot_sink: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    snapshot = snapshot_sink if snapshot_sink is not None else {}
+    snapshot.clear()
+    snapshot["changed"] = False
+    path = desktop_path or fleet_desktop_entry_path()
+    expected = fleet_desktop_entry_bytes(install_path)
+    previous = _read_fleet_desktop_entry(path)
+    if (
+        previous is not None
+        and previous[0] == expected
+        and stat_module.S_IMODE(previous[1].st_mode) == 0o644
+    ):
+        return (
+            {"requested": True, "status": "already_installed", "verified": True},
+            snapshot,
+        )
+    snapshot.update(
+        {
+            "changed": True,
+            "operation": "install",
+            "path": path,
+            "previous_data": previous[0] if previous is not None else None,
+            "previous_mode": stat_module.S_IMODE(previous[1].st_mode) if previous is not None else None,
+        }
+    )
+    try:
+        _replace_fleet_desktop_entry(path, expected, 0o644, previous[1] if previous is not None else None)
+        installed = _read_fleet_desktop_entry(path)
+        if installed is None:
+            raise AgentError("desktop entry installation could not be verified")
+        snapshot["installed_stat"] = installed[1]
+        if not verify_fleet_desktop_entry(install_path, path)["ok"]:
+            raise AgentError("desktop entry installation could not be verified")
+    except BaseException:
+        try:
+            current = _read_fleet_desktop_entry(path)
+            previous_unchanged = bool(
+                previous is not None
+                and current is not None
+                and source_identity_with_snapshot_matches(current[1], previous[1])
+                and current[0] == previous[0]
+            )
+            if current is not None and current[0] == expected and stat_module.S_IMODE(current[1].st_mode) == 0o644:
+                snapshot["installed_stat"] = current[1]
+                restore_fleet_desktop_entry(snapshot)
+            elif current is None and previous is not None:
+                _replace_fleet_desktop_entry(path, previous[0], stat_module.S_IMODE(previous[1].st_mode), None)
+                restored = _read_fleet_desktop_entry(path)
+                if (
+                    restored is None
+                    or restored[0] != previous[0]
+                    or stat_module.S_IMODE(restored[1].st_mode) != stat_module.S_IMODE(previous[1].st_mode)
+                ):
+                    raise AgentError("desktop entry restore could not be verified")
+                snapshot["changed"] = False
+            elif not previous_unchanged and not (current is None and previous is None):
+                raise AgentError("desktop entry changed unexpectedly")
+            else:
+                snapshot["changed"] = False
+        except Exception as restore_exc:
+            raise AgentError("could_not_restore_desktop_entry") from restore_exc
+        raise
+    return {"requested": True, "status": "installed", "verified": True}, snapshot
+
+
+def remove_fleet_desktop_entry(
+    install_path: Path,
+    desktop_path: Path | None = None,
+    *,
+    snapshot_sink: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    snapshot = snapshot_sink if snapshot_sink is not None else {}
+    snapshot.clear()
+    snapshot["changed"] = False
+    path = desktop_path or fleet_desktop_entry_path()
+    current = _read_fleet_desktop_entry(path)
+    if current is None:
+        return {"requested": True, "status": "missing"}, snapshot
+    try:
+        expected = fleet_desktop_entry_bytes(install_path)
+    except AgentError as exc:
+        if str(exc) != "desktop command path is invalid" or not _is_generated_fleet_desktop_entry(current[0]):
+            if str(exc) == "desktop command path is invalid":
+                return {"requested": True, "status": "left_in_place_different_content"}, snapshot
+            raise
+        expected = current[0]
+    if current[0] != expected or stat_module.S_IMODE(current[1].st_mode) != 0o644:
+        return {"requested": True, "status": "left_in_place_different_content"}, snapshot
+    snapshot.update(
+        {
+            "changed": True,
+            "operation": "remove",
+            "path": path,
+            "previous_data": current[0],
+            "previous_mode": stat_module.S_IMODE(current[1].st_mode),
+        }
+    )
+    try:
+        parent_fd = _open_fleet_desktop_parent(path, create=False)
+        try:
+            latest = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not source_identity_with_snapshot_matches(latest, current[1]):
+                raise AgentError("desktop entry changed unexpectedly")
+            os.unlink(path.name, dir_fd=parent_fd)
+        except FileNotFoundError as exc:
+            raise AgentError("desktop entry changed unexpectedly") from exc
+        finally:
+            os.close(parent_fd)
+    except BaseException:
+        try:
+            after = _read_fleet_desktop_entry(path)
+            if after is None:
+                restore_removed_fleet_desktop_entry(snapshot)
+            elif not (
+                source_identity_with_snapshot_matches(after[1], current[1])
+                and after[0] == current[0]
+                and stat_module.S_IMODE(after[1].st_mode) == stat_module.S_IMODE(current[1].st_mode)
+            ):
+                raise AgentError("desktop entry changed unexpectedly")
+            else:
+                snapshot["changed"] = False
+        except Exception as restore_exc:
+            raise AgentError("could_not_restore_desktop_entry") from restore_exc
+        raise
+    return {"requested": True, "status": "removed"}, snapshot
+
+
+def restore_removed_fleet_desktop_entry(snapshot: dict[str, Any]) -> None:
+    if not snapshot.get("changed"):
+        return
+    path = snapshot["path"]
+    if _read_fleet_desktop_entry(path) is not None:
+        raise AgentError("desktop entry changed unexpectedly")
+    _replace_fleet_desktop_entry(path, snapshot["previous_data"], snapshot["previous_mode"], None)
+    restored = _read_fleet_desktop_entry(path)
+    if (
+        restored is None
+        or restored[0] != snapshot["previous_data"]
+        or stat_module.S_IMODE(restored[1].st_mode) != snapshot["previous_mode"]
+    ):
+        raise AgentError("desktop entry restore could not be verified")
+    snapshot["changed"] = False
+
+
+def _install_enrolled_unlocked(
     register: bool = True,
     force: bool = False,
     install_path: Path = DEFAULT_INSTALL_PATH,
     sync_plugin_cache: bool = True,
+    install_desktop: bool = False,
 ) -> dict[str, Any]:
-    if register:
-        assert_install_context_allows_master_registration()
     wrapper = repo_wrapper_path()
     if not path_present_no_follow(wrapper):
         raise AgentError("repo wrapper missing")
@@ -11446,6 +13526,7 @@ def _install_unlocked(
         wrapper_self_test = mcp_command_startup_self_test(wrapper)
         if not wrapper_self_test["ok"]:
             raise AgentError("repo wrapper failed MCP startup self-test")
+    ensure_applet_action_key()
 
     install_path = normalize_install_path(install_path)
     expected_parent_stat = ensure_real_parent(
@@ -11498,7 +13579,28 @@ def _install_unlocked(
     registration_removed = False
     registration_added = False
     startup_timeout_snapshot: dict[str, Any] | None = None
+    desktop_install: dict[str, Any] = {"requested": install_desktop, "status": "skipped", "verified": False}
+    desktop_snapshot: dict[str, Any] | None = {"changed": False} if install_desktop else None
     try:
+        if install_desktop:
+            try:
+                desktop_install, _ = install_fleet_desktop_entry(
+                    install_path,
+                    snapshot_sink=desktop_snapshot,
+                )
+            except AgentError as exc:
+                if str(exc) != "desktop command path is invalid":
+                    raise
+                stale_entry, _ = remove_fleet_desktop_entry(
+                    install_path,
+                    snapshot_sink=desktop_snapshot,
+                )
+                desktop_install = {
+                    "requested": True,
+                    "status": "skipped_unsupported_command_path",
+                    "verified": False,
+                    "stale_entry": stale_entry["status"],
+                }
         if register:
             startup_self_test = {"requested": True, **mcp_command_startup_self_test(install_path)}
             if not startup_self_test["ok"]:
@@ -11550,9 +13652,10 @@ def _install_unlocked(
             plugin_cache_install = sync_plugin_cache_from_repo()
             if not plugin_cache_install.get("ok"):
                 raise AgentError("plugin cache sync incomplete")
-    except Exception:
+    except BaseException:
         mcp_restore_error: Exception | None = None
         config_restore_error: Exception | None = None
+        desktop_restore_error: Exception | None = None
         if registration_added or registration_removed:
             try:
                 if registration_added:
@@ -11570,6 +13673,11 @@ def _install_unlocked(
                 restore_mcp_startup_timeout_snapshot(startup_timeout_snapshot)
             except Exception as restore_exc:
                 config_restore_error = restore_exc
+        if desktop_snapshot is not None:
+            try:
+                rollback_fleet_desktop_snapshot(desktop_snapshot)
+            except Exception as restore_exc:
+                desktop_restore_error = restore_exc
         rollback_install = symlink_status != "already_installed" and (
             not previous_install_present or previous_install_target_text is not None
         )
@@ -11587,6 +13695,8 @@ def _install_unlocked(
             raise AgentError("could_not_restore_mcp_registration") from mcp_restore_error
         if config_restore_error is not None:
             raise AgentError("could_not_restore_codex_config") from config_restore_error
+        if desktop_restore_error is not None:
+            raise AgentError("could_not_restore_desktop_entry") from desktop_restore_error
         raise
     return {
         "ok": True,
@@ -11599,8 +13709,37 @@ def _install_unlocked(
         "startup_self_test": startup_self_test,
         "mcp": registration,
         "plugin_cache_install": plugin_cache_install,
+        "desktop_entry": desktop_install,
         "raw_output": "not_returned",
     }
+
+
+def _install_unlocked(
+    register: bool = True,
+    force: bool = False,
+    install_path: Path = DEFAULT_INSTALL_PATH,
+    sync_plugin_cache: bool = True,
+    install_desktop: bool = False,
+) -> dict[str, Any]:
+    enrollment: dict[str, Any] | None = None
+    if register:
+        assert_install_context_allows_master_registration()
+        enrollment = enroll_current_teamleader()
+    try:
+        return _install_enrolled_unlocked(
+            register=register,
+            force=force,
+            install_path=install_path,
+            sync_plugin_cache=sync_plugin_cache,
+            install_desktop=install_desktop,
+        )
+    except BaseException:
+        if enrollment is not None and enrollment.get("changed"):
+            try:
+                revoke_current_teamleader()
+            except Exception as restore_exc:
+                raise AgentError("could_not_restore_teamleader_registry") from restore_exc
+        raise
 
 
 def install(
@@ -11608,6 +13747,7 @@ def install(
     force: bool = False,
     install_path: Path = DEFAULT_INSTALL_PATH,
     sync_plugin_cache: bool = True,
+    install_desktop: bool = False,
 ) -> dict[str, Any]:
     with install_lock():
         return _install_unlocked(
@@ -11615,6 +13755,7 @@ def install(
             force=force,
             install_path=install_path,
             sync_plugin_cache=sync_plugin_cache,
+            install_desktop=install_desktop,
         )
 
 
@@ -11622,6 +13763,7 @@ def _uninstall_unlocked(
     unregister: bool = True,
     remove_symlink: bool = False,
     install_path: Path = DEFAULT_INSTALL_PATH,
+    remove_desktop: bool = False,
 ) -> dict[str, Any]:
     install_path = normalize_install_path(install_path)
     mcp_status = "skipped"
@@ -11629,6 +13771,9 @@ def _uninstall_unlocked(
     expected_parent_stat: os.stat_result | None = None
     wrapper: Path | None = None
     symlink_removed = False
+    registration_removed = False
+    desktop_removal: dict[str, Any] = {"requested": remove_desktop, "status": "skipped"}
+    desktop_snapshot: dict[str, Any] | None = {"changed": False} if remove_desktop else None
     if remove_symlink:
         wrapper = repo_wrapper_path()
         try:
@@ -11650,6 +13795,11 @@ def _uninstall_unlocked(
             symlink_removed = symlink_status == "removed"
 
     try:
+        if remove_desktop:
+            desktop_removal, _ = remove_fleet_desktop_entry(
+                install_path,
+                snapshot_sink=desktop_snapshot,
+            )
         if unregister:
             current = check_mcp_registration(install_path)
             if current.get("lookup_status") == "unavailable":
@@ -11660,11 +13810,23 @@ def _uninstall_unlocked(
                     if remove.returncode != 0:
                         raise AgentError("codex mcp remove failed")
                     mcp_status = "removed"
+                    registration_removed = True
                 else:
                     mcp_status = "left_in_place_different_command"
             else:
                 mcp_status = "not_registered"
-    except Exception:
+        teamleader_status = "preserved"
+        if unregister and mcp_status in {"removed", "not_registered"}:
+            revoked = revoke_current_teamleader()
+            teamleader_status = "removed" if revoked["changed"] else "not_registered"
+    except BaseException:
+        symlink_restore_error: Exception | None = None
+        desktop_restore_error: Exception | None = None
+        if desktop_snapshot is not None:
+            try:
+                rollback_fleet_desktop_snapshot(desktop_snapshot)
+            except Exception as restore_exc:
+                desktop_restore_error = restore_exc
         if symlink_removed and wrapper is not None and expected_parent_stat is not None:
             try:
                 if install_path.exists() or install_path.is_symlink():
@@ -11675,22 +13837,45 @@ def _uninstall_unlocked(
                     expected_parent_stat=expected_parent_stat,
                 )
             except Exception as restore_exc:
-                raise AgentError("could_not_restore_install_symlink") from restore_exc
+                symlink_restore_error = restore_exc
+        registration_restore_error: Exception | None = None
+        if registration_removed:
+            try:
+                restore = run_command(["codex", "mcp", "add", MCP_SERVER_NAME, "--", str(install_path)])
+                if restore.returncode != 0:
+                    raise AgentError("codex mcp add failed")
+            except Exception as restore_exc:
+                registration_restore_error = restore_exc
+        if registration_restore_error is not None:
+            raise AgentError("could_not_restore_mcp_registration") from registration_restore_error
+        if symlink_restore_error is not None:
+            raise AgentError("could_not_restore_install_symlink") from symlink_restore_error
+        if desktop_restore_error is not None:
+            raise AgentError("could_not_restore_desktop_entry") from desktop_restore_error
         raise
 
-    return {"ok": True, "mcp": mcp_status, "symlink": symlink_status, "raw_output": "not_returned"}
+    return {
+        "ok": True,
+        "mcp": mcp_status,
+        "symlink": symlink_status,
+        "teamleader": teamleader_status,
+        "desktop_entry": desktop_removal,
+        "raw_output": "not_returned",
+    }
 
 
 def uninstall(
     unregister: bool = True,
     remove_symlink: bool = False,
     install_path: Path = DEFAULT_INSTALL_PATH,
+    remove_desktop: bool = False,
 ) -> dict[str, Any]:
     with install_lock():
         return _uninstall_unlocked(
             unregister=unregister,
             remove_symlink=remove_symlink,
             install_path=install_path,
+            remove_desktop=remove_desktop,
         )
 
 
@@ -12091,6 +14276,7 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
     lease = ensure_agent_lease_available(agent)
     meta = read_meta(agent)
     session_live = tmux_alive(agent_config(agent)["session"])
+    raw_log_path: Path | None = None
     if source == "pane":
         if session_live:
             require_managed_tmux_session(agent)
@@ -12260,6 +14446,8 @@ def call_authenticated_agent_mutation(
 def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name in {tool["name"] for tool in hive_tool_definitions()}:
         return dict(call_hive_tool(name, args))
+    if name == "agent_spawn_offers":
+        return agent_spawn_offers(int_arg(args, "required_slots", 1))
     if name == "agent_start":
         selected = agent_ids(str(args.get("agent", "both")))
         allow_unauthenticated = bool_arg(args, "allow_unauthenticated", False)
@@ -12545,6 +14733,8 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return master_watchdog_status()
     if name == "master_timeout_policy":
         return master_timeout_policy()
+    if name == "master_applet_status":
+        return applet_status(args.get("agents"), schema_version=args.get("schema_version", 1))
     if name == "agent_selector_policy":
         series = args.get("series")
         if series is None:
@@ -12877,6 +15067,3417 @@ def default_agent_pool_spec() -> dict[str, Any]:
         "runtime_dirs": ["sessions", "logs", "tmp"],
         "auth": {"policy": "preserve_existing_only", "copy": []},
     }
+
+
+def fleet_wrapper_text(
+    agent: AgentDescriptor,
+    executable: Path,
+    *,
+    bash_executable: Path = FLEET_BASH_EXECUTABLE,
+    taskset_executable: Path = FLEET_TASKSET_EXECUTABLE,
+    true_executable: Path = FLEET_TRUE_EXECUTABLE,
+) -> str:
+    if agent.runner is RunnerKind.CODEX_CLI:
+        home_lines = (
+            f"export CODEX_HOME={shlex.quote(str(agent.home))}",
+            "unset GEMINI_CLI_HOME",
+        )
+    else:
+        quoted_home = shlex.quote(str(agent.home))
+        home_lines = (
+            f"export HOME={quoted_home}",
+            f"export GEMINI_CLI_HOME={quoted_home}",
+            "unset CODEX_HOME",
+        )
+    retained = {
+        Provider.OPENAI_API: {"OPENAI_API_KEY"},
+        Provider.GEMINI_API: {"GEMINI_API_KEY"},
+        Provider.HUGGINGFACE_INFERENCE: {"HF_TOKEN"},
+    }.get(agent.provider, set())
+    secret_variables = {
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "HF_TOKEN",
+        "CODEX_ACCESS_TOKEN",
+        "GOOGLE_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+    }
+    unset_variables = " ".join(sorted(secret_variables - retained))
+    executable_word = shlex.quote(str(executable))
+    taskset_word = shlex.quote(str(taskset_executable))
+    true_word = shlex.quote(str(true_executable))
+    return "\n".join(
+        [
+            f"#!{bash_executable}",
+            "set -euo pipefail",
+            "",
+            *home_lines,
+            f"unset {unset_variables}",
+            f"if {taskset_word} --cpu-list 4-10 {true_word} >/dev/null 2>&1; then",
+            f'  exec {taskset_word} --cpu-list 4-10 {executable_word} "$@"',
+            "fi",
+            f'exec {executable_word} "$@"',
+            "",
+        ]
+    )
+
+
+def fleet_minimal_config(agent: AgentDescriptor) -> tuple[str, str]:
+    if agent.runner is RunnerKind.GEMINI_CLI:
+        document = {
+            "advanced": {
+                "autoConfigureMemory": False,
+                "ignoreLocalEnv": True,
+            },
+            "general": {
+                "defaultApprovalMode": "default",
+                "enableAutoUpdate": False,
+                "enableAutoUpdateNotification": False,
+            },
+            "privacy": {"usageStatisticsEnabled": False},
+            "security": {
+                "auth": {"enforcedType": "gemini-api-key"},
+                "disableYoloMode": True,
+            },
+        }
+        return ".gemini/settings.json", json.dumps(document, indent=2, sort_keys=True) + "\n"
+
+    lines = [
+        f"model = {json.dumps(agent.model)}",
+        'approval_policy = "never"',
+        'sandbox_mode = "danger-full-access"',
+    ]
+    if agent.provider is Provider.OLLAMA_LOCAL:
+        lines.extend(
+            [
+                'model_provider = "ollama-launch"',
+                f"model_catalog_json = {json.dumps(str(agent.home / 'model.json'))}",
+                "",
+                "[model_providers.ollama-launch]",
+                'name = "Ollama"',
+                'base_url = "http://127.0.0.1:11434/v1/"',
+                'wire_api = "responses"',
+            ]
+        )
+    elif agent.provider is Provider.HUGGINGFACE_INFERENCE:
+        lines.append('model_provider = "huggingface"')
+    lines.extend(
+        [
+            "",
+            f"[projects.{json.dumps(str(agent.home))}]",
+            'trust_level = "trusted"',
+        ]
+    )
+    if agent.provider is Provider.HUGGINGFACE_INFERENCE:
+        lines.extend(
+            [
+                "",
+                "[model_providers.huggingface]",
+                'name = "Hugging Face"',
+                'base_url = "https://router.huggingface.co/v1"',
+                'env_key = "HF_TOKEN"',
+                'wire_api = "responses"',
+            ]
+        )
+    return "config.toml", "\n".join((*lines, ""))
+
+
+def _fleet_candidate_series(
+    *,
+    prefix: str,
+    count: int,
+    runner: str,
+    provider: str,
+    model: str,
+    account_id: str | None,
+    enabled: bool,
+) -> FleetSeries:
+    try:
+        runner_kind = RunnerKind(runner)
+        provider_kind = Provider(provider)
+    except (TypeError, ValueError):
+        raise AgentError("invalid_series") from None
+    return FleetSeries(
+        prefix,
+        f"Series {prefix.upper()}" if isinstance(prefix, str) else "Series",
+        count,
+        runner_kind,
+        provider_kind,
+        model,
+        account_id,
+        enabled,
+    )
+
+
+def _fleet_plan_materialized_ids(prefix: str, count: int) -> set[str]:
+    try:
+        root_stat = AGENT_POOL_ROOT.lstat()
+    except FileNotFoundError:
+        return set()
+    except OSError as exc:
+        raise AgentError("fleet_home_state_unknown") from exc
+    _fleet_private_directory_stat(root_stat, "fleet_home_state_unknown")
+    root_fd = open_directory_no_follow_matching(
+        AGENT_POOL_ROOT,
+        root_stat,
+        error_text="fleet_home_state_unknown",
+        changed_text="fleet_home_state_unknown",
+    )
+    present: set[str] = set()
+    try:
+        for ordinal in range(1, count + 1):
+            agent_id = f"{prefix}{ordinal}"
+            try:
+                current = os.stat(agent_id, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise AgentError("fleet_home_state_unknown") from exc
+            _fleet_private_directory_stat(current, "fleet_home_state_unknown")
+            present.add(agent_id)
+    finally:
+        os.close(root_fd)
+    return present
+
+
+def _fleet_materialization_sets(
+    existing: FleetSeries | None,
+    candidate: FleetSeries,
+    present_ids: set[str],
+) -> dict[str, tuple[str, ...]]:
+    old_count = existing.count if existing is not None else 0
+    target_ids = {
+        f"{candidate.prefix}{ordinal}"
+        for ordinal in range(1, candidate.count + 1)
+    }
+    managed_changed = existing is not None and (
+        existing.runner is not candidate.runner
+        or existing.provider is not candidate.provider
+        or existing.model != candidate.model
+    )
+    tail_ids = {
+        f"{candidate.prefix}{ordinal}"
+        for ordinal in range(old_count + 1, candidate.count + 1)
+    }
+    if existing is None and candidate.enabled:
+        create_ids = target_ids
+    elif candidate.enabled:
+        create_ids = target_ids - present_ids
+    elif existing is not None and present_ids:
+        create_ids = tail_ids - present_ids
+    else:
+        create_ids = set()
+    update_ids = present_ids & target_ids if managed_changed else set()
+    keep_ids = (present_ids & target_ids) - update_ids - create_ids
+    remove_ids = present_ids - target_ids
+
+    def ordered(values: set[str]) -> tuple[str, ...]:
+        return tuple(sorted(values, key=lambda item: int(item[len(candidate.prefix) :])))
+
+    return {
+        "create_ids": ordered(create_ids),
+        "keep_ids": ordered(keep_ids),
+        "update_ids": ordered(update_ids),
+        "remove_ids": ordered(remove_ids),
+    }
+
+
+def _fleet_series_plan_with_service(
+    service: FleetService,
+    *,
+    prefix: str,
+    count: int,
+    runner: str,
+    provider: str,
+    model: str,
+    account_id: str | None,
+    enabled: bool,
+    expected_generation: int,
+    confirmed_remove_ids: list[str] | None,
+) -> tuple[
+    dict[str, Any],
+    FleetSnapshot,
+    FleetSnapshot,
+    FleetSeries | None,
+    FleetSeries,
+    dict[str, tuple[str, ...]],
+]:
+    candidate = _fleet_candidate_series(
+        prefix=prefix,
+        count=count,
+        runner=runner,
+        provider=provider,
+        model=model,
+        account_id=account_id,
+        enabled=enabled,
+    )
+    try:
+        current = service.load()
+        planned = plan_series_apply(
+            current,
+            candidate,
+            expected_generation=expected_generation,
+            confirmed_remove_ids=confirmed_remove_ids or (),
+        )
+    except (FleetConflictError, FleetValidationError, ValueError) as exc:
+        code = str(exc)
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code):
+            code = "fleet_series_invalid"
+        raise AgentError(code) from None
+    normalized = next(item for item in planned.series if item.prefix == candidate.prefix)
+    if normalized.enabled:
+        decision = service.series_gate(normalized, snapshot=current)
+        if not decision.allowed:
+            raise AgentError(decision.reason)
+    existing = next((item for item in current.series if item.prefix == normalized.prefix), None)
+    old_count = existing.count if existing is not None else 0
+    known_count = max(old_count, normalized.count)
+    present_ids = _fleet_plan_materialized_ids(normalized.prefix, known_count)
+    materialization = _fleet_materialization_sets(existing, normalized, present_ids)
+    result = {
+        "mutation_performed": False,
+        "generation": current.generation,
+        "next_generation": planned.generation,
+        "create_count": len(materialization["create_ids"]),
+        "keep_count": len(materialization["keep_ids"]),
+        "update_count": len(materialization["update_ids"]),
+        "remove_count": len(materialization["remove_ids"]),
+        "confirmation_required": normalized.count < old_count,
+        "pool_root": "not_returned",
+        "raw_output": "not_returned",
+    }
+    return result, current, planned, existing, normalized, materialization
+
+
+def fleet_series_plan(
+    *,
+    prefix: str,
+    count: int,
+    runner: str,
+    provider: str,
+    model: str,
+    account_id: str | None,
+    enabled: bool = True,
+    expected_generation: int,
+    confirmed_remove_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    result, _current, _planned, _existing, _candidate, _materialization = _fleet_series_plan_with_service(
+        _readonly_fleet_service(),
+        prefix=prefix,
+        count=count,
+        runner=runner,
+        provider=provider,
+        model=model,
+        account_id=account_id,
+        enabled=enabled,
+        expected_generation=expected_generation,
+        confirmed_remove_ids=confirmed_remove_ids,
+    )
+    return result
+
+
+@contextlib.contextmanager
+def _fleet_pinned_path(
+    path: Path,
+    *,
+    invalid_text: str,
+    close_state: dict[str, bool] | None = None,
+) -> Any:
+    path = path.expanduser()
+    if not path.is_absolute():
+        raise AgentError(invalid_text)
+    path = path.absolute()
+    try:
+        expected = path.lstat()
+    except OSError as exc:
+        raise AgentError(invalid_text) from exc
+    if (
+        not stat_module.S_ISREG(expected.st_mode)
+        or getattr(expected, "st_nlink", 1) != 1
+        or expected.st_mode & 0o111 == 0
+    ):
+        raise AgentError(invalid_text)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(path, flags)
+        opened = os.fstat(fd)
+        if (
+            not source_identity_with_snapshot_matches(opened, expected)
+            or not stat_module.S_ISREG(opened.st_mode)
+            or getattr(opened, "st_nlink", 1) != 1
+            or opened.st_mode & 0o111 == 0
+        ):
+            raise AgentError(invalid_text)
+        yield path, opened
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError(invalid_text) from exc
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                if close_state is not None:
+                    close_state["cleanup_pending"] = True
+
+
+@contextlib.contextmanager
+def _fleet_pinned_executable(
+    runner: RunnerKind,
+    *,
+    codex_executable: Path | None,
+    gemini_executable: Path | None,
+    close_state: dict[str, bool] | None = None,
+) -> Any:
+    supplied = codex_executable if runner is RunnerKind.CODEX_CLI else gemini_executable
+    if supplied is None:
+        found = shutil.which("codex" if runner is RunnerKind.CODEX_CLI else "gemini")
+        if found is None:
+            raise AgentError("fleet_executable_unavailable")
+        path = Path(found)
+    elif isinstance(supplied, Path):
+        path = supplied
+    else:
+        raise AgentError("fleet_executable_invalid")
+    with _fleet_pinned_path(
+        path,
+        invalid_text="fleet_executable_invalid",
+        close_state=close_state,
+    ) as pinned:
+        yield pinned
+
+
+def _fleet_revalidate_executable(path: Path, expected: os.stat_result) -> None:
+    try:
+        current = path.lstat()
+    except OSError as exc:
+        raise AgentError("fleet_executable_changed") from exc
+    if not source_identity_with_snapshot_matches(current, expected):
+        raise AgentError("fleet_executable_changed")
+
+
+@contextlib.contextmanager
+def _fleet_artifact_builder(
+    runner: RunnerKind,
+    *,
+    codex_executable: Path | None,
+    gemini_executable: Path | None,
+) -> Any:
+    close_state = {"cleanup_pending": False}
+    with contextlib.ExitStack() as stack:
+        executable, executable_stat = stack.enter_context(
+            _fleet_pinned_executable(
+                runner,
+                codex_executable=codex_executable,
+                gemini_executable=gemini_executable,
+                close_state=close_state,
+            )
+        )
+        bash_executable, bash_stat = stack.enter_context(
+            _fleet_pinned_path(
+                FLEET_BASH_EXECUTABLE,
+                invalid_text="fleet_system_executable_invalid",
+                close_state=close_state,
+            )
+        )
+        taskset_executable, taskset_stat = stack.enter_context(
+            _fleet_pinned_path(
+                FLEET_TASKSET_EXECUTABLE,
+                invalid_text="fleet_system_executable_invalid",
+                close_state=close_state,
+            )
+        )
+        true_executable, true_stat = stack.enter_context(
+            _fleet_pinned_path(
+                FLEET_TRUE_EXECUTABLE,
+                invalid_text="fleet_system_executable_invalid",
+                close_state=close_state,
+            )
+        )
+
+        def build(agent: AgentDescriptor) -> dict[str, Any]:
+            return _fleet_home_artifacts(
+                agent,
+                executable,
+                executable_stat=executable_stat,
+                bash_executable=bash_executable,
+                bash_stat=bash_stat,
+                taskset_executable=taskset_executable,
+                taskset_stat=taskset_stat,
+                true_executable=true_executable,
+                true_stat=true_stat,
+            )
+
+        def validate() -> None:
+            for path, expected in (
+                (executable, executable_stat),
+                (bash_executable, bash_stat),
+                (taskset_executable, taskset_stat),
+                (true_executable, true_stat),
+            ):
+                _fleet_revalidate_executable(path, expected)
+
+        build.validate = validate  # type: ignore[attr-defined]
+        build.close_state = close_state  # type: ignore[attr-defined]
+        yield build
+
+
+def _fleet_home_artifacts(
+    agent: AgentDescriptor,
+    executable: Path,
+    *,
+    executable_stat: os.stat_result | None = None,
+    bash_executable: Path = FLEET_BASH_EXECUTABLE,
+    bash_stat: os.stat_result | None = None,
+    taskset_executable: Path = FLEET_TASKSET_EXECUTABLE,
+    taskset_stat: os.stat_result | None = None,
+    true_executable: Path = FLEET_TRUE_EXECUTABLE,
+    true_stat: os.stat_result | None = None,
+) -> dict[str, Any]:
+    executable_checks = tuple(
+        (path, expected)
+        for path, expected in (
+            (executable, executable_stat),
+            (bash_executable, bash_stat),
+            (taskset_executable, taskset_stat),
+            (true_executable, true_stat),
+        )
+        if expected is not None
+    )
+    for path, expected in executable_checks:
+        _fleet_revalidate_executable(path, expected)
+    wrapper_name = "codex" if agent.runner is RunnerKind.CODEX_CLI else "gemini"
+    config_name, config_text = fleet_minimal_config(agent)
+    if agent.provider is Provider.OLLAMA_LOCAL and agent.runner is RunnerKind.CODEX_CLI:
+        config_text = (
+            config_text.rstrip("\n")
+            + f'\nmodel_catalog_json = {json.dumps(str(agent.home / "model.json"))}\n'
+        )
+    for path, expected in executable_checks:
+        _fleet_revalidate_executable(path, expected)
+    files = {
+        wrapper_name: (
+            fleet_wrapper_text(
+                agent,
+                executable,
+                bash_executable=bash_executable,
+                taskset_executable=taskset_executable,
+                true_executable=true_executable,
+            ).encode("utf-8"),
+            0o700,
+        ),
+        config_name: (config_text.encode("utf-8"), 0o600),
+    }
+    if agent.runner is RunnerKind.GEMINI_CLI:
+        bootstrap = {"advanced": {"autoConfigureMemory": False}}
+        policy = "\n".join(
+            (
+                "[[rule]]",
+                'toolName = "run_shell_command"',
+                'decision = "deny"',
+                "priority = 999",
+                "",
+            )
+        )
+        files["settings.json"] = (
+            (json.dumps(bootstrap, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+            0o600,
+        )
+        files[".gemini/policies/codex-master.toml"] = (policy.encode("utf-8"), 0o600)
+    if agent.provider is Provider.OLLAMA_LOCAL and agent.runner is RunnerKind.CODEX_CLI:
+        files["model.json"] = (fleet_model_catalog(agent).encode("utf-8"), 0o600)
+    marker = {
+        "schema_version": 1,
+        "kind": "codex_master_fleet_agent",
+        "agent_id": agent.agent_id,
+        "prefix": agent.series_prefix,
+        "runner": agent.runner.value,
+        "provider": agent.provider.value,
+        "model": agent.model,
+        "managed_files": sorted(files),
+        "files": {
+            name: hashlib.sha256(content).hexdigest()
+            for name, (content, _mode) in sorted(files.items())
+        },
+    }
+    marker_bytes = (json.dumps(marker, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    files[FLEET_AGENT_MARKER_FILE] = (marker_bytes, 0o600)
+    return {"files": files, "marker": marker, "executable_checks": executable_checks}
+
+
+def _fleet_revalidate_artifact_executables(artifacts: dict[str, Any]) -> None:
+    for path, expected in artifacts.get("executable_checks", ()):
+        _fleet_revalidate_executable(path, expected)
+
+
+def _fleet_artifact_files(artifacts: dict[str, Any]) -> dict[str, tuple[bytes, int]]:
+    return {**artifacts["files"], **artifacts.get("extra_files", {})}
+
+
+def _fleet_private_directory_stat(current: os.stat_result, error: str) -> None:
+    if (
+        not stat_module.S_ISDIR(current.st_mode)
+        or stat_module.S_ISLNK(current.st_mode)
+        or current.st_uid != os.geteuid()
+        or stat_module.S_IMODE(current.st_mode) != 0o700
+    ):
+        raise AgentError(error)
+
+
+def _fleet_artifact_directories(files: Mapping[str, Any]) -> set[str]:
+    directories: set[str] = set()
+    for name in files:
+        path = Path(name)
+        if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+            raise AgentError("fleet_artifact_path_invalid")
+        current = path.parent
+        while current != Path("."):
+            directories.add(current.as_posix())
+            current = current.parent
+    return directories
+
+
+def _fleet_open_artifact_parent(
+    home_fd: int,
+    name: str,
+    *,
+    create: bool,
+    error: str,
+) -> tuple[int, str]:
+    path = Path(name)
+    if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+        raise AgentError(error)
+    try:
+        current_fd = os.dup(home_fd)
+        for part in path.parts[:-1]:
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            next_fd = os.open(part, flags, dir_fd=current_fd)
+            try:
+                _fleet_private_directory_stat(os.fstat(next_fd), error)
+            except Exception:
+                os.close(next_fd)
+                raise
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd, path.parts[-1]
+    except Exception as exc:
+        if "current_fd" in locals():
+            try:
+                os.close(current_fd)
+            except OSError:
+                pass
+        if isinstance(exc, AgentError):
+            raise
+        raise AgentError(error) from exc
+
+
+def _fleet_tree_entries(directory_fd: int, error: str) -> tuple[set[str], set[str]]:
+    files: set[str] = set()
+    directories: set[str] = set()
+    entry_count = 0
+
+    def visit(current_fd: int, prefix: str, depth: int) -> None:
+        nonlocal entry_count
+        if depth > 8:
+            raise AgentError(error)
+        _fleet_private_directory_stat(os.fstat(current_fd), error)
+        for name in os.listdir(current_fd):
+            entry_count += 1
+            if entry_count > 128 or not isinstance(name, str) or name in {"", ".", ".."} or "/" in name:
+                raise AgentError(error)
+            relative = f"{prefix}/{name}" if prefix else name
+            current = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
+            if stat_module.S_ISDIR(current.st_mode) and not stat_module.S_ISLNK(current.st_mode):
+                _fleet_private_directory_stat(current, error)
+                flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                child_fd = os.open(name, flags, dir_fd=current_fd)
+                try:
+                    _fleet_private_directory_stat(os.fstat(child_fd), error)
+                    directories.add(relative)
+                    visit(child_fd, relative, depth + 1)
+                finally:
+                    os.close(child_fd)
+            elif (
+                stat_module.S_ISREG(current.st_mode)
+                and getattr(current, "st_nlink", 1) == 1
+                and current.st_uid == os.geteuid()
+            ):
+                files.add(relative)
+            else:
+                raise AgentError(error)
+
+    try:
+        visit(directory_fd, "", 0)
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError(error) from exc
+    return files, directories
+
+
+def _fleet_read_private_file_at(
+    home_fd: int,
+    name: str,
+    mode: int,
+    error: str,
+) -> tuple[bytes, os.stat_result]:
+    parent_fd, basename = _fleet_open_artifact_parent(home_fd, name, create=False, error=error)
+    fd = -1
+    try:
+        current = os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat_module.S_ISREG(current.st_mode)
+            or getattr(current, "st_nlink", 1) != 1
+            or current.st_uid != os.geteuid()
+            or stat_module.S_IMODE(current.st_mode) != mode
+        ):
+            raise AgentError(error)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(basename, flags, dir_fd=parent_fd)
+        opened = os.fstat(fd)
+        if (
+            not source_identity_with_snapshot_matches(opened, current)
+            or not stat_module.S_ISREG(opened.st_mode)
+            or getattr(opened, "st_nlink", 1) != 1
+            or opened.st_uid != os.geteuid()
+            or stat_module.S_IMODE(opened.st_mode) != mode
+        ):
+            raise AgentError(error)
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            data = handle.read(MAX_POOL_SPEC_BYTES + 1)
+        if len(data) > MAX_POOL_SPEC_BYTES:
+            raise AgentError(error)
+        return data, opened
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError(error) from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(parent_fd)
+
+
+def _fleet_read_exact_file_at(
+    home_fd: int,
+    name: str,
+    expected: bytes,
+    mode: int,
+    error: str,
+) -> os.stat_result:
+    data, opened = _fleet_read_private_file_at(home_fd, name, mode, error)
+    if data != expected:
+        raise AgentError(error)
+    return opened
+
+
+def _fleet_read_exact_file(path: Path, expected: bytes, mode: int, error: str) -> os.stat_result:
+    try:
+        current = path.lstat()
+    except OSError as exc:
+        raise AgentError(error) from exc
+    if (
+        not stat_module.S_ISREG(current.st_mode)
+        or getattr(current, "st_nlink", 1) != 1
+        or current.st_uid != os.geteuid()
+        or stat_module.S_IMODE(current.st_mode) != mode
+    ):
+        raise AgentError(error)
+    data = pool_read_private_bytes(
+        path,
+        MAX_POOL_SPEC_BYTES,
+        error,
+        expected_target_stat=current,
+        expected_mode=mode,
+    )
+    if data != expected:
+        raise AgentError(error)
+    return current
+
+
+def _fleet_verify_home(
+    root: Path,
+    agent_id: str,
+    artifacts: dict[str, Any],
+    *,
+    exact_contents: bool,
+) -> os.stat_result:
+    home = root / agent_id
+    try:
+        home_stat = home.lstat()
+    except OSError as exc:
+        raise AgentError("fleet_home_verification_failed") from exc
+    _fleet_private_directory_stat(home_stat, "fleet_home_verification_failed")
+    home_fd = open_directory_no_follow_matching(
+        home,
+        home_stat,
+        error_text="fleet_home_verification_failed",
+        changed_text="fleet_home_verification_failed",
+    )
+    try:
+        artifact_files = _fleet_artifact_files(artifacts)
+        actual_files, actual_directories = _fleet_tree_entries(
+            home_fd,
+            "fleet_home_verification_failed",
+        )
+        expected_directories = _fleet_artifact_directories(artifact_files)
+        if exact_contents:
+            if actual_files != set(artifact_files) or actual_directories != expected_directories:
+                raise AgentError("fleet_home_verification_failed")
+        elif not set(artifact_files) <= actual_files or not expected_directories <= actual_directories:
+            raise AgentError("fleet_home_verification_failed")
+        for name, (content, mode) in artifact_files.items():
+            _fleet_read_exact_file_at(
+                home_fd,
+                name,
+                content,
+                mode,
+                "fleet_home_verification_failed",
+            )
+        return home_stat
+    finally:
+        os.close(home_fd)
+
+
+def _fleet_root_marker_state(root: Path) -> bool:
+    marker = root / FLEET_POOL_MARKER_FILE
+    expected = b'{\n  "kind": "codex_master_fleet_pool",\n  "schema_version": 1\n}\n'
+    try:
+        marker.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise AgentError("fleet_pool_marker_invalid") from exc
+    _fleet_read_exact_file(marker, expected, 0o600, "fleet_pool_marker_invalid")
+    return True
+
+
+def _fleet_write_root_marker(root_fd: int) -> None:
+    expected = b'{\n  "kind": "codex_master_fleet_pool",\n  "schema_version": 1\n}\n'
+    if not write_private_bytes_if_absent_at_dir_fd(
+        root_fd,
+        FLEET_POOL_MARKER_FILE,
+        expected,
+        mode=0o600,
+        error_text="fleet_pool_marker_invalid",
+    ):
+        raise AgentError("fleet_pool_marker_invalid")
+
+
+class _FleetPartialHomeError(Exception):
+    def __init__(self, staging_name: str, home_stat: os.stat_result | None) -> None:
+        self.staging_name = staging_name
+        self.home_stat = home_stat
+        super().__init__("fleet_partial_home")
+
+
+def _fleet_create_home(
+    root_fd: int,
+    agent_id: str,
+    artifacts: dict[str, Any],
+    *,
+    hidden_name: str | None = None,
+    entry_index: int | None = None,
+    transaction: _FleetRecoveryTransaction | None = None,
+) -> os.stat_result:
+    _fleet_revalidate_artifact_executables(artifacts)
+    if hidden_name is None:
+        if transaction is not None:
+            if entry_index is None:
+                raise AgentError("fleet_recovery_state_invalid")
+            raise AgentError("fleet_recovery_state_invalid")
+        hidden_name = f"{FLEET_TOMBSTONE_PREFIX}create-{uuid.uuid4().hex}"
+    if transaction is not None and entry_index is not None:
+        transaction.record_entry_phase(entry_index, EntryPhase.INTENT)
+    elif transaction is None and entry_index is None:
+        _fleet_record_recovery_intent(
+            agent_id,
+            MutationKind.CREATED,
+            hidden_name,
+        )
+    try:
+        os.mkdir(hidden_name, 0o700, dir_fd=root_fd)
+    except FileExistsError:
+        raise AgentError("fleet_tombstone_collision") from None
+    except OSError as exc:
+        raise AgentError("fleet_home_create_failed") from exc
+    try:
+        created_stat = os.stat(hidden_name, dir_fd=root_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise _FleetPartialHomeError(hidden_name, None) from exc
+    home_fd = -1
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        home_fd = os.open(hidden_name, flags, dir_fd=root_fd)
+        os.fchmod(home_fd, 0o700)
+        home_stat = os.fstat(home_fd)
+        _fleet_private_directory_stat(home_stat, "fleet_home_verification_failed")
+        artifact_files = _fleet_artifact_files(artifacts)
+        for name, (content, mode) in artifact_files.items():
+            parent_fd, basename = _fleet_open_artifact_parent(
+                home_fd,
+                name,
+                create=True,
+                error="fleet_home_verification_failed",
+            )
+            try:
+                write_private_new_bytes(Path(basename), content, mode=mode, dir_fd=parent_fd)
+            finally:
+                os.close(parent_fd)
+        actual_files, actual_directories = _fleet_tree_entries(
+            home_fd,
+            "fleet_home_verification_failed",
+        )
+        if (
+            actual_files != set(artifact_files)
+            or actual_directories != _fleet_artifact_directories(artifact_files)
+        ):
+            raise AgentError("fleet_home_verification_failed")
+        for name, (content, mode) in artifact_files.items():
+            _fleet_read_exact_file_at(
+                home_fd,
+                name,
+                content,
+                mode,
+                "fleet_home_verification_failed",
+            )
+        _fleet_revalidate_artifact_executables(artifacts)
+        home_stat = os.fstat(home_fd)
+    except Exception as exc:
+        partial_stat = os.fstat(home_fd) if home_fd >= 0 else created_stat
+        if home_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(home_fd)
+        raise _FleetPartialHomeError(hidden_name, partial_stat) from exc
+
+    published = False
+
+    def mark_published() -> None:
+        nonlocal published
+        published = True
+
+    try:
+        _fleet_rename_noreplace_at(
+            root_fd,
+            hidden_name,
+            agent_id,
+            home_stat,
+            "fleet_home_publish_failed",
+            collision_text="fleet_create_target_exists",
+            committed=mark_published,
+        )
+    except AgentError as exc:
+        if not published:
+            with contextlib.suppress(OSError):
+                os.close(home_fd)
+            raise
+        quarantine = f"{FLEET_TOMBSTONE_PREFIX}create-{uuid.uuid4().hex}"
+        quarantined = False
+
+        def mark_quarantined() -> None:
+            nonlocal quarantined
+            quarantined = True
+
+        try:
+            _fleet_rename_noreplace_at(
+                root_fd,
+                agent_id,
+                quarantine,
+                os.fstat(home_fd),
+                "fleet_create_rollback_diverged",
+                collision_text="fleet_create_rollback_diverged",
+                committed=mark_quarantined,
+            )
+        except AgentError:
+            if not quarantined:
+                with contextlib.suppress(OSError):
+                    os.close(home_fd)
+                raise AgentError("fleet_create_rollback_diverged") from None
+        with contextlib.suppress(OSError):
+            os.close(home_fd)
+        raise _FleetPartialHomeError(quarantine, home_stat) from exc
+    with contextlib.suppress(OSError):
+        os.close(home_fd)
+    return home_stat
+
+
+def _fleet_created_home_unchanged(
+    root: Path,
+    agent_id: str,
+    expected_home: os.stat_result,
+    artifacts: dict[str, Any],
+) -> bool:
+    home = root / agent_id
+    try:
+        current_home = home.lstat()
+        if (
+            not source_identity_matches(current_home, expected_home)
+            or current_home.st_uid != os.geteuid()
+        ):
+            return False
+        _fleet_private_directory_stat(current_home, "fleet_create_rollback_diverged")
+        home_fd = open_directory_no_follow_matching(
+            home,
+            current_home,
+            error_text="fleet_create_rollback_diverged",
+            changed_text="fleet_create_rollback_diverged",
+        )
+        try:
+            artifact_files = _fleet_artifact_files(artifacts)
+            actual_files, actual_directories = _fleet_tree_entries(
+                home_fd,
+                "fleet_create_rollback_diverged",
+            )
+            if (
+                not actual_files <= set(artifact_files)
+                or not actual_directories <= _fleet_artifact_directories(artifact_files)
+            ):
+                return False
+            for name in actual_files:
+                content, mode = artifact_files[name]
+                _fleet_read_exact_file_at(
+                    home_fd,
+                    name,
+                    content,
+                    mode,
+                    "fleet_create_rollback_diverged",
+                )
+            return True
+        finally:
+            os.close(home_fd)
+    except (AgentError, OSError):
+        return False
+
+
+def _fleet_rollback_created(
+    created: list[
+        tuple[str, os.stat_result, dict[str, Any], str] | tuple[str, os.stat_result, dict[str, Any]]
+    ],
+) -> bool:
+    if not created:
+        return True
+    clean = True
+    try:
+        with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+            AGENT_POOL_ROOT,
+            ensure=False,
+            error_text="fleet_create_rollback_diverged",
+            require_private=True,
+        ) as root:
+            root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                for created_item in reversed(created):
+                    agent_id, expected_home, artifacts = created_item[:3]
+                    if not _fleet_created_home_unchanged(
+                        root,
+                        agent_id,
+                        expected_home,
+                        artifacts,
+                    ):
+                        clean = False
+                        continue
+                    quarantine = (
+                        created_item[3]
+                        if len(created_item) > 3 and created_item[3]
+                        else f"{FLEET_TOMBSTONE_PREFIX}rollback-{uuid.uuid4().hex}"
+                    )
+                    try:
+                        _fleet_rename_noreplace_at(
+                            root_fd,
+                            agent_id,
+                            quarantine,
+                            expected_home,
+                            "fleet_create_rollback_diverged",
+                            collision_text="fleet_create_rollback_diverged",
+                        )
+                    except AgentError:
+                        clean = False
+            finally:
+                os.close(root_fd)
+    except AgentError:
+        return False
+    return clean
+
+
+def _fleet_publish_stored(service: FleetService, stored: FleetSnapshot) -> None:
+    try:
+        reloaded = service.load()
+    except Exception:
+        raise AgentError("fleet_inventory_publish_failed") from None
+    if reloaded.generation != stored.generation:
+        raise AgentError("fleet_inventory_publish_failed")
+    transaction = _FLEET_ACTIVE_RECOVERY_TRANSACTION.get()
+    if isinstance(transaction, _FleetRecoveryTransaction):
+        if transaction.journal.phase not in (
+            RecoveryPhase.VERIFIED,
+            RecoveryPhase.PUBLISHED,
+            RecoveryPhase.COMPLETE,
+        ):
+            raise AgentError("fleet_inventory_publish_failed")
+        if not _fleet_verify_authoritative_materialization(reloaded, transaction.journal):
+            raise AgentError("fleet_inventory_publish_failed")
+    try:
+        publish_agent_inventory(build_inventory(reloaded, AGENT_POOL_ROOT))
+    except Exception:
+        raise AgentError("fleet_inventory_publish_failed") from None
+
+
+def _fleet_publish_recovery_commit(
+    service: FleetService,
+    stored: FleetSnapshot,
+    transaction: _FleetRecoveryTransaction | None,
+) -> None:
+    if transaction is None:
+        _fleet_publish_stored(service, stored)
+        return
+    try:
+        authoritative = service.load()
+    except Exception:
+        raise AgentError("fleet_inventory_publish_failed") from None
+    if authoritative.generation != stored.generation:
+        raise AgentError("fleet_inventory_publish_failed")
+    if transaction.journal.phase is RecoveryPhase.MATERIALIZING:
+        transaction.advance(RecoveryPhase.CAS_PENDING)
+    if transaction.journal.phase is RecoveryPhase.CAS_PENDING:
+        transaction.advance(
+            RecoveryPhase.RECONCILING,
+            authoritative_generation=authoritative.generation,
+        )
+    if transaction.journal.phase is RecoveryPhase.RECONCILING:
+        if not _fleet_verify_authoritative_materialization(
+            authoritative,
+            transaction.journal,
+        ):
+            raise AgentError("fleet_inventory_publish_failed")
+        transaction.advance(
+            RecoveryPhase.VERIFIED,
+            authoritative_generation=authoritative.generation,
+        )
+    if transaction.journal.phase is not RecoveryPhase.VERIFIED:
+        raise AgentError("fleet_inventory_publish_failed")
+    with _fleet_active_recovery_transaction(transaction):
+        _fleet_publish_stored(service, authoritative)
+    transaction.advance(
+        RecoveryPhase.PUBLISHED,
+        authoritative_generation=authoritative.generation,
+    )
+
+
+def _fleet_reconcile_commit_exception(
+    service: FleetService,
+    current: FleetSnapshot,
+    planned: FleetSnapshot,
+) -> tuple[str, FleetSnapshot]:
+    try:
+        reloaded = service.load()
+    except Exception:
+        raise AgentError("fleet_registry_commit_diverged") from None
+    if reloaded == planned:
+        return "planned", reloaded
+    if reloaded == current:
+        return "current", reloaded
+    return "diverged", reloaded
+
+
+def _fleet_recovery_action_error_code(action: RecoveryActionKind) -> str | None:
+    return {
+        RecoveryActionKind.QUARANTINE_CREATED: "fleet_create_rollback_diverged",
+        RecoveryActionKind.VERIFY_CREATED: "fleet_recovery_incomplete",
+        RecoveryActionKind.RESTORE_BACKUP: "fleet_update_rollback_diverged",
+        RecoveryActionKind.RESTORE_TOMBSTONE: "fleet_tombstone_rollback_diverged",
+        RecoveryActionKind.RELEASE_RESERVATION: "fleet_registry_delete_reservation_diverged",
+    }.get(action)
+
+
+@contextlib.contextmanager
+def _fleet_active_recovery_transaction(
+    transaction: _FleetRecoveryTransaction | None,
+) -> Any:
+    if transaction is None:
+        yield
+        return
+    token = _FLEET_ACTIVE_RECOVERY_TRANSACTION.set(transaction)
+    try:
+        yield
+    finally:
+        _FLEET_ACTIVE_RECOVERY_TRANSACTION.reset(token)
+
+
+def _fleet_record_recovery_intent(
+    agent_id: str,
+    kind: MutationKind,
+    hidden_name: str,
+    manifest: tuple[tuple[str, int, str], ...] = (),
+) -> int | None:
+    transaction = _FLEET_ACTIVE_RECOVERY_TRANSACTION.get()
+    if transaction is None:
+        return None
+    for index, entry in enumerate(transaction.journal.entries):
+        if entry.agent_id == agent_id and entry.hidden_name == hidden_name:
+            transaction.record_entry_phase(index, EntryPhase.INTENT)
+            return index
+    new_entry = RecoveryEntry(
+        kind=kind,
+        agent_id=agent_id,
+        hidden_name=hidden_name,
+        old_descriptor_fingerprint=None,
+        new_descriptor_fingerprint=None,
+        old_materialization_fingerprint=None,
+        new_materialization_fingerprint=None,
+        source_identity=None,
+        target_identity=None,
+        manifest=tuple(
+            ArtifactDigest(
+                relative_path=relative_path,
+                mode=mode,
+                sha256=hashes,
+            )
+            for relative_path, mode, hashes in manifest
+        ),
+        phase=EntryPhase.INTENT,
+        result_code=None,
+    )
+    return transaction.append_entry(new_entry)
+
+
+def _fleet_execute_recovery_action(
+    action: RecoveryAction,
+    entry: RecoveryEntry,
+    authoritative_agent: AgentDescriptor | None,
+) -> bool:
+    if action.kind == RecoveryActionKind.RETAIN_QUARANTINE:
+        return True
+
+    if action.kind == RecoveryActionKind.VERIFY_CREATED:
+        if authoritative_agent is None or entry.target_identity is None:
+            return False
+        try:
+            current = _fleet_managed_home_state(
+                AGENT_POOL_ROOT,
+                authoritative_agent,
+                strict_contents=True,
+            )
+        except AgentError:
+            return False
+        return source_identity_matches(current, entry.target_identity)
+
+    if action.kind == RecoveryActionKind.QUARANTINE_CREATED:
+        if authoritative_agent is None:
+            return False
+        try:
+            with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+                AGENT_POOL_ROOT,
+                ensure=False,
+                error_text="fleet_create_rollback_diverged",
+                require_private=True,
+            ) as root:
+                root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    try:
+                        home_stat = os.stat(
+                            authoritative_agent.agent_id,
+                            dir_fd=root_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        return True
+                    except OSError:
+                        return False
+                    _fleet_rename_noreplace_at(
+                        root_fd,
+                        authoritative_agent.agent_id,
+                        entry.hidden_name,
+                        home_stat,
+                        "fleet_create_rollback_diverged",
+                        collision_text="fleet_create_rollback_diverged",
+                    )
+                finally:
+                    os.close(root_fd)
+            return True
+        except (AgentError, OSError):
+            return False
+
+    if action.kind == RecoveryActionKind.RESTORE_BACKUP:
+        if authoritative_agent is None:
+            return False
+        try:
+            with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+                AGENT_POOL_ROOT,
+                ensure=False,
+                error_text="fleet_update_rollback_diverged",
+                require_private=True,
+            ) as root:
+                root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    backup_stat = os.stat(
+                        entry.hidden_name,
+                        dir_fd=root_fd,
+                        follow_symlinks=False,
+                    )
+                    target_stat = None
+                    try:
+                        target_stat = os.stat(
+                            authoritative_agent.agent_id,
+                            dir_fd=root_fd,
+                            follow_symlinks=False,
+                        )
+                        if not stat_module.S_ISDIR(target_stat.st_mode):
+                            return False
+                    except FileNotFoundError:
+                        target_stat = None
+                    if target_stat is not None:
+                        quarantine = f"{FLEET_TOMBSTONE_PREFIX}restore-{uuid.uuid4().hex}"
+                        _fleet_rename_noreplace_at(
+                            root_fd,
+                            authoritative_agent.agent_id,
+                            quarantine,
+                            target_stat,
+                            "fleet_update_rollback_diverged",
+                            collision_text="fleet_update_rollback_diverged",
+                        )
+                    _fleet_rename_noreplace_at(
+                        root_fd,
+                        entry.hidden_name,
+                        authoritative_agent.agent_id,
+                        backup_stat,
+                        "fleet_update_rollback_diverged",
+                        collision_text="fleet_update_rollback_diverged",
+                    )
+                finally:
+                    os.close(root_fd)
+            return True
+        except (AgentError, OSError):
+            return False
+
+    if action.kind == RecoveryActionKind.RESTORE_TOMBSTONE:
+        if authoritative_agent is None:
+            return False
+        try:
+            with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+                AGENT_POOL_ROOT,
+                ensure=False,
+                error_text="fleet_tombstone_rollback_diverged",
+                require_private=True,
+            ) as root:
+                root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    tombstone_stat = os.stat(
+                        entry.hidden_name,
+                        dir_fd=root_fd,
+                        follow_symlinks=False,
+                    )
+                    _fleet_rename_noreplace_at(
+                        root_fd,
+                        entry.hidden_name,
+                        authoritative_agent.agent_id,
+                        tombstone_stat,
+                        "fleet_tombstone_rollback_diverged",
+                        collision_text="fleet_tombstone_rollback_diverged",
+                    )
+                finally:
+                    os.close(root_fd)
+            return True
+        except (AgentError, OSError):
+            return False
+
+    if action.kind == RecoveryActionKind.RELEASE_RESERVATION:
+        try:
+            with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+                AGENT_POOL_ROOT,
+                ensure=False,
+                error_text="fleet_registry_delete_reservation_diverged",
+                require_private=True,
+            ) as root:
+                root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    try:
+                        home_stat = os.stat(
+                            entry.agent_id,
+                            dir_fd=root_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        return True
+                    except OSError:
+                        return False
+                    if not stat_module.S_ISDIR(home_stat.st_mode):
+                        return False
+                    with contextlib.closing(os.open(
+                        entry.agent_id,
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                        dir_fd=root_fd,
+                    )) as home_dir_fd:
+                        if os.listdir(home_dir_fd):
+                            return False
+                    os.rmdir(entry.agent_id, dir_fd=root_fd)
+                finally:
+                    os.close(root_fd)
+            return True
+        except (AgentError, OSError):
+            return False
+
+    return False
+
+
+def _fleet_verify_authoritative_materialization(
+    authoritative: FleetSnapshot,
+    journal: FleetRecoveryJournal,
+) -> bool:
+    authoritative_agents = build_inventory(authoritative, AGENT_POOL_ROOT).agents
+    authoritative_fingerprints = {
+        entry.agent_id: (
+            descriptor_fingerprint(authoritative_agents[entry.agent_id])
+            if entry.agent_id in authoritative_agents
+            else None
+        )
+        for entry in journal.entries
+    }
+    plan = plan_reconciliation(journal, authoritative_fingerprints)
+    if plan.has_third:
+        return False
+    for action in plan.actions:
+        entry = journal.entries[action.entry_index]
+        if action.kind is RecoveryActionKind.RETAIN_QUARANTINE:
+            continue
+        if action.kind is RecoveryActionKind.RELEASE_RESERVATION:
+            reservation = AGENT_POOL_ROOT / entry.agent_id
+            try:
+                reservation_stat = reservation.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+            if (
+                entry.target_identity is None
+                or not source_identity_matches(reservation_stat, entry.target_identity)
+            ):
+                return False
+            try:
+                reservation_fd = open_directory_no_follow_matching(
+                    reservation,
+                    reservation_stat,
+                    error_text="fleet_registry_delete_reservation_diverged",
+                    changed_text="fleet_registry_delete_reservation_diverged",
+                )
+                try:
+                    if os.listdir(reservation_fd):
+                        return False
+                finally:
+                    os.close(reservation_fd)
+            except (AgentError, OSError):
+                return False
+            continue
+        if action.descriptor_state is DescriptorState.NEW:
+            if entry.target_identity is None:
+                return False
+            if not _fleet_verify_directory_fingerprint(
+                AGENT_POOL_ROOT / entry.agent_id,
+                entry.target_identity,
+            ):
+                return False
+            continue
+        if action.descriptor_state in {DescriptorState.ABSENT, DescriptorState.OLD}:
+            if _fleet_private_directory_exists(AGENT_POOL_ROOT / entry.agent_id):
+                if entry.source_identity is None:
+                    return False
+                if not _fleet_verify_directory_fingerprint(
+                    AGENT_POOL_ROOT / entry.agent_id,
+                    entry.source_identity,
+                ):
+                    return False
+            continue
+    return True
+
+
+def _fleet_private_directory_exists(path: Path) -> bool:
+    try:
+        stat_result = path.lstat()
+    except OSError:
+        return False
+    return stat_module.S_ISDIR(stat_result.st_mode) and not stat_module.S_ISLNK(stat_result.st_mode)
+
+
+def _fleet_verify_directory_fingerprint(path: Path, expected: FileIdentity) -> bool:
+    try:
+        stat_result = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat_result.st_ino == expected.ino
+        and stat_result.st_dev == expected.dev
+        and stat_result.st_mode == expected.mode
+        and stat_result.st_nlink == expected.nlink
+    )
+
+def _fleet_execute_recovery_plan(
+    transaction: _FleetRecoveryTransaction,
+    recovery_plan: RecoveryPlan,
+    authoritative: FleetSnapshot,
+) -> tuple[tuple[str, ...], bool]:
+    errors: list[str] = []
+    blocking = False
+    try:
+        authoritative = current_fleet_service().load()
+    except Exception:
+        errors.append("fleet_recovery_incomplete")
+        return tuple(dict.fromkeys(errors)), True
+    authoritative_agents = build_inventory(authoritative, AGENT_POOL_ROOT).agents
+    for action in recovery_plan.actions:
+        entry = transaction.journal.entries[action.entry_index]
+        authoritative_agent = authoritative_agents.get(action.agent_id)
+        try:
+            ok = _fleet_execute_recovery_action(
+                action,
+                entry,
+                authoritative_agent,
+            )
+        except (AgentError, OSError):
+            ok = False
+        if not ok:
+            code = _fleet_recovery_action_error_code(action.kind)
+            if code is not None:
+                errors.append(code)
+        transaction.record_action_result(action.entry_index, ok)
+    if recovery_plan.has_third:
+        errors.append("fleet_recovery_incomplete")
+        blocking = True
+    else:
+        try:
+            authoritative = current_fleet_service().load()
+        except Exception:
+            errors.append("fleet_recovery_incomplete")
+            return tuple(dict.fromkeys(errors)), True
+        if not _fleet_verify_authoritative_materialization(
+            authoritative,
+            transaction.journal,
+        ):
+            errors.append("fleet_recovery_incomplete")
+            blocking = True
+    blocking_codes = {
+        "fleet_create_rollback_diverged",
+        "fleet_update_rollback_diverged",
+        "fleet_tombstone_rollback_diverged",
+        "fleet_registry_delete_reservation_diverged",
+    }
+    blocking = blocking or any(code in blocking_codes for code in errors)
+    return tuple(dict.fromkeys(errors)), blocking
+
+
+def _fleet_prepare_managed_update_recovery_entries(
+    current: FleetSnapshot,
+    planned: FleetSnapshot,
+    update_ids: tuple[str, ...],
+    create_ids: tuple[str, ...],
+    remove_ids: tuple[str, ...],
+) -> tuple[RecoveryEntry, ...]:
+    old_inventory = build_inventory(current, AGENT_POOL_ROOT)
+    planned_inventory = build_inventory(planned, AGENT_POOL_ROOT)
+    entries: list[RecoveryEntry] = []
+    for agent_id in update_ids:
+        old_agent = old_inventory.agents[agent_id]
+        new_agent = planned_inventory.agents[agent_id]
+        entries.append(
+            RecoveryEntry(
+                kind=MutationKind.CREATED,
+                agent_id=agent_id,
+                hidden_name=f"{FLEET_TOMBSTONE_PREFIX}create-{uuid.uuid4().hex}",
+                old_descriptor_fingerprint=descriptor_fingerprint(old_agent),
+                new_descriptor_fingerprint=descriptor_fingerprint(new_agent),
+                old_materialization_fingerprint=None,
+                new_materialization_fingerprint=None,
+                source_identity=None,
+                target_identity=None,
+                manifest=(),
+                phase=EntryPhase.INTENT,
+                result_code=None,
+            )
+        )
+        entries.append(
+            RecoveryEntry(
+                kind=MutationKind.BACKUP,
+                agent_id=agent_id,
+                hidden_name=f"{FLEET_TOMBSTONE_PREFIX}backup-{uuid.uuid4().hex}",
+                old_descriptor_fingerprint=descriptor_fingerprint(old_agent),
+                new_descriptor_fingerprint=descriptor_fingerprint(new_agent),
+                old_materialization_fingerprint=None,
+                new_materialization_fingerprint=None,
+                source_identity=None,
+                target_identity=None,
+                manifest=(),
+                phase=EntryPhase.INTENT,
+                result_code=None,
+            )
+        )
+    for agent_id in create_ids:
+        new_agent = planned_inventory.agents[agent_id]
+        entries.append(
+            RecoveryEntry(
+                kind=MutationKind.CREATED,
+                agent_id=agent_id,
+                hidden_name=f"{FLEET_TOMBSTONE_PREFIX}create-{uuid.uuid4().hex}",
+                old_descriptor_fingerprint=None,
+                new_descriptor_fingerprint=descriptor_fingerprint(new_agent),
+                old_materialization_fingerprint=None,
+                new_materialization_fingerprint=None,
+                source_identity=None,
+                target_identity=None,
+                manifest=(),
+                phase=EntryPhase.INTENT,
+                result_code=None,
+            )
+        )
+    for agent_id in remove_ids:
+        old_agent = old_inventory.agents[agent_id]
+        entries.append(
+            RecoveryEntry(
+                kind=MutationKind.TOMBSTONE,
+                agent_id=agent_id,
+                hidden_name=f"{FLEET_TOMBSTONE_PREFIX}{uuid.uuid4().hex}",
+                old_descriptor_fingerprint=descriptor_fingerprint(old_agent),
+                new_descriptor_fingerprint=None,
+                old_materialization_fingerprint=None,
+                new_materialization_fingerprint=None,
+                source_identity=None,
+                target_identity=None,
+                manifest=(),
+                phase=EntryPhase.INTENT,
+                result_code=None,
+            )
+        )
+    return tuple(entries)
+
+
+def _fleet_descriptor_reconciliation_states(
+    current: FleetSnapshot,
+    planned: FleetSnapshot,
+    authoritative: FleetSnapshot,
+    agent_ids: set[str],
+) -> dict[str, str]:
+    old_agents = build_inventory(current, AGENT_POOL_ROOT).agents
+    new_agents = build_inventory(planned, AGENT_POOL_ROOT).agents
+    authoritative_agents = build_inventory(authoritative, AGENT_POOL_ROOT).agents
+    states: dict[str, str] = {}
+    for agent_id in agent_ids:
+        authoritative_agent = authoritative_agents.get(agent_id)
+        if authoritative_agent is None:
+            states[agent_id] = "absent"
+        elif authoritative_agent == old_agents.get(agent_id):
+            states[agent_id] = "old"
+        elif authoritative_agent == new_agents.get(agent_id):
+            states[agent_id] = "new"
+        else:
+            states[agent_id] = "unknown"
+    return states
+
+
+def _fleet_tmux_state(session: str) -> str:
+    try:
+        result = run_tmux(["has-session", "-t", session], check=False)
+    except Exception:
+        return "unknown"
+    if result.returncode == 0:
+        return "running"
+    if result.returncode == 1:
+        return "stopped"
+    return "unknown"
+
+
+def _fleet_managed_home_state(
+    root: Path,
+    agent: AgentDescriptor,
+    *,
+    entry_name: str | None = None,
+    strict_contents: bool,
+) -> os.stat_result:
+    home = root / (entry_name or agent.agent_id)
+    try:
+        home_stat = home.lstat()
+    except OSError as exc:
+        raise AgentError("fleet_home_content_invalid") from exc
+    _fleet_private_directory_stat(home_stat, "fleet_home_content_invalid")
+    home_fd = open_directory_no_follow_matching(
+        home,
+        home_stat,
+        error_text="fleet_home_content_invalid",
+        changed_text="fleet_home_content_invalid",
+    )
+    try:
+        marker_bytes, _marker_stat = _fleet_read_private_file_at(
+            home_fd,
+            FLEET_AGENT_MARKER_FILE,
+            0o600,
+            "fleet_home_content_invalid",
+        )
+        try:
+            marker = json.loads(marker_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise AgentError("fleet_home_content_invalid") from None
+        expected_fields = {
+            "schema_version",
+            "kind",
+            "agent_id",
+            "prefix",
+            "runner",
+            "provider",
+            "model",
+            "managed_files",
+            "files",
+        }
+        wrapper_name = "codex" if agent.runner is RunnerKind.CODEX_CLI else "gemini"
+        expected_files = (
+            {wrapper_name, "config.toml"}
+            | ({"model.json"} if agent.provider is Provider.OLLAMA_LOCAL else set())
+            if agent.runner is RunnerKind.CODEX_CLI
+            else {
+                wrapper_name,
+                "settings.json",
+                ".gemini/settings.json",
+                ".gemini/policies/codex-master.toml",
+            }
+        )
+        if (
+            not isinstance(marker, dict)
+            or set(marker) != expected_fields
+            or marker.get("schema_version") != 1
+            or marker.get("kind") != "codex_master_fleet_agent"
+            or marker.get("agent_id") != agent.agent_id
+            or marker.get("prefix") != agent.series_prefix
+            or marker.get("runner") != agent.runner.value
+            or marker.get("provider") != agent.provider.value
+            or marker.get("model") != agent.model
+            or not isinstance(marker.get("managed_files"), list)
+            or set(marker["managed_files"]) != expected_files
+            or not isinstance(marker.get("files"), dict)
+            or set(marker["files"]) != expected_files
+        ):
+            raise AgentError("fleet_home_content_invalid")
+        for name in expected_files:
+            digest = marker["files"].get(name)
+            if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise AgentError("fleet_home_content_invalid")
+            mode = 0o700 if name == wrapper_name else 0o600
+            content, _file_stat = _fleet_read_private_file_at(
+                home_fd,
+                name,
+                mode,
+                "fleet_home_content_invalid",
+            )
+            if not hmac.compare_digest(hashlib.sha256(content).hexdigest(), digest):
+                raise AgentError("fleet_home_content_invalid")
+        actual_files, actual_directories = _fleet_tree_entries(
+            home_fd,
+            "fleet_home_content_invalid",
+        )
+        allowed_files = {FLEET_AGENT_MARKER_FILE, *expected_files, "auth.json"}
+        expected_directories = _fleet_artifact_directories({name: None for name in expected_files})
+        if strict_contents and (
+            not actual_files <= allowed_files
+            or actual_directories != expected_directories
+        ):
+            raise AgentError("fleet_home_content_invalid")
+        if "auth.json" in actual_files:
+            _fleet_read_private_file_at(
+                home_fd,
+                "auth.json",
+                0o600,
+                "fleet_home_content_invalid",
+            )
+        return home_stat
+    except OSError as exc:
+        raise AgentError("fleet_home_content_invalid") from exc
+    finally:
+        os.close(home_fd)
+
+
+def _fleet_validate_materialized_series_homes(
+    snapshot: FleetSnapshot,
+    series: FleetSeries,
+) -> None:
+    inventory = build_inventory(snapshot, AGENT_POOL_ROOT)
+    with pool_root_lock(AGENT_POOL_ROOT):
+        present_ids = _fleet_plan_materialized_ids(series.prefix, series.count)
+        if not present_ids:
+            return
+        with pool_root_operation(
+            AGENT_POOL_ROOT,
+            ensure=False,
+            error_text="fleet_home_state_unknown",
+            require_private=True,
+        ) as root:
+            for agent_id in sorted(present_ids):
+                _fleet_managed_home_state(
+                    root,
+                    inventory.agents[agent_id],
+                    strict_contents=True,
+                )
+
+
+@contextlib.contextmanager
+def _fleet_idle_agent_locks(
+    inventory: InventorySnapshot,
+    agent_ids_to_check: list[str],
+) -> Any:
+    pinned: dict[str, os.stat_result] = {}
+    with pool_agent_lifecycle_locks(agent_ids_to_check, snapshot=inventory):
+        for agent_id in sorted(agent_ids_to_check):
+            agent = inventory.agents[agent_id]
+            try:
+                home_stat = agent.home.lstat()
+            except OSError as exc:
+                raise AgentError("fleet_home_content_invalid") from exc
+            _fleet_private_directory_stat(home_stat, "fleet_home_content_invalid")
+            pinned[agent_id] = home_stat
+            lease = agent_lease_status(
+                agent_id,
+                initialize_state=False,
+                snapshot=inventory,
+            )
+            if lease.get("state") not in {"unclaimed", "expired"}:
+                raise AgentError("fleet_agent_lease_active")
+            tmux_state = _fleet_tmux_state(agent.session)
+            if tmux_state == "running":
+                raise AgentError("fleet_agent_running")
+            if tmux_state != "stopped":
+                raise AgentError("fleet_agent_tmux_unknown")
+            processes = pool_home_processes(agent.home)
+            if processes is None:
+                raise AgentError("fleet_agent_process_unknown")
+            if processes:
+                raise AgentError("fleet_agent_process_active")
+        yield pinned
+
+
+def _fleet_rename_noreplace_at(
+    root_fd: int,
+    source: str,
+    target: str,
+    expected_source: os.stat_result,
+    error_text: str,
+    *,
+    collision_text: str | None = None,
+    committed: Callable[[], None] | None = None,
+) -> None:
+    try:
+        current = os.stat(source, dir_fd=root_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise AgentError(error_text) from exc
+    if not source_identity_matches(current, expected_source):
+        raise AgentError(error_text)
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise AgentError("fleet_noreplace_unavailable")
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        root_fd,
+        os.fsencode(source),
+        root_fd,
+        os.fsencode(target),
+        1,
+    )
+    if result != 0:
+        current_errno = ctypes.get_errno()
+        if current_errno == errno.EEXIST and collision_text is not None:
+            raise AgentError(collision_text)
+        raise AgentError(error_text)
+    if committed is not None:
+        committed()
+    try:
+        renamed = os.stat(target, dir_fd=root_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise AgentError(error_text) from exc
+    if not source_identity_matches(renamed, expected_source):
+        raise AgentError(error_text)
+
+
+def _fleet_restore_tombstones(staged: list[dict[str, Any]]) -> bool:
+    if not staged:
+        return True
+    try:
+        agent_ids_to_restore = [item["agent"].agent_id for item in staged]
+        with pool_agent_lifecycle_locks(
+            agent_ids_to_restore,
+            snapshot=staged[0]["inventory"],
+        ), pool_root_lock(
+            AGENT_POOL_ROOT
+        ), pool_root_operation(
+            AGENT_POOL_ROOT,
+            ensure=False,
+            error_text="fleet_tombstone_rollback_diverged",
+            require_private=True,
+        ) as root:
+            root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                for item in reversed(staged):
+                    agent = item["agent"]
+                    tombstone = item["tombstone"]
+                    current = _fleet_managed_home_state(
+                        root,
+                        agent,
+                        entry_name=tombstone,
+                        strict_contents=True,
+                    )
+                    if not source_identity_matches(current, item["home_stat"]):
+                        return False
+                    _fleet_rename_noreplace_at(
+                        root_fd,
+                        tombstone,
+                        agent.agent_id,
+                        current,
+                        "fleet_tombstone_rollback_diverged",
+                        collision_text="fleet_tombstone_rollback_diverged",
+                    )
+            finally:
+                os.close(root_fd)
+    except (AgentError, OSError):
+        return False
+    return True
+
+
+def _fleet_stage_tombstones(
+    inventory: InventorySnapshot,
+    agent_ids_to_remove: list[str],
+    *,
+    transaction: _FleetRecoveryTransaction | None = None,
+    planned_tombstones: dict[str, tuple[str, int]] | None = None,
+) -> list[dict[str, Any]]:
+    staged: list[dict[str, Any]] = []
+    try:
+        with _fleet_idle_agent_locks(inventory, agent_ids_to_remove) as pinned:
+            with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+                AGENT_POOL_ROOT,
+                ensure=False,
+                error_text="fleet_pool_root_invalid",
+                require_private=True,
+            ) as root:
+                if not _fleet_root_marker_state(root):
+                    raise AgentError("fleet_pool_marker_required")
+                root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    ordered = sorted(
+                        agent_ids_to_remove,
+                        key=lambda item: inventory.agents[item].ordinal,
+                        reverse=True,
+                    )
+                    for agent_id in ordered:
+                        agent = inventory.agents[agent_id]
+                        current = _fleet_managed_home_state(
+                            root,
+                            agent,
+                            strict_contents=True,
+                        )
+                        if not source_identity_matches(current, pinned[agent_id]):
+                            raise AgentError("fleet_home_changed")
+                        if planned_tombstones is None:
+                            if transaction is not None:
+                                raise AgentError("fleet_recovery_state_invalid")
+                            tombstone = f"{FLEET_TOMBSTONE_PREFIX}{uuid.uuid4().hex}"
+                            tombstone_index = None
+                        else:
+                            tombstone, tombstone_index = planned_tombstones[agent_id]
+                        if transaction is not None and tombstone_index is not None:
+                            transaction.record_entry_phase(tombstone_index, EntryPhase.INTENT)
+                        staged_item = {
+                            "agent": agent,
+                            "inventory": inventory,
+                            "tombstone": tombstone,
+                            "home_stat": current,
+                        }
+                        try:
+                            _fleet_rename_noreplace_at(
+                                root_fd,
+                                agent_id,
+                                tombstone,
+                                current,
+                                "fleet_tombstone_stage_failed",
+                                collision_text="fleet_tombstone_collision",
+                                committed=lambda item=staged_item: staged.append(item),
+                            )
+                        except AgentError:
+                            raise
+                        tombstone_stat = os.stat(
+                            tombstone,
+                            dir_fd=root_fd,
+                            follow_symlinks=False,
+                        )
+                        if not source_identity_matches(tombstone_stat, current):
+                            raise AgentError("fleet_home_changed")
+                finally:
+                    os.close(root_fd)
+    except Exception:
+        if staged and not _fleet_restore_tombstones(staged):
+            raise AgentError("fleet_tombstone_rollback_diverged") from None
+        raise
+    return staged
+
+
+def _fleet_cleanup_tombstones(staged: list[dict[str, Any]]) -> bool:
+    return bool(staged)
+
+
+def _fleet_reserve_absent_homes(
+    agent_ids: list[str],
+    *,
+    transaction: _FleetRecoveryTransaction | None = None,
+    planned_reservations: dict[str, tuple[str, int]] | None = None,
+) -> list[dict[str, Any]]:
+    reservations: list[dict[str, Any]] = []
+    try:
+        with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+            AGENT_POOL_ROOT,
+            ensure=True,
+            error_text="fleet_pool_root_invalid",
+            require_private=True,
+        ) as root:
+            root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                if not _fleet_root_marker_state(root):
+                    _fleet_write_root_marker(root_fd)
+                for agent_id in agent_ids:
+                    try:
+                        os.stat(agent_id, dir_fd=root_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        raise AgentError("fleet_home_state_unknown") from exc
+                    else:
+                        raise AgentError("fleet_registry_delete_raced")
+                    if planned_reservations is None:
+                        if transaction is not None:
+                            raise AgentError("fleet_recovery_state_invalid")
+                        staging = f"{FLEET_TOMBSTONE_PREFIX}reservation-{uuid.uuid4().hex}"
+                        staging_index = None
+                    else:
+                        staging, staging_index = planned_reservations[agent_id]
+                    if transaction is not None and staging_index is not None:
+                        transaction.record_entry_phase(staging_index, EntryPhase.INTENT)
+                    try:
+                        os.mkdir(staging, 0o700, dir_fd=root_fd)
+                        reservation: dict[str, Any] = {
+                            "agent_id": agent_id,
+                            "entry_name": staging,
+                            "home_stat": None,
+                        }
+                        reservations.append(reservation)
+                        home_stat = os.stat(staging, dir_fd=root_fd, follow_symlinks=False)
+                        reservation["home_stat"] = home_stat
+                    except OSError as exc:
+                        raise AgentError("fleet_registry_delete_reservation_failed") from exc
+
+                    def mark_reserved(item: dict[str, Any] = reservation) -> None:
+                        item["entry_name"] = item["agent_id"]
+
+                    _fleet_rename_noreplace_at(
+                        root_fd,
+                        staging,
+                        agent_id,
+                        home_stat,
+                        "fleet_registry_delete_reservation_failed",
+                        collision_text="fleet_registry_delete_raced",
+                        committed=mark_reserved,
+                    )
+                    if transaction is not None and staging_index is not None:
+                        transaction.record_entry_phase(
+                            staging_index,
+                            EntryPhase.PUBLIC,
+                            target_identity=_snapshot_file_identity(home_stat),
+                        )
+            finally:
+                os.close(root_fd)
+    except Exception:
+        if reservations and not _fleet_release_reservations(reservations):
+            raise AgentError("fleet_registry_delete_reservation_diverged") from None
+        raise
+    return reservations
+
+
+def _fleet_release_reservations(reservations: list[dict[str, Any]]) -> bool:
+    if not reservations:
+        return True
+    clean = True
+    try:
+        with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+            AGENT_POOL_ROOT,
+            ensure=False,
+            error_text="fleet_registry_delete_raced",
+            require_private=True,
+        ) as root:
+            root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                for item in reservations:
+                    entry_name = item.get("entry_name", item["agent_id"])
+                    expected_home = item.get("home_stat")
+                    if expected_home is None:
+                        clean = False
+                        continue
+                    try:
+                        current = os.stat(
+                            entry_name,
+                            dir_fd=root_fd,
+                            follow_symlinks=False,
+                        )
+                    except OSError:
+                        clean = False
+                        continue
+                    if not source_identity_matches(current, expected_home):
+                        clean = False
+                        continue
+                    if entry_name != item["agent_id"]:
+                        clean = False
+                        continue
+                    try:
+                        reservation_fd = open_directory_no_follow_matching(
+                            root / item["agent_id"],
+                            current,
+                            error_text="fleet_registry_delete_raced",
+                            changed_text="fleet_registry_delete_raced",
+                        )
+                    except AgentError:
+                        clean = False
+                        continue
+                    try:
+                        if os.listdir(reservation_fd):
+                            clean = False
+                    finally:
+                        os.close(reservation_fd)
+                    quarantine = f"{FLEET_TOMBSTONE_PREFIX}reservation-{uuid.uuid4().hex}"
+                    try:
+                        _fleet_rename_noreplace_at(
+                            root_fd,
+                            item["agent_id"],
+                            quarantine,
+                            current,
+                            "fleet_registry_delete_raced",
+                            collision_text="fleet_registry_delete_raced",
+                        )
+                    except AgentError:
+                        clean = False
+            finally:
+                os.close(root_fd)
+    except (AgentError, OSError):
+        return False
+    return clean
+
+
+def _fleet_commit_staged_removal(
+    service: FleetService,
+    current: FleetSnapshot,
+    planned: FleetSnapshot,
+    *,
+    expected_generation: int,
+    inventory: InventorySnapshot,
+    agent_ids_to_remove: list[str],
+    planned_tombstones: dict[str, tuple[str, int]] | None = None,
+    transaction: _FleetRecoveryTransaction | None = None,
+) -> tuple[FleetSnapshot, bool]:
+    staged = _fleet_stage_tombstones(
+        inventory,
+        agent_ids_to_remove,
+        transaction=transaction,
+        planned_tombstones=planned_tombstones,
+    )
+    if transaction is not None:
+        transaction.advance(RecoveryPhase.CAS_PENDING)
+    try:
+        stored = service.commit_snapshot(planned, expected_generation=expected_generation)
+    except Exception as exc:
+        state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
+        if state == "planned":
+            _fleet_publish_recovery_commit(service, reloaded, transaction)
+            cleanup_complete = True
+            try:
+                cleanup_complete = not _fleet_cleanup_tombstones(staged)
+            except Exception:
+                cleanup_complete = False
+            if transaction is not None and cleanup_complete:
+                transaction.advance(RecoveryPhase.COMPLETE)
+                _fleet_remove_complete_recovery_journal(transaction.journal)
+            staged = []
+            raise AgentError("fleet_registry_commit_failed_after_cas") from None
+        if state == "diverged":
+            if transaction is not None:
+                transaction.advance(
+                    RecoveryPhase.RECONCILING,
+                    authoritative_generation=reloaded.generation,
+                )
+            reconciled = _fleet_reconcile_divergent_materialization(
+                current,
+                planned,
+                reloaded,
+                staged=staged,
+                transaction=transaction,
+            )
+            if not reconciled:
+                raise AgentError("fleet_registry_commit_diverged") from None
+            _fleet_publish_recovery_commit(service, reloaded, transaction)
+            if transaction is not None:
+                transaction.advance(RecoveryPhase.COMPLETE)
+                _fleet_remove_complete_recovery_journal(transaction.journal)
+            staged = []
+            raise AgentError("fleet_registry_commit_diverged") from None
+        if not _fleet_restore_tombstones(staged):
+            staged = []
+            raise AgentError("fleet_tombstone_rollback_diverged") from None
+        if isinstance(exc, FleetConflictError):
+            if transaction is not None:
+                _fleet_complete_rolled_back_transaction(
+                    transaction,
+                    current.generation,
+                )
+            staged = []
+            raise AgentError("generation_conflict") from None
+        staged = []
+        raise AgentError("fleet_registry_commit_failed") from None
+    _fleet_publish_recovery_commit(service, stored, transaction)
+    cleanup_complete = True
+    try:
+        cleanup_pending = _fleet_cleanup_tombstones(staged)
+        cleanup_complete = not cleanup_pending
+    except Exception:
+        cleanup_pending = True
+        cleanup_complete = False
+    if transaction is not None and cleanup_complete:
+        transaction.advance(RecoveryPhase.COMPLETE)
+    return stored, cleanup_pending
+
+
+def _fleet_home_file_snapshot(home_fd: int, name: str) -> tuple[bytes, int, os.stat_result]:
+    pinned = Path(f"/proc/self/fd/{home_fd}") / name
+    try:
+        current = os.stat(name, dir_fd=home_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise AgentError("fleet_home_content_invalid") from exc
+    if not stat_module.S_ISREG(current.st_mode) or getattr(current, "st_nlink", 1) != 1:
+        raise AgentError("fleet_home_content_invalid")
+    return (
+        pool_read_private_bytes(
+            pinned,
+            MAX_POOL_SPEC_BYTES,
+            "fleet_home_content_invalid",
+            expected_target_stat=current,
+        ),
+        stat_module.S_IMODE(current.st_mode),
+        current,
+    )
+
+
+def _fleet_snapshot_metadata(current: os.stat_result) -> tuple[int, ...]:
+    return (
+        current.st_dev,
+        current.st_ino,
+        current.st_mode,
+        current.st_uid,
+        current.st_gid,
+        current.st_nlink,
+        current.st_size,
+        current.st_mtime_ns,
+    )
+
+
+def _fleet_home_tree_snapshot(home_fd: int) -> dict[str, tuple[tuple[int, ...], str | None]]:
+    error = "fleet_home_content_invalid"
+    files, directories = _fleet_tree_entries(home_fd, error)
+    snapshot: dict[str, tuple[tuple[int, ...], str | None]] = {
+        "": (_fleet_snapshot_metadata(os.fstat(home_fd)), None)
+    }
+    for name in sorted(directories):
+        parent_fd, basename = _fleet_open_artifact_parent(
+            home_fd,
+            name,
+            create=False,
+            error=error,
+        )
+        try:
+            current = os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
+            _fleet_private_directory_stat(current, error)
+            snapshot[name] = (_fleet_snapshot_metadata(current), None)
+        finally:
+            os.close(parent_fd)
+    for name in sorted(files):
+        parent_fd, basename = _fleet_open_artifact_parent(
+            home_fd,
+            name,
+            create=False,
+            error=error,
+        )
+        try:
+            current = os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
+        finally:
+            os.close(parent_fd)
+        content, opened = _fleet_read_private_file_at(
+            home_fd,
+            name,
+            stat_module.S_IMODE(current.st_mode),
+            error,
+        )
+        snapshot[name] = (
+            _fleet_snapshot_metadata(opened),
+            hashlib.sha256(content).hexdigest(),
+        )
+    return snapshot
+
+
+def _fleet_restore_managed_updates(backups: list[dict[str, Any]]) -> bool:
+    if not backups:
+        return True
+    try:
+        ids = [item["old_agent"].agent_id for item in backups]
+        with pool_agent_lifecycle_locks(
+            ids,
+            snapshot=backups[0]["inventory"],
+        ), pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+            AGENT_POOL_ROOT,
+            ensure=False,
+            error_text="fleet_update_rollback_diverged",
+            require_private=True,
+        ) as root:
+            root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                for item in reversed(backups):
+                    current = _fleet_managed_home_state(
+                        root,
+                        item["old_agent"],
+                        entry_name=item["backup"],
+                        strict_contents=True,
+                    )
+                    if not source_identity_matches(current, item["home_stat"]):
+                        return False
+                    backup_fd = open_directory_no_follow_matching(
+                        root / item["backup"],
+                        current,
+                        error_text="fleet_update_rollback_diverged",
+                        changed_text="fleet_update_rollback_diverged",
+                    )
+                    try:
+                        if _fleet_home_tree_snapshot(backup_fd) != item["snapshot"]:
+                            return False
+                    finally:
+                        os.close(backup_fd)
+                    _fleet_rename_noreplace_at(
+                        root_fd,
+                        item["backup"],
+                        item["old_agent"].agent_id,
+                        current,
+                        "fleet_update_rollback_diverged",
+                        collision_text="fleet_update_rollback_diverged",
+                    )
+            finally:
+                os.close(root_fd)
+    except (AgentError, OSError):
+        return False
+    return True
+
+
+def _fleet_created_homes_match(
+    created: list[
+        tuple[str, os.stat_result, dict[str, Any], str] | tuple[str, os.stat_result, dict[str, Any]]
+    ],
+) -> bool:
+    if not created:
+        return True
+    try:
+        with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+            AGENT_POOL_ROOT,
+            ensure=False,
+            error_text="fleet_create_rollback_diverged",
+            require_private=True,
+        ) as root:
+            for created_item in created:
+                agent_id, expected_home, artifacts = created_item[:3]
+                current = _fleet_verify_home(
+                    root,
+                    agent_id,
+                    artifacts,
+                    exact_contents=True,
+                )
+                if not source_identity_matches(current, expected_home):
+                    return False
+    except (AgentError, OSError):
+        return False
+    return True
+
+
+def _fleet_reconcile_divergent_materialization(
+    current: FleetSnapshot,
+    planned: FleetSnapshot,
+    authoritative: FleetSnapshot,
+    *,
+    created: list[tuple[str, os.stat_result, dict[str, Any], str]] | None = None,
+    backups: list[dict[str, Any]] | None = None,
+    staged: list[dict[str, Any]] | None = None,
+    transaction: _FleetRecoveryTransaction | None = None,
+) -> bool:
+    if transaction is None:
+        return False
+
+    try:
+        persisted = _fleet_load_recovery_journal(transaction.paths)
+    except AgentError:
+        return False
+    if persisted is None:
+        return False
+    entries = tuple(persisted.entries)
+    if not entries:
+        return False
+    transaction.journal = persisted
+
+    authoritative_inventory = build_inventory(authoritative, AGENT_POOL_ROOT)
+    authoritative_fingerprints = {
+        agent_id: (
+            descriptor_fingerprint(authoritative_inventory.agents[agent_id])
+            if agent_id in authoritative_inventory.agents
+            else None
+        )
+        for entry in entries
+        for agent_id in [entry.agent_id]
+    }
+    plan = plan_reconciliation(persisted, authoritative_fingerprints)
+    errors, blocking = _fleet_execute_recovery_plan(
+        transaction,
+        plan,
+        authoritative,
+    )
+    if errors:
+        return False
+    if blocking:
+        return False
+    return True
+
+
+def _fleet_apply_managed_update(
+    service: FleetService,
+    current: FleetSnapshot,
+    planned: FleetSnapshot,
+    existing: FleetSeries,
+    candidate: FleetSeries,
+    materialization: dict[str, tuple[str, ...]],
+    *,
+    expected_generation: int,
+    codex_executable: Path | None,
+    gemini_executable: Path | None,
+    transaction: _FleetRecoveryTransaction | None = None,
+) -> tuple[FleetSnapshot, bool, int, int, int]:
+    if existing.enabled and not candidate.enabled:
+        raise AgentError("series_must_be_disabled")
+
+    def find_entry(
+        agent_id: str,
+        kind: MutationKind,
+    ) -> tuple[int | None, RecoveryEntry | None]:
+        if transaction is None:
+            return None, None
+        for index, entry in enumerate(transaction.journal.entries):
+            if entry.agent_id == agent_id and entry.kind == kind:
+                return index, entry
+        return None, None
+
+    old_inventory = build_inventory(current, AGENT_POOL_ROOT)
+    new_inventory = build_inventory(planned, AGENT_POOL_ROOT)
+    update_ids = list(materialization["update_ids"])
+    create_ids = list(materialization["create_ids"])
+    remove_ids = list(materialization["remove_ids"])
+    backups: list[dict[str, Any]] = []
+    created: list[tuple[str, os.stat_result, dict[str, Any], str]] = []
+    staged: list[dict[str, Any]] = []
+
+    def rollback() -> bool:
+        clean = True
+        if created and not _fleet_rollback_created(created):
+            clean = False
+        if backups and not _fleet_restore_managed_updates(backups):
+            clean = False
+        if staged and not _fleet_restore_tombstones(staged):
+            clean = False
+        return clean
+
+    def _advance_verified(target_generation: int | None = None) -> None:
+        if transaction is None:
+            return
+        if transaction.journal.phase is RecoveryPhase.CAS_PENDING:
+            transaction.advance(
+                RecoveryPhase.RECONCILING,
+                authoritative_generation=target_generation,
+            )
+        transaction.advance(
+            RecoveryPhase.VERIFIED,
+            authoritative_generation=target_generation,
+        )
+
+    if transaction is not None:
+        transaction.advance(RecoveryPhase.MATERIALIZING)
+
+    with _fleet_artifact_builder(
+        candidate.runner,
+        codex_executable=codex_executable,
+        gemini_executable=gemini_executable,
+    ) as build_artifacts:
+        try:
+            new_artifacts = {
+                agent_id: build_artifacts(new_inventory.agents[agent_id])
+                for agent_id in (*update_ids, *create_ids)
+            }
+            with _fleet_idle_agent_locks(old_inventory, [*update_ids, *remove_ids]) as pinned:
+                with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+                    AGENT_POOL_ROOT,
+                    ensure=not (update_ids or remove_ids),
+                    error_text="fleet_pool_root_invalid",
+                    require_private=True,
+                ) as root:
+                    marker_present = _fleet_root_marker_state(root)
+                    if not marker_present and (update_ids or remove_ids):
+                        raise AgentError("fleet_pool_marker_required")
+                    root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                    try:
+                        if not marker_present:
+                            _fleet_write_root_marker(root_fd)
+                        for agent_id in update_ids:
+                            old_agent = old_inventory.agents[agent_id]
+                            new_agent = new_inventory.agents[agent_id]
+                            current_home = _fleet_managed_home_state(
+                                root,
+                                old_agent,
+                                strict_contents=True,
+                            )
+                            if not source_identity_matches(current_home, pinned[agent_id]):
+                                raise AgentError("fleet_home_changed")
+                            home_fd = open_directory_no_follow_matching(
+                                root / agent_id,
+                                current_home,
+                                error_text="fleet_home_changed",
+                                changed_text="fleet_home_changed",
+                            )
+                            try:
+                                if "auth.json" in os.listdir(home_fd):
+                                    auth_bytes, auth_mode, _auth_stat = _fleet_home_file_snapshot(
+                                        home_fd,
+                                        "auth.json",
+                                    )
+                                    new_artifacts[agent_id]["extra_files"] = {
+                                        "auth.json": (auth_bytes, auth_mode)
+                                    }
+                                backup_snapshot = _fleet_home_tree_snapshot(home_fd)
+                            finally:
+                                os.close(home_fd)
+                            backup_index, backup_entry = find_entry(agent_id, MutationKind.BACKUP)
+                            if transaction is not None and backup_index is not None:
+                                transaction.record_entry_phase(backup_index, EntryPhase.INTENT)
+                            backup = (
+                                backup_entry.hidden_name
+                                if backup_entry is not None
+                                else f"{FLEET_TOMBSTONE_PREFIX}backup-{uuid.uuid4().hex}"
+                            )
+                            backup_item = {
+                                "old_agent": old_agent,
+                                "inventory": old_inventory,
+                                "backup": backup,
+                                "home_stat": current_home,
+                                "snapshot": backup_snapshot,
+                            }
+                            _fleet_rename_noreplace_at(
+                                root_fd,
+                                agent_id,
+                                backup,
+                                current_home,
+                                "fleet_managed_update_failed",
+                                collision_text="fleet_tombstone_collision",
+                                committed=lambda item=backup_item: backups.append(item),
+                            )
+                            if transaction is not None and backup_index is not None:
+                                transaction.record_entry_phase(
+                                    backup_index,
+                                    EntryPhase.INTENT,
+                                    source_identity=_snapshot_file_identity(current_home),
+                                )
+                            create_index, create_entry = find_entry(agent_id, MutationKind.CREATED)
+                            create_hidden_name = (
+                                create_entry.hidden_name if create_entry is not None else None
+                            )
+                            if create_hidden_name is None:
+                                raise AgentError("fleet_recovery_state_invalid")
+                            if transaction is not None and create_index is not None:
+                                transaction.record_entry_phase(
+                                    create_index,
+                                    EntryPhase.INTENT,
+                                )
+                            try:
+                                home_stat = _fleet_create_home(
+                                    root_fd,
+                                    agent_id,
+                                    new_artifacts[agent_id],
+                                    hidden_name=create_hidden_name,
+                                    entry_index=create_index,
+                                    transaction=transaction,
+                                )
+                            except _FleetPartialHomeError:
+                                raise AgentError("fleet_materialization_failed") from None
+                            if transaction is not None and create_index is not None:
+                                transaction.record_entry_phase(
+                                    create_index,
+                                    transaction.journal.entries[create_index].phase,
+                                    target_identity=_snapshot_file_identity(home_stat),
+                                )
+                            created.append((agent_id, home_stat, new_artifacts[agent_id], create_hidden_name))
+                            _fleet_verify_home(
+                                root,
+                                agent_id,
+                                new_artifacts[agent_id],
+                                exact_contents=True,
+                            )
+                            _fleet_managed_home_state(root, new_agent, strict_contents=True)
+
+                        for agent_id in create_ids:
+                            create_index, create_entry = find_entry(agent_id, MutationKind.CREATED)
+                            create_hidden_name = (
+                                create_entry.hidden_name if create_entry is not None else None
+                            )
+                            if path_present_no_follow(root / agent_id):
+                                raise AgentError("fleet_create_target_exists")
+                            if transaction is not None and create_index is not None:
+                                transaction.record_entry_phase(create_index, EntryPhase.INTENT)
+                            try:
+                                home_stat = _fleet_create_home(
+                                    root_fd,
+                                    agent_id,
+                                    new_artifacts[agent_id],
+                                    hidden_name=create_hidden_name,
+                                    entry_index=create_index,
+                                    transaction=transaction,
+                                )
+                            except _FleetPartialHomeError:
+                                raise AgentError("fleet_materialization_failed") from None
+                            if transaction is not None and create_index is not None:
+                                transaction.record_entry_phase(
+                                    create_index,
+                                    transaction.journal.entries[create_index].phase,
+                                    target_identity=_snapshot_file_identity(home_stat),
+                                )
+                            created.append((agent_id, home_stat, new_artifacts[agent_id], create_hidden_name or ""))
+                            _fleet_verify_home(
+                                root,
+                                agent_id,
+                                new_artifacts[agent_id],
+                                exact_contents=True,
+                            )
+
+                        for agent_id in sorted(
+                            remove_ids,
+                            key=lambda item: old_inventory.agents[item].ordinal,
+                            reverse=True,
+                        ):
+                            old_agent = old_inventory.agents[agent_id]
+                            current_home = _fleet_managed_home_state(
+                                root,
+                                old_agent,
+                                strict_contents=True,
+                            )
+                            if not source_identity_matches(current_home, pinned[agent_id]):
+                                raise AgentError("fleet_home_changed")
+                            tombstone_index, tombstone_entry = find_entry(agent_id, MutationKind.TOMBSTONE)
+                            if transaction is not None and tombstone_index is not None:
+                                transaction.record_entry_phase(tombstone_index, EntryPhase.INTENT)
+                            tombstone = (
+                                tombstone_entry.hidden_name
+                                if tombstone_entry is not None
+                                else f"{FLEET_TOMBSTONE_PREFIX}{uuid.uuid4().hex}"
+                            )
+                            staged_item = {
+                                "agent": old_agent,
+                                "inventory": old_inventory,
+                                "tombstone": tombstone,
+                                "home_stat": current_home,
+                            }
+                            _fleet_rename_noreplace_at(
+                                root_fd,
+                                agent_id,
+                                tombstone,
+                                current_home,
+                                "fleet_tombstone_stage_failed",
+                                collision_text="fleet_tombstone_collision",
+                                committed=lambda item=staged_item: staged.append(item),
+                            )
+                            if transaction is not None and tombstone_index is not None:
+                                transaction.record_entry_phase(
+                                    tombstone_index,
+                                    EntryPhase.INTENT,
+                                    source_identity=_snapshot_file_identity(current_home),
+                                )
+                    finally:
+                        os.close(root_fd)
+            build_artifacts.validate()  # type: ignore[attr-defined]
+        except Exception as exc:
+            if not rollback():
+                raise AgentError("fleet_update_rollback_diverged") from None
+            if isinstance(exc, AgentError):
+                raise
+            raise AgentError("fleet_managed_update_failed") from None
+        if transaction is not None:
+            transaction.advance(RecoveryPhase.CAS_PENDING)
+        try:
+            stored = service.commit_snapshot(planned, expected_generation=expected_generation)
+        except Exception as exc:
+            state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
+            if state == "planned":
+                if transaction is not None:
+                    _advance_verified(reloaded.generation)
+                try:
+                    build_artifacts.validate()  # type: ignore[attr-defined]
+                except AgentError:
+                    _fleet_publish_stored(service, reloaded)
+                    raise AgentError("fleet_executable_changed_after_cas") from None
+                _fleet_publish_stored(service, reloaded)
+                try:
+                    build_artifacts.validate()  # type: ignore[attr-defined]
+                except AgentError:
+                    raise AgentError("fleet_executable_changed_after_cas") from None
+                created = []
+                backups = []
+                staged = []
+                raise AgentError("fleet_registry_commit_failed_after_cas") from None
+            if state == "diverged":
+                if transaction is not None:
+                    transaction.advance(
+                        RecoveryPhase.RECONCILING,
+                        authoritative_generation=reloaded.generation,
+                    )
+                reconciled = _fleet_reconcile_divergent_materialization(
+                    current,
+                    planned,
+                    reloaded,
+                    created=created,
+                    backups=backups,
+                    staged=staged,
+                    transaction=transaction,
+                )
+                if not reconciled:
+                    raise AgentError("fleet_registry_commit_diverged") from None
+                if transaction is not None:
+                    _advance_verified(reloaded.generation)
+                _fleet_publish_stored(service, reloaded)
+                created = []
+                backups = []
+                staged = []
+                raise AgentError("fleet_registry_commit_diverged") from None
+            if not rollback():
+                created = []
+                backups = []
+                staged = []
+                raise AgentError("fleet_update_rollback_diverged") from None
+            if isinstance(exc, FleetConflictError):
+                if transaction is not None:
+                    _fleet_complete_rolled_back_transaction(
+                        transaction,
+                        current.generation,
+                    )
+                created = []
+                backups = []
+                staged = []
+                raise AgentError("generation_conflict") from None
+            created = []
+            backups = []
+            staged = []
+            raise AgentError("fleet_registry_commit_failed") from None
+        try:
+            build_artifacts.validate()  # type: ignore[attr-defined]
+        except AgentError:
+            if transaction is not None:
+                _advance_verified(stored.generation)
+            _fleet_publish_stored(service, stored)
+            raise AgentError("fleet_executable_changed_after_cas") from None
+        if transaction is not None:
+            transaction.advance(
+                RecoveryPhase.RECONCILING,
+                authoritative_generation=stored.generation,
+            )
+            transaction.advance(RecoveryPhase.VERIFIED, authoritative_generation=stored.generation)
+        _fleet_publish_stored(service, stored)
+        if transaction is not None:
+            transaction.advance(RecoveryPhase.PUBLISHED, authoritative_generation=stored.generation)
+            transaction.advance(RecoveryPhase.COMPLETE, authoritative_generation=stored.generation)
+            _fleet_remove_complete_recovery_journal(transaction.journal)
+        try:
+            build_artifacts.validate()  # type: ignore[attr-defined]
+        except AgentError:
+            raise AgentError("fleet_executable_changed_after_cas") from None
+    cleanup_pending = bool(backups or staged)
+    try:
+        cleanup_pending = _fleet_cleanup_tombstones(staged) or cleanup_pending
+    except Exception:
+        cleanup_pending = True
+    cleanup_pending = build_artifacts.close_state["cleanup_pending"] or cleanup_pending  # type: ignore[attr-defined]
+    return stored, cleanup_pending, len(create_ids), len(update_ids), len(remove_ids)
+
+
+def fleet_series_apply(
+    *,
+    prefix: str,
+    count: int,
+    runner: str,
+    provider: str,
+    model: str,
+    account_id: str | None,
+    enabled: bool = True,
+    expected_generation: int,
+    confirmed_remove_ids: list[str] | None = None,
+    codex_executable: Path | None = None,
+    gemini_executable: Path | None = None,
+) -> dict[str, Any]:
+    service = current_fleet_service()
+    plan, current, planned, existing, candidate, materialization = _fleet_series_plan_with_service(
+        service,
+        prefix=prefix,
+        count=count,
+        runner=runner,
+        provider=provider,
+        model=model,
+        account_id=account_id,
+        enabled=enabled,
+        expected_generation=expected_generation,
+        confirmed_remove_ids=confirmed_remove_ids,
+    )
+    planned_inventory = build_inventory(planned, AGENT_POOL_ROOT)
+    old_count = existing.count if existing is not None else 0
+    managed_changed = existing is not None and (
+        existing.runner is not candidate.runner
+        or existing.provider is not candidate.provider
+        or existing.model != candidate.model
+    )
+    prepared_recovery_entries: tuple[RecoveryEntry, ...] = ()
+    with fleet_mutation_lock(FleetPaths.from_state_root(STATE_ROOT)):
+        if managed_changed and any(
+            plan[name] for name in ("create_count", "update_count", "remove_count")
+        ):
+            prepared_recovery_entries = _fleet_prepare_managed_update_recovery_entries(
+                current,
+                planned,
+                materialization["update_ids"],
+                materialization["create_ids"],
+                materialization["remove_ids"],
+            )
+            with _fleet_active_recovery_transaction(
+                _FleetRecoveryTransaction.begin(
+                    RecoveryOperation.SERIES_APPLY,
+                    current,
+                    planned,
+                    prepared_recovery_entries,
+                )
+            ):
+                stored, cleanup_pending, created_count, updated_count, removed_count = _fleet_apply_managed_update(
+                    service,
+                    current,
+                    planned,
+                    existing,
+                    candidate,
+                    materialization,
+                    expected_generation=expected_generation,
+                    codex_executable=codex_executable,
+                    gemini_executable=gemini_executable,
+                    transaction=_FLEET_ACTIVE_RECOVERY_TRANSACTION.get(),
+                )
+            return {
+                "mutation_performed": True,
+                "generation": stored.generation,
+                "created_count": created_count,
+                "kept_count": 0,
+                "updated_count": updated_count,
+                "removed_count": removed_count,
+                "cleanup_pending": cleanup_pending,
+                "pool_root": "not_returned",
+                "raw_output": "not_returned",
+            }
+    with fleet_mutation_lock(FleetPaths.from_state_root(STATE_ROOT)):
+        enabling = existing is not None and not existing.enabled and candidate.enabled
+        registry_only = not any(
+            materialization[name]
+            for name in ("create_ids", "update_ids", "remove_ids")
+        ) and (
+            (existing is None and not candidate.enabled)
+            or managed_changed
+            or (
+                existing is not None
+                and old_count == candidate.count
+                and not enabling
+            )
+        )
+        if registry_only:
+            _fleet_validate_materialized_series_homes(planned, candidate)
+            try:
+                stored = service.commit_snapshot(planned, expected_generation=expected_generation)
+            except Exception as exc:
+                state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
+                if state == "planned":
+                    _fleet_publish_stored(service, reloaded)
+                    raise AgentError("fleet_registry_commit_failed_after_cas") from None
+                if state == "diverged":
+                    _fleet_publish_stored(service, reloaded)
+                    raise AgentError("fleet_registry_commit_diverged") from None
+                if isinstance(exc, FleetConflictError):
+                    raise AgentError("generation_conflict") from None
+                raise AgentError("fleet_registry_commit_failed") from None
+            _fleet_publish_stored(service, stored)
+            return {
+                "mutation_performed": True,
+                "generation": stored.generation,
+                "created_count": 0,
+                "kept_count": len(materialization["keep_ids"]),
+                "updated_count": len(materialization["update_ids"]),
+                "removed_count": len(materialization["remove_ids"]),
+                "cleanup_pending": False,
+                "pool_root": "not_returned",
+                "raw_output": "not_returned",
+            }
+
+        create_ids = list(materialization["create_ids"])
+        keep_ids = list(materialization["keep_ids"])
+        update_ids = list(materialization["update_ids"])
+        remove_ids = list(materialization["remove_ids"])
+        verify_keep_ids = keep_ids if enabling else []
+        artifacts: dict[str, dict[str, Any]] = {}
+        created: list[tuple[str, os.stat_result, dict[str, Any]]] = []
+        staged: list[dict[str, Any]] = []
+        active_tx = None
+        preplanned_create_indexes: dict[str, int] = {}
+        preplanned_create_names: dict[str, str] = {}
+        planned_tombstone_indexes: dict[str, int] = {}
+        planned_tombstone_names: dict[str, str] = {}
+        if create_ids or update_ids or remove_ids:
+            prepared_entries: list[RecoveryEntry] = []
+            current_inventory = build_inventory(current, AGENT_POOL_ROOT)
+            for agent_id in create_ids:
+                hidden_name = f"{FLEET_TOMBSTONE_PREFIX}create-{uuid.uuid4().hex}"
+                new_agent = planned_inventory.agents[agent_id]
+                preplanned_create_indexes[agent_id] = len(prepared_entries)
+                preplanned_create_names[agent_id] = hidden_name
+                prepared_entries.append(
+                    RecoveryEntry(
+                        kind=MutationKind.CREATED,
+                        agent_id=agent_id,
+                        hidden_name=hidden_name,
+                        old_descriptor_fingerprint=None,
+                        new_descriptor_fingerprint=descriptor_fingerprint(new_agent),
+                        old_materialization_fingerprint=None,
+                        new_materialization_fingerprint=None,
+                        source_identity=None,
+                        target_identity=None,
+                        manifest=(),
+                        phase=EntryPhase.INTENT,
+                        result_code=None,
+                    )
+                )
+            for agent_id in remove_ids:
+                old_agent = current_inventory.agents[agent_id]
+                hidden_name = f"{FLEET_TOMBSTONE_PREFIX}tombstone-{uuid.uuid4().hex}"
+                planned_tombstone_indexes[agent_id] = len(prepared_entries)
+                planned_tombstone_names[agent_id] = hidden_name
+                prepared_entries.append(
+                    RecoveryEntry(
+                        kind=MutationKind.TOMBSTONE,
+                        agent_id=agent_id,
+                        hidden_name=hidden_name,
+                        old_descriptor_fingerprint=descriptor_fingerprint(old_agent),
+                        new_descriptor_fingerprint=None,
+                        old_materialization_fingerprint=None,
+                        new_materialization_fingerprint=None,
+                        source_identity=None,
+                        target_identity=None,
+                        manifest=(),
+                        phase=EntryPhase.INTENT,
+                        result_code=None,
+                    )
+                )
+            active_tx = _FleetRecoveryTransaction.begin(
+                RecoveryOperation.SERIES_APPLY,
+                current,
+                planned,
+                tuple(prepared_entries),
+            )
+            _fleet_recovery_crash_point("after_journal_before_pool")
+        artifact_context = (
+            _fleet_artifact_builder(
+                candidate.runner,
+                codex_executable=codex_executable,
+                gemini_executable=gemini_executable,
+            )
+            if create_ids or verify_keep_ids
+            else contextlib.nullcontext(None)
+        )
+        with _fleet_active_recovery_transaction(active_tx):
+            with artifact_context as build_artifacts:
+                try:
+                    def _advance_verified(target_generation: int | None = None) -> None:
+                        if active_tx is None:
+                            return
+                        if active_tx.journal.phase is RecoveryPhase.CAS_PENDING:
+                            active_tx.advance(
+                                RecoveryPhase.RECONCILING,
+                                authoritative_generation=target_generation,
+                            )
+                        active_tx.advance(
+                            RecoveryPhase.VERIFIED,
+                            authoritative_generation=target_generation,
+                        )
+
+                    if active_tx is not None:
+                        active_tx.advance(RecoveryPhase.MATERIALIZING)
+                    _fleet_recovery_crash_point("after_intent_before_filesystem")
+                    if build_artifacts is not None:
+                        for agent_id in (*verify_keep_ids, *create_ids):
+                            artifacts[agent_id] = build_artifacts(planned_inventory.agents[agent_id])
+                    if verify_keep_ids or create_ids:
+                        with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+                            AGENT_POOL_ROOT,
+                            ensure=True,
+                            error_text="fleet_pool_root_invalid",
+                            require_private=True,
+                        ) as root:
+                            marker_present = _fleet_root_marker_state(root)
+                            if not marker_present and remove_ids:
+                                raise AgentError("fleet_pool_marker_required")
+                            for agent_id in verify_keep_ids:
+                                _fleet_verify_home(root, agent_id, artifacts[agent_id], exact_contents=False)
+                            for agent_id in keep_ids:
+                                _fleet_managed_home_state(
+                                    root,
+                                    planned_inventory.agents[agent_id],
+                                    strict_contents=True,
+                                )
+                            for agent_id in create_ids:
+                                if path_present_no_follow(root / agent_id):
+                                    raise AgentError("fleet_create_target_exists")
+                            root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                            try:
+                                if not marker_present:
+                                    _fleet_write_root_marker(root_fd)
+                                for agent_id in create_ids:
+                                    try:
+                                        home_stat = _fleet_create_home(
+                                            root_fd,
+                                            agent_id,
+                                            artifacts[agent_id],
+                                            hidden_name=preplanned_create_names[agent_id],
+                                            entry_index=preplanned_create_indexes[agent_id],
+                                            transaction=active_tx,
+                                        )
+                                    except _FleetPartialHomeError:
+                                        raise AgentError("fleet_materialization_failed") from None
+                                    entry_index = preplanned_create_indexes[agent_id]
+                                    if active_tx is not None and entry_index is not None:
+                                        active_tx.record_entry_phase(
+                                            entry_index,
+                                            active_tx.journal.entries[entry_index].phase,
+                                            target_identity=_snapshot_file_identity(home_stat),
+                                        )
+                                    created.append(
+                                        (
+                                            agent_id,
+                                            home_stat,
+                                            artifacts[agent_id],
+                                            preplanned_create_names[agent_id],
+                                        )
+                                    )
+                                for created_item in created:
+                                    agent_id, _home_stat, item_artifacts = created_item[:3]
+                                    _fleet_verify_home(root, agent_id, item_artifacts, exact_contents=True)
+                            finally:
+                                os.close(root_fd)
+                    if remove_ids:
+                        staged = _fleet_stage_tombstones(
+                            build_inventory(current, AGENT_POOL_ROOT),
+                            remove_ids,
+                            transaction=active_tx,
+                            planned_tombstones={
+                                agent_id: (
+                                    planned_tombstone_names[agent_id],
+                                    planned_tombstone_indexes[agent_id],
+                                )
+                                for agent_id in planned_tombstone_names
+                            },
+                        )
+                    _fleet_recovery_crash_point("after_filesystem_before_applied")
+                    if build_artifacts is not None:
+                        build_artifacts.validate()  # type: ignore[attr-defined]
+                    _fleet_recovery_crash_point("after_materialization_before_cas")
+                    try:
+                        if active_tx is not None and active_tx.journal.phase is RecoveryPhase.MATERIALIZING:
+                            active_tx.advance(RecoveryPhase.CAS_PENDING)
+                        stored = service.commit_snapshot(
+                            planned, expected_generation=expected_generation
+                        )
+                        _fleet_recovery_crash_point("after_cas_before_reload")
+                    except Exception as exc:
+                        reconciled_materialization = False
+                        state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
+                        if state == "planned":
+                            if active_tx is not None:
+                                _advance_verified(reloaded.generation)
+                            if build_artifacts is not None:
+                                try:
+                                    build_artifacts.validate()  # type: ignore[attr-defined]
+                                except AgentError:
+                                    _fleet_publish_stored(service, reloaded)
+                                    raise AgentError("fleet_executable_changed_after_cas") from None
+                            _fleet_publish_stored(service, reloaded)
+                            if build_artifacts is not None:
+                                try:
+                                    build_artifacts.validate()  # type: ignore[attr-defined]
+                                except AgentError:
+                                    created = []
+                                    staged = []
+                                    raise AgentError("fleet_executable_changed_after_cas") from None
+                            created = []
+                            staged = []
+                            raise AgentError("fleet_registry_commit_failed_after_cas") from None
+                        if state == "diverged":
+                            if active_tx is not None:
+                                active_tx.advance(
+                                    RecoveryPhase.RECONCILING,
+                                    authoritative_generation=reloaded.generation,
+                                )
+                            if reloaded.series == current.series and (
+                                created or staged
+                            ):
+                                reconciled_materialization = True
+                                reconciled = _fleet_reconcile_divergent_materialization(
+                                    current,
+                                    planned,
+                                    reloaded,
+                                    created=created,
+                                    staged=staged,
+                                    transaction=active_tx,
+                                )
+                                if not reconciled:
+                                    created = []
+                                    staged = []
+                                    raise AgentError("fleet_registry_commit_diverged") from None
+                                created = []
+                                staged = []
+                                if active_tx is not None:
+                                    _advance_verified(reloaded.generation)
+                            else:
+                                if not created:
+                                    created = []
+                                    staged = []
+                            raise AgentError("fleet_registry_commit_diverged") from None
+                        clean = _fleet_rollback_created(created)
+                        if staged and not reconciled_materialization and not _fleet_restore_tombstones(staged):
+                            clean = False
+                            staged = []
+                        if not clean:
+                            created = []
+                            staged = []
+                            raise AgentError("fleet_create_rollback_diverged") from None
+                        if isinstance(exc, FleetConflictError):
+                            if active_tx is not None:
+                                _fleet_complete_rolled_back_transaction(
+                                    active_tx,
+                                    current.generation,
+                                )
+                            created = []
+                            staged = []
+                            raise AgentError("generation_conflict") from None
+                        created = []
+                        staged = []
+                        raise AgentError("fleet_registry_commit_failed") from None
+                    if build_artifacts is not None:
+                        try:
+                            build_artifacts.validate()  # type: ignore[attr-defined]
+                        except AgentError:
+                            if active_tx is not None:
+                                _advance_verified(stored.generation)
+                            created = []
+                            staged = []
+                            _fleet_publish_stored(service, stored)
+                            raise AgentError("fleet_executable_changed_after_cas") from None
+                    try:
+                        if active_tx is not None:
+                            _advance_verified(stored.generation)
+                        _fleet_recovery_crash_point("after_verify_before_publish")
+                        _fleet_publish_stored(service, stored)
+                        _fleet_recovery_crash_point("after_publish_before_complete")
+                    except AgentError:
+                        created = []
+                        staged = []
+                        raise
+                    if build_artifacts is not None:
+                        try:
+                            build_artifacts.validate()  # type: ignore[attr-defined]
+                        except AgentError:
+                            if active_tx is not None:
+                                _fleet_remove_complete_recovery_journal(active_tx.journal)
+                            created = []
+                            staged = []
+                            raise AgentError("fleet_executable_changed_after_cas") from None
+                    if active_tx is not None:
+                        active_tx.advance(
+                            RecoveryPhase.PUBLISHED,
+                            authoritative_generation=stored.generation,
+                        )
+                        active_tx.advance(
+                            RecoveryPhase.COMPLETE,
+                            authoritative_generation=stored.generation,
+                        )
+                        _fleet_recovery_crash_point("after_complete_before_remove")
+                        _fleet_remove_complete_recovery_journal(active_tx.journal)
+                except Exception as exc:
+                    clean = _fleet_rollback_created(created)
+                    if staged and not _fleet_restore_tombstones(staged):
+                        clean = False
+                    if not clean:
+                        raise AgentError("fleet_create_rollback_diverged") from None
+                    if isinstance(exc, AgentError):
+                        raise
+                    raise AgentError("fleet_materialization_failed") from None
+        cleanup_pending = bool(staged)
+        try:
+            cleanup_pending = _fleet_cleanup_tombstones(staged) or cleanup_pending
+        except Exception:
+            cleanup_pending = True
+        if build_artifacts is not None:
+            cleanup_pending = build_artifacts.close_state["cleanup_pending"] or cleanup_pending  # type: ignore[attr-defined]
+        return {
+            "mutation_performed": True,
+            "generation": stored.generation,
+            "created_count": len(create_ids),
+            "kept_count": len(keep_ids),
+            "updated_count": plan["update_count"],
+            "removed_count": len(remove_ids),
+            "cleanup_pending": cleanup_pending,
+            "pool_root": "not_returned",
+            "raw_output": "not_returned",
+        }
+
+
+def fleet_series_disable(*, prefix: str, expected_generation: int) -> dict[str, Any]:
+    service = current_fleet_service()
+    with fleet_mutation_lock(FleetPaths.from_state_root(STATE_ROOT)):
+        try:
+            current = service.load()
+            planned = plan_series_disable(
+                current,
+                prefix,
+                expected_generation=expected_generation,
+            )
+            build_inventory(planned, AGENT_POOL_ROOT)
+            planned_series = next(item for item in planned.series if item.prefix == prefix)
+            _fleet_validate_materialized_series_homes(planned, planned_series)
+        except FleetValidationError as exc:
+            raise AgentError(str(exc)) from None
+        except AgentError:
+            raise
+        except Exception:
+            raise AgentError("fleet_registry_commit_failed") from None
+        try:
+            stored = service.commit_snapshot(planned, expected_generation=expected_generation)
+        except Exception as exc:
+            state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
+            if state == "planned":
+                _fleet_publish_stored(service, reloaded)
+                raise AgentError("fleet_registry_commit_failed_after_cas") from None
+            if state == "diverged":
+                _fleet_publish_stored(service, reloaded)
+                raise AgentError("fleet_registry_commit_diverged") from None
+            if isinstance(exc, FleetConflictError):
+                raise AgentError("generation_conflict") from None
+            raise AgentError("fleet_registry_commit_failed") from None
+        _fleet_publish_stored(service, stored)
+        return {
+            "mutation_performed": True,
+            "generation": stored.generation,
+            "disabled": True,
+            "pool_root": "not_returned",
+            "raw_output": "not_returned",
+        }
+
+
+def fleet_series_delete(
+    *,
+    prefix: str,
+    expected_generation: int,
+    confirmed_remove_ids: list[str],
+    yes: bool = False,
+) -> dict[str, Any]:
+    service = current_fleet_service()
+    with fleet_mutation_lock(FleetPaths.from_state_root(STATE_ROOT)):
+        try:
+            current = service.load()
+            planned = plan_series_delete(
+                current,
+                prefix,
+                expected_generation=expected_generation,
+            )
+        except FleetValidationError as exc:
+            raise AgentError(str(exc)) from None
+        existing = next(item for item in current.series if item.prefix == prefix)
+        if not yes:
+            raise AgentError("fleet_series_delete_confirmation_required")
+        expected_ids = [f"{prefix}{ordinal}" for ordinal in range(1, existing.count + 1)]
+        if (
+            not isinstance(confirmed_remove_ids, list)
+            or len(confirmed_remove_ids) != len(expected_ids)
+            or frozenset(confirmed_remove_ids) != frozenset(expected_ids)
+        ):
+            raise AgentError("remove_confirmation_required")
+        build_inventory(planned, AGENT_POOL_ROOT)
+        present_ids = _fleet_plan_materialized_ids(prefix, existing.count)
+        if not present_ids:
+            old_inventory = build_inventory(current, AGENT_POOL_ROOT)
+            planned_tombstones: dict[str, tuple[str, int]] = {}
+            prepared_entries: list[RecoveryEntry] = []
+            for agent_id in expected_ids:
+                entry_index = len(prepared_entries)
+                hidden_name = f"{FLEET_TOMBSTONE_PREFIX}reservation-{uuid.uuid4().hex}"
+                planned_tombstones[agent_id] = (hidden_name, entry_index)
+                prepared_entries.append(
+                    RecoveryEntry(
+                        kind=MutationKind.RESERVATION,
+                        agent_id=agent_id,
+                        hidden_name=hidden_name,
+                        old_descriptor_fingerprint=descriptor_fingerprint(
+                            old_inventory.agents[agent_id]
+                        ),
+                        new_descriptor_fingerprint=None,
+                        old_materialization_fingerprint=None,
+                        new_materialization_fingerprint=None,
+                        source_identity=None,
+                        target_identity=None,
+                        manifest=(),
+                        phase=EntryPhase.INTENT,
+                        result_code=None,
+                    )
+                )
+            active_tx = _FleetRecoveryTransaction.begin(
+                RecoveryOperation.SERIES_APPLY,
+                current,
+                planned,
+                tuple(prepared_entries),
+            )
+            active_tx.advance(RecoveryPhase.MATERIALIZING)
+            reservations = _fleet_reserve_absent_homes(
+                expected_ids,
+                transaction=active_tx,
+                planned_reservations=planned_tombstones,
+            )
+            active_tx.advance(RecoveryPhase.CAS_PENDING)
+            stored: FleetSnapshot | None = None
+            try:
+                try:
+                    stored = service.commit_snapshot(planned, expected_generation=expected_generation)
+                except Exception as exc:
+                    state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
+                    if state == "planned":
+                        stored = reloaded
+                        _fleet_publish_recovery_commit(service, reloaded, active_tx)
+                        raise AgentError("fleet_registry_commit_failed_after_cas") from None
+                    if state == "diverged":
+                        active_tx.advance(
+                            RecoveryPhase.RECONCILING,
+                            authoritative_generation=reloaded.generation,
+                        )
+                        descriptor_states = _fleet_descriptor_reconciliation_states(
+                            current,
+                            planned,
+                            reloaded,
+                            set(expected_ids),
+                        )
+                        if any(
+                            descriptor_state == "unknown"
+                            for descriptor_state in descriptor_states.values()
+                        ):
+                            raise AgentError("fleet_registry_commit_diverged") from None
+                        _fleet_publish_recovery_commit(service, reloaded, active_tx)
+                        raise AgentError("fleet_registry_commit_diverged") from None
+                    if isinstance(exc, FleetConflictError):
+                        raise AgentError("generation_conflict") from None
+                    raise AgentError("fleet_registry_commit_failed") from None
+                _fleet_publish_recovery_commit(service, stored, active_tx)
+            finally:
+                if active_tx.journal.phase is RecoveryPhase.PUBLISHED:
+                    if not _fleet_release_reservations(reservations):
+                        raise AgentError("fleet_registry_delete_raced") from None
+                    active_tx.advance(RecoveryPhase.COMPLETE)
+                    _fleet_remove_complete_recovery_journal(active_tx.journal)
+            return {
+                "mutation_performed": True,
+                "generation": stored.generation,
+                "removed_count": 0,
+                "cleanup_pending": True,
+                "pool_root": "not_returned",
+                "raw_output": "not_returned",
+            }
+        old_inventory = build_inventory(current, AGENT_POOL_ROOT)
+        planned_tombstones = {
+            agent_id: (
+                f"{FLEET_TOMBSTONE_PREFIX}tombstone-{uuid.uuid4().hex}",
+                index,
+            )
+            for index, agent_id in enumerate(expected_ids)
+        }
+        prepared_entries = tuple(
+            RecoveryEntry(
+                kind=MutationKind.TOMBSTONE,
+                agent_id=agent_id,
+                hidden_name=hidden_name,
+                old_descriptor_fingerprint=descriptor_fingerprint(old_inventory.agents[agent_id]),
+                new_descriptor_fingerprint=None,
+                old_materialization_fingerprint=None,
+                new_materialization_fingerprint=None,
+                source_identity=None,
+                target_identity=None,
+                manifest=(),
+                phase=EntryPhase.INTENT,
+                result_code=None,
+            )
+            for agent_id, (hidden_name, _) in planned_tombstones.items()
+        )
+        active_tx = _FleetRecoveryTransaction.begin(
+            RecoveryOperation.SERIES_APPLY,
+            current,
+            planned,
+            prepared_entries,
+        )
+        active_tx.advance(RecoveryPhase.MATERIALIZING)
+        stored, cleanup_pending = _fleet_commit_staged_removal(
+            service,
+            current,
+            planned,
+            expected_generation=expected_generation,
+            inventory=old_inventory,
+            agent_ids_to_remove=expected_ids,
+            planned_tombstones=planned_tombstones,
+            transaction=active_tx,
+        )
+        _fleet_remove_complete_recovery_journal(active_tx.journal)
+        return {
+            "mutation_performed": True,
+            "generation": stored.generation,
+            "removed_count": len(expected_ids),
+            "cleanup_pending": cleanup_pending,
+            "pool_root": "not_returned",
+            "raw_output": "not_returned",
+        }
 
 
 def pool_expand_text(value: str) -> str:
@@ -13268,7 +18869,10 @@ def pool_wrapper_text(agent: str, home: Path, codex_bin: str) -> str:
             "fi",
             "export CODEX_AGENT_BIN",
             "unset CODEX_ACCESS_TOKEN OPENAI_API_KEY",
-            'exec taskset --cpu-list 4-10 /usr/bin/env -- "${CODEX_AGENT_BIN}" "$@"',
+            "if taskset --cpu-list 4-10 /usr/bin/true >/dev/null 2>&1; then",
+            '  exec taskset --cpu-list 4-10 /usr/bin/env -- "${CODEX_AGENT_BIN}" "$@"',
+            "fi",
+            'exec /usr/bin/env -- "${CODEX_AGENT_BIN}" "$@"',
             "",
         ]
     )
@@ -13379,10 +18983,22 @@ def pool_write_private_bytes_if_absent(path: Path, data: bytes, mode: int = 0o60
         os.close(parent_fd)
 
 
-def pool_read_private_bytes(path: Path, max_bytes: int, error_text: str) -> bytes:
+def pool_read_private_bytes(
+    path: Path,
+    max_bytes: int,
+    error_text: str,
+    *,
+    expected_parent_stat: os.stat_result | None = None,
+    expected_target_stat: os.stat_result | None = None,
+    expected_mode: int | None = None,
+) -> bytes:
     parent_fd = -1
     try:
-        parent_stat = path.parent.lstat()
+        parent_stat = (
+            expected_parent_stat
+            if expected_parent_stat is not None
+            else path.parent.lstat()
+        )
         parent_fd = open_directory_no_follow_matching(
             path.parent,
             parent_stat,
@@ -13397,9 +19013,11 @@ def pool_read_private_bytes(path: Path, max_bytes: int, error_text: str) -> byte
     if (
         stat_module.S_ISLNK(current.st_mode)
         or not stat_module.S_ISREG(current.st_mode)
-        or getattr(current, "st_nlink", 1) > 1
+        or getattr(current, "st_nlink", 1) != 1
         or current.st_size > max_bytes
     ):
+        os.close(parent_fd)
+        parent_fd = -1
         raise AgentError(error_text)
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -13410,10 +19028,15 @@ def pool_read_private_bytes(path: Path, max_bytes: int, error_text: str) -> byte
         opened = os.fstat(fd)
         if (
             not source_identity_matches(opened, current)
+            or (
+                expected_target_stat is not None
+                and not source_identity_with_snapshot_matches(opened, expected_target_stat)
+            )
             or stat_module.S_ISLNK(opened.st_mode)
             or not stat_module.S_ISREG(opened.st_mode)
-            or getattr(opened, "st_nlink", 1) > 1
+            or getattr(opened, "st_nlink", 1) != 1
             or opened.st_size > max_bytes
+            or (expected_mode is not None and stat_module.S_IMODE(opened.st_mode) != expected_mode)
         ):
             raise AgentError(error_text)
         with os.fdopen(fd, "rb") as fh:
@@ -13431,6 +19054,20 @@ def pool_read_private_bytes(path: Path, max_bytes: int, error_text: str) -> byte
     if len(data) > max_bytes:
         raise AgentError(error_text)
     return data
+
+
+def fleet_read_optional_private_bytes(path: Path, max_bytes: int, error_text: str) -> bytes | None:
+    stats = _fleet_optional_stats(path, error_text)
+    if stats is None:
+        return None
+    parent_stat, target_stat = stats
+    return pool_read_private_bytes(
+        path,
+        max_bytes,
+        error_text,
+        expected_parent_stat=parent_stat,
+        expected_target_stat=target_stat,
+    )
 
 
 def pool_private_text_matches(path: Path, expected: str, max_bytes: int) -> bool:
@@ -13714,6 +19351,7 @@ def pool_root_operation(
     error_text: str,
     expected_parent_stat: os.stat_result | None = None,
     expected_root_stat: os.stat_result | None = None,
+    require_private: bool = False,
 ) -> Any:
     if expected_parent_stat is None:
         try:
@@ -13734,6 +19372,8 @@ def pool_root_operation(
     else:
         root_stat = expected_root_stat
 
+    if require_private and root_stat is not None:
+        _fleet_private_directory_stat(root_stat, error_text)
     if ensure:
         ensure_private_dir(root)
     elif parent_stat is None or root_stat is None:
@@ -13748,6 +19388,8 @@ def pool_root_operation(
             root_stat = root.lstat()
         except OSError as exc:
             raise AgentError(error_text) from exc
+    if require_private:
+        _fleet_private_directory_stat(root_stat, error_text)
 
     parent_fd = -1
     root_fd = -1
@@ -13765,6 +19407,8 @@ def pool_root_operation(
             changed_text=error_text,
             dir_fd=parent_fd,
         )
+        if require_private:
+            _fleet_private_directory_stat(os.fstat(root_fd), error_text)
         operation_root = Path(f"/proc/self/fd/{root_fd}")
         yield operation_root
     finally:
@@ -14069,11 +19713,21 @@ def agent_pool_copy_auth(
 
 
 @contextlib.contextmanager
-def pool_agent_lifecycle_locks(agents: list[str]) -> Any:
+def pool_agent_lifecycle_locks(
+    agents: list[str],
+    *,
+    snapshot: InventorySnapshot | None = None,
+) -> Any:
+    known_agents = set((snapshot or current_agent_inventory()).agent_ids)
     with contextlib.ExitStack() as stack:
         for agent in sorted(agents):
-            if agent in AGENTS:
-                stack.enter_context(agent_lifecycle_lock(agent))
+            if agent in known_agents:
+                lock = (
+                    agent_lifecycle_lock(agent)
+                    if snapshot is None
+                    else agent_lifecycle_lock(agent, snapshot=snapshot)
+                )
+                stack.enter_context(lock)
         yield
 
 
@@ -14193,8 +19847,9 @@ def _agent_pool_destroy_pool_unlocked(
                     raise AgentError("pool marker changed during removal")
 
         with pool_agent_lifecycle_locks(normalized["ids"]):
+            known_agents = set(all_agent_ids())
             for agent in normalized["ids"]:
-                if agent in AGENTS:
+                if agent in known_agents:
                     lease = agent_lease_status(agent, initialize_state=False)
                     if lease.get("state") not in {"unclaimed", "expired"}:
                         raise AgentError("pool Agentin has an active or unreadable lease")
@@ -14308,7 +19963,958 @@ def agent_pool_destroy_pool(
         )
 
 
+def legacy_agent_inventory(
+    agents: Mapping[str, Mapping[str, Any]] | None = None,
+) -> InventorySnapshot:
+    runtime_fallback = agents is None
+    source = AGENTS if runtime_fallback else agents
+    descriptors: dict[str, AgentDescriptor] = {}
+    by_series_lists: dict[str, list[str]] = {}
+    positions: dict[str, int] = {}
+    agent_ids: list[str] = []
+    series_prefixes: list[str] = []
+    for agent, config in source.items():
+        match = re.fullmatch(r"([a-z])([1-9][0-9]{0,2})", agent)
+        if not isinstance(config, Mapping):
+            raise AgentError("legacy_agent_inventory_invalid")
+        if match is None:
+            if not runtime_fallback or agent not in LEGACY_AGENT_ALIASES:
+                raise AgentError("legacy_agent_inventory_invalid")
+            prefix = agent
+            ordinal = 1
+        else:
+            prefix, ordinal_text = match.groups()
+            ordinal = int(ordinal_text)
+        if runtime_fallback:
+            home = Path(config.get("home", AGENT_POOL_ROOT / agent))
+            label = config.get("label", f"Codex Agentin {agent.upper()}")
+            Path(config.get("runner", home / "codex"))
+            session = config.get("session", f"codex_agent_{agent}_mcp")
+        else:
+            try:
+                label = config["label"]
+                Path(config["runner"])
+                home = Path(config["home"])
+                session = config["session"]
+            except (KeyError, TypeError, ValueError):
+                raise AgentError("legacy_agent_inventory_invalid") from None
+        if not isinstance(label, str) or not isinstance(session, str):
+            raise AgentError("legacy_agent_inventory_invalid")
+        if prefix not in by_series_lists:
+            by_series_lists[prefix] = []
+            series_prefixes.append(prefix)
+        positions[agent] = len(agent_ids)
+        agent_ids.append(agent)
+        by_series_lists[prefix].append(agent)
+        descriptors[agent] = AgentDescriptor(
+            agent_id=agent,
+            series_prefix=prefix,
+            ordinal=ordinal,
+            label=label,
+            runner=RunnerKind.CODEX_CLI,
+            provider=Provider.OPENAI_CHATGPT,
+            model=DEFAULT_AGENT_MODEL,
+            account_id=f"legacy-{prefix}",
+            home=home,
+            session=session,
+            enabled=config.get("enabled", True) is True,
+        )
+    by_series = {f"{prefix}-series": tuple(ids) for prefix, ids in by_series_lists.items()}
+    return InventorySnapshot(
+        agent_ids=tuple(agent_ids),
+        agents=MappingProxyType(descriptors),
+        by_series=MappingProxyType(by_series),
+        positions=MappingProxyType(positions),
+        series_prefixes=tuple(series_prefixes),
+    )
+
+
+def normalize_applet_agents(agents: Any, *, allow_empty: bool = False) -> list[str]:
+    if not isinstance(agents, list):
+        raise AgentError("applet_agents must be a list")
+    normalized_agents = agents
+    if not normalized_agents and not allow_empty:
+        raise AgentError("applet_agents must contain 1 to 6 entries")
+    if len(normalized_agents) > MAX_APPLET_AGENTS:
+        raise AgentError("applet_agents list has at most 6 entries")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    snapshot = current_agent_inventory()
+    for agent in normalized_agents:
+        if not isinstance(agent, str):
+            raise AgentError("applet_agents entries must be strings")
+        value = normalize_agent_selector_text(agent)
+        if value in seen:
+            raise AgentError("applet_agents must not contain duplicates")
+        descriptor = snapshot.agents.get(value)
+        if descriptor is None or not descriptor.enabled:
+            raise AgentError("applet_agents only accepts concrete enabled agent ids")
+        normalized.append(value)
+        seen.add(value)
+    return normalized
+
+
+def applet_remaining_timeout(deadline: float) -> float:
+    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(deadline):
+        raise AgentError("applet status deadline is invalid")
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        raise AgentError("applet status deadline exceeded")
+    return min(APPLET_TMUX_TIMEOUT_SECONDS, remaining)
+
+
+def ensure_applet_action_key() -> bytes:
+    ensure_private_dir(STATE_ROOT)
+    try:
+        APPLET_ACTION_KEY_FILE.lstat()
+    except FileNotFoundError:
+        encoded = base64.urlsafe_b64encode(os.urandom(APPLET_ACTION_KEY_BYTES))
+        write_private_new_bytes(APPLET_ACTION_KEY_FILE, encoded, mode=0o600)
+    except OSError as exc:
+        raise AgentError("applet action key is unavailable") from exc
+    return read_applet_action_key()
+
+
+def read_applet_action_key() -> bytes:
+    try:
+        key_stat = APPLET_ACTION_KEY_FILE.lstat()
+    except OSError as exc:
+        raise AgentError("applet action key is unavailable") from exc
+    if (
+        not stat_module.S_ISREG(key_stat.st_mode)
+        or stat_module.S_ISLNK(key_stat.st_mode)
+        or getattr(key_stat, "st_nlink", 1) > 1
+        or key_stat.st_uid != os.geteuid()
+        or stat_module.S_IMODE(key_stat.st_mode) != 0o600
+        or key_stat.st_size != APPLET_ACTION_KEY_TEXT_BYTES
+    ):
+        raise AgentError("applet action key is unavailable")
+    encoded = read_private_regular_text(
+        APPLET_ACTION_KEY_FILE,
+        APPLET_ACTION_KEY_TEXT_BYTES,
+        "applet action key is unavailable",
+    )
+    if not re.fullmatch(r"[A-Za-z0-9_-]{43}=", encoded):
+        raise AgentError("applet action key is unavailable")
+    try:
+        key = base64.b64decode(encoded, altchars=b"-_", validate=True)
+    except (ValueError, base64.binascii.Error) as exc:
+        raise AgentError("applet action key is unavailable") from exc
+    if len(key) != APPLET_ACTION_KEY_BYTES:
+        raise AgentError("applet action key is unavailable")
+    return key
+
+
+def _applet_token_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _applet_token_decode(text: str) -> bytes:
+    if not isinstance(text, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", text):
+        raise AgentError("applet context token is invalid")
+    padding = "=" * (-len(text) % 4)
+    try:
+        decoded = base64.b64decode(text + padding, altchars=b"-_", validate=True)
+    except (ValueError, base64.binascii.Error) as exc:
+        raise AgentError("applet context token is invalid") from exc
+    if _applet_token_encode(decoded) != text:
+        raise AgentError("applet context token is invalid")
+    return decoded
+
+
+def applet_action_fingerprint(state: dict[str, Any]) -> str:
+    try:
+        encoded = json.dumps(state, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    except (TypeError, ValueError, RecursionError, UnicodeError) as exc:
+        raise AgentError("applet action state is invalid") from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def applet_action_fingerprint_for(action: str, state: dict[str, Any]) -> str:
+    if action == "start":
+        selected = state
+    elif action == "stop":
+        selected = {
+            key: state.get(key)
+            for key in (
+                "agent",
+                "activity_state",
+                "backend_state",
+                "identity_state",
+                "lease_state",
+                "run_marker",
+            )
+        }
+    else:
+        raise AgentError("applet action is invalid")
+    return applet_action_fingerprint(selected)
+
+
+def issue_applet_action_token(
+    action: str,
+    agent: str,
+    state: dict[str, Any],
+    key: bytes,
+    *,
+    now: float | None = None,
+) -> str:
+    if action not in {"start", "stop"}:
+        raise AgentError("applet action is invalid")
+    agent = normalize_applet_agents([agent])[0]
+    if not isinstance(key, bytes) or len(key) != APPLET_ACTION_KEY_BYTES:
+        raise AgentError("applet action key is unavailable")
+    issued_at = int(time.time() if now is None else now)
+    claims = {
+        "a": action,
+        "e": issued_at + APPLET_ACTION_TOKEN_TTL_SECONDS,
+        "f": applet_action_fingerprint_for(action, state),
+        "g": agent,
+        "i": issued_at,
+        "v": 1,
+    }
+    payload = json.dumps(claims, sort_keys=True, separators=(",", ":")).encode("ascii")
+    encoded_payload = _applet_token_encode(payload)
+    signature = hmac.new(key, encoded_payload.encode("ascii"), hashlib.sha256).digest()
+    token = f"{encoded_payload}.{_applet_token_encode(signature)}"
+    if len(token) > MAX_APPLET_ACTION_TOKEN_CHARS:
+        raise AgentError("applet context token is invalid")
+    return token
+
+
+def validate_applet_action_token(
+    token: str,
+    key: bytes,
+    *,
+    now: float | None = None,
+) -> dict[str, Any]:
+    if (
+        not isinstance(token, str)
+        or not token
+        or len(token) > MAX_APPLET_ACTION_TOKEN_CHARS
+        or not APPLET_ACTION_TOKEN_RE.fullmatch(token)
+    ):
+        raise AgentError("applet context token is invalid")
+    if not isinstance(key, bytes) or len(key) != APPLET_ACTION_KEY_BYTES:
+        raise AgentError("applet action key is unavailable")
+    encoded_payload, encoded_signature = token.split(".", 1)
+    supplied_signature = _applet_token_decode(encoded_signature)
+    expected_signature = hmac.new(key, encoded_payload.encode("ascii"), hashlib.sha256).digest()
+    if len(supplied_signature) != len(expected_signature) or not hmac.compare_digest(
+        supplied_signature,
+        expected_signature,
+    ):
+        raise AgentError("applet context token is invalid")
+    try:
+        claims = json.loads(_applet_token_decode(encoded_payload))
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
+        raise AgentError("applet context token is invalid") from exc
+    if not isinstance(claims, dict) or set(claims) != {"a", "e", "f", "g", "i", "v"}:
+        raise AgentError("applet context token is invalid")
+    if (
+        claims.get("v") != 1
+        or claims.get("a") not in {"start", "stop"}
+        or not isinstance(claims.get("g"), str)
+        or claims["g"] not in current_agent_inventory().agents
+        or not isinstance(claims.get("f"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", claims["f"])
+        or isinstance(claims.get("i"), bool)
+        or not isinstance(claims.get("i"), int)
+        or isinstance(claims.get("e"), bool)
+        or not isinstance(claims.get("e"), int)
+        or claims["e"] - claims["i"] != APPLET_ACTION_TOKEN_TTL_SECONDS
+    ):
+        raise AgentError("applet context token is invalid")
+    timestamp = time.time() if now is None else now
+    if claims["i"] > timestamp + 5:
+        raise AgentError("applet context token is invalid")
+    if claims["e"] < timestamp:
+        raise AgentError("applet context token expired")
+    return claims
+
+
+def applet_limit_observation(usage: Any) -> tuple[str, str | None]:
+    if not isinstance(usage, dict):
+        return "unknown", None
+    blocked_until = usage.get("blocked_until_utc")
+    if blocked_until is not None and (
+        not isinstance(blocked_until, str) or parse_utc_timestamp(blocked_until) is None
+    ):
+        blocked_until = None
+    if usage.get("blocked") is True:
+        return "blocked", blocked_until
+    if usage.get("blocked") is False and usage.get("state") in {"clear", "ok", "released"}:
+        return "clear", blocked_until
+    return "unknown", blocked_until
+
+
+def applet_capacity_observation(admission: Any) -> dict[str, Any] | None:
+    if not isinstance(admission, dict):
+        return None
+    allowed = admission.get("allowed")
+    available_slots = admission.get("available_slots")
+    reason_codes = admission.get("reason_codes")
+    if (
+        not isinstance(allowed, bool)
+        or (
+            available_slots is not None
+            and (isinstance(available_slots, bool) or not isinstance(available_slots, int) or available_slots < 0)
+        )
+        or not isinstance(reason_codes, list)
+        or any(not isinstance(reason, str) or reason not in RESOURCE_REASON_CODES for reason in reason_codes)
+    ):
+        return None
+    return {
+        "allowed": allowed,
+        "available_slots": available_slots,
+        "reason_codes": sorted(set(reason_codes)),
+    }
+
+
+def applet_action_state(
+    row: dict[str, Any],
+    usage: Any,
+    admission: Any = None,
+    *,
+    run_marker: str | None = None,
+) -> dict[str, Any]:
+    limit_state, blocked_until = applet_limit_observation(usage)
+    return {
+        "agent": row.get("agent"),
+        "activity_state": row.get("activity_state"),
+        "backend_state": row.get("backend_state"),
+        "control_state": row.get("control_state"),
+        "auth_state": row.get("auth_state"),
+        "identity_state": row.get("identity_state"),
+        "lease_state": row.get("lease_state"),
+        "limit_state": limit_state,
+        "blocked_until_utc": blocked_until,
+        "capacity": applet_capacity_observation(admission),
+        "run_marker": run_marker if isinstance(run_marker, str) and len(run_marker) <= 128 else None,
+    }
+
+
+def applet_action_allowed(action: str, state: dict[str, Any]) -> bool:
+    if action == "start":
+        capacity = state.get("capacity")
+        return (
+            state.get("activity_state") == "sleeping"
+            and state.get("backend_state") == "ok"
+            and state.get("control_state") == "ready"
+            and state.get("auth_state") == "ready"
+            and state.get("identity_state") == "stopped"
+            and state.get("lease_state") in {"unclaimed", "expired"}
+            and state.get("limit_state") == "clear"
+            and isinstance(capacity, dict)
+            and capacity.get("allowed") is True
+        )
+    if action == "stop":
+        return (
+            state.get("activity_state") == "running"
+            and state.get("backend_state") == "ok"
+            and state.get("identity_state") == "verified"
+            and state.get("lease_state") in {"unclaimed", "expired"}
+        )
+    return False
+
+
+def pane_pid_from_text(text: str) -> int | None:
+    if not text.isascii() or not text.isdigit():
+        return None
+    try:
+        value = int(text)
+    except ValueError:
+        return None
+    return value if value > 0 and text == str(value) else None
+
+
+def managed_applet_inventory(snapshot: InventorySnapshot | None = None) -> dict[str, Any]:
+    selected = snapshot or current_agent_inventory()
+    inventory = run_tmux(
+        ["list-sessions", "-F", "#{session_name}"],
+        check=False,
+        timeout=APPLET_TMUX_TIMEOUT_SECONDS,
+    )
+    if inventory.returncode != 0:
+        raise AgentError("applet status backend unavailable")
+    session_to_agent = {
+        agent_config(agent, selected)["session"]: agent
+        for agent in selected.agent_ids
+        if selected.agents[agent].enabled
+    }
+    ordered_running: list[str] = []
+    seen: set[str] = set()
+    for line in inventory.stdout.splitlines():
+        agent = session_to_agent.get(line.strip())
+        if agent is None or agent in seen:
+            continue
+        seen.add(agent)
+        ordered_running.append(agent)
+    ordered_running.sort(key=selected.positions.__getitem__)
+    visible_running = ordered_running[:MAX_APPLET_AGENTS]
+    return {
+        "running_agents": ordered_running,
+        "visible_running_agents": visible_running,
+        "overflow": max(0, len(ordered_running) - len(visible_running)),
+    }
+
+
+def applet_agent_observation(agent: str, *, deadline: float, known_running: bool | None = None) -> dict[str, Any]:
+    agent = normalize_applet_agents([agent])[0]
+    cfg = agent_config(agent)
+    session = cfg["session"]
+    if known_running is None:
+        session_check = run_tmux(
+            ["has-session", "-t", session],
+            check=False,
+            timeout=applet_remaining_timeout(deadline),
+        )
+        if session_check.returncode not in {0, 1}:
+            raise AgentError("applet status backend unavailable")
+        running = session_check.returncode == 0
+    else:
+        if not isinstance(known_running, bool):
+            raise AgentError("known_running must be a boolean")
+        running = known_running
+
+    applet_remaining_timeout(deadline)
+    process_summary = agent_home_process_summary(agent)
+    if running:
+        pane_check = run_tmux(
+            ["display-message", "-p", "-t", session, "#{pane_pid}"],
+            check=False,
+            timeout=applet_remaining_timeout(deadline),
+        )
+        if pane_check.returncode != 0:
+            raise AgentError("applet status backend unavailable")
+        pane_text = pane_check.stdout.strip()
+        pane_process_id = pane_pid_from_text(pane_text)
+        activity_state = "running"
+    else:
+        pane_process_id = None
+        activity_state = "sleeping"
+    identity_guard = agent_identity_guard(
+        running,
+        process_summary,
+        pane_process_id=pane_process_id,
+    )
+    identity_verified = identity_guard.get("ok") is True
+    identity_state = ("verified" if running else "stopped") if identity_verified else "unverified"
+    backend_state = "ok" if identity_verified else "degraded"
+
+    applet_remaining_timeout(deadline)
+    auth = agent_auth_status(agent)
+    if auth.get("authenticated") is True:
+        auth_state = "ready"
+    elif auth.get("auth_state") == "unreadable":
+        auth_state = "unknown"
+    else:
+        auth_state = "blocked"
+
+    applet_remaining_timeout(deadline)
+    lease = agent_lease_status(agent, initialize_state=False)
+    applet_remaining_timeout(deadline)
+    raw_lease_state = lease.get("state")
+    lease_state = (
+        raw_lease_state
+        if raw_lease_state in {"unclaimed", "held", "expired", "unreadable"}
+        else "unreadable"
+    )
+
+    if auth_state == "blocked" or identity_state == "unverified" or lease_state == "held":
+        control_state = "blocked"
+    elif auth_state == "unknown" or identity_state == "unknown" or lease_state == "unreadable":
+        control_state = "unknown"
+    elif auth_state == "ready" and identity_state in {"verified", "stopped"}:
+        control_state = "ready"
+    else:
+        control_state = "unknown"
+
+    return {
+        "agent": agent,
+        "activity_state": activity_state,
+        "backend_state": backend_state,
+        "control_state": control_state,
+        "auth_state": auth_state,
+        "identity_state": identity_state,
+        "lease_state": lease_state,
+    }
+
+
+def applet_error_row(agent: str) -> dict[str, Any]:
+    return {
+        "agent": agent,
+        "activity_state": "unknown",
+        "backend_state": "error",
+        "control_state": "unknown",
+        "auth_state": "unknown",
+        "identity_state": "unknown",
+        "lease_state": "unreadable",
+    }
+
+
+def applet_action_rows(
+    rows: list[dict[str, Any]],
+    *,
+    running_count: int | None = None,
+    deadline: float,
+) -> list[dict[str, Any]]:
+    try:
+        key = read_applet_action_key()
+    except AgentError:
+        key = None
+    start_offered = False
+    admission: dict[str, Any] | None = None
+    admission_checked = False
+    decorated: list[dict[str, Any]] = []
+    for row in rows:
+        if time.monotonic() >= deadline:
+            decorated.append(
+                {
+                    **row,
+                    "allowed_action": "none",
+                    "context_token": "",
+                    "limit_state": "unknown",
+                    "blocked_until_utc": None,
+                }
+            )
+            continue
+        meta = read_meta(row["agent"])
+        run_marker = meta.get("run_id") if not meta.get("meta_error") else None
+        try:
+            usage = codex_usage_watchdog_status(
+                row["agent"],
+                include_assignment_history=False,
+            )
+            routing_timeout_seconds = deadline - time.monotonic()
+            if routing_timeout_seconds <= 0:
+                raise AgentError("applet status deadline exceeded")
+            usage = codex_usage_status_with_routing(
+                row["agent"],
+                usage,
+                persist_account=False,
+                include_assignment_history=False,
+                force_policy_check=True,
+                routing_timeout_seconds=routing_timeout_seconds,
+            )
+        except AgentError:
+            usage = None
+        action = "none"
+        if (
+            key is not None
+            and not start_offered
+            and row.get("activity_state") == "sleeping"
+            and row.get("control_state") == "ready"
+        ):
+            if not admission_checked:
+                admission_checked = True
+                try:
+                    admission = spawn_admission_decision(
+                        1,
+                        running_agents_override=running_count,
+                    )
+                except AgentError:
+                    admission = None
+            candidate_state = applet_action_state(row, usage, admission, run_marker=run_marker)
+            if applet_action_allowed("start", candidate_state):
+                action = "start"
+                start_offered = True
+        state = applet_action_state(
+            row,
+            usage,
+            admission if action == "start" else None,
+            run_marker=run_marker,
+        )
+        if action == "none" and key is not None and applet_action_allowed("stop", state):
+            action = "stop"
+        context_token = ""
+        if action != "none" and key is not None:
+            try:
+                context_token = issue_applet_action_token(action, row["agent"], state, key)
+            except AgentError:
+                action = "none"
+        decorated.append(
+            {
+                **row,
+                "allowed_action": action,
+                "context_token": context_token,
+                "limit_state": state["limit_state"],
+                "blocked_until_utc": state["blocked_until_utc"],
+            }
+        )
+    return decorated
+
+
+def normalize_applet_schema_version(schema_version: Any) -> int:
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+        raise AgentError("schema_version must be an integer")
+    if schema_version not in {1, 2}:
+        raise AgentError("schema_version must be 1 or 2")
+    return schema_version
+
+
+def applet_status_v1(agents: Any) -> dict[str, Any]:
+    selected = normalize_applet_agents(agents)
+    deadline = time.monotonic() + APPLET_STATUS_TIMEOUT_SECONDS
+    rows: list[dict[str, Any]] = []
+    for agent in selected:
+        if time.monotonic() >= deadline:
+            rows.append(applet_error_row(agent))
+            continue
+        try:
+            rows.append(applet_agent_observation(agent, deadline=deadline))
+        except AgentError:
+            rows.append(applet_error_row(agent))
+
+    activity_states = [row["activity_state"] for row in rows]
+    if all(state == "running" for state in activity_states):
+        activity_state = "running"
+    elif all(state == "sleeping" for state in activity_states):
+        activity_state = "sleeping"
+    elif all(state == "unknown" for state in activity_states):
+        activity_state = "unknown"
+    else:
+        activity_state = "mixed"
+
+    backend_states = [row["backend_state"] for row in rows]
+    if all(state == "ok" for state in backend_states):
+        backend_state = "ok"
+    elif all(state == "error" for state in backend_states):
+        backend_state = "unavailable"
+    else:
+        backend_state = "degraded"
+
+    control_states = [row["control_state"] for row in rows]
+    if all(state == "ready" for state in control_states):
+        control_state = "ready"
+    elif all(state == "blocked" for state in control_states):
+        control_state = "blocked"
+    elif all(state == "unknown" for state in control_states):
+        control_state = "unknown"
+    else:
+        control_state = "mixed"
+
+    counts = {
+        "tracked": len(rows),
+        "running": activity_states.count("running"),
+        "sleeping": activity_states.count("sleeping"),
+        "ready": control_states.count("ready"),
+        "blocked": control_states.count("blocked"),
+        "issues": sum(
+            row["backend_state"] != "ok" or row["control_state"] != "ready" for row in rows
+        ),
+    }
+    return {
+        "schema_version": 1,
+        "mode": "read_only",
+        "activity_state": activity_state,
+        "backend_state": backend_state,
+        "control_state": control_state,
+        "counts": counts,
+        "agents": rows,
+        "raw_output": "not_returned",
+    }
+
+
+def applet_status_v2(agents: Any) -> dict[str, Any]:
+    pinned_agents = normalize_applet_agents(agents, allow_empty=True)
+    selected: list[str] = []
+    running_agents: list[str] = []
+    overflow = 0
+    try:
+        inventory = managed_applet_inventory()
+    except AgentError:
+        pass
+    else:
+        running_agents = inventory["running_agents"]
+        overflow = inventory["overflow"]
+        selected = list(inventory["visible_running_agents"])
+        running_set = set(running_agents)
+        for agent in pinned_agents:
+            if agent in running_set or agent in selected:
+                continue
+            if len(selected) >= MAX_APPLET_AGENTS:
+                break
+            selected.append(agent)
+
+    deadline = time.monotonic() + APPLET_STATUS_TIMEOUT_SECONDS
+    running_set = set(running_agents)
+    rows: list[dict[str, Any]] = []
+    for agent in selected:
+        if time.monotonic() >= deadline:
+            rows.append(applet_error_row(agent))
+            continue
+        try:
+            rows.append(
+                applet_agent_observation(
+                    agent,
+                    deadline=deadline,
+                    known_running=agent in running_set,
+                )
+            )
+        except AgentError:
+            rows.append(applet_error_row(agent))
+
+    rows = applet_action_rows(
+        rows,
+        running_count=len(running_agents),
+        deadline=deadline,
+    )
+
+    try:
+        native_agents = native_agent_status()
+    except AgentError:
+        native_agents = {
+            "bridge_state": "degraded",
+            "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
+            "agents": [],
+            "truncated": False,
+        }
+
+    return {
+        "schema_version": 2,
+        "mode": "read_only",
+        "counts": {
+            "tracked": len(rows),
+            "running": len(running_agents),
+            "sleeping": sum(row["activity_state"] == "sleeping" for row in rows),
+            "overflow": overflow,
+        },
+        "agents": rows,
+        "native_agents": native_agents,
+        "raw_output": "not_returned",
+    }
+
+
+def applet_action(action: Any, agent: Any, context_token: Any) -> dict[str, Any]:
+    if not isinstance(action, str) or action not in {"start", "stop"}:
+        raise AgentError("applet action is invalid")
+    if not isinstance(agent, str):
+        raise AgentError("applet agent is invalid")
+    agent = normalize_applet_agents([agent])[0]
+    if not isinstance(context_token, str):
+        raise AgentError("applet context token is invalid")
+    with agent_lifecycle_lock(agent, timeout_seconds=APPLET_TMUX_TIMEOUT_SECONDS):
+        key = read_applet_action_key()
+        claims = validate_applet_action_token(context_token, key)
+        if claims["a"] != action or claims["g"] != agent:
+            raise AgentError("applet context token is invalid")
+        deadline = time.monotonic() + APPLET_STATUS_TIMEOUT_SECONDS
+        row = applet_agent_observation(agent, deadline=deadline)
+        try:
+            usage = codex_usage_watchdog_status(agent, include_assignment_history=False)
+            routing_timeout_seconds = deadline - time.monotonic()
+            if routing_timeout_seconds <= 0:
+                raise AgentError("applet action deadline exceeded")
+            usage = codex_usage_status_with_routing(
+                agent,
+                usage,
+                persist_account=False,
+                include_assignment_history=False,
+                force_policy_check=True,
+                routing_timeout_seconds=routing_timeout_seconds,
+            )
+        except AgentError:
+            usage = None
+        admission = spawn_admission_decision(1) if action == "start" else None
+        meta = read_meta(agent)
+        run_marker = meta.get("run_id") if not meta.get("meta_error") else None
+        state = applet_action_state(row, usage, admission, run_marker=run_marker)
+        if not hmac.compare_digest(claims["f"], applet_action_fingerprint_for(action, state)):
+            raise AgentError("applet context token is stale")
+        if not applet_action_allowed(action, state):
+            raise AgentError("applet action is no longer allowed")
+
+        if action == "start":
+            result = _start_agent_with_lease_unlocked(
+                agent,
+                cwd=str(Path.home()),
+            )
+            final_state = "running" if result.get("status") in {"started", "already_running"} else "unknown"
+        else:
+            _claim_agent_unlocked(agent, ttl_seconds=60)
+            try:
+                result = _stop_agent_unlocked(agent)
+            except Exception:
+                with contextlib.suppress(AgentError):
+                    current_lease = agent_lease_status(agent)
+                    if current_lease.get("held_by_this_server"):
+                        _release_agent_unlocked(agent, force=True)
+                raise
+            final_state = "sleeping" if result.get("status") in {"stopped", "not_running"} else "unknown"
+        return {
+            "agent": agent,
+            "action": action,
+            "status": "completed" if final_state != "unknown" else "unknown",
+            "state": final_state,
+            "raw_output": "not_returned",
+        }
+
+
+def _snapshot_file_identity(stat_result: os.stat_result | None) -> FileIdentity | None:
+    if stat_result is None:
+        return None
+    return FileIdentity(
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_mode,
+        stat_result.st_uid,
+        stat_result.st_gid,
+        stat_result.st_nlink,
+    )
+
+
+def _fleet_load_recovery_journal_with_identity(
+    paths: FleetPaths | None = None,
+) -> tuple[FleetRecoveryJournal, FileIdentity] | None:
+    paths = paths or FleetPaths.from_state_root(STATE_ROOT)
+    raw_text: str | None = None
+    identity: FileIdentity | None = None
+    try:
+        parent_stat = paths.root.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise AgentError("fleet_recovery_state_invalid") from exc
+    parent_fd = -1
+    try:
+        parent_fd = open_directory_no_follow_matching(
+            paths.root,
+            parent_stat,
+            error_text="fleet_recovery_state_invalid",
+            changed_text="fleet_recovery_state_invalid",
+        )
+        try:
+            target_stat = os.stat(paths.recovery.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise AgentError("fleet_recovery_state_invalid") from exc
+        if (
+            not stat_module.S_ISREG(target_stat.st_mode)
+            or stat_module.S_ISLNK(target_stat.st_mode)
+            or getattr(target_stat, "st_nlink", 1) != 1
+            or target_stat.st_uid != os.geteuid()
+            or stat_module.S_IMODE(target_stat.st_mode) != 0o600
+            or target_stat.st_size > MAX_RECOVERY_DOCUMENT_BYTES
+        ):
+            raise AgentError("fleet_recovery_state_invalid")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = -1
+        try:
+            fd = os.open(paths.recovery.name, flags, dir_fd=parent_fd)
+            opened = os.fstat(fd)
+            if not source_identity_with_snapshot_matches(opened, target_stat):
+                raise AgentError("fleet_recovery_state_invalid")
+            identity = _snapshot_file_identity(opened)
+            with os.fdopen(fd, "rb") as handle:
+                fd = -1
+                raw = handle.read(MAX_RECOVERY_DOCUMENT_BYTES + 1)
+            if len(raw) > MAX_RECOVERY_DOCUMENT_BYTES:
+                raise AgentError("fleet_recovery_state_invalid")
+            raw_text = raw.decode("utf-8")
+        except OSError as exc:
+            raise AgentError("fleet_recovery_state_invalid") from exc
+        finally:
+            if fd >= 0:
+                os.close(fd)
+    finally:
+        if parent_fd >= 0:
+            os.close(parent_fd)
+    try:
+        payload = json.loads(raw_text)
+    except (json.JSONDecodeError, TypeError, UnicodeError) as exc:
+        raise AgentError("fleet_recovery_state_invalid") from exc
+    try:
+        journal = normalize_recovery_document(payload)
+    except Exception as exc:
+        raise AgentError("fleet_recovery_state_invalid") from exc
+    if identity is None:
+        raise AgentError("fleet_recovery_state_invalid")
+    return journal, identity
+
+
+@contextlib.contextmanager
+def native_agent_registry_lock(
+    *, timeout_seconds: float = NATIVE_AGENT_LOCK_TIMEOUT_SECONDS
+) -> Any:
+    held_locks = _NATIVE_AGENT_REGISTRY_LOCK_STACK.get()
+    if "native-agents" in held_locks:
+        yield
+        return
+    try:
+        timeout_seconds_f = float(timeout_seconds)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise AgentError("native agent registry lock timeout must be a finite number") from exc
+    if not math.isfinite(timeout_seconds_f) or timeout_seconds_f < 0:
+        raise AgentError("native agent registry lock timeout must be a finite number")
+    deadline = time.monotonic() + timeout_seconds_f if timeout_seconds_f > 0 else None
+    ensure_private_dir(STATE_ROOT)
+    ensure_private_dir(LOCK_DIR)
+    lock_path = NATIVE_AGENT_REGISTRY_LOCK_FILE
+    with open_private_regular_update(lock_path) as fh:
+        token = None
+        lock_acquired = False
+        try:
+            if deadline is None:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            else:
+                while True:
+                    try:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise AgentError("could not acquire native agent registry lock")
+                        time.sleep(min(0.01, remaining))
+            lock_acquired = True
+            token = _NATIVE_AGENT_REGISTRY_LOCK_STACK.set((*held_locks, "native-agents"))
+            yield
+        except OSError as exc:
+            raise AgentError("could not acquire native agent registry lock") from exc
+        finally:
+            if token is not None:
+                _NATIVE_AGENT_REGISTRY_LOCK_STACK.reset(token)
+            if lock_acquired:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+
+
+@contextlib.contextmanager
+def spawn_admission_lock() -> Any:
+    ensure_private_dir(STATE_ROOT)
+    ensure_private_dir(LOCK_DIR)
+    lock_path = LOCK_DIR / "spawn-admission.lock"
+    with open_private_regular_update(lock_path) as fh:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        except OSError as exc:
+            raise AgentError("could not acquire spawn admission lock") from exc
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+
+
 TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "agent_spawn_offers",
+        "description": "Return short-lived, advisory spawn offers for currently admitted routes. Does not reserve capacity or return raw output.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "required_slots": {"type": "integer", "minimum": 1, "maximum": 6, "default": 1}
+            },
+            "additionalProperties": False,
+        },
+    },
     {
         "name": "agent_start",
         "description": "Start selected Codex Agentinnen in persistent tmux sessions with gpt-5.4-mini, --yolo -s danger-full-access --search. Does not return raw output.",
@@ -14922,6 +21528,24 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
+        "name": "master_applet_status",
+        "description": "Return bounded, read-only applet status for concrete applet agent ids.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["agents"],
+            "properties": {
+                "agents": {
+                    "type": "array",
+                    "minItems": 0,
+                    "maxItems": MAX_APPLET_AGENTS,
+                    "items": text_schema(MAX_AGENT_SELECTOR_TEXT),
+                },
+                "schema_version": {"type": "integer", "enum": [1, 2], "default": 1},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "agent_pool_validate",
         "description": "Validate a machine-readable Codex Agentinnen pool spec and return data-sparse counts only.",
         "inputSchema": {
@@ -15105,7 +21729,12 @@ TOOLS: list[dict[str, Any]] = [
 
 # Hive diagnostics are additive and read-only.  Their schemas are deliberately
 # closed; productive admission/assignment operations remain outside this catalog.
-TOOLS.extend(hive_tool_definitions())
+_published_tool_names = {tool["name"] for tool in TOOLS}
+TOOLS.extend(
+    tool
+    for tool in hive_tool_definitions()
+    if tool["name"] not in _published_tool_names
+)
 
 
 TOOL_SCHEMAS = {tool["name"]: tool["inputSchema"] for tool in TOOLS}
@@ -15145,6 +21774,25 @@ def call_validated_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     return call_tool(validated_name, validated_args)
 
 
+def call_teamleader_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    require_teamleader_tool_access()
+    return call_validated_tool(name, args)
+
+
+def teamleader_tool_catalog() -> list[dict[str, Any]]:
+    require_teamleader_tool_access()
+    try:
+        encoded = json.dumps(TOOLS, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    except (TypeError, ValueError, RecursionError, UnicodeError) as exc:
+        raise AgentError("teamleader tool catalog is invalid") from exc
+    if len(encoded) > MAX_TOOL_CATALOG_BYTES:
+        raise AgentError("teamleader tool catalog is invalid")
+    snapshot = json.loads(encoded)
+    if not isinstance(snapshot, list):
+        raise AgentError("teamleader tool catalog is invalid")
+    return snapshot
+
+
 def validate_schema_value(field: str, value: Any, schema: dict[str, Any]) -> None:
     value_type = schema.get("type")
     if value_type == "string":
@@ -15160,6 +21808,9 @@ def validate_schema_value(field: str, value: Any, schema: dict[str, Any]) -> Non
     if value_type == "integer":
         if isinstance(value, bool) or not isinstance(value, int):
             raise AgentError(f"{field} must be an integer")
+        allowed = schema.get("enum")
+        if allowed and value not in allowed:
+            raise AgentError(f"{field} must be one of: {', '.join(str(item) for item in allowed)}")
         minimum = schema.get("minimum")
         maximum = schema.get("maximum")
         if isinstance(minimum, int) and value < minimum:
@@ -15184,6 +21835,8 @@ def validate_schema_value(field: str, value: Any, schema: dict[str, Any]) -> Non
         if isinstance(item_schema, dict):
             for index, item in enumerate(value):
                 validate_schema_value(f"{field}[{index}]", item, item_schema)
+        return
+    raise AgentError(f"{field} uses an unsupported schema type")
 
 
 def rpc_result(message_id: Any, result: Any) -> dict[str, Any]:
@@ -15194,7 +21847,7 @@ def rpc_error(message_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": message_id, "error": {"code": code, "message": safe_error_text(message)}}
 
 
-def handle_rpc(msg: dict[str, Any]) -> dict[str, Any] | None:
+def handle_rpc(msg: dict[str, Any], *, enforce_master_role: bool = False) -> dict[str, Any] | None:
     if not isinstance(msg, dict):
         raise AgentError("RPC message must be an object")
     message_id = msg.get("id")
@@ -15245,13 +21898,18 @@ def handle_rpc(msg: dict[str, Any]) -> dict[str, Any] | None:
             )
         )
     if method == "tools/list":
-        return reply(rpc_result(message_id, {"tools": TOOLS}))
+        tools = TOOLS
+        if enforce_master_role:
+            tools = teamleader_tool_catalog() if master_tool_access_status()["authorized"] else []
+        return reply(rpc_result(message_id, {"tools": tools}))
     if method == "resources/list":
         return reply(rpc_result(message_id, {"resources": []}))
     if method == "prompts/list":
         return reply(rpc_result(message_id, {"prompts": []}))
     if method == "tools/call":
         try:
+            if enforce_master_role:
+                require_teamleader_tool_access()
             params = msg.get("params", {})
             if params is None:
                 params = {}
@@ -15342,9 +22000,7 @@ def read_message() -> dict[str, Any] | None:
 
 
 def write_message(message: dict[str, Any]) -> None:
-    body = json.dumps(message, separators=(",", ":")).encode("utf-8")
-    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii"))
-    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.write(json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n")
     sys.stdout.buffer.flush()
 
 
@@ -15390,7 +22046,7 @@ def _serve_mcp_impl() -> int:
             msg = read_message()
             if msg is None:
                 return 0
-            response = handle_rpc(msg)
+            response = handle_rpc(msg, enforce_master_role=True)
             if response is not None:
                 write_message(response)
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -15441,6 +22097,9 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_start.add_argument("--prompt")
     p_start.add_argument("--allow-unauthenticated", action="store_true")
     p_start.add_argument("--allow-broad-selector", action="store_true")
+
+    p_spawn_offers = sub.add_parser("spawn-offers")
+    p_spawn_offers.add_argument("--required-slots", type=int, default=1)
 
     p_status = sub.add_parser("status")
     p_status.add_argument("agent", nargs="?", default="all", help=AGENT_SELECTOR_DESCRIPTION)
@@ -15732,6 +22391,15 @@ def _main_cli_impl(argv: list[str]) -> int:
     sub.add_parser("release-status")
     sub.add_parser("watchdog-status")
     sub.add_parser("timeout-policy")
+    sub.add_parser("control-center")
+    sub.add_parser("control-center-launch", help=argparse.SUPPRESS)
+    p_applet_status = sub.add_parser("applet-status")
+    p_applet_status.add_argument("agents", nargs="*")
+    p_applet_status.add_argument("--schema-version", type=int, default=1)
+    p_applet_action = sub.add_parser("applet-action", help=argparse.SUPPRESS)
+    p_applet_action.add_argument("action", choices=("start", "stop"))
+    p_applet_action.add_argument("agent")
+    p_applet_action.add_argument("context_token")
 
     p_pool = sub.add_parser("pool")
     pool_sub = p_pool.add_subparsers(dest="pool_command", required=True)
@@ -15878,6 +22546,13 @@ def _main_cli_impl(argv: list[str]) -> int:
                         "allow_unauthenticated": True if args.allow_unauthenticated else None,
                         "allow_broad_selector": True if args.allow_broad_selector else None,
                     },
+                )
+            )
+        if args.command == "spawn-offers":
+            return print_json(
+                call_validated_tool(
+                    "agent_spawn_offers",
+                    {"required_slots": args.required_slots},
                 )
             )
         if args.command == "status":
@@ -16235,6 +22910,21 @@ def _main_cli_impl(argv: list[str]) -> int:
             )
         if args.command == "timeout-policy":
             return print_json(call_validated_tool("master_timeout_policy", {}))
+        if args.command == "control-center":
+            from codex_master.control_center import run_control_center
+
+            return run_control_center([])
+        if args.command == "control-center-launch":
+            return print_json(launch_control_center_detached())
+        if args.command == "applet-status":
+            return print_json(
+                call_validated_tool(
+                    "master_applet_status",
+                    {"agents": args.agents, "schema_version": args.schema_version},
+                )
+            )
+        if args.command == "applet-action":
+            return print_json(applet_action(args.action, args.agent, args.context_token))
         if args.command == "pool":
             common = {"spec": args.spec, "target_dir": args.target_dir, "codex_bin": args.codex_bin}
             if args.pool_command == "validate":
@@ -16286,6 +22976,7 @@ def _main_cli_impl(argv: list[str]) -> int:
                     force=args.force,
                     install_path=Path(args.path),
                     sync_plugin_cache=not args.no_plugin_cache,
+                    install_desktop=True,
                 )
             )
         if args.command == "uninstall":
@@ -16294,12 +22985,13 @@ def _main_cli_impl(argv: list[str]) -> int:
                     unregister=not args.keep_registration,
                     remove_symlink=args.remove_symlink,
                     install_path=Path(args.path),
+                    remove_desktop=args.remove_symlink,
                 )
             )
         if args.command == "doctor":
             return print_json(doctor())
         if args.command == "tools":
-            return print_json({"tools": TOOLS})
+            return print_json({"tools": teamleader_tool_catalog()})
     except Exception as exc:
         print(json.dumps(public_error_payload(exc), indent=2, sort_keys=True))
         return 1
@@ -17331,78 +24023,10 @@ def fleet_account_delete(*, account_id: str, expected_generation: int) -> dict[s
         return {"mutation_performed": True, **result, "raw_output": "not_returned"}
 
 
-def _fleet_candidate_series(
-    *, prefix: str, count: int, runner: str, provider: str, model: str,
-    account_id: str | None, enabled: bool,
-) -> FleetSeries:
-    prefix = normalize_agent_selector_text(prefix)
-    if not re.fullmatch(r"[a-z]", prefix):
-        raise AgentError("invalid_series")
-    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= MAX_FLEET_SERIES_COUNT:
-        raise AgentError("invalid_series")
-    try:
-        return FleetSeries(
-            prefix, f"Series {str(prefix).upper()}", count,
-            RunnerKind(runner), Provider(provider), model, account_id, enabled,
-        )
-    except (TypeError, ValueError):
-        raise AgentError("invalid_series") from None
 
 
-def fleet_wrapper_text(
-    agent: AgentDescriptor,
-    executable_or_series: Path | FleetSeries,
-    executable: Path | None = None,
-) -> str:
-    executable_path = executable if executable is not None else executable_or_series
-    if not isinstance(executable_path, Path) or not executable_path.is_absolute():
-        raise AgentError("fleet_executable_invalid")
-    secret_names = {"OPENAI_API_KEY", "GEMINI_API_KEY", "HF_TOKEN", "CODEX_ACCESS_TOKEN"}
-    retained = {
-        Provider.OPENAI_API: {"OPENAI_API_KEY"},
-        Provider.GEMINI_API: {"GEMINI_API_KEY"},
-        Provider.HUGGINGFACE_INFERENCE: {"HF_TOKEN"},
-    }.get(agent.provider, set())
-    lines = ["#!/usr/bin/env bash", "set -euo pipefail", ""]
-    if agent.runner is RunnerKind.GEMINI_CLI:
-        lines.extend([f"export HOME={shlex.quote(str(agent.home))}", f"export GEMINI_CLI_HOME={shlex.quote(str(agent.home))}", "unset CODEX_HOME"])
-    else:
-        lines.extend([f"export CODEX_HOME={shlex.quote(str(agent.home))}", "unset GEMINI_CLI_HOME"])
-    if secret_names - retained:
-        lines.append("unset " + " ".join(sorted(secret_names - retained)))
-    lines.extend([
-        "if taskset --cpu-list 4-10 /usr/bin/true >/dev/null 2>&1; then",
-        f"  exec taskset --cpu-list 4-10 {shlex.quote(str(executable_path))} \"$@\"",
-        "fi",
-        f"exec {shlex.quote(str(executable_path))} \"$@\"",
-        "",
-    ])
-    return "\n".join(lines)
 
 
-def fleet_minimal_config(agent: AgentDescriptor) -> tuple[str, str]:
-    if agent.runner is RunnerKind.GEMINI_CLI:
-        return "settings.json", json.dumps({
-            "advanced": {"autoConfigureMemory": False, "ignoreLocalEnv": True},
-            "general": {"enableAutoUpdate": False, "enableAutoUpdateNotification": False},
-            "privacy": {"usageStatisticsEnabled": False},
-            "security": {"auth": {"enforcedType": "gemini-api-key"}},
-        }, indent=2, sort_keys=True) + "\n"
-    lines = [f"model = {json.dumps(agent.model)}", 'approval_policy = "never"', 'sandbox_mode = "danger-full-access"']
-    if agent.provider is Provider.OLLAMA_LOCAL:
-        lines.extend([
-            'model_provider = "ollama-launch"',
-            f"model_catalog_json = {json.dumps(str(agent.home / 'model.json'))}",
-            "",
-            '[model_providers.ollama-launch]',
-            'name = "Ollama"',
-            'base_url = "http://127.0.0.1:11434/v1/"',
-            'wire_api = "responses"',
-        ])
-    elif agent.provider is Provider.HUGGINGFACE_INFERENCE:
-        lines.extend(['model_provider = "huggingface"', '', '[model_providers.huggingface]', 'name = "Hugging Face"', 'base_url = "https://router.huggingface.co/v1"', 'env_key = "HF_TOKEN"', 'wire_api = "responses"'])
-    lines.extend(["", f"[projects.{json.dumps(str(agent.home))}]", 'trust_level = "trusted"', ""])
-    return "config.toml", "\n".join(lines)
 
 
 def fleet_model_catalog(agent: AgentDescriptor) -> str:
@@ -17664,29 +24288,8 @@ def _fleet_plan(
     }, current, planned, existing, normalized)
 
 
-def fleet_series_plan(*, prefix: str, count: int, runner: str, provider: str, model: str, account_id: str | None, enabled: bool = True, expected_generation: int, confirmed_remove_ids: list[str] | None = None) -> dict[str, Any]:
-    result, *_ = _fleet_plan(_readonly_fleet_service(), prefix=prefix, count=count, runner=runner, provider=provider, model=model, account_id=account_id, enabled=enabled, expected_generation=expected_generation, confirmed_remove_ids=confirmed_remove_ids)
-    return result
 
 
-def _fleet_cleanup_tombstones(
-    root: Path,
-    tombstones: list[tuple[Path, Path]],
-) -> bool:
-    pending = False
-    for _home, tombstone in tombstones:
-        tombstone_path = root / tombstone
-        try:
-            current = tombstone_path.lstat()
-            if stat_module.S_ISDIR(current.st_mode) and not stat_module.S_ISLNK(current.st_mode):
-                shutil.rmtree(tombstone_path)
-            else:
-                tombstone_path.unlink()
-        except FileNotFoundError:
-            continue
-        except OSError:
-            pending = True
-    return pending
 
 
 def _fleet_rollback_mutation(
@@ -17743,22 +24346,6 @@ def _fleet_require_removable(agent_id: str) -> None:
         raise AgentError("fleet_agent_lease_busy")
 
 
-def fleet_series_apply(*, prefix: str, count: int, runner: str, provider: str, model: str, account_id: str | None, enabled: bool = True, expected_generation: int, confirmed_remove_ids: list[str] | None = None, codex_executable: Path | None = None, gemini_executable: Path | None = None) -> dict[str, Any]:
-    require_fleet_recovery_ready("fleet_series_apply")
-    with fleet_mutation_lock():
-        return _fleet_series_apply_locked(
-            prefix=prefix,
-            count=count,
-            runner=runner,
-            provider=provider,
-            model=model,
-            account_id=account_id,
-            enabled=enabled,
-            expected_generation=expected_generation,
-            confirmed_remove_ids=confirmed_remove_ids,
-            codex_executable=codex_executable,
-            gemini_executable=gemini_executable,
-        )
 
 
 def _fleet_series_apply_locked(*, prefix: str, count: int, runner: str, provider: str, model: str, account_id: str | None, enabled: bool = True, expected_generation: int, confirmed_remove_ids: list[str] | None = None, codex_executable: Path | None = None, gemini_executable: Path | None = None) -> dict[str, Any]:
@@ -17897,10 +24484,6 @@ def _fleet_series_apply_locked(*, prefix: str, count: int, runner: str, provider
     return {"mutation_performed": True, "generation": stored.generation, "created_count": len(created), "kept_count": plan["keep_count"], "updated_count": len(updated), "removed_count": len(remove_ids), "cleanup_pending": cleanup_pending, "pool_root": PATH_NOT_RETURNED, "raw_output": "not_returned"}
 
 
-def fleet_series_disable(*, prefix: str, expected_generation: int) -> dict[str, Any]:
-    require_fleet_recovery_ready("fleet_series_disable")
-    with fleet_mutation_lock():
-        return _fleet_series_disable_locked(prefix=prefix, expected_generation=expected_generation)
 
 
 def _fleet_series_disable_locked(*, prefix: str, expected_generation: int) -> dict[str, Any]:
@@ -17965,14 +24548,6 @@ def _fleet_series_disable_locked(*, prefix: str, expected_generation: int) -> di
     return {"mutation_performed": True, "generation": stored.generation, "disabled": prefix, "raw_output": "not_returned"}
 
 
-def fleet_series_delete(*, prefix: str, expected_generation: int, confirmed_remove_ids: list[str] | None = None) -> dict[str, Any]:
-    require_fleet_recovery_ready("fleet_series_delete")
-    with fleet_mutation_lock():
-        return _fleet_series_delete_locked(
-            prefix=prefix,
-            expected_generation=expected_generation,
-            confirmed_remove_ids=confirmed_remove_ids,
-        )
 
 
 def _fleet_series_delete_locked(*, prefix: str, expected_generation: int, confirmed_remove_ids: list[str] | None = None) -> dict[str, Any]:
@@ -18059,36 +24634,6 @@ def _fleet_series_delete_locked(*, prefix: str, expected_generation: int, confir
         raise
     return {"mutation_performed": True, "generation": stored.generation, "removed_count": len(remove_ids), "cleanup_pending": cleanup_pending, "pool_root": PATH_NOT_RETURNED, "raw_output": "not_returned"}
 
-def _fleet_optional_stats(
-    path: Path,
-    error_text: str,
-) -> tuple[os.stat_result, os.stat_result] | None:
-    try:
-        parent_stat = path.parent.lstat()
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise AgentError(error_text) from exc
-    parent_fd = -1
-    try:
-        parent_fd = open_directory_no_follow_matching(
-            path.parent,
-            parent_stat,
-            error_text=error_text,
-            changed_text=error_text,
-        )
-        try:
-            target_stat = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return None
-        except OSError as exc:
-            raise AgentError(error_text) from exc
-    except AgentError:
-        raise
-    finally:
-        if parent_fd >= 0:
-            os.close(parent_fd)
-    return parent_stat, target_stat
 
 
 def _fleet_remove_private_file(path: Path) -> bool:
@@ -18126,252 +24671,16 @@ def _fleet_remove_private_file(path: Path) -> bool:
         os.close(parent_fd)
 
 
-def fleet_read_optional_private_text(path: Path, max_bytes: int, error_text: str) -> str | None:
-    data = fleet_read_optional_private_bytes(path, max_bytes, error_text)
-    if data is None:
-        return None
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise AgentError(error_text) from exc
 
 
-def replace_private_bytes(
-    path: Path,
-    data: bytes,
-    mode: int = 0o600,
-    *,
-    expected_parent_stat: os.stat_result | None = None,
-    expected_existing_stat: os.stat_result | None | object = _EXPECTED_EXISTING_STAT_UNSET,
-) -> None:
-    parent = path.parent.expanduser()
-    if not parent.is_absolute():
-        parent = Path.cwd() / parent
-    parent = parent.absolute()
-    parent_parts = parent.parts
-    proc_parent_fd = None
-    if len(parent_parts) == 5 and parent_parts[:4] == ("/", "proc", "self", "fd") and parent_parts[4].isdigit():
-        proc_parent_fd = int(parent_parts[4])
-
-    parent_fd = -1
-    if proc_parent_fd is not None:
-        try:
-            parent_fd = os.dup(proc_parent_fd)
-            parent_stat = os.fstat(parent_fd)
-        except OSError as exc:
-            if parent_fd >= 0:
-                os.close(parent_fd)
-            raise AgentError("private state parent directories must be real directories") from exc
-        if not stat_module.S_ISDIR(parent_stat.st_mode):
-            os.close(parent_fd)
-            raise AgentError("private state parent directories must be real directories")
-    else:
-        parent_stat = expected_parent_stat
-        if parent_stat is None:
-            try:
-                parent_stat = parent.lstat()
-            except FileNotFoundError:
-                parent_stat = None
-            except OSError as exc:
-                raise AgentError("private state parent directories must be real directories") from exc
-            ensure_private_dir(parent)
-            if parent_stat is None:
-                try:
-                    parent_stat = parent.lstat()
-                except OSError as exc:
-                    raise AgentError("private state parent directories must be real directories") from exc
-        parent_fd = open_directory_no_follow_matching(
-            parent,
-            parent_stat,
-            error_text="private state parent directories must be real directories",
-            changed_text="private state parent directories changed unexpectedly",
-        )
-
-    tmp_name = f".{path.name}.{now_id()}.{uuid.uuid4().hex}.tmp"
-    tmp_path = parent / tmp_name
-    tmp_created = False
-    try:
-        write_private_new_bytes(tmp_path, data, mode=mode, dir_fd=parent_fd)
-        tmp_created = True
-        sync_fd = -1
-        try:
-            sync_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-            sync_fd = os.open(tmp_name, sync_flags, dir_fd=parent_fd)
-            os.fsync(sync_fd)
-        finally:
-            if sync_fd >= 0:
-                os.close(sync_fd)
-        if expected_existing_stat is not _EXPECTED_EXISTING_STAT_UNSET:
-            try:
-                current = os.lstat(path.name, dir_fd=parent_fd)
-            except FileNotFoundError:
-                current = None
-            except OSError as exc:
-                raise AgentError("private state path changed unexpectedly") from exc
-            if expected_existing_stat is None:
-                if current is not None:
-                    raise AgentError("private state path changed unexpectedly")
-            elif (
-                current is None
-                or not stat_module.S_ISREG(current.st_mode)
-                or getattr(current, "st_nlink", 1) != 1
-                or not source_identity_with_snapshot_matches(current, expected_existing_stat)
-            ):
-                raise AgentError("private state path changed unexpectedly")
-        os.replace(tmp_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-        tmp_created = False
-        os.fsync(parent_fd)
-    finally:
-        if tmp_created:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_name, dir_fd=parent_fd)
-        if parent_fd >= 0:
-            os.close(parent_fd)
 
 
-def _fleet_replace_private_bytes(path: Path, data: bytes, mode: int) -> None:
-    error_text = "could_not_replace_fleet_private_file"
-    parent_stat = ensure_real_parent(path, error_text)
-    try:
-        existing_stat = path.lstat()
-    except FileNotFoundError:
-        existing_stat = None
-    except OSError as exc:
-        raise AgentError(error_text) from exc
-    if existing_stat is not None and (
-        not stat_module.S_ISREG(existing_stat.st_mode)
-        or getattr(existing_stat, "st_nlink", 1) > 1
-    ):
-        raise AgentError(error_text)
-    replace_private_bytes(
-        path,
-        data,
-        mode=mode,
-        expected_parent_stat=parent_stat,
-        expected_existing_stat=existing_stat,
-    )
 
 
-def _fleet_replace_private_text(path: Path, text: str) -> None:
-    _fleet_replace_private_bytes(path, text.encode("utf-8"), 0o600)
 
 
-def write_private_new_bytes(
-    path: Path,
-    data: bytes,
-    mode: int = 0o600,
-    *,
-    dir_fd: int | None = None,
-) -> None:
-    parent_fd = -1
-    effective_dir_fd = dir_fd
-    if dir_fd is None:
-        try:
-            parent_stat = path.parent.lstat()
-        except FileNotFoundError:
-            parent_stat = None
-        except OSError as exc:
-            raise AgentError("private state parent directories must be real directories") from exc
-        ensure_private_dir(path.parent)
-        if parent_stat is None:
-            try:
-                parent_stat = path.parent.lstat()
-            except OSError as exc:
-                raise AgentError("private state parent directories must be real directories") from exc
-        parent_fd = open_directory_no_follow_matching(
-            path.parent,
-            parent_stat,
-            error_text="private state parent directories must be real directories",
-            changed_text="private state parent directories changed unexpectedly",
-        )
-        effective_dir_fd = parent_fd
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        if effective_dir_fd is None:
-            fd = os.open(path, flags, 0o600)
-        else:
-            fd = os.open(path.name, flags, 0o600, dir_fd=effective_dir_fd)
-    except OSError as exc:
-        if parent_fd >= 0:
-            os.close(parent_fd)
-        raise AgentError("could not create private state temp file without following symlinks") from exc
-    try:
-        current_stat = os.fstat(fd)
-        if not stat_module.S_ISREG(current_stat.st_mode) or getattr(current_stat, "st_nlink", 1) > 1:
-            raise AgentError("private state temp path is not a regular file")
-        try:
-            os.fchmod(fd, mode)
-        except PermissionError as exc:
-            if stat_module.S_IMODE(os.fstat(fd).st_mode) != stat_module.S_IMODE(mode):
-                raise AgentError("private state temp file mode could not be set") from exc
-        if stat_module.S_IMODE(os.fstat(fd).st_mode) != stat_module.S_IMODE(mode):
-            raise AgentError("private state temp file mode could not be set")
-        with os.fdopen(fd, "wb") as fh:
-            fd = -1
-            fh.write(data)
-    except BaseException:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            if effective_dir_fd is None:
-                path.unlink()
-            else:
-                os.unlink(path.name, dir_fd=effective_dir_fd)
-        except FileNotFoundError:
-            pass
-        raise
-    finally:
-        if parent_fd >= 0:
-            os.close(parent_fd)
 
 
-def open_private_regular_update(path: Path) -> Any:
-    try:
-        parent_stat = path.parent.lstat()
-    except FileNotFoundError:
-        parent_stat = None
-    except OSError as exc:
-        raise AgentError("could not open private state file without following symlinks") from exc
-    ensure_private_dir(path.parent)
-    parent_fd = -1
-    try:
-        if parent_stat is None:
-            parent_stat = path.parent.lstat()
-        parent_fd = open_directory_no_follow_matching(
-            path.parent,
-            parent_stat,
-            error_text="could not open private state file without following symlinks",
-            changed_text="could not open private state file without following symlinks",
-        )
-    except (AgentError, OSError) as exc:
-        if parent_fd >= 0:
-            os.close(parent_fd)
-        raise AgentError("could not open private state file without following symlinks") from exc
-    flags = os.O_RDWR | os.O_CREAT
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = -1
-    try:
-        fd = os.open(path.name, flags, 0o600, dir_fd=parent_fd)
-    except OSError as exc:
-        raise AgentError("could not open private state file without following symlinks") from exc
-    finally:
-        if parent_fd >= 0:
-            os.close(parent_fd)
-    try:
-        current_stat = os.fstat(fd)
-        if not stat_module.S_ISREG(current_stat.st_mode) or getattr(current_stat, "st_nlink", 1) > 1:
-            raise AgentError("private state path is not a regular file")
-        try:
-            os.fchmod(fd, 0o600)
-        except PermissionError:
-            pass
-        return os.fdopen(fd, "r+b")
-    except Exception:
-        os.close(fd)
-        raise
 
 
 _NATIVE_AGENT_REGISTRY_LOCK_STACK: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
@@ -18694,6 +25003,9 @@ def _fleet_series_recovery_entries(
     return tuple(entries)
 
 
+_REPLACE_ENTRY_NONE: object = object()
+
+
 class _FleetRecoveryTransaction:
     def __init__(self, paths: FleetPaths, journal: FleetRecoveryJournal) -> None:
         self.paths = paths
@@ -18734,13 +25046,22 @@ class _FleetRecoveryTransaction:
         index: int,
         phase: EntryPhase,
         *,
-        target_identity: FileIdentity | None = None,
-        result_code: str | None = None,
+        target_identity: FileIdentity | None | object = _REPLACE_ENTRY_NONE,
+        source_identity: FileIdentity | None | object = _REPLACE_ENTRY_NONE,
+        result_code: str | None | object = _REPLACE_ENTRY_NONE,
     ) -> None:
         entries = list(self.journal.entries)
+        current_entry = entries[index]
+        if target_identity is _REPLACE_ENTRY_NONE:
+            target_identity = current_entry.target_identity
+        if source_identity is _REPLACE_ENTRY_NONE:
+            source_identity = current_entry.source_identity
+        if result_code is _REPLACE_ENTRY_NONE:
+            result_code = current_entry.result_code
         entries[index] = dataclass_replace(
-            entries[index],
+            current_entry,
             phase=phase,
+            source_identity=source_identity,
             target_identity=target_identity,
             result_code=result_code,
         )
@@ -19299,43 +25620,6 @@ def _fleet_peek_optional_private_text(
             os.close(directory_fd)
 
 
-def fleet_read_optional_private_bytes(path: Path, max_bytes: int, error_text: str) -> bytes | None:
-    stats = _fleet_optional_stats(path, error_text)
-    if stats is None:
-        return None
-    parent_stat, target_stat = stats
-    parent_fd = open_directory_no_follow_matching(
-        path.parent,
-        parent_stat,
-        error_text=error_text,
-        changed_text=error_text,
-    )
-    fd = -1
-    try:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(path.name, flags, dir_fd=parent_fd)
-        opened = os.fstat(fd)
-        if (
-            not source_identity_with_snapshot_matches(opened, target_stat)
-            or not stat_module.S_ISREG(opened.st_mode)
-            or getattr(opened, "st_nlink", 1) != 1
-            or opened.st_size > max_bytes
-        ):
-            raise AgentError(error_text)
-        with os.fdopen(fd, "rb") as handle:
-            fd = -1
-            data = handle.read(max_bytes + 1)
-        if len(data) > max_bytes:
-            raise AgentError(error_text)
-        return data
-    except (OSError, AgentError) as exc:
-        if isinstance(exc, AgentError):
-            raise
-        raise AgentError(error_text) from exc
-    finally:
-        if fd >= 0:
-            os.close(fd)
-        os.close(parent_fd)
 
 def main() -> int:
     if len(sys.argv) > 1:

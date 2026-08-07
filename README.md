@@ -342,6 +342,8 @@ Public, secret-free configuration examples live in
 - `master_timeout_policy`: report effective timeout and polling policy for MCP
   startup, Agentin claim retry, Agentin wait, productive headless assignments,
   watchdog supervision, and hidden CLI lease identity source
+- `master_applet_status`: bounded read-only snapshot for 1–6 concrete Agentinnen;
+  used by the Cinnamon applet and available as `applet-status` in the CLI
 - `agent_pool_validate`: validate a machine-readable Agentinnen pool spec
 - `agent_pool_install`: install or refresh sleeping Agentinnen homes from a spec
 - `agent_pool_status`: inspect data-sparse pool installation counts
@@ -377,6 +379,68 @@ Master MCP tools.
 
 ## Local CLI
 
+### Ressourcenbewusste Spawn-Angebote
+
+`agent_spawn_offers` ist ein read-only MCP-Hinweis fuer eine moegliche lokale
+Kapazitaet. Beispiel fuer einen MCP-`tools/call`:
+
+```json
+{"name":"agent_spawn_offers","arguments":{"required_slots":1}}
+```
+
+Gleiches CLI-Kommando aus diesem Worktree:
+
+```sh
+PYTHONPATH=src python -m codex_master.server spawn-offers --required-slots 1
+./bin/codex-master-mcp spawn-offers --required-slots 1
+```
+
+`PYTHONPATH=src` ist fuer Python-Aufrufe dieses Worktrees erforderlich: eine
+lokale editable Installation kann auf einen anderen Quellstand zeigen.
+
+Ein Offer ist advisory, gilt 5 Sekunden und reserviert nichts
+(`reservation: "none"`). `start` prueft CPU, Speicher und Slots vor einem
+neuen tmux-Start unter dem Admission-Lock erneut. Bei verweigerter oder
+unvollstaendiger Messung bleiben Offers leer; die data-sparse Antwort enthaelt
+nur Reason-Codes, keine `/proc`-Inhalte, tmux-Ausgabe, lokalen Pfade oder
+Environment-Text. Sie ist retryable mit 15 Sekunden Wartehinweis.
+
+Default-Grenzen fuer einen neuen Start:
+
+- Last pro CPU hoechstens `0.85`
+- verfuegbarer Speicher mindestens `20 %` und `1024 MiB`
+- hoechstens `6` laufende verwaltete tmux-Agentinnen
+- `required_slots` liegt zwischen 1 und 6
+
+`CODEX_MASTER_SPAWN_PRIORITY` ist einzige Spawn-Environment-Konfiguration.
+Sie ist eine kommagetrennte Prioritaetsliste (Default `mcp_host`), wird nur als
+Daten gelesen, dedupliziert und niemals als Shell-Befehl oder Netzwerkziel
+ausgefuehrt. Ihr Text wird nicht in Antworten gespiegelt. Aktuell kann nur der
+exakte lokale Route-Wert `mcp_host` ein Offer erzeugen. `developer_vm` und
+`sandbox` sind nicht angeboten, selbst wenn sie in dieser Liste stehen; es gibt
+keine Remote-Ausfuehrung in dieser Version.
+
+Ein Offer erzeugt keine Lease, keine Meta-Datei und keinen Assignment-Audit-
+Eintrag. Auth-, Scope-, Routing-, Modell-, Nutzungs- und bestehende Admission-
+Gates bleiben beim eigentlichen Start beziehungsweise bei Assignments wirksam.
+Ein sauberer tmux-Zustand ohne Server oder Sessions zaehlt als null laufende
+Agentinnen. Messfehler, `/proc`-Fehler und alle anderen tmux-Fehler fail-closed;
+ihre oeffentlichen Fehler bleiben begrenzt und redigiert.
+
+Native Subagentinnen sind davon getrennt: deren Steuerung ist Assignment-
+Prompt-Policy (inklusive frischem Ressourcencheck vor weiterem Spawn). Sie ist
+nicht technisch erzwungen. Der Masterjet kann eine native Codex-Delegation
+nicht intercepten. `developer_vm` darf erst offerable werden, wenn alle
+folgenden Voraussetzungen erfuellt sind:
+
+- real reachability/health probe against the actual VM
+- authenticated transport and host-key verification/pinning
+- distributed leases/reservations across hosts
+- bounded remote execution (timeouts and bounded output)
+- end-to-end integration testing against the real target
+
+Bis dahin bleibt ein VM-Backend vollstaendig weggelassen.
+
 ```sh
 cd /home/teladi/codex-master
 python3 -m codex_master.server install          # create ~/.local/bin/codex-master-mcp + codex mcp add
@@ -397,7 +461,7 @@ python3 -m codex_master.server claim b --forever --poll-interval-seconds 30
 python3 -m codex_master.server claim b --no-wait
 python3 -m codex_master.server claim b --no-recover-stopped
 python3 -m codex_master.server wait a --timeout-seconds 120 --poll-interval-seconds 30
-python3 -m codex_master.server watchdog all --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 15 --action stop --manage-unclaimed --quiet
+python3 -m codex_master.server watchdog active --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 15 --action stop --manage-unclaimed --quiet
 python3 -m codex_master.server capabilities all --agents-limit 30
 python3 -m codex_master.server skills all --agents-limit 30
 python3 -m codex_master.server skills a --include-names --limit 20 --names-offset 20 --plugins-offset 20 --plugins-limit 20
@@ -484,6 +548,104 @@ or D-Bus mutation; `--no-reload` is useful for CI and temporary-home smoke
 tests. `verify` additionally checks the running Cinnamon Xlet when a desktop
 session is available.
 
+## Cinnamon Applet: Flottenmanagement
+
+`codex-master@H234598` is the P3/P3a read-only status applet. Its visible panel
+title is always `Flottenmanagement`. It explicitly requests applet status
+schema v2; schema v1 remains available for older callers.
+
+Each schema-v2 refresh uses one bounded tmux session inventory. Every known
+running codex-master Agentin is discovered automatically and shown, up to the
+fixed six-row limit. Foreign tmux sessions are ignored. `tracked-agents` no
+longer defines the visible fleet: it only pins sleeping Agentinnen into rows
+left free by active Agentinnen. Its `a1,b1` default therefore does not limit
+automatic discovery. More than six active managed Agentinnen produce a bounded
+overflow marker instead of an unbounded menu.
+
+Native Codex-Subagentinnen are not mixed with managed tmux Agentinnen. Official
+`SessionStart`, `SubagentStart`, `SubagentStop`, and `SessionEnd` hooks maintain
+a private bounded register. The applet renders that register only in the
+separate `Native Bienen (N)` submenu, using six fixed, non-reactive child rows.
+Native rows are status-only and contain no action or context token.
+
+The applet starts at most one bounded `codex-master-mcp applet-status` child
+process, never invokes a shell, and currently exposes no start, stop,
+interrupt, auth, or lease mutation. Applet actions belong to later milestone
+P4.
+
+The status model keeps three concerns separate:
+
+- `activity_state`: running, sleeping, mixed, or unknown;
+- `backend_state`: ok, degraded, or unavailable;
+- `control_state`: ready, blocked, mixed, or unknown.
+
+A sleeping Agentin is normal and does not by itself degrade backend health.
+Failed refreshes retain the last valid snapshot and mark it as stale. Responses
+contain fixed state fields and counts only; prompts, logs, process IDs, paths,
+lease owners, lease IDs, and raw output are not returned.
+
+The four applet settings are:
+
+- `tracked-agents`: comma-separated `a1` through `c100`; 1–6 concrete IDs to
+  pin as sleeping rows when automatic active discovery leaves capacity,
+  case-normalized and deduplicated; default `a1,b1`;
+- `refresh-on-open`: refresh when opening the menu; default on;
+- `background-refresh`: opt-in periodic refresh; default off;
+- `refresh-interval-seconds`: 15–3600 seconds; default 60.
+
+Malformed agent, switch, or interval values show a configuration error, fall
+back to safe defaults, disable background work, and never reach the process
+argv. Finite refresh intervals outside the allowed range are clamped to
+15–3600 seconds. The menu contains a manual refresh, applet administration,
+one summary, at most six managed rows, and the separately bounded Native-Bienen
+submenu.
+
+Install MCP/plugin and applet with the repository-owned installers:
+
+```sh
+./bin/codex-master-mcp install
+./scripts/codex-master-cinnamon-applet install --dry-run
+./scripts/codex-master-cinnamon-applet install
+./scripts/codex-master-cinnamon-applet verify
+```
+
+`codex-master-mcp install` synchronizes the regular `hooks/hooks.json` and
+`hooks/native_bee_event.py` files into the personal plugin cache. It does not
+and must not alter Codex hook-trust state. After installation, open a new Codex
+session, run `/hooks`, inspect the four `codex-master` lifecycle hook
+definitions, and explicitly trust them. Until that manual step succeeds, do
+not claim that Native-Bienen hooks are active.
+
+Rollback the active applet tree with:
+
+```sh
+./scripts/codex-master-cinnamon-applet rollback
+```
+
+`install` stages and hashes regular non-hardlinked source files, rejects
+symlinked source/target paths, reloads only this UUID through Cinnamon's
+`ReloadXlet`, and restores and reloads the previous tree if deployment fails.
+`verify` requires byte-identical installed files and a running UUID from
+`GetRunningXletUUIDs applet`. `rollback` requires validated installed and
+rollback trees, but not an intact repository source. It fails closed when a
+required tree is missing or unexpected. Install, verify, and rollback are
+serialized by a private per-UUID lock. `--no-reload` is available for
+controlled offline install/rollback tests. No command uses `Eval` or restarts
+Cinnamon globally.
+
+Useful diagnostics:
+
+```sh
+./bin/codex-master-mcp applet-status --schema-version 2
+gdbus call --session --dest org.Cinnamon --object-path /org/Cinnamon \
+  --method org.Cinnamon.GetRunningXletUUIDs applet
+journalctl --user -b | grep -F codex-master@H234598
+```
+
+An `unavailable` or stale applet state means the bounded read-only refresh
+failed. Verify the installed files and CLI first; do not interpret ordinary
+`sleeping` activity as a backend failure.
+
 ## Install-Contract (CLI)
 
 `install`
@@ -567,9 +729,10 @@ session is available.
   `systemd/user/codex-master-watchdog.service` and
   `systemd/user/codex-master-watchdog.timer`
 - the user service runs with conservative hardening directives:
-  empty `CapabilityBoundingSet`, private keyring/tmp/devices, kernel and clock
-  protections, read-only system hierarchy, explicit write access only to the
-  managed state and user runtime directories, no IP sockets, no namespaces,
+  empty `CapabilityBoundingSet`, private keyring/tmp/devices, a read-only bind
+  of the user's tmux socket directory, kernel and clock protections, read-only
+  system hierarchy, explicit write access only to the managed state and user
+  runtime directories, no IP sockets, no namespaces,
   `NoNewPrivileges`, `MemoryDenyWriteExecute`, native syscall architecture,
   and `UMask=0077`; it intentionally keeps normal user home read access because
   the watchdog needs Codex config, tmux IPC, and managed state files

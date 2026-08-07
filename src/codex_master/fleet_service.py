@@ -711,6 +711,10 @@ class FleetService:
             reason = "limit_active"
         elif account.limit_state in {LimitState.UNKNOWN, LimitState.PROBING}:
             reason = "limit_unknown"
+        elif account.limit_reason == "provider_unavailable":
+            reason = "provider_unavailable"
+        elif account.limit_reason == "model_unavailable":
+            reason = "model_unavailable"
         elif not self._probe_is_fresh(account.last_probe_at_utc):
             reason = "probe_stale"
         else:

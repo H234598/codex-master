@@ -50,6 +50,7 @@ def test_codex_runner_keeps_chatgpt_home_and_unsets_foreign_secrets(tmp_path: Pa
         agent(tmp_path, Provider.OPENAI_CHATGPT, RunnerKind.CODEX_CLI, account_id="chatgpt"),
         Path("/usr/local/bin/codex"),
     )
+
     assert plan.mode == "persistent_tui"
     assert plan.argv == ("/usr/local/bin/codex", "-m", "gemini-3-flash-preview")
     assert plan.env["CODEX_HOME"] == str(tmp_path / "agents" / "d1")
@@ -63,6 +64,7 @@ def test_openai_api_runner_allows_only_its_secret_name(tmp_path: Path) -> None:
         agent(tmp_path, Provider.OPENAI_API, RunnerKind.CODEX_CLI, account_id="openai"),
         Path("/usr/local/bin/codex"),
     )
+
     assert plan.secret_env_name == "OPENAI_API_KEY"
     assert "OPENAI_API_KEY" not in plan.unset_env
     assert "HF_TOKEN" in plan.unset_env
@@ -83,6 +85,7 @@ def test_hf_runner_uses_responses_profile_and_env_reference(tmp_path: Path) -> N
         agent(tmp_path, Provider.HUGGINGFACE_INFERENCE, RunnerKind.CODEX_CLI, account_id="hf"),
         Path("/usr/local/bin/codex"),
     )
+
     assert plan.secret_env_name == "HF_TOKEN"
     assert "https://router.huggingface.co/v1" in " ".join(plan.argv)
     assert 'env_key="HF_TOKEN"' in " ".join(plan.argv)
@@ -94,6 +97,7 @@ def test_gemini_runner_is_headless_jsonl_and_home_isolated(tmp_path: Path) -> No
         agent(tmp_path, Provider.GEMINI_API, RunnerKind.GEMINI_CLI, account_id="gemini-project-1"),
         Path("/usr/local/bin/gemini"),
     )
+
     assert plan.mode == "headless_job"
     assert plan.argv == (
         "/usr/local/bin/gemini", "--output-format", "stream-json", "--model",
@@ -188,6 +192,7 @@ def test_gemini_parser_keeps_only_assistant_response_and_aggregate_usage() -> No
         '{"type":"message","role":"assistant","content":"answer"}',
         '{"type":"result","stats":{"input_tokens":12,"output_tokens":7}}',
     ])
+
     assert result.response == "first answer"
     assert result.session_id == "session-1"
     assert result.model == "gemini-3-flash-preview"
@@ -204,6 +209,7 @@ def test_gemini_parser_accepts_final_response_and_counts_unknown_events() -> Non
         '{"type":"new_event","prompt":"private"}',
         '{"type":"result","response":"final answer","stats":{"input_tokens":0,"output_tokens":2}}',
     ])
+
     assert result.response == "final answer"
     assert result.unknown_event_count == 1
 
@@ -245,6 +251,7 @@ def test_gemini_parser_returns_data_minimized_structured_provider_error() -> Non
         '"message":"private provider diagnosis"}}',
         '{"type":"result"}',
     ])
+
     assert result.error is not None
     assert result.error.kind == "account_limited"
     assert result.error.status_code == 429
@@ -255,6 +262,7 @@ def test_resource_exhausted_is_shared_account_limit() -> None:
     error = classify_provider_error(
         Provider.GEMINI_API, {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}}, "",
     )
+
     assert error.kind == "account_limited"
     assert error.retryable is True
 

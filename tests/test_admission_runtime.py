@@ -23,7 +23,7 @@ from codex_master.server import AgentError, build_server_admission_runtime, buil
 from codex_master.selection_service import SelectionDeniedError, SelectionService
 
 
-NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc)
 
 
 def admission() -> object:

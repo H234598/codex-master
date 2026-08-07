@@ -22,7 +22,7 @@ from codex_master.selection_service import (
 )
 
 
-NOW = datetime(2026, 8, 6, 12, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc)
 
 
 def candidate(agent: str = "a1") -> SelectionCandidate:

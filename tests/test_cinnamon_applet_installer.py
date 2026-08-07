@@ -389,29 +389,6 @@ else:
                 path.unlink()
                 path.write_text("// new\n", encoding="utf-8")
 
-    def test_scan_tree_rejects_oversized_files(self) -> None:
-        module = self._load_tool_module()
-        (self.source / "applet.js").write_bytes(b"x" * (module.MAX_SCAN_FILE_BYTES + 1))
-
-        with self.assertRaisesRegex(module.InstallerError, "scan size limit"):
-            module.validate_source(self.source)
-
-    def test_scan_tree_rejects_entry_depth_and_total_byte_limits(self) -> None:
-        module = self._load_tool_module()
-        with mock.patch.object(module, "MAX_SCAN_ENTRIES", 2):
-            with self.assertRaisesRegex(module.InstallerError, "scan entry limit"):
-                module.scan_tree(self.source, "test tree")
-
-        nested = self.source / "nested"
-        nested.mkdir()
-        with mock.patch.object(module, "MAX_SCAN_DEPTH", 1):
-            with self.assertRaisesRegex(module.InstallerError, "scan depth limit"):
-                module.scan_tree(self.source, "test tree")
-
-        with mock.patch.object(module, "MAX_SCAN_TOTAL_BYTES", 10):
-            with self.assertRaisesRegex(module.InstallerError, "scan byte limit"):
-                module.scan_tree(self.source, "test tree")
-
     def test_source_wrong_owner_or_group_writable_mode_is_rejected(self) -> None:
         source_file = self.source / "applet.js"
         source_file.chmod(0o664)

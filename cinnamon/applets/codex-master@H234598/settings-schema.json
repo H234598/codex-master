@@ -1,7 +1,28 @@
 {
-  "favoriteAgents": {
+  "tracked-agents": {
     "type": "entry",
-    "default": "",
-    "description": "At most six concrete dispatch targets; the dynamic series menu is independent."
+    "description": "Beobachtete Agentinnen",
+    "tooltip": "Kommagetrennte konkrete IDs, zum Beispiel a1,b1. Erlaubt sind 1 bis 6 IDs aus a1 bis c100.",
+    "default": "a1,b1"
+  },
+  "refresh-on-open": {
+    "type": "switch",
+    "description": "Beim Öffnen aktualisieren",
+    "default": true
+  },
+  "background-refresh": {
+    "type": "switch",
+    "description": "Im Hintergrund aktualisieren",
+    "tooltip": "Standardmäßig aus. Aktualisierungen bleiben read-only.",
+    "default": false
+  },
+  "refresh-interval-seconds": {
+    "type": "spinbutton",
+    "description": "Aktualisierungsintervall",
+    "default": 60,
+    "min": 15,
+    "max": 3600,
+    "step": 15,
+    "units": "Sekunden"
   }
 }

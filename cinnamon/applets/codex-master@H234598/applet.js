@@ -1,351 +1,1709 @@
-/* Dynamic fleet menu model.  Cinnamon bindings are deliberately kept outside
- * this bounded, Node-testable core. */
-(function (root, factory) {
-    if (typeof module !== "undefined" && module.exports) {
-        module.exports = factory(root);
-    } else {
-        const exported = factory(root);
-        root.CodexMasterApplet = exported;
-        root.main = exported.main;
-    }
-}(typeof globalThis !== "undefined" ? globalThis : this, function (host) {
-    "use strict";
+/* -*- mode: js2; js2-basic-offset: 4; indent-tabs-mode: nil -*- */
+const Applet = imports.ui.applet;
+const PopupMenu = imports.ui.popupMenu;
+const Settings = imports.ui.settings;
+const Util = imports.misc.util;
+const Gio = imports.gi.Gio;
+const GLib = imports.gi.GLib;
+const ByteArray = imports.byteArray;
 
-    const LABEL = "Flottenmanagement";
-    const UUID = "codex-master@H234598";
-    const MAX_SERIES = 26;
-    const MAX_AGENTS = 1000;
-    const MAX_NATIVE_AGENTS = 1000;
-    const MAX_VISIBLE_ROWS = 25;
-    const MAX_DISPATCH_TARGETS = 6;
-    const LIMIT_STATES = new Set(["ready", "limited", "unknown", "probing", "disabled"]);
+const LABEL = "Flottenmanagement";
+const UUID = "codex-master@H234598";
+const APPLET_STATUS_TIMEOUT_MILLISECONDS = 10 * 1000;
+const APPLET_ACTION_TIMEOUT_MILLISECONDS = 120 * 1000;
+const CONTROL_CENTER_LAUNCH_TIMEOUT_MILLISECONDS = 10 * 1000;
+const APPLET_STDOUT_LIMIT_BYTES = 64 * 1024;
+const APPLET_STDERR_LIMIT_BYTES = 8 * 1024;
+const APPLET_STATUS_CHUNK_BYTES = 1024;
+const APPLET_STATUS_AGENTS = ["a1", "b1"];
+const DEFAULT_TRACKED_AGENTS_TEXT = "a1,b1";
+const DEFAULT_REFRESH_ON_OPEN = true;
+const DEFAULT_BACKGROUND_REFRESH = false;
+const DEFAULT_REFRESH_INTERVAL_SECONDS = 60;
+const MIN_REFRESH_INTERVAL_SECONDS = 15;
+const MAX_REFRESH_INTERVAL_SECONDS = 3600;
+const MAX_TRACKED_AGENTS = 6;
+const MAX_NATIVE_BEES = 6;
+const MAX_TRACKED_AGENTS_SETTING_CHARS = 128;
+const APPLET_ERROR_LOG_LIMIT = 8;
+const APPLET_IMMEDIATE_EXIT_WAIT_LIMIT = 2;
+const APPLET_SAFE_PATH = "/usr/bin:/bin";
+const APPLET_STATUS_COMMAND = "applet-status";
+const APPLET_ACTION_COMMAND = "applet-action";
+const APPLET_STATUS_SCHEMA_VERSION = 2;
+const MAX_ENVIRONMENT_KEYS = 256;
+let appletErrorLogCount = 0;
+const APPLET_STATUS_REQUIRED_FIELDS = [
+    "schema_version", "mode", "counts", "agents", "native_agents", "raw_output",
+];
+const APPLET_STATUS_REQUIRED_ROW_FIELDS = [
+    "agent", "activity_state", "backend_state", "control_state", "auth_state", "identity_state", "lease_state",
+    "allowed_action", "context_token", "limit_state", "blocked_until_utc",
+];
+const APPLET_STATUS_BASE_ROW_STRING_FIELDS = [
+    "agent", "activity_state", "backend_state", "control_state", "auth_state", "identity_state", "lease_state",
+];
+const APPLET_STATUS_REQUIRED_COUNTS = ["tracked", "running", "sleeping", "overflow"];
+const APPLET_STATUS_REQUIRED_NATIVE_FIELDS = ["bridge_state", "counts", "agents", "truncated"];
+const APPLET_STATUS_REQUIRED_NATIVE_COUNTS = ["active", "unconfirmed", "overflow"];
+const APPLET_STATUS_REQUIRED_NATIVE_AGENT_FIELDS = ["display_id", "agent_type", "activity_state", "updated_at_utc"];
+const APPLET_STATUS_RAW_OUTPUT = "not_returned";
+const APPLET_STATUS_ERROR_ROW = {
+    activity_state: "unknown",
+    backend_state: "error",
+    control_state: "unknown",
+    auth_state: "unknown",
+    identity_state: "unknown",
+    lease_state: "unreadable",
+};
+const APPLET_STATUS_VALID_STRINGS = {
+    row: {
+        activity_state: new Set(["running", "sleeping", "unknown"]),
+        backend_state: new Set(["ok", "degraded", "error"]),
+        control_state: new Set(["ready", "blocked", "unknown"]),
+        auth_state: new Set(["ready", "blocked", "unknown"]),
+        identity_state: new Set(["verified", "unverified", "stopped", "unknown"]),
+        lease_state: new Set(["unclaimed", "held", "expired", "unreadable"]),
+        allowed_action: new Set(["start", "stop", "none"]),
+        limit_state: new Set(["clear", "blocked", "unknown"]),
+    },
+    native: {
+        bridge_state: new Set(["ready", "disabled", "degraded", "unavailable"]),
+        activity_state: new Set(["active", "unconfirmed"]),
+    },
+};
+const APPLET_STATUS_LABELS = {
+    activity: {
+        running: "laufend",
+        sleeping: "schlafend",
+        mixed: "gemischt",
+        unknown: "unbekannt",
+    },
+    backend: {
+        ok: "ok",
+        degraded: "eingeschränkt",
+        unavailable: "nicht verfügbar",
+        error: "Fehler",
+    },
+    control: {
+        ready: "bereit",
+        blocked: "blockiert",
+        mixed: "gemischt",
+        unknown: "unbekannt",
+    },
+    nativeActivity: {
+        active: "aktiv",
+        unconfirmed: "unbestätigt",
+    },
+    nativeBridge: {
+        ready: "bereit",
+        disabled: "deaktiviert",
+        degraded: "eingeschränkt",
+        unavailable: "nicht verfügbar",
+    },
+};
+const APPLET_ALLOWED_ENV_VARS = new Set([
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_RUNTIME_DIR",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_DESKTOP",
+    "XDG_SESSION_TYPE",
+    "DESKTOP_STARTUP_ID",
+    "XDG_ACTIVATION_TOKEN",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "TZ",
+]);
 
-    function text(value, fallback) {
-        return typeof value === "string" && value.length > 0 && value.length <= 120
-                && !/[\u0000-\u001F\u007F]/.test(value)
-            ? value
-            : fallback;
-    }
+function FlottenmanagementApplet(metadata, orientation, panel_height, instance_id) {
+    this._init(metadata, orientation, panel_height, instance_id);
+}
 
-    function normalizeAppletSnapshot(payload) {
-        if (!payload || (payload.schema_version !== 2 && payload.schema_version !== 3)) {
-            return {schema_version: 3, generation: 0, series: [], native_agents: [], dispatch_targets: []};
-        }
-        const generation = Number.isInteger(payload.generation) && payload.generation >= 0 ? payload.generation : 0;
-        const rawSeries = Array.isArray(payload.series) ? payload.series.slice(0, MAX_SERIES) : [];
-        let remainingAgents = MAX_AGENTS;
-        const seenPrefixes = new Set();
-        const series = rawSeries.flatMap((item) => {
-            if (!item || typeof item.prefix !== "string" || !/^[a-z]$/.test(item.prefix)) return [];
-            if (seenPrefixes.has(item.prefix)) return [];
-            if (remainingAgents <= 0) return [];
-            const requestedCount = Number.isInteger(item.count) ? Math.max(0, Math.min(100, item.count)) : 0;
-            const count = Math.min(requestedCount, remainingAgents);
-            remainingAgents -= count;
-            if (count <= 0) return [];
-            seenPrefixes.add(item.prefix);
-            const running = Number.isInteger(item.running_count) ? Math.max(0, Math.min(count, item.running_count)) : 0;
-            const eligible = Number.isInteger(item.eligible_count) ? Math.max(0, Math.min(count, item.eligible_count)) : 0;
-            const limitState = typeof item.limit_state === "string" && LIMIT_STATES.has(item.limit_state)
-                ? item.limit_state
-                : "unknown";
-            return [{
-                prefix: item.prefix,
-                display_name: text(item.display_name, item.prefix.toUpperCase()),
-                count,
-                polled_count: Number.isInteger(item.polled_count)
-                    ? Math.max(0, Math.min(count, item.polled_count))
-                    : count,
-                running_count: running,
-                eligible_count: eligible,
-                limit_state: limitState,
-                blocked_until_utc: typeof item.blocked_until_utc === "string" ? item.blocked_until_utc : null,
-                generation,
-            }];
-        });
-        const rawNative = Array.isArray(payload.native_agents)
-            ? payload.native_agents.slice(0, MAX_NATIVE_AGENTS)
-            : [];
-        const seenNative = new Set();
-        const native_agents = rawNative.flatMap((item) => {
-            if (remainingAgents <= 0) return [];
-            const native = typeof item === "string" ? {id: item} : item;
-            if (!native || typeof native.id !== "string"
-                    || !/^[a-z](?:[1-9]|[1-9][0-9]|100)$/.test(native.id)) return [];
-            if (seenNative.has(native.id)) return [];
-            seenNative.add(native.id);
-            remainingAgents -= 1;
-            const limitState = typeof native.limit_state === "string" && LIMIT_STATES.has(native.limit_state)
-                ? native.limit_state
-                : "unknown";
-            return [{
-                id: native.id,
-                label: text(native.label, native.id),
-                running: native.running === true,
-                limit_state: limitState,
-            }];
-        });
-        const targets = Array.isArray(payload.dispatch_targets)
-            ? payload.dispatch_targets.filter((item) => typeof item === "string" && /^[a-z](?:[1-9]|[1-9][0-9]|100)$/.test(item)).slice(0, MAX_DISPATCH_TARGETS)
-            : [];
-        return {schema_version: payload.schema_version, generation, series, native_agents, dispatch_targets: targets};
-    }
+FlottenmanagementApplet.prototype = {
+    __proto__: Applet.TextApplet.prototype,
 
-    class SeriesMenuModel {
-        constructor() {
-            this.snapshot = normalizeAppletSnapshot(null);
-            this.openedSeries = null;
-            this.page = 0;
-            this.rows = [];
-        }
+    _init(metadata, orientation, panel_height, instance_id) {
+        Applet.TextApplet.prototype._init.call(this, orientation, panel_height, instance_id);
+        this._removed = false;
+        this._cleanupComplete = false;
+        this._statusInFlight = false;
+        this._statusPendingRefresh = false;
+        this._statusGeneration = 0;
+        this._statusActiveGeneration = 0;
+        this._statusLastGood = null;
+        this._statusActiveState = null;
+        this._statusViewState = "initializing";
+        this._backgroundRefreshSource = 0;
+        this._launcherInFlight = false;
+        this._actionInFlight = false;
+        this._armedAction = null;
+        this._actionsAwaitingRefresh = false;
+        this._startActionBinding = null;
+        this._stopActionBindings = Array(MAX_TRACKED_AGENTS).fill(null);
+        this._trackedAgents = APPLET_STATUS_AGENTS.slice();
+        this.trackedAgentsSetting = DEFAULT_TRACKED_AGENTS_TEXT;
+        this.refreshOnOpenSetting = DEFAULT_REFRESH_ON_OPEN;
+        this.backgroundRefreshSetting = DEFAULT_BACKGROUND_REFRESH;
+        this.refreshIntervalSecondsSetting = DEFAULT_REFRESH_INTERVAL_SECONDS;
+        this.refreshOnOpen = DEFAULT_REFRESH_ON_OPEN;
+        this.backgroundRefresh = DEFAULT_BACKGROUND_REFRESH;
+        this.refreshIntervalSeconds = DEFAULT_REFRESH_INTERVAL_SECONDS;
+        this._settingsValid = true;
+        this._settingsInitializing = false;
+        this.settings = null;
+        this._settingsCleanupPending = null;
+        this._statusSummaryItem = null;
+        this._statusRowItems = [];
+        this._nativeSubmenuItem = null;
+        this._nativeBeeRowItems = [];
+        this._quickControlSubmenuItem = null;
+        this._startActionItem = null;
+        this._stopActionItems = [];
+        this._confirmationDetailItem = null;
+        this._confirmationConfirmItem = null;
+        this._confirmationCancelItem = null;
+        this._menuCleanupState = {};
+        this._signalConnections = [];
+        this.menu = null;
+        this.menuManager = null;
 
-        setSnapshot(payload) {
-            const next = normalizeAppletSnapshot(payload);
-            if (next.generation !== this.snapshot.generation) {
-                this.openedSeries = null;
-                this.page = 0;
-                this.rows = [];
-            }
-            this.snapshot = next;
-            if (this.openedSeries !== null) {
-                if (next.series.some((item) => item.prefix === this.openedSeries)) {
-                    this.openSeries(this.openedSeries, this.page);
-                } else {
-                    this.closeSeries();
-                }
-            }
-            return next;
-        }
-
-        seriesRows() {
-            return this.snapshot.series.slice(0, MAX_SERIES);
-        }
-
-        nativeRows() {
-            return this.snapshot.native_agents.slice(0, MAX_NATIVE_AGENTS).map((item) => ({
-                ...item,
-                reactive: this.snapshot.dispatch_targets.includes(item.id),
-            }));
-        }
-
-        openSeries(prefix, page) {
-            const series = this.snapshot.series.find((item) => item.prefix === prefix);
-            if (!series) return [];
-            const maxPage = Math.max(0, Math.ceil(series.count / MAX_VISIBLE_ROWS) - 1);
-            this.openedSeries = prefix;
-            this.page = Math.max(0, Math.min(Number.isInteger(page) ? page : 0, maxPage));
-            const first = this.page * MAX_VISIBLE_ROWS;
-            const disabled = series.limit_state !== "ready" || series.eligible_count === 0;
-            this.rows = Array.from({length: Math.min(MAX_VISIBLE_ROWS, Math.max(0, series.count - first))}, (_, offset) => {
-                const ordinal = first + offset + 1;
-                const id = `${series.prefix}${ordinal}`;
-                const reactive = !disabled && this.snapshot.dispatch_targets.includes(id);
-                return {id, reactive, status: disabled ? series.limit_state : (reactive ? "ready" : "idle")};
-            });
-            return this.rows.slice(0, MAX_VISIBLE_ROWS);
-        }
-
-        closeSeries() {
-            this.openedSeries = null;
-            this.page = 0;
-            this.rows = [];
-        }
-    }
-
-    function cinnamonApi() {
-        const imported = (host && host.imports)
-            || (typeof imports !== "undefined" ? imports : null);
-        if (!imported || !imported.ui || !imported.ui.applet || !imported.ui.popupMenu || !imported.misc) {
-            return null;
-        }
-        if (!imported.ui.applet.TextApplet || !imported.ui.applet.AppletPopupMenu
-                || !imported.ui.popupMenu.PopupMenuManager || !imported.ui.popupMenu.PopupMenuItem
-                || !imported.misc.util) {
-            return null;
-        }
-        return imported;
-    }
-
-    function CinnamonFleetApplet(metadata, orientation, panelHeight, instanceId) {
-        this.model = new SeriesMenuModel();
-        this._cinnamon = cinnamonApi();
-        const textApplet = this._cinnamon && this._cinnamon.ui.applet.TextApplet;
-        if (textApplet && textApplet.prototype && typeof textApplet.prototype._init === "function") {
-            this._initCinnamon(metadata, orientation, panelHeight, instanceId);
-        } else {
-            this._cinnamon = null;
-        }
-    }
-
-    const importedCinnamon = cinnamonApi();
-    if (importedCinnamon) {
-        CinnamonFleetApplet.prototype = Object.create(importedCinnamon.ui.applet.TextApplet.prototype);
-    }
-    CinnamonFleetApplet.prototype.constructor = CinnamonFleetApplet;
-
-    CinnamonFleetApplet.prototype._initCinnamon = function (metadata, orientation, panelHeight, instanceId) {
-        const Applet = this._cinnamon.ui.applet;
-        const PopupMenu = this._cinnamon.ui.popupMenu;
-        const Util = this._cinnamon.misc.util;
-        Applet.TextApplet.prototype._init.call(this, orientation, panelHeight, instanceId);
         if (!metadata || metadata.uuid !== UUID) {
             this.set_applet_label("Applet-Fehler");
             this.set_applet_tooltip("UUID mismatch");
             return;
         }
+
         this.set_applet_label(LABEL);
         this.set_applet_tooltip("Flottenmanagement öffnen");
+
         this.menu = new Applet.AppletPopupMenu(this, orientation);
         this.menuManager = new PopupMenu.PopupMenuManager(this);
         this.menuManager.addMenu(this.menu);
-        this._dynamicItems = [];
-        const statusItem = new PopupMenu.PopupMenuItem("Flottenstatus im Terminal");
-        statusItem.connect("activate", function () {
-            Util.spawn([
-                "x-terminal-emulator", "-e", "bash", "-lc",
-                "codex-master-mcp status; printf '\\n'; exec bash",
-            ]);
+
+        const statusItem = new PopupMenu.PopupMenuItem("Jetzt aktualisieren");
+        this._connectTracked(statusItem, "activate", () => {
+            if (this._removed) return;
+            this._refreshStatus();
         });
         this.menu.addMenuItem(statusItem);
+
         const settingsItem = new PopupMenu.PopupMenuItem("Applet-Verwaltung öffnen");
-        settingsItem.connect("activate", function () {
-            Util.spawn(["cinnamon-settings", "applets"]);
+        this._connectTracked(settingsItem, "activate", () => {
+            if (this._removed) return;
+            try {
+                Util.spawn(["cinnamon-settings", "applets"]);
+            } catch (error) {
+                this._logCleanupError(error);
+            }
         });
         this.menu.addMenuItem(settingsItem);
-        this._renderDynamicMenu();
-    };
 
-    CinnamonFleetApplet.prototype.setSnapshot = function (payload) {
-        const snapshot = this.model.setSnapshot(payload);
-        this._renderDynamicMenu();
-        return snapshot;
-    };
+        const controlCenterItem = new PopupMenu.PopupMenuItem("Steuerzentrale öffnen");
+        this._connectTracked(controlCenterItem, "activate", () => this._launchControlCenter());
+        this.menu.addMenuItem(controlCenterItem);
 
-    CinnamonFleetApplet.prototype._clearDynamicMenu = function () {
-        if (!this.menu) return;
-        this._dynamicItems.forEach((item) => {
-            if (typeof this.menu.removeMenuItem === "function") this.menu.removeMenuItem(item);
-            if (item && typeof item.destroy === "function") item.destroy();
-        });
-        this._dynamicItems = [];
-    };
-
-    CinnamonFleetApplet.prototype._renderDynamicMenu = function () {
-        if (!this.menu) return;
-        this._clearDynamicMenu();
-        const PopupMenu = this._cinnamon.ui.popupMenu;
-        const addItem = (label, onActivate, reactive = true) => {
-            const item = new PopupMenu.PopupMenuItem(label);
-            if (!reactive && typeof item.setSensitive === "function") item.setSensitive(false);
-            item.connect("activate", onActivate);
-            this.menu.addMenuItem(item);
-            this._dynamicItems.push(item);
-        };
-        if (this.model.openedSeries !== null) {
-            addItem("← Serien", () => {
-                this.model.closeSeries();
-                this._renderDynamicMenu();
-            });
-            const opened = this.model.snapshot.series.find(
-                (series) => series.prefix === this.model.openedSeries,
-            );
-            const maxPage = opened
-                ? Math.max(0, Math.ceil(opened.count / MAX_VISIBLE_ROWS) - 1)
-                : 0;
-            if (this.model.page > 0) {
-                addItem("← Vorherige Seite", () => {
-                    this.model.openSeries(this.model.openedSeries, this.model.page - 1);
-                    this._renderDynamicMenu();
-                });
-            }
-            this.model.rows.forEach((row) => {
-                addItem(`${row.id} — ${row.status}`, () => {
-                    if (row.reactive) this._dispatchAgent(row.id);
-                }, row.reactive);
-            });
-            if (this.model.page < maxPage) {
-                addItem("Nächste Seite →", () => {
-                    this.model.openSeries(this.model.openedSeries, this.model.page + 1);
-                    this._renderDynamicMenu();
-                });
-            }
-            return;
+        this._statusSummaryItem = new PopupMenu.PopupMenuItem("", { reactive: false });
+        this.menu.addMenuItem(this._statusSummaryItem);
+        for (let index = 0; index < MAX_TRACKED_AGENTS; index += 1) {
+            const rowItem = new PopupMenu.PopupMenuItem("", { reactive: false });
+            this._statusRowItems.push(rowItem);
+            this.menu.addMenuItem(rowItem);
         }
-        const seriesEntries = this.model.seriesRows().map((series) => ({
-            label: `${series.display_name} — ${series.running_count}/${series.polled_count} von ${series.count} — ${series.limit_state}`,
-            reactive: true,
-            onActivate: () => {
-                this.model.openSeries(series.prefix, 0);
-                this._renderDynamicMenu();
-            },
-        }));
-        const nativeEntries = this.model.nativeRows().map((native) => ({
-            label: `${native.label} — ${native.limit_state}`,
-            reactive: native.reactive,
-            onActivate: () => {
-                if (native.reactive) this._dispatchAgent(native.id);
-            },
-        }));
-        const addSubmenu = (label, entries) => {
-            if (!entries.length) return;
-            if (PopupMenu.PopupSubMenuMenuItem) {
-                const submenu = new PopupMenu.PopupSubMenuMenuItem(label);
-                entries.forEach((entry) => {
-                    const item = new PopupMenu.PopupMenuItem(entry.label);
-                    if (!entry.reactive && typeof item.setSensitive === "function") item.setSensitive(false);
-                    item.connect("activate", entry.onActivate);
-                    submenu.menu.addMenuItem(item);
-                });
-                this.menu.addMenuItem(submenu);
-                this._dynamicItems.push(submenu);
+
+        this._quickControlSubmenuItem = new PopupMenu.PopupSubMenuMenuItem("Schnellsteuerung");
+        this.menu.addMenuItem(this._quickControlSubmenuItem);
+        this._startActionItem = new PopupMenu.PopupMenuItem("Biene starten");
+        this._connectTracked(this._startActionItem, "activate", () => this._armStartAction());
+        this._quickControlSubmenuItem.menu.addMenuItem(this._startActionItem);
+        for (let index = 0; index < MAX_TRACKED_AGENTS; index += 1) {
+            const rowItem = new PopupMenu.PopupMenuItem("Biene stoppen");
+            this._connectTracked(rowItem, "activate", () => this._armStopAction(index));
+            this._stopActionItems.push(rowItem);
+            this._quickControlSubmenuItem.menu.addMenuItem(rowItem);
+        }
+        this._confirmationDetailItem = new PopupMenu.PopupMenuItem("", { reactive: false });
+        this._quickControlSubmenuItem.menu.addMenuItem(this._confirmationDetailItem);
+        this._confirmationConfirmItem = new PopupMenu.PopupMenuItem("Bestätigen");
+        this._connectTracked(this._confirmationConfirmItem, "activate", () => this._confirmArmedAction());
+        this._quickControlSubmenuItem.menu.addMenuItem(this._confirmationConfirmItem);
+        this._confirmationCancelItem = new PopupMenu.PopupMenuItem("Abbrechen");
+        this._connectTracked(this._confirmationCancelItem, "activate", () => this._cancelArmedAction());
+        this._quickControlSubmenuItem.menu.addMenuItem(this._confirmationCancelItem);
+
+        this._nativeSubmenuItem = new PopupMenu.PopupSubMenuMenuItem("Native Bienen");
+        this.menu.addMenuItem(this._nativeSubmenuItem);
+        for (let index = 0; index < MAX_NATIVE_BEES; index += 1) {
+            const rowItem = new PopupMenu.PopupMenuItem("", { reactive: false });
+            this._nativeBeeRowItems.push(rowItem);
+            this._nativeSubmenuItem.menu.addMenuItem(rowItem);
+        }
+
+        this._initializeSettings(instance_id);
+        this._applySettings();
+    },
+
+    _initializeSettings(instanceId) {
+        this._settingsInitializing = true;
+        try {
+            this.settings = new Settings.AppletSettings(this, UUID, instanceId);
+            const bind = (key, property) => {
+                const bound = this.settings.bindProperty(
+                    Settings.BindingDirection.IN,
+                    key,
+                    property,
+                    () => this._onSettingsChanged(),
+                    null
+                );
+                if (bound !== true) throw new Error("Applet setting binding failed");
+            };
+            bind("tracked-agents", "trackedAgentsSetting");
+            bind("refresh-on-open", "refreshOnOpenSetting");
+            bind("background-refresh", "backgroundRefreshSetting");
+            bind("refresh-interval-seconds", "refreshIntervalSecondsSetting");
+        } catch (_error) {
+            const incompleteSettings = this.settings;
+            let settingsFinalized = !incompleteSettings || typeof incompleteSettings.finalize !== "function";
+            for (let attempt = 0; attempt < 2 && !settingsFinalized; attempt += 1) {
+                try {
+                    incompleteSettings.finalize();
+                    settingsFinalized = true;
+                } catch (error) {
+                    this._logCleanupError(error);
+                }
+            }
+            this._settingsCleanupPending = settingsFinalized ? null : incompleteSettings;
+            this.settings = null;
+            this._settingsValid = false;
+        } finally {
+            this._settingsInitializing = false;
+        }
+    },
+
+    _normalizeTrackedAgents(value) {
+        if (typeof value !== "string" || value.length > MAX_TRACKED_AGENTS_SETTING_CHARS) return null;
+        const entries = value.split(",").map((entry) => entry.trim().toLowerCase());
+        if (entries.length < 1 || entries.length > MAX_TRACKED_AGENTS) return null;
+        const normalized = [];
+        const seen = new Set();
+        for (const entry of entries) {
+            if (!/^[abc](?:[1-9]|[1-9][0-9]|100)$/.test(entry)) return null;
+            if (seen.has(entry)) continue;
+            seen.add(entry);
+            normalized.push(entry);
+        }
+        return normalized.length > 0 && normalized.length <= MAX_TRACKED_AGENTS ? normalized : null;
+    },
+
+    _applySettings() {
+        let valid = this.settings !== null;
+        const previousAgents = this._trackedAgents.join(",");
+        const agents = this._normalizeTrackedAgents(this.trackedAgentsSetting);
+        this._trackedAgents = agents || APPLET_STATUS_AGENTS.slice();
+        if (!agents) valid = false;
+
+        if (typeof this.refreshOnOpenSetting !== "boolean") {
+            this.refreshOnOpen = DEFAULT_REFRESH_ON_OPEN;
+            valid = false;
+        } else {
+            this.refreshOnOpen = this.refreshOnOpenSetting;
+        }
+        if (typeof this.backgroundRefreshSetting !== "boolean") {
+            this.backgroundRefresh = DEFAULT_BACKGROUND_REFRESH;
+            valid = false;
+        } else {
+            this.backgroundRefresh = this.backgroundRefreshSetting;
+        }
+        if (!Number.isFinite(this.refreshIntervalSecondsSetting)) {
+            this.refreshIntervalSeconds = DEFAULT_REFRESH_INTERVAL_SECONDS;
+            valid = false;
+        } else {
+            this.refreshIntervalSeconds = Math.min(
+                MAX_REFRESH_INTERVAL_SECONDS,
+                Math.max(MIN_REFRESH_INTERVAL_SECONDS, Math.trunc(this.refreshIntervalSecondsSetting))
+            );
+        }
+
+        this._settingsValid = valid;
+        if (previousAgents !== this._trackedAgents.join(",")) {
+            this._statusLastGood = null;
+            this._armedAction = null;
+            this._clearActionBindings();
+            this._statusViewState = "initializing";
+            if (this._statusInFlight) this._statusPendingRefresh = true;
+        }
+        this._restartBackgroundRefresh();
+        this._renderStatusSafely();
+    },
+
+    _onSettingsChanged() {
+        if (this._removed || this._settingsInitializing) return;
+        this._applySettings();
+    },
+
+    _restartBackgroundRefresh() {
+        if (this._backgroundRefreshSource) {
+            try {
+                GLib.source_remove(this._backgroundRefreshSource);
+            } catch (error) {
+                this._settingsValid = false;
+                this._logCleanupError(error);
                 return;
             }
-            entries.forEach((entry) => addItem(`${label}: ${entry.label}`, entry.onActivate, entry.reactive));
-        };
-        addSubmenu("Serien", seriesEntries);
-        addSubmenu("Native Bienen", nativeEntries);
-    };
+            this._backgroundRefreshSource = 0;
+        }
+        if (this._removed || !this._settingsValid || !this.backgroundRefresh) return;
+        try {
+            const backgroundRefreshSource = GLib.timeout_add_seconds(
+                GLib.PRIORITY_DEFAULT,
+                this.refreshIntervalSeconds,
+                () => {
+                    if (this._removed || !this._settingsValid || !this.backgroundRefresh) {
+                        this._backgroundRefreshSource = 0;
+                        return GLib.SOURCE_REMOVE;
+                    }
+                    this._refreshStatus();
+                    return GLib.SOURCE_CONTINUE;
+                }
+            );
+            if (!Number.isSafeInteger(backgroundRefreshSource) || backgroundRefreshSource <= 0) {
+                throw new Error("Invalid background timeout source id");
+            }
+            this._backgroundRefreshSource = backgroundRefreshSource;
+        } catch (error) {
+            this._backgroundRefreshSource = 0;
+            this._settingsValid = false;
+            this._logCleanupError(error);
+        }
+    },
 
-    CinnamonFleetApplet.prototype._dispatchAgent = function (agent) {
-        if (host && typeof host.codexMasterDispatch === "function") {
-            host.codexMasterDispatch(agent);
+    _trackedStatusArgv() {
+        const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
+        return [
+            home + "/.local/bin/codex-master-mcp",
+            APPLET_STATUS_COMMAND,
+            "--schema-version",
+            String(APPLET_STATUS_SCHEMA_VERSION),
+            ...this._trackedAgents,
+        ];
+    },
+
+    _launchControlCenter() {
+        if (this._removed || this._statusInFlight) return;
+        this._startStatusRefresh({ kind: "launcher" });
+    },
+
+    _controlCenterArgv() {
+        const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
+        return [home + "/.local/bin/codex-master-mcp", "control-center-launch"];
+    },
+
+    _appletActionArgv(actionRequest) {
+        if (
+            !actionRequest
+            || !["start", "stop"].includes(actionRequest.action)
+            || !this._isCanonicalManagedAgentId(actionRequest.agent)
+            || !this._isValidContextToken(actionRequest.contextToken)
+        ) {
+            throw new Error("Invalid applet action request");
+        }
+        const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
+        return [
+            home + "/.local/bin/codex-master-mcp",
+            APPLET_ACTION_COMMAND,
+            actionRequest.action,
+            actionRequest.agent,
+            actionRequest.contextToken,
+        ];
+    },
+
+    _clearActionBindings() {
+        this._startActionBinding = null;
+        for (let index = 0; index < this._stopActionBindings.length; index += 1) {
+            this._stopActionBindings[index] = null;
+        }
+    },
+
+    _updateActionBindings(payload) {
+        this._clearActionBindings();
+        if (!payload) return;
+        let stopIndex = 0;
+        for (const row of payload.agents) {
+            if (row.allowed_action === "start") {
+                this._startActionBinding = {
+                    action: "start",
+                    agent: row.agent,
+                    contextToken: row.context_token,
+                };
+            } else if (row.allowed_action === "stop" && stopIndex < this._stopActionBindings.length) {
+                this._stopActionBindings[stopIndex] = {
+                    action: "stop",
+                    agent: row.agent,
+                    contextToken: row.context_token,
+                };
+                stopIndex += 1;
+            }
+        }
+    },
+
+    _armStartAction() {
+        this._armAction(this._startActionBinding);
+    },
+
+    _armStopAction(index) {
+        this._armAction(this._stopActionBindings[index]);
+    },
+
+    _armAction(binding) {
+        if (
+            this._removed
+            || this._statusInFlight
+            || this._actionInFlight
+            || this._launcherInFlight
+            || this._actionsAwaitingRefresh
+            || !binding
+            || !["start", "stop"].includes(binding.action)
+            || !this._isCanonicalManagedAgentId(binding.agent)
+            || !this._isValidContextToken(binding.contextToken)
+        ) return;
+        this._armedAction = {
+            action: binding.action,
+            agent: binding.agent,
+            contextToken: binding.contextToken,
+        };
+        this._renderStatusSafely();
+    },
+
+    _cancelArmedAction() {
+        if (this._removed || this._actionInFlight) return;
+        this._armedAction = null;
+        this._renderStatusSafely();
+    },
+
+    _confirmArmedAction() {
+        if (
+            this._removed
+            || this._statusInFlight
+            || this._actionInFlight
+            || this._launcherInFlight
+            || !this._armedAction
+        ) return;
+        const request = this._armedAction;
+        this._armedAction = null;
+        this._statusLastGood = null;
+        this._clearActionBindings();
+        this._actionsAwaitingRefresh = true;
+        this._startStatusRefresh(request);
+    },
+
+    _refreshStatus() {
+        if (this._actionInFlight || this._launcherInFlight) return;
+        if (this._statusInFlight) {
+            if (!this._actionsAwaitingRefresh) this._statusPendingRefresh = true;
             return;
         }
-        if (!this._cinnamon) return;
-        const command = `codex-master-mcp status --agent ${agent}; printf '\\n'; exec bash`;
-        this._cinnamon.misc.util.spawn(["x-terminal-emulator", "-e", "bash", "-lc", command]);
-    };
+        this._startStatusRefresh();
+    },
 
-    CinnamonFleetApplet.prototype.on_applet_clicked = function () {
-        if (this.menu && typeof this.menu.toggle === "function") {
+    _startStatusRefresh(request = null) {
+        if (this._removed) return;
+        const commandKind = request && request.kind === "launcher" ? "launcher" : request ? "action" : "status";
+        const actionRequest = commandKind === "action" ? request : null;
+
+        const generation = ++this._statusGeneration;
+        let process;
+        try {
+            const argv = commandKind === "launcher"
+                ? this._controlCenterArgv()
+                : actionRequest ? this._appletActionArgv(actionRequest) : this._trackedStatusArgv();
+            const launcher = Gio.SubprocessLauncher.new(
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+            );
+            this._sanitizeLauncherEnvironment(launcher);
+            process = launcher.spawnv(argv);
+        } catch (_error) {
+            this._statusInFlight = false;
+            this._actionInFlight = false;
+            if (commandKind === "action") {
+                this._actionsAwaitingRefresh = true;
+                this._renderStatusSafely();
+                this._startStatusRefresh();
+            } else {
+                if (commandKind === "status") this._markRefreshFailed();
+            }
+            return;
+        }
+
+        let cancellable = null;
+        try {
+            cancellable = Gio.Cancellable ? new Gio.Cancellable() : null;
+        } catch (error) {
+            this._logCleanupError(error);
+        }
+
+        const state = {
+            generation,
+            commandKind,
+            actionRequest,
+            process,
+            cancellable,
+            cancellableCancelled: false,
+            timeoutSource: 0,
+            finalizing: false,
+            streamFailed: false,
+            waitDone: false,
+            exitConfirmed: false,
+            exitWaitInFlight: false,
+            exitWaitAttempts: 0,
+            exitWaitCancellable: null,
+            exitWaitCancellableCancelled: false,
+            stdoutDone: false,
+            stderrDone: false,
+            stdoutChunks: [],
+            stdoutByteCount: 0,
+            stderrByteCount: 0,
+            discardOutput: false,
+            waitFailed: false,
+            forceExitCalled: false,
+            timedOut: false,
+            stdoutLimitExceeded: false,
+            stderrLimitExceeded: false,
+        };
+
+        this._activeStatusProcess = process;
+        this._statusActiveState = state;
+        this._statusActiveGeneration = generation;
+        this._statusInFlight = true;
+        this._actionInFlight = commandKind === "action";
+        this._launcherInFlight = commandKind === "launcher";
+        if (commandKind === "status") {
+            this._statusViewState = this._statusLastGood ? "refreshing" : "initializing";
+        }
+        this._renderStatusSafely();
+
+        const requestForceExit = (stateArg) => {
+            if (stateArg.forceExitCalled || !stateArg.process) return true;
+            if (typeof stateArg.process.force_exit !== "function") return false;
+            try {
+                stateArg.process.force_exit();
+                stateArg.forceExitCalled = true;
+                return true;
+            } catch (error) {
+                this._logCleanupError(error);
+                return false;
+            }
+        };
+
+        const requestCancel = (stateArg) => {
+            if (stateArg.cancellableCancelled || !stateArg.cancellable) return true;
+            try {
+                stateArg.cancellable.cancel();
+                stateArg.cancellableCancelled = true;
+                return true;
+            } catch (error) {
+                this._logCleanupError(error);
+                return false;
+            }
+        };
+
+        const failRefresh = (stateArg) => {
+            requestCancel(stateArg);
+            stateArg.discardOutput = true;
+            this._clearStatusBuffers(stateArg);
+            if (stateArg.commandKind === "status") this._markRefreshFailed();
+        };
+
+        const attemptFinalize = (stateArg) => {
+            if (stateArg.finalizing) return;
+            if (!(stateArg.waitDone && stateArg.stdoutDone && stateArg.stderrDone)) {
+                return;
+            }
+            if (stateArg.process && !stateArg.exitConfirmed) return;
+            stateArg.finalizing = true;
+            if (stateArg.timeoutSource) {
+                try {
+                    GLib.source_remove(stateArg.timeoutSource);
+                } catch (error) {
+                    stateArg.finalizing = false;
+                    this._logCleanupError(error);
+                    return;
+                }
+                stateArg.timeoutSource = 0;
+            }
+            this._finalizeStatusProcess(stateArg);
+        };
+
+        const ensureExitWait = (stateArg) => {
+            if (stateArg.finalizing || stateArg.exitConfirmed || stateArg.exitWaitInFlight || !stateArg.process) return;
+            if (typeof stateArg.process.wait_async !== "function") return;
+            stateArg.exitWaitAttempts += 1;
+            if (!stateArg.exitWaitCancellable) {
+                try {
+                    stateArg.exitWaitCancellable = Gio.Cancellable ? new Gio.Cancellable() : null;
+                } catch (error) {
+                    this._logCleanupError(error);
+                    if (!stateArg.timeoutSource && stateArg.exitWaitAttempts < APPLET_IMMEDIATE_EXIT_WAIT_LIMIT) {
+                        ensureExitWait(stateArg);
+                    }
+                    return;
+                }
+            }
+            if (!stateArg.exitWaitCancellable || stateArg.exitWaitCancellableCancelled) {
+                if (!stateArg.timeoutSource && stateArg.exitWaitAttempts < APPLET_IMMEDIATE_EXIT_WAIT_LIMIT) {
+                    ensureExitWait(stateArg);
+                }
+                return;
+            }
+            stateArg.exitWaitInFlight = true;
+            try {
+                stateArg.process.wait_async(stateArg.exitWaitCancellable, (_proc, result) => {
+                    try {
+                        if (typeof stateArg.process.wait_finish === "function") {
+                            stateArg.process.wait_finish(result);
+                        }
+                        stateArg.exitConfirmed = true;
+                        stateArg.waitFailed = false;
+                    } catch (_error) {
+                        stateArg.waitFailed = true;
+                    }
+                    stateArg.exitWaitInFlight = false;
+                    if (stateArg.finalizing) {
+                        stateArg.exitWaitCancellable = null;
+                        return;
+                    }
+                    if (stateArg.exitConfirmed) stateArg.exitWaitCancellable = null;
+                    if (
+                        !stateArg.exitConfirmed
+                        && !stateArg.timeoutSource
+                        && stateArg.exitWaitAttempts < APPLET_IMMEDIATE_EXIT_WAIT_LIMIT
+                    ) {
+                        ensureExitWait(stateArg);
+                    }
+                    attemptFinalize(stateArg);
+                });
+            } catch (error) {
+                stateArg.exitWaitInFlight = false;
+                stateArg.waitFailed = true;
+                this._logCleanupError(error);
+                if (!stateArg.timeoutSource && stateArg.exitWaitAttempts < APPLET_IMMEDIATE_EXIT_WAIT_LIMIT) {
+                    ensureExitWait(stateArg);
+                }
+            }
+        };
+
+        const readStream = (stateArg, key, stream, limit) => {
+            if (!stream || typeof stream.read_bytes_async !== "function") {
+                stateArg.streamFailed = true;
+                stateArg[`${key}Done`] = true;
+                requestForceExit(stateArg);
+                failRefresh(stateArg);
+                attemptFinalize(stateArg);
+                return;
+            }
+
+            const chunksKey = key === "stdout" ? "stdoutChunks" : null;
+            const byteCountKey = `${key}ByteCount`;
+            const doneKey = `${key}Done`;
+            const finishKey = key === "stdout" ? "stdoutLimitExceeded" : "stderrLimitExceeded";
+
+            const readChunk = () => {
+                try {
+                    stream.read_bytes_async(
+                        APPLET_STATUS_CHUNK_BYTES,
+                        GLib.PRIORITY_DEFAULT,
+                        stateArg.cancellable,
+                        (reader, result) => {
+                            let packet;
+                            try {
+                                packet = reader.read_bytes_finish(result);
+                            } catch (_error) {
+                                stateArg.streamFailed = true;
+                                stateArg[doneKey] = true;
+                                requestForceExit(stateArg);
+                                failRefresh(stateArg);
+                                attemptFinalize(stateArg);
+                                return;
+                            }
+
+                            if (stateArg.finalizing) {
+                                stateArg[doneKey] = true;
+                                return;
+                            }
+
+                            if (!packet) {
+                                stateArg[doneKey] = true;
+                                attemptFinalize(stateArg);
+                                return;
+                            }
+
+                            let data = null;
+                            let size = 0;
+                            let bytes = null;
+                            try {
+                                data = packet.get_data ? packet.get_data() : null;
+                                size = packet.get_size ? packet.get_size() : (data ? data.length : 0);
+                                bytes = data && size > 0
+                                    ? (data instanceof Uint8Array ? data : Uint8Array.from(data))
+                                    : null;
+                            } catch (_error) {
+                                stateArg.streamFailed = true;
+                                stateArg[doneKey] = true;
+                                requestForceExit(stateArg);
+                                failRefresh(stateArg);
+                                attemptFinalize(stateArg);
+                                return;
+                            }
+                            if (!data || size <= 0) {
+                                stateArg[doneKey] = true;
+                                attemptFinalize(stateArg);
+                                return;
+                            }
+
+                            if (stateArg.discardOutput) {
+                                readChunk();
+                                return;
+                            }
+
+                            const take = Math.max(0, limit - stateArg[byteCountKey]);
+                            const exceedsLimit = bytes.length > take;
+                            if (take > 0) {
+                                const chunkLength = Math.min(bytes.length, take);
+                                if (chunksKey) {
+                                    const chunk = new Uint8Array(chunkLength);
+                                    chunk.set(bytes.subarray(0, chunk.length));
+                                    stateArg[chunksKey].push(chunk);
+                                }
+                                stateArg[byteCountKey] += chunkLength;
+                            }
+
+                            if (exceedsLimit) {
+                                stateArg[finishKey] = true;
+                                requestForceExit(stateArg);
+                                failRefresh(stateArg);
+                                stateArg[doneKey] = true;
+                                attemptFinalize(stateArg);
+                                return;
+                            }
+
+                            readChunk();
+                        }
+                    );
+                } catch (_error) {
+                    stateArg.streamFailed = true;
+                    stateArg[doneKey] = true;
+                    requestForceExit(stateArg);
+                    failRefresh(stateArg);
+                    attemptFinalize(stateArg);
+                }
+            };
+
+            readChunk();
+        };
+
+        try {
+            const timeoutSource = GLib.timeout_add(
+                GLib.PRIORITY_DEFAULT,
+                commandKind === "action"
+                    ? APPLET_ACTION_TIMEOUT_MILLISECONDS
+                    : commandKind === "launcher"
+                        ? CONTROL_CENTER_LAUNCH_TIMEOUT_MILLISECONDS
+                        : APPLET_STATUS_TIMEOUT_MILLISECONDS,
+                () => {
+                    if (this._removed) {
+                        state.timeoutSource = 0;
+                        this.on_applet_removed_from_panel();
+                        return GLib.SOURCE_REMOVE;
+                    }
+                    if (state.finalizing) {
+                        state.timeoutSource = 0;
+                        return GLib.SOURCE_REMOVE;
+                    }
+                    if (!state.exitConfirmed || !state.stdoutDone || !state.stderrDone) {
+                        state.timedOut = true;
+                        if (!state.exitConfirmed) requestForceExit(state);
+                        failRefresh(state);
+                        if (state.waitFailed) ensureExitWait(state);
+                    }
+                    if (!state.exitConfirmed || !state.stdoutDone || !state.stderrDone) {
+                        attemptFinalize(state);
+                        return GLib.SOURCE_CONTINUE;
+                    }
+                    state.timeoutSource = 0;
+                    attemptFinalize(state);
+                    return GLib.SOURCE_REMOVE;
+                }
+            );
+            if (!Number.isSafeInteger(timeoutSource) || timeoutSource <= 0) {
+                throw new Error("Invalid status timeout source id");
+            }
+            state.timeoutSource = timeoutSource;
+        } catch (error) {
+            state.timedOut = true;
+            if (!requestForceExit(state)) requestForceExit(state);
+            this._logCleanupError(error);
+            failRefresh(state);
+        }
+
+        let stdoutStream = null;
+        let stderrStream = null;
+        try {
+            stdoutStream = process.get_stdout_pipe();
+            stderrStream = process.get_stderr_pipe();
+        } catch (_error) {
+            state.streamFailed = true;
+            state.stdoutDone = true;
+            state.stderrDone = true;
+            requestForceExit(state);
+            failRefresh(state);
+        }
+        if (!state.stdoutDone) {
+            readStream(
+                state,
+                "stdout",
+                stdoutStream,
+                commandKind === "status" ? APPLET_STDOUT_LIMIT_BYTES : APPLET_STDERR_LIMIT_BYTES
+            );
+        }
+        if (!state.stderrDone) {
+            readStream(state, "stderr", stderrStream, APPLET_STDERR_LIMIT_BYTES);
+        }
+
+        try {
+            process.wait_async(state.cancellable, (_proc, result) => {
+                try {
+                    if (typeof process.wait_finish === "function") {
+                        process.wait_finish(result);
+                    }
+                } catch (_error) {
+                    state.waitFailed = true;
+                    requestForceExit(state);
+                    failRefresh(state);
+                    ensureExitWait(state);
+                }
+                if (!state.waitFailed) state.exitConfirmed = true;
+                state.waitDone = true;
+                attemptFinalize(state);
+            });
+        } catch (_error) {
+            state.waitFailed = true;
+            state.waitDone = true;
+            requestForceExit(state);
+            failRefresh(state);
+            ensureExitWait(state);
+            attemptFinalize(state);
+        }
+    },
+
+    _sanitizeLauncherEnvironment(launcher) {
+        const keys = typeof GLib.listenv === "function" ? GLib.listenv() : null;
+        if (!Array.isArray(keys) || keys.length > MAX_ENVIRONMENT_KEYS) {
+            throw new Error("Process environment unavailable");
+        }
+        for (const key of keys) {
+            if (typeof key !== "string" || !APPLET_ALLOWED_ENV_VARS.has(key)) launcher.unsetenv(key);
+        }
+        const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
+        launcher.setenv("PATH", APPLET_SAFE_PATH, true);
+        launcher.setenv("HOME", home, true);
+    },
+
+    _clearStatusBuffers(state) {
+        if (!state) return;
+        state.stdoutChunks = [];
+        state.stdoutByteCount = 0;
+        state.stderrByteCount = 0;
+    },
+
+    _finalizeStatusProcess(state) {
+        const generation = state.generation;
+        if (generation !== this._statusActiveGeneration) return;
+
+        this._statusInFlight = false;
+        this._statusActiveGeneration = 0;
+        this._statusActiveState = null;
+        this._activeStatusProcess = null;
+
+        if (state.commandKind === "launcher") {
+            this._clearStatusBuffers(state);
+            this._launcherInFlight = false;
+            this._statusPendingRefresh = false;
+            if (state.timeoutSource) {
+                GLib.source_remove(state.timeoutSource);
+                state.timeoutSource = 0;
+            }
+            return;
+        }
+
+        if (state.commandKind === "action") {
+            let actionCompleted = false;
+            if (!state.timedOut && !state.waitFailed && !state.streamFailed && !state.stdoutLimitExceeded && !state.stderrLimitExceeded) {
+                const payload = state.process ? this._collectProcessPayload(state) : null;
+                let processSuccessful = false;
+                try {
+                    processSuccessful = state.process && state.process.get_successful();
+                } catch (_error) {
+                    processSuccessful = false;
+                }
+                actionCompleted = processSuccessful && this._isValidAppletActionPayload(payload, state.actionRequest);
+            }
+            this._clearStatusBuffers(state);
+            this._actionInFlight = false;
+            this._armedAction = null;
+            this._actionsAwaitingRefresh = true;
+            this._statusPendingRefresh = false;
+            this._setMenuItemText(
+                this._confirmationDetailItem,
+                actionCompleted ? "Aktion abgeschlossen · Status wird geprüft" : "Ausgang unbekannt · Status wird geprüft"
+            );
+            this._renderStatusSafely();
+            if (state.timeoutSource) {
+                GLib.source_remove(state.timeoutSource);
+                state.timeoutSource = 0;
+            }
+            if (!this._removed) this._startStatusRefresh();
+            return;
+        }
+
+        let applied = false;
+        if (!state.timedOut && !state.waitFailed && !state.streamFailed && !state.stdoutLimitExceeded && !state.stderrLimitExceeded) {
+            const payload = state.process ? this._collectProcessPayload(state) : null;
+            if (payload) {
+                let processSuccessful = false;
+                try {
+                    processSuccessful = state.process.get_successful();
+                } catch (_error) {
+                    processSuccessful = false;
+                }
+                if (processSuccessful) {
+                    applied = this._maybeApplyStatusPayload(payload);
+                }
+            }
+        }
+        this._clearStatusBuffers(state);
+        if (!applied) this._markRefreshFailed();
+
+        if (state.timeoutSource) {
+            GLib.source_remove(state.timeoutSource);
+            state.timeoutSource = 0;
+        }
+
+        if (this._statusPendingRefresh) {
+            this._statusPendingRefresh = false;
+            this._startStatusRefresh();
+        }
+    },
+
+    _collectProcessPayload(state) {
+        const stdoutChunks = state.stdoutChunks;
+        const stdoutByteCount = state.stdoutByteCount;
+        this._clearStatusBuffers(state);
+        try {
+            const stdoutBytes = new Uint8Array(stdoutByteCount);
+            let offset = 0;
+            for (const chunk of stdoutChunks) {
+                stdoutBytes.set(chunk, offset);
+                offset += chunk.length;
+            }
+            const stdoutText = ByteArray.toString(stdoutBytes);
+            if (typeof stdoutText !== "string" || stdoutText.length === 0) {
+                return null;
+            }
+            if (stdoutText.includes("\uFFFD")) {
+                return null;
+            }
+            return JSON.parse(stdoutText);
+        } catch (_error) {
+            return null;
+        }
+    },
+
+    _maybeApplyStatusPayload(payload) {
+        if (!this._isValidAppletStatusPayload(payload)) {
+            return false;
+        }
+        this._statusLastGood = payload;
+        this._armedAction = null;
+        this._actionsAwaitingRefresh = false;
+        this._updateActionBindings(payload);
+        this._statusViewState = "ready";
+        return this._renderStatusSafely();
+    },
+
+    _isValidAppletActionPayload(payload, request) {
+        if (!payload || typeof payload !== "object" || !request) return false;
+        if (!this._hasExactFields(payload, ["agent", "action", "status", "state", "raw_output"])) return false;
+        return payload.agent === request.agent
+            && payload.action === request.action
+            && payload.status === "completed"
+            && payload.state === (request.action === "start" ? "running" : "sleeping")
+            && payload.raw_output === APPLET_STATUS_RAW_OUTPUT;
+    },
+
+    _isValidAppletStatusPayload(payload) {
+        if (!payload || typeof payload !== "object") return false;
+        if (!this._hasExactFields(payload, APPLET_STATUS_REQUIRED_FIELDS)) return false;
+        if (payload.schema_version !== APPLET_STATUS_SCHEMA_VERSION) return false;
+        if (payload.mode !== "read_only") return false;
+        if (payload.raw_output !== APPLET_STATUS_RAW_OUTPUT) return false;
+
+        if (typeof payload.counts !== "object" || payload.counts === null) return false;
+        if (!this._hasExactFields(payload.counts, APPLET_STATUS_REQUIRED_COUNTS)) return false;
+        for (const key of APPLET_STATUS_REQUIRED_COUNTS) {
+            const value = payload.counts[key];
+            if (!Number.isInteger(value) || value < 0) return false;
+        }
+
+        if (!Array.isArray(payload.agents) || payload.agents.length > MAX_TRACKED_AGENTS) return false;
+        const agents = new Set();
+        let startOfferCount = 0;
+        for (const row of payload.agents) {
+            if (!row || typeof row !== "object") return false;
+            if (!this._hasExactFields(row, APPLET_STATUS_REQUIRED_ROW_FIELDS)) return false;
+            for (const field of APPLET_STATUS_BASE_ROW_STRING_FIELDS) {
+                if (typeof row[field] !== "string" || row[field].length === 0) return false;
+            }
+            if (typeof row.context_token !== "string") return false;
+            if (row.blocked_until_utc !== null && !this._isValidUtcTimestamp(row.blocked_until_utc)) return false;
+            if (!this._isCanonicalManagedAgentId(row.agent)) return false;
+            if (agents.has(row.agent)) return false;
+            agents.add(row.agent);
+            if (!this._isValidStateSet("row", "activity_state", row.activity_state)) return false;
+            if (!this._isValidStateSet("row", "backend_state", row.backend_state)) return false;
+            if (!this._isValidStateSet("row", "control_state", row.control_state)) return false;
+            if (!this._isValidStateSet("row", "auth_state", row.auth_state)) return false;
+            if (!this._isValidStateSet("row", "identity_state", row.identity_state)) return false;
+            if (!this._isValidStateSet("row", "lease_state", row.lease_state)) return false;
+            if (!this._isValidStateSet("row", "allowed_action", row.allowed_action)) return false;
+            if (!this._isValidStateSet("row", "limit_state", row.limit_state)) return false;
+            if (!this._isValidAppletStatusRow(row)) return false;
+            if (!this._isValidAppletActionOffer(row)) return false;
+            if (row.allowed_action === "start") startOfferCount += 1;
+        }
+        if (startOfferCount > 1) return false;
+
+        if (payload.counts.tracked !== payload.agents.length) return false;
+        const expectedCounts = {
+            tracked: payload.agents.length,
+            running: payload.agents.filter((row) => row.activity_state === "running").length + payload.counts.overflow,
+            sleeping: payload.agents.filter((row) => row.activity_state === "sleeping").length,
+            overflow: payload.counts.overflow,
+        };
+        if (APPLET_STATUS_REQUIRED_COUNTS.some((key) => payload.counts[key] !== expectedCounts[key])) return false;
+        return this._isValidNativeAgentSnapshot(payload.native_agents);
+    },
+
+    _isValidAppletStatusRow(row) {
+        const isErrorRow = (
+            row.activity_state === APPLET_STATUS_ERROR_ROW.activity_state
+            && row.backend_state === APPLET_STATUS_ERROR_ROW.backend_state
+            && row.control_state === APPLET_STATUS_ERROR_ROW.control_state
+            && row.auth_state === APPLET_STATUS_ERROR_ROW.auth_state
+            && row.identity_state === APPLET_STATUS_ERROR_ROW.identity_state
+            && row.lease_state === APPLET_STATUS_ERROR_ROW.lease_state
+        );
+        if (isErrorRow) return true;
+
+        if (row.backend_state === "error") return false;
+
+        if (row.activity_state === "running" && row.identity_state === "verified") {
+            if (row.backend_state !== "ok") return false;
+        } else if (row.activity_state === "running" && row.identity_state === "unverified") {
+            if (row.backend_state !== "degraded") return false;
+        } else if (row.activity_state === "sleeping" && row.identity_state === "stopped") {
+            if (row.backend_state !== "ok") return false;
+        } else if (row.activity_state === "sleeping" && row.identity_state === "unverified") {
+            if (row.backend_state !== "degraded") return false;
+        } else {
+            return false;
+        }
+
+        const expectedControlState = this._deriveControlStateForAppletRow(row);
+        return row.control_state === expectedControlState;
+    },
+
+    _isValidContextToken(value) {
+        return typeof value === "string"
+            && value.length >= 3
+            && value.length <= 512
+            && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
+    },
+
+    _isValidAppletActionOffer(row) {
+        const isErrorRow = row.activity_state === "unknown" && row.backend_state === "error";
+        if (row.allowed_action === "none") {
+            return row.context_token === ""
+                && (!isErrorRow || (row.limit_state === "unknown" && row.blocked_until_utc === null));
+        }
+        if (!this._isValidContextToken(row.context_token) || isErrorRow) return false;
+        if (row.allowed_action === "start") {
+            return row.activity_state === "sleeping"
+                && row.backend_state === "ok"
+                && row.control_state === "ready"
+                && row.auth_state === "ready"
+                && row.identity_state === "stopped"
+                && ["unclaimed", "expired"].includes(row.lease_state)
+                && row.limit_state === "clear";
+        }
+        return row.allowed_action === "stop"
+            && row.activity_state === "running"
+            && row.backend_state === "ok"
+            && row.identity_state === "verified"
+            && ["unclaimed", "expired"].includes(row.lease_state);
+    },
+
+    _deriveControlStateForAppletRow(row) {
+        if (row.auth_state === "blocked" || row.identity_state === "unverified" || row.lease_state === "held") {
+            return "blocked";
+        }
+        if (row.auth_state === "unknown" || row.identity_state === "unknown" || row.lease_state === "unreadable") {
+            return "unknown";
+        }
+        if (row.auth_state === "ready" && (row.identity_state === "verified" || row.identity_state === "stopped")) {
+            return "ready";
+        }
+        return "unknown";
+    },
+
+    _isCanonicalManagedAgentId(value) {
+        return typeof value === "string" && /^[abc](?:[1-9]|[1-9][0-9]|100)$/.test(value);
+    },
+
+    _isValidNativeSafeString(value) {
+        return typeof value === "string" && /^[A-Za-z0-9_-]{1,32}$/.test(value);
+    },
+
+    _isValidUtcTimestamp(value) {
+        if (typeof value !== "string" || value.length < 20 || value.length > 40) return false;
+        if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|\+00:00)$/.test(value)) return false;
+        return Number.isFinite(Date.parse(value));
+    },
+
+    _isValidNativeAgentSnapshot(nativeAgents) {
+        if (!nativeAgents || typeof nativeAgents !== "object") return false;
+        if (!this._hasExactFields(nativeAgents, APPLET_STATUS_REQUIRED_NATIVE_FIELDS)) return false;
+        if (!this._isValidStateSet("native", "bridge_state", nativeAgents.bridge_state)) return false;
+        if (typeof nativeAgents.counts !== "object" || nativeAgents.counts === null) return false;
+        if (!this._hasExactFields(nativeAgents.counts, APPLET_STATUS_REQUIRED_NATIVE_COUNTS)) return false;
+        for (const key of APPLET_STATUS_REQUIRED_NATIVE_COUNTS) {
+            if (!Number.isInteger(nativeAgents.counts[key]) || nativeAgents.counts[key] < 0) return false;
+        }
+        if (typeof nativeAgents.truncated !== "boolean") return false;
+        if (!Array.isArray(nativeAgents.agents) || nativeAgents.agents.length > MAX_NATIVE_BEES) return false;
+
+        const displayIds = new Set();
+        let activeCount = 0;
+        let unconfirmedCount = 0;
+        for (const row of nativeAgents.agents) {
+            if (!row || typeof row !== "object") return false;
+            if (!this._hasExactFields(row, APPLET_STATUS_REQUIRED_NATIVE_AGENT_FIELDS)) return false;
+            if (!this._isValidNativeSafeString(row.display_id)) return false;
+            if (!this._isValidNativeSafeString(row.agent_type)) return false;
+            if (!this._isValidStateSet("native", "activity_state", row.activity_state)) return false;
+            if (!this._isValidUtcTimestamp(row.updated_at_utc)) return false;
+            if (displayIds.has(row.display_id)) return false;
+            displayIds.add(row.display_id);
+            if (row.activity_state === "active") activeCount += 1;
+            else unconfirmedCount += 1;
+        }
+
+        if (activeCount > nativeAgents.counts.active) return false;
+        if (unconfirmedCount > nativeAgents.counts.unconfirmed) return false;
+        const totalCount = nativeAgents.counts.active + nativeAgents.counts.unconfirmed;
+        if (totalCount !== nativeAgents.agents.length + nativeAgents.counts.overflow) return false;
+        if (nativeAgents.truncated !== (nativeAgents.counts.overflow > 0)) return false;
+        return true;
+    },
+
+    _deriveSnapshotActivity(rows) {
+        if (!rows || rows.length === 0) return "unknown";
+        const activityStates = rows.map((row) => row.activity_state);
+        return activityStates.every((state) => state === "running")
+            ? "running"
+            : activityStates.every((state) => state === "sleeping")
+                ? "sleeping"
+                : activityStates.every((state) => state === "unknown") ? "unknown" : "mixed";
+    },
+
+    _deriveSnapshotBackend(rows) {
+        if (!rows || rows.length === 0) return "unavailable";
+        const backendStates = rows.map((row) => row.backend_state);
+        return backendStates.every((state) => state === "ok")
+            ? "ok"
+            : backendStates.every((state) => state === "error") ? "unavailable" : "degraded";
+    },
+
+    _hasExactFields(value, requiredFields) {
+        const keys = Object.keys(value);
+        return keys.length === requiredFields.length
+            && requiredFields.every((field) => Object.prototype.hasOwnProperty.call(value, field));
+    },
+
+    _isValidStateSet(scope, name, value) {
+        return APPLET_STATUS_VALID_STRINGS[scope]?.[name]?.has(value);
+    },
+
+    _markRefreshFailed() {
+        if (this._removed) return;
+        this._armedAction = null;
+        this._clearActionBindings();
+        this._statusViewState = this._statusLastGood ? "stale" : "unavailable";
+        this._renderStatusSafely();
+    },
+
+    _stateLabel(scope, value) {
+        return APPLET_STATUS_LABELS[scope]?.[value] || "unbekannt";
+    },
+
+    _setMenuItemText(item, text) {
+        if (!item) return;
+        if (item.label && typeof item.label.set_text === "function") item.label.set_text(text);
+        else item.label = text;
+    },
+
+    _setMenuItemVisible(item, visible) {
+        if (!item) return;
+        const actor = item.actor || item;
+        if (visible && typeof actor.show === "function") actor.show();
+        else if (!visible && typeof actor.hide === "function") actor.hide();
+        else actor.visible = visible;
+    },
+
+    _renderStatusSafely() {
+        try {
+            this._renderStatus();
+            return true;
+        } catch (error) {
+            this._logCleanupError(error);
+            return false;
+        }
+    },
+
+    _renderStatus() {
+        if (this._removed) return;
+        this.set_applet_label(LABEL);
+        const payload = this._statusLastGood;
+        const managedRows = payload ? payload.agents : this._trackedAgents.map((agent) => ({
+            agent,
+            activity_state: "unknown",
+            backend_state: "error",
+            control_state: "unknown",
+        }));
+        const activity = this._stateLabel("activity", this._deriveSnapshotActivity(managedRows));
+        const backend = this._stateLabel("backend", this._deriveSnapshotBackend(managedRows));
+        const stale = this._statusViewState === "stale" ? " · veraltet" : "";
+        const unavailable = this._statusViewState === "unavailable" ? " · nicht verfügbar" : "";
+        const configuration = this._settingsValid ? "" : "Konfigurationsfehler · ";
+        const summary = `${configuration}Aktivität: ${activity} · Backend: ${backend} · Modus: Schnellsteuerung${stale}${unavailable}`;
+        this.set_applet_tooltip(summary);
+        this._setMenuItemText(this._statusSummaryItem, summary);
+
+        for (let index = 0; index < this._statusRowItems.length; index += 1) {
+            const item = this._statusRowItems[index];
+            const row = managedRows[index];
+            if (!row) {
+                this._setMenuItemVisible(item, false);
+                continue;
+            }
+            let limit = "";
+            if (row.limit_state === "blocked") {
+                limit = row.blocked_until_utc
+                    ? ` · Limit bis ${row.blocked_until_utc}`
+                    : " · Limit blockiert";
+            } else if (row.limit_state === "unknown") {
+                limit = " · Limit unbekannt";
+            }
+            const text = `${row.agent}: ${this._stateLabel("activity", row.activity_state)} · Backend ${this._stateLabel("backend", row.backend_state)} · Steuerung ${this._stateLabel("control", row.control_state)}${limit}`;
+            this._setMenuItemText(item, text);
+            this._setMenuItemVisible(item, true);
+        }
+
+        this._renderQuickControl(payload);
+        this._renderNativeStatus(payload ? payload.native_agents : null);
+    },
+
+    _renderQuickControl(payload) {
+        if (!this._quickControlSubmenuItem) return;
+        this._setMenuItemVisible(this._startActionItem, false);
+        for (const item of this._stopActionItems) this._setMenuItemVisible(item, false);
+        this._setMenuItemVisible(this._confirmationDetailItem, false);
+        this._setMenuItemVisible(this._confirmationConfirmItem, false);
+        this._setMenuItemVisible(this._confirmationCancelItem, false);
+
+        if (this._actionInFlight) {
+            const action = this._statusActiveState && this._statusActiveState.actionRequest;
+            const label = action
+                ? `${action.action === "start" ? "Start" : "Stop"} ${action.agent} läuft · kein automatischer Retry`
+                : "Aktion läuft · kein automatischer Retry";
+            this._setMenuItemText(this._quickControlSubmenuItem, "Schnellsteuerung (läuft)");
+            this._setMenuItemText(this._confirmationDetailItem, label);
+            this._setMenuItemVisible(this._confirmationDetailItem, true);
+            return;
+        }
+        if (this._actionsAwaitingRefresh) {
+            this._setMenuItemText(this._quickControlSubmenuItem, "Schnellsteuerung (Statusprüfung)");
+            this._setMenuItemText(this._confirmationDetailItem, "Ausgang wird read-only geprüft");
+            this._setMenuItemVisible(this._confirmationDetailItem, true);
+            return;
+        }
+        if (this._armedAction) {
+            const verb = this._armedAction.action === "start" ? "starten" : "stoppen";
+            this._setMenuItemText(this._quickControlSubmenuItem, "Schnellsteuerung (Bestätigung)");
+            this._setMenuItemText(this._confirmationDetailItem, `${this._armedAction.agent} wirklich ${verb}?`);
+            this._setMenuItemText(this._confirmationConfirmItem, `Ja, ${this._armedAction.agent} ${verb}`);
+            this._setMenuItemVisible(this._confirmationDetailItem, true);
+            this._setMenuItemVisible(this._confirmationConfirmItem, true);
+            this._setMenuItemVisible(this._confirmationCancelItem, true);
+            return;
+        }
+
+        let stopCount = 0;
+        for (let index = 0; index < this._stopActionBindings.length; index += 1) {
+            const binding = this._stopActionBindings[index];
+            if (!binding) continue;
+            this._setMenuItemText(this._stopActionItems[index], `${binding.agent} stoppen`);
+            this._setMenuItemVisible(this._stopActionItems[index], true);
+            stopCount += 1;
+        }
+        if (this._startActionBinding) {
+            this._setMenuItemText(this._startActionItem, `${this._startActionBinding.agent} starten`);
+            this._setMenuItemVisible(this._startActionItem, true);
+        }
+        const actionCount = (this._startActionBinding ? 1 : 0) + stopCount;
+        this._setMenuItemText(
+            this._quickControlSubmenuItem,
+            actionCount > 0 ? `Schnellsteuerung (${actionCount})` : "Schnellsteuerung"
+        );
+        if (actionCount === 0) {
+            this._setMenuItemText(this._confirmationDetailItem, "Keine sichere Schnellaktion verfügbar");
+            this._setMenuItemVisible(this._confirmationDetailItem, true);
+        }
+    },
+
+    _renderNativeStatus(nativeAgents) {
+        if (!this._nativeSubmenuItem) return;
+
+        let title = "Native Bienen";
+        const rows = [];
+        if (!nativeAgents) {
+            rows.push("Native Bridge nicht verfügbar");
+        } else if (nativeAgents.bridge_state !== "ready") {
+            rows.push(`Native Bridge ${this._stateLabel("nativeBridge", nativeAgents.bridge_state)}`);
+        } else {
+            const total = nativeAgents.counts.active + nativeAgents.counts.unconfirmed;
+            if (total > 0) title = `Native Bienen (${total})`;
+            if (nativeAgents.agents.length === 0) {
+                rows.push("Keine aktiven Native Bienen");
+            } else {
+                for (const agent of nativeAgents.agents) {
+                    rows.push(
+                        `${agent.agent_type} · ${this._stateLabel("nativeActivity", agent.activity_state)} · ${agent.display_id}`
+                    );
+                }
+                if (nativeAgents.counts.overflow > 0 && rows.length === MAX_NATIVE_BEES) {
+                    rows[MAX_NATIVE_BEES - 1] = `+${nativeAgents.counts.overflow} weitere Native Bienen`;
+                }
+            }
+        }
+
+        this._setMenuItemText(this._nativeSubmenuItem, title);
+        for (let index = 0; index < this._nativeBeeRowItems.length; index += 1) {
+            const item = this._nativeBeeRowItems[index];
+            const text = rows[index];
+            if (!text) {
+                this._setMenuItemVisible(item, false);
+                continue;
+            }
+            this._setMenuItemText(item, text);
+            this._setMenuItemVisible(item, true);
+        }
+    },
+
+    _connectTracked(target, signal, callback) {
+        if (
+            this._removed
+            || !target
+            || typeof target.connect !== "function"
+            || typeof target.disconnect !== "function"
+        ) return 0;
+        let id = 0;
+        try {
+            id = target.connect(signal, callback);
+        } catch (error) {
+            this._logCleanupError(error);
+            return 0;
+        }
+        if (!Number.isSafeInteger(id) || id <= 0) return 0;
+        this._signalConnections.push({ target, id });
+        return id;
+    },
+
+    _logCleanupError(error) {
+        try {
+            if (
+                appletErrorLogCount < APPLET_ERROR_LOG_LIMIT
+                && typeof global !== "undefined"
+                && global
+                && typeof global.logError === "function"
+            ) {
+                appletErrorLogCount += 1;
+                global.logError(error);
+            }
+        } catch (_loggingError) {}
+    },
+
+    _disconnectTrackedSignals() {
+        const connections = this._signalConnections;
+        this._signalConnections = [];
+        for (const connection of connections) {
+            try {
+                if (connection.target && typeof connection.target.disconnect === "function") {
+                    connection.target.disconnect(connection.id);
+                }
+            } catch (_error) {}
+        }
+        return true;
+    },
+
+    _cleanupMenuResource(menuProperty, managerProperty) {
+        const menu = this[menuProperty];
+        const manager = this[managerProperty];
+        if (!menu && !manager) return true;
+
+        const stateKey = menuProperty + ":" + managerProperty;
+        const state = this._menuCleanupState[stateKey] || {
+            managerReleased: !manager,
+            managerNeedsDestroy: false,
+            menuDestroyed: !menu,
+        };
+        this._menuCleanupState[stateKey] = state;
+
+        let success = true;
+        if (menu && menu.isOpen === true) {
+            try {
+                if (typeof menu.close !== "function") throw new Error("Menu close operation is unavailable");
+                menu.close(false);
+                if (menu.isOpen === true) throw new Error("Menu remained open after cleanup");
+            } catch (error) {
+                this._logCleanupError(error);
+                success = false;
+            }
+        }
+
+        if (manager && manager.grabbed === true) {
+            try {
+                if (typeof manager._ungrab !== "function") throw new Error("Menu manager ungrab operation is unavailable");
+                manager._ungrab();
+                if (manager.grabbed === true) throw new Error("Menu manager retained its modal grab");
+            } catch (error) {
+                this._logCleanupError(error);
+                success = false;
+            }
+        }
+
+        if (success && manager && !state.managerReleased && state.managerNeedsDestroy) {
+            try {
+                if (typeof manager.destroy !== "function") throw new Error("Menu manager destroy operation is unavailable");
+                manager.destroy();
+                state.managerNeedsDestroy = false;
+                state.managerReleased = true;
+            } catch (error) {
+                this._logCleanupError(error);
+                success = false;
+            }
+        } else if (success && manager && menu && !state.managerReleased) {
+            try {
+                if (typeof manager.removeMenu !== "function") throw new Error("Menu manager removal operation is unavailable");
+                manager.removeMenu(menu);
+                const managedMenus = Array.isArray(manager._menus)
+                    ? manager._menus
+                    : (Array.isArray(manager.menus) ? manager.menus : null);
+                if (managedMenus && managedMenus.indexOf(menu) !== -1) {
+                    throw new Error("Menu remained registered after cleanup");
+                }
+                if (managedMenus && managedMenus.length > 0) {
+                    if (typeof manager.destroy !== "function") {
+                        throw new Error("Menu manager retained child menus without a destroy operation");
+                    }
+                    manager.destroy();
+                }
+                state.managerReleased = true;
+            } catch (error) {
+                const managedMenus = Array.isArray(manager._menus)
+                    ? manager._menus
+                    : (Array.isArray(manager.menus) ? manager.menus : null);
+                if (managedMenus && managedMenus.indexOf(menu) === -1) {
+                    state.managerNeedsDestroy = true;
+                }
+                this._logCleanupError(error);
+                success = false;
+            }
+        } else if (success && manager && !menu && !state.managerReleased) {
+            try {
+                if (typeof manager.destroy !== "function") throw new Error("Menu manager destroy operation is unavailable");
+                manager.destroy();
+                state.managerReleased = true;
+            } catch (error) {
+                this._logCleanupError(error);
+                success = false;
+            }
+        }
+
+        if (success && menu && !state.menuDestroyed) {
+            try {
+                if (typeof menu.destroy !== "function") throw new Error("Menu destroy operation is unavailable");
+                menu.destroy();
+                state.menuDestroyed = true;
+            } catch (error) {
+                this._logCleanupError(error);
+                success = false;
+            }
+        }
+
+        if (success && state.managerReleased && state.menuDestroyed) {
+            this[menuProperty] = null;
+            this[managerProperty] = null;
+            delete this._menuCleanupState[stateKey];
+            return true;
+        }
+        return false;
+    },
+
+    _cleanupStatusResources() {
+        let success = true;
+        let statusClean = true;
+        this._statusLastGood = null;
+        this._armedAction = null;
+        this._actionInFlight = false;
+        this._launcherInFlight = false;
+        this._actionsAwaitingRefresh = false;
+        this._clearActionBindings();
+        if (this._backgroundRefreshSource) {
+            try {
+                GLib.source_remove(this._backgroundRefreshSource);
+                this._backgroundRefreshSource = 0;
+            } catch (error) {
+                this._logCleanupError(error);
+                success = false;
+            }
+        }
+
+        this._statusPendingRefresh = false;
+        this._statusGeneration += 1;
+        this._statusActiveGeneration = 0;
+        const state = this._statusActiveState;
+        if (state) {
+            state.finalizing = true;
+            state.discardOutput = true;
+            this._clearStatusBuffers(state);
+            if (state.timeoutSource) {
+                try {
+                    GLib.source_remove(state.timeoutSource);
+                    state.timeoutSource = 0;
+                } catch (error) {
+                    this._logCleanupError(error);
+                    success = false;
+                    statusClean = false;
+                }
+            }
+            if (state.cancellable && !state.cancellableCancelled) {
+                try {
+                    state.cancellable.cancel();
+                    state.cancellableCancelled = true;
+                } catch (error) {
+                    this._logCleanupError(error);
+                    success = false;
+                    statusClean = false;
+                }
+            }
+            if (state.exitWaitCancellable && !state.exitWaitCancellableCancelled) {
+                try {
+                    state.exitWaitCancellable.cancel();
+                    state.exitWaitCancellableCancelled = true;
+                } catch (error) {
+                    this._logCleanupError(error);
+                    success = false;
+                    statusClean = false;
+                }
+            }
+            if (!state.forceExitCalled && state.process && typeof state.process.force_exit === "function") {
+                try {
+                    state.process.force_exit();
+                    state.forceExitCalled = true;
+                } catch (error) {
+                    this._logCleanupError(error);
+                    success = false;
+                    statusClean = false;
+                }
+            }
+            if (statusClean) {
+                this._statusActiveState = null;
+                this._activeStatusProcess = null;
+            }
+        }
+        this._statusInFlight = false;
+        return success;
+    },
+
+    _cleanupSettings() {
+        const settings = this.settings || this._settingsCleanupPending;
+        if (!settings) return true;
+        try {
+            settings.finalize();
+            if (this.settings === settings) this.settings = null;
+            if (this._settingsCleanupPending === settings) this._settingsCleanupPending = null;
+            return true;
+        } catch (error) {
+            this._logCleanupError(error);
+            return false;
+        }
+    },
+
+    on_applet_clicked() {
+        if (this._removed) return;
+        try {
+            if (!this.menu || typeof this.menu.toggle !== "function") return;
+            if (this.menu.actor && typeof this.menu.actor.is_finalized === "function" && this.menu.actor.is_finalized()) return;
+            const wasOpen = this.menu.isOpen === true;
             this.menu.toggle();
+            if (!wasOpen && this.menu.isOpen === true && this.refreshOnOpen) this._refreshStatus();
+        } catch (error) {
+            this._logCleanupError(error);
         }
-    };
+    },
 
-    CinnamonFleetApplet.prototype.on_applet_removed_from_panel = function () {
-        if (this.menu && this.menu.isOpen && typeof this.menu.close === "function") {
-            this.menu.close();
+    on_applet_removed_from_panel() {
+        if (this._cleanupComplete) return;
+        this._removed = true;
+        for (let attempt = 0; attempt < 2 && !this._cleanupComplete; attempt += 1) {
+            const statusClean = this._cleanupStatusResources();
+            const settingsClean = this._cleanupSettings();
+            const signalsClean = this._disconnectTrackedSignals();
+            const appletMenuClean = this._cleanupMenuResource("menu", "menuManager");
+            const contextMenuClean = this._cleanupMenuResource("_applet_context_menu", "_menuManager");
+            if (appletMenuClean) {
+                this._statusSummaryItem = null;
+                this._statusRowItems = [];
+                this._nativeSubmenuItem = null;
+                this._nativeBeeRowItems = [];
+                this._quickControlSubmenuItem = null;
+                this._startActionItem = null;
+                this._stopActionItems = [];
+                this._confirmationDetailItem = null;
+                this._confirmationConfirmItem = null;
+                this._confirmationCancelItem = null;
+                this._startActionBinding = null;
+                this._stopActionBindings = [];
+            }
+            this._cleanupComplete = statusClean && settingsClean && signalsClean && appletMenuClean && contextMenuClean;
         }
-        if (this.menuManager && typeof this.menuManager.removeMenu === "function") {
-            this.menuManager.removeMenu(this.menu);
-        }
-        this.menu = null;
-        this.menuManager = null;
-    };
+    },
+};
 
-    function main(metadata, orientation, panelHeight, instanceId) {
-        return new CinnamonFleetApplet(metadata, orientation, panelHeight, instanceId);
-    }
-
-    return {
-        MAX_SERIES,
-        MAX_AGENTS,
-        MAX_NATIVE_AGENTS,
-        MAX_VISIBLE_ROWS,
-        MAX_DISPATCH_TARGETS,
-        SeriesMenuModel,
-        CinnamonFleetApplet,
-        main,
-        normalizeAppletSnapshot,
-    };
-}));
+function main(metadata, orientation, panel_height, instance_id) {
+    return new FlottenmanagementApplet(metadata, orientation, panel_height, instance_id);
+}

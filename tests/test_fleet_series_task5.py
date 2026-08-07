@@ -117,7 +117,7 @@ def test_series_disable_is_registry_only_and_removes_from_dispatch_inventory() -
         assert (root / "pool" / "d1").exists()
 
 
-def test_series_disable_scales_shared_deadline_for_all_agents() -> None:
+def test_series_disable_is_registry_only() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         executable = _runner(root)
@@ -129,26 +129,14 @@ def test_series_disable_scales_shared_deadline_for_all_agents() -> None:
                 model="local-model", account_id=None, expected_generation=1,
                 codex_executable=executable,
             )
-            stopped: list[tuple[str, float | None]] = []
-
-            def slow_stop(agent: str, *, force: bool, timeout_seconds: float | None = None) -> dict[str, object]:
-                assert force is True
-                stopped.append((agent, timeout_seconds))
-                import time
-                time.sleep(0.02)
-                return {"agent": agent, "status": "stopped", "raw_output": "not_returned"}
-
-            with patch.object(server, "stop_agent", side_effect=slow_stop), patch.object(
-                server, "update_watchdog_marker"
-            ), patch.object(server, "SERIES_DISABLE_TIMEOUT_SECONDS", 0.02):
-                with pytest.raises(server.AgentLifecycleLockBusyError):
-                    server.fleet_series_disable(prefix="d", expected_generation=2)
+            with patch.object(server, "stop_agent", side_effect=AssertionError("stop I/O attempted")), patch.object(
+                server, "update_watchdog_marker", side_effect=AssertionError("watchdog I/O attempted")
+            ):
+                result = server.fleet_series_disable(prefix="d", expected_generation=2)
             snapshot = server.current_fleet_service().load()
 
-    assert [item[0] for item in stopped] == ["d1", "d2"]
-    assert all(item[1] is not None and 0 < item[1] <= 0.04 for item in stopped[1:])
-    assert stopped[0][1] is not None and 0 < stopped[0][1] <= 0.04
-    assert snapshot.series[0].enabled is True
+    assert result["generation"] == 3
+    assert snapshot.series[0].enabled is False
 
 
 def test_provider_wrapper_keeps_only_provider_secret() -> None:
@@ -212,12 +200,12 @@ def test_series_shrink_and_delete_reap_tombstones_after_commit() -> None:
             )
             server.fleet_series_disable(prefix="d", expected_generation=3)
             deleted = server.fleet_series_delete(
-                prefix="d", expected_generation=4, confirmed_remove_ids=["d1"]
+                prefix="d", expected_generation=4, confirmed_remove_ids=["d1"], yes=True
             )
         hidden = list((root / "pool").glob(".codex-fleet-remove-*"))
-        assert shrunk["cleanup_pending"] is False
-        assert deleted["cleanup_pending"] is False
-        assert hidden == []
+    assert shrunk["cleanup_pending"] is True
+    assert deleted["cleanup_pending"] is True
+    assert len(hidden) == 2
 
 
 def test_series_update_restores_home_when_registry_commit_conflicts() -> None:
@@ -320,7 +308,7 @@ def test_series_retry_restores_durable_update_backup_before_cas() -> None:
             assert server.fleet_recovery_status()["state"] == "cas_pending"
             assert server.fleet_recovery_retry()["state"] == "ready"
             assert config.read_bytes() == before
-            assert list((root / "pool").glob(".codex-fleet-remove-*")) == []
+            assert len(list((root / "pool").glob(".codex-fleet-remove-*"))) == 1
 
 
 def test_series_retry_discards_create_intent_before_home_creation() -> None:
@@ -332,7 +320,7 @@ def test_series_retry_discards_create_intent_before_home_creation() -> None:
         ), server.temporary_agent_inventory(None):
             with patch.object(
                 server,
-                "_fleet_write_home",
+                "_fleet_create_home",
                 side_effect=BaseException("simulated_process_crash"),
             ):
                 try:

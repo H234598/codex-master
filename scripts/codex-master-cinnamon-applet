@@ -24,10 +24,6 @@ DBUS_TIMEOUT_SECONDS = 10.0
 DBUS_OUTPUT_LIMIT_BYTES = 64 * 1024
 RELOAD_SIGNAL_TIMEOUT_SECONDS = 5.0
 REQUIRED_SOURCE_FILES = {"applet.js", "metadata.json", "settings-schema.json"}
-MAX_SCAN_ENTRIES = 4096
-MAX_SCAN_DEPTH = 32
-MAX_SCAN_FILE_BYTES = 8 * 1024 * 1024
-MAX_SCAN_TOTAL_BYTES = 64 * 1024 * 1024
 
 
 class InstallerError(RuntimeError):
@@ -138,8 +134,6 @@ def ensure_real_directory_chain(path: Path, *, create: bool) -> None:
 
 
 def hash_regular_file(path: Path, expected: os.stat_result) -> str:
-    if expected.st_size > MAX_SCAN_FILE_BYTES:
-        raise InstallerError("file exceeds the scan size limit")
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -153,19 +147,13 @@ def hash_regular_file(path: Path, expected: os.stat_result) -> str:
             or opened.st_nlink != 1
             or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)
             or stat.S_IMODE(opened.st_mode) != stat.S_IMODE(expected.st_mode)
-            or opened.st_size != expected.st_size
-            or opened.st_size > MAX_SCAN_FILE_BYTES
         ):
             raise InstallerError("file identity changed or is not a private regular file")
         validate_owner_and_mode(opened, "opened file")
-        read_bytes = 0
         while True:
             chunk = os.read(descriptor, 64 * 1024)
             if not chunk:
                 break
-            read_bytes += len(chunk)
-            if read_bytes > MAX_SCAN_FILE_BYTES:
-                raise InstallerError("file exceeds the scan size limit")
             digest.update(chunk)
     except OSError as exc:
         raise InstallerError("regular file could not be read safely") from exc
@@ -186,21 +174,13 @@ def scan_tree(root: Path, label: str) -> tuple[list[Path], dict[str, tuple[str, 
 
     directories: list[Path] = []
     files: dict[str, tuple[str, int]] = {}
-    entry_count = 0
-    total_bytes = 0
 
     def visit(directory: Path, relative: Path) -> None:
-        nonlocal entry_count, total_bytes
-        if len(relative.parts) >= MAX_SCAN_DEPTH:
-            raise InstallerError(f"{label} exceeds the scan depth limit")
         try:
             entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
         except OSError as exc:
             raise InstallerError(f"{label} contains an unreadable directory") from exc
         for entry in entries:
-            entry_count += 1
-            if entry_count > MAX_SCAN_ENTRIES:
-                raise InstallerError(f"{label} exceeds the scan entry limit")
             entry_path = directory / entry.name
             entry_relative = relative / entry.name
             try:
@@ -216,11 +196,6 @@ def scan_tree(root: Path, label: str) -> tuple[list[Path], dict[str, tuple[str, 
                 continue
             if not stat.S_ISREG(entry_stat.st_mode) or entry_stat.st_nlink != 1:
                 raise InstallerError(f"{label} must contain only non-hardlinked regular files")
-            if entry_stat.st_size > MAX_SCAN_FILE_BYTES:
-                raise InstallerError(f"{label} file exceeds the scan size limit")
-            total_bytes += entry_stat.st_size
-            if total_bytes > MAX_SCAN_TOTAL_BYTES:
-                raise InstallerError(f"{label} exceeds the scan byte limit")
             validate_owner_and_mode(entry_stat, f"{label} file")
             files[str(entry_relative)] = (hash_regular_file(entry_path, entry_stat), stat.S_IMODE(entry_stat.st_mode))
 

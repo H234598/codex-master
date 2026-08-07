@@ -22,6 +22,19 @@ from codex_master.fleet_registry import (
 from codex_master.fleet_runners import ProbeResult, ProviderError
 
 
+def test_fleet_paths_keep_registry_and_secrets_separate(tmp_path: Path) -> None:
+    from codex_master.fleet_service import FleetPaths
+
+    paths = FleetPaths.from_state_root(tmp_path)
+
+    assert paths.registry == tmp_path / "fleet" / "registry.json"
+    assert paths.secrets == tmp_path / "fleet" / "secrets"
+    assert paths.limits == tmp_path / "fleet" / "limits.json"
+    assert paths.lock == tmp_path / "fleet" / "registry.lock"
+    assert paths.recovery == tmp_path / "fleet" / "recovery.json"
+    assert paths.mutation_lock == tmp_path / "fleet" / "mutation.lock"
+
+
 def _account(
     account_id: str = "shared",
     *,
@@ -58,16 +71,6 @@ def _configured_snapshot(*, generation: int = 2) -> FleetSnapshot:
     return FleetSnapshot(1, generation, (_account(secret_state=SecretState.CONFIGURED),), (_series(),))
 
 
-def test_fleet_paths_keep_registry_and_secrets_separate(tmp_path: Path) -> None:
-    from codex_master.fleet_service import FleetPaths
-
-    paths = FleetPaths.from_state_root(tmp_path)
-    assert paths.registry == tmp_path / "fleet" / "registry.json"
-    assert paths.secrets == tmp_path / "fleet" / "secrets"
-    assert paths.limits == tmp_path / "fleet" / "limits.json"
-    assert paths.lock == tmp_path / "fleet" / "registry.lock"
-
-
 def test_missing_registry_loads_initial_private_layout(tmp_path: Path) -> None:
     service, paths = _service(tmp_path)
     assert service.load() == FleetSnapshot(1, 1, (), ())
@@ -94,6 +97,26 @@ def test_set_secret_rejects_invalid_size(tmp_path: Path, secret: str) -> None:
         service.set_secret("shared", secret, expected_generation=2)
     assert str(raised.value) == "invalid_secret"
     assert not (paths.secrets / "shared.secret").exists()
+
+
+def test_set_secret_rejects_value_above_16_kib(tmp_path: Path) -> None:
+    from codex_master.fleet_service import FleetSecretError
+
+    service, paths = _service(tmp_path, FleetSnapshot(1, 2, (_account(),), ()))
+
+    with pytest.raises(FleetSecretError) as raised:
+        service.set_secret("shared", "x" * (16 * 1024 + 1), expected_generation=2)
+
+    assert str(raised.value) == "invalid_secret"
+    assert not (paths.secrets / "shared.secret").exists()
+
+
+def test_set_secret_accepts_exactly_16_kib(tmp_path: Path) -> None:
+    service, paths = _service(tmp_path, FleetSnapshot(1, 2, (_account(),), ()))
+
+    service.set_secret("shared", "x" * (16 * 1024), expected_generation=2)
+
+    assert (paths.secrets / "shared.secret").stat().st_size == 16 * 1024
 
 
 def test_generation_conflict_does_not_overwrite_secret(tmp_path: Path) -> None:
@@ -141,6 +164,7 @@ def test_commit_rejects_stale_generation(tmp_path: Path) -> None:
     current = service.load()
     next_snapshot = FleetSnapshot(1, 2, (_account(),), ())
     service.commit_snapshot(next_snapshot, expected_generation=current.generation)
+
     with pytest.raises(FleetConflictError):
         service.commit_snapshot(next_snapshot, expected_generation=current.generation)
 
@@ -251,6 +275,7 @@ def test_probe_rejects_generation_change_while_external_call_runs(tmp_path: Path
 
     with pytest.raises(FleetConflictError):
         service.probe_account("shared", probe, expected_generation=2)
+
     assert service.account_gate("d1").reason == "limit_active"
 
 
