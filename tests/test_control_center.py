@@ -471,6 +471,41 @@ class ControlCenterControllerTest(unittest.TestCase):
         self.assertTrue(controller._executor._shutdown)
         self.assertFalse(scheduled[0][0](*scheduled[0][1]))
 
+    def test_optionless_tool_runs_when_user_selects_it(self) -> None:
+        tool = control_center.ToolDescriptor(
+            "agent_status", "Status", control_center.Risk.READ_ONLY, (), True, None
+        )
+        view = control_center.ControlCenterWindow.__new__(control_center.ControlCenterWindow)
+        view.tool_selector = Mock()
+        view.tool_selector.get_active_id.return_value = "0"
+        view.visible_tools = (tool,)
+        view._suppress_tool_auto_run = False
+        view._render_tool_form = Mock()
+        view._run_selected_tool = Mock()
+
+        view._tool_selection_changed()
+
+        view._render_tool_form.assert_called_once_with()
+        view._run_selected_tool.assert_called_once_with()
+
+    def test_tool_with_options_waits_for_execute_button(self) -> None:
+        field = control_center.FieldDescriptor("agent", control_center.FieldKind.STRING, True)
+        tool = control_center.ToolDescriptor(
+            "agent_send", "Send", control_center.Risk.MUTATING, (field,), True, None
+        )
+        view = control_center.ControlCenterWindow.__new__(control_center.ControlCenterWindow)
+        view.tool_selector = Mock()
+        view.tool_selector.get_active_id.return_value = "0"
+        view.visible_tools = (tool,)
+        view._suppress_tool_auto_run = False
+        view._render_tool_form = Mock()
+        view._run_selected_tool = Mock()
+
+        view._tool_selection_changed()
+
+        view._render_tool_form.assert_called_once_with()
+        view._run_selected_tool.assert_not_called()
+
 
 class ControlCenterCliTest(unittest.TestCase):
     @patch("codex_master.control_center.launch_gtk_application", return_value=0)

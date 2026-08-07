@@ -808,6 +808,7 @@ class ControlCenterWindow:
         self.tool_inputs: dict[str, tuple[FieldDescriptor, Any, Any, str]] = {}
         self.visible_tools: tuple[ToolDescriptor, ...] = ()
         self.selected_tool: ToolDescriptor | None = None
+        self._suppress_tool_auto_run = False
         self._close_poll_id = 0
         try:
             self.tool_catalog = compile_catalog(teamleader_tool_catalog())
@@ -933,11 +934,15 @@ class ControlCenterWindow:
         self.visible_tools = tuple(
             tool for tool in self.tool_catalog if selected == "Alle" or tool_category(tool.name) == selected
         )
-        self.tool_selector.remove_all()
-        for index, tool in enumerate(self.visible_tools):
-            suffix = "" if tool.enabled else " · gesperrt"
-            self.tool_selector.append(str(index), f"{tool.name} · {tool.risk.value}{suffix}")
-        self.tool_selector.set_active(0 if self.visible_tools else -1)
+        self._suppress_tool_auto_run = True
+        try:
+            self.tool_selector.remove_all()
+            for index, tool in enumerate(self.visible_tools):
+                suffix = "" if tool.enabled else " · gesperrt"
+                self.tool_selector.append(str(index), f"{tool.name} · {tool.risk.value}{suffix}")
+            self.tool_selector.set_active(0 if self.visible_tools else -1)
+        finally:
+            self._suppress_tool_auto_run = False
         if not self.visible_tools:
             self.selected_tool = None
             self.tool_run_button.set_sensitive(False)
@@ -950,6 +955,13 @@ class ControlCenterWindow:
             index = -1
         self.selected_tool = self.visible_tools[index] if 0 <= index < len(self.visible_tools) else None
         self._render_tool_form()
+        if (
+            not self._suppress_tool_auto_run
+            and self.selected_tool is not None
+            and self.selected_tool.enabled
+            and not self.selected_tool.fields
+        ):
+            self._run_selected_tool()
 
     def _clear_tool_form(self) -> None:
         for child in self.tool_form.get_children():

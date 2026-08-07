@@ -201,11 +201,25 @@ privileges; set an explicit user-owned `NPM_CONFIG_PREFIX` as above.
 Gemini jobs use an agent-private `HOME`/`GEMINI_CLI_HOME`, stdin-only task
 input, bounded `stream-json` stdout/stderr, process-group cancellation, and
 role-specific approval (`plan` for Exploriererinnen, `auto_edit` for
-Arbeitsbienen). They do not use `yolo`, `-p -`, or Codex TUI markers. The
-assignment response is bounded and parsed. Prompts, credentials, tool events,
-and raw output stay out of persistent metadata; process output remains bounded.
+Arbeitsbienen). The CLI is explicitly put into headless mode with an empty
+`--prompt`; the actual task remains stdin-only. They do not use `yolo`, `-p -`,
+or Codex TUI markers. The assignment response is bounded and parsed. Prompts,
+credentials, tool events, and raw output stay out of persistent metadata;
+process output remains bounded.
 Productive headless assignments accept up to 7200 seconds (120 minutes) per
 call; the default remains 600 seconds.
+
+For Gemini series whose registry model is `auto`, Masterjet pins the
+headless CLI to `gemini-3.1-flash-lite`, the low-cost/high-RPM default for
+structured Bauplan audits. A heavier model is used only when it is explicitly
+configured for that series.
+
+Every Gemini API probe or headless job also takes a persistent per-project
+request reservation. Reservations allow only one active request, enforce a
+60-second minimum spacing across processes and restarts, and apply an
+exponential cooldown after a verified 429 (starting at 15 minutes, capped at
+24 hours). The private state is stored in `fleet/rate-limits.json`; malformed
+state fails closed and is quarantined rather than permitting another request.
 
 The GTK-free `fleet_control` view model and `control_center` controller enforce
 the same bounds and generation checks as the server; the optional GTK3 page is

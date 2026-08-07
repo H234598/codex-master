@@ -3,9 +3,10 @@ from __future__ import annotations
 import contextlib
 import json
 import re
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace as dataclass_replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ContextManager
 
@@ -29,7 +30,12 @@ from .fleet_runners import ProbeResult
 
 MAX_REGISTRY_BYTES = 1024 * 1024
 MAX_LIMIT_BYTES = 256 * 1024
+MAX_RATE_LIMIT_BYTES = 256 * 1024
 MAX_SECRET_BYTES = 16 * 1024
+GEMINI_MIN_REQUEST_INTERVAL_SECONDS = 60
+GEMINI_REQUEST_LEASE_SECONDS = 120 * 60 + 60
+GEMINI_INITIAL_429_COOLDOWN_SECONDS = 15 * 60
+GEMINI_MAX_429_COOLDOWN_SECONDS = 24 * 60 * 60
 _ACCOUNT_ID_RE = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 _LIMIT_REASON_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 
@@ -40,6 +46,20 @@ class FleetConflictError(ValueError):
 
 class FleetSecretError(ValueError):
     pass
+
+
+class FleetRateLimitError(ValueError):
+    def __init__(self, reason: str, retry_after_seconds: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.retry_after_seconds = max(0, int(retry_after_seconds))
+
+
+@dataclass(frozen=True, slots=True)
+class GeminiRequestReservation:
+    account_id: str
+    reservation_id: str
+    expires_at_utc: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +76,7 @@ class FleetPaths:
     registry: Path = field(repr=False)
     secrets: Path = field(repr=False)
     limits: Path = field(repr=False)
+    rate_limits: Path = field(repr=False)
     lock: Path = field(repr=False)
     recovery: Path = field(repr=False)
     mutation_lock: Path = field(repr=False)
@@ -68,6 +89,7 @@ class FleetPaths:
             registry=fleet_root / "registry.json",
             secrets=fleet_root / "secrets",
             limits=fleet_root / "limits.json",
+            rate_limits=fleet_root / "rate-limits.json",
             lock=fleet_root / "registry.lock",
             recovery=fleet_root / "recovery.json",
             mutation_lock=fleet_root / "mutation.lock",
@@ -211,6 +233,202 @@ class FleetService:
         self._io.replace_text(self._paths.limits, text)
         if self._load_limits() != entries:
             raise ValueError("fleet_limits_write_verification_failed")
+
+    def _quarantine_rate_limits(self, reason: str = "invalid_gemini_rate_limits") -> None:
+        marker = self._paths.recovery.with_name("rate-limits.recovery.json")
+        try:
+            self._io.replace_text(
+                marker,
+                json.dumps({"schema_version": 1, "kind": "gemini_rate_limits_quarantine", "reason": reason}) + "\n",
+            )
+        except Exception:
+            pass
+
+    def _load_rate_limits(self) -> dict[str, dict[str, object]]:
+        self._ensure_layout()
+        try:
+            text = self._io.read_text(
+                self._paths.rate_limits,
+                MAX_RATE_LIMIT_BYTES,
+                "could_not_read_gemini_rate_limits",
+            )
+            if text is None:
+                return {}
+            raw = json.loads(text)
+            if (
+                not isinstance(raw, dict)
+                or set(raw) != {"schema_version", "accounts"}
+                or raw.get("schema_version") != 1
+                or not isinstance(raw.get("accounts"), dict)
+            ):
+                raise ValueError("invalid_gemini_rate_limits")
+            entries: dict[str, dict[str, object]] = {}
+            for account_id, value in raw["accounts"].items():
+                if (
+                    not isinstance(account_id, str)
+                    or not _ACCOUNT_ID_RE.fullmatch(account_id)
+                    or not isinstance(value, dict)
+                    or set(value) != {
+                        "next_allowed_at_utc", "cooldown_until_utc", "in_flight", "consecutive_429",
+                    }
+                ):
+                    raise ValueError("invalid_gemini_rate_limits")
+                next_allowed = self._parse_time(value.get("next_allowed_at_utc"))
+                cooldown = self._parse_time(value.get("cooldown_until_utc"))
+                if next_allowed is None:
+                    raise ValueError("invalid_gemini_rate_limits")
+                in_flight = value.get("in_flight")
+                if in_flight is not None:
+                    if (
+                        not isinstance(in_flight, dict)
+                        or set(in_flight) != {"reservation_id", "expires_at_utc"}
+                        or not isinstance(in_flight.get("reservation_id"), str)
+                        or not re.fullmatch(r"[0-9a-f]{32}", in_flight["reservation_id"])
+                        or self._parse_time(in_flight.get("expires_at_utc")) is None
+                    ):
+                        raise ValueError("invalid_gemini_rate_limits")
+                    in_flight = {
+                        "reservation_id": in_flight["reservation_id"],
+                        "expires_at_utc": in_flight["expires_at_utc"],
+                    }
+                consecutive = value.get("consecutive_429")
+                if isinstance(consecutive, bool) or not isinstance(consecutive, int) or not 0 <= consecutive <= 32:
+                    raise ValueError("invalid_gemini_rate_limits")
+                entries[account_id] = {
+                    "next_allowed_at_utc": next_allowed,
+                    "cooldown_until_utc": cooldown,
+                    "in_flight": in_flight,
+                    "consecutive_429": consecutive,
+                }
+            return entries
+        except Exception:
+            self._quarantine_rate_limits()
+            raise ValueError("invalid_gemini_rate_limits") from None
+
+    def _write_rate_limits(self, entries: dict[str, dict[str, object]]) -> None:
+        document = {"schema_version": 1, "accounts": entries}
+        text = json.dumps(document, indent=2, sort_keys=True) + "\n"
+        self._io.replace_text(self._paths.rate_limits, text)
+        if self._load_rate_limits() != entries:
+            raise ValueError("gemini_rate_limits_write_verification_failed")
+
+    def _rate_now(self) -> datetime:
+        now = self._io.utc_now()
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise ValueError("invalid_utc_clock")
+        return now.astimezone(timezone.utc)
+
+    @staticmethod
+    def _rate_text(value: datetime) -> str:
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    @staticmethod
+    def _retry_after(now: datetime, *values: str | None) -> int:
+        deadlines: list[datetime] = []
+        for value in values:
+            if value is None:
+                continue
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if parsed.tzinfo is not None and parsed > now:
+                deadlines.append(parsed.astimezone(timezone.utc))
+        if not deadlines:
+            return 0
+        return max(1, int(max((item - now).total_seconds() for item in deadlines) + 0.999))
+
+    def reserve_gemini_request(self, account_id: str) -> GeminiRequestReservation:
+        if self._read_only:
+            raise FleetRateLimitError("rate_limiter_read_only", 60)
+        if not isinstance(account_id, str) or not _ACCOUNT_ID_RE.fullmatch(account_id):
+            raise FleetRateLimitError("rate_limiter_invalid_account", 60)
+        with self._io.lock():
+            now = self._rate_now()
+            entries = self._load_rate_limits()
+            entry = entries.get(account_id)
+            if entry is not None:
+                in_flight = entry.get("in_flight")
+                in_flight_until = in_flight.get("expires_at_utc") if isinstance(in_flight, dict) else None
+                retry_after = self._retry_after(
+                    now,
+                    entry.get("next_allowed_at_utc") if isinstance(entry.get("next_allowed_at_utc"), str) else None,
+                    entry.get("cooldown_until_utc") if isinstance(entry.get("cooldown_until_utc"), str) else None,
+                    in_flight_until if isinstance(in_flight_until, str) else None,
+                )
+                if retry_after:
+                    raise FleetRateLimitError("gemini_local_rate_limit", retry_after)
+            reservation_id = uuid.uuid4().hex
+            expires = now + timedelta(seconds=GEMINI_REQUEST_LEASE_SECONDS)
+            previous_cooldown = entry.get("cooldown_until_utc") if entry else None
+            previous_429 = entry.get("consecutive_429", 0) if entry else 0
+            entries[account_id] = {
+                "next_allowed_at_utc": self._rate_text(
+                    now + timedelta(seconds=GEMINI_MIN_REQUEST_INTERVAL_SECONDS)
+                ),
+                "cooldown_until_utc": previous_cooldown if isinstance(previous_cooldown, str) else None,
+                "in_flight": {"reservation_id": reservation_id, "expires_at_utc": self._rate_text(expires)},
+                "consecutive_429": previous_429 if isinstance(previous_429, int) else 0,
+            }
+            self._write_rate_limits(entries)
+        return GeminiRequestReservation(account_id, reservation_id, self._rate_text(expires))
+
+    def release_gemini_request(
+        self,
+        reservation: GeminiRequestReservation,
+        *,
+        outcome: str,
+        reset_at_utc: str | None = None,
+    ) -> None:
+        if self._read_only:
+            return
+        if outcome not in {"completed", "provider_error", "rate_limited"}:
+            raise ValueError("invalid_gemini_rate_outcome")
+        with self._io.lock():
+            now = self._rate_now()
+            entries = self._load_rate_limits()
+            entry = entries.get(reservation.account_id)
+            in_flight = entry.get("in_flight") if entry else None
+            if (
+                entry is None
+                or not isinstance(in_flight, dict)
+                or in_flight.get("reservation_id") != reservation.reservation_id
+            ):
+                return
+            next_allowed = entry.get("next_allowed_at_utc")
+            cooldown = entry.get("cooldown_until_utc")
+            consecutive = entry.get("consecutive_429", 0)
+            if not isinstance(consecutive, int):
+                consecutive = 0
+            if outcome == "rate_limited":
+                consecutive = min(32, consecutive + 1)
+                cooldown_at: datetime | None = None
+                if reset_at_utc is not None:
+                    try:
+                        cooldown_at = datetime.fromisoformat(reset_at_utc.replace("Z", "+00:00"))
+                    except ValueError:
+                        cooldown_at = None
+                    if cooldown_at is not None and cooldown_at.tzinfo is not None:
+                        cooldown_at = cooldown_at.astimezone(timezone.utc)
+                if cooldown_at is None or cooldown_at <= now:
+                    seconds = min(
+                        GEMINI_MAX_429_COOLDOWN_SECONDS,
+                        GEMINI_INITIAL_429_COOLDOWN_SECONDS * (2 ** min(consecutive - 1, 6)),
+                    )
+                    cooldown_at = now + timedelta(seconds=seconds)
+                cooldown = self._rate_text(cooldown_at)
+                next_allowed = cooldown
+            elif isinstance(cooldown, str) and self._retry_after(now, cooldown) == 0:
+                cooldown = None
+                consecutive = 0
+            entry = {
+                "next_allowed_at_utc": next_allowed,
+                "cooldown_until_utc": cooldown,
+                "in_flight": None,
+                "consecutive_429": consecutive,
+            }
+            entries[reservation.account_id] = entry
+            self._write_rate_limits(entries)
 
     def _overlay_limits(
         self,
@@ -562,10 +780,34 @@ class FleetService:
                 raise ValueError("invalid_account")
             probed_generation = current.generation
 
+        reservation = None
+        if account.provider.value == "gemini_api":
+            reservation = self.reserve_gemini_request(account.account_id)
+        result: ProbeResult | None = None
         try:
             result = probe(account)
         except Exception:
             result = None
+        finally:
+            if reservation is not None:
+                rate_limited = (
+                    isinstance(result, ProbeResult)
+                    and result.error is not None
+                    and result.error.kind == "account_limited"
+                )
+                self.release_gemini_request(
+                    reservation,
+                    outcome=(
+                        "rate_limited" if rate_limited
+                        else "completed" if isinstance(result, ProbeResult) and result.ok
+                        else "provider_error"
+                    ),
+                    reset_at_utc=(
+                        result.error.reset_at_utc
+                        if rate_limited and result is not None and result.error is not None
+                        else None
+                    ),
+                )
 
         with self._io.lock():
             latest = self._load_registry()

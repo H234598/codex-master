@@ -30,6 +30,7 @@ def test_fleet_paths_keep_registry_and_secrets_separate(tmp_path: Path) -> None:
     assert paths.registry == tmp_path / "fleet" / "registry.json"
     assert paths.secrets == tmp_path / "fleet" / "secrets"
     assert paths.limits == tmp_path / "fleet" / "limits.json"
+    assert paths.rate_limits == tmp_path / "fleet" / "rate-limits.json"
     assert paths.lock == tmp_path / "fleet" / "registry.lock"
     assert paths.recovery == tmp_path / "fleet" / "recovery.json"
     assert paths.mutation_lock == tmp_path / "fleet" / "mutation.lock"
@@ -193,6 +194,49 @@ def test_invalid_limit_sidecar_is_quarantined_and_fail_closed(tmp_path: Path) ->
     marker = paths.recovery.with_name("limits.recovery.json")
     assert marker.exists()
     assert "invalid_fleet_limits" in marker.read_text(encoding="utf-8")
+
+
+def test_gemini_rate_reservation_blocks_bursts_across_service_instances(tmp_path: Path) -> None:
+    from codex_master.fleet_service import FleetRateLimitError
+
+    service, paths = _service(tmp_path, _configured_snapshot())
+    reservation = service.reserve_gemini_request("shared")
+    assert reservation.account_id == "shared"
+    assert paths.rate_limits.exists()
+
+    with pytest.raises(FleetRateLimitError) as raised:
+        type(service)(paths, service._io, pool_root=tmp_path / "pool").reserve_gemini_request("shared")
+
+    assert raised.value.reason == "gemini_local_rate_limit"
+    assert raised.value.retry_after_seconds >= 60
+    assert reservation.reservation_id in paths.rate_limits.read_text(encoding="utf-8")
+
+
+def test_gemini_rate_reservation_applies_exponential_429_cooldown(tmp_path: Path) -> None:
+    from codex_master.fleet_service import FleetRateLimitError
+
+    service, paths = _service(tmp_path, _configured_snapshot())
+    reservation = service.reserve_gemini_request("shared")
+    service.release_gemini_request(reservation, outcome="rate_limited")
+
+    with pytest.raises(FleetRateLimitError) as raised:
+        service.reserve_gemini_request("shared")
+
+    assert raised.value.retry_after_seconds >= 15 * 60
+    assert '"in_flight": null' in paths.rate_limits.read_text(encoding="utf-8")
+
+
+def test_invalid_gemini_rate_state_fails_closed(tmp_path: Path) -> None:
+    from codex_master.fleet_service import FleetRateLimitError
+
+    service, paths = _service(tmp_path, _configured_snapshot())
+    paths.rate_limits.write_text("{invalid", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid_gemini_rate_limits"):
+        service.reserve_gemini_request("shared")
+
+    marker = paths.recovery.with_name("rate-limits.recovery.json")
+    assert marker.exists()
 
 
 @pytest.mark.parametrize(

@@ -5,6 +5,7 @@ const Settings = imports.ui.settings;
 const Util = imports.misc.util;
 const Gio = imports.gi.Gio;
 const GLib = imports.gi.GLib;
+const St = imports.gi.St;
 const ByteArray = imports.byteArray;
 
 const LABEL = "Flottenmanagement";
@@ -20,14 +21,29 @@ const DEFAULT_TRACKED_AGENTS_TEXT = "a1,b1";
 const DEFAULT_REFRESH_ON_OPEN = true;
 const DEFAULT_BACKGROUND_REFRESH = false;
 const DEFAULT_REFRESH_INTERVAL_SECONDS = 60;
+const DEFAULT_TERMINAL_COMMAND = "ghostty";
+const DEFAULT_PANEL_ICON = "hive-01-core";
+const DEFAULT_SETTINGS_ICON = "hive-02-queen-crown";
+const DEFAULT_PANEL_DISPLAY = "icon-text";
 const MIN_REFRESH_INTERVAL_SECONDS = 15;
 const MAX_REFRESH_INTERVAL_SECONDS = 3600;
 const MAX_TRACKED_AGENTS = 6;
 const MAX_NATIVE_BEES = 6;
 const MAX_TRACKED_AGENTS_SETTING_CHARS = 128;
+const MAX_TERMINAL_COMMAND_CHARS = 256;
 const APPLET_ERROR_LOG_LIMIT = 8;
 const APPLET_IMMEDIATE_EXIT_WAIT_LIMIT = 2;
 const APPLET_SAFE_PATH = "/usr/bin:/bin";
+const APPLET_ICON_NAMES = new Set([
+    "hive-01-core", "hive-02-queen-crown", "hive-03-worker-bee", "hive-04-drone",
+    "hive-05-honeycomb-shield", "hive-06-swarm-orbit", "hive-07-hex-command", "hive-08-honey-drop",
+    "hive-09-royal-cell", "hive-10-nectar-lance", "hive-11-amber-gateway", "hive-12-guardian-bee",
+    "hive-13-six-cell-star", "hive-14-hive-moon", "hive-15-pollen-scout", "hive-16-bee-crown",
+    "hive-17-naval-hive", "hive-18-queen-signal", "hive-19-honeycomb-star", "hive-20-swarm-helm",
+    "starwars-01-rebel-scout", "starwars-02-imperial-fighter", "starwars-03-freighter",
+    "starwars-04-destroyer", "starwars-05-fleet-command",
+]);
+const APPLET_PANEL_DISPLAY_MODES = new Set(["icon", "text", "icon-text"]);
 const APPLET_STATUS_COMMAND = "applet-status";
 const APPLET_ACTION_COMMAND = "applet-action";
 const APPLET_STATUS_SCHEMA_VERSION = 2;
@@ -126,10 +142,10 @@ function FlottenmanagementApplet(metadata, orientation, panel_height, instance_i
 }
 
 FlottenmanagementApplet.prototype = {
-    __proto__: Applet.TextApplet.prototype,
+    __proto__: Applet.TextIconApplet.prototype,
 
     _init(metadata, orientation, panel_height, instance_id) {
-        Applet.TextApplet.prototype._init.call(this, orientation, panel_height, instance_id);
+        Applet.TextIconApplet.prototype._init.call(this, orientation, panel_height, instance_id);
         this._removed = false;
         this._cleanupComplete = false;
         this._statusInFlight = false;
@@ -151,14 +167,24 @@ FlottenmanagementApplet.prototype = {
         this.refreshOnOpenSetting = DEFAULT_REFRESH_ON_OPEN;
         this.backgroundRefreshSetting = DEFAULT_BACKGROUND_REFRESH;
         this.refreshIntervalSecondsSetting = DEFAULT_REFRESH_INTERVAL_SECONDS;
+        this.terminalCommandSetting = DEFAULT_TERMINAL_COMMAND;
+        this.panelIconSetting = DEFAULT_PANEL_ICON;
+        this.settingsIconSetting = DEFAULT_SETTINGS_ICON;
+        this.panelDisplaySetting = DEFAULT_PANEL_DISPLAY;
         this.refreshOnOpen = DEFAULT_REFRESH_ON_OPEN;
         this.backgroundRefresh = DEFAULT_BACKGROUND_REFRESH;
         this.refreshIntervalSeconds = DEFAULT_REFRESH_INTERVAL_SECONDS;
+        this.terminalCommand = DEFAULT_TERMINAL_COMMAND;
+        this.panelIcon = DEFAULT_PANEL_ICON;
+        this.settingsIcon = DEFAULT_SETTINGS_ICON;
+        this.panelDisplay = DEFAULT_PANEL_DISPLAY;
+        this._metadataPath = metadata && typeof metadata.path === "string" ? metadata.path : null;
         this._settingsValid = true;
         this._settingsInitializing = false;
         this.settings = null;
         this._settingsCleanupPending = null;
         this._statusSummaryItem = null;
+        this._settingsMenuItem = null;
         this._statusRowItems = [];
         this._nativeSubmenuItem = null;
         this._nativeBeeRowItems = [];
@@ -193,7 +219,12 @@ FlottenmanagementApplet.prototype = {
         });
         this.menu.addMenuItem(statusItem);
 
-        const settingsItem = new PopupMenu.PopupMenuItem("Applet-Verwaltung öffnen");
+        const settingsItem = new PopupMenu.PopupIconMenuItem(
+            "Applet-Verwaltung öffnen",
+            this._iconPath(DEFAULT_SETTINGS_ICON),
+            St.IconType.FULLCOLOR
+        );
+        this._settingsMenuItem = settingsItem;
         this._connectTracked(settingsItem, "activate", () => {
             if (this._removed) return;
             try {
@@ -207,6 +238,10 @@ FlottenmanagementApplet.prototype = {
         const controlCenterItem = new PopupMenu.PopupMenuItem("Steuerzentrale öffnen");
         this._connectTracked(controlCenterItem, "activate", () => this._launchControlCenter());
         this.menu.addMenuItem(controlCenterItem);
+
+        const terminalStatusItem = new PopupMenu.PopupMenuItem("Flottenstatus im Terminal");
+        this._connectTracked(terminalStatusItem, "activate", () => this._launchTerminalStatus());
+        this.menu.addMenuItem(terminalStatusItem);
 
         this._statusSummaryItem = new PopupMenu.PopupMenuItem("", { reactive: false });
         this.menu.addMenuItem(this._statusSummaryItem);
@@ -266,6 +301,10 @@ FlottenmanagementApplet.prototype = {
             bind("refresh-on-open", "refreshOnOpenSetting");
             bind("background-refresh", "backgroundRefreshSetting");
             bind("refresh-interval-seconds", "refreshIntervalSecondsSetting");
+            bind("terminal-command", "terminalCommandSetting");
+            bind("panel-icon", "panelIconSetting");
+            bind("settings-icon", "settingsIconSetting");
+            bind("panel-display", "panelDisplaySetting");
         } catch (_error) {
             const incompleteSettings = this.settings;
             let settingsFinalized = !incompleteSettings || typeof incompleteSettings.finalize !== "function";
@@ -300,6 +339,64 @@ FlottenmanagementApplet.prototype = {
         return normalized.length > 0 && normalized.length <= MAX_TRACKED_AGENTS ? normalized : null;
     },
 
+    _normalizeTerminalCommand(value) {
+        if (typeof value !== "string" || value.length > MAX_TERMINAL_COMMAND_CHARS) return null;
+        const normalized = value.trim();
+        if (
+            normalized.length === 0
+            || normalized.length > MAX_TERMINAL_COMMAND_CHARS
+            || !/^(?:[A-Za-z0-9_+.-]+|\/[A-Za-z0-9_+./-]+)$/.test(normalized)
+        ) return null;
+        return normalized;
+    },
+
+    _normalizeIconName(value) {
+        return typeof value === "string" && APPLET_ICON_NAMES.has(value) ? value : null;
+    },
+
+    _normalizePanelDisplay(value) {
+        return typeof value === "string" && APPLET_PANEL_DISPLAY_MODES.has(value) ? value : null;
+    },
+
+    _iconPath(iconName) {
+        const safeName = this._normalizeIconName(iconName) || DEFAULT_PANEL_ICON;
+        const appletPath = this._metadataPath
+            || ((GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown")
+                + "/.local/share/cinnamon/applets/" + UUID);
+        return appletPath + "/icons/" + safeName + ".png";
+    },
+
+    _applySettingsMenuIcon() {
+        const item = this._settingsMenuItem;
+        if (!item) return;
+        const iconPath = this._iconPath(this.settingsIcon);
+        try {
+            if (item._icon && typeof item._icon.set_gicon === "function") {
+                item._icon.set_gicon(Gio.icon_new_for_string(iconPath));
+                item._codexIconPath = iconPath;
+            } else if (typeof item.setIconName === "function") {
+                item.setIconName(iconPath);
+            }
+        } catch (error) {
+            this._logCleanupError(error);
+        }
+    },
+
+    _applyPanelPresentation() {
+        const showIcon = this.panelDisplay !== "text";
+        const showLabel = this.panelDisplay !== "icon";
+        try {
+            if (showIcon && typeof this.set_applet_icon_path === "function") {
+                this.set_applet_icon_path(this._iconPath(this.panelIcon));
+            } else if (!showIcon && typeof this.hide_applet_icon === "function") {
+                this.hide_applet_icon();
+            }
+        } catch (error) {
+            this._logCleanupError(error);
+        }
+        this.set_applet_label(showLabel ? LABEL : "");
+    },
+
     _applySettings() {
         let valid = this.settings !== null;
         const previousAgents = this._trackedAgents.join(",");
@@ -328,8 +425,39 @@ FlottenmanagementApplet.prototype = {
                 Math.max(MIN_REFRESH_INTERVAL_SECONDS, Math.trunc(this.refreshIntervalSecondsSetting))
             );
         }
+        const terminalCommand = this._normalizeTerminalCommand(this.terminalCommandSetting);
+        if (!terminalCommand) {
+            this.terminalCommand = DEFAULT_TERMINAL_COMMAND;
+            valid = false;
+        } else {
+            this.terminalCommand = terminalCommand;
+        }
+
+        const panelIcon = this._normalizeIconName(this.panelIconSetting);
+        if (!panelIcon) {
+            this.panelIcon = DEFAULT_PANEL_ICON;
+            valid = false;
+        } else {
+            this.panelIcon = panelIcon;
+        }
+        const settingsIcon = this._normalizeIconName(this.settingsIconSetting);
+        if (!settingsIcon) {
+            this.settingsIcon = DEFAULT_SETTINGS_ICON;
+            valid = false;
+        } else {
+            this.settingsIcon = settingsIcon;
+        }
+        const panelDisplay = this._normalizePanelDisplay(this.panelDisplaySetting);
+        if (!panelDisplay) {
+            this.panelDisplay = DEFAULT_PANEL_DISPLAY;
+            valid = false;
+        } else {
+            this.panelDisplay = panelDisplay;
+        }
 
         this._settingsValid = valid;
+        this._applyPanelPresentation();
+        this._applySettingsMenuIcon();
         if (previousAgents !== this._trackedAgents.join(",")) {
             this._statusLastGood = null;
             this._armedAction = null;
@@ -396,6 +524,36 @@ FlottenmanagementApplet.prototype = {
     _launchControlCenter() {
         if (this._removed || this._statusInFlight) return;
         this._startStatusRefresh({ kind: "launcher" });
+    },
+
+    _launchTerminalStatus() {
+        if (this._removed || !this._settingsValid) return;
+        const terminal = this._normalizeTerminalCommand(this.terminalCommand);
+        if (!terminal) return;
+        const home = GLib.get_home_dir ? GLib.get_home_dir() : "/home/unknown";
+        const statusCommand = home + "/.local/bin/codex-master-mcp";
+        const shellQuote = (value) => `'${String(value).replace(/'/g, "'\\''")}'`;
+        const terminalName = terminal.split("/").pop();
+        const terminalExecutionArgs = terminalName === "gnome-terminal" ? ["--"] : ["-e"];
+        const shellCommand = [
+            shellQuote(statusCommand),
+            "status",
+            "all",
+            "--agents-limit",
+            "30",
+            "; printf '\\n\\nZum Schließen Enter drücken ... '; read -r",
+        ].join(" ");
+        try {
+            Util.spawn([
+                terminal,
+                ...terminalExecutionArgs,
+                "/bin/bash",
+                "-c",
+                shellCommand,
+            ]);
+        } catch (error) {
+            this._logCleanupError(error);
+        }
     },
 
     _controlCenterArgv() {
@@ -1285,7 +1443,7 @@ FlottenmanagementApplet.prototype = {
 
     _renderStatus() {
         if (this._removed) return;
-        this.set_applet_label(LABEL);
+        this._applyPanelPresentation();
         const payload = this._statusLastGood;
         const managedRows = payload ? payload.agents : this._trackedAgents.map((agent) => ({
             agent,

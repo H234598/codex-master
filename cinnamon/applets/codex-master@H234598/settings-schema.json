@@ -24,5 +24,88 @@
     "max": 3600,
     "step": 15,
     "units": "Sekunden"
+  },
+  "terminal-command": {
+    "type": "entry",
+    "description": "Terminal für Flottenstatus",
+    "tooltip": "Programmname oder absoluter Pfad eines Terminals, das -e unterstützt. Standard: ghostty.",
+    "default": "ghostty"
+  },
+  "panel-icon": {
+    "type": "combobox",
+    "description": "Taskleistenicon des Applets",
+    "tooltip": "Wähle eines der 20 Hive- oder 5 Flottenmotive für das Applet.",
+    "default": "hive-01-core",
+    "options": {
+      "Hive 01 · Amber Core": "hive-01-core",
+      "Hive 02 · Queen Crown": "hive-02-queen-crown",
+      "Hive 03 · Worker Bee": "hive-03-worker-bee",
+      "Hive 04 · Drone": "hive-04-drone",
+      "Hive 05 · Honeycomb Shield": "hive-05-honeycomb-shield",
+      "Hive 06 · Swarm Orbit": "hive-06-swarm-orbit",
+      "Hive 07 · Hex Command": "hive-07-hex-command",
+      "Hive 08 · Honey Drop": "hive-08-honey-drop",
+      "Hive 09 · Royal Cell": "hive-09-royal-cell",
+      "Hive 10 · Nectar Lance": "hive-10-nectar-lance",
+      "Hive 11 · Amber Gateway": "hive-11-amber-gateway",
+      "Hive 12 · Guardian Bee": "hive-12-guardian-bee",
+      "Hive 13 · Six-Cell Star": "hive-13-six-cell-star",
+      "Hive 14 · Hive Moon": "hive-14-hive-moon",
+      "Hive 15 · Pollen Scout": "hive-15-pollen-scout",
+      "Hive 16 · Bee Crown": "hive-16-bee-crown",
+      "Hive 17 · Naval Hive": "hive-17-naval-hive",
+      "Hive 18 · Queen Signal": "hive-18-queen-signal",
+      "Hive 19 · Honeycomb Star": "hive-19-honeycomb-star",
+      "Hive 20 · Swarm Helm": "hive-20-swarm-helm",
+      "Star Wars 01 · Rebel Scout": "starwars-01-rebel-scout",
+      "Star Wars 02 · Imperial Fighter": "starwars-02-imperial-fighter",
+      "Star Wars 03 · Freighter": "starwars-03-freighter",
+      "Star Wars 04 · Destroyer": "starwars-04-destroyer",
+      "Star Wars 05 · Fleet Command": "starwars-05-fleet-command"
+    }
+  },
+  "settings-icon": {
+    "type": "combobox",
+    "description": "Icon für Applet-Verwaltung",
+    "tooltip": "Wähle das Icon für den Menüpunkt, der die Applet-Einstellungen öffnet.",
+    "default": "hive-02-queen-crown",
+    "options": {
+      "Hive 01 · Amber Core": "hive-01-core",
+      "Hive 02 · Queen Crown": "hive-02-queen-crown",
+      "Hive 03 · Worker Bee": "hive-03-worker-bee",
+      "Hive 04 · Drone": "hive-04-drone",
+      "Hive 05 · Honeycomb Shield": "hive-05-honeycomb-shield",
+      "Hive 06 · Swarm Orbit": "hive-06-swarm-orbit",
+      "Hive 07 · Hex Command": "hive-07-hex-command",
+      "Hive 08 · Honey Drop": "hive-08-honey-drop",
+      "Hive 09 · Royal Cell": "hive-09-royal-cell",
+      "Hive 10 · Nectar Lance": "hive-10-nectar-lance",
+      "Hive 11 · Amber Gateway": "hive-11-amber-gateway",
+      "Hive 12 · Guardian Bee": "hive-12-guardian-bee",
+      "Hive 13 · Six-Cell Star": "hive-13-six-cell-star",
+      "Hive 14 · Hive Moon": "hive-14-hive-moon",
+      "Hive 15 · Pollen Scout": "hive-15-pollen-scout",
+      "Hive 16 · Bee Crown": "hive-16-bee-crown",
+      "Hive 17 · Naval Hive": "hive-17-naval-hive",
+      "Hive 18 · Queen Signal": "hive-18-queen-signal",
+      "Hive 19 · Honeycomb Star": "hive-19-honeycomb-star",
+      "Hive 20 · Swarm Helm": "hive-20-swarm-helm",
+      "Star Wars 01 · Rebel Scout": "starwars-01-rebel-scout",
+      "Star Wars 02 · Imperial Fighter": "starwars-02-imperial-fighter",
+      "Star Wars 03 · Freighter": "starwars-03-freighter",
+      "Star Wars 04 · Destroyer": "starwars-04-destroyer",
+      "Star Wars 05 · Fleet Command": "starwars-05-fleet-command"
+    }
+  },
+  "panel-display": {
+    "type": "combobox",
+    "description": "Darstellung in der Taskleiste",
+    "tooltip": "Zeige nur das Icon, nur den Text oder beides.",
+    "default": "icon-text",
+    "options": {
+      "Nur Icon": "icon",
+      "Nur Text": "text",
+      "Icon + Text": "icon-text"
+    }
   }
 }

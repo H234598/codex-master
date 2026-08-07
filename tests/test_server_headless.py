@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import io
+import hashlib
+import json
+import signal
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import Mock
@@ -65,6 +69,12 @@ class FakeService:
 
     def mark_limited(self, *_args: object, **_kwargs: object) -> None:
         raise AssertionError("limit marking was not expected")
+
+    def reserve_gemini_request(self, account_id: str) -> object:
+        return (account_id, "reservation")
+
+    def release_gemini_request(self, *_args: object, **_kwargs: object) -> None:
+        return None
 
 
 def _snapshot(tmp_path: Path) -> FleetSnapshot:
@@ -178,6 +188,110 @@ def test_headless_assignment_rejects_invalid_timeout_before_claim(monkeypatch) -
         )
 
     claim.assert_not_called()
+
+
+def test_headless_assignment_passes_subagent_admission_to_prompt(monkeypatch) -> None:
+    descriptor = type("Descriptor", (), {"model": "gemini-3-flash-preview"})()
+    captured: dict[str, object] = {}
+
+    def fake_prompt(**kwargs: object) -> str:
+        captured.update(kwargs)
+        return "bounded assignment prompt"
+
+    monkeypatch.setattr(server, "canonical_agent_id", lambda _agent: "d1")
+    monkeypatch.setattr(server, "_headless_descriptor", lambda _agent: descriptor)
+    monkeypatch.setattr(server, "skill_matches", lambda *_args: [])
+    monkeypatch.setattr(server, "scope_check", lambda *_args: {"allowed": True})
+    monkeypatch.setattr(server, "assignment_prompt", fake_prompt)
+    monkeypatch.setattr(server, "current_fleet_service", lambda: FakeService(_snapshot(Path("/tmp"))))
+    monkeypatch.setattr(server, "agent_lifecycle_lock", lambda _agent: nullcontext())
+    monkeypatch.setattr(server, "_claim_agent_unlocked", lambda _agent: {
+        "status": "already_held",
+        "lease": {"held_by_this_server": True},
+    })
+    monkeypatch.setattr(server, "record_assignment", lambda _record: None)
+    monkeypatch.setattr(server, "_headless_marker", lambda _agent: {})
+    monkeypatch.setattr(server, "_write_headless_marker", lambda _agent, _marker: None)
+    monkeypatch.setattr(server, "_run_headless_process", lambda *_args, **_kwargs: {"status": "completed"})
+
+    result = server._assign_headless_agent(
+        "d1",
+        role="exploriererin",
+        task="inspect",
+        scope=[],
+        timeout_seconds=5,
+    )
+
+    assert result["status"] == "completed"
+    assert captured["subagent_admission"] is None
+
+
+def test_headless_retry_policy_caps_existing_gemini_home_settings(tmp_path: Path) -> None:
+    settings_path = tmp_path / ".gemini" / "settings.json"
+    settings_path.parent.mkdir()
+    settings_path.write_text(
+        '{"general":{"maxAttempts":10,"retryFetchErrors":true},"privacy":{"usageStatisticsEnabled":false}}\n',
+        encoding="utf-8",
+    )
+
+    server._ensure_gemini_headless_retry_policy(tmp_path)
+
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert settings["general"] == {"maxAttempts": 2, "retryFetchErrors": False}
+    assert settings["privacy"]["usageStatisticsEnabled"] is False
+
+
+def test_stale_headless_force_recovery_signals_only_verified_process_group(monkeypatch) -> None:
+    home = Path("/tmp/managed-d1")
+    descriptor = type("Descriptor", (), {"home": home})()
+    marker = {
+        "state": "running",
+        "process": {
+            "pid": 81236,
+            "pgid": 81236,
+            "proc_start_ticks": 42,
+            "home_tag": hashlib.sha256(str(home).encode("utf-8")).hexdigest(),
+        },
+    }
+    signals: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(server, "_headless_descriptor", lambda _agent: descriptor)
+    monkeypatch.setattr(server, "_headless_process_start_ticks", lambda _pid: 42)
+    monkeypatch.setattr(server.os, "getpgid", lambda _pid: 81236)
+    monkeypatch.setattr(server.os, "getpgrp", lambda: 99999)
+
+    def fake_killpg(pgid: int, signum: int) -> None:
+        signals.append((pgid, signum))
+        if signum == 0:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(server.os, "killpg", fake_killpg)
+
+    assert server._recover_headless_process("d1", marker) == "stopped"
+    assert signals == [(81236, signal.SIGTERM), (81236, 0)]
+
+
+def test_force_stop_recovers_stale_headless_marker(monkeypatch) -> None:
+    descriptor = type("Descriptor", (), {"home": Path("/tmp/managed-d1")})()
+    marker = {"state": "running", "assignment_id": "assignment-1"}
+    written: dict[str, object] = {}
+    release = Mock(return_value={"lease": {"state": "unclaimed"}})
+
+    monkeypatch.setattr(server, "canonical_agent_id", lambda _agent: "d1")
+    monkeypatch.setattr(server, "_headless_descriptor", lambda _agent: descriptor)
+    monkeypatch.setattr(server, "_headless_marker", lambda _agent: marker)
+    recover = Mock(return_value="stopped")
+    monkeypatch.setattr(server, "_recover_headless_process", recover)
+    monkeypatch.setattr(server, "_write_headless_marker", lambda _agent, value: written.update(value))
+    monkeypatch.setattr(server, "agent_lease_status", lambda _agent: {"state": "free"})
+    monkeypatch.setattr(server, "release_agent", release)
+
+    result = server._stop_agent_unlocked("d1", force=True)
+
+    assert result["status"] == "stopped"
+    recover.assert_called_once_with("d1", marker)
+    assert written["state"] == "disabled"
+    release.assert_called_once_with("d1", force=True)
 
 
 def test_generic_headless_assignment_preserves_requested_role(monkeypatch) -> None:

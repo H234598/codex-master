@@ -27,6 +27,7 @@ MAX_PROVIDER_RESPONSE_BYTES = 1024 * 1024
 MAX_PROVIDER_MODELS = 1000
 PROVIDER_HTTP_TIMEOUT_SECONDS = 5
 GEMINI_PROBE_TIMEOUT_SECONDS = 30
+GEMINI_DEFAULT_LIGHT_MODEL = "gemini-3.1-flash-lite"
 OLLAMA_MODELS_URL = "http://127.0.0.1:11434/api/tags"
 HUGGINGFACE_MODELS_URL = "https://router.huggingface.co/v1/models"
 _SECRET_ENV_NAMES = frozenset({
@@ -153,9 +154,10 @@ def build_runner_plan(agent: AgentDescriptor, executable: Path) -> RunnerPlan:
             MappingProxyType({"CODEX_HOME": str(agent.home)}), _plan_env("HF_TOKEN"), "HF_TOKEN",
         )
     if agent.provider is Provider.GEMINI_API and agent.runner is RunnerKind.GEMINI_CLI and agent.account_id:
+        model = GEMINI_DEFAULT_LIGHT_MODEL if agent.model in {"auto", "auto-gemini-3", "flash-lite"} else agent.model
         return RunnerPlan(
             "headless_job",
-            (command, "--output-format", "stream-json", "--model", agent.model),
+            (command, "--output-format", "stream-json", "--model", model, "--prompt", ""),
             MappingProxyType({
                 "HOME": str(agent.home),
                 "GEMINI_CLI_HOME": str(agent.home),
@@ -522,7 +524,12 @@ def _gemini_probe_settings(home: Path) -> None:
     policy_home.mkdir(mode=0o700)
     settings = {
         "advanced": {"autoConfigureMemory": False, "ignoreLocalEnv": True},
-        "general": {"enableAutoUpdate": False, "enableAutoUpdateNotification": False},
+        "general": {
+            "enableAutoUpdate": False,
+            "enableAutoUpdateNotification": False,
+            "maxAttempts": 2,
+            "retryFetchErrors": False,
+        },
         "privacy": {"usageStatisticsEnabled": False},
         "security": {"auth": {"enforcedType": "gemini-api-key"}},
     }
@@ -589,9 +596,8 @@ def probe_gemini_cli(
                 "GEMINI_API_KEY": secret,
                 "GEMINI_CLI_TRUST_WORKSPACE": "true",
             })
-            argv = [command, "--output-format", "stream-json", "--approval-mode=plan"]
-            if model is not None:
-                argv.extend(("--model", model))
+            argv = [command, "--output-format", "stream-json", "--prompt", "", "--approval-mode=plan",
+                    "--model", model or GEMINI_DEFAULT_LIGHT_MODEL]
             registry.register(job)
             result = run_bounded_process(
                 job,

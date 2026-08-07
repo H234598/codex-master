@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import shlex
+import signal
 import stat as stat_module
 import subprocess
 import sys
@@ -88,7 +89,14 @@ from codex_master.fleet_recovery import (
     recovery_document,
     normalize_recovery_document,
 )
-from codex_master.fleet_service import FleetConflictError, FleetPaths, FleetPrivateIO, FleetSecretError, FleetService
+from codex_master.fleet_service import (
+    FleetConflictError,
+    FleetPaths,
+    FleetPrivateIO,
+    FleetRateLimitError,
+    FleetSecretError,
+    FleetService,
+)
 from codex_master.fleet_runners import (
     FleetRunnerError,
     ProbeResult,
@@ -6401,6 +6409,34 @@ def _headless_executable(descriptor: AgentDescriptor) -> Path:
     return candidate
 
 
+def _ensure_gemini_headless_retry_policy(home: Path) -> None:
+    settings_path = home / ".gemini" / "settings.json"
+    settings_text = fleet_read_optional_private_text(
+        settings_path,
+        256 * 1024,
+        "headless_settings_invalid",
+    )
+    if settings_text is None:
+        return
+    try:
+        document = json.loads(settings_text)
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise AgentError("headless_settings_invalid") from exc
+    if not isinstance(document, dict):
+        raise AgentError("headless_settings_invalid")
+    general = document.get("general")
+    if general is None:
+        general = {}
+        document["general"] = general
+    if not isinstance(general, dict):
+        raise AgentError("headless_settings_invalid")
+    if general.get("maxAttempts") == 2 and general.get("retryFetchErrors") is False:
+        return
+    general["maxAttempts"] = 2
+    general["retryFetchErrors"] = False
+    replace_private_text(settings_path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+
+
 def _headless_marker(agent: str) -> dict[str, Any]:
     value = read_meta(agent).get(HEADLESS_META_KEY)
     return dict(value) if isinstance(value, dict) else {}
@@ -6487,6 +6523,75 @@ def headless_job_status(agent: str) -> dict[str, Any]:
         "running": state in {"running", "cancelling"},
         "raw_output": "not_returned",
     }
+
+
+def _headless_process_start_ticks(pid: int) -> int | None:
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        fields = stat_text.rsplit(")", 1)[-1].split()
+        if len(fields) > 19 and fields[19].isdigit():
+            return int(fields[19])
+    except (OSError, UnicodeError, ValueError):
+        pass
+    return None
+
+
+def _headless_recovery_identity(agent: str, marker: Mapping[str, Any]) -> tuple[int, int] | None:
+    descriptor = _headless_descriptor(agent)
+    process = marker.get("process")
+    if descriptor is None or not isinstance(process, Mapping):
+        return None
+    pid = process.get("pid")
+    pgid = process.get("pgid")
+    start_ticks = process.get("proc_start_ticks")
+    home_tag = process.get("home_tag")
+    if (
+        isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0
+        or isinstance(pgid, bool) or not isinstance(pgid, int) or pgid <= 0
+        or isinstance(start_ticks, bool) or not isinstance(start_ticks, int) or start_ticks <= 0
+        or not isinstance(home_tag, str)
+        or home_tag != hashlib.sha256(str(descriptor.home).encode("utf-8")).hexdigest()
+    ):
+        return None
+    try:
+        current_pgid = os.getpgid(pid)
+    except OSError:
+        return None
+    if current_pgid != pgid or pgid == os.getpgrp():
+        return None
+    if _headless_process_start_ticks(pid) != start_ticks:
+        return None
+    return pid, pgid
+
+
+def _recover_headless_process(agent: str, marker: Mapping[str, Any]) -> str:
+    identity = _headless_recovery_identity(agent, marker)
+    if identity is None:
+        return "identity_unverified"
+    _pid, pgid = identity
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "already_gone"
+    except OSError:
+        return "identity_unverified"
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return "stopped"
+        except OSError:
+            return "identity_unverified"
+        time.sleep(0.05)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return "stopped"
+    except OSError:
+        return "identity_unverified"
+    return "stopped"
 
 
 def cancel_headless_job(agent: str, force: bool = False) -> dict[str, Any]:
@@ -6576,8 +6681,8 @@ def _run_headless_process(
         or fresh_descriptor.account_id != descriptor.account_id
     ):
         raise AgentError("headless_binding_changed")
-    secret = service.read_secret(gate.account_id, expected_generation=gate.generation)
     executable = _headless_executable(descriptor)
+    _ensure_gemini_headless_retry_policy(descriptor.home)
     plan = build_runner_plan(descriptor, executable)
     child_env = dict(os.environ)
     for name in plan.unset_env | {"CODEX_HOME"}:
@@ -6585,7 +6690,6 @@ def _run_headless_process(
     child_env.update(plan.env)
     if plan.secret_env_name is None:
         raise AgentError("headless_secret_binding_missing")
-    child_env[plan.secret_env_name] = secret
     argv = list(plan.argv)
     argv.append("--approval-mode=plan" if role == "exploriererin" else "--approval-mode=auto_edit")
     assignment_id = assignment_id or f"{now_id()}-{agent}"
@@ -6594,7 +6698,15 @@ def _run_headless_process(
     result: HeadlessProcessResult | None = None
     parsed = None
     popen_env: dict[str, str] | None = None
+    reservation = None
+    rate_outcome = "provider_error"
+    rate_reset_at_utc: str | None = None
+    secret = ""
     try:
+        if gate.account_id is not None:
+            reservation = service.reserve_gemini_request(gate.account_id)
+        secret = service.read_secret(gate.account_id, expected_generation=gate.generation)
+        child_env[plan.secret_env_name] = secret
         try:
             popen_env = dict(child_env)
             process = subprocess.Popen(
@@ -6647,6 +6759,8 @@ def _run_headless_process(
             })
             raise AgentError("invalid_headless_output") from exc
         if parsed.error is not None and parsed.error.kind == "account_limited":
+            rate_outcome = "rate_limited"
+            rate_reset_at_utc = parsed.error.reset_at_utc
             try:
                 service.mark_limited(
                     gate.account_id,
@@ -6674,6 +6788,8 @@ def _run_headless_process(
             "stderr_truncated": result.stderr_truncated,
         })
         response = parsed.response if terminal == "completed" else ""
+        if terminal == "completed":
+            rate_outcome = "completed"
         return {
             "agent": agent,
             "assignment_id": assignment_id,
@@ -6699,6 +6815,13 @@ def _run_headless_process(
         if popen_env is not None:
             popen_env.clear()
         secret = ""
+        if reservation is not None:
+            with contextlib.suppress(Exception):
+                service.release_gemini_request(
+                    reservation,
+                    outcome=rate_outcome,
+                    reset_at_utc=rate_reset_at_utc,
+                )
         if job is not None and result is not None:
             HEADLESS_JOBS.finish(job, result)
         if job is not None and result is None:
@@ -6798,10 +6921,12 @@ def _assign_headless_agent(
     matches = skill_matches(agent, skill) if skill else []
     if skill and not matches and not allow_missing_skill:
         raise AgentError(f"skill not found for agent {agent}")
+    subagent_admission = spawn_admission_decision(1) if allow_subagents else None
     prompt = assignment_prompt(
         agent=agent, role=role, task=task, scope=scope, skill=skill,
         write_paths=write_paths, context=context, forbidden=forbidden, name=name,
         model=descriptor.model, allow_subagents=allow_subagents,
+        subagent_admission=subagent_admission,
         requires_search=requires_search, live_data_topic=live_data_topic,
     )
     if len(prompt) > MAX_ASSIGNMENT_TEXT:
@@ -7033,6 +7158,24 @@ def _stop_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]:
                 "raw_output": "not_returned",
             }
         marker = _headless_marker(agent)
+        if marker.get("state") == "running":
+            if not force:
+                return {
+                    "agent": agent,
+                    "status": "identity_unverified",
+                    "backend": "headless_job",
+                    "lease": agent_lease_status(agent),
+                    "raw_output": "not_returned",
+                }
+            recovery = _recover_headless_process(agent, marker)
+            if recovery == "identity_unverified":
+                return {
+                    "agent": agent,
+                    "status": "identity_unverified",
+                    "backend": "headless_job",
+                    "lease": agent_lease_status(agent),
+                    "raw_output": "not_returned",
+                }
         marker.update({"state": "disabled", "assignment_id": marker.get("assignment_id")})
         _write_headless_marker(agent, marker)
         current_lease = agent_lease_status(agent)
@@ -15148,6 +15291,8 @@ def fleet_minimal_config(agent: AgentDescriptor) -> tuple[str, str]:
                 "defaultApprovalMode": "default",
                 "enableAutoUpdate": False,
                 "enableAutoUpdateNotification": False,
+                "maxAttempts": 2,
+                "retryFetchErrors": False,
             },
             "privacy": {"usageStatisticsEnabled": False},
             "security": {
@@ -24007,6 +24152,15 @@ def fleet_account_probe(*, account_id: str, expected_generation: int) -> dict[st
                 _fleet_account_probe,
                 expected_generation=expected_generation,
             )
+        except FleetRateLimitError as exc:
+            return {
+                "probed": False,
+                "generation": expected_generation,
+                "ready": False,
+                "reason": exc.reason,
+                "retry_after_seconds": exc.retry_after_seconds,
+                "raw_output": "not_returned",
+            }
         except (FleetConflictError, FleetSecretError, ValueError) as exc:
             code = str(exc)
             if code not in {"generation_conflict", "invalid_account", "secret_missing", "secret_unavailable", "secret_read_failed"}:

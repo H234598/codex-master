@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import io
 import json
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
@@ -101,9 +101,8 @@ def test_gemini_runner_is_headless_jsonl_and_home_isolated(tmp_path: Path) -> No
     assert plan.mode == "headless_job"
     assert plan.argv == (
         "/usr/local/bin/gemini", "--output-format", "stream-json", "--model",
-        "gemini-3-flash-preview",
+        "gemini-3-flash-preview", "--prompt", "",
     )
-    assert "-p" not in plan.argv
     assert "private task" not in plan.argv
     assert plan.env == {
         "HOME": str(tmp_path / "agents" / "d1"),
@@ -114,6 +113,12 @@ def test_gemini_runner_is_headless_jsonl_and_home_isolated(tmp_path: Path) -> No
     assert "OPENAI_API_KEY" in plan.unset_env
     assert {"GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT",
             "GOOGLE_CLOUD_LOCATION", "GOOGLE_GENAI_USE_VERTEXAI"} <= plan.unset_env
+
+    lightweight = build_runner_plan(
+        replace(agent(tmp_path, Provider.GEMINI_API, RunnerKind.GEMINI_CLI, account_id="gemini-project-1"), model="auto"),
+        Path("/usr/local/bin/gemini"),
+    )
+    assert "gemini-3.1-flash-lite" in lightweight.argv
 
 
 def test_gemini_provider_probe_is_stdin_only_bounded_and_isolated(
@@ -149,7 +154,12 @@ def test_gemini_provider_probe_is_stdin_only_bounded_and_isolated(
     assert isinstance(argv, tuple)
     assert "private-gemini-secret" not in argv
     assert "Reply with exactly OK. Do not modify files or use tools." not in argv
+    assert "--prompt" in argv
     assert "--approval-mode=plan" in argv
+    assert "gemini-3.1-flash-lite" in argv
+    settings = json.loads(captured["settings"])  # type: ignore[arg-type]
+    assert settings["general"]["maxAttempts"] == 2
+    assert settings["general"]["retryFetchErrors"] is False
     env = captured["env"]
     assert isinstance(env, dict)
     assert env["GEMINI_API_KEY"] == "private-gemini-secret"

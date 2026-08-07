@@ -129,6 +129,10 @@ function loadApplet() {
     "refresh-on-open": true,
     "background-refresh": false,
     "refresh-interval-seconds": 60,
+    "terminal-command": "ghostty",
+    "panel-icon": "hive-01-core",
+    "settings-icon": "hive-02-queen-crown",
+    "panel-display": "icon-text",
   };
   let home = "/home/tester";
   let timeoutId = 1;
@@ -179,6 +183,8 @@ function loadApplet() {
   TextApplet.prototype._init = function () {
     this.labels = [];
     this.tooltips = [];
+    this.iconPaths = [];
+    this.iconVisible = false;
     this._applet_context_menu = new AppletPopupMenu();
     this._menuManager = new PopupMenuManager();
     this._menuManager.addMenu(this._applet_context_menu);
@@ -188,6 +194,14 @@ function loadApplet() {
   };
   TextApplet.prototype.set_applet_tooltip = function (value) {
     this.tooltips.push(value);
+  };
+  class TextIconApplet extends TextApplet {}
+  TextIconApplet.prototype.set_applet_icon_path = function (value) {
+    this.iconPaths.push(value);
+    this.iconVisible = true;
+  };
+  TextIconApplet.prototype.hide_applet_icon = function () {
+    this.iconVisible = false;
   };
 
   class PopupMenuItem {
@@ -214,6 +228,23 @@ function loadApplet() {
           handler.callback();
         }
       }
+    }
+  }
+
+  class PopupIconMenuItem extends PopupMenuItem {
+    constructor(label, iconName, iconType) {
+      super(label);
+      this.iconName = iconName;
+      this.iconType = iconType;
+      this._icon = {
+        path: iconName,
+        iconType,
+        set_gicon: (gicon) => { this._icon.path = gicon.path; },
+      };
+    }
+    setIconName(iconName) {
+      this.iconName = iconName;
+      this._icon.path = iconName;
     }
   }
 
@@ -542,6 +573,7 @@ function loadApplet() {
   };
 
   const Gio = {
+    icon_new_for_string(path) { return { path }; },
     SubprocessLauncher: {
       new: function (flags) {
         const launcher = new FakeSubprocessLauncher();
@@ -562,14 +594,15 @@ function loadApplet() {
     AppletSettings: FakeAppletSettings,
     BindingDirection: { IN: 1 },
   };
+  const St = { IconType: { FULLCOLOR: 1, SYMBOLIC: 2 } };
 
   const context = {
     imports: {
-      gi: { Gio, GLib },
+      gi: { Gio, GLib, St },
       mainloop: Mainloop,
       ui: {
-        applet: { TextApplet, AppletPopupMenu },
-        popupMenu: { PopupMenuItem, PopupSubMenuMenuItem, PopupMenuManager },
+        applet: { TextApplet, TextIconApplet, AppletPopupMenu },
+        popupMenu: { PopupMenuItem, PopupIconMenuItem, PopupSubMenuMenuItem, PopupMenuManager },
         settings: Settings,
       },
       misc: { util: { spawn(args) {
@@ -2596,19 +2629,33 @@ test("removal cancels an in-flight replacement wait", () => {
   assert.equal(fixture.subprocesses.length, 1, "cancel callback starts no refresh");
 });
 
-test("task 5 settings schema contains exactly four bounded settings", () => {
+test("settings schema contains the bounded fleet settings and Ghostty terminal default", () => {
   const schemaPath = path.join(root, "cinnamon/applets/codex-master@H234598/settings-schema.json");
   const schema = JSON.parse(fs.readFileSync(schemaPath, "utf8"));
 
   assert.deepEqual(Object.keys(schema).sort(), [
     "background-refresh",
+    "panel-display",
+    "panel-icon",
     "refresh-interval-seconds",
     "refresh-on-open",
+    "settings-icon",
+    "terminal-command",
     "tracked-agents",
   ]);
   assert.equal(schema["tracked-agents"].default, "a1,b1");
   assert.equal(schema["refresh-on-open"].default, true);
   assert.equal(schema["background-refresh"].default, false);
+  assert.equal(schema["terminal-command"].default, "ghostty");
+  assert.equal(schema["panel-icon"].default, "hive-01-core");
+  assert.equal(schema["settings-icon"].default, "hive-02-queen-crown");
+  assert.equal(schema["panel-display"].default, "icon-text");
+  assert.equal(Object.keys(schema["panel-icon"].options).length, 25);
+  assert.deepEqual(schema["panel-display"].options, {
+    "Nur Icon": "icon",
+    "Nur Text": "text",
+    "Icon + Text": "icon-text",
+  });
   assert.deepEqual(
     {
       default: schema["refresh-interval-seconds"].default,
@@ -2617,6 +2664,91 @@ test("task 5 settings schema contains exactly four bounded settings", () => {
     },
     { default: 60, min: 15, max: 3600 },
   );
+});
+
+test("panel and settings icons plus display mode are live-configurable", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const settingsItem = applet.menu.items[1];
+
+  assert.equal(applet.panelIcon, "hive-01-core");
+  assert.equal(applet.settingsIcon, "hive-02-queen-crown");
+  assert.equal(applet.panelDisplay, "icon-text");
+  assert.equal(applet.iconVisible, true);
+  assert.match(applet.iconPaths.at(-1), /icons\/hive-01-core\.png$/);
+  assert.match(settingsItem._codexIconPath, /icons\/hive-02-queen-crown\.png$/);
+
+  fixture.setSetting("panel-icon", "starwars-04-destroyer");
+  fixture.setSetting("settings-icon", "hive-19-honeycomb-star");
+  fixture.setSetting("panel-display", "icon");
+  assert.equal(applet.panelIcon, "starwars-04-destroyer");
+  assert.equal(applet.settingsIcon, "hive-19-honeycomb-star");
+  assert.equal(applet.panelDisplay, "icon");
+  assert.equal(applet.labels.at(-1), "");
+  assert.match(applet.iconPaths.at(-1), /icons\/starwars-04-destroyer\.png$/);
+  assert.match(settingsItem._codexIconPath, /icons\/hive-19-honeycomb-star\.png$/);
+
+  fixture.setSetting("panel-display", "text");
+  assert.equal(applet.labels.at(-1), "Flottenmanagement");
+  assert.equal(applet.iconVisible, false);
+
+  fixture.setSetting("panel-display", "icon-text");
+  assert.equal(applet.labels.at(-1), "Flottenmanagement");
+  assert.match(applet.iconPaths.at(-1), /icons\/starwars-04-destroyer\.png$/);
+  assert.equal(applet._settingsValid, true);
+});
+
+test("invalid icon and panel display settings fail closed to safe defaults", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+
+  fixture.setSetting("panel-icon", "../../outside");
+  assert.equal(applet.panelIcon, "hive-01-core");
+  assert.equal(applet._settingsValid, false);
+  assert.match(applet.iconPaths.at(-1), /icons\/hive-01-core\.png$/);
+
+  fixture.setSetting("settings-icon", "not-an-icon");
+  fixture.setSetting("panel-display", "icon-only-with-command");
+  assert.equal(applet.settingsIcon, "hive-02-queen-crown");
+  assert.equal(applet.panelDisplay, "icon-text");
+  assert.equal(applet._settingsValid, false);
+  assert.match(applet._settingsMenuItem._codexIconPath, /icons\/hive-02-queen-crown\.png$/);
+});
+
+test("fleet status terminal uses Ghostty by default and the configured executable", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const terminalStatusItem = applet.menu.items[3];
+
+  assert.equal(getMenuItemText(terminalStatusItem), "Flottenstatus im Terminal");
+  terminalStatusItem.activate();
+  assert.deepEqual(Array.from(fixture.spawned[0]), [
+    "ghostty",
+    "-e",
+    "/bin/bash",
+    "-c",
+    "'/home/tester/.local/bin/codex-master-mcp' status all --agents-limit 30 ; printf '\\n\\nZum Schließen Enter drücken ... '; read -r",
+  ]);
+
+  fixture.setSetting("terminal-command", "gnome-terminal");
+  terminalStatusItem.activate();
+  assert.deepEqual(Array.from(fixture.spawned[1]), [
+    "gnome-terminal",
+    "--",
+    "/bin/bash",
+    "-c",
+    "'/home/tester/.local/bin/codex-master-mcp' status all --agents-limit 30 ; printf '\\n\\nZum Schließen Enter drücken ... '; read -r",
+  ]);
+
+  fixture.setSetting("terminal-command", "konsole");
+  terminalStatusItem.activate();
+  assert.deepEqual(Array.from(fixture.spawned[2]), [
+    "konsole",
+    "-e",
+    "/bin/bash",
+    "-c",
+    "'/home/tester/.local/bin/codex-master-mcp' status all --agents-limit 30 ; printf '\\n\\nZum Schließen Enter drücken ... '; read -r",
+  ]);
 });
 
 test("settings parser canonicalizes bounded concrete ids and never launches attacker text", () => {
@@ -2708,6 +2840,7 @@ test("scalar setting normalization never writes through Cinnamon bindings", () =
     { key: "background-refresh", value: "yes", property: "backgroundRefresh", expected: false, valid: false },
     { key: "refresh-interval-seconds", value: 5, property: "refreshIntervalSeconds", expected: 15, valid: true },
     { key: "refresh-interval-seconds", value: "5", property: "refreshIntervalSeconds", expected: 60, valid: false },
+    { key: "terminal-command", value: "ghostty --bad", property: "terminalCommand", expected: "ghostty", valid: false },
   ];
 
   for (const item of cases) {
