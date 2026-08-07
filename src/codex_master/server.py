@@ -16316,6 +16316,16 @@ def _fleet_publish_recovery_commit(
         raise AgentError("fleet_inventory_publish_failed") from None
     if authoritative.generation != stored.generation:
         raise AgentError("fleet_inventory_publish_failed")
+    if (
+        transaction.journal.operation is RecoveryOperation.REGISTRY_ONLY
+        and authoritative != stored
+    ):
+        transaction.advance(
+            RecoveryPhase.DEGRADED,
+            authoritative_generation=authoritative.generation,
+            blocking_error_codes=("fleet_recovery_incomplete",),
+        )
+        raise AgentError("fleet_registry_commit_diverged")
     if transaction.journal.phase is RecoveryPhase.MATERIALIZING:
         transaction.advance(RecoveryPhase.CAS_PENDING)
     if transaction.journal.phase is RecoveryPhase.CAS_PENDING:
@@ -16356,7 +16366,76 @@ def _fleet_reconcile_commit_exception(
         return "planned", reloaded
     if reloaded == current:
         return "current", reloaded
-    return "diverged", reloaded
+    return "third", reloaded
+
+
+def _fleet_commit_registry_only(
+    service: FleetService,
+    current: FleetSnapshot,
+    planned: FleetSnapshot,
+    *,
+    expected_generation: int,
+) -> FleetSnapshot:
+    transaction = _FleetRecoveryTransaction.begin(
+        RecoveryOperation.REGISTRY_ONLY,
+        current,
+        planned,
+        (),
+    )
+    transaction.advance(RecoveryPhase.MATERIALIZING)
+    transaction.advance(RecoveryPhase.CAS_PENDING)
+    try:
+        stored = service.commit_snapshot(
+            planned,
+            expected_generation=expected_generation,
+        )
+    except Exception as exc:
+        state, authoritative = _fleet_reconcile_commit_exception(
+            service,
+            current,
+            planned,
+        )
+        transaction.advance(
+            RecoveryPhase.RECONCILING,
+            authoritative_generation=authoritative.generation,
+        )
+        reconciled = _fleet_reconcile_divergent_materialization(
+            current,
+            planned,
+            authoritative,
+            transaction=transaction,
+        )
+        if state == "third" or not reconciled:
+            transaction.advance(
+                RecoveryPhase.DEGRADED,
+                authoritative_generation=authoritative.generation,
+                blocking_error_codes=("fleet_recovery_incomplete",),
+            )
+            if state == "third":
+                raise AgentError("fleet_registry_commit_diverged") from None
+            if state == "planned":
+                raise AgentError("fleet_registry_commit_failed_after_cas") from None
+            if isinstance(exc, FleetConflictError):
+                raise AgentError("generation_conflict") from None
+            raise AgentError("fleet_registry_commit_failed") from None
+        _fleet_publish_recovery_commit(service, authoritative, transaction)
+        transaction.advance(
+            RecoveryPhase.COMPLETE,
+            authoritative_generation=authoritative.generation,
+        )
+        _fleet_remove_complete_recovery_journal(transaction.journal)
+        if state == "planned":
+            raise AgentError("fleet_registry_commit_failed_after_cas") from None
+        if isinstance(exc, FleetConflictError):
+            raise AgentError("generation_conflict") from None
+        raise AgentError("fleet_registry_commit_failed") from None
+    _fleet_publish_recovery_commit(service, stored, transaction)
+    transaction.advance(
+        RecoveryPhase.COMPLETE,
+        authoritative_generation=stored.generation,
+    )
+    _fleet_remove_complete_recovery_journal(transaction.journal)
+    return stored
 
 
 def _fleet_recovery_action_error_code(action: RecoveryActionKind) -> str | None:
@@ -17375,7 +17454,7 @@ def _fleet_commit_staged_removal(
                 _fleet_remove_complete_recovery_journal(transaction.journal)
             staged = []
             raise AgentError("fleet_registry_commit_failed_after_cas") from None
-        if state == "diverged":
+        if state == "third":
             if transaction is not None:
                 transaction.advance(
                     RecoveryPhase.RECONCILING,
@@ -17598,7 +17677,7 @@ def _fleet_reconcile_divergent_materialization(
     if persisted is None:
         return False
     entries = tuple(persisted.entries)
-    if not entries:
+    if not entries and persisted.operation is not RecoveryOperation.REGISTRY_ONLY:
         return False
     transaction.journal = persisted
 
@@ -17914,7 +17993,7 @@ def _fleet_apply_managed_update(
                 backups = []
                 staged = []
                 raise AgentError("fleet_registry_commit_failed_after_cas") from None
-            if state == "diverged":
+            if state == "third":
                 if transaction is not None:
                     transaction.advance(
                         RecoveryPhase.RECONCILING,
@@ -18081,20 +18160,12 @@ def fleet_series_apply(
         )
         if registry_only:
             _fleet_validate_materialized_series_homes(planned, candidate)
-            try:
-                stored = service.commit_snapshot(planned, expected_generation=expected_generation)
-            except Exception as exc:
-                state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
-                if state == "planned":
-                    _fleet_publish_stored(service, reloaded)
-                    raise AgentError("fleet_registry_commit_failed_after_cas") from None
-                if state == "diverged":
-                    _fleet_publish_stored(service, reloaded)
-                    raise AgentError("fleet_registry_commit_diverged") from None
-                if isinstance(exc, FleetConflictError):
-                    raise AgentError("generation_conflict") from None
-                raise AgentError("fleet_registry_commit_failed") from None
-            _fleet_publish_stored(service, stored)
+            stored = _fleet_commit_registry_only(
+                service,
+                current,
+                planned,
+                expected_generation=expected_generation,
+            )
             return {
                 "mutation_performed": True,
                 "generation": stored.generation,
@@ -18307,7 +18378,7 @@ def fleet_series_apply(
                             created = []
                             staged = []
                             raise AgentError("fleet_registry_commit_failed_after_cas") from None
-                        if state == "diverged":
+                        if state == "third":
                             if active_tx is not None:
                                 active_tx.advance(
                                     RecoveryPhase.RECONCILING,
@@ -18446,20 +18517,12 @@ def fleet_series_disable(*, prefix: str, expected_generation: int) -> dict[str, 
             raise
         except Exception:
             raise AgentError("fleet_registry_commit_failed") from None
-        try:
-            stored = service.commit_snapshot(planned, expected_generation=expected_generation)
-        except Exception as exc:
-            state, reloaded = _fleet_reconcile_commit_exception(service, current, planned)
-            if state == "planned":
-                _fleet_publish_stored(service, reloaded)
-                raise AgentError("fleet_registry_commit_failed_after_cas") from None
-            if state == "diverged":
-                _fleet_publish_stored(service, reloaded)
-                raise AgentError("fleet_registry_commit_diverged") from None
-            if isinstance(exc, FleetConflictError):
-                raise AgentError("generation_conflict") from None
-            raise AgentError("fleet_registry_commit_failed") from None
-        _fleet_publish_stored(service, stored)
+        stored = _fleet_commit_registry_only(
+            service,
+            current,
+            planned,
+            expected_generation=expected_generation,
+        )
         return {
             "mutation_performed": True,
             "generation": stored.generation,
@@ -18548,7 +18611,7 @@ def fleet_series_delete(
                         stored = reloaded
                         _fleet_publish_recovery_commit(service, reloaded, active_tx)
                         raise AgentError("fleet_registry_commit_failed_after_cas") from None
-                    if state == "diverged":
+                    if state == "third":
                         active_tx.advance(
                             RecoveryPhase.RECONCILING,
                             authoritative_generation=reloaded.generation,
@@ -24964,6 +25027,7 @@ def _fleet_store_recovery_journal(
         raise AgentError("fleet_recovery_state_invalid") from exc
     parent_fd = -1
     tmp_fd = -1
+    expected_tmp_stat: os.stat_result | None = None
     tmp_name = f".{paths.recovery.name}.{uuid.uuid4().hex}.tmp"
     replaced = False
     try:
@@ -24977,6 +25041,7 @@ def _fleet_store_recovery_journal(
         try:
             tmp_fd = os.open(tmp_name, flags, 0o600, dir_fd=parent_fd)
             current = os.fstat(tmp_fd)
+            expected_tmp_stat = current
             if (
                 not stat_module.S_ISREG(current.st_mode)
                 or getattr(current, "st_nlink", 1) != 1
@@ -24988,6 +25053,9 @@ def _fleet_store_recovery_journal(
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
+            current_tmp_stat = os.stat(tmp_name, dir_fd=parent_fd, follow_symlinks=False)
+            if expected_tmp_stat is None or not source_identity_matches(current_tmp_stat, expected_tmp_stat):
+                raise AgentError("fleet_recovery_state_invalid")
             os.replace(tmp_name, paths.recovery.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
             replaced = True
             os.fsync(parent_fd)
@@ -25001,8 +25069,19 @@ def _fleet_store_recovery_journal(
                 os.close(tmp_fd)
         if parent_fd >= 0:
             if not replaced:
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp_name, dir_fd=parent_fd)
+                try:
+                    current_tmp_stat = os.stat(tmp_name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    current_tmp_stat = None
+                except OSError:
+                    current_tmp_stat = None
+                if (
+                    expected_tmp_stat is not None
+                    and current_tmp_stat is not None
+                    and source_identity_matches(current_tmp_stat, expected_tmp_stat)
+                ):
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp_name, dir_fd=parent_fd)
             os.close(parent_fd)
     if _fleet_load_recovery_journal(paths) != journal:
         raise AgentError("fleet_recovery_state_invalid")
@@ -25015,8 +25094,10 @@ def _fleet_remove_complete_recovery_journal(
     if expected.phase is not RecoveryPhase.COMPLETE:
         return False
     paths = paths or FleetPaths.from_state_root(STATE_ROOT)
-    if _fleet_load_recovery_journal(paths) != expected:
+    loaded = _fleet_load_recovery_journal_with_identity(paths)
+    if loaded is None or loaded[0] != expected:
         return False
+    expected_identity = loaded[1]
     parent_fd = -1
     try:
         parent_stat = paths.root.lstat()
@@ -25026,6 +25107,9 @@ def _fleet_remove_complete_recovery_journal(
             error_text="fleet_recovery_state_invalid",
             changed_text="fleet_recovery_state_invalid",
         )
+        current_stat = os.stat(paths.recovery.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not source_identity_matches(current_stat, expected_identity):
+            return False
         os.unlink(paths.recovery.name, dir_fd=parent_fd)
         os.fsync(parent_fd)
         return True
