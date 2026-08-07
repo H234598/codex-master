@@ -27,7 +27,7 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
             state_patch, lock_patch, registry_patch = self._paths(root)
             with state_patch, lock_patch, registry_patch, patch.dict(
                 os.environ, {"HOME": str(home)}, clear=False
-            ):
+            ), patch.object(server, "managed_home_in_process_ancestry", return_value=False):
                 os.environ.pop("CODEX_HOME", None)
                 enrolled = server.enroll_current_teamleader()
                 status = server.master_tool_access_status()
@@ -133,7 +133,7 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
             state_patch, lock_patch, registry_patch = self._paths(root)
             with state_patch, lock_patch, registry_patch, patch.dict(
                 os.environ, {"HOME": str(home)}, clear=False
-            ):
+            ), patch.object(server, "managed_home_in_process_ancestry", return_value=False):
                 os.environ.pop("CODEX_HOME", None)
                 server.ensure_private_dir(server.STATE_ROOT)
                 registry = server.TEAMLEADER_REGISTRY_FILE

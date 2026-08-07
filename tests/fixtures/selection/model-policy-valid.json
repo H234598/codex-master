@@ -1,0 +1,1 @@
+{"schema_version":1,"models":[{"model_id":"gpt-primary","aliases":["primary"],"role":"primary","provider":"synthetic","capabilities":["tools"],"budget_key":"standard"},{"model_id":"gpt-spark","aliases":["spark"],"role":"secondary_simple","provider":"synthetic","capabilities":["tools"],"budget_key":"spark"}]}

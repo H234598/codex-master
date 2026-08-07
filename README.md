@@ -148,10 +148,72 @@ Agentinnen leased by the current server; the systemd supervisor uses
 `--manage-unclaimed --quiet` to handle unclaimed or expired leases while still
 skipping active leases held by other clients and avoiding successful JSON noise
 in the user journal.
+Each fleet watchdog run creates one immutable in-memory fleet snapshot for the
+managed process homes and tmux sessions. Agent evaluation reuses that snapshot;
+standalone `agent_status` calls retain the legacy live-query fallback. Lease
+release paths revalidate the live session/process identity immediately before
+the release. An unavailable tmux observation is reported as unknown and skips
+watchdog actions; it is never interpreted as a stopped session.
 `usage-watchdog` consumes `codex-usage` snapshot state, writes a local
-codex-usage block marker, and stops running Agentinnen whose accounts are still
-blocked until their next reset. `agent_start`, claim, send, and report-request
-flows refuse to use a blocked Agentin until the codex-usage watchdog releases it again.
+codex-usage block marker, and stops running Agentinnen whose accounts have a
+future verified reset. A verified reset already in the past clears the block;
+an unknown reset remains fail-closed. `agent_start`, claim, send, and
+report-request flows refuse to use a blocked Agentin until the watchdog
+releases it again.
+
+## Fleet accounts, series, and Gemini headless jobs
+
+The Fleet registry is the source of truth for provider-backed series. Use the
+read-only account/series views first, then set credentials locally through the
+control center or stdin-only CLI flow:
+
+```sh
+python3 -m codex_master.server fleet account list
+python3 -m codex_master.server fleet series list
+python3 -m codex_master.server fleet provider-models --provider ollama_local
+python3 -m codex_master.server fleet account set-secret \
+  --account-id gemini-project-1 --expected-generation 1 --secret-stdin < token.txt
+```
+
+Secrets may be entered transiently in the control center or stdin flow, but
+are never displayed, persisted in UI state, or returned by UI or normal MCP
+output. They are stored only in private sidecars and are never part of the
+registry, assignments, or shell history. Account gates require a
+configured secret, a fresh successful capability probe, and a non-limited
+account before a bound series can dispatch. A structured provider limit marks
+the whole account domain; only series bound to different accounts remain
+eligible.
+
+`fleet_gemini_bootstrap_plan` is a dry plan for the three isolated
+`gemini-project-1` through `gemini-project-3` accounts and the `d`, `e`, and `f`
+series. It does not create accounts, read credentials, or guess a model; each
+model must come from a successful provider probe. The optional installer uses
+only the official stable package channel:
+
+```sh
+NPM_CONFIG_PREFIX="$HOME/.local" ./scripts/install-gemini-cli
+"$HOME/.local/bin/gemini" --version
+```
+
+The installer refuses an unwritable system NPM prefix instead of escalating
+privileges; set an explicit user-owned `NPM_CONFIG_PREFIX` as above.
+
+Gemini jobs use an agent-private `HOME`/`GEMINI_CLI_HOME`, stdin-only task
+input, bounded `stream-json` stdout/stderr, process-group cancellation, and
+role-specific approval (`plan` for Exploriererinnen, `auto_edit` for
+Arbeitsbienen). They do not use `yolo`, `-p -`, or Codex TUI markers. The
+assignment response is bounded and parsed. Prompts, credentials, tool events,
+and raw output stay out of persistent metadata; process output remains bounded.
+Productive headless assignments accept up to 7200 seconds (120 minutes) per
+call; the default remains 600 seconds.
+
+The GTK-free `fleet_control` view model and `control_center` controller enforce
+the same bounds and generation checks as the server; the optional GTK3 page is
+loaded lazily so headless imports remain display-free. The Cinnamon adapter uses
+snapshot schema v3, at most 26 series and 25 visible rows per series page;
+limited rows are status-only. Real provider credentials, account probes,
+300-agent materialization, and desktop-session acceptance remain explicit
+local gates.
 
 ## Tools
 
@@ -200,6 +262,70 @@ flows refuse to use a blocked Agentin until the codex-usage watchdog releases it
   `a,b` or `a,b,c`
 - `agent_selector_preview`: preview numeric selector mapping without mutating
   state
+- `agent_selection_preview`: preview real fleet candidates through the
+  read-only Selection-/Admission-Kern; Shadow plans but never executes.
+  Enforced remains closed until authoritative Hive callbacks and an
+  operation-specific executor are supplied; `ServerAdmissionRuntime` provides
+  the fail-closed boundary but does not execute operations
+
+The local `codex_master.admission` module now supplies that reservation
+boundary as an in-process, fail-closed contract: immutable records bind work
+version, grant/scope digests, lease expectation, and the selected resource;
+state changes use a revision CAS, reservation TTLs are bounded to 30–120
+seconds, and `public()` removes account keys, scope paths, and other private
+bindings. Scope overlap, agent/account/account-model capacities, and
+read/read versus write overlap are checked atomically. `FileAdmissionStore`
+adds a private lock plus atomic state replacement for fresh-process recovery;
+malformed, oversized, or symlinked state fails closed. It performs no
+provider, lifecycle, lease, or network mutation and is not yet wired into
+Enforced execution.
+
+`codex_master.selection_service.SelectionService` is the next local
+orchestration layer. It delegates preview to the same deterministic planner,
+revalidates before an injected runtime call, retries at most three times with
+50/100/200 ms backoff, compensates failed attempts, and reconciles crash
+evidence without re-executing. `codex_master.admission_runtime.ServerAdmissionRuntime`
+now provides the fail-closed server boundary: authority, repository, and
+canonical scope callbacks must come from authoritative Hive records; existing
+Fleet account, model, Usage, lease, process-identity, auth, and runner-config
+checks are attached in a fixed order. Missing Hive bindings, stale admissions,
+malformed gate evidence, or callback errors deny the runtime, and successful
+revalidation is single-use per admission revision. The adapter itself never
+claims, starts, assigns, or calls a provider. Its private cross-process store
+is rooted at the state-local `admission-state.json`/lock pair when an auto
+execution path explicitly requests `current_admission_store()`; productive
+Enforced execution remains closed until the authoritative Hive callbacks and
+an operation-specific executor are supplied.
+
+Applet status exposes bounded `fleet_snapshot_degraded` and
+`watchdog_snapshot_degraded` flags when its read-only sources are unavailable.
+An exhausted Usage-v2 window whose verified reset is already past no longer
+blocks the account; future or unknown resets remain fail-closed.
+
+### Hive control plane
+
+The `codex_master.hive` package now contains the bounded control-plane
+foundations: strict public configuration, private state, principals and
+execution bindings, repository/authority checks, typed messages and dispatch
+state machines, append-only decisions, provenance-aware memory, a DP work
+queue, and a single admission boundary. The `codex_master.selection` package
+is a compatibility boundary around the existing deterministic planner and
+adds typed model-policy, task-classification, source, fairness-state, and
+passive-anchor contracts without introducing a second selector.
+
+Hive status, validation, migration, and Selection diagnostics are exposed as
+read-only MCP tools. Missing authoritative Work-/Grant-/Repository-/Scope-
+and Lease evidence remains fail-closed; no Hive diagnostic tool claims,
+starts, assigns, or invokes a provider.
+
+Operational details are documented in [`docs/account-aware-selection.md`](docs/account-aware-selection.md),
+[`docs/operations/hive-operations.md`](docs/operations/hive-operations.md),
+[`docs/operations/selection-operations.md`](docs/operations/selection-operations.md),
+[`docs/security/hive-security.md`](docs/security/hive-security.md),
+[`docs/security/selection-privacy.md`](docs/security/selection-privacy.md), and
+[`docs/migration/hive-selection-migration.md`](docs/migration/hive-selection-migration.md).
+Public, secret-free configuration examples live in
+[`examples/`](examples/): agent classes, Hive mode, and model policy.
 - `worktree_create_for_agent`: create an isolated git worktree for one Agentin
 - `worktree_status`: capped git status and worktree metadata
 - `integration_status`: repo status, diff stat, and recent assignment metadata
@@ -214,8 +340,8 @@ flows refuse to use a blocked Agentin until the codex-usage watchdog releases it
 - `master_watchdog_status`: diagnose systemd Fleetwatchdog health, installed
   unit hardening, and aggregate security-score status
 - `master_timeout_policy`: report effective timeout and polling policy for MCP
-  startup, Agentin claim retry, Agentin wait, watchdog supervision, and
-  hidden CLI lease identity source
+  startup, Agentin claim retry, Agentin wait, productive headless assignments,
+  watchdog supervision, and hidden CLI lease identity source
 - `master_applet_status`: bounded read-only snapshot for 1–6 concrete Agentinnen;
   used by the Cinnamon applet and available as `applet-status` in the CLI
 - `agent_pool_validate`: validate a machine-readable Agentinnen pool spec
@@ -225,6 +351,12 @@ flows refuse to use a blocked Agentin until the codex-usage watchdog releases it
   installed Agentinnen, dry-run by default
 - `agent_pool_destroy_pool`: guarded removal of installed Agentinnen homes
 - `agent_doctor`: structured diagnostics without raw output
+- `fleet_account_list`, `fleet_gemini_bootstrap_plan`, `fleet_series_list`,
+  `fleet_account_upsert`, `fleet_account_set_secret`, `fleet_account_disable`,
+  `fleet_account_probe`, `fleet_account_delete`, `fleet_provider_models`,
+  `fleet_series_plan`, `fleet_series_apply`, `fleet_series_disable`, and
+  `fleet_series_delete`: bounded Fleet account/provider/series management;
+  secret input is stdin-only and mutations use generation CAS
 
 `/mcp` should show `codex-master-mcp` only in the Teamleiterin/main Codex
 instance. Managed Agentinnen intentionally do not receive Masterjet MCP tools;
@@ -314,12 +446,16 @@ cd /home/teladi/codex-master
 python3 -m codex_master.server install          # create ~/.local/bin/codex-master-mcp + codex mcp add
 python3 -m codex_master.server doctor          # smoke check (codex, tmux, state path, JSON result)
 python3 -m codex_master.server uninstall       # remove mcp registration and local symlink
+python3 scripts/codex-master-cinnamon-applet install --dry-run
+python3 scripts/codex-master-cinnamon-applet install --no-reload
+python3 scripts/codex-master-cinnamon-applet verify
 
 python3 -m codex_master.server start both --cwd /home/teladi/codex-master
 python3 -m codex_master.server status
 python3 -m codex_master.server selector-policy
 python3 -m codex_master.server selector-policy --series a,b,c
 python3 -m codex_master.server selector-preview --limit 6
+python3 -m codex_master.server selection-preview --series d --task-kind simple --admission-mode shadow --sp1a --limit 8
 python3 -m codex_master.server lease-status all --agents-limit 30
 python3 -m codex_master.server claim b --forever --poll-interval-seconds 30
 python3 -m codex_master.server claim b --no-wait
@@ -345,6 +481,8 @@ python3 -m codex_master.server namespace-status
 python3 -m codex_master.server release-status
 python3 -m codex_master.server watchdog-status
 python3 -m codex_master.server timeout-policy
+python3 -m codex_master.server fleet-recovery-status
+python3 -m codex_master.server fleet-recovery-retry
 python3 -m codex_master.server pool validate --spec codex-agent-pool.json
 python3 -m codex_master.server pool install --spec codex-agent-pool.json --target-dir "$HOME/.codex-agents" --codex-bin /usr/local/bin/codex
 python3 -m codex_master.server pool status --spec codex-agent-pool.json
@@ -402,6 +540,13 @@ Agentinnen.
 
 See `docs/agent-pool.md` for the full command set and `docs/auth-copy.md` for
 the auth-copy safety model.
+
+The Cinnamon installer copies the applet into the per-user Xlet directory with
+an atomic swap, one validated rollback tree, a private operation lock, and
+bounded source/target verification. `install --dry-run` performs no filesystem
+or D-Bus mutation; `--no-reload` is useful for CI and temporary-home smoke
+tests. `verify` additionally checks the running Cinnamon Xlet when a desktop
+session is available.
 
 ## Cinnamon Applet: Flottenmanagement
 
@@ -591,10 +736,14 @@ failed. Verify the installed files and CLI first; do not interpret ordinary
   `NoNewPrivileges`, `MemoryDenyWriteExecute`, native syscall architecture,
   and `UMask=0077`; it intentionally keeps normal user home read access because
   the watchdog needs Codex config, tmux IPC, and managed state files
-- `codex-usage` stores its snapshots under `~/.local/share/codex-usage/snapshots`
-  by default; `usage_watchdog` reads those snapshots, writes the local
-  codex-usage block marker, and refuses new `agent_start`/claim flows until the
-  next reset window
+- `codex-usage` stores its current snapshots under
+  `~/.local/share/codex-usage/current/<account>.json` by default; the reader
+  accepts the older `snapshots/` layout only when the current file is absent
+  and fails closed when an existing current file is malformed. `usage_watchdog`
+  normalizes current 5-hour/weekly windows into secret-free Usage-v2 data,
+  writes the local codex-usage block marker, and refuses new
+  `agent_start`/claim flows while a future reset window remains active; past
+  verified resets clear the block and unknown resets remain fail-closed
 
 `watchdog-status`
 - reports whether the systemd timer is active and whether the last service run
@@ -613,6 +762,8 @@ failed. Verify the installed files and CLI first; do not interpret ordinary
   stopped Agentinnen, no managed-home process, and sufficient idle evidence
 - keeps `agent_wait` separate as a bounded activity wait: default 120 seconds,
   maximum 600 seconds
+- reports productive headless assignments with a default of 600 seconds and a
+  maximum of 7200 seconds (120 minutes)
 - reports the `send`/`assign-*`/`report-request` TUI input-readiness gate:
   default 15 seconds, 0.5 second polling, visible input prompt required,
   fail-closed without paste via retryable `agent_input_not_ready`

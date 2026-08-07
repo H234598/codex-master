@@ -17,6 +17,7 @@ MAX_ACCOUNTS = 64
 MAX_SERIES = 26
 MAX_AGENTS = 1000
 MAX_SERIES_COUNT = 100
+MAX_GENERATION = 2**63 - 1
 _ACCOUNT_ID_RE = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 _LIMIT_REASON_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _RFC3339_RE = re.compile(
@@ -97,6 +98,10 @@ class FleetSnapshot:
     accounts: tuple[FleetAccount, ...]
     series: tuple[FleetSeries, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "accounts", tuple(self.accounts))
+        object.__setattr__(self, "series", tuple(self.series))
+
 
 @dataclass(frozen=True, slots=True)
 class AgentDescriptor:
@@ -111,6 +116,7 @@ class AgentDescriptor:
     home: Path
     session: str
     enabled: bool
+    runner_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +126,13 @@ class InventorySnapshot:
     by_series: Mapping[str, tuple[str, ...]]
     positions: Mapping[str, int]
     series_prefixes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "agent_ids", tuple(self.agent_ids))
+        object.__setattr__(self, "agents", MappingProxyType(dict(self.agents)))
+        object.__setattr__(self, "by_series", MappingProxyType({key: tuple(value) for key, value in self.by_series.items()}))
+        object.__setattr__(self, "positions", MappingProxyType(dict(self.positions)))
+        object.__setattr__(self, "series_prefixes", tuple(self.series_prefixes))
 
 
 _PROVIDER_RULES = {
@@ -265,7 +278,11 @@ def normalize_fleet_document(raw: object) -> FleetSnapshot:
     if set(document) != _ROOT_FIELDS or document.get("schema_version") != 1:
         _fail("invalid_document")
     generation = document.get("generation")
-    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+    if (
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or not 0 <= generation <= MAX_GENERATION
+    ):
         _fail("invalid_document")
     accounts_raw = document.get("accounts")
     series_raw = document.get("series")
@@ -331,10 +348,11 @@ def build_inventory(snapshot: FleetSnapshot, pool_root: Path) -> InventorySnapsh
             ids.append(agent_id)
             agent_ids.append(agent_id)
             positions[agent_id] = len(agent_ids) - 1
+            executable = "gemini" if item.runner is RunnerKind.GEMINI_CLI else "codex"
             agents[agent_id] = AgentDescriptor(
                 agent_id, item.prefix, ordinal, f"{item.display_name} {ordinal}", item.runner,
                 item.provider, item.model, item.account_id, root / agent_id,
-                f"codex_agent_{agent_id}_mcp", enabled,
+                f"codex_agent_{agent_id}_mcp", enabled, root / agent_id / executable,
             )
         by_series[f"{item.prefix}-series"] = tuple(ids)
     return InventorySnapshot(tuple(agent_ids), MappingProxyType(agents), MappingProxyType(by_series),
@@ -361,12 +379,15 @@ def public_fleet_snapshot(snapshot: FleetSnapshot) -> dict[str, object]:
 
 
 def _generation(snapshot: FleetSnapshot, expected_generation: int) -> None:
-    if not isinstance(expected_generation, int) or isinstance(expected_generation, bool) or snapshot.generation != expected_generation:
+    if (not isinstance(expected_generation, int) or isinstance(expected_generation, bool)
+            or snapshot.generation != expected_generation):
         _fail("generation_conflict")
 
 
 def _next(snapshot: FleetSnapshot, *, accounts: Iterable[FleetAccount] | None = None,
           series: Iterable[FleetSeries] | None = None) -> FleetSnapshot:
+    if snapshot.generation >= MAX_GENERATION:
+        _fail("invalid_document")
     candidate = FleetSnapshot(snapshot.schema_version, snapshot.generation + 1,
                               tuple(snapshot.accounts if accounts is None else accounts),
                               tuple(snapshot.series if series is None else series))
@@ -381,16 +402,19 @@ def plan_account_upsert(snapshot: FleetSnapshot, account: FleetAccount, *, expec
 
 def plan_account_disable(snapshot: FleetSnapshot, account_id: str, *, expected_generation: int) -> FleetSnapshot:
     _generation(snapshot, expected_generation)
+    if not any(item.account_id == account_id for item in snapshot.accounts):
+        _fail("invalid_account")
     accounts = [replace(item, enabled=False) if item.account_id == account_id else item for item in snapshot.accounts]
-    if accounts == list(snapshot.accounts): _fail("invalid_account")
     return _next(snapshot, accounts=accounts)
 
 
 def plan_account_delete(snapshot: FleetSnapshot, account_id: str, *, expected_generation: int) -> FleetSnapshot:
     _generation(snapshot, expected_generation)
-    if any(item.account_id == account_id for item in snapshot.series): _fail("account_in_use")
+    if any(item.account_id == account_id for item in snapshot.series):
+        _fail("account_in_use")
     accounts = [item for item in snapshot.accounts if item.account_id != account_id]
-    if accounts == list(snapshot.accounts): _fail("invalid_account")
+    if accounts == list(snapshot.accounts):
+        _fail("invalid_account")
     return _next(snapshot, accounts=accounts)
 
 
@@ -401,7 +425,8 @@ def plan_series_apply(snapshot: FleetSnapshot, series: FleetSeries, *, expected_
     confirmed = tuple(confirmed_remove_ids)
     if existing is not None and series.count < existing.count:
         expected = frozenset(f"{series.prefix}{number}" for number in range(series.count + 1, existing.count + 1))
-        if len(confirmed) != len(expected) or frozenset(confirmed) != expected: _fail("remove_confirmation_required")
+        if len(confirmed) != len(expected) or frozenset(confirmed) != expected:
+            _fail("remove_confirmation_required")
     elif confirmed:
         _fail("remove_confirmation_required")
     items = [item for item in snapshot.series if item.prefix != series.prefix] + [series]
@@ -410,16 +435,19 @@ def plan_series_apply(snapshot: FleetSnapshot, series: FleetSeries, *, expected_
 
 def plan_series_disable(snapshot: FleetSnapshot, prefix: str, *, expected_generation: int) -> FleetSnapshot:
     _generation(snapshot, expected_generation)
+    if not any(item.prefix == prefix for item in snapshot.series):
+        _fail("invalid_series")
     series = [replace(item, enabled=False) if item.prefix == prefix else item for item in snapshot.series]
-    if series == list(snapshot.series): _fail("invalid_series")
     return _next(snapshot, series=series)
 
 
 def plan_series_delete(snapshot: FleetSnapshot, prefix: str, *, expected_generation: int) -> FleetSnapshot:
     _generation(snapshot, expected_generation)
     existing = next((item for item in snapshot.series if item.prefix == prefix), None)
-    if existing is None: _fail("invalid_series")
-    if existing.enabled: _fail("series_must_be_disabled")
+    if existing is None:
+        _fail("invalid_series")
+    if existing.enabled:
+        _fail("series_must_be_disabled")
     return _next(snapshot, series=[item for item in snapshot.series if item.prefix != prefix])
 
 
@@ -428,5 +456,6 @@ def mark_account_limit(snapshot: FleetSnapshot, account_id: str, *, reset_at_utc
     _generation(snapshot, expected_generation)
     accounts = [replace(item, limit_state=LimitState.LIMITED, reset_at_utc=reset_at_utc, limit_reason=reason)
                 if item.account_id == account_id else item for item in snapshot.accounts]
-    if accounts == list(snapshot.accounts): _fail("invalid_account")
+    if accounts == list(snapshot.accounts):
+        _fail("invalid_account")
     return _next(snapshot, accounts=accounts)

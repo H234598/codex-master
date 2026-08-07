@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "models": [
+    {"model_id":"gpt-primary","aliases":["primary"],"role":"primary","provider":"openai","capabilities":["tools","complex_task_eligible"],"budget_key":"standard"},
+    {"model_id":"gpt-spark","aliases":["spark"],"role":"secondary_simple","provider":"openai","capabilities":["tools","simple_task_eligible"],"budget_key":"spark"}
+  ]
+}

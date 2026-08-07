@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -13,8 +15,8 @@ MAX_FIELDS_PER_TOOL = 64
 MAX_ENUM_ITEMS = 64
 MAX_DESCRIPTOR_NAME_CHARS = 128
 MAX_DESCRIPTOR_TEXT_CHARS = 2_000
-MAX_SUPPORTED_STRING_CHARS = 12_000
-MAX_SUPPORTED_ARRAY_ITEMS = 50
+MAX_SUPPORTED_STRING_CHARS = 16_384
+MAX_SUPPORTED_ARRAY_ITEMS = 1_000
 
 
 class CatalogError(ValueError):
@@ -36,6 +38,7 @@ class Risk(str, Enum):
 class FieldKind(str, Enum):
     STRING = "string"
     INTEGER = "integer"
+    NUMBER = "number"
     BOOLEAN = "boolean"
     STRING_ARRAY = "string_array"
 
@@ -47,10 +50,10 @@ class FieldDescriptor:
     required: bool
     description: str = ""
     has_default: bool = False
-    default: str | int | bool | tuple[str, ...] | None = None
+    default: str | int | float | bool | tuple[str, ...] | None = None
     enum: tuple[str | int, ...] = ()
-    minimum: int | None = None
-    maximum: int | None = None
+    minimum: int | float | None = None
+    maximum: int | float | None = None
     max_length: int | None = None
     min_items: int | None = None
     max_items: int | None = None
@@ -94,6 +97,23 @@ _READ_ONLY_TOOLS = {
     "agent_pool_validate",
     "agent_pool_status",
     "agent_doctor",
+    "fleet_account_list",
+    "fleet_gemini_bootstrap_plan",
+    "fleet_series_list",
+    "fleet_provider_models",
+    "fleet_series_plan",
+    "hive_status",
+    "godbee_status",
+    "queen_list",
+    "queen_status",
+    "hive_dispatch_status",
+    "hive_queue_status",
+    "hive_decisions",
+    "hive_authority_check",
+    "hive_plan_dispatch",
+    "hive_admission_status",
+    "agent_selection_preview",
+    "agent_selection_status",
 }
 _MUTATING_TOOLS = {
     "agent_claim",
@@ -108,6 +128,14 @@ _MUTATING_TOOLS = {
     "agent_selector_policy",
     "worktree_create_for_agent",
     "commit_ready_check",
+    "fleet_account_upsert",
+    "fleet_account_set_secret",
+    "fleet_account_disable",
+    "fleet_account_probe",
+    "fleet_account_delete",
+    "fleet_series_apply",
+    "fleet_series_disable",
+    "fleet_series_delete",
 }
 _BROAD_TOOLS = {
     "agent_start",
@@ -225,7 +253,7 @@ def _normalize_value(
     value: Any,
     *,
     error_type: type[CatalogError] = CatalogError,
-) -> str | int | bool | tuple[str, ...]:
+) -> str | int | float | bool | tuple[str, ...]:
     label = field.name
     if field.kind is FieldKind.STRING:
         if not isinstance(value, str):
@@ -240,6 +268,14 @@ def _normalize_value(
             raise error_type(f"{label} must be an integer")
         if field.enum and value not in field.enum:
             raise error_type(f"{label} must be one of the supported values")
+        if field.minimum is not None and value < field.minimum:
+            raise error_type(f"{label} must be >= {field.minimum}")
+        if field.maximum is not None and value > field.maximum:
+            raise error_type(f"{label} must be <= {field.maximum}")
+        return value
+    if field.kind is FieldKind.NUMBER:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise error_type(f"{label} must be a number")
         if field.minimum is not None and value < field.minimum:
             raise error_type(f"{label} must be >= {field.minimum}")
         if field.maximum is not None and value > field.maximum:
@@ -327,6 +363,27 @@ def _compile_field(name: str, raw_schema: Any, required: bool) -> FieldDescripto
             required=required,
             description=description,
             enum=_enum_values(schema, label, int),
+            minimum=minimum,
+            maximum=maximum,
+        )
+    elif value_type == "number":
+        _reject_unknown_keywords(schema, frozenset({"type", "description", "default", "minimum", "maximum"}), label)
+        minimum = schema.get("minimum")
+        maximum = schema.get("maximum")
+        for bound_name, bound in (("minimum", minimum), ("maximum", maximum)):
+            if bound is not None and (
+                isinstance(bound, bool)
+                or not isinstance(bound, (int, float))
+                or not math.isfinite(bound)
+            ):
+                raise SchemaError(f"{label} {bound_name} must be a finite number")
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise SchemaError(f"{label} minimum must not exceed maximum")
+        field = FieldDescriptor(
+            name=name,
+            kind=FieldKind.NUMBER,
+            required=required,
+            description=description,
             minimum=minimum,
             maximum=maximum,
         )

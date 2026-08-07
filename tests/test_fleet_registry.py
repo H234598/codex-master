@@ -8,24 +8,56 @@ from pathlib import Path
 import pytest
 
 from codex_master.fleet_registry import (
-    AuthKind, FleetAccount, FleetSeries, FleetValidationError, LimitState,
-    Provider, RunnerKind, SecretState, build_inventory, fleet_document,
-    mark_account_limit, normalize_fleet_document, plan_account_delete,
-    plan_account_disable, plan_account_upsert, plan_series_apply,
-    plan_series_delete, plan_series_disable, public_fleet_snapshot,
+    AuthKind,
+    FleetAccount,
+    FleetSeries,
+    FleetValidationError,
+    LimitState,
+    Provider,
+    RunnerKind,
+    SecretState,
+    build_inventory,
+    fleet_document,
+    mark_account_limit,
+    normalize_fleet_document,
+    plan_account_delete,
+    plan_account_disable,
+    plan_account_upsert,
+    plan_series_apply,
+    plan_series_delete,
+    plan_series_disable,
+    public_fleet_snapshot,
 )
 
 
 def gemini_document() -> dict[str, object]:
     return {
-        "schema_version": 1, "generation": 4,
-        "accounts": [{"account_id": f"gemini-project-{n}", "label": f"Gemini {n}",
-                      "provider": "gemini_api", "auth_kind": "api_key", "enabled": True,
-                      "limit_state": "ready"} for n in range(1, 4)],
-        "series": [{"prefix": prefix, "display_name": f"Gemini {prefix.upper()}", "count": 100,
-                    "runner": "gemini_cli", "provider": "gemini_api",
-                    "model": "gemini-3-flash-preview", "account_id": f"gemini-project-{n}",
-                    "enabled": True} for n, prefix in enumerate(("d", "e", "f"), 1)],
+        "schema_version": 1,
+        "generation": 4,
+        "accounts": [
+            {
+                "account_id": f"gemini-project-{n}",
+                "label": f"Gemini {n}",
+                "provider": "gemini_api",
+                "auth_kind": "api_key",
+                "enabled": True,
+                "limit_state": "ready",
+            }
+            for n in range(1, 4)
+        ],
+        "series": [
+            {
+                "prefix": prefix,
+                "display_name": f"Gemini {prefix.upper()}",
+                "count": 100,
+                "runner": "gemini_cli",
+                "provider": "gemini_api",
+                "model": "gemini-3-flash-preview",
+                "account_id": f"gemini-project-{n}",
+                "enabled": True,
+            }
+            for n, prefix in enumerate(("d", "e", "f"), 1)
+        ],
     }
 
 
@@ -46,14 +78,26 @@ def test_normalizes_three_independent_gemini_series() -> None:
 def test_normalization_sorts_entries_and_applies_safe_defaults() -> None:
     document = valid_document()
     document["accounts"] = [
-        {"account_id": "zeta", "label": "Zeta", "provider": "gemini_api",
-         "auth_kind": "api_key", "enabled": True},
+        {
+            "account_id": "zeta",
+            "label": "Zeta",
+            "provider": "gemini_api",
+            "auth_kind": "api_key",
+            "enabled": True,
+        },
         document["accounts"][0],
     ]
     document["series"] = [
-        {"prefix": "z", "display_name": "Z series", "count": 1, "runner": "gemini_cli",
-         "provider": "gemini_api", "model": "gemini-3-flash-preview", "account_id": "zeta",
-         "enabled": True},
+        {
+            "prefix": "z",
+            "display_name": "Z series",
+            "count": 1,
+            "runner": "gemini_cli",
+            "provider": "gemini_api",
+            "model": "gemini-3-flash-preview",
+            "account_id": "zeta",
+            "enabled": True,
+        },
         document["series"][0],
     ]
     snapshot = normalize_fleet_document(document)
@@ -93,18 +137,21 @@ def test_normalization_rejects_c1_controls_and_unpaired_surrogates(
     assert caught.value.code == code
 
 
-@pytest.mark.parametrize(("change", "code"), [
-    (lambda document: document["series"].append(deepcopy(document["series"][0])), "invalid_series"),
-    (lambda document: document["series"][0].update(prefix="aa"), "invalid_series"),
-    (lambda document: document["series"][0].update(count=0), "invalid_series"),
-    (lambda document: document["series"][0].update(count=101), "invalid_series"),
-    (lambda document: document["series"][0].update(runner="codex_cli"), "invalid_series"),
-    (lambda document: document["series"][0].update(account_id=None), "invalid_series"),
-    (lambda document: document["accounts"][0].update(provider="openai_api"), "invalid_series"),
-    (lambda document: document["accounts"][0].update(label="bad\nlabel"), "invalid_account"),
-    (lambda document: document["series"][0].update(model="x" * 201), "invalid_series"),
-    (lambda document: document["accounts"][0].update(reset_at_utc="2026-08-03T12:00:00"), "invalid_account"),
-])
+@pytest.mark.parametrize(
+    ("change", "code"),
+    [
+        (lambda document: document["series"].append(deepcopy(document["series"][0])), "invalid_series"),
+        (lambda document: document["series"][0].update(prefix="aa"), "invalid_series"),
+        (lambda document: document["series"][0].update(count=0), "invalid_series"),
+        (lambda document: document["series"][0].update(count=101), "invalid_series"),
+        (lambda document: document["series"][0].update(runner="codex_cli"), "invalid_series"),
+        (lambda document: document["series"][0].update(account_id=None), "invalid_series"),
+        (lambda document: document["accounts"][0].update(provider="openai_api"), "invalid_series"),
+        (lambda document: document["accounts"][0].update(label="bad\nlabel"), "invalid_account"),
+        (lambda document: document["series"][0].update(model="x" * 201), "invalid_series"),
+        (lambda document: document["accounts"][0].update(reset_at_utc="2026-08-03T12:00:00"), "invalid_account"),
+    ],
+)
 def test_normalization_rejects_invalid_contract_values(change: object, code: str) -> None:
     document = valid_document()
     change(document)  # type: ignore[operator]
@@ -128,9 +175,16 @@ def test_normalization_rejects_duplicate_accounts_and_total_agent_limit() -> Non
     duplicate["accounts"].append(deepcopy(duplicate["accounts"][0]))
     excess = gemini_document()
     excess["series"] = [
-        {"prefix": chr(ord("a") + i), "display_name": f"Series {i}",
-         "count": 100 if i < 10 else 1, "runner": "gemini_cli", "provider": "gemini_api",
-         "model": "gemini-3-flash-preview", "account_id": "gemini-project-1", "enabled": True}
+        {
+            "prefix": chr(ord("a") + i),
+            "display_name": f"Series {i}",
+            "count": 100 if i < 10 else 1,
+            "runner": "gemini_cli",
+            "provider": "gemini_api",
+            "model": "gemini-3-flash-preview",
+            "account_id": "gemini-project-1",
+            "enabled": True,
+        }
         for i in range(11)
     ]
     for document, code in ((duplicate, "invalid_account"), (excess, "invalid_document")):
@@ -142,9 +196,16 @@ def test_normalization_rejects_duplicate_accounts_and_total_agent_limit() -> Non
 def test_normalization_rejects_more_than_twenty_six_series() -> None:
     document = valid_document()
     document["series"] = [
-        {"prefix": chr(ord("a") + (index % 26)), "display_name": f"Series {index}", "count": 1,
-         "runner": "gemini_cli", "provider": "gemini_api", "model": "gemini-3-flash-preview",
-         "account_id": "gemini-project-1", "enabled": True}
+        {
+            "prefix": chr(ord("a") + (index % 26)),
+            "display_name": f"Series {index}",
+            "count": 1,
+            "runner": "gemini_cli",
+            "provider": "gemini_api",
+            "model": "gemini-3-flash-preview",
+            "account_id": "gemini-project-1",
+            "enabled": True,
+        }
         for index in range(27)
     ]
 
@@ -173,6 +234,17 @@ def test_fleet_document_round_trips_immutable_snapshot() -> None:
         snapshot.generation = 5  # type: ignore[misc]
 
 
+def test_snapshot_constructor_freezes_nested_collections() -> None:
+    snapshot = normalize_fleet_document(valid_document())
+    accounts = list(snapshot.accounts)
+    series = list(snapshot.series)
+    direct = type(snapshot)(snapshot.schema_version, snapshot.generation, accounts, series)
+    assert isinstance(direct.accounts, tuple)
+    assert isinstance(direct.series, tuple)
+    with pytest.raises(AttributeError):
+        direct.accounts.append(snapshot.accounts[0])  # type: ignore[attr-defined]
+
+
 def test_inventory_derives_exact_agent_ids(tmp_path: Path) -> None:
     inventory = build_inventory(normalize_fleet_document(gemini_document()), tmp_path / "agents")
     assert inventory.agent_ids[0] == "d1"
@@ -195,17 +267,33 @@ def test_inventory_keeps_disabled_entries_manageable(tmp_path: Path) -> None:
     assert build_inventory(normalize_fleet_document(document), tmp_path).agents["d1"].enabled is False
 
 
+def test_inventory_constructor_freezes_nested_maps() -> None:
+    snapshot = normalize_fleet_document(valid_document())
+    inventory = build_inventory(snapshot, Path("/tmp/agents"))
+    direct = type(inventory)(list(inventory.agent_ids), dict(inventory.agents),
+                             {key: list(value) for key, value in inventory.by_series.items()},
+                             dict(inventory.positions), list(inventory.series_prefixes))
+    with pytest.raises(TypeError):
+        direct.agents["x1"] = inventory.agents["d1"]  # type: ignore[index]
+    with pytest.raises(TypeError):
+        direct.by_series["d-series"] = ()  # type: ignore[index]
+
+
 def test_public_snapshot_uses_only_whitelisted_metadata() -> None:
     public = public_fleet_snapshot(normalize_fleet_document(valid_document()))
     allowed = {"generation", "account_count", "series_count", "agent_count", "accounts", "series",
                "label", "provider", "auth_kind", "secret_state", "limit_state", "enabled", "prefix",
                "display_name", "count", "runner", "model"}
+
     def visit(value: object) -> None:
         if isinstance(value, dict):
             assert set(value).issubset(allowed)
-            for child in value.values(): visit(child)
+            for child in value.values():
+                visit(child)
         elif isinstance(value, list):
-            for child in value: visit(child)
+            for child in value:
+                visit(child)
+
     visit(public)
     assert public["agent_count"] == 100
     assert public["accounts"][0]["secret_state"] == "missing"

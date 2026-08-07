@@ -65,6 +65,31 @@ EXPECTED_RISKS = {
     "agent_pool_copy_auth": Risk.BROAD,
     "agent_pool_destroy_pool": Risk.DESTRUCTIVE,
     "agent_doctor": Risk.READ_ONLY,
+    "fleet_account_list": Risk.READ_ONLY,
+    "fleet_gemini_bootstrap_plan": Risk.READ_ONLY,
+    "fleet_series_list": Risk.READ_ONLY,
+    "fleet_account_upsert": Risk.MUTATING,
+    "fleet_account_set_secret": Risk.MUTATING,
+    "fleet_account_disable": Risk.MUTATING,
+    "fleet_account_probe": Risk.MUTATING,
+    "fleet_account_delete": Risk.MUTATING,
+    "fleet_provider_models": Risk.READ_ONLY,
+    "fleet_series_plan": Risk.READ_ONLY,
+    "fleet_series_apply": Risk.MUTATING,
+    "fleet_series_disable": Risk.MUTATING,
+    "fleet_series_delete": Risk.MUTATING,
+    "hive_status": Risk.READ_ONLY,
+    "godbee_status": Risk.READ_ONLY,
+    "queen_list": Risk.READ_ONLY,
+    "queen_status": Risk.READ_ONLY,
+    "hive_dispatch_status": Risk.READ_ONLY,
+    "hive_queue_status": Risk.READ_ONLY,
+    "hive_decisions": Risk.READ_ONLY,
+    "hive_authority_check": Risk.READ_ONLY,
+    "hive_plan_dispatch": Risk.READ_ONLY,
+    "hive_admission_status": Risk.READ_ONLY,
+    "agent_selection_preview": Risk.READ_ONLY,
+    "agent_selection_status": Risk.READ_ONLY,
 }
 
 
@@ -87,17 +112,17 @@ def tool_fixture(
 
 
 class ControlCatalogTest(unittest.TestCase):
-    def test_risk_registry_exactly_covers_current_45_tools(self) -> None:
+    def test_risk_registry_exactly_covers_current_tools(self) -> None:
         published_names = {tool["name"] for tool in TOOLS}
 
-        self.assertEqual(len(EXPECTED_RISKS), 45)
+        self.assertEqual(len(EXPECTED_RISKS), len(published_names))
         self.assertEqual(dict(RISK_BY_TOOL), EXPECTED_RISKS)
         self.assertEqual(published_names, set(EXPECTED_RISKS))
 
     def test_current_server_catalog_compiles_with_immutable_bounded_descriptors(self) -> None:
         catalog = compile_catalog(TOOLS)
 
-        self.assertEqual(len(catalog), 45)
+        self.assertEqual(len(catalog), len(TOOLS))
         self.assertTrue(all(tool.enabled for tool in catalog))
         self.assertTrue(all(isinstance(tool.fields, tuple) for tool in catalog))
         status = next(tool for tool in catalog if tool.name == "agent_status")
@@ -196,9 +221,9 @@ class ControlCatalogTest(unittest.TestCase):
                 "properties": {"text": {"type": "string", "pattern": ".*"}},
                 "additionalProperties": False,
             },
-            "unknown field type": {
+            "unsupported number keyword": {
                 "type": "object",
-                "properties": {"ratio": {"type": "number"}},
+                "properties": {"ratio": {"type": "number", "multipleOf": 0.5}},
                 "additionalProperties": False,
             },
             "nested object": {

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import json
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -8,11 +10,32 @@ import pytest
 from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
 from codex_master.fleet_runners import (
     FleetRunnerError,
+    HUGGINGFACE_MODELS_URL,
+    MAX_PROVIDER_RESPONSE_BYTES,
+    OLLAMA_MODELS_URL,
     build_runner_plan,
     classify_provider_error,
     model_is_agentic,
     parse_gemini_jsonl,
+    probe_gemini_cli,
+    probe_huggingface_models,
+    probe_ollama_models,
 )
+
+
+class _ProbeProcess:
+    def __init__(self, stdout: bytes) -> None:
+        self.pid = 74231
+        self.stdin = io.BytesIO()
+        self.stdout = io.BytesIO(stdout)
+        self.stderr = io.BytesIO()
+        self._returncode = 0
+
+    def poll(self) -> int:
+        return self._returncode
+
+    def wait(self) -> int:
+        return self._returncode
 
 
 def agent(tmp_path: Path, provider: Provider, runner: RunnerKind, *, account_id: str | None) -> AgentDescriptor:
@@ -52,8 +75,7 @@ def test_ollama_runner_uses_codex_builtin_provider_without_secret(tmp_path: Path
         agent(tmp_path, Provider.OLLAMA_LOCAL, RunnerKind.CODEX_CLI, account_id=None),
         Path("/usr/local/bin/codex"),
     )
-
-    assert plan.argv[:4] == ("/usr/local/bin/codex", "--oss", "--local-provider", "ollama")
+    assert plan.argv == ("/usr/local/bin/codex", "-m", "gemini-3-flash-preview")
     assert plan.secret_env_name is None
     assert "OPENAI_API_KEY" in plan.unset_env
 
@@ -86,11 +108,56 @@ def test_gemini_runner_is_headless_jsonl_and_home_isolated(tmp_path: Path) -> No
     assert plan.env == {
         "HOME": str(tmp_path / "agents" / "d1"),
         "GEMINI_CLI_HOME": str(tmp_path / "agents" / "d1"),
+        "GEMINI_CLI_TRUST_WORKSPACE": "true",
     }
     assert plan.secret_env_name == "GEMINI_API_KEY"
     assert "OPENAI_API_KEY" in plan.unset_env
     assert {"GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT",
             "GOOGLE_CLOUD_LOCATION", "GOOGLE_GENAI_USE_VERTEXAI"} <= plan.unset_env
+
+
+def test_gemini_provider_probe_is_stdin_only_bounded_and_isolated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "gemini"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o700)
+    captured: dict[str, object] = {}
+
+    def launch(argv: tuple[str, ...], **kwargs: object) -> _ProbeProcess:
+        captured["argv"] = argv
+        captured["env"] = dict(kwargs["env"])  # type: ignore[arg-type]
+        settings_path = Path(captured["env"]["GEMINI_CLI_HOME"]) / ".gemini" / "settings.json"  # type: ignore[index]
+        captured["settings"] = settings_path.read_text(encoding="utf-8")
+        return _ProbeProcess(
+            b'{"type":"init","model":"gemini-3-flash-preview"}\n'
+            b'{"type":"result","response":"OK"}\n',
+        )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "foreign-secret")
+    monkeypatch.setenv("GOOGLE_API_KEY", "foreign-secret")
+    result = probe_gemini_cli(
+        "private-gemini-secret",
+        executable,
+        popen_factory=launch,
+    )
+
+    assert result.ok is True
+    assert result.model == "gemini-3-flash-preview"
+    assert result.supports_tools is True
+    argv = captured["argv"]
+    assert isinstance(argv, tuple)
+    assert "private-gemini-secret" not in argv
+    assert "Reply with exactly OK. Do not modify files or use tools." not in argv
+    assert "--approval-mode=plan" in argv
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["GEMINI_API_KEY"] == "private-gemini-secret"
+    assert env["GEMINI_CLI_TRUST_WORKSPACE"] == "true"
+    assert "OPENAI_API_KEY" not in env
+    assert "GOOGLE_API_KEY" not in env
+    assert '"enforcedType": "gemini-api-key"' in captured["settings"]
+    assert "private-gemini-secret" not in repr(result)
 
 
 def test_runner_plan_is_immutable_and_refuses_relative_or_controlled_executable(tmp_path: Path) -> None:
@@ -103,6 +170,16 @@ def test_runner_plan_is_immutable_and_refuses_relative_or_controlled_executable(
     for executable in (Path("codex"), Path("/usr/local/bin/co\nex")):
         with pytest.raises(FleetRunnerError):
             build_runner_plan(valid_agent, executable)
+
+
+def test_runner_plan_constructor_freezes_nested_collections(tmp_path: Path) -> None:
+    valid_agent = agent(tmp_path, Provider.OLLAMA_LOCAL, RunnerKind.CODEX_CLI, account_id=None)
+    plan = build_runner_plan(valid_agent, Path("/usr/local/bin/codex"))
+    direct = type(plan)(plan.mode, list(plan.argv), dict(plan.env), set(plan.unset_env), plan.secret_env_name)
+    with pytest.raises(TypeError):
+        direct.env["X"] = "value"  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        direct.argv.append("unexpected")  # type: ignore[attr-defined]
 
 
 def test_gemini_parser_keeps_only_assistant_response_and_aggregate_usage() -> None:
@@ -139,8 +216,8 @@ def test_gemini_parser_accepts_final_response_and_counts_unknown_events() -> Non
 
 @pytest.mark.parametrize("lines", [
     ['{"type":"init"}'],
-    ['not json'],
-    ['[]'],
+    ["not json"],
+    ["[]"],
     ['{"type":"result","stats":{"input_tokens":-1}}'],
     ['{"type":"result","stats":{"output_tokens":9223372036854775808}}'],
     ["\ud800"],
@@ -212,14 +289,10 @@ def test_provider_error_classifier_uses_only_structured_confirmations(
 
 def test_provider_error_keeps_only_valid_structured_reset_time() -> None:
     valid = classify_provider_error(
-        Provider.GEMINI_API,
-        {"code": 429, "reset_at_utc": "2026-08-03T12:00:00Z"},
-        "",
+        Provider.GEMINI_API, {"code": 429, "reset_at_utc": "2026-08-03T12:00:00Z"}, "",
     )
     invalid = classify_provider_error(
-        Provider.GEMINI_API,
-        {"code": 429, "reset_at_utc": "private reset date"},
-        "",
+        Provider.GEMINI_API, {"code": 429, "reset_at_utc": "private reset date"}, "",
     )
     assert valid.reset_at_utc == "2026-08-03T12:00:00Z"
     assert invalid.reset_at_utc is None
@@ -227,15 +300,14 @@ def test_provider_error_keeps_only_valid_structured_reset_time() -> None:
 
 def test_provider_error_rejects_non_rfc3339_structured_reset_time() -> None:
     error = classify_provider_error(
-        Provider.GEMINI_API,
-        {"code": 429, "reset_at_utc": "2026-08-03T12:00Z"},
-        "",
+        Provider.GEMINI_API, {"code": 429, "reset_at_utc": "2026-08-03T12:00Z"}, "",
     )
     assert error.reset_at_utc is None
 
 
 @pytest.mark.parametrize(("provider", "metadata", "expected"), [
-    (Provider.OLLAMA_LOCAL, {"installed": True}, True),
+    (Provider.OLLAMA_LOCAL, {"installed": True, "supports_tools": True}, True),
+    (Provider.OLLAMA_LOCAL, {"installed": True, "supports_tools": False}, False),
     (Provider.OLLAMA_LOCAL, {"installed": "true"}, False),
     (Provider.HUGGINGFACE_INFERENCE,
      {"supports_tools": True, "supports_responses": True, "provider_available": True}, True),
@@ -248,3 +320,110 @@ def test_model_agentic_requires_real_capability_booleans(
     provider: Provider, metadata: dict[str, object], expected: bool
 ) -> None:
     assert model_is_agentic(provider, metadata) is expected
+
+
+class FakeProviderResponse:
+    def __init__(self, url: str, body: bytes, *, status: int = 200, headers: dict[str, str] | None = None) -> None:
+        self._url = url
+        self._body = body
+        self.status = status
+        self.headers = headers or {}
+        self.read_sizes: list[int] = []
+        self.closed = False
+
+    def geturl(self) -> str:
+        return self._url
+
+    def read(self, size: int = -1) -> bytes:
+        self.read_sizes.append(size)
+        return self._body
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_ollama_probe_is_loopback_bounded_and_secret_free() -> None:
+    response = FakeProviderResponse(
+        OLLAMA_MODELS_URL,
+        json.dumps({"models": [{
+            "name": "qwen3-coder:latest", "capabilities": ["completion", "tools"],
+        }, {"name": "qwen3-coder:latest", "capabilities": ["completion", "tools"]}]}).encode(),
+    )
+    observed: dict[str, object] = {}
+
+    def opener(request: object, *, timeout: int) -> FakeProviderResponse:
+        observed["url"] = request.full_url  # type: ignore[attr-defined]
+        observed["authorization"] = request.get_header("Authorization")  # type: ignore[attr-defined]
+        observed["timeout"] = timeout
+        return response
+
+    result = probe_ollama_models(opener=opener)
+    assert result.available is True
+    assert result.models == ({
+        "id": "qwen3-coder:latest", "installed": True,
+        "supports_tools": True, "agentic": True,
+    },)
+    assert observed == {"url": OLLAMA_MODELS_URL, "authorization": None, "timeout": 5}
+    assert response.read_sizes == [MAX_PROVIDER_RESPONSE_BYTES + 1]
+    assert response.closed is True
+    assert "private" not in repr(result)
+
+
+def test_ollama_probe_keeps_models_without_tools_non_agentic() -> None:
+    response = FakeProviderResponse(
+        OLLAMA_MODELS_URL,
+        json.dumps({"models": [{"name": "completion-only", "capabilities": ["completion"]}]}).encode(),
+    )
+
+    result = probe_ollama_models(opener=lambda *_args, **_kwargs: response)
+
+    assert result.available is True
+    assert result.models == ({
+        "id": "completion-only", "installed": True,
+        "supports_tools": False, "agentic": False,
+    },)
+
+
+def test_huggingface_probe_sends_secret_only_in_private_request_and_gates_capabilities() -> None:
+    response = FakeProviderResponse(
+        HUGGINGFACE_MODELS_URL,
+        json.dumps({"data": [
+            {"id": "good/model", "supports_tools": True, "supports_responses": True, "provider_available": True},
+            {"id": "text/model", "supports_tools": True, "supports_responses": False, "provider_available": True},
+        ]}).encode(),
+    )
+    observed: dict[str, object] = {}
+
+    def opener(request: object, *, timeout: int) -> FakeProviderResponse:
+        observed["url"] = request.full_url  # type: ignore[attr-defined]
+        observed["authorization"] = request.get_header("Authorization")  # type: ignore[attr-defined]
+        observed["timeout"] = timeout
+        return response
+
+    result = probe_huggingface_models("private-token", opener=opener)
+    assert result.available is True
+    assert result.models[0]["agentic"] is True
+    assert result.models[1]["agentic"] is False
+    assert observed == {"url": HUGGINGFACE_MODELS_URL, "authorization": "Bearer private-token", "timeout": 5}
+    assert "private-token" not in repr(result)
+
+
+def test_provider_probe_rejects_redirects_and_unbounded_bodies() -> None:
+    redirected = FakeProviderResponse("http://localhost:11434/api/tags", b"{}")
+    assert probe_ollama_models(opener=lambda *_args, **_kwargs: redirected).error == "redirect_rejected"
+
+    oversized = FakeProviderResponse(OLLAMA_MODELS_URL, b"x" * (MAX_PROVIDER_RESPONSE_BYTES + 1))
+    assert probe_ollama_models(opener=lambda *_args, **_kwargs: oversized).error == "provider_response_too_large"
+
+
+def test_huggingface_probe_requires_a_private_secret_before_network() -> None:
+    called = False
+
+    def opener(*_args: object, **_kwargs: object) -> FakeProviderResponse:
+        nonlocal called
+        called = True
+        return FakeProviderResponse(HUGGINGFACE_MODELS_URL, b"{}")
+
+    result = probe_huggingface_models(None, opener=opener)
+    assert result.error == "secret_missing"
+    assert called is False
