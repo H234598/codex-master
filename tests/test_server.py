@@ -2852,6 +2852,10 @@ class ServerHelpersTest(unittest.TestCase):
                 )
             server_module._fleet_verify_home(pool, "d1", artifacts, exact_contents=True)
             server_module._fleet_managed_home_state(pool, agent, strict_contents=True)
+            (home / ".gemini/projects.json").write_text("{}\n", encoding="utf-8")
+            (home / ".gemini/history").mkdir(mode=0o755)
+            (home / ".gemini/tmp").mkdir(mode=0o755)
+            server_module._fleet_managed_home_state(pool, agent, strict_contents=True)
             (home / ".gemini/policies/foreign.toml").write_text("foreign = true\n", encoding="utf-8")
             with self.assertRaisesRegex(AgentError, "fleet_home_content_invalid"):
                 server_module._fleet_managed_home_state(pool, agent, strict_contents=True)
@@ -2947,6 +2951,28 @@ class ServerHelpersTest(unittest.TestCase):
                 self.assertFalse(
                     {"account_id", "generation", "executable", "home", "auth"} & set(marker)
                 )
+
+    def test_fleet_gemini_symlink_launcher_is_resolved_before_pinning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "gemini-bundle"
+            launcher = root / "gemini"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            launcher.symlink_to(executable)
+
+            with patch.object(
+                server_module,
+                "trusted_gemini_executable",
+                return_value=executable,
+            ) as trusted:
+                with server_module._fleet_pinned_executable(
+                    server_module.RunnerKind.GEMINI_CLI,
+                    codex_executable=None,
+                    gemini_executable=launcher,
+                ) as (pinned, _pinned_stat):
+                    self.assertEqual(pinned, executable)
+                trusted.assert_called_once_with(launcher)
 
     def test_fleet_series_grow_only_creates_tail_and_keeps_existing_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -9174,7 +9200,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.10.2")
+        self.assertEqual(result["expected_tag"], "v0.10.3")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")

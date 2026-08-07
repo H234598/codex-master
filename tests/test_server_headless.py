@@ -241,6 +241,28 @@ def test_headless_retry_policy_caps_existing_gemini_home_settings(tmp_path: Path
     assert settings["privacy"]["usageStatisticsEnabled"] is False
 
 
+def test_headless_retry_policy_refreshes_managed_home_marker(tmp_path: Path) -> None:
+    settings_path = tmp_path / ".gemini" / "settings.json"
+    settings_path.parent.mkdir()
+    settings_path.write_text(
+        '{"general":{"maxAttempts":2,"retryFetchErrors":false}}\n',
+        encoding="utf-8",
+    )
+    marker_path = tmp_path / server.FLEET_AGENT_MARKER_FILE
+    marker_path.write_text(
+        json.dumps({"files": {".gemini/settings.json": "0" * 64}}) + "\n",
+        encoding="utf-8",
+    )
+    marker_path.chmod(0o600)
+
+    server._ensure_gemini_headless_retry_policy(tmp_path)
+
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["files"][".gemini/settings.json"] == hashlib.sha256(
+        settings_path.read_bytes()
+    ).hexdigest()
+
+
 def test_stale_headless_force_recovery_signals_only_verified_process_group(monkeypatch) -> None:
     home = Path("/tmp/managed-d1")
     descriptor = type("Descriptor", (), {"home": home})()

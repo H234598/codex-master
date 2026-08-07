@@ -6431,10 +6431,37 @@ def _ensure_gemini_headless_retry_policy(home: Path) -> None:
     if not isinstance(general, dict):
         raise AgentError("headless_settings_invalid")
     if general.get("maxAttempts") == 2 and general.get("retryFetchErrors") is False:
+        _refresh_gemini_fleet_marker(home, settings_text)
         return
     general["maxAttempts"] = 2
     general["retryFetchErrors"] = False
-    replace_private_text(settings_path, json.dumps(document, indent=2, sort_keys=True) + "\n")
+    settings_text = json.dumps(document, indent=2, sort_keys=True) + "\n"
+    replace_private_text(settings_path, settings_text)
+    _refresh_gemini_fleet_marker(home, settings_text)
+
+
+def _refresh_gemini_fleet_marker(home: Path, settings_text: str) -> None:
+    """Keep the managed-home digest in sync with the bounded retry policy."""
+
+    marker_path = home / FLEET_AGENT_MARKER_FILE
+    marker_text = fleet_read_optional_private_text(
+        marker_path,
+        256 * 1024,
+        "headless_marker_invalid",
+    )
+    if marker_text is None:
+        return
+    try:
+        marker = json.loads(marker_text)
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise AgentError("headless_marker_invalid") from exc
+    if not isinstance(marker, dict) or not isinstance(marker.get("files"), dict):
+        raise AgentError("headless_marker_invalid")
+    files = marker["files"]
+    if ".gemini/settings.json" not in files:
+        return
+    files[".gemini/settings.json"] = hashlib.sha256(settings_text.encode("utf-8")).hexdigest()
+    replace_private_text(marker_path, json.dumps(marker, indent=2, sort_keys=True) + "\n")
 
 
 def _headless_marker(agent: str) -> dict[str, Any]:
@@ -15603,6 +15630,11 @@ def _fleet_pinned_executable(
         path = supplied
     else:
         raise AgentError("fleet_executable_invalid")
+    if runner is RunnerKind.GEMINI_CLI and path.is_symlink():
+        # The npm-installed Gemini CLI is normally exposed through a user-owned
+        # launcher symlink. Pin the resolved bundle, while keeping the existing
+        # no-symlink validation for the final executable path.
+        path = trusted_gemini_executable(path)
     with _fleet_pinned_path(
         path,
         invalid_text="fleet_executable_invalid",
@@ -15842,7 +15874,12 @@ def _fleet_open_artifact_parent(
         raise AgentError(error) from exc
 
 
-def _fleet_tree_entries(directory_fd: int, error: str) -> tuple[set[str], set[str]]:
+def _fleet_tree_entries(
+    directory_fd: int,
+    error: str,
+    *,
+    allow_gemini_runtime: bool = False,
+) -> tuple[set[str], set[str]]:
     files: set[str] = set()
     directories: set[str] = set()
     entry_count = 0
@@ -15851,7 +15888,33 @@ def _fleet_tree_entries(directory_fd: int, error: str) -> tuple[set[str], set[st
         nonlocal entry_count
         if depth > 8:
             raise AgentError(error)
-        _fleet_private_directory_stat(os.fstat(current_fd), error)
+        current_fd_stat = os.fstat(current_fd)
+        prefix_is_gemini_runtime = (
+            allow_gemini_runtime
+            and (
+                prefix == ".gemini/history"
+                or prefix.startswith(".gemini/history/")
+                or prefix == ".gemini/tmp"
+                or prefix.startswith(".gemini/tmp/")
+            )
+        )
+        if prefix_is_gemini_runtime:
+            if (
+                current_fd_stat.st_uid != os.geteuid()
+                or stat_module.S_IMODE(current_fd_stat.st_mode) not in {0o700, 0o755}
+                or getattr(current_fd_stat, "st_nlink", 1) < 1
+            ):
+                raise AgentError(error)
+        else:
+            _fleet_private_directory_stat(current_fd_stat, error)
+        try:
+            # A directory FD that was opened before entries were created can
+            # retain an end-of-directory stream position on some filesystems.
+            # Rewind it before enumerating so freshly materialized homes are
+            # not mistaken for empty or partial directories.
+            os.lseek(current_fd, 0, os.SEEK_SET)
+        except OSError as exc:
+            raise AgentError(error) from exc
         for name in os.listdir(current_fd):
             entry_count += 1
             if entry_count > 128 or not isinstance(name, str) or name in {"", ".", ".."} or "/" in name:
@@ -15859,13 +15922,39 @@ def _fleet_tree_entries(directory_fd: int, error: str) -> tuple[set[str], set[st
             relative = f"{prefix}/{name}" if prefix else name
             current = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
             if stat_module.S_ISDIR(current.st_mode) and not stat_module.S_ISLNK(current.st_mode):
-                _fleet_private_directory_stat(current, error)
+                relative_is_gemini_runtime = (
+                    allow_gemini_runtime
+                    and (
+                        relative == ".gemini/history"
+                        or relative.startswith(".gemini/history/")
+                        or relative == ".gemini/tmp"
+                        or relative.startswith(".gemini/tmp/")
+                    )
+                )
+                if relative_is_gemini_runtime:
+                    if (
+                        current.st_uid != os.geteuid()
+                        or stat_module.S_IMODE(current.st_mode) not in {0o700, 0o755}
+                        or getattr(current, "st_nlink", 1) < 1
+                    ):
+                        raise AgentError(error)
+                else:
+                    _fleet_private_directory_stat(current, error)
                 flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
                 if hasattr(os, "O_NOFOLLOW"):
                     flags |= os.O_NOFOLLOW
                 child_fd = os.open(name, flags, dir_fd=current_fd)
                 try:
-                    _fleet_private_directory_stat(os.fstat(child_fd), error)
+                    child_stat = os.fstat(child_fd)
+                    if relative_is_gemini_runtime:
+                        if (
+                            child_stat.st_uid != os.geteuid()
+                            or stat_module.S_IMODE(child_stat.st_mode) not in {0o700, 0o755}
+                            or getattr(child_stat, "st_nlink", 1) < 1
+                        ):
+                            raise AgentError(error)
+                    else:
+                        _fleet_private_directory_stat(child_stat, error)
                     directories.add(relative)
                     visit(child_fd, relative, depth + 1)
                 finally:
@@ -17026,14 +17115,34 @@ def _fleet_managed_home_state(
         actual_files, actual_directories = _fleet_tree_entries(
             home_fd,
             "fleet_home_content_invalid",
+            allow_gemini_runtime=True,
         )
-        allowed_files = {FLEET_AGENT_MARKER_FILE, *expected_files, "auth.json"}
+        allowed_files = {
+            FLEET_AGENT_MARKER_FILE,
+            *expected_files,
+            "auth.json",
+            ".gemini/projects.json",
+        }
         expected_directories = _fleet_artifact_directories({name: None for name in expected_files})
-        if strict_contents and (
-            not actual_files <= allowed_files
-            or actual_directories != expected_directories
-        ):
-            raise AgentError("fleet_home_content_invalid")
+        if strict_contents:
+            runtime_files = {
+                path
+                for path in actual_files
+                if path.startswith(".gemini/history/") or path.startswith(".gemini/tmp/")
+            }
+            runtime_directories = {
+                path
+                for path in actual_directories
+                if path == ".gemini/history"
+                or path.startswith(".gemini/history/")
+                or path == ".gemini/tmp"
+                or path.startswith(".gemini/tmp/")
+            }
+            if (
+                not actual_files <= allowed_files | runtime_files
+                or actual_directories != expected_directories | runtime_directories
+            ):
+                raise AgentError("fleet_home_content_invalid")
         if "auth.json" in actual_files:
             _fleet_read_private_file_at(
                 home_fd,

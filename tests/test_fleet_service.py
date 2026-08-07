@@ -227,8 +227,6 @@ def test_gemini_rate_reservation_applies_exponential_429_cooldown(tmp_path: Path
 
 
 def test_invalid_gemini_rate_state_fails_closed(tmp_path: Path) -> None:
-    from codex_master.fleet_service import FleetRateLimitError
-
     service, paths = _service(tmp_path, _configured_snapshot())
     paths.rate_limits.write_text("{invalid", encoding="utf-8")
 
