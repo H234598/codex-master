@@ -6,7 +6,7 @@
   "series": [
     {
       "prefix": "a",
-      "count": 100,
+      "count": 5,
       "template": "a1",
       "authenticated": [
         "a1"
@@ -14,7 +14,7 @@
     },
     {
       "prefix": "b",
-      "count": 100,
+      "count": 3,
       "template": "b1",
       "authenticated": [
         "b1"
@@ -22,7 +22,7 @@
     },
     {
       "prefix": "c",
-      "count": 100,
+      "count": 3,
       "template": "c1",
       "authenticated": []
     }

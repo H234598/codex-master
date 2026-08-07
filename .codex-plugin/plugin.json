@@ -1,7 +1,7 @@
 {
   "name": "codex-master",
-  "version": "0.10.3+codex.20260807162349",
-  "description": "Local Codex Masterjet plugin for controlling a sleeping Agentinnen pool through a data-sparse tmux MCP server.",
+  "version": "0.10.4+codex.20260807222838",
+  "description": "The Hive plugin for controlling a sleeping Agentinnen fleet through a data-sparse local MCP server. codex-master-mcp and Masterjet remain compatibility aliases.",
   "author": {
     "name": "teladi"
   },
@@ -22,9 +22,9 @@
   "apps": "./.app.json",
   "hooks": "./hooks/hooks.json",
   "interface": {
-    "displayName": "Codex Master",
-    "shortDescription": "Control isolated Codex Agentinnen with a local Masterjet MCP.",
-    "longDescription": "Adds the codex-master-mcp local MCP server plus fleet-management skills and an App Bridge manifest for starting, assigning, auditing, and safely inspecting a scalable sleeping Codex Agentinnen pool through tmux. The tool surface is data-sparse by default and keeps prompt text, Agentin responses, raw terminal logs, and raw-log file paths out of normal MCP responses.",
+    "displayName": "The Hive",
+    "shortDescription": "Control isolated Agentinnen with The Hive local MCP.",
+    "longDescription": "Adds The Hive local MCP server (technical alias codex-master-mcp) plus fleet-management skills and an App Bridge manifest for starting, assigning, auditing, and safely inspecting a scalable sleeping Agentinnen fleet. Masterjet remains a compatible colloquial alias; the tool surface is data-sparse by default.",
     "developerName": "teladi",
     "category": "Developer Tools",
     "capabilities": [

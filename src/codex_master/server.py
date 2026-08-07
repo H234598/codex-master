@@ -340,11 +340,18 @@ FLEET_DESKTOP_ENTRY_NAME = "de.teladi.CodexMaster.ControlCenter.desktop"
 MAX_FLEET_DESKTOP_ENTRY_BYTES = 16 * 1024
 FLEET_DESKTOP_COMMAND_RE = re.compile(r"^/[-A-Za-z0-9._+@/ ]+$")
 AGENT_POOL_ROOT = Path(os.environ.get("CODEX_AGENT_POOL_ROOT", "~/.codex-agents")).expanduser()
+HIVE_API_TOKEN_ENV_FILE = Path(
+    os.environ.get(
+        "CODEX_MASTER_MCP_API_TOKEN_ENV",
+        "~/.config/codex-master-mcp/api-token.env",
+    )
+).expanduser()
 POOL_SPEC_FILE = "codex-agent-pool.json"
 POOL_MARKER_FILE = ".codex-agent-pool-installed.json"
 FLEET_POOL_MARKER_FILE = ".codex-fleet-pool.json"
 FLEET_AGENT_MARKER_FILE = ".codex-fleet-agent.json"
 MAX_FLEET_ARTIFACT_BYTES = 256 * 1024
+MAX_PORTABLE_SKILLS = 2048
 FLEET_TOMBSTONE_PREFIX = ".codex-fleet-remove-"
 FLEET_BASH_EXECUTABLE = Path("/usr/bin/bash")
 FLEET_TASKSET_EXECUTABLE = Path("/usr/bin/taskset")
@@ -378,6 +385,7 @@ LEASE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 MAX_POOL_AGENTS = 1000
 MAX_POOL_SERIES = 26
 MAX_FLEET_SERIES_COUNT = 100
+MAX_HIVE_API_KEYS = 30
 MAX_POOL_SHARED_ASSETS = 40
 MAX_POOL_RUNTIME_DIRS = 40
 MAX_APPLET_AGENTS = 6
@@ -667,6 +675,34 @@ _WATCHDOG_SNAPSHOT: contextvars.ContextVar[FleetWatchdogSnapshot | None] = conte
 RUNNER_EXECUTION_FDS: dict[str, int] = {}
 
 
+def _legacy_pool_ids() -> tuple[str, ...]:
+    """Use the checked-in native pool counts while retaining active b92."""
+
+    # Unit/integration callers may inject a small legacy mapping that is not
+    # represented by the production A/B/C pool constants.  Preserve that
+    # explicit mapping verbatim so diagnostics and security tests stay local.
+    if set(AGENTS) - set(AGENT_IDS):
+        return tuple(AGENTS)
+    try:
+        raw, _source = pool_load_raw_spec()
+        raw_series = raw.get("series") if isinstance(raw, dict) else None
+        selected: list[str] = []
+        if isinstance(raw_series, list):
+            for item in raw_series:
+                if not isinstance(item, dict) or item.get("prefix") not in AGENT_SERIES:
+                    continue
+                count = item.get("count")
+                if isinstance(count, int) and not isinstance(count, bool) and 1 <= count <= AGENTS_PER_SERIES:
+                    selected.extend(f"{item['prefix']}{index}" for index in range(1, count + 1))
+        if selected:
+            if "b92" in AGENTS and "b92" not in selected:
+                selected.append("b92")
+            return tuple(agent for agent in selected if agent in AGENTS)
+    except Exception:
+        pass
+    return AGENT_IDS
+
+
 def _agent_config_fingerprint() -> tuple[tuple[str, str], ...]:
     return tuple(
         [("__agent_pool_root__", str(AGENT_POOL_ROOT))]
@@ -686,7 +722,8 @@ def _legacy_inventory() -> InventorySnapshot:
     descriptors: dict[str, AgentDescriptor] = {}
     by_series: dict[str, list[str]] = {}
     positions: dict[str, int] = {}
-    for agent, config in AGENTS.items():
+    for agent in _legacy_pool_ids():
+        config = AGENTS[agent]
         match = re.fullmatch(r"([a-z])([1-9][0-9]{0,2})", agent)
         if match is None:
             prefix, ordinal = agent, 1
@@ -732,6 +769,29 @@ def current_agent_inventory() -> InventorySnapshot:
     if snapshot is not None and fingerprint == _agent_config_fingerprint():
         return snapshot
     return _legacy_inventory()
+
+
+def merge_agent_inventories(*snapshots: InventorySnapshot) -> InventorySnapshot:
+    """Expose legacy native and provider-backed Fleet series through one view."""
+
+    agents: dict[str, AgentDescriptor] = {}
+    by_series: dict[str, list[str]] = {}
+    positions: dict[str, int] = {}
+    for snapshot in snapshots:
+        for agent_id in snapshot.agent_ids:
+            if agent_id in agents:
+                continue
+            descriptor = snapshot.agents[agent_id]
+            agents[agent_id] = descriptor
+            by_series.setdefault(f"{descriptor.series_prefix}-series", []).append(agent_id)
+            positions[agent_id] = len(positions)
+    return InventorySnapshot(
+        tuple(agents),
+        MappingProxyType(agents),
+        MappingProxyType({key: tuple(value) for key, value in by_series.items()}),
+        MappingProxyType(positions),
+        tuple(by_series),
+    )
 
 
 def published_agent_inventory() -> tuple[InventorySnapshot, bool]:
@@ -809,7 +869,8 @@ def series_agent_ids(selector: str, snapshot: InventorySnapshot | None = None) -
 
 def pinned_legacy_agent_configs() -> Mapping[str, Mapping[str, Any]]:
     configs: dict[str, Mapping[str, Any]] = {}
-    for agent, config in AGENTS.items():
+    for agent in _legacy_pool_ids():
+        config = AGENTS[agent]
         if not isinstance(config, Mapping):
             raise AgentError("legacy_agent_inventory_invalid")
         configs[agent] = MappingProxyType(dict(config))
@@ -2229,7 +2290,14 @@ def ordinal_mapping_preview(series: tuple[str, ...] | None = None, *, limit: int
         raise AgentError("ordinal selector requires at least one enabled Agentinnen series")
     preview = []
     for ordinal in range(1, max(1, limit) + 1):
-        preview.append({"selector": str(ordinal), "agent": ordinal_agent_id(str(ordinal), selected_series)})
+        try:
+            agent = ordinal_agent_id(str(ordinal), selected_series)
+        except AgentError:
+            # The preview is bounded by the currently installed pool.  A
+            # smaller configured series must not make the status endpoint
+            # fail merely because the next round-robin slot is absent.
+            break
+        preview.append({"selector": str(ordinal), "agent": agent})
     return preview
 
 
@@ -2286,6 +2354,12 @@ def agent_ids(agent: str) -> list[str]:
         return list(managed_applet_inventory()["running_agents"])
     inventory, published = published_agent_inventory()
     if normalized == "all":
+        if not published:
+            # Preserve the legacy selector contract until a fleet inventory
+            # is published for this server lifetime.  serve_mcp publishes
+            # the installed 5/3/3 native pool before handling requests, so
+            # live broad selectors remain scoped to real homes.
+            return [agent_id for agent_id in AGENTS if AGENTS[agent_id].get("enabled", True) is not False]
         return [agent_id for agent_id in inventory.agent_ids if inventory.agents[agent_id].enabled]
     if normalized == "both":
         if published:
@@ -2303,6 +2377,18 @@ def agent_ids(agent: str) -> list[str]:
         if published:
             raise AgentError("unknown Agentinnen series selector")
         return [item for item in SERIES_AGENT_IDS[normalized] if item in AGENTS]
+    if not published and normalized.isdecimal():
+        # Numeric selectors retain the pre-fleet legacy domain until the
+        # serving process publishes the installed pool snapshot.
+        value = int(normalized)
+        selected_series = selector_policy_series()
+        if value < 1 or not selected_series:
+            raise AgentError("ordinal selector must be >= 1")
+        prefix = selected_series[(value - 1) % len(selected_series)]
+        agent = f"{prefix}{((value - 1) // len(selected_series)) + 1}"
+        if agent in AGENTS and AGENTS[agent].get("enabled", True) is not False:
+            return [agent]
+        raise AgentError("ordinal selector resolves outside the installed Agentinnen pool")
     return [canonical_agent_id(normalized, snapshot=inventory)]
 
 
@@ -6530,14 +6616,25 @@ def headless_job_status(agent: str) -> dict[str, Any]:
     marker = _headless_marker(agent)
     state = marker.get("state")
     if state == "running":
-        # A process record that survived a server restart is not enough to
-        # authorize a signal.  The recovery path must re-prove identity first.
+        identity = _headless_recovery_identity(agent, marker)
+        if identity is not None:
+            return {
+                "agent": agent,
+                "assignment_id": marker.get("assignment_id"),
+                "status": "running",
+                "backend": "headless_job",
+                "running": True,
+                "pid": identity[0],
+                "identity_verified": True,
+                "raw_output": "not_returned",
+            }
         return {
             "agent": agent,
             "assignment_id": marker.get("assignment_id"),
             "status": "identity_unverified",
             "backend": "headless_job",
             "running": False,
+            "identity_verified": False,
             "raw_output": "not_returned",
         }
     if not isinstance(state, str):
@@ -6628,6 +6725,29 @@ def cancel_headless_job(agent: str, force: bool = False) -> dict[str, Any]:
         marker = _headless_marker(agent)
         marker.update({"state": "cancelling", "cancel_requested": True})
         _write_headless_marker(agent, marker)
+    else:
+        marker = _headless_marker(agent)
+        if marker.get("state") in {"running", "cancelling"}:
+            recovery = _recover_headless_process(agent, marker)
+            if recovery == "identity_unverified":
+                return {
+                    "agent": agent,
+                    "status": "identity_unverified",
+                    "running": False,
+                    "recovery": recovery,
+                    "backend": "headless_job",
+                    "raw_output": "not_returned",
+                }
+            marker.update({"state": "cancelled" if recovery == "stopped" else "failed"})
+            marker.pop("process", None)
+            _write_headless_marker(agent, marker)
+            result = {
+                "agent": agent,
+                "status": "cancelled" if recovery == "stopped" else "not_running",
+                "running": False,
+                "recovery": recovery,
+                "raw_output": "not_returned",
+            }
     return {**result, "backend": "headless_job", "raw_output": "not_returned"}
 
 
@@ -6804,6 +6924,11 @@ def _run_headless_process(
             and not result.stderr_truncated
             else "failed"
         )
+        usage_status = (
+            "rate_limited"
+            if parsed.error is not None and parsed.error.kind == "account_limited"
+            else terminal
+        )
         _write_headless_marker(agent, {
             "agent": agent,
             "backend": "headless_job",
@@ -6814,6 +6939,26 @@ def _run_headless_process(
             "stdout_truncated": result.stdout_truncated,
             "stderr_truncated": result.stderr_truncated,
         })
+        with contextlib.suppress(Exception):
+            service.record_gemini_usage(
+                gate.account_id,
+                model=parsed.model or descriptor.model,
+                input_tokens=parsed.input_tokens,
+                output_tokens=parsed.output_tokens,
+                status=usage_status,
+            )
+        with contextlib.suppress(Exception):
+            service.record_gemini_event(
+                event_type="headless_result",
+                agent_id=agent,
+                account_id=gate.account_id,
+                assignment_id=assignment_id,
+                status=usage_status,
+                reason=parsed.error.kind if parsed.error is not None else None,
+                model=parsed.model or descriptor.model,
+                input_tokens=parsed.input_tokens,
+                output_tokens=parsed.output_tokens,
+            )
         response = parsed.response if terminal == "completed" else ""
         if terminal == "completed":
             rate_outcome = "completed"
@@ -6836,6 +6981,25 @@ def _run_headless_process(
             ),
             "raw_output": "not_returned",
         }
+    except Exception as exc:
+        usage_status = "rate_limited" if isinstance(exc, FleetRateLimitError) else "failed"
+        with contextlib.suppress(Exception):
+            service.record_gemini_usage(
+                gate.account_id,
+                model=descriptor.model,
+                status=usage_status,
+            )
+        with contextlib.suppress(Exception):
+            service.record_gemini_event(
+                event_type="headless_exception",
+                agent_id=agent,
+                account_id=gate.account_id,
+                assignment_id=assignment_id,
+                status=usage_status,
+                reason=(str(exc) if isinstance(exc, (AgentError, FleetRateLimitError, FleetSecretError)) else type(exc).__name__.lower()),
+                model=descriptor.model,
+            )
+        raise
     finally:
         if plan.secret_env_name is not None:
             child_env.pop(plan.secret_env_name, None)
@@ -6895,6 +7059,43 @@ def run_headless_assignment(
     return _run_headless_process(agent, prompt, lease, timeout_seconds)
 
 
+def _headless_route_candidates(agent: str, skill: str | None, required_skills: list[str] | None = None) -> list[str]:
+    """Choose the requested Gemini bee first, then another fresh ready series."""
+
+    requested = canonical_agent_id(agent)
+    service = current_fleet_service()
+    inventory = current_agent_inventory()
+    ordered = [requested] + [item for item in inventory.agent_ids if item != requested]
+    candidates: list[str] = []
+    for candidate in ordered:
+        descriptor = inventory.agents.get(candidate)
+        if descriptor is None or descriptor.runner is not RunnerKind.GEMINI_CLI or not descriptor.enabled:
+            continue
+        with contextlib.suppress(Exception):
+            sync_gemini_skill_home(candidate)
+        gate = service.account_gate(candidate, inventory=inventory)
+        if not gate.allowed:
+            continue
+        if gate.account_id is not None:
+            rate_status = getattr(service, "gemini_rate_status", None)
+            if callable(rate_status):
+                rate = rate_status(gate.account_id)
+                if rate.get("allowed") is not True:
+                    continue
+        lease = agent_lease_status(candidate)
+        if lease.get("state") == "held":
+            continue
+        if HEADLESS_JOBS.status(candidate).get("status") in {"running", "cancelling"}:
+            continue
+        required = list(required_skills or [])
+        if skill and skill not in required:
+            required.insert(0, skill)
+        if any(not skill_matches(candidate, item) for item in required):
+            continue
+        candidates.append(candidate)
+    return candidates
+
+
 def _assign_headless_agent(
     agent: str,
     *,
@@ -6916,9 +7117,11 @@ def _assign_headless_agent(
     live_data_topic: str | None = None,
     timeout_seconds: float = DEFAULT_HEADLESS_TIMEOUT_SECONDS,
     operation: str = "agent_assign",
+    required_skills: Any = None,
 ) -> dict[str, Any]:
     del operation, allow_unauthenticated
-    agent = canonical_agent_id(agent)
+    requested_agent = canonical_agent_id(agent)
+    agent = requested_agent
     descriptor = _headless_descriptor(agent)
     if descriptor is None:
         raise AgentError("headless_runner_unavailable")
@@ -6928,6 +7131,9 @@ def _assign_headless_agent(
         raise AgentError("role must be 'exploriererin' or 'arbeitsbiene'")
     task = bounded_text(task, field="task", max_chars=MAX_TASK_TEXT, required=True) or ""
     skill = bounded_text(skill, field="skill", max_chars=MAX_SKILL_REF) if skill is not None else None
+    required_skills = as_string_list(required_skills, field="required_skills", max_chars=MAX_SKILL_REF)
+    if skill and skill not in required_skills:
+        required_skills.insert(0, skill)
     name = bounded_text(name, field="name", max_chars=MAX_AGENTIN_NAME) if name is not None else None
     group_id = normalize_routing_context_id(group_id, field="group_id")
     job_id = normalize_routing_context_id(job_id, field="job_id")
@@ -6946,8 +7152,16 @@ def _assign_headless_agent(
     if role == "arbeitsbiene" and not scope_result["allowed"]:
         raise AgentError("write paths must stay inside scope")
     matches = skill_matches(agent, skill) if skill else []
-    if skill and not matches and not allow_missing_skill:
-        raise AgentError(f"skill not found for agent {agent}")
+    missing_skills = [item for item in required_skills if not skill_matches(agent, item)]
+    if missing_skills and not allow_missing_skill:
+        # Skill provisioning may have just repaired the managed home.  Re-read
+        # the inventory before failing so a ready alternate series can be used.
+        candidates = _headless_route_candidates(requested_agent, skill, required_skills)
+        if not candidates:
+            raise AgentError(f"skill not found for agent {agent}")
+        agent = candidates[0]
+        descriptor = _headless_descriptor(agent)
+        matches = skill_matches(agent, skill)
     subagent_admission = spawn_admission_decision(1) if allow_subagents else None
     prompt = assignment_prompt(
         agent=agent, role=role, task=task, scope=scope, skill=skill,
@@ -6955,12 +7169,22 @@ def _assign_headless_agent(
         model=descriptor.model, allow_subagents=allow_subagents,
         subagent_admission=subagent_admission,
         requires_search=requires_search, live_data_topic=live_data_topic,
+        required_skills=required_skills,
     )
     if len(prompt) > MAX_ASSIGNMENT_TEXT:
         raise AgentError(f"assignment prompt exceeds {MAX_ASSIGNMENT_TEXT} characters")
-    first_gate = current_fleet_service().account_gate(agent)
-    if not first_gate.allowed:
-        raise AgentError(first_gate.reason)
+    candidates = _headless_route_candidates(agent, skill, required_skills)
+    if not candidates:
+        first_gate = current_fleet_service().account_gate(agent)
+        if first_gate.allowed:
+            candidates = [agent]
+        else:
+            raise AgentError(first_gate.reason)
+    agent = candidates[0]
+    descriptor = _headless_descriptor(agent)
+    if descriptor is None:
+        raise AgentError("headless_runner_unavailable")
+    matches = skill_matches(agent, skill) if skill else []
     with agent_lifecycle_lock(agent):
         claim = _claim_agent_unlocked(agent)
         lease = claim["lease"]
@@ -7000,13 +7224,80 @@ def _assign_headless_agent(
             if release_on_completion:
                 release_start_lease_if_safe(agent, lease, True)
             raise
-    result = _run_headless_process(
-        agent, prompt, lease, timeout_seconds,
-        role=role, assignment_id=assignment_id,
-        release_lease_on_completion=release_on_completion,
-    )
+    fallback_attempts: list[dict[str, Any]] = []
+    try:
+        result = _run_headless_process(
+            agent, prompt, lease, timeout_seconds,
+            role=role, assignment_id=assignment_id,
+            release_lease_on_completion=release_on_completion,
+        )
+    except FleetRateLimitError as exc:
+        # A second admission check can race the read-only route preview.  A
+        # local limiter hit is therefore a routable failure, not a reason to
+        # strand the assignment on the first series.
+        fallback_attempts.append({
+            "agent": agent,
+            "status": "exception",
+            "reason": exc.reason,
+            "retry_after_seconds": exc.retry_after_seconds,
+        })
+        if len(candidates) <= 1:
+            raise
+        result = {
+            "agent": agent,
+            "assignment_id": assignment_id,
+            "status": "failed",
+            "model": descriptor.model,
+            "response": "",
+            "error": {"kind": exc.reason, "retryable": True},
+            "raw_output": "not_returned",
+        }
+    failure = result.get("error") if isinstance(result, dict) else None
+    should_fallback = (
+        isinstance(failure, dict)
+        and failure.get("kind") in {"account_limited", "provider_unavailable", "runner_failed"}
+    ) or (isinstance(result, dict) and result.get("status") == "timeout")
+    if should_fallback:
+        for fallback_agent in candidates[1:]:
+            try:
+                with agent_lifecycle_lock(fallback_agent):
+                    fallback_claim = _claim_agent_unlocked(fallback_agent)
+                    fallback_lease = fallback_claim["lease"]
+                    fallback_owned = fallback_claim["status"] in {"claimed", "claimed_expired"}
+                    fallback_marker = _headless_marker(fallback_agent)
+                    fallback_marker.update({"state": "ready", "assignment_id": assignment_id})
+                    _write_headless_marker(fallback_agent, fallback_marker)
+                    fallback_result = _run_headless_process(
+                        fallback_agent,
+                        prompt,
+                        fallback_lease,
+                        timeout_seconds,
+                        role=role,
+                        assignment_id=assignment_id,
+                        release_lease_on_completion=fallback_owned,
+                    )
+                fallback_attempts.append({
+                    "agent": fallback_agent,
+                    "status": fallback_result.get("status"),
+                    "error": fallback_result.get("error"),
+                })
+                result = fallback_result
+                agent = fallback_agent
+                if result.get("status") == "completed":
+                    break
+            except Exception as exc:
+                fallback_attempts.append({
+                    "agent": fallback_agent,
+                    "status": "exception",
+                    "reason": str(exc) if isinstance(exc, (AgentError, FleetRateLimitError)) else type(exc).__name__.lower(),
+                })
+                continue
+    if fallback_attempts:
+        result["fallback_attempts"] = fallback_attempts
     result.update({
         "role": role,
+        "requested_agent": requested_agent,
+        "routed_from": requested_agent if requested_agent != agent else None,
         "name": name or default_agentin_name(agent),
         "scope_count": len(scope),
         "write_path_count": len(write_paths),
@@ -8010,6 +8301,9 @@ def status_agent(
             "disabled" if gate_reason in {"account_disabled", "series_disabled"} else
             "unknown"
         )
+        usage = current_fleet_service().gemini_usage_status(
+            headless_descriptor.account_id or "unknown"
+        )
         return {
             "agent": agent,
             "label": cfg["label"],
@@ -8030,7 +8324,17 @@ def status_agent(
             "last_assignment": latest_assignment,
             "headless_job": job,
             "limit_state": {**headless_gate, "state": gate_state, "limited": gate_state == "limited"},
-            "usage_watchdog": {"state": "not_applicable", "raw_output": "not_returned"},
+            "usage": usage,
+            "usage_watchdog": {
+                "state": "active" if usage.get("probe_state") == "fresh" else "degraded",
+                "provider": "gemini_api",
+                "account_id": headless_descriptor.account_id,
+                "probe_state": usage.get("probe_state"),
+                "rpm_observed": usage.get("rpm_observed"),
+                "tpm_observed": usage.get("tpm_observed"),
+                "rpd_observed": usage.get("rpd_observed"),
+                "raw_output": "not_returned",
+            },
             "response_state": {
                 "state": f"headless_{state or 'unknown'}",
                 "raw_output": "not_returned",
@@ -9431,12 +9735,23 @@ def fleet_usage_watchdog(agent: str = "all", *, dry_run: bool = False) -> dict[s
         selected,
         run_agent,
     )["results"]
+    try:
+        gemini_usage = current_fleet_service().gemini_usage_watchdog()
+    except Exception:
+        gemini_usage = {
+            "provider": "gemini_api",
+            "state": "unknown",
+            "accounts": [],
+            "stale_or_unknown_accounts": [],
+            "raw_output": "not_returned",
+        }
     return {
         "agent": agent,
         "dry_run": dry_run,
         "results": results,
         "result_count": len(results),
         "total_count": len(selected),
+        "gemini": gemini_usage,
         "raw_output": "not_returned",
     }
 
@@ -9544,6 +9859,16 @@ def parse_skill_path(home: Path, path: Path) -> dict[str, str]:
 
     if len(parts) >= 4 and parts[0] == "skills" and parts[1] == ".system":
         return {"name": parts[2], "source": "system", "plugin": ""}
+
+    if len(parts) >= 4 and parts[:2] == ("skills", ".portable"):
+        namespace = parts[2]
+        if namespace == "plugins" and len(parts) >= 5:
+            name = parts[4]
+            plugin = f"portable:{parts[3]}"
+        else:
+            name = parts[3]
+            plugin = ""
+        return {"name": name, "source": "portable", "plugin": plugin}
 
     if len(parts) >= 6 and parts[:3] == ("plugins", "cache", "openai-curated"):
         return {"name": path.parent.name, "source": "plugin_cache", "plugin": f"{parts[3]}@openai-curated"}
@@ -9865,9 +10190,14 @@ def assignment_prompt(
     subagent_admission: dict[str, Any] | None,
     requires_search: bool = False,
     live_data_topic: str | None = None,
+    required_skills: list[str] | None = None,
 ) -> str:
     display_name = (name or default_agentin_name(agent)).strip()
-    skill_line = skill.strip() if skill else "kein spezieller Skill vorgegeben"
+    required = list(required_skills or [])
+    if skill and skill not in required:
+        required.insert(0, skill.strip())
+    skill_line = ", ".join(required) if required else "kein spezieller Skill vorgegeben"
+    legacy_skill_line = f"Skill: {skill}" if skill else "Skill: keiner"
     search_lines: list[str] = []
     if requires_search:
         topic = live_data_topic.strip() if live_data_topic else task
@@ -9916,14 +10246,15 @@ def assignment_prompt(
                 f"Name: {display_name}",
                 "Rolle: Exploriererin",
                 f"Modell: {model}",
-                f"Skill: {skill_line}",
+                legacy_skill_line,
+                f"Mindestskills: {skill_line}",
                 f"Scope:\n{bullet_block(scope)}",
                 "Darf schreiben: nein",
                 *subagent_lines,
                 f"Web-/Live-Daten:\n{search_block}",
                 f"Stabiler Kontext:\n{bullet_block(context)}",
                 f"Aufgabe: {task}",
-                f"Grenzen:\n{bullet_block(forbidden)}",
+                f"Blacklist / Grenzen:\n{bullet_block(forbidden)}",
                 "Rueckgabe: knappe Fakten, relevante Dateien/Zeilen, Empfehlung",
             ]
         )
@@ -9934,14 +10265,15 @@ def assignment_prompt(
             f"Name: {display_name}",
             "Rolle: Arbeitsbiene",
             f"Modell: {model}",
-            f"Skill: {skill_line}",
+            legacy_skill_line,
+            f"Mindestskills: {skill_line}",
             f"Scope:\n{bullet_block(scope)}",
             f"Darf schreiben: ja, nur:\n{bullet_block(write_paths)}",
             *subagent_lines,
             f"Web-/Live-Daten:\n{search_block}",
             f"Stabiler Kontext:\n{bullet_block(context)}",
             f"Aktuelle Aufgabe: {task}",
-            f"Grenzen:\n{bullet_block(forbidden)}",
+            f"Blacklist / Grenzen:\n{bullet_block(forbidden)}",
             "Rueckgabe: Root Cause, Aenderung, Tests, offene Risiken",
         ]
     )
@@ -10035,6 +10367,7 @@ def _assign_agent_unlocked(
     live_data_topic: str | None = None,
     operation: str = "agent_assign",
     lease: dict[str, Any] | None = None,
+    required_skills: Any = None,
 ) -> dict[str, Any]:
     require_fleet_recovery_ready("agent_assign")
     agent = canonical_agent_id(agent)
@@ -10048,6 +10381,9 @@ def _assign_agent_unlocked(
         raise AgentError("role must be 'exploriererin' or 'arbeitsbiene'")
     task = bounded_text(task, field="task", max_chars=MAX_TASK_TEXT, required=True) or ""
     skill = bounded_text(skill, field="skill", max_chars=MAX_SKILL_REF) if skill is not None else None
+    required_skills = as_string_list(required_skills, field="required_skills", max_chars=MAX_SKILL_REF)
+    if skill and skill not in required_skills:
+        required_skills.insert(0, skill)
     name = bounded_text(name, field="name", max_chars=MAX_AGENTIN_NAME) if name is not None else None
     group_id = normalize_routing_context_id(group_id, field="group_id")
     job_id = normalize_routing_context_id(job_id, field="job_id")
@@ -10071,8 +10407,9 @@ def _assign_agent_unlocked(
     matches: list[dict[str, str]] = []
     if skill:
         matches = skill_matches(agent, skill)
-        if not matches and not allow_missing_skill:
-            raise AgentError(f"skill not found for agent {agent}")
+    missing_skills = [item for item in required_skills if not skill_matches(agent, item)]
+    if missing_skills and not allow_missing_skill:
+        raise AgentError(f"skill not found for agent {agent}")
 
     if allow_unauthenticated:
         ensure_agent_not_blocked_by_codex_usage(agent)
@@ -10128,6 +10465,7 @@ def _assign_agent_unlocked(
         subagent_admission=subagent_admission,
         requires_search=requires_search,
         live_data_topic=live_data_topic,
+        required_skills=required_skills,
     )
     if len(prompt) > MAX_ASSIGNMENT_TEXT:
         raise AgentError(f"assignment prompt exceeds {MAX_ASSIGNMENT_TEXT} characters")
@@ -14272,6 +14610,18 @@ def _interrupt_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]
     if _headless_descriptor(agent) is not None:
         current = HEADLESS_JOBS.status(agent)
         if current.get("status") not in {"running", "cancelling"}:
+            marker = _headless_marker(agent)
+            if marker.get("state") in {"running", "cancelling"}:
+                cancelled = cancel_headless_job(agent, force=force)
+                return {
+                    "agent": agent,
+                    "status": "interrupt_sent" if cancelled.get("status") != "identity_unverified" else "identity_unverified",
+                    "backend": "headless_job",
+                    "job": cancelled,
+                    "lease": agent_lease_status(agent),
+                    "raw_output": "not_returned",
+                    "response_output": "not_returned",
+                }
             return {
                 "agent": agent,
                 "status": "not_running",
@@ -14747,6 +15097,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 task=args.get("task"),
                 scope=args.get("scope"),
                 skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
+                required_skills=args.get("required_skills"),
                 write_paths=args.get("write_paths"),
                 context=args.get("context"),
                 forbidden=args.get("forbidden"),
@@ -14772,6 +15123,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 task=args.get("task"),
                 scope=args.get("scope"),
                 skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
+                required_skills=args.get("required_skills"),
                 write_paths=args.get("write_paths"),
                 context=args.get("context"),
                 forbidden=args.get("forbidden"),
@@ -14795,6 +15147,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 task=args.get("task"),
                 scope=args.get("scope"),
                 skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
+                required_skills=args.get("required_skills"),
                 context=args.get("context"),
                 forbidden=args.get("forbidden"),
                 name=args.get("name") if isinstance(args.get("name"), str) else None,
@@ -14817,6 +15170,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 task=args.get("task"),
                 scope=args.get("scope"),
                 skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
+                required_skills=args.get("required_skills"),
                 context=args.get("context"),
                 forbidden=args.get("forbidden"),
                 name=args.get("name") if isinstance(args.get("name"), str) else None,
@@ -14841,6 +15195,7 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 task=args.get("task"),
                 scope=args.get("scope"),
                 skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
+                required_skills=args.get("required_skills"),
                 write_paths=args.get("write_paths"),
                 context=args.get("context"),
                 forbidden=args.get("forbidden"),
@@ -15702,6 +16057,7 @@ def _fleet_artifact_builder(
                 taskset_stat=taskset_stat,
                 true_executable=true_executable,
                 true_stat=true_stat,
+                include_portable_skills=True,
             )
 
         def validate() -> None:
@@ -15729,6 +16085,7 @@ def _fleet_home_artifacts(
     taskset_stat: os.stat_result | None = None,
     true_executable: Path = FLEET_TRUE_EXECUTABLE,
     true_stat: os.stat_result | None = None,
+    include_portable_skills: bool = False,
 ) -> dict[str, Any]:
     executable_checks = tuple(
         (path, expected)
@@ -15780,6 +16137,8 @@ def _fleet_home_artifacts(
             0o600,
         )
         files[".gemini/policies/codex-master.toml"] = (policy.encode("utf-8"), 0o600)
+        if include_portable_skills:
+            files.update({name: (data, 0o600) for name, data in portable_gemini_skill_artifacts().items()})
     if agent.provider is Provider.OLLAMA_LOCAL and agent.runner is RunnerKind.CODEX_CLI:
         files["model.json"] = (fleet_model_catalog(agent).encode("utf-8"), 0o600)
     marker = {
@@ -15917,7 +16276,7 @@ def _fleet_tree_entries(
             raise AgentError(error) from exc
         for name in os.listdir(current_fd):
             entry_count += 1
-            if entry_count > 128 or not isinstance(name, str) or name in {"", ".", ".."} or "/" in name:
+            if entry_count > 4096 or not isinstance(name, str) or name in {"", ".", ".."} or "/" in name:
                 raise AgentError(error)
             relative = f"{prefix}/{name}" if prefix else name
             current = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
@@ -17072,7 +17431,7 @@ def _fleet_managed_home_state(
             "files",
         }
         wrapper_name = "codex" if agent.runner is RunnerKind.CODEX_CLI else "gemini"
-        expected_files = (
+        base_expected_files = (
             {wrapper_name, "config.toml"}
             | ({"model.json"} if agent.provider is Provider.OLLAMA_LOCAL else set())
             if agent.runner is RunnerKind.CODEX_CLI
@@ -17094,11 +17453,24 @@ def _fleet_managed_home_state(
             or marker.get("provider") != agent.provider.value
             or marker.get("model") != agent.model
             or not isinstance(marker.get("managed_files"), list)
-            or set(marker["managed_files"]) != expected_files
             or not isinstance(marker.get("files"), dict)
-            or set(marker["files"]) != expected_files
         ):
             raise AgentError("fleet_home_content_invalid")
+        marker_files = set(marker["managed_files"])
+        marker_digest_files = set(marker["files"])
+        portable_files = {
+            name for name in marker_files
+            if isinstance(name, str) and name.startswith("skills/.portable/") and name.endswith("/SKILL.md")
+        }
+        if (
+            not base_expected_files <= marker_files
+            or marker_files != marker_digest_files
+            or len(portable_files) > MAX_PORTABLE_SKILLS
+            or any(not _fleet_managed_name(name) for name in marker_files)
+            or any(not name.startswith("skills/.portable/") for name in marker_files - base_expected_files)
+        ):
+            raise AgentError("fleet_home_content_invalid")
+        expected_files = marker_files
         for name in expected_files:
             digest = marker["files"].get(name)
             if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
@@ -21555,6 +21927,7 @@ TOOLS: list[dict[str, Any]] = [
                 "role": {"type": "string", "enum": ["exploriererin", "arbeitsbiene"]},
                 "task": text_schema(MAX_TASK_TEXT),
                 "skill": text_schema(MAX_SKILL_REF),
+                "required_skills": text_array_schema(max_chars=MAX_SKILL_REF, default=[]),
                 "scope": text_array_schema(max_chars=MAX_PATH_TEXT, default=[]),
                 "write_paths": text_array_schema(max_chars=MAX_PATH_TEXT, default=[]),
                 "context": text_array_schema(default=[]),
@@ -21587,6 +21960,7 @@ TOOLS: list[dict[str, Any]] = [
                 "agent": agent_selector_schema(single=True),
                 "task": text_schema(MAX_TASK_TEXT),
                 "skill": text_schema(MAX_SKILL_REF),
+                "required_skills": text_array_schema(max_chars=MAX_SKILL_REF, default=[]),
                 "scope": text_array_schema(max_chars=MAX_PATH_TEXT, default=[]),
                 "context": text_array_schema(default=[]),
                 "forbidden": text_array_schema(default=[]),
@@ -21622,6 +21996,7 @@ TOOLS: list[dict[str, Any]] = [
                     description="Optional concrete current-data topic, for example weather in Berlin today.",
                 ),
                 "skill": text_schema(MAX_SKILL_REF),
+                "required_skills": text_array_schema(max_chars=MAX_SKILL_REF, default=[]),
                 "scope": text_array_schema(max_chars=MAX_PATH_TEXT, default=[]),
                 "context": text_array_schema(default=[]),
                 "forbidden": text_array_schema(default=[]),
@@ -21653,6 +22028,7 @@ TOOLS: list[dict[str, Any]] = [
                 "agent": agent_selector_schema(single=True),
                 "task": text_schema(MAX_TASK_TEXT),
                 "skill": text_schema(MAX_SKILL_REF),
+                "required_skills": text_array_schema(max_chars=MAX_SKILL_REF, default=[]),
                 "scope": text_array_schema(max_chars=MAX_PATH_TEXT, default=[]),
                 "write_paths": text_array_schema(max_chars=MAX_PATH_TEXT, min_items=1),
                 "context": text_array_schema(default=[]),
@@ -22347,7 +22723,10 @@ def _publish_startup_fleet_inventory() -> None:
     try:
         snapshot = _readonly_fleet_service().load()
         if snapshot.series:
-            publish_agent_inventory(build_inventory(snapshot, AGENT_POOL_ROOT))
+            publish_agent_inventory(merge_agent_inventories(
+                _legacy_inventory(),
+                build_inventory(snapshot, AGENT_POOL_ROOT),
+            ))
         else:
             swap_agent_inventory(None)
     except Exception:
@@ -22563,10 +22942,11 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_assign.add_argument("--role", choices=["exploriererin", "arbeitsbiene"], required=True)
     p_assign.add_argument("--task", required=True)
     p_assign.add_argument("--skill")
+    p_assign.add_argument("--required-skill", dest="required_skills", action="append", default=[])
     p_assign.add_argument("--scope", action="append", default=[])
     p_assign.add_argument("--write-path", dest="write_paths", action="append", default=[])
     p_assign.add_argument("--context", action="append", default=[])
-    p_assign.add_argument("--forbid", dest="forbidden", action="append", default=[])
+    p_assign.add_argument("--forbid", "--blacklist", dest="forbidden", action="append", default=[])
     p_assign.add_argument("--name")
     p_assign.add_argument("--group-id")
     p_assign.add_argument("--job-id")
@@ -22579,9 +22959,10 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_assign_readonly.add_argument("agent")
     p_assign_readonly.add_argument("--task", required=True)
     p_assign_readonly.add_argument("--skill")
+    p_assign_readonly.add_argument("--required-skill", dest="required_skills", action="append", default=[])
     p_assign_readonly.add_argument("--scope", action="append", default=[])
     p_assign_readonly.add_argument("--context", action="append", default=[])
-    p_assign_readonly.add_argument("--forbid", dest="forbidden", action="append", default=[])
+    p_assign_readonly.add_argument("--forbid", "--blacklist", dest="forbidden", action="append", default=[])
     p_assign_readonly.add_argument("--name")
     p_assign_readonly.add_argument("--group-id")
     p_assign_readonly.add_argument("--job-id")
@@ -22595,9 +22976,10 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_assign_live_data.add_argument("--task", required=True)
     p_assign_live_data.add_argument("--live-data-topic")
     p_assign_live_data.add_argument("--skill")
+    p_assign_live_data.add_argument("--required-skill", dest="required_skills", action="append", default=[])
     p_assign_live_data.add_argument("--scope", action="append", default=[])
     p_assign_live_data.add_argument("--context", action="append", default=[])
-    p_assign_live_data.add_argument("--forbid", dest="forbidden", action="append", default=[])
+    p_assign_live_data.add_argument("--forbid", "--blacklist", dest="forbidden", action="append", default=[])
     p_assign_live_data.add_argument("--name")
     p_assign_live_data.add_argument("--group-id")
     p_assign_live_data.add_argument("--job-id")
@@ -22610,10 +22992,11 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_assign_write.add_argument("agent")
     p_assign_write.add_argument("--task", required=True)
     p_assign_write.add_argument("--skill")
+    p_assign_write.add_argument("--required-skill", dest="required_skills", action="append", default=[])
     p_assign_write.add_argument("--scope", action="append", default=[])
     p_assign_write.add_argument("--write-path", dest="write_paths", action="append", default=[])
     p_assign_write.add_argument("--context", action="append", default=[])
-    p_assign_write.add_argument("--forbid", dest="forbidden", action="append", default=[])
+    p_assign_write.add_argument("--forbid", "--blacklist", dest="forbidden", action="append", default=[])
     p_assign_write.add_argument("--name")
     p_assign_write.add_argument("--group-id")
     p_assign_write.add_argument("--job-id")
@@ -22673,12 +23056,17 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_account_probe = account_sub.add_parser("probe")
     p_account_probe.add_argument("--account-id", required=True)
     p_account_probe.add_argument("--expected-generation", type=int, required=True)
+    p_account_sync = account_sub.add_parser("sync-env")
+    p_account_sync.add_argument("--first-key", type=int, default=1)
+    p_account_sync.add_argument("--last-key", type=int, default=20)
+    p_account_sync.add_argument("--no-activate-series", action="store_true")
     p_account_disable = account_sub.add_parser("disable")
     p_account_disable.add_argument("--account-id", required=True)
     p_account_disable.add_argument("--expected-generation", type=int, required=True)
     p_account_delete = account_sub.add_parser("delete")
     p_account_delete.add_argument("--account-id", required=True)
     p_account_delete.add_argument("--expected-generation", type=int, required=True)
+    fleet_sub.add_parser("sync-skills")
 
     p_fleet_series = fleet_sub.add_parser("series")
     series_sub = p_fleet_series.add_subparsers(dest="fleet_series_command", required=True)
@@ -22822,6 +23210,12 @@ def _main_cli_impl(argv: list[str]) -> int:
                         "account_id": args.account_id,
                         "expected_generation": args.expected_generation,
                     }))
+                if args.fleet_account_command == "sync-env":
+                    return print_json(fleet_account_sync_env(
+                        first_key=args.first_key,
+                        last_key=args.last_key,
+                        activate_series=not args.no_activate_series,
+                    ))
                 if args.fleet_account_command == "disable":
                     return print_json(call_validated_tool("fleet_account_disable", {
                         "account_id": args.account_id,
@@ -22832,6 +23226,8 @@ def _main_cli_impl(argv: list[str]) -> int:
                         "account_id": args.account_id,
                         "expected_generation": args.expected_generation,
                     }))
+            if args.fleet_namespace == "sync-skills":
+                return print_json(fleet_sync_gemini_skills())
             if args.fleet_namespace == "series":
                 if args.fleet_series_command == "list":
                     return print_json(call_validated_tool("fleet_series_list", {}))
@@ -23095,6 +23491,7 @@ def _main_cli_impl(argv: list[str]) -> int:
                         "role": args.role,
                         "task": args.task,
                         "skill": args.skill,
+                        **({"required_skills": args.required_skills} if args.required_skills else {}),
                         "scope": args.scope,
                         "write_paths": args.write_paths,
                         "context": args.context,
@@ -23117,6 +23514,7 @@ def _main_cli_impl(argv: list[str]) -> int:
                         "agent": args.agent,
                         "task": args.task,
                         "skill": args.skill,
+                        **({"required_skills": args.required_skills} if args.required_skills else {}),
                         "scope": args.scope,
                         "context": args.context,
                         "forbidden": args.forbidden,
@@ -23139,6 +23537,7 @@ def _main_cli_impl(argv: list[str]) -> int:
                         "task": args.task,
                         "live_data_topic": args.live_data_topic,
                         "skill": args.skill,
+                        **({"required_skills": args.required_skills} if args.required_skills else {}),
                         "scope": args.scope,
                         "context": args.context,
                         "forbidden": args.forbidden,
@@ -23160,6 +23559,7 @@ def _main_cli_impl(argv: list[str]) -> int:
                         "agent": args.agent,
                         "task": args.task,
                         "skill": args.skill,
+                        **({"required_skills": args.required_skills} if args.required_skills else {}),
                         "scope": args.scope,
                         "write_paths": args.write_paths,
                         "context": args.context,
@@ -23955,6 +24355,7 @@ def _fleet_public_account(snapshot: FleetSnapshot, account_id: str) -> dict[str,
                 "auth_kind": account.auth_kind.value,
                 "secret_state": account.secret_state.value,
                 "limit_state": account.limit_state.value,
+                "billing_group": FleetService.gemini_billing_group(account.account_id),
                 "enabled": account.enabled,
                 "raw_output": "not_returned",
             }
@@ -23999,6 +24400,7 @@ def fleet_account_list() -> dict[str, Any]:
             "auth_kind": account.auth_kind.value,
             "secret_state": account.secret_state.value,
             "limit_state": account.limit_state.value,
+            "billing_group": FleetService.gemini_billing_group(account.account_id),
             "enabled": account.enabled,
         }
         for account in snapshot.accounts
@@ -24007,6 +24409,180 @@ def fleet_account_list() -> dict[str, Any]:
         "generation": snapshot.generation,
         "accounts": accounts,
         "account_count": len(accounts),
+        "raw_output": "not_returned",
+    }
+
+
+def _read_hive_api_tokens(path: Path = HIVE_API_TOKEN_ENV_FILE) -> dict[int, str]:
+    """Read only The_Hive_N assignments from the private local token file."""
+
+    try:
+        file_stat = path.lstat()
+    except OSError as exc:
+        raise AgentError("api_token_env_unavailable") from exc
+    if (
+        not stat_module.S_ISREG(file_stat.st_mode)
+        or getattr(file_stat, "st_nlink", 1) != 1
+        or file_stat.st_uid != os.geteuid()
+        or stat_module.S_IMODE(file_stat.st_mode) & 0o077
+    ):
+        raise AgentError("api_token_env_invalid")
+    text = read_private_regular_text(path, 512 * 1024, "api_token_env_unavailable")
+    tokens: dict[int, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        match = re.fullmatch(r"The_Hive_(\d{1,2})\s*=\s*(.*)", line)
+        if match is None:
+            continue
+        number = int(match.group(1))
+        value = match.group(2).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        if not value:
+            continue
+        if (
+            not 1 <= number <= MAX_HIVE_API_KEYS
+            or len(value.encode("utf-8")) > 16 * 1024
+            or any(character.isspace() or ord(character) < 32 for character in value)
+            or number in tokens
+        ):
+            raise AgentError("api_token_env_invalid")
+        tokens[number] = value
+    return tokens
+
+
+def _hive_series_prefix(number: int) -> str:
+    if not 1 <= number <= 20:
+        raise AgentError("hive_series_prefix_unavailable")
+    return chr(ord("f") + number)
+
+
+def fleet_account_sync_env(
+    *,
+    first_key: int = 1,
+    last_key: int = 20,
+    activate_series: bool = True,
+) -> dict[str, Any]:
+    """Synchronize The_Hive_N keys and optionally activate one-agent series."""
+
+    if (
+        isinstance(first_key, bool)
+        or isinstance(last_key, bool)
+        or not isinstance(first_key, int)
+        or not isinstance(last_key, int)
+        or not 1 <= first_key <= last_key <= MAX_HIVE_API_KEYS
+    ):
+        raise AgentError("invalid_hive_key_range")
+    if not isinstance(activate_series, bool):
+        raise AgentError("invalid_hive_series_flag")
+    tokens = _read_hive_api_tokens()
+    requested = list(range(first_key, last_key + 1))
+    missing = [number for number in requested if number not in tokens]
+    configured: list[int] = []
+    probe_results: list[dict[str, Any]] = []
+    ready_models: dict[int, str] = {}
+    for number in requested:
+        secret = tokens.get(number)
+        if secret is None:
+            continue
+        account_id = f"the-hive-{number}"
+        label = f"The Hive {number}"
+        generation = current_fleet_service().load().generation
+        fleet_account_upsert(
+            account_id=account_id,
+            label=label,
+            provider=Provider.GEMINI_API.value,
+            auth_kind=AuthKind.API_KEY.value,
+            enabled=True,
+            expected_generation=generation,
+        )
+        generation = current_fleet_service().load().generation
+        fleet_account_set_secret(
+            account_id=account_id,
+            secret=secret,
+            expected_generation=generation,
+        )
+        configured.append(number)
+        generation = current_fleet_service().load().generation
+        try:
+            probe = fleet_account_probe(account_id=account_id, expected_generation=generation)
+        except AgentError as exc:
+            probe = {
+                "probed": False,
+                "ready": False,
+                "reason": str(exc),
+                "raw_output": "not_returned",
+            }
+        probe_results.append({"key": number, "account_id": account_id, **probe})
+        if probe.get("ready") is True and isinstance(probe.get("model"), str):
+            ready_models[number] = probe["model"]
+        secret = ""
+
+    activated: list[dict[str, Any]] = []
+    if activate_series:
+        for number, model in ready_models.items():
+            prefix = _hive_series_prefix(number)
+            generation = current_fleet_service().load().generation
+            try:
+                applied = fleet_series_apply(
+                    prefix=prefix,
+                    count=1,
+                    runner=RunnerKind.GEMINI_CLI.value,
+                    provider=Provider.GEMINI_API.value,
+                    model=model,
+                    account_id=f"the-hive-{number}",
+                    enabled=True,
+                    expected_generation=generation,
+                )
+                activated.append({"key": number, "prefix": prefix, **applied})
+            except AgentError as exc:
+                activated.append({
+                    "key": number,
+                    "prefix": prefix,
+                    "activated": False,
+                    "reason": str(exc),
+                    "raw_output": "not_returned",
+                })
+    return {
+        "requested_keys": requested,
+        "configured_keys": configured,
+        "missing_keys": missing,
+        "probe_results": probe_results,
+        "activated_series": activated,
+        "source": "private_api_token_env",
+        "credential_values": "not_returned",
+        "raw_output": "not_returned",
+    }
+
+
+def fleet_sync_gemini_skills() -> dict[str, Any]:
+    """Refresh the portable Markdown skill projection in every Gemini home."""
+
+    inventory = current_agent_inventory()
+    synced: list[str] = []
+    failed: list[dict[str, str]] = []
+    for agent_id in inventory.agent_ids:
+        descriptor = inventory.agents.get(agent_id)
+        if descriptor is None or descriptor.runner is not RunnerKind.GEMINI_CLI:
+            continue
+        try:
+            sync_gemini_skill_home(agent_id)
+        except Exception as exc:
+            failed.append({
+                "agent": agent_id,
+                "reason": str(exc) if isinstance(exc, AgentError) else type(exc).__name__.lower(),
+            })
+        else:
+            synced.append(agent_id)
+    return {
+        "synced_agents": synced,
+        "failed": failed,
+        "synced_count": len(synced),
+        "failed_count": len(failed),
         "raw_output": "not_returned",
     }
 
@@ -24325,6 +24901,16 @@ def fleet_account_probe(*, account_id: str, expected_generation: int) -> dict[st
                 expected_generation=expected_generation,
             )
         except FleetRateLimitError as exc:
+            with contextlib.suppress(Exception):
+                current_fleet_service().record_gemini_event(
+                    event_type="account_probe",
+                    agent_id=None,
+                    account_id=account_id,
+                    assignment_id=None,
+                    status="failed",
+                    reason=exc.reason,
+                    model="probe",
+                )
             return {
                 "probed": False,
                 "generation": expected_generation,
@@ -24338,6 +24924,25 @@ def fleet_account_probe(*, account_id: str, expected_generation: int) -> dict[st
             if code not in {"generation_conflict", "invalid_account", "secret_missing", "secret_unavailable", "secret_read_failed"}:
                 code = "provider_unavailable"
             raise AgentError(code) from None
+        probe_status = "probe" if result.get("ready") is True else (
+            "rate_limited" if result.get("reason") == "limit_active" else "failed"
+        )
+        with contextlib.suppress(Exception):
+            service = current_fleet_service()
+            service.record_gemini_usage(
+                account_id,
+                model=str(result.get("model") or "probe"),
+                status=probe_status,
+            )
+            service.record_gemini_event(
+                event_type="account_probe",
+                agent_id=None,
+                account_id=account_id,
+                assignment_id=None,
+                status="completed" if result.get("ready") is True else "failed",
+                reason=result.get("reason") if isinstance(result.get("reason"), str) else None,
+                model=str(result.get("model") or "probe"),
+            )
         return {**result, "raw_output": "not_returned"}
 
 
@@ -24403,6 +25008,7 @@ def _fleet_artifacts(agent: AgentDescriptor, executable: Path) -> dict[str, byte
     if agent.runner is RunnerKind.GEMINI_CLI:
         artifacts[".gemini/settings.json"] = config_text.encode()
         artifacts[".gemini/policies/codex-master.toml"] = b'approvalMode = "deny"\n'
+        artifacts.update(portable_gemini_skill_artifacts())
     marker = {
         "schema_version": 1,
         "kind": "codex_master_fleet_agent",
@@ -24415,6 +25021,68 @@ def _fleet_artifacts(agent: AgentDescriptor, executable: Path) -> dict[str, byte
         "files": {name: hashlib.sha256(data).hexdigest() for name, data in sorted(artifacts.items())},
     }
     artifacts[FLEET_AGENT_MARKER_FILE] = (json.dumps(marker, indent=2, sort_keys=True) + "\n").encode()
+    return artifacts
+
+
+def portable_gemini_skill_artifacts() -> dict[str, bytes]:
+    """Materialize portable SKILL.md documents without copying Codex plugins."""
+
+    home = Path.home()
+    roots = [
+        (home / ".codex-agents" / "b1" / "skills" / ".system", "system"),
+        (home / ".codex-agents" / "b1" / "skills", "agents"),
+        (home / ".agents" / "skills", "agents"),
+    ]
+    artifacts: dict[str, bytes] = {}
+    for root, namespace in roots:
+        if not is_real_directory_no_symlink(root):
+            continue
+        for skill_file in sorted(root.glob("*/SKILL.md")):
+            if namespace == "agents" and skill_file.parent.name == ".system":
+                continue
+            try:
+                stat_result = skill_file.lstat()
+                if (
+                    not stat_module.S_ISREG(stat_result.st_mode)
+                    or stat_module.S_ISLNK(stat_result.st_mode)
+                    or getattr(stat_result, "st_nlink", 1) != 1
+                    or stat_result.st_size > MAX_FLEET_ARTIFACT_BYTES
+                ):
+                    continue
+                data = skill_file.read_bytes()
+            except OSError:
+                continue
+            target = f"skills/.portable/{namespace}/{skill_file.parent.name}/SKILL.md"
+            artifacts.setdefault(target, data)
+            if len(artifacts) >= MAX_PORTABLE_SKILLS:
+                return artifacts
+
+    plugin_root = home / ".codex-agents" / "b1" / "plugins" / "cache"
+    if is_real_directory_no_symlink(plugin_root):
+        for skill_file in sorted(plugin_root.glob("*/**/skills/*/SKILL.md")):
+            try:
+                stat_result = skill_file.lstat()
+                if (
+                    not stat_module.S_ISREG(stat_result.st_mode)
+                    or stat_module.S_ISLNK(stat_result.st_mode)
+                    or getattr(stat_result, "st_nlink", 1) != 1
+                    or stat_result.st_size > MAX_FLEET_ARTIFACT_BYTES
+                ):
+                    continue
+                data = skill_file.read_bytes()
+            except OSError:
+                continue
+            parts = skill_file.parts
+            try:
+                cache_index = parts.index("cache")
+                plugin = parts[cache_index + 2]
+                skill_name = skill_file.parent.name
+            except (ValueError, IndexError):
+                continue
+            target = f"skills/.portable/plugins/{plugin}/{skill_name}/SKILL.md"
+            artifacts.setdefault(target, data)
+            if len(artifacts) >= MAX_PORTABLE_SKILLS:
+                break
     return artifacts
 
 
@@ -24473,6 +25141,26 @@ def _fleet_write_home(home: Path, artifacts: dict[str, bytes]) -> bool:
         except OSError as exc:
             raise AgentError("fleet_home_cleanup_failed") from exc
     return not existed
+
+
+def sync_gemini_skill_home(agent: str) -> bool:
+    """Refresh the managed portable skill projection for one Gemini home."""
+
+    descriptor = _headless_descriptor(canonical_agent_id(agent))
+    if descriptor is None:
+        return False
+    executable = _headless_executable(descriptor)
+    with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+        AGENT_POOL_ROOT,
+        ensure=False,
+        error_text="fleet_pool_root_invalid",
+        require_private=True,
+    ):
+        home = descriptor.home
+        if not path_present_no_follow(home):
+            return False
+        _fleet_write_home(home, _fleet_artifacts(descriptor, executable))
+    return True
 
 
 def _fleet_managed_name(name: object) -> bool:

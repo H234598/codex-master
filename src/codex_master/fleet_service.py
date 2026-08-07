@@ -31,6 +31,8 @@ from .fleet_runners import ProbeResult
 MAX_REGISTRY_BYTES = 1024 * 1024
 MAX_LIMIT_BYTES = 256 * 1024
 MAX_RATE_LIMIT_BYTES = 256 * 1024
+MAX_USAGE_BYTES = 1024 * 1024
+MAX_EVENT_BYTES = 512 * 1024
 MAX_SECRET_BYTES = 16 * 1024
 GEMINI_MIN_REQUEST_INTERVAL_SECONDS = 60
 GEMINI_REQUEST_LEASE_SECONDS = 120 * 60 + 60
@@ -80,6 +82,8 @@ class FleetPaths:
     lock: Path = field(repr=False)
     recovery: Path = field(repr=False)
     mutation_lock: Path = field(repr=False)
+    usage: Path = field(repr=False)
+    events: Path = field(repr=False)
 
     @classmethod
     def from_state_root(cls, root: Path) -> FleetPaths:
@@ -93,6 +97,8 @@ class FleetPaths:
             lock=fleet_root / "registry.lock",
             recovery=fleet_root / "recovery.json",
             mutation_lock=fleet_root / "mutation.lock",
+            usage=fleet_root / "usage.json",
+            events=fleet_root / "events.jsonl",
         )
 
 
@@ -312,6 +318,256 @@ class FleetService:
         if self._load_rate_limits() != entries:
             raise ValueError("gemini_rate_limits_write_verification_failed")
 
+    def _load_usage(self) -> dict[str, list[dict[str, object]]]:
+        self._ensure_layout()
+        try:
+            text = self._io.read_text(self._paths.usage, MAX_USAGE_BYTES, "could_not_read_gemini_usage")
+            if text is None:
+                return {}
+            raw = json.loads(text)
+            if not isinstance(raw, dict) or raw.get("schema_version") != 1 or not isinstance(raw.get("accounts"), dict):
+                raise ValueError("invalid_gemini_usage")
+            result: dict[str, list[dict[str, object]]] = {}
+            for account_id, events in raw["accounts"].items():
+                if not isinstance(account_id, str) or not _ACCOUNT_ID_RE.fullmatch(account_id) or not isinstance(events, list):
+                    raise ValueError("invalid_gemini_usage")
+                clean: list[dict[str, object]] = []
+                for event in events:
+                    if not isinstance(event, dict):
+                        raise ValueError("invalid_gemini_usage")
+                    timestamp = event.get("at_utc")
+                    if self._parse_time(timestamp) is None:
+                        raise ValueError("invalid_gemini_usage")
+                    model = event.get("model")
+                    if not isinstance(model, str) or not 1 <= len(model) <= 200:
+                        raise ValueError("invalid_gemini_usage")
+                    for key in ("input_tokens", "output_tokens"):
+                        value = event.get(key, 0)
+                        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2**63 - 1:
+                            raise ValueError("invalid_gemini_usage")
+                    status = event.get("status")
+                    if not isinstance(status, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", status):
+                        raise ValueError("invalid_gemini_usage")
+                    clean.append({
+                        "at_utc": timestamp,
+                        "model": model,
+                        "input_tokens": event.get("input_tokens", 0),
+                        "output_tokens": event.get("output_tokens", 0),
+                        "status": status,
+                    })
+                result[account_id] = clean[-2000:]
+            return result
+        except Exception:
+            marker = self._paths.recovery.with_name("usage.recovery.json")
+            try:
+                self._io.replace_text(
+                    marker,
+                    json.dumps({"schema_version": 1, "kind": "gemini_usage_quarantine"}) + "\n",
+                )
+            except Exception:
+                pass
+            raise ValueError("invalid_gemini_usage") from None
+
+    def _write_usage(self, entries: dict[str, list[dict[str, object]]]) -> None:
+        document = {"schema_version": 1, "accounts": entries}
+        text = json.dumps(document, indent=2, sort_keys=True) + "\n"
+        self._io.replace_text(self._paths.usage, text)
+        if self._load_usage() != entries:
+            raise ValueError("gemini_usage_write_verification_failed")
+
+    @staticmethod
+    def gemini_billing_group(account_id: str) -> str:
+        match = re.fullmatch(r"the-hive-(\d+)", account_id)
+        if match:
+            number = int(match.group(1))
+            return f"the-hive-account-{((number - 1) // 10) + 1}"
+        return account_id
+
+    def record_gemini_usage(
+        self,
+        account_id: str,
+        *,
+        model: str,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        status: str = "completed",
+    ) -> dict[str, object]:
+        if not isinstance(account_id, str) or not _ACCOUNT_ID_RE.fullmatch(account_id):
+            raise ValueError("invalid_account")
+        if not isinstance(model, str) or not 1 <= len(model) <= 200:
+            raise ValueError("invalid_gemini_usage")
+        if status not in {"completed", "failed", "cancelled", "timeout", "probe", "rate_limited"}:
+            raise ValueError("invalid_gemini_usage")
+        input_value = 0 if input_tokens is None else input_tokens
+        output_value = 0 if output_tokens is None else output_tokens
+        if (
+            isinstance(input_value, bool) or not isinstance(input_value, int) or input_value < 0
+            or isinstance(output_value, bool) or not isinstance(output_value, int) or output_value < 0
+        ):
+            raise ValueError("invalid_gemini_usage")
+        with self._io.lock():
+            now = self._rate_now()
+            cutoff = now - timedelta(hours=24)
+            entries = self._load_usage()
+            events = []
+            for event in entries.get(account_id, []):
+                try:
+                    at = datetime.fromisoformat(str(event["at_utc"]).replace("Z", "+00:00"))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if at.tzinfo is not None and at.astimezone(timezone.utc) >= cutoff:
+                    events.append(event)
+            event = {
+                "at_utc": self._rate_text(now),
+                "model": model,
+                "input_tokens": input_value,
+                "output_tokens": output_value,
+                "status": status,
+            }
+            events.append(event)
+            entries[account_id] = events[-2000:]
+            self._write_usage(entries)
+        return self.gemini_usage_status(account_id)
+
+    def gemini_usage_status(self, account_id: str) -> dict[str, object]:
+        snapshot = self.load()
+        now = self._rate_now()
+        events = self._load_usage().get(account_id, [])
+        recent_minute: list[dict[str, object]] = []
+        recent_day: list[dict[str, object]] = []
+        for event in events:
+            try:
+                at = datetime.fromisoformat(str(event["at_utc"]).replace("Z", "+00:00"))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if at.tzinfo is None:
+                continue
+            age = (now - at.astimezone(timezone.utc)).total_seconds()
+            if 0 <= age <= 60:
+                recent_minute.append(event)
+            if 0 <= age <= 86400:
+                recent_day.append(event)
+        account = next((item for item in snapshot.accounts if item.account_id == account_id), None)
+        probe_age = None
+        probe_state = "unknown"
+        if account is not None and account.last_probe_at_utc is not None:
+            try:
+                probed = datetime.fromisoformat(account.last_probe_at_utc.replace("Z", "+00:00"))
+                probe_age = max(0, int((now - probed.astimezone(timezone.utc)).total_seconds()))
+                probe_state = "fresh" if self._probe_is_fresh(account.last_probe_at_utc) else "stale"
+            except (TypeError, ValueError, AttributeError):
+                probe_state = "invalid"
+        return {
+            "account_id": account_id,
+            "billing_group": self.gemini_billing_group(account_id),
+            "probe_state": probe_state,
+            "probe_age_seconds": probe_age,
+            "rpm_observed": len(recent_minute),
+            "tpm_observed": sum(int(event.get("input_tokens", 0)) + int(event.get("output_tokens", 0)) for event in recent_minute),
+            "rpd_observed": len(recent_day),
+            "input_tokens_24h": sum(int(event.get("input_tokens", 0)) for event in recent_day),
+            "output_tokens_24h": sum(int(event.get("output_tokens", 0)) for event in recent_day),
+            "last_request_at_utc": events[-1].get("at_utc") if events else None,
+            "event_count_24h": len(recent_day),
+            "raw_output": "not_returned",
+        }
+
+    def gemini_usage_watchdog(self) -> dict[str, object]:
+        snapshot = self.load()
+        accounts = [
+            self.gemini_usage_status(account.account_id)
+            for account in snapshot.accounts
+            if account.provider.value == "gemini_api"
+        ]
+        stale = [item["account_id"] for item in accounts if item["probe_state"] in {"stale", "unknown", "invalid"}]
+        return {
+            "provider": "gemini_api",
+            "account_count": len(accounts),
+            "accounts": accounts,
+            "stale_or_unknown_accounts": stale,
+            "state": "degraded" if stale else "ready",
+            "limits_source": "observed_request_and_token_counters; provider_quota_caps_not_available_locally",
+            "recent_events": self.gemini_event_status(),
+            "raw_output": "not_returned",
+        }
+
+    def gemini_event_status(self, limit: int = 20) -> list[dict[str, object]]:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("invalid_gemini_event_limit")
+        try:
+            text = self._io.read_text(self._paths.events, MAX_EVENT_BYTES, "could_not_read_gemini_events") or ""
+        except Exception:
+            return []
+        result: list[dict[str, object]] = []
+        for line in text.splitlines()[-limit:]:
+            try:
+                value = json.loads(line)
+            except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(value, dict):
+                value.pop("raw_output", None)
+                result.append(value)
+        return result
+
+    def record_gemini_event(
+        self,
+        *,
+        event_type: str,
+        agent_id: str | None,
+        account_id: str | None,
+        assignment_id: str | None,
+        status: str,
+        reason: str | None = None,
+        model: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+    ) -> dict[str, object]:
+        """Append a bounded, redacted Gemini event for master/dispatcher status."""
+
+        if self._read_only:
+            return {"recorded": False, "reason": "read_only"}
+        values = {
+            "event_type": event_type,
+            "agent_id": agent_id,
+            "account_id": account_id,
+            "assignment_id": assignment_id,
+            "status": status,
+            "reason": reason,
+            "model": model,
+            "input_tokens": input_tokens or 0,
+            "output_tokens": output_tokens or 0,
+        }
+        for key in ("event_type", "status"):
+            value = values[key]
+            if not isinstance(value, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value):
+                raise ValueError("invalid_gemini_event")
+        for key in ("agent_id", "account_id", "assignment_id", "reason", "model"):
+            value = values[key]
+            if value is not None and (not isinstance(value, str) or not 1 <= len(value) <= 300):
+                raise ValueError("invalid_gemini_event")
+        for key in ("input_tokens", "output_tokens"):
+            value = values[key]
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2**63 - 1:
+                raise ValueError("invalid_gemini_event")
+        with self._io.lock():
+            try:
+                existing = self._io.read_text(self._paths.events, MAX_EVENT_BYTES, "could_not_read_gemini_events") or ""
+            except Exception:
+                existing = ""
+            lines = [line for line in existing.splitlines() if line.strip()][-511:]
+            entry = {
+                "at_utc": self._rate_text(self._rate_now()),
+                **values,
+                "raw_output": "not_returned",
+            }
+            lines.append(json.dumps(entry, sort_keys=True, ensure_ascii=False))
+            text = "\n".join(lines) + "\n"
+            if len(text.encode("utf-8")) > MAX_EVENT_BYTES:
+                lines = lines[-256:]
+                text = "\n".join(lines) + "\n"
+            self._io.replace_text(self._paths.events, text)
+        return {"recorded": True, "event_type": event_type, "status": status}
+
     def _rate_now(self) -> datetime:
         now = self._io.utc_now()
         if not isinstance(now, datetime) or now.tzinfo is None:
@@ -372,6 +628,27 @@ class FleetService:
             }
             self._write_rate_limits(entries)
         return GeminiRequestReservation(account_id, reservation_id, self._rate_text(expires))
+
+    def gemini_rate_status(self, account_id: str) -> dict[str, object]:
+        """Return the local admission state without reserving a request."""
+
+        now = self._rate_now()
+        entry = self._load_rate_limits().get(account_id)
+        if entry is None:
+            return {"allowed": True, "reason": "ready", "retry_after_seconds": 0}
+        in_flight = entry.get("in_flight")
+        in_flight_until = in_flight.get("expires_at_utc") if isinstance(in_flight, dict) else None
+        retry_after = self._retry_after(
+            now,
+            entry.get("next_allowed_at_utc") if isinstance(entry.get("next_allowed_at_utc"), str) else None,
+            entry.get("cooldown_until_utc") if isinstance(entry.get("cooldown_until_utc"), str) else None,
+            in_flight_until if isinstance(in_flight_until, str) else None,
+        )
+        return {
+            "allowed": retry_after == 0,
+            "reason": "ready" if retry_after == 0 else "gemini_local_rate_limit",
+            "retry_after_seconds": retry_after,
+        }
 
     def release_gemini_request(
         self,
