@@ -22606,10 +22606,12 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertNotIn("control_center", {tool["name"] for tool in server_module.TOOLS})
 
     @patch("codex_master.server.require_teamleader_tool_access")
+    @patch("codex_master.server.subprocess.Popen")
     @patch("codex_master.server.os.posix_spawn", return_value=12345)
     def test_detached_control_center_spawn_is_private_bounded_and_path_sparse(
         self,
         mock_spawn,
+        mock_popen,
         mock_access,
     ) -> None:
         command = Path("/home/tester/.local/bin/codex-master-mcp")
@@ -22630,26 +22632,37 @@ class CliLifecycleTest(unittest.TestCase):
         )
 
         mock_access.assert_called_once_with()
-        executable, argv, env = mock_spawn.call_args.args
-        self.assertEqual(executable, str(command))
-        self.assertEqual(argv, [str(command), "control-center"])
-        self.assertEqual(
-            env,
-            {
-                "DISPLAY": ":0",
-                "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
-                "XDG_RUNTIME_DIR": "/run/user/1000",
-                "DESKTOP_STARTUP_ID": "startup-id",
-                "XDG_ACTIVATION_TOKEN": "activation-token",
-                "LANG": "de_DE.UTF-8",
-                "PATH": "/usr/bin:/bin",
-                "HOME": str(Path.home()),
-            },
-        )
-        self.assertEqual(mock_spawn.call_args.kwargs["setsid"], True)
-        file_actions = mock_spawn.call_args.kwargs["file_actions"]
-        self.assertEqual([action[1] for action in file_actions], [0, 1, 2, 3])
-        self.assertEqual(file_actions[-1], (os.POSIX_SPAWN_CLOSEFROM, 3))
+        expected_env = {
+            "DISPLAY": ":0",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+            "XDG_RUNTIME_DIR": "/run/user/1000",
+            "DESKTOP_STARTUP_ID": "startup-id",
+            "XDG_ACTIVATION_TOKEN": "activation-token",
+            "LANG": "de_DE.UTF-8",
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(Path.home()),
+        }
+        if hasattr(os, "POSIX_SPAWN_CLOSEFROM"):
+            executable, argv, env = mock_spawn.call_args.args
+            self.assertEqual(executable, str(command))
+            self.assertEqual(argv, [str(command), "control-center"])
+            self.assertEqual(env, expected_env)
+            self.assertEqual(mock_spawn.call_args.kwargs["setsid"], True)
+            file_actions = mock_spawn.call_args.kwargs["file_actions"]
+            self.assertEqual([action[1] for action in file_actions], [0, 1, 2, 3])
+            self.assertEqual(file_actions[-1], (os.POSIX_SPAWN_CLOSEFROM, 3))
+            mock_popen.assert_not_called()
+        else:
+            mock_spawn.assert_not_called()
+            mock_popen.assert_called_once_with(
+                [str(command), "control-center"],
+                env=expected_env,
+                stdin=mock_popen.call_args.kwargs["stdin"],
+                stdout=mock_popen.call_args.kwargs["stdout"],
+                stderr=mock_popen.call_args.kwargs["stderr"],
+                close_fds=True,
+                start_new_session=True,
+            )
         self.assertNotIn("pid", result)
         self.assertEqual(result["status"], "launched")
         self.assertEqual(result["raw_output"], "not_returned")

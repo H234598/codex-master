@@ -13107,17 +13107,29 @@ def launch_control_center_detached(
         (os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDONLY, 0),
         (os.POSIX_SPAWN_OPEN, 1, os.devnull, os.O_WRONLY, 0),
         (os.POSIX_SPAWN_OPEN, 2, os.devnull, os.O_WRONLY, 0),
-        (os.POSIX_SPAWN_CLOSEFROM, 3),
     )
     command = str(command_path)
     try:
-        os.posix_spawn(
-            command,
-            [command, "control-center"],
-            child_env,
-            file_actions=file_actions,
-            setsid=True,
-        )
+        closefrom = getattr(os, "POSIX_SPAWN_CLOSEFROM", None)
+        if closefrom is None:
+            with open(os.devnull, "rb") as null_stdin, open(os.devnull, "wb") as null_stdout:
+                subprocess.Popen(
+                    [command, "control-center"],
+                    env=child_env,
+                    stdin=null_stdin,
+                    stdout=null_stdout,
+                    stderr=null_stdout,
+                    close_fds=True,
+                    start_new_session=True,
+                )
+        else:
+            os.posix_spawn(
+                command,
+                [command, "control-center"],
+                child_env,
+                file_actions=(*file_actions, (closefrom, 3)),
+                setsid=True,
+            )
     except OSError as exc:
         raise AgentError("control-center launch failed") from exc
     return {"status": "launched", "raw_output": "not_returned"}

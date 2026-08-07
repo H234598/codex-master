@@ -79,4 +79,3 @@ __all__ = [
     "validate_identifier",
     "validate_utc_datetime",
 ]
-

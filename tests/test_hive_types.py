@@ -36,9 +36,7 @@ def test_utc_validation_normalizes_offsets_without_accepting_naive_time() -> Non
     with pytest.raises(HiveValidationError, match="invalid_created"):
         validate_utc_datetime(datetime(2026, 8, 6, 12), field="created")
 
-
 def test_system_clock_returns_aware_utc_and_monotonic_value() -> None:
     clock = SystemClock()
     assert clock.wall_time_utc().tzinfo == timezone.utc
     assert isinstance(clock.monotonic(), float)
-
