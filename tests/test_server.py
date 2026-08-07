@@ -9200,7 +9200,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["release_needed"])
-        self.assertEqual(result["expected_tag"], "v0.10.3")
+        self.assertEqual(result["expected_tag"], "v0.10.4")
         self.assertFalse(result["current_tag_exists"])
         self.assertFalse(result["current_version_has_github_release"])
         self.assertEqual(result["latest_local_tag"], "v0.3.0")
@@ -21925,7 +21925,7 @@ class AppletStatusContractTest(unittest.TestCase):
     def test_applet_status_schema_v2_limits_visible_rows_and_reports_active_overflow(
         self, mock_observation, mock_run_tmux, _mock_native_status
     ) -> None:
-        running_agents = [f"a{index}" for index in range(1, 8)]
+        running_agents = [f"a{index}" for index in range(1, 6)] + ["b1", "b2"]
         mock_run_tmux.return_value = subprocess.CompletedProcess(
             ["tmux"],
             0,
@@ -22453,7 +22453,7 @@ class AppletStatusContractTest(unittest.TestCase):
 
     @patch("codex_master.server.applet_agent_observation")
     def test_applet_status_six_agent_response_is_small_and_has_exact_fields(self, mock_observation) -> None:
-        agents = ["a1", "a2", "a3", "a4", "a5", "a6"]
+        agents = ["a1", "a2", "a3", "a4", "a5", "b1"]
         mock_observation.side_effect = [self._row(agent) for agent in agents]
 
         result = applet_status(agents)

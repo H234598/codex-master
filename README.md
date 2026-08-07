@@ -511,10 +511,11 @@ python3 -m codex_master.server stop both
 ## Agentinnen Pool Spec
 
 The repo contains a generic, machine-readable `codex-agent-pool.json` plus
-`schemas/codex-agent-pool.schema.json`. The default spec describes the current
-300-Agentinnen pool: `a1..a100`, `b1..b100`, and `c1..c100`, with `a1` and
-`b1` marked as the authenticated source homes and the C series intentionally
-unauthenticated.
+`schemas/codex-agent-pool.schema.json`. The current installed native pool uses
+five A homes, three B homes, and three C homes. `a1` and `b1` remain the
+authenticated source homes; b92 is a separately preserved active home and is
+shown in the merged fleet inventory. Gemini series are managed through the
+Fleet registry and are not part of this native pool spec.
 Pool spec reads accept only regular UTF-8 JSON files, reject symlinked or
 oversized spec files, and keep spec paths out of public error responses.
 Pool validation returns only counts and state markers for series, aliases, and
