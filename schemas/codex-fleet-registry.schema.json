@@ -15,7 +15,7 @@
     },
     "series": {
       "type": "array",
-      "maxItems": 26,
+      "maxItems": 64,
       "items": {"$ref": "#/$defs/series"}
     }
   },
@@ -38,7 +38,7 @@
       "properties": {
         "account_id": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$"},
         "label": {"$ref": "#/$defs/safe_label"},
-        "provider": {"enum": ["openai_chatgpt", "openai_api", "gemini_api", "huggingface_inference"]},
+        "provider": {"enum": ["openai_chatgpt", "openai_api", "gemini_api", "ollama_local", "huggingface_inference"]},
         "auth_kind": {"enum": ["chatgpt_session", "api_key"]},
         "secret_state": {"enum": ["missing", "configured", "invalid", "not_required"]},
         "limit_state": {"enum": ["ready", "limited", "unknown", "probing", "disabled"]},
@@ -49,7 +49,8 @@
           "type": ["string", "null"],
           "maxLength": 64,
           "pattern": "^[a-z][a-z0-9_]{0,63}$"
-        }
+        },
+        "billing_group": {"type": ["string", "null"], "pattern": "^[a-z][a-z0-9-]{0,63}$"}
       },
       "allOf": [
         {"if": {"properties": {"provider": {"const": "openai_chatgpt"}}}, "then": {"properties": {"auth_kind": {"const": "chatgpt_session"}}}},
@@ -61,14 +62,16 @@
       "required": ["prefix", "display_name", "count", "runner", "provider", "model", "account_id", "enabled"],
       "additionalProperties": false,
       "properties": {
-        "prefix": {"type": "string", "pattern": "^[a-z]$"},
+        "prefix": {"type": "string", "pattern": "^[a-z](?:[a-z0-9_-]*[-_][a-z0-9_-]*)?$"},
         "display_name": {"$ref": "#/$defs/safe_label"},
         "count": {"type": "integer", "minimum": 1, "maximum": 100},
         "runner": {"enum": ["codex_cli", "gemini_cli"]},
         "provider": {"enum": ["openai_chatgpt", "openai_api", "gemini_api", "ollama_local", "huggingface_inference"]},
         "model": {"type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"},
         "account_id": {"type": ["string", "null"], "pattern": "^[a-z][a-z0-9-]{0,63}$"},
-        "enabled": {"type": "boolean"}
+        "enabled": {"type": "boolean"},
+        "skill_profile": {"type": "string", "minLength": 1, "maxLength": 64},
+        "task_profile": {"type": "string", "minLength": 1, "maxLength": 64}
       },
       "allOf": [
         {"if": {"properties": {"provider": {"const": "gemini_api"}}}, "then": {"properties": {"runner": {"const": "gemini_cli"}, "account_id": {"type": "string"}}}},

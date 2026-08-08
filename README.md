@@ -1,6 +1,9 @@
 # codex-master
 
-Local MCP wrapper for controlling a sleeping/scalable Codex Agentinnen pool:
+The Hive (legacy names: `codex-master`, `codex-master-mcp`, and Masterjet) is
+the local MCP control plane for a sleeping/scalable Codex Agentinnen fleet.
+The Fleet Registry is authoritative for active series; the legacy pool spec is
+kept only for compatibility.
 
 - `/home/teladi/.codex-agents/a1` through `/home/teladi/.codex-agents/a100`
 - `/home/teladi/.codex-agents/b1` through `/home/teladi/.codex-agents/b100`
@@ -163,31 +166,34 @@ releases it again.
 
 ## Fleet accounts, series, and Gemini headless jobs
 
-The Fleet registry is the source of truth for provider-backed series. Use the
-read-only account/series views first, then set credentials locally through the
-control center or stdin-only CLI flow:
+The Fleet registry is the source of truth for every provider-backed series and
+for native A/B/C materialization. The project is canonically named **The
+Hive**; the legacy names above remain valid aliases. Use the read-only
+account/series views first, then synchronize credentials locally through the
+stdin-only CLI flow:
 
 ```sh
 python3 -m codex_master.server fleet account list
 python3 -m codex_master.server fleet series list
 python3 -m codex_master.server fleet provider-models --provider ollama_local
-python3 -m codex_master.server fleet account set-secret \
-  --account-id gemini-project-1 --expected-generation 1 --secret-stdin < token.txt
+python3 -m codex_master.server fleet account sync-env --first-key 1 --last-key 30
 ```
 
 Secrets may be entered transiently in the control center or stdin flow, but
 are never displayed, persisted in UI state, or returned by UI or normal MCP
 output. They are stored only in private sidecars and are never part of the
-registry, assignments, or shell history. Account gates require a
-configured secret, a fresh successful capability probe, and a non-limited
-account before a bound series can dispatch. A structured provider limit marks
-the whole account domain; only series bound to different accounts remain
-eligible.
+registry, assignments, or shell history. Account gates require a configured
+secret and a successful admission check. Stale or unknown Gemini probes are
+checked once at invocation time, so a neighboring project does not make this
+project stale. Gemini RPM/TPM/RPD observations are project-scoped; billing
+tier and spend caps may still be shared by the billing account.
 
-`fleet_gemini_bootstrap_plan` is a dry plan for the three isolated
-`gemini-project-1` through `gemini-project-3` accounts and the `d`, `e`, and `f`
-series. It does not create accounts, read credentials, or guess a model; each
-model must come from a successful provider probe. The optional installer uses
+`fleet_gemini_bootstrap_plan` remains a secret-free compatibility dry-plan
+helper only. It does not create the retired D/E/F series; runtime activation
+comes from populated `The_Hive_N` entries in the private token file. Keys
+1–10 belong to one billing account with one project per key; keys 11–20 and
+21–30 are reserved for the next two accounts and are activated only when
+their values exist. The optional installer uses
 only the official stable package channel:
 
 ```sh
@@ -226,8 +232,9 @@ the same bounds and generation checks as the server; the optional GTK3 page is
 loaded lazily so headless imports remain display-free. The Cinnamon adapter uses
 snapshot schema v3, at most 26 series and 25 visible rows per series page;
 limited rows are status-only. Real provider credentials, account probes,
-300-agent materialization, and desktop-session acceptance remain explicit
-local gates.
+Ollama resource admission, and desktop-session acceptance remain explicit
+local gates. Ollama series are `simple_only`, capped at two concurrent agents,
+and reject complex or repository-changing tasks.
 
 ## Tools
 

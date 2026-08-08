@@ -15,7 +15,12 @@ MAX_RECOVERY_ENTRIES = 1000
 RECOVERY_SCHEMA_VERSION = 1
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _JOURNAL_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
-_AGENT_ID_RE = re.compile(r"[a-z](?:[1-9]|[1-9][0-9]|100)\Z")
+# Registry series may use an explicit separator in a multi-part prefix, for
+# example ``o-a1``.  Keep the legacy one-letter form strict so ambiguous
+# identifiers such as ``aa1`` remain rejected.
+_AGENT_ID_RE = re.compile(
+    r"[a-z](?:[a-z0-9_-]*[-_][a-z0-9_-]*)?(?:[1-9]|[1-9][0-9]|100)\Z"
+)
 _HIDDEN_NAME_RE = re.compile(r"\.codex-fleet-remove-[a-z0-9-]{1,96}\Z")
 _ARTIFACT_RE = re.compile(r"[A-Za-z0-9._-][A-Za-z0-9._/-]{0,199}\Z")
 
@@ -407,6 +412,8 @@ def descriptor_fingerprint(descriptor: AgentDescriptor | None) -> str | None:
         "provider": descriptor.provider.value,
         "model": descriptor.model,
         "account_id": descriptor.account_id,
+        "skill_profile": descriptor.skill_profile,
+        "task_profile": descriptor.task_profile,
         "home": str(descriptor.home),
         "session": descriptor.session,
         "enabled": descriptor.enabled,
@@ -424,6 +431,8 @@ def materialization_fingerprint(
         "runner": descriptor.runner.value,
         "provider": descriptor.provider.value,
         "model": descriptor.model,
+        "skill_profile": descriptor.skill_profile,
+        "task_profile": descriptor.task_profile,
         "manifest": [
             {"relative_path": item.relative_path, "mode": item.mode, "sha256": item.sha256}
             for item in manifest

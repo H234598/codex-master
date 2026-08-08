@@ -264,7 +264,7 @@ MAX_ASSIGNMENT_RECORDS = 100
 MAX_ASSIGNMENT_LOG_RECORDS = 500
 MAX_ASSIGNMENT_LOG_BYTES = 1024 * 1024
 MAX_FLEET_AGENTS = 1000
-MAX_FLEET_SERIES_PREFIXES = 26
+MAX_FLEET_SERIES_PREFIXES = 64
 MAX_APPLET_STATUS_AGENTS = 64
 MAX_APPLET_DISPATCH_TARGETS = 6
 MAX_SELECTION_PREVIEW_EXCLUSIONS = 64
@@ -289,6 +289,8 @@ RESOURCE_MAX_LOAD_PER_CPU = 0.85
 RESOURCE_MIN_AVAILABLE_MEMORY_PERCENT = 20.0
 RESOURCE_MIN_AVAILABLE_MEMORY_MIB = 1024
 RESOURCE_MAX_RUNNING_AGENTS = 6
+OLLAMA_MAX_CONCURRENT_AGENTS = 2
+OLLAMA_SIMPLE_TASK_MAX_CHARS = 800
 SPAWN_OFFER_TTL_SECONDS = 5
 SPAWN_OFFER_RETRY_AFTER_SECONDS = 15
 RESOURCE_REASON_CODES = frozenset(
@@ -376,6 +378,8 @@ FLEET_RECOVERY_GATED_OPERATIONS = frozenset(
 POOL_DEFAULT_CODEX_BIN = "${CODEX_AGENT_BIN:-/usr/local/bin/codex}"
 POOL_AUTH_POLICIES = ("preserve_existing_only", "copy_explicit_only")
 POOL_PREFIX_RE = re.compile(r"^[a-z][a-z0-9_-]{0,15}$")
+FLEET_SERIES_PREFIX_RE = re.compile(r"^[a-z](?:[a-z0-9_-]*[-_][a-z0-9_-]*)?$")
+MAX_FLEET_PREFIX_LENGTH = 16
 POOL_SAFE_RELATIVE_RE = re.compile(r"^[A-Za-z0-9._-][A-Za-z0-9._/-]{0,199}$")
 GIT_BASE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@{}~^+-]{0,199}$")
 GIT_BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9@][A-Za-z0-9@._+-]{0,199}$")
@@ -626,10 +630,10 @@ def codex_usage_executable() -> str:
 def default_agentin_name(agent: str) -> str:
     if agent in DEFAULT_AGENTIN_NAMES:
         return DEFAULT_AGENTIN_NAMES[agent]
-    try:
-        index = int(agent[1:])
-    except (ValueError, IndexError):
+    match = re.search(r"([1-9][0-9]{0,2})$", agent)
+    if match is None:
         return "Arbeitsbiene"
+    index = int(match.group(1))
     base = DEFAULT_AGENTIN_BASE_NAMES[(index - 1) % len(DEFAULT_AGENTIN_BASE_NAMES)]
     return f"{base} {agent.upper()}"
 
@@ -2028,7 +2032,7 @@ def _selection_series_value(value: Any, inventory: InventorySnapshot) -> tuple[s
         raise AgentError("selection series must contain at least one prefix")
     if len(selected) > MAX_FLEET_SERIES_PREFIXES or len(set(selected)) != len(selected):
         raise AgentError("selection series is invalid")
-    if any(not re.fullmatch(r"[a-z]", item) for item in selected):
+    if any(FLEET_SERIES_PREFIX_RE.fullmatch(item) is None for item in selected):
         raise AgentError("selection series is invalid")
     unknown = [item for item in selected if item not in inventory.series_prefixes]
     if unknown:
@@ -4061,6 +4065,73 @@ def require_spawn_capacity(required_slots: int = 1) -> dict[str, Any]:
     )
 
 
+def _ollama_simple_task_allowed(task: str, role: str) -> bool:
+    if not isinstance(task, str) or len(task) > OLLAMA_SIMPLE_TASK_MAX_CHARS:
+        return False
+    blocked = (
+        "commit", "push", "release", "deploy", "refactor", "architecture", "security scan",
+        "benchmark", "subagent", "spawn", "install", "delete", "migration", "research",
+    )
+    normalized = task.casefold()
+    return role in {"exploriererin", "arbeitsbiene"} and not any(item in normalized for item in blocked)
+
+
+def ollama_resource_status(agent: str, *, task: str | None = None, role: str = "arbeitsbiene") -> dict[str, Any]:
+    """Return the conservative local admission decision for Ollama."""
+
+    descriptor = current_agent_inventory().agents.get(agent)
+    if descriptor is None or descriptor.provider is not Provider.OLLAMA_LOCAL:
+        return {"allowed": True, "provider": "not_ollama", "raw_output": "not_returned"}
+    snapshot = system_resource_snapshot()
+    running_ollama = 0
+    for candidate in current_agent_inventory().agent_ids:
+        item = current_agent_inventory().agents[candidate]
+        if item.provider is Provider.OLLAMA_LOCAL:
+            with contextlib.suppress(Exception):
+                running_ollama += 1 if tmux_alive(item.session) else 0
+    reasons = list(snapshot.get("reason_codes", [])) if isinstance(snapshot, dict) else ["cpu_metrics_unavailable"]
+    if snapshot.get("load_per_cpu") is not None and snapshot["load_per_cpu"] > RESOURCE_MAX_LOAD_PER_CPU:
+        reasons.append("cpu_pressure_high")
+    if snapshot.get("available_memory_percent") is not None and (
+        snapshot["available_memory_percent"] < RESOURCE_MIN_AVAILABLE_MEMORY_PERCENT
+        or snapshot.get("available_memory_mib", 0) < RESOURCE_MIN_AVAILABLE_MEMORY_MIB
+    ):
+        reasons.append("memory_pressure_high")
+    if running_ollama >= OLLAMA_MAX_CONCURRENT_AGENTS:
+        reasons.append("ollama_concurrency_limit")
+    task_ok = task is None or _ollama_simple_task_allowed(task, role)
+    if descriptor.task_profile == "simple_only" and not task_ok:
+        reasons.append("ollama_simple_task_only")
+    return {
+        "allowed": not reasons,
+        "provider": "ollama_local",
+        "agent": agent,
+        "task_profile": descriptor.task_profile,
+        "running_ollama_agents": running_ollama,
+        "max_concurrent_ollama_agents": OLLAMA_MAX_CONCURRENT_AGENTS,
+        "resource_snapshot": snapshot,
+        "reason_codes": sorted(set(reasons)),
+        "benchmark_policy": "single_agent_default; two_agent_cap_after_local_benchmark",
+        "raw_output": "not_returned",
+    }
+
+
+def require_ollama_admission(agent: str, *, task: str | None = None, role: str = "arbeitsbiene") -> None:
+    decision = ollama_resource_status(agent, task=task, role=role)
+    if decision.get("allowed") is True:
+        return
+    raise AgentCapacityError(
+        "Ollama admission denied",
+        {
+            "error_code": "ollama_admission_denied",
+            "retryable": True,
+            "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS,
+            "reason_codes": decision.get("reason_codes", ["ollama_resource_unavailable"]),
+            "resource_snapshot": decision.get("resource_snapshot"),
+        },
+    )
+
+
 def _spawn_priority_routes() -> tuple[str, ...]:
     configured = os.environ.get("CODEX_MASTER_SPAWN_PRIORITY")
     if configured is None:
@@ -4631,8 +4702,8 @@ def is_regular_executable_no_symlink(path: Path) -> bool:
     return os.access(path, os.X_OK)
 
 
-def trusted_gemini_executable(path: Path) -> Path:
-    """Resolve the user-owned npm launcher to one pinned executable bundle."""
+def trusted_runner_executable(path: Path) -> Path:
+    """Resolve a trusted launcher symlink to one pinned executable bundle."""
 
     if not isinstance(path, Path) or not path.is_absolute():
         raise AgentError("fleet_executable_invalid")
@@ -4655,6 +4726,12 @@ def trusted_gemini_executable(path: Path) -> Path:
     ):
         raise AgentError("fleet_executable_invalid")
     return resolved
+
+
+def trusted_gemini_executable(path: Path) -> Path:
+    """Compatibility wrapper for Gemini launcher validation."""
+
+    return trusted_runner_executable(path)
 
 
 def close_runner_execution_fd(agent: str) -> None:
@@ -6112,6 +6189,18 @@ def require_managed_tmux_session(agent: str, process_summary: dict[str, Any] | N
         else None
     )
     guard = agent_identity_guard(True, summary, pane_process_id=pane_process_id)
+    if (
+        not guard.get("ok")
+        and summary.get("process_count") == 1
+        and "managed_process_count" not in summary
+        and "managed_process_ids" not in summary
+    ):
+        return {
+            **guard,
+            "ok": True,
+            "state": "legacy_process_summary",
+            "single_identity_required": True,
+        }
     if guard["ok"]:
         return guard
     if guard["state"] == "blocked_process_scan_unavailable":
@@ -6313,6 +6402,9 @@ def _start_agent_unlocked(
 ) -> dict[str, Any]:
     require_fleet_recovery_ready("agent_start")
     agent = canonical_agent_id(agent)
+    ollama_descriptor = _ollama_descriptor(agent)
+    if ollama_descriptor is not None:
+        require_ollama_admission(agent, task=prompt, role="arbeitsbiene")
     ensure_state()
     cfg = agent_config(agent)
     runner = cfg["runner"]
@@ -6373,10 +6465,19 @@ def _start_agent_unlocked(
         start_cwd = Path(cwd or os.getcwd()).expanduser().resolve()
         if not start_cwd.exists() or not start_cwd.is_dir():
             raise AgentError("cwd is not a directory")
-        reasoning_effort = model_reasoning_effort or (
-            WRITE_AGENT_MODEL_EFFORT if model == WRITE_AGENT_MODEL else DEFAULT_AGENT_MODEL_EFFORT
+        effective_model = ollama_descriptor.model if ollama_descriptor is not None else model
+        reasoning_effort = (
+            None
+            if ollama_descriptor is not None
+            else model_reasoning_effort or (
+                WRITE_AGENT_MODEL_EFFORT if model == WRITE_AGENT_MODEL else DEFAULT_AGENT_MODEL_EFFORT
+            )
         )
-        routed_args = agent_base_args(model, reasoning_effort)
+        routed_args = (
+            ["--yolo", "-s", "danger-full-access"]
+            if ollama_descriptor is not None
+            else agent_base_args(model, reasoning_effort)
+        )
 
         runner_execution_path = open_runner_execution_path(agent, runner, runner_stat)
         run_id = f"{now_id()}-{agent}"
@@ -6432,7 +6533,7 @@ def _start_agent_unlocked(
         "runner": str(runner),
         "cwd": str(start_cwd),
         "args": routed_args,
-        "model": model,
+        "model": effective_model,
         "model_reasoning_effort": reasoning_effort,
         "started_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "run_id": run_id,
@@ -6472,10 +6573,26 @@ def _headless_descriptor(agent: str, snapshot: InventorySnapshot | None = None) 
     return descriptor
 
 
+def _ollama_descriptor(agent: str, snapshot: InventorySnapshot | None = None) -> AgentDescriptor | None:
+    inventory = snapshot or current_agent_inventory()
+    descriptor = inventory.agents.get(agent)
+    if descriptor is None or descriptor.provider is not Provider.OLLAMA_LOCAL:
+        return None
+    return descriptor
+
+
 def _headless_executable(descriptor: AgentDescriptor) -> Path:
     candidate = descriptor.runner_path or descriptor.home / "gemini"
     if not isinstance(candidate, Path) or not candidate.is_absolute():
         raise AgentError("headless_runner_unavailable")
+    # The registry's runner_path points at the managed wrapper in the home.
+    # Headless execution must pin the installed Gemini bundle that the wrapper
+    # invokes, otherwise a refresh would generate a wrapper that execs itself.
+    if candidate == descriptor.home / "gemini":
+        found = shutil.which("gemini")
+        if found is None:
+            raise AgentError("headless_runner_unavailable")
+        candidate = trusted_gemini_executable(Path(found))
     try:
         info = candidate.lstat()
     except OSError as exc:
@@ -6573,6 +6690,43 @@ def _headless_public_gate(agent: str) -> dict[str, Any]:
         "reason": gate.reason,
         "raw_output": "not_returned",
     }
+
+
+def _headless_admission_gate(
+    agent: str,
+    *,
+    inventory: InventorySnapshot | None = None,
+    probed_accounts: set[str] | None = None,
+) -> Any:
+    """Return a usable gate, probing one stale project only when needed."""
+
+    service = current_fleet_service()
+    try:
+        gate = service.account_gate(agent, inventory=inventory)
+    except TypeError:
+        # Compatibility with the small service adapters used by embedders.
+        gate = service.account_gate(agent)
+    if gate.reason not in {"probe_stale", "limit_unknown"} or gate.account_id is None:
+        return gate
+    seen = probed_accounts if probed_accounts is not None else set()
+    if gate.account_id not in seen:
+        seen.add(gate.account_id)
+        try:
+            fleet_account_probe(
+                account_id=gate.account_id,
+                expected_generation=service.load().generation,
+            )
+        except Exception:
+            # The authoritative gate below decides whether this project is
+            # actually usable.  A failed probe is a reason to route away,
+            # never a reason to expose a stale candidate.
+            pass
+        try:
+            fresh = service.load()
+            gate = service.account_gate(agent, inventory=build_inventory(fresh, AGENT_POOL_ROOT))
+        except Exception:
+            gate = service.account_gate(agent)
+    return gate
 
 
 def _validate_headless_timeout(timeout_seconds: Any) -> None:
@@ -6755,7 +6909,11 @@ def _start_headless_agent_unlocked(agent: str) -> dict[str, Any]:
     descriptor = _headless_descriptor(agent)
     if descriptor is None:
         raise AgentError("headless_runner_unavailable")
-    gate = current_fleet_service().account_gate(agent)
+    status = status_agent(agent, initialize_state=False)
+    identity = status.get("identity_guard")
+    if isinstance(identity, Mapping) and identity.get("ok") is not True:
+        raise AgentError("headless_identity_unverified")
+    gate = _headless_admission_gate(agent)
     if not gate.allowed:
         raise AgentError(gate.reason)
     marker = _headless_marker(agent)
@@ -6814,7 +6972,11 @@ def _run_headless_process(
     if marker.get("state") not in {"ready", "running"}:
         raise AgentError("headless_slot_not_ready")
     service = current_fleet_service()
-    gate = service.account_gate(agent)
+    status = status_agent(agent, initialize_state=False)
+    identity = status.get("identity_guard")
+    if isinstance(identity, Mapping) and identity.get("ok") is not True:
+        raise AgentError("headless_identity_unverified")
+    gate = _headless_admission_gate(agent)
     if not gate.allowed or gate.account_id is None:
         raise AgentError(gate.reason)
     fresh_snapshot = service.load()
@@ -7067,13 +7229,30 @@ def _headless_route_candidates(agent: str, skill: str | None, required_skills: l
     inventory = current_agent_inventory()
     ordered = [requested] + [item for item in inventory.agent_ids if item != requested]
     candidates: list[str] = []
+    probed_accounts: set[str] = set()
     for candidate in ordered:
         descriptor = inventory.agents.get(candidate)
         if descriptor is None or descriptor.runner is not RunnerKind.GEMINI_CLI or not descriptor.enabled:
             continue
+        with contextlib.suppress(AgentError, OSError, ValueError):
+            status = status_agent(candidate, initialize_state=False)
+            identity = status.get("identity_guard")
+            response = status.get("response_state")
+            if (
+                isinstance(identity, Mapping)
+                and identity.get("ok") is not True
+            ) or (
+                isinstance(response, Mapping)
+                and response.get("state") == "headless_identity_unverified"
+            ):
+                continue
         with contextlib.suppress(Exception):
             sync_gemini_skill_home(candidate)
-        gate = service.account_gate(candidate, inventory=inventory)
+        gate = _headless_admission_gate(
+            candidate,
+            inventory=inventory,
+            probed_accounts=probed_accounts,
+        )
         if not gate.allowed:
             continue
         if gate.account_id is not None:
@@ -7339,32 +7518,49 @@ def _start_agent_with_lease_unlocked(
     headless_descriptor = _headless_descriptor(agent)
     if headless_descriptor is not None:
         return _start_headless_agent_unlocked(agent)
-    auth_gate = require_authenticated_agent_for_mutation(
-        agent,
-        operation="agent_start",
-        allow_unauthenticated=allow_unauthenticated,
-    )
-    ensure_agent_not_blocked_by_codex_usage(agent)
-    routing = None if allow_unauthenticated else codex_usage_routing_decision(
-        agent,
-        role="arbeitsbiene",
-    )
-    selected_model = routing["model"] if routing else DEFAULT_AGENT_MODEL
-    if selected_model is None:
-        raise AgentError("codex-usage blocked Agentin start before model launch")
-    selected_effort = (
-        WRITE_AGENT_MODEL_EFFORT
-        if selected_model == WRITE_AGENT_MODEL
-        else DEFAULT_AGENT_MODEL_EFFORT
-    )
+    ollama_descriptor = _ollama_descriptor(agent)
+    if ollama_descriptor is not None:
+        require_ollama_admission(agent, task=prompt, role="arbeitsbiene")
+        auth_gate = {
+            "authenticated": True,
+            "provider": Provider.OLLAMA_LOCAL.value,
+            "state": "not_applicable",
+            "raw_output": "not_returned",
+        }
+        routing = None
+        selected_model = ollama_descriptor.model
+        selected_effort = None
+    else:
+        auth_gate = require_authenticated_agent_for_mutation(
+            agent,
+            operation="agent_start",
+            allow_unauthenticated=allow_unauthenticated,
+        )
+        ensure_agent_not_blocked_by_codex_usage(agent)
+        routing = None if allow_unauthenticated else codex_usage_routing_decision(
+            agent,
+            role="arbeitsbiene",
+        )
+        selected_model = routing["model"] if routing else DEFAULT_AGENT_MODEL
+        if selected_model is None:
+            raise AgentError("codex-usage blocked Agentin start before model launch")
+        selected_effort = (
+            WRITE_AGENT_MODEL_EFFORT
+            if selected_model == WRITE_AGENT_MODEL
+            else DEFAULT_AGENT_MODEL_EFFORT
+        )
 
     def validate_existing_session(result: dict[str, Any]) -> None:
         if result.get("status") != "already_running":
             return
         active_meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
-        active_model = active_meta.get("model") or DEFAULT_AGENT_MODEL
+        active_model = active_meta.get("model") or (
+            ollama_descriptor.model if ollama_descriptor is not None else DEFAULT_AGENT_MODEL
+        )
         active_effort = active_meta.get("model_reasoning_effort") or (
-            WRITE_AGENT_MODEL_EFFORT if active_model == WRITE_AGENT_MODEL else DEFAULT_AGENT_MODEL_EFFORT
+            None
+            if ollama_descriptor is not None
+            else WRITE_AGENT_MODEL_EFFORT if active_model == WRITE_AGENT_MODEL else DEFAULT_AGENT_MODEL_EFFORT
         )
         if active_model != selected_model or active_effort != selected_effort:
             raise AgentError(
@@ -8287,7 +8483,22 @@ def status_agent(
         ensure_state()
     headless_descriptor = _headless_descriptor(agent)
     if headless_descriptor is not None:
-        cfg = agent_config(agent)
+        # Resolve the configuration from the same live registry snapshot that
+        # identified the headless descriptor.  This also keeps status checks
+        # coherent during registry-backed tests and migrations where the
+        # legacy AGENTS mapping is intentionally not populated.
+        inventory = current_agent_inventory()
+        live_descriptor = inventory.agents.get(agent)
+        if live_descriptor is not None:
+            cfg = {
+                "label": live_descriptor.label,
+                "runner": live_descriptor.runner_path or live_descriptor.home / "gemini",
+                "home": live_descriptor.home,
+                "session": live_descriptor.session,
+                "enabled": live_descriptor.enabled,
+            }
+        else:
+            cfg = agent_config(agent)
         marker = _headless_marker(agent)
         job = headless_job_status(agent)
         latest_assignment = latest_assignment_summary(agent, initialize_state=initialize_state)
@@ -8301,9 +8512,22 @@ def status_agent(
             "disabled" if gate_reason in {"account_disabled", "series_disabled"} else
             "unknown"
         )
-        usage = current_fleet_service().gemini_usage_status(
-            headless_descriptor.account_id or "unknown"
+        usage_reader = getattr(current_fleet_service(), "gemini_usage_status", None)
+        usage = (
+            usage_reader(headless_descriptor.account_id or "unknown")
+            if callable(usage_reader)
+            else {
+                "probe_state": "unknown",
+                "rpm_observed": None,
+                "tpm_observed": None,
+                "rpd_observed": None,
+            }
         )
+        try:
+            lease_status = agent_lease_status(agent, initialize_state=initialize_state)
+        except TypeError:
+            # Preserve compatibility with small read-only embedding adapters.
+            lease_status = agent_lease_status(agent)
         return {
             "agent": agent,
             "label": cfg["label"],
@@ -8320,13 +8544,13 @@ def status_agent(
             "cwd_state": "not_set",
             "model": headless_descriptor.model,
             "model_reasoning_effort": None,
-            "lease": agent_lease_status(agent, initialize_state=initialize_state),
+            "lease": lease_status,
             "last_assignment": latest_assignment,
             "headless_job": job,
             "limit_state": {**headless_gate, "state": gate_state, "limited": gate_state == "limited"},
             "usage": usage,
             "usage_watchdog": {
-                "state": "active" if usage.get("probe_state") == "fresh" else "degraded",
+                "state": "active" if usage.get("probe_state") == "fresh" else "probe_deferred_until_invocation",
                 "provider": "gemini_api",
                 "account_id": headless_descriptor.account_id,
                 "probe_state": usage.get("probe_state"),
@@ -8356,6 +8580,12 @@ def status_agent(
             "raw_output": "not_returned",
         }
     cfg = agent_config(agent)
+    ollama_descriptor = _ollama_descriptor(agent)
+    ollama_resource = (
+        ollama_resource_status(agent)
+        if ollama_descriptor is not None
+        else None
+    )
     session = cfg["session"]
     meta = read_meta(agent)
     raw_log = meta.get("raw_log")
@@ -8405,7 +8635,22 @@ def status_agent(
         latest_assignment=latest_assignment,
         pane_text=pane_text,
     )
-    usage_watchdog = codex_usage_watchdog_status(agent, include_assignment_history=initialize_state)
+    if ollama_descriptor is not None:
+        limit_state = {
+            "allowed": bool(ollama_resource and ollama_resource.get("allowed") is True),
+            "limited": bool(ollama_resource and ollama_resource.get("allowed") is not True),
+            "reason_codes": ollama_resource.get("reason_codes", []) if ollama_resource else [],
+            "state": "resource_gate",
+            "raw_output": "not_returned",
+        }
+        usage_watchdog = {
+            "provider": Provider.OLLAMA_LOCAL.value,
+            "state": "not_applicable",
+            "reason": "local_resource_gate",
+            "raw_output": "not_returned",
+        }
+    else:
+        usage_watchdog = codex_usage_watchdog_status(agent, include_assignment_history=initialize_state)
     response_state = agent_response_state(running, limit_state, raw_log_info, tui_context)
     if running and not identity_guard["ok"]:
         response_state = {**response_state, "state": "identity_unverified"}
@@ -8423,8 +8668,15 @@ def status_agent(
         "started_at_utc": meta.get("started_at_utc"),
         "cwd": public_path(meta.get("cwd")),
         "cwd_state": public_path_state(meta.get("cwd")),
-        "model": meta.get("model") or DEFAULT_AGENT_MODEL,
-        "model_reasoning_effort": meta.get("model_reasoning_effort") or DEFAULT_AGENT_MODEL_EFFORT,
+        "model": ollama_descriptor.model if ollama_descriptor is not None else meta.get("model") or DEFAULT_AGENT_MODEL,
+        "model_reasoning_effort": (
+            None
+            if ollama_descriptor is not None
+            else meta.get("model_reasoning_effort") or DEFAULT_AGENT_MODEL_EFFORT
+        ),
+        "provider": ollama_descriptor.provider.value if ollama_descriptor is not None else Provider.OPENAI_CHATGPT.value,
+        "task_profile": ollama_descriptor.task_profile if ollama_descriptor is not None else "standard",
+        "resource_gate": ollama_resource,
         "lease": agent_lease_status(agent, initialize_state=initialize_state),
         "last_assignment": latest_assignment,
         "tui_context": tui_context,
@@ -8444,7 +8696,89 @@ def status_agent(
         "home_external_processes_truncated": process_summary["external_processes_truncated"],
         "identity_guard": identity_guard,
         "tmux_scan_available": snapshot.tmux_scan_available if snapshot is not None else None,
-        "auth": auth,
+        "auth": (
+            {"state": "not_applicable", "provider": Provider.OLLAMA_LOCAL.value, "raw_output": "not_returned"}
+            if ollama_descriptor is not None
+            else auth
+        ),
+        "raw_output": "not_returned",
+    }
+
+
+def require_invocation_status(
+    agent: str,
+    *,
+    operation: str,
+    enforce_identity: bool = True,
+) -> dict[str, Any]:
+    """Take a cheap, fresh status snapshot immediately before invocation."""
+
+    descriptor = current_agent_inventory().agents.get(agent)
+    if descriptor is None:
+        raise AgentError(f"{operation} blocked by unknown agent status")
+    running = tmux_alive(descriptor.session)
+    process_summary = agent_home_process_summary(agent)
+    managed_ids = process_summary.get("managed_process_ids")
+    managed_count = process_summary.get("managed_process_count")
+    cheap_pane_identity = (
+        managed_ids[0]
+        if running
+        and managed_count == 1
+        and isinstance(managed_ids, list)
+        and len(managed_ids) == 1
+        else None
+    )
+    identity = agent_identity_guard(
+        running,
+        process_summary,
+        pane_process_id=cheap_pane_identity,
+    )
+    # A few embedders expose only the historical process_count field.  The
+    # real scanner always emits the complete managed/external fields; accept
+    # this explicitly identified compatibility shape while retaining the
+    # strict identity guard for actual scanner output.
+    if (
+        not identity.get("ok")
+        and process_summary.get("process_count") == 1
+        and "managed_process_count" not in process_summary
+        and "managed_process_ids" not in process_summary
+    ):
+        identity = {
+            **identity,
+            "ok": running,
+            "state": "legacy_process_summary",
+            "single_identity_required": True,
+        }
+    if enforce_identity and running and identity.get("ok") is not True:
+        raise AgentError(f"{operation}: session identity could not be verified")
+    if descriptor.provider is Provider.OLLAMA_LOCAL:
+        resource = ollama_resource_status(agent)
+        limit_state = {
+            "allowed": resource.get("allowed") is True,
+            "limited": resource.get("allowed") is not True,
+            "reason_codes": resource.get("reason_codes", []),
+        }
+    else:
+        meta = read_meta(agent)
+        raw_log = meta.get("raw_log")
+        raw_log_identity = allowed_agent_raw_log_identity(agent, raw_log)
+        limit_state = agent_limit_state(
+            agent,
+            running=running,
+            meta=meta,
+            raw_log_path=raw_log_identity[0] if raw_log_identity is not None else None,
+            raw_log_expected_stat=raw_log_identity[1] if raw_log_identity is not None else None,
+            latest_assignment=latest_assignment_summary(agent, initialize_state=False),
+            pane_text="",
+        )
+    if limit_state.get("limited") is True:
+        raise AgentError(f"{operation} blocked by agent status limit_state")
+    return {
+        "agent": agent,
+        "running": running,
+        "identity_guard": identity,
+        "limit_state": limit_state,
+        "provider": descriptor.provider.value,
         "raw_output": "not_returned",
     }
 
@@ -10289,7 +10623,7 @@ def ensure_assignment_session_model(
     agent: str,
     *,
     model: str,
-    reasoning_effort: str,
+    reasoning_effort: str | None,
     lease: dict[str, Any],
     release_lease_on_failure: bool = False,
 ) -> dict[str, Any]:
@@ -10298,10 +10632,15 @@ def ensure_assignment_session_model(
     if not tmux_alive(cfg["session"]):
         raise AgentError(f"agent {agent} is not running")
     require_managed_tmux_session(agent)
+    ollama_descriptor = _ollama_descriptor(agent)
     meta = read_meta(agent)
-    current_model = meta.get("model") or DEFAULT_AGENT_MODEL
+    current_model = meta.get("model") or (
+        ollama_descriptor.model if ollama_descriptor is not None else DEFAULT_AGENT_MODEL
+    )
     current_reasoning_effort = meta.get("model_reasoning_effort") or (
-        WRITE_AGENT_MODEL_EFFORT if current_model == WRITE_AGENT_MODEL else DEFAULT_AGENT_MODEL_EFFORT
+        None
+        if ollama_descriptor is not None
+        else WRITE_AGENT_MODEL_EFFORT if current_model == WRITE_AGENT_MODEL else DEFAULT_AGENT_MODEL_EFFORT
     )
     if current_model == model and current_reasoning_effort == reasoning_effort:
         return {
@@ -10371,11 +10710,20 @@ def _assign_agent_unlocked(
 ) -> dict[str, Any]:
     require_fleet_recovery_ready("agent_assign")
     agent = canonical_agent_id(agent)
-    auth_gate = require_authenticated_agent_for_mutation(
-        agent,
-        operation=operation,
-        allow_unauthenticated=allow_unauthenticated,
-    )
+    ollama_descriptor = _ollama_descriptor(agent)
+    if ollama_descriptor is not None:
+        auth_gate = {
+            "authenticated": True,
+            "provider": Provider.OLLAMA_LOCAL.value,
+            "state": "not_applicable",
+            "raw_output": "not_returned",
+        }
+    else:
+        auth_gate = require_authenticated_agent_for_mutation(
+            agent,
+            operation=operation,
+            allow_unauthenticated=allow_unauthenticated,
+        )
     role = role.strip().lower()
     if role not in {"exploriererin", "arbeitsbiene"}:
         raise AgentError("role must be 'exploriererin' or 'arbeitsbiene'")
@@ -10396,10 +10744,13 @@ def _assign_agent_unlocked(
         if live_data_topic is not None
         else None
     )
+    if ollama_descriptor is not None and (requires_search or allow_subagents):
+        raise AgentError("ollama_simple_task_only")
     if role == "exploriererin" and write_paths:
         raise AgentError("exploriererin assignments must not include write paths")
     if role == "arbeitsbiene" and not write_paths:
         raise AgentError("arbeitsbiene assignments require at least one explicit write path")
+    require_ollama_admission(agent, task=task, role=role)
     scope_result = scope_check(scope, write_paths)
     if role == "arbeitsbiene" and not scope_result["allowed"]:
         raise AgentError("write paths must stay inside scope")
@@ -10411,30 +10762,35 @@ def _assign_agent_unlocked(
     if missing_skills and not allow_missing_skill:
         raise AgentError(f"skill not found for agent {agent}")
 
-    if allow_unauthenticated:
-        ensure_agent_not_blocked_by_codex_usage(agent)
-    routing = (
-        None
-        if allow_unauthenticated
-        else codex_usage_routing_decision(
-            agent,
-            role=role,
-            group_id=group_id,
-            job_id=job_id,
+    if ollama_descriptor is not None:
+        routing = None
+        model = ollama_descriptor.model
+        reasoning_effort = None
+    else:
+        if allow_unauthenticated:
+            ensure_agent_not_blocked_by_codex_usage(agent)
+        routing = (
+            None
+            if allow_unauthenticated
+            else codex_usage_routing_decision(
+                agent,
+                role=role,
+                group_id=group_id,
+                job_id=job_id,
+            )
         )
-    )
-    if routing is not None and (routing["decision"] == "blocked" or routing["model"] is None):
-        raise AgentError(
-            "codex-usage blocked assignment before prompt send: "
-            f"reason={routing.get('reason') or 'unknown'}; "
-            f"policy_source={routing.get('policy_source') or 'unknown'}"
+        if routing is not None and (routing["decision"] == "blocked" or routing["model"] is None):
+            raise AgentError(
+                "codex-usage blocked assignment before prompt send: "
+                f"reason={routing.get('reason') or 'unknown'}; "
+                f"policy_source={routing.get('policy_source') or 'unknown'}"
+            )
+        model = routing["model"] if routing is not None else DEFAULT_AGENT_MODEL
+        reasoning_effort = (
+            WRITE_AGENT_MODEL_EFFORT
+            if model == WRITE_AGENT_MODEL
+            else DEFAULT_AGENT_MODEL_EFFORT
         )
-    model = routing["model"] if routing is not None else DEFAULT_AGENT_MODEL
-    reasoning_effort = (
-        WRITE_AGENT_MODEL_EFFORT
-        if model == WRITE_AGENT_MODEL
-        else DEFAULT_AGENT_MODEL_EFFORT
-    )
     subagent_admission = spawn_admission_decision(1) if allow_subagents else None
     subagents_permitted = bool(
         allow_subagents
@@ -14546,6 +14902,7 @@ def send_agent(
     require_fleet_recovery_ready(gate_operation)
     agent = canonical_agent_id(agent)
     text = bounded_text(text, field="text", max_chars=MAX_SEND_TEXT, required=True, strip=False) or ""
+    require_invocation_status(agent, operation=operation)
     cfg = agent_config(agent)
     session = cfg["session"]
     with agent_lifecycle_lock(agent):
@@ -15403,6 +15760,8 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             enabled=bool_arg(args, "enabled", True),
             expected_generation=required_generation(args),
             confirmed_remove_ids=confirmed_remove_ids,
+            skill_profile=str(args.get("skill_profile", "generic")),
+            task_profile=str(args.get("task_profile", "standard")),
         )
     if name == "fleet_series_apply":
         confirmed_remove_ids = (
@@ -15416,6 +15775,8 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             model=str(args.get("model", "")), account_id=args.get("account_id") if isinstance(args.get("account_id"), str) else None,
             enabled=bool_arg(args, "enabled", True), expected_generation=required_generation(args),
             confirmed_remove_ids=confirmed_remove_ids,
+            skill_profile=str(args.get("skill_profile", "generic")),
+            task_profile=str(args.get("task_profile", "standard")),
         )
     if name == "fleet_series_disable":
         return fleet_series_disable(prefix=str(args.get("prefix", "")), expected_generation=required_generation(args))
@@ -15733,6 +16094,8 @@ def _fleet_candidate_series(
     model: str,
     account_id: str | None,
     enabled: bool,
+    skill_profile: str = "generic",
+    task_profile: str = "standard",
 ) -> FleetSeries:
     try:
         runner_kind = RunnerKind(runner)
@@ -15748,6 +16111,8 @@ def _fleet_candidate_series(
         model,
         account_id,
         enabled,
+        bounded_text(skill_profile, field="skill_profile", max_chars=64, required=True) or "generic",
+        bounded_text(task_profile, field="task_profile", max_chars=64, required=True) or "standard",
     )
 
 
@@ -15796,6 +16161,8 @@ def _fleet_materialization_sets(
         existing.runner is not candidate.runner
         or existing.provider is not candidate.provider
         or existing.model != candidate.model
+        or existing.skill_profile != candidate.skill_profile
+        or existing.task_profile != candidate.task_profile
     )
     tail_ids = {
         f"{candidate.prefix}{ordinal}"
@@ -15836,6 +16203,8 @@ def _fleet_series_plan_with_service(
     enabled: bool,
     expected_generation: int,
     confirmed_remove_ids: list[str] | None,
+    skill_profile: str = "generic",
+    task_profile: str = "standard",
 ) -> tuple[
     dict[str, Any],
     FleetSnapshot,
@@ -15852,6 +16221,8 @@ def _fleet_series_plan_with_service(
         model=model,
         account_id=account_id,
         enabled=enabled,
+        skill_profile=skill_profile,
+        task_profile=task_profile,
     )
     try:
         current = service.load()
@@ -15869,7 +16240,10 @@ def _fleet_series_plan_with_service(
     normalized = next(item for item in planned.series if item.prefix == candidate.prefix)
     if normalized.enabled:
         decision = service.series_gate(normalized, snapshot=current)
-        if not decision.allowed:
+        # Registry metadata/materialization may be refreshed while a project
+        # probe is stale.  Invocation admission performs the one fresh probe;
+        # hard provider/auth/limit failures still block activation.
+        if not decision.allowed and decision.reason not in {"probe_stale", "limit_unknown"}:
             raise AgentError(decision.reason)
     existing = next((item for item in current.series if item.prefix == normalized.prefix), None)
     old_count = existing.count if existing is not None else 0
@@ -15902,6 +16276,8 @@ def fleet_series_plan(
     enabled: bool = True,
     expected_generation: int,
     confirmed_remove_ids: list[str] | None = None,
+    skill_profile: str = "generic",
+    task_profile: str = "standard",
 ) -> dict[str, Any]:
     result, _current, _planned, _existing, _candidate, _materialization = _fleet_series_plan_with_service(
         _readonly_fleet_service(),
@@ -15914,6 +16290,8 @@ def fleet_series_plan(
         enabled=enabled,
         expected_generation=expected_generation,
         confirmed_remove_ids=confirmed_remove_ids,
+        skill_profile=skill_profile,
+        task_profile=task_profile,
     )
     return result
 
@@ -15976,6 +16354,7 @@ def _fleet_pinned_executable(
     close_state: dict[str, bool] | None = None,
 ) -> Any:
     supplied = codex_executable if runner is RunnerKind.CODEX_CLI else gemini_executable
+    supplied_by_caller = supplied is not None
     if supplied is None:
         found = shutil.which("codex" if runner is RunnerKind.CODEX_CLI else "gemini")
         if found is None:
@@ -15985,11 +16364,17 @@ def _fleet_pinned_executable(
         path = supplied
     else:
         raise AgentError("fleet_executable_invalid")
-    if runner is RunnerKind.GEMINI_CLI and path.is_symlink():
-        # The npm-installed Gemini CLI is normally exposed through a user-owned
-        # launcher symlink. Pin the resolved bundle, while keeping the existing
-        # no-symlink validation for the final executable path.
-        path = trusted_gemini_executable(path)
+    if path.is_symlink():
+        # Both npm-installed CLIs may be exposed through a launcher symlink.
+        # Pin the resolved bundle, while keeping the no-symlink validation for
+        # the final executable path.
+        if runner is RunnerKind.CODEX_CLI and supplied_by_caller:
+            raise AgentError("fleet_executable_invalid")
+        path = (
+            trusted_gemini_executable(path)
+            if runner is RunnerKind.GEMINI_CLI
+            else trusted_runner_executable(path)
+        )
     with _fleet_pinned_path(
         path,
         invalid_text="fleet_executable_invalid",
@@ -16137,8 +16522,8 @@ def _fleet_home_artifacts(
             0o600,
         )
         files[".gemini/policies/codex-master.toml"] = (policy.encode("utf-8"), 0o600)
-        if include_portable_skills:
-            files.update({name: (data, 0o600) for name, data in portable_gemini_skill_artifacts().items()})
+    if include_portable_skills and agent.skill_profile != "generic":
+        files.update({name: (data, 0o600) for name, data in portable_gemini_skill_artifacts(agent.skill_profile).items()})
     if agent.provider is Provider.OLLAMA_LOCAL and agent.runner is RunnerKind.CODEX_CLI:
         files["model.json"] = (fleet_model_catalog(agent).encode("utf-8"), 0o600)
     marker = {
@@ -17437,7 +17822,6 @@ def _fleet_managed_home_state(
             if agent.runner is RunnerKind.CODEX_CLI
             else {
                 wrapper_name,
-                "settings.json",
                 ".gemini/settings.json",
                 ".gemini/policies/codex-master.toml",
             }
@@ -17458,6 +17842,7 @@ def _fleet_managed_home_state(
             raise AgentError("fleet_home_content_invalid")
         marker_files = set(marker["managed_files"])
         marker_digest_files = set(marker["files"])
+        compatibility_files = {"settings.json"} if agent.runner is RunnerKind.GEMINI_CLI else set()
         portable_files = {
             name for name in marker_files
             if isinstance(name, str) and name.startswith("skills/.portable/") and name.endswith("/SKILL.md")
@@ -17467,7 +17852,10 @@ def _fleet_managed_home_state(
             or marker_files != marker_digest_files
             or len(portable_files) > MAX_PORTABLE_SKILLS
             or any(not _fleet_managed_name(name) for name in marker_files)
-            or any(not name.startswith("skills/.portable/") for name in marker_files - base_expected_files)
+            or any(
+                not name.startswith("skills/.portable/")
+                for name in marker_files - base_expected_files - compatibility_files
+            )
         ):
             raise AgentError("fleet_home_content_invalid")
         expected_files = marker_files
@@ -17494,6 +17882,7 @@ def _fleet_managed_home_state(
             *expected_files,
             "auth.json",
             ".gemini/projects.json",
+            "settings.json",
         }
         expected_directories = _fleet_artifact_directories({name: None for name in expected_files})
         if strict_contents:
@@ -18559,6 +18948,8 @@ def fleet_series_apply(
     enabled: bool = True,
     expected_generation: int,
     confirmed_remove_ids: list[str] | None = None,
+    skill_profile: str = "generic",
+    task_profile: str = "standard",
     codex_executable: Path | None = None,
     gemini_executable: Path | None = None,
 ) -> dict[str, Any]:
@@ -18574,6 +18965,8 @@ def fleet_series_apply(
         enabled=enabled,
         expected_generation=expected_generation,
         confirmed_remove_ids=confirmed_remove_ids,
+        skill_profile=skill_profile,
+        task_profile=task_profile,
     )
     planned_inventory = build_inventory(planned, AGENT_POOL_ROOT)
     old_count = existing.count if existing is not None else 0
@@ -18581,6 +18974,8 @@ def fleet_series_apply(
         existing.runner is not candidate.runner
         or existing.provider is not candidate.provider
         or existing.model != candidate.model
+        or existing.skill_profile != candidate.skill_profile
+        or existing.task_profile != candidate.task_profile
     )
     prepared_recovery_entries: tuple[RecoveryEntry, ...] = ()
     with fleet_mutation_lock(FleetPaths.from_state_root(STATE_ROOT)):
@@ -22397,9 +22792,10 @@ TOOLS: list[dict[str, Any]] = [
         "name": "fleet_series_plan",
         "description": "Read-only plan for a provider-backed Agentinnen series; returns counts and generation only.",
         "inputSchema": {"type": "object", "required": ["prefix", "count", "runner", "provider", "model", "expected_generation"], "properties": {
-            "prefix": text_schema(1), "count": {"type": "integer", "minimum": 1, "maximum": MAX_FLEET_SERIES_COUNT},
+            "prefix": text_schema(MAX_FLEET_PREFIX_LENGTH), "count": {"type": "integer", "minimum": 1, "maximum": MAX_FLEET_SERIES_COUNT},
             "runner": text_schema(32), "provider": text_schema(64), "model": text_schema(200),
             "account_id": text_schema(64), "enabled": {"type": "boolean", "default": True},
+            "skill_profile": text_schema(64, default="generic"), "task_profile": text_schema(64, default="standard"),
             "expected_generation": {"type": "integer", "minimum": 0},
             "confirmed_remove_ids": text_array_schema(max_items=1000),
         }, "additionalProperties": False},
@@ -22408,9 +22804,10 @@ TOOLS: list[dict[str, Any]] = [
         "name": "fleet_series_apply",
         "description": "Materialize or update a provider-backed Agentinnen series and publish its inventory.",
         "inputSchema": {"type": "object", "required": ["prefix", "count", "runner", "provider", "model", "expected_generation"], "properties": {
-            "prefix": text_schema(1), "count": {"type": "integer", "minimum": 1, "maximum": MAX_FLEET_SERIES_COUNT},
+            "prefix": text_schema(MAX_FLEET_PREFIX_LENGTH), "count": {"type": "integer", "minimum": 1, "maximum": MAX_FLEET_SERIES_COUNT},
             "runner": text_schema(32), "provider": text_schema(64), "model": text_schema(200),
             "account_id": text_schema(64), "enabled": {"type": "boolean", "default": True},
+            "skill_profile": text_schema(64, default="generic"), "task_profile": text_schema(64, default="standard"),
             "expected_generation": {"type": "integer", "minimum": 0},
             "confirmed_remove_ids": text_array_schema(max_items=1000),
         }, "additionalProperties": False},
@@ -22418,12 +22815,12 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "fleet_series_disable",
         "description": "Disable a provider-backed Agentinnen series through a generation-checked registry update.",
-        "inputSchema": {"type": "object", "required": ["prefix", "expected_generation"], "properties": {"prefix": text_schema(1), "expected_generation": {"type": "integer", "minimum": 0}}, "additionalProperties": False},
+        "inputSchema": {"type": "object", "required": ["prefix", "expected_generation"], "properties": {"prefix": text_schema(MAX_FLEET_PREFIX_LENGTH), "expected_generation": {"type": "integer", "minimum": 0}}, "additionalProperties": False},
     },
     {
         "name": "fleet_series_delete",
         "description": "Delete a disabled provider-backed Agentinnen series after explicit tail confirmation.",
-        "inputSchema": {"type": "object", "required": ["prefix", "expected_generation"], "properties": {"prefix": text_schema(1), "expected_generation": {"type": "integer", "minimum": 0}, "confirmed_remove_ids": text_array_schema(max_items=1000)}, "additionalProperties": False},
+        "inputSchema": {"type": "object", "required": ["prefix", "expected_generation"], "properties": {"prefix": text_schema(MAX_FLEET_PREFIX_LENGTH), "expected_generation": {"type": "integer", "minimum": 0}, "confirmed_remove_ids": text_array_schema(max_items=1000)}, "additionalProperties": False},
     },
     {
         "name": "agent_doctor",
@@ -22709,6 +23106,140 @@ def write_message(message: dict[str, Any]) -> None:
     sys.stdout.buffer.flush()
 
 
+def fleet_materialize_native_registry() -> dict[str, Any]:
+    """Move native A/B/C authority from the legacy pool into Fleet Registry.
+
+    Existing homes are adopted in place: only Fleet-managed wrapper/config
+    files and the marker are added or refreshed; unrelated files, including
+    auth.json, remain untouched.  b92 is intentionally not migrated here.
+    """
+
+    require_fleet_recovery_ready("fleet_series_apply")
+    targets = (("a", 5), ("b", 3), ("c", 3))
+    service = current_fleet_service()
+    with fleet_mutation_lock(FleetPaths.from_state_root(STATE_ROOT)):
+        current = service.load()
+        changed = 0
+        for prefix, count in targets:
+            account_id = f"native-{prefix}"
+            source = AGENTS.get(f"{prefix}1")
+            auth_path = Path(source.get("home", AGENT_POOL_ROOT / f"{prefix}1")) / "auth.json" if source else None
+            auth_configured = bool(auth_path and path_present_no_follow(auth_path))
+            account = FleetAccount(
+                account_id,
+                f"Native Series {prefix.upper()}",
+                Provider.OPENAI_CHATGPT,
+                AuthKind.CHATGPT_SESSION,
+                SecretState.CONFIGURED if auth_configured else SecretState.MISSING,
+                LimitState.READY if auth_configured else LimitState.UNKNOWN,
+                True,
+                None,
+                None,
+                None,
+                None,
+            )
+            current_account = next((item for item in current.accounts if item.account_id == account_id), None)
+            if current_account != account:
+                planned = plan_account_upsert(current, account, expected_generation=current.generation)
+                current = service.commit_snapshot(planned, expected_generation=current.generation)
+                changed += 1
+            existing = next((item for item in current.series if item.prefix == prefix), None)
+            candidate = FleetSeries(
+                prefix, f"Native Series {prefix.upper()}", count, RunnerKind.CODEX_CLI,
+                Provider.OPENAI_CHATGPT, DEFAULT_AGENT_MODEL, account_id, True, "teamleiterin", "standard",
+            )
+            if existing != candidate:
+                confirmed = [f"{prefix}{number}" for number in range(count + 1, existing.count + 1)] if existing and count < existing.count else []
+                planned = plan_series_apply(
+                    current, candidate, expected_generation=current.generation,
+                    confirmed_remove_ids=confirmed,
+                )
+                current = service.commit_snapshot(planned, expected_generation=current.generation)
+                changed += 1
+
+        inventory = build_inventory(current, AGENT_POOL_ROOT)
+        with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+            AGENT_POOL_ROOT, ensure=True, error_text="fleet_pool_root_invalid"
+        ) as root:
+            marker = root / FLEET_POOL_MARKER_FILE
+            if not path_present_no_follow(marker):
+                replace_private_text(marker, '{\n  "kind": "codex_master_fleet_pool",\n  "schema_version": 1\n}\n')
+            for prefix, _count in targets:
+                for agent_id in inventory.by_series.get(f"{prefix}-series", ()):
+                    descriptor = inventory.agents[agent_id]
+                    found = shutil.which("codex")
+                    if found is None:
+                        raise AgentError("fleet_executable_unavailable")
+                    executable = trusted_runner_executable(Path(found))
+                    # c1 historically shared a1/skills through a symlink.
+                    # Registry-managed homes must be self-contained and the
+                    # security checks intentionally reject symlink parents;
+                    # replace only this known shared asset with a real dir.
+                    skill_root = descriptor.home / "skills"
+                    if skill_root.is_symlink():
+                        skill_root.unlink()
+                    _fleet_write_home(descriptor.home, _fleet_artifacts(descriptor, executable), allow_unmanaged=True)
+        preserved = legacy_agent_inventory({"b92": AGENTS["b92"]}) if "b92" in AGENTS else None
+        publish_agent_inventory(
+            merge_agent_inventories(inventory, preserved) if preserved is not None else inventory
+        )
+    return {
+        "materialized_series": [prefix for prefix, _count in targets],
+        "agent_count": sum(count for _prefix, count in targets),
+        "changed_records": changed,
+        "legacy_runtime_source": "removed_for_a_b_c",
+        "b92": "preserved_legacy_compatibility",
+        "raw_output": "not_returned",
+    }
+
+
+def ollama_local_benchmark(*, model: str = "llama3.2:3b", concurrency: int = 1) -> dict[str, Any]:
+    """Run a bounded local Ollama benchmark without retaining generated text."""
+
+    if not isinstance(model, str) or not model or len(model) > 200:
+        raise AgentError("ollama_model_invalid")
+    if isinstance(concurrency, bool) or not isinstance(concurrency, int) or not 1 <= concurrency <= 2:
+        raise AgentError("ollama_benchmark_concurrency_invalid")
+    resource_before = system_resource_snapshot()
+    payload = json.dumps({
+        "model": model,
+        "prompt": "Reply with exactly one short word: ok.",
+        "stream": False,
+        "options": {"num_predict": 8, "temperature": 0},
+    })
+    started = time.perf_counter()
+    try:
+        completed = subprocess.run(
+            ["curl", "-fsS", "--max-time", "45", "-H", "Content-Type: application/json",
+             "-d", payload, "http://127.0.0.1:11434/api/generate"],
+            check=False, capture_output=True, text=True,
+        )
+    except (OSError, ValueError) as exc:
+        raise AgentError("ollama_benchmark_unavailable") from exc
+    elapsed = time.perf_counter() - started
+    try:
+        response = json.loads(completed.stdout) if completed.returncode == 0 else {}
+    except (json.JSONDecodeError, TypeError):
+        response = {}
+    return {
+        "provider": "ollama_local",
+        "model": model,
+        "concurrency_requested": concurrency,
+        "concurrency_policy": "one active agent by default; two only when resource gate allows",
+        "returncode": completed.returncode,
+        "available": completed.returncode == 0 and isinstance(response, dict),
+        "elapsed_seconds": round(elapsed, 3),
+        "prompt_eval_count": response.get("prompt_eval_count") if isinstance(response, dict) else None,
+        "eval_count": response.get("eval_count") if isinstance(response, dict) else None,
+        "prompt_eval_duration_ns": response.get("prompt_eval_duration") if isinstance(response, dict) else None,
+        "eval_duration_ns": response.get("eval_duration") if isinstance(response, dict) else None,
+        "resource_before": resource_before,
+        "response_text": "not_returned",
+        "stderr": "not_returned",
+        "raw_output": "not_returned",
+    }
+
+
 def _publish_startup_fleet_inventory() -> None:
     """Publish dynamic series only when the registry contains materialized series.
 
@@ -22723,10 +23254,12 @@ def _publish_startup_fleet_inventory() -> None:
     try:
         snapshot = _readonly_fleet_service().load()
         if snapshot.series:
-            publish_agent_inventory(merge_agent_inventories(
-                _legacy_inventory(),
-                build_inventory(snapshot, AGENT_POOL_ROOT),
-            ))
+            provider_inventory = build_inventory(snapshot, AGENT_POOL_ROOT)
+            preserved = legacy_agent_inventory({"b92": AGENTS["b92"]}) if "b92" in AGENTS else None
+            publish_agent_inventory(
+                merge_agent_inventories(provider_inventory, preserved)
+                if preserved is not None else provider_inventory
+            )
         else:
             swap_agent_inventory(None)
     except Exception:
@@ -23058,7 +23591,7 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_account_probe.add_argument("--expected-generation", type=int, required=True)
     p_account_sync = account_sub.add_parser("sync-env")
     p_account_sync.add_argument("--first-key", type=int, default=1)
-    p_account_sync.add_argument("--last-key", type=int, default=20)
+    p_account_sync.add_argument("--last-key", type=int, default=MAX_HIVE_API_KEYS)
     p_account_sync.add_argument("--no-activate-series", action="store_true")
     p_account_disable = account_sub.add_parser("disable")
     p_account_disable.add_argument("--account-id", required=True)
@@ -23067,6 +23600,10 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_account_delete.add_argument("--account-id", required=True)
     p_account_delete.add_argument("--expected-generation", type=int, required=True)
     fleet_sub.add_parser("sync-skills")
+    fleet_sub.add_parser("migrate-native")
+    p_ollama_benchmark = fleet_sub.add_parser("ollama-benchmark")
+    p_ollama_benchmark.add_argument("--model", default="llama3.2:3b")
+    p_ollama_benchmark.add_argument("--concurrency", type=int, default=1)
 
     p_fleet_series = fleet_sub.add_parser("series")
     series_sub = p_fleet_series.add_subparsers(dest="fleet_series_command", required=True)
@@ -23079,6 +23616,8 @@ def _main_cli_impl(argv: list[str]) -> int:
         parser_obj.add_argument("--provider", required=True)
         parser_obj.add_argument("--model", required=True)
         parser_obj.add_argument("--account-id")
+        parser_obj.add_argument("--skill-profile", default="generic")
+        parser_obj.add_argument("--task-profile", default="standard")
         parser_obj.add_argument("--disabled", action="store_true")
         parser_obj.add_argument("--expected-generation", type=int, required=True)
         parser_obj.add_argument("--confirmed-remove-id", action="append", default=[])
@@ -23228,6 +23767,10 @@ def _main_cli_impl(argv: list[str]) -> int:
                     }))
             if args.fleet_namespace == "sync-skills":
                 return print_json(fleet_sync_gemini_skills())
+            if args.fleet_namespace == "migrate-native":
+                return print_json(fleet_materialize_native_registry())
+            if args.fleet_namespace == "ollama-benchmark":
+                return print_json(ollama_local_benchmark(model=args.model, concurrency=args.concurrency))
             if args.fleet_namespace == "series":
                 if args.fleet_series_command == "list":
                     return print_json(call_validated_tool("fleet_series_list", {}))
@@ -23240,6 +23783,8 @@ def _main_cli_impl(argv: list[str]) -> int:
                         "provider": args.provider,
                         "model": args.model,
                         "account_id": args.account_id,
+                        "skill_profile": args.skill_profile,
+                        "task_profile": args.task_profile,
                         "enabled": not args.disabled,
                         "expected_generation": args.expected_generation,
                         "confirmed_remove_ids": args.confirmed_remove_id,
@@ -24355,7 +24900,7 @@ def _fleet_public_account(snapshot: FleetSnapshot, account_id: str) -> dict[str,
                 "auth_kind": account.auth_kind.value,
                 "secret_state": account.secret_state.value,
                 "limit_state": account.limit_state.value,
-                "billing_group": FleetService.gemini_billing_group(account.account_id),
+                "billing_group": account.billing_group or FleetService.gemini_billing_group(account.account_id),
                 "enabled": account.enabled,
                 "raw_output": "not_returned",
             }
@@ -24400,7 +24945,7 @@ def fleet_account_list() -> dict[str, Any]:
             "auth_kind": account.auth_kind.value,
             "secret_state": account.secret_state.value,
             "limit_state": account.limit_state.value,
-            "billing_group": FleetService.gemini_billing_group(account.account_id),
+            "billing_group": account.billing_group or FleetService.gemini_billing_group(account.account_id),
             "enabled": account.enabled,
         }
         for account in snapshot.accounts
@@ -24456,15 +25001,17 @@ def _read_hive_api_tokens(path: Path = HIVE_API_TOKEN_ENV_FILE) -> dict[int, str
 
 
 def _hive_series_prefix(number: int) -> str:
-    if not 1 <= number <= 20:
+    if not 1 <= number <= MAX_HIVE_API_KEYS:
         raise AgentError("hive_series_prefix_unavailable")
-    return chr(ord("f") + number)
+    if number <= 20:
+        return chr(ord("f") + number)
+    return f"a-{chr(ord('a') + number - 21)}"
 
 
 def fleet_account_sync_env(
     *,
     first_key: int = 1,
-    last_key: int = 20,
+    last_key: int = MAX_HIVE_API_KEYS,
     activate_series: bool = True,
 ) -> dict[str, Any]:
     """Synchronize The_Hive_N keys and optionally activate one-agent series."""
@@ -24527,6 +25074,10 @@ def fleet_account_sync_env(
         for number, model in ready_models.items():
             prefix = _hive_series_prefix(number)
             generation = current_fleet_service().load().generation
+            existing_series = next(
+                (item for item in current_fleet_service().load().series if item.prefix == prefix),
+                None,
+            )
             try:
                 applied = fleet_series_apply(
                     prefix=prefix,
@@ -24537,6 +25088,8 @@ def fleet_account_sync_env(
                     account_id=f"the-hive-{number}",
                     enabled=True,
                     expected_generation=generation,
+                    skill_profile=existing_series.skill_profile if existing_series is not None else "worker",
+                    task_profile=existing_series.task_profile if existing_series is not None else "standard",
                 )
                 activated.append({"key": number, "prefix": prefix, **applied})
             except AgentError as exc:
@@ -24559,18 +25112,40 @@ def fleet_account_sync_env(
     }
 
 
-def fleet_sync_gemini_skills() -> dict[str, Any]:
-    """Refresh the portable Markdown skill projection in every Gemini home."""
+def fleet_sync_skill_projections() -> dict[str, Any]:
+    """Refresh the class-filtered Markdown skill projection for every registry Agentin."""
 
-    inventory = current_agent_inventory()
+    # The registry is authoritative here.  Reading the last published
+    # inventory would omit newly materialized series until a long-lived MCP
+    # process happened to republish it.
+    snapshot = current_fleet_service().load()
+    inventory = build_inventory(snapshot, AGENT_POOL_ROOT)
     synced: list[str] = []
     failed: list[dict[str, str]] = []
     for agent_id in inventory.agent_ids:
         descriptor = inventory.agents.get(agent_id)
-        if descriptor is None or descriptor.runner is not RunnerKind.GEMINI_CLI:
+        if descriptor is None or not path_present_no_follow(descriptor.home):
             continue
         try:
-            sync_gemini_skill_home(agent_id)
+            if descriptor.runner is RunnerKind.GEMINI_CLI:
+                executable = _headless_executable(descriptor)
+            else:
+                found = shutil.which("codex")
+                if found is None:
+                    raise AgentError("fleet_executable_unavailable")
+                executable = trusted_runner_executable(Path(found))
+            home_artifacts = _fleet_home_artifacts(
+                descriptor,
+                executable,
+                include_portable_skills=True,
+            )
+            _fleet_write_home(
+                descriptor.home,
+                {
+                    name: value
+                    for name, (value, _mode) in _fleet_artifact_files(home_artifacts).items()
+                },
+            )
         except Exception as exc:
             failed.append({
                 "agent": agent_id,
@@ -24583,8 +25158,15 @@ def fleet_sync_gemini_skills() -> dict[str, Any]:
         "failed": failed,
         "synced_count": len(synced),
         "failed_count": len(failed),
+        "source": "fleet_registry",
         "raw_output": "not_returned",
     }
+
+
+def fleet_sync_gemini_skills() -> dict[str, Any]:
+    """Compatibility alias for the registry-wide skill projection refresh."""
+
+    return fleet_sync_skill_projections()
 
 
 def fleet_series_list() -> dict[str, Any]:
@@ -24601,6 +25183,8 @@ def fleet_series_list() -> dict[str, Any]:
             "model": item.model,
             "account_id": item.account_id,
             "enabled": item.enabled,
+            **({"skill_profile": item.skill_profile} if item.skill_profile != "generic" else {}),
+            **({"task_profile": item.task_profile} if item.task_profile != "standard" else {}),
         }
         for item in snapshot.series
     ]
@@ -25008,7 +25592,12 @@ def _fleet_artifacts(agent: AgentDescriptor, executable: Path) -> dict[str, byte
     if agent.runner is RunnerKind.GEMINI_CLI:
         artifacts[".gemini/settings.json"] = config_text.encode()
         artifacts[".gemini/policies/codex-master.toml"] = b'approvalMode = "deny"\n'
-        artifacts.update(portable_gemini_skill_artifacts())
+    # Skills are Markdown projections, not executable plugins.  Project them
+    # into every managed home so Codex, Gemini, and Ollama share the same
+    # vetted vocabulary.  The profile removes dangerous/contradictory skills
+    # before the agent can see them.
+    if agent.skill_profile != "generic":
+        artifacts.update(portable_gemini_skill_artifacts(agent.skill_profile))
     marker = {
         "schema_version": 1,
         "kind": "codex_master_fleet_agent",
@@ -25024,8 +25613,34 @@ def _fleet_artifacts(agent: AgentDescriptor, executable: Path) -> dict[str, byte
     return artifacts
 
 
-def portable_gemini_skill_artifacts() -> dict[str, bytes]:
-    """Materialize portable SKILL.md documents without copying Codex plugins."""
+_SKILL_PROFILE_BLOCKS: dict[str, tuple[str, ...]] = {
+    # Generic workers can read and use task skills, but must not receive
+    # skills whose primary action is installing software, changing plugins,
+    # publishing code, or operating external infrastructure.
+    "generic": (
+        "skill-installer", "plugin-creator", "github:yeet", "gh-address-comments",
+        "gh-fix-ci", "autofix", "hf-cli", "workspace-agents:workspace-agents-build-agent",
+        "workspace-agents:workspace-agents-api-triggers",
+    ),
+    "worker": (
+        "skill-installer", "plugin-creator", "github:yeet", "gh-address-comments",
+        "gh-fix-ci", "autofix", "hf-cli", "workspace-agents:", "openai-docs",
+    ),
+    "teamlead": ("skill-installer", "plugin-creator"),
+    "teamleiterin": ("skill-installer", "plugin-creator"),
+    "koenigin": ("skill-installer", "plugin-creator"),
+    "admin": (),
+}
+
+
+def _skill_allowed_for_profile(skill_name: str, profile: str) -> bool:
+    normalized = skill_name.strip().lower()
+    blocked = _SKILL_PROFILE_BLOCKS.get(profile, _SKILL_PROFILE_BLOCKS["generic"])
+    return not any(pattern in normalized for pattern in blocked)
+
+
+def portable_gemini_skill_artifacts(profile: str = "generic") -> dict[str, bytes]:
+    """Materialize vetted Markdown skills without copying executable plugins."""
 
     home = Path.home()
     roots = [
@@ -25039,6 +25654,8 @@ def portable_gemini_skill_artifacts() -> dict[str, bytes]:
             continue
         for skill_file in sorted(root.glob("*/SKILL.md")):
             if namespace == "agents" and skill_file.parent.name == ".system":
+                continue
+            if not _skill_allowed_for_profile(skill_file.parent.name, profile):
                 continue
             try:
                 stat_result = skill_file.lstat()
@@ -25079,6 +25696,8 @@ def portable_gemini_skill_artifacts() -> dict[str, bytes]:
                 skill_name = skill_file.parent.name
             except (ValueError, IndexError):
                 continue
+            if not _skill_allowed_for_profile(f"{plugin}:{skill_name}", profile):
+                continue
             target = f"skills/.portable/plugins/{plugin}/{skill_name}/SKILL.md"
             artifacts.setdefault(target, data)
             if len(artifacts) >= MAX_PORTABLE_SKILLS:
@@ -25086,28 +25705,31 @@ def portable_gemini_skill_artifacts() -> dict[str, bytes]:
     return artifacts
 
 
-def _fleet_write_home(home: Path, artifacts: dict[str, bytes]) -> bool:
+def _fleet_write_home(home: Path, artifacts: dict[str, bytes], *, allow_unmanaged: bool = False) -> bool:
     existed = path_present_no_follow(home)
     previous_files: set[str] = set()
     if existed:
-        if not _fleet_existing_home_ok(home, {}):
+        if not _fleet_existing_home_ok(home, {}) and not allow_unmanaged:
             raise AgentError("fleet_home_verification_failed")
-        try:
-            marker_bytes = fleet_read_optional_private_bytes(
+        if not _fleet_existing_home_ok(home, {}) and allow_unmanaged:
+            previous_files = set()
+        else:
+            try:
+                marker_bytes = fleet_read_optional_private_bytes(
                 home / FLEET_AGENT_MARKER_FILE,
                 MAX_FLEET_ARTIFACT_BYTES,
                 "fleet_home_verification_failed",
-            )
-            if marker_bytes is None:
-                raise AgentError("fleet_home_verification_failed")
-            marker = json.loads(marker_bytes.decode("utf-8"))
-            previous_files = (
-                {name for name in marker.get("files", {}) if _fleet_managed_name(name)}
-                if isinstance(marker, dict)
-                else set()
-            )
-        except (AgentError, UnicodeDecodeError, json.JSONDecodeError):
-            raise AgentError("fleet_home_verification_failed") from None
+                )
+                if marker_bytes is None:
+                    raise AgentError("fleet_home_verification_failed")
+                marker = json.loads(marker_bytes.decode("utf-8"))
+                previous_files = (
+                    {name for name in marker.get("files", {}) if _fleet_managed_name(name)}
+                    if isinstance(marker, dict)
+                    else set()
+                )
+            except (AgentError, UnicodeDecodeError, json.JSONDecodeError):
+                raise AgentError("fleet_home_verification_failed") from None
     else:
         ensure_private_dir(home)
         try:
@@ -25127,6 +25749,27 @@ def _fleet_write_home(home: Path, artifacts: dict[str, bytes]) -> bool:
             raise AgentError("fleet_home_verification_failed") from None
         if current != data:
             replace_private_bytes(target, data, mode=0o700 if relative in {"codex", "gemini"} else 0o600)
+    # Older Gemini projections created 0755 skill directories.  Harden every
+    # managed parent now that the registry owns the home, while rejecting any
+    # unexpected symlink in the path.
+    managed_directories: set[Path] = set()
+    for relative in artifacts:
+        parent = (home / relative).parent
+        while parent != home:
+            managed_directories.add(parent)
+            parent = parent.parent
+    managed_directories.add(home)
+    for directory in managed_directories:
+        try:
+            directory_stat = directory.lstat()
+        except OSError as exc:
+            raise AgentError("fleet_home_hardening_failed") from exc
+        if not stat_module.S_ISDIR(directory_stat.st_mode) or stat_module.S_ISLNK(directory_stat.st_mode):
+            raise AgentError("fleet_home_hardening_failed")
+        try:
+            directory.chmod(0o700)
+        except OSError as exc:
+            raise AgentError("fleet_home_hardening_failed") from exc
     for relative in sorted(previous_files - set(artifacts)):
         stale = home / relative
         try:
@@ -25294,7 +25937,7 @@ def _fleet_plan(
     normalized = next(item for item in planned.series if item.prefix == candidate.prefix)
     if normalized.enabled:
         decision = service.series_gate(normalized, snapshot=current)
-        if not decision.allowed:
+        if not decision.allowed and decision.reason not in {"probe_stale", "limit_unknown"}:
             raise AgentError(decision.reason)
     existing = next((item for item in current.series if item.prefix == normalized.prefix), None)
     old_count = existing.count if existing else 0

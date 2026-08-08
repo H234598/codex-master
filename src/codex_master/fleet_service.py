@@ -16,6 +16,7 @@ from .fleet_registry import (
     FleetSnapshot,
     InventorySnapshot,
     LimitState,
+    Provider,
     SecretState,
     build_inventory,
     fleet_document,
@@ -383,6 +384,28 @@ class FleetService:
             return f"the-hive-account-{((number - 1) // 10) + 1}"
         return account_id
 
+    def project_limit_identity(self, account_id: str) -> dict[str, object]:
+        """Expose the quota scope explicitly.
+
+        Gemini RPM/TPM/RPD counters are per project.  Billing tier and spend
+        caps can additionally be shared by the billing group.  The local
+        request limiter must therefore never use this group as its key.
+        """
+
+        snapshot = self.load()
+        account = next((item for item in snapshot.accounts if item.account_id == account_id), None)
+        billing_group = (
+            account.billing_group
+            if account is not None and account.billing_group
+            else self.gemini_billing_group(account_id)
+        )
+        return {
+            "project_id": account_id,
+            "billing_group": billing_group,
+            "rpm_tpm_rpd_scope": "project",
+            "spend_and_tier_scope": "billing_account",
+        }
+
     def record_gemini_usage(
         self,
         account_id: str,
@@ -457,13 +480,17 @@ class FleetService:
                 probe_state = "fresh" if self._probe_is_fresh(account.last_probe_at_utc) else "stale"
             except (TypeError, ValueError, AttributeError):
                 probe_state = "invalid"
+        identity = self.project_limit_identity(account_id)
         return {
             "account_id": account_id,
-            "billing_group": self.gemini_billing_group(account_id),
+            **identity,
             "probe_state": probe_state,
             "probe_age_seconds": probe_age,
             "rpm_observed": len(recent_minute),
-            "tpm_observed": sum(int(event.get("input_tokens", 0)) + int(event.get("output_tokens", 0)) for event in recent_minute),
+            # Google defines TPM as input tokens per minute.  Output tokens
+            # remain visible separately and are not folded into TPM.
+            "tpm_observed": sum(int(event.get("input_tokens", 0)) for event in recent_minute),
+            "output_tokens_per_minute_observed": sum(int(event.get("output_tokens", 0)) for event in recent_minute),
             "rpd_observed": len(recent_day),
             "input_tokens_24h": sum(int(event.get("input_tokens", 0)) for event in recent_day),
             "output_tokens_24h": sum(int(event.get("output_tokens", 0)) for event in recent_day),
@@ -485,7 +512,8 @@ class FleetService:
             "account_count": len(accounts),
             "accounts": accounts,
             "stale_or_unknown_accounts": stale,
-            "state": "degraded" if stale else "ready",
+            "state": "ready" if not stale else "probe_deferred_until_invocation",
+            "probe_policy": "probe_once_when_invocation_admission_sees_stale_or_unknown",
             "limits_source": "observed_request_and_token_counters; provider_quota_caps_not_available_locally",
             "recent_events": self.gemini_event_status(),
             "raw_output": "not_returned",
@@ -1226,6 +1254,12 @@ class FleetService:
             reason = "provider_unavailable"
         elif account.limit_reason == "model_unavailable":
             reason = "model_unavailable"
+        elif provider is Provider.OPENAI_CHATGPT:
+            # Native Codex sessions are authenticated by each home’s
+            # auth.json.  They have no provider quota probe and must not be
+            # made stale merely because a Gemini-style probe timestamp is
+            # absent.
+            reason = "ready"
         elif account.limit_state is LimitState.LIMITED:
             reason = "limit_active"
         elif account.limit_state in {LimitState.UNKNOWN, LimitState.PROBING}:

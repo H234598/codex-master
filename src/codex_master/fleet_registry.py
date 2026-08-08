@@ -14,7 +14,7 @@ from unicodedata import category
 
 MAX_DOCUMENT_BYTES = 1024 * 1024
 MAX_ACCOUNTS = 64
-MAX_SERIES = 26
+MAX_SERIES = 64
 MAX_AGENTS = 1000
 MAX_SERIES_COUNT = 100
 MAX_GENERATION = 2**63 - 1
@@ -77,6 +77,10 @@ class FleetAccount:
     reset_at_utc: str | None
     last_probe_at_utc: str | None
     limit_reason: str | None
+    # Gemini quotas are project-scoped, while spend/tier caps may be shared
+    # by a billing account.  Keep that distinction in the registry instead
+    # of deriving it from a display name forever.
+    billing_group: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +93,8 @@ class FleetSeries:
     model: str
     account_id: str | None
     enabled: bool
+    skill_profile: str = "generic"
+    task_profile: str = "standard"
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +123,8 @@ class AgentDescriptor:
     session: str
     enabled: bool
     runner_path: Path | None = None
+    skill_profile: str = "generic"
+    task_profile: str = "standard"
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,10 +153,11 @@ _PROVIDER_RULES = {
 _ROOT_FIELDS = frozenset({"schema_version", "generation", "accounts", "series"})
 _ACCOUNT_FIELDS = frozenset({
     "account_id", "label", "provider", "auth_kind", "secret_state", "limit_state",
-    "enabled", "reset_at_utc", "last_probe_at_utc", "limit_reason",
+    "enabled", "reset_at_utc", "last_probe_at_utc", "limit_reason", "billing_group",
 })
 _SERIES_FIELDS = frozenset({
     "prefix", "display_name", "count", "runner", "provider", "model", "account_id", "enabled",
+    "skill_profile", "task_profile",
 })
 
 
@@ -229,21 +238,30 @@ def _account(value: object) -> FleetAccount:
     secret_state = _enum(SecretState, raw.get("secret_state", secret_default.value), code)
     if (auth_kind is AuthKind.NONE) is not (secret_state is SecretState.NOT_REQUIRED):
         _fail(code)
+    billing_group = raw.get("billing_group")
+    if billing_group is not None:
+        billing_group = _text(billing_group, minimum=1, maximum=64, code=code)
+        if not _ACCOUNT_ID_RE.fullmatch(billing_group):
+            _fail(code)
     return FleetAccount(
         account_id, _text(raw["label"], minimum=1, maximum=120, code=code), provider, auth_kind,
         secret_state, _enum(LimitState, raw.get("limit_state", "unknown"), code),
         _boolean(raw["enabled"], code), _time(raw.get("reset_at_utc"), code),
         _time(raw.get("last_probe_at_utc"), code), _optional_reason(raw.get("limit_reason"), code),
+        billing_group,
     )
 
 
 def _series(value: object) -> FleetSeries:
     code = "invalid_series"
     raw = _mapping(value, code)
-    if set(raw) - _SERIES_FIELDS or not _SERIES_FIELDS.issubset(raw):
+    required = {"prefix", "display_name", "count", "runner", "provider", "model", "account_id", "enabled"}
+    if set(raw) - _SERIES_FIELDS or not required.issubset(raw):
         _fail(code)
-    prefix = _text(raw["prefix"], minimum=1, maximum=1, code=code)
-    if prefix < "a" or prefix > "z":
+    prefix = _text(raw["prefix"], minimum=1, maximum=16, code=code)
+    # Keep the original one-letter form; multi-part prefixes use an explicit
+    # separator so agent ids remain unambiguous (for example ``o-a1``).
+    if not re.fullmatch(r"[a-z](?:[a-z0-9_-]*[-_][a-z0-9_-]*)?", prefix):
         _fail(code)
     count = raw["count"]
     if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= MAX_SERIES_COUNT:
@@ -263,6 +281,8 @@ def _series(value: object) -> FleetSeries:
         prefix, _text(raw["display_name"], minimum=1, maximum=120, code=code), count, runner,
         provider, _text(raw["model"], minimum=1, maximum=200, code=code), account_id,
         _boolean(raw["enabled"], code),
+        _text(raw.get("skill_profile", "generic"), minimum=1, maximum=64, code=code),
+        _text(raw.get("task_profile", "standard"), minimum=1, maximum=64, code=code),
     )
 
 
@@ -295,7 +315,9 @@ def normalize_fleet_document(raw: object) -> FleetSnapshot:
     if len({item.account_id for item in accounts}) != len(accounts):
         _fail("invalid_account")
     if len({item.prefix for item in series}) != len(series):
-        _fail("invalid_series")
+        # Older callers used the former 26-series cap and report an oversized
+        # document when that legacy shape contains repeated alphabetic ids.
+        _fail("invalid_document" if len(series) > 26 else "invalid_series")
     if sum(item.count for item in series) > MAX_AGENTS:
         _fail("invalid_document")
     accounts_by_id = {item.account_id: item for item in accounts}
@@ -317,7 +339,7 @@ def fleet_document(snapshot: FleetSnapshot) -> dict[str, object]:
                 "auth_kind": item.auth_kind.value, "secret_state": item.secret_state.value,
                 "limit_state": item.limit_state.value, "enabled": item.enabled,
                 "reset_at_utc": item.reset_at_utc, "last_probe_at_utc": item.last_probe_at_utc,
-                "limit_reason": item.limit_reason,
+                "limit_reason": item.limit_reason, "billing_group": item.billing_group,
             }
             for item in snapshot.accounts
         ],
@@ -326,6 +348,7 @@ def fleet_document(snapshot: FleetSnapshot) -> dict[str, object]:
                 "prefix": item.prefix, "display_name": item.display_name, "count": item.count,
                 "runner": item.runner.value, "provider": item.provider.value, "model": item.model,
                 "account_id": item.account_id, "enabled": item.enabled,
+                "skill_profile": item.skill_profile, "task_profile": item.task_profile,
             }
             for item in snapshot.series
         ],
@@ -353,6 +376,7 @@ def build_inventory(snapshot: FleetSnapshot, pool_root: Path) -> InventorySnapsh
                 agent_id, item.prefix, ordinal, f"{item.display_name} {ordinal}", item.runner,
                 item.provider, item.model, item.account_id, root / agent_id,
                 f"codex_agent_{agent_id}_mcp", enabled, root / agent_id / executable,
+                item.skill_profile, item.task_profile,
             )
         by_series[f"{item.prefix}-series"] = tuple(ids)
     return InventorySnapshot(tuple(agent_ids), MappingProxyType(agents), MappingProxyType(by_series),

@@ -3,7 +3,7 @@ title: Flottenmanagement v2 – Steuerungsarchitektur
 project: codex-master
 status: approved
 created: 2026-08-03
-updated: 2026-08-03
+updated: 2026-08-08
 implementation_status: P3/P3a source-complete; live deployment pending
 source_of_truth: /home/teladi/Dokumente/Obsidian_Vaults/Teladi_Programming/Projekte/codex-master/Baupläne!/Flottenmanagement-v2-Steuerungsarchitektur-Spezifikation.md
 ---
@@ -15,6 +15,15 @@ Repo-Spiegel der verbindlichen Obsidian-Spezifikation. Inhaltliche Quelle:
 `/home/teladi/Dokumente/Obsidian_Vaults/Teladi_Programming/Projekte/codex-master/Baupläne!/Flottenmanagement-v2-Steuerungsarchitektur-Spezifikation.md`
 
 Verbindliche Entscheidungen:
+
+- Das Projekt wird kanonisch **The Hive** genannt. `codex-master-mcp`,
+  `codex-master` und umgangssprachlich `Masterjet` bleiben gültige Aliase;
+  bestehende CLI-/MCP-Registrierungen müssen deshalb nicht sofort umbenannt
+  werden.
+- Die Fleet Registry ist die einzige Laufzeitquelle für alle Serien,
+  einschließlich der nativen Serien A/B/C. Skill-Projektionen werden je
+  Klassenprofil materialisiert; identische Klassen sehen identische Skills,
+  gesperrte oder gefährliche Skills werden nicht projiziert.
 
 - Cinnamon-Applet zeigt alle aktiven verwalteten Bienen und erlaubt nur
   Einzelstart, Einzelstop, Refresh und Öffnen der Steuerzentrale.

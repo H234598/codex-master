@@ -1,6 +1,6 @@
 {
   "name": "codex-master",
-  "version": "0.10.4+codex.20260807222838",
+  "version": "0.10.5+codex.20260808003125",
   "description": "The Hive plugin for controlling a sleeping Agentinnen fleet through a data-sparse local MCP server. codex-master-mcp and Masterjet remain compatibility aliases.",
   "author": {
     "name": "teladi"
