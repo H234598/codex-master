@@ -733,7 +733,7 @@ def test_systemd_adapter_uses_fixed_argv_internal_unit_and_one_internal_gate_rel
             "--collect",
             f"--unit={scope.unit_name}",
             "--slice=codex-master.slice",
-            "--property=Delegate=yes",
+            "--property=Delegate=cpu cpuset memory pids io",
             "--property=AllowedCPUs=4-11",
             "--property=CPUQuota=750%",
             "--property=CPUWeight=50",

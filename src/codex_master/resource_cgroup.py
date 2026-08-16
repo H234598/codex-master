@@ -860,7 +860,7 @@ class SystemdUserCgroupAdapter:
             "--collect",
             f"--unit={unit_name}",
             f"--slice={CODEX_MASTER_SLICE}",
-            "--property=Delegate=yes",
+            "--property=Delegate=cpu cpuset memory pids io",
             f"--property=AllowedCPUs={profile.cpuset_expression}",
             f"--property=CPUQuota={profile.cpu_quota_percent}%",
             f"--property=CPUWeight={profile.cpu_weight}",
