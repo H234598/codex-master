@@ -408,8 +408,7 @@ MAX_META_BYTES = 64 * 1024
 RESOURCE_MAX_LOAD_PER_CPU = 1.75
 RESOURCE_MAX_CPU_BUSY_PERCENT = 90.0
 RESOURCE_MAX_IO_WAIT_PERCENT = 50.0
-RESOURCE_MIN_AVAILABLE_MEMORY_PERCENT = 20.0
-RESOURCE_MIN_AVAILABLE_MEMORY_MIB = 1024
+RESOURCE_MIN_AVAILABLE_MEMORY_MIB = 7 * 1024
 RESOURCE_MAX_RUNNING_AGENTS = 10
 RESOURCE_PRESSURE_LIMITS_ENABLED = True
 OLLAMA_MAX_CONCURRENT_AGENTS = 2
@@ -5048,7 +5047,6 @@ def spawn_resource_policy() -> dict[str, Any]:
         "max_load_per_cpu": RESOURCE_MAX_LOAD_PER_CPU,
         "max_cpu_busy_percent": RESOURCE_MAX_CPU_BUSY_PERCENT,
         "max_io_wait_percent": RESOURCE_MAX_IO_WAIT_PERCENT,
-        "min_available_memory_percent": RESOURCE_MIN_AVAILABLE_MEMORY_PERCENT,
         "min_available_memory_mib": RESOURCE_MIN_AVAILABLE_MEMORY_MIB,
         "max_running_agents": RESOURCE_MAX_RUNNING_AGENTS,
         "ollama_concurrency_limit_enabled": OLLAMA_CONCURRENCY_LIMIT_ENABLED,
@@ -5438,9 +5436,8 @@ def _valid_spawn_policy(policy: Any) -> bool:
         and policy["max_cpu_busy_percent"] <= 100.0
         and _finite_resource_number(policy.get("max_io_wait_percent"), minimum=0.0)
         and policy["max_io_wait_percent"] <= 100.0
-        and _finite_resource_number(policy.get("min_available_memory_percent"), minimum=0.0)
-        and policy["min_available_memory_percent"] <= 100.0
-        and _finite_resource_number(policy.get("min_available_memory_mib"), minimum=0.0)
+        and type(policy.get("min_available_memory_mib")) is int
+        and policy["min_available_memory_mib"] == RESOURCE_MIN_AVAILABLE_MEMORY_MIB
         and isinstance(policy.get("max_running_agents"), int)
         and not isinstance(policy["max_running_agents"], bool)
         and 1 <= policy["max_running_agents"] <= 10
@@ -5523,7 +5520,7 @@ def spawn_error_details(
         "memory_pressure_high": (
             "Speicherdruck zu hoch",
             "Verfuegbarer Arbeitsspeicher unterschreitet die konfigurierte aktive Grenze.",
-            f"Aktive Grenze: mindestens {RESOURCE_MIN_AVAILABLE_MEMORY_PERCENT:g} Prozent und {RESOURCE_MIN_AVAILABLE_MEMORY_MIB} MiB frei.",
+            f"Aktive Grenze: mindestens {RESOURCE_MIN_AVAILABLE_MEMORY_MIB} MiB frei.",
             "Speicher freigeben oder erneut versuchen.",
         ),
         "ollama_concurrency_limit": (
@@ -5620,14 +5617,10 @@ def _resource_pressure_reason_codes(snapshot: Mapping[str, Any], policy: Mapping
             reasons.append("resource_monitor_unavailable")
         elif io_psi_percent > policy["max_io_wait_percent"]:
             reasons.append("io_pressure_high")
-    memory_percent = snapshot.get("available_memory_percent")
     memory_mib = snapshot.get("available_memory_mib")
-    if not _finite_resource_number(memory_percent) or not _finite_resource_number(memory_mib):
+    if type(memory_mib) is not int or memory_mib < 0:
         reasons.append("memory_metrics_unavailable")
-    elif (
-        memory_percent < policy["min_available_memory_percent"]
-        or memory_mib < policy["min_available_memory_mib"]
-    ):
+    elif memory_mib < policy["min_available_memory_mib"]:
         reasons.append("memory_pressure_high")
     for reason in declared or ():
         if reason not in reasons:
