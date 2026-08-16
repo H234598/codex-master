@@ -100,9 +100,12 @@ from codex_master.resource_cgroup import (
 )
 from codex_master.resource_monitor import (
     ResourceGateFacts,
+    ResourceOperatorStatus,
     ResourceSnapshotError,
+    build_resource_operator_status,
     read_current_resource_boot_id,
     read_resource_gate_facts,
+    read_resource_snapshot,
     run_resource_monitor as run_resource_monitor_loop,
 )
 from codex_master.fleet_snapshot import (
@@ -929,6 +932,57 @@ def _call_with_resource_gate_composer(callback: Any) -> Any:
 
     with _resource_gate_composer_scope():
         return callback()
+
+
+def _read_resource_operator_status() -> ResourceOperatorStatus:
+    """Read one authorized snapshot and return its bounded operator projection."""
+
+    with _resource_gate_composer_scope():
+        runtime = _RESOURCE_GATE_RUNTIME.get()
+        if runtime is None or not isinstance(runtime.state, HiveStateStore):
+            raise AgentError("resource_status_unavailable")
+        try:
+            now_utc = runtime.now_utc()
+            if (
+                not isinstance(now_utc, _dt.datetime)
+                or now_utc.tzinfo is None
+                or now_utc.utcoffset() != _dt.timedelta(0)
+            ):
+                raise ValueError
+            snapshot = read_resource_snapshot(
+                runtime.state,
+                now_utc=now_utc,
+                expected_boot_id=runtime.expected_boot_id,
+            )
+            status = build_resource_operator_status(snapshot)
+            if not isinstance(status, ResourceOperatorStatus):
+                raise ValueError
+            return status
+        except (ResourceSnapshotError, TypeError, ValueError, AttributeError, OverflowError):
+            raise AgentError("resource_status_unavailable") from None
+
+
+def _resource_operator_document(status: ResourceOperatorStatus) -> dict[str, Any]:
+    if not isinstance(status, ResourceOperatorStatus):
+        raise AgentError("resource_status_unavailable")
+    if any(reason != "resource_ready" and reason not in RESOURCE_REASON_CODES for reason in status.reason_codes):
+        raise AgentError("resource_status_unavailable")
+    return {
+        "schema_version": status.schema_version,
+        "generation": status.generation,
+        "state": status.state,
+        "bottleneck": status.bottleneck,
+        "current": dict(status.current),
+        "mean_1m": dict(status.mean_1m),
+        "mean_10m": dict(status.mean_10m),
+        "peak_10m": dict(status.peak_10m),
+        "trend": dict(status.trend),
+        "confidence": status.confidence,
+        "preferred_profiles": list(status.preferred_profiles),
+        "avoid_profiles": list(status.avoid_profiles),
+        "reason_codes": list(status.reason_codes),
+        "raw_output": "not_returned",
+    }
 
 
 def run_resource_monitor() -> None:
@@ -11052,12 +11106,17 @@ def applet_status(
 ) -> dict[str, Any]:
     """Return a bounded, read-only snapshot for the Cinnamon adapter."""
 
-    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in (1, 2, 3):
-        raise AgentError("schema_version must be 1, 2, or 3")
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in (1, 2, 3, 4):
+        raise AgentError("schema_version must be 1, 2, 3, or 4")
     if schema_version == 1:
         return applet_status_v1(selected_agents)
     if schema_version == 2:
         return applet_status_v2(selected_agents)
+    if schema_version == 4:
+        result = applet_status_v2(selected_agents)
+        result["schema_version"] = 4
+        result["resource"] = _applet_resource_projection()
+        return result
     inventory, _published = published_agent_inventory()
     selected = tuple(selected_agents or ())
     if len(selected) > MAX_FLEET_AGENTS:
@@ -11217,6 +11276,40 @@ def applet_status(
         result["series"] = rows
         result["native_agents"] = native_agents
     return result
+
+
+def _unavailable_applet_resource_projection() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "generation": 0,
+        "state": "unavailable",
+        "bottleneck": "unknown",
+        "trend": {},
+        "confidence": "low",
+        "preferred_profiles": [],
+        "avoid_profiles": [],
+        "raw_output": "not_returned",
+    }
+
+
+def _applet_resource_projection() -> dict[str, Any]:
+    try:
+        status = _read_resource_operator_status()
+        if status.schema_version != 1:
+            raise AgentError("resource_status_unavailable")
+        return {
+            "schema_version": status.schema_version,
+            "generation": status.generation,
+            "state": status.state,
+            "bottleneck": status.bottleneck,
+            "trend": dict(status.trend),
+            "confidence": status.confidence,
+            "preferred_profiles": list(status.preferred_profiles),
+            "avoid_profiles": list(status.avoid_profiles),
+            "raw_output": "not_returned",
+        }
+    except Exception:
+        return _unavailable_applet_resource_projection()
 
 
 def watchdog_marker(meta: dict[str, Any]) -> dict[str, Any]:
@@ -25833,7 +25926,7 @@ TOOLS: list[dict[str, Any]] = [
                     "maxItems": MAX_APPLET_AGENTS,
                     "items": text_schema(MAX_AGENT_SELECTOR_TEXT),
                 },
-                "schema_version": {"type": "integer", "enum": [1, 2], "default": 1},
+                "schema_version": {"type": "integer", "enum": [1, 2, 3, 4], "default": 1},
             },
             "additionalProperties": False,
         },
@@ -26734,6 +26827,33 @@ def _fleet_overview_cli(argv: list[str]) -> int:
         return 1
 
 
+def _render_resource_operator_status(status: ResourceOperatorStatus, *, format: str) -> str:
+    if format not in {"compact", "json", "markdown"}:
+        raise AgentError("resource_status_unavailable")
+    document = _resource_operator_document(status)
+    if format == "json":
+        return json.dumps(document, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    rendered = {
+        key: value if isinstance(value, str) else json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        for key, value in document.items()
+    }
+    if format == "compact":
+        return " ".join(f"{key}={rendered[key]}" for key in document)
+    return "\n".join(("| field | value |", "| --- | --- |", *(f"| {key} | {rendered[key]} |" for key in document)))
+
+
+def _resource_status_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="codex-master-mcp resource-status")
+    parser.add_argument("--format", choices=("compact", "json", "markdown"), default="compact")
+    args = parser.parse_args(argv)
+    try:
+        print(_render_resource_operator_status(_read_resource_operator_status(), format=args.format))
+        return 0
+    except Exception:
+        print(json.dumps({"error": "resource_status_unavailable"}, indent=2, sort_keys=True))
+        return 1
+
+
 def _goddess_report_state() -> ReporterStateStore:
     return ReporterStateStore(GODDESS_REPORT_STATE_FILE)
 
@@ -27114,6 +27234,8 @@ def main_cli(argv: list[str]) -> int:
         return _fleet_overview_cli(argv[2:])
     if argv[:2] == ["goddess", "report"]:
         return _goddess_report_cli(argv[2:])
+    if argv[:1] == ["resource-status"]:
+        return _resource_status_cli(argv[1:])
 
     global _FLEET_STARTUP_ERROR
     previous_inventory = swap_agent_inventory(None)

@@ -51,9 +51,24 @@ function getMenuItemText(item) {
   return typeof item.label === "string" ? item.label : "";
 }
 
+function sampleResource(overrides = {}) {
+  return {
+    schema_version: 1,
+    generation: 7,
+    state: "ready",
+    bottleneck: "cpu",
+    trend: { cpu: "stable", io: "rising", memory: "falling" },
+    confidence: "high",
+    preferred_profiles: ["cpu_low"],
+    avoid_profiles: ["io_high"],
+    raw_output: "not_returned",
+    ...overrides,
+  };
+}
+
 function samplePayload() {
   return {
-    schema_version: 2,
+    schema_version: 4,
     mode: "read_only",
     counts: {
       tracked: 2,
@@ -99,6 +114,7 @@ function samplePayload() {
       agents: [],
       truncated: false,
     },
+    resource: sampleResource(),
     raw_output: "not_returned",
   };
 }
@@ -1274,7 +1290,7 @@ test("builds fixed mcp argv and validierte ids", async () => {
   assert.equal(launch.argv[0], "/tmp/home/.local/bin/codex-master-mcp");
   assert.equal(launch.argv[1], "applet-status");
   assert.equal(launch.argv[2], "--schema-version");
-  assert.equal(launch.argv[3], "2");
+  assert.equal(launch.argv[3], "4");
   assert.equal(launch.argv[4], "a1");
   assert.equal(launch.argv[5], "b1");
   assert.deepEqual(Array.from(launch.envCalls), [
@@ -1960,7 +1976,7 @@ test("readers run via async before wait completion", async () => {
 
   proc.waitCallbacks.at(-1)(proc, null);
   await Promise.resolve();
-  assert.equal(applet._statusLastGood.schema_version, 2);
+  assert.equal(applet._statusLastGood.schema_version, 4);
 });
 
 test("finalize waits for wait + both stream EOFs", async () => {
@@ -2002,7 +2018,7 @@ test("finalize waits for wait + both stream EOFs", async () => {
 
   process.releaseEof();
   await Promise.resolve();
-  assert.equal(applet._statusLastGood.schema_version, 2);
+  assert.equal(applet._statusLastGood.schema_version, 4);
 });
 
 test("timeout cancels inherited pipes that outlive a confirmed process exit", () => {
@@ -2047,7 +2063,7 @@ test("timeout removal failure defers finalization to timer without wedging", () 
   assert.equal(process.forceExitCount, 0);
   assert.equal(applet._statusInFlight, false);
   assert.equal(applet._statusActiveState, null);
-  assert.equal(applet._statusLastGood.schema_version, 2);
+  assert.equal(applet._statusLastGood.schema_version, 4);
   assert.equal(fixture.activeTimers("timeout").length, 0);
 });
 
@@ -2075,7 +2091,7 @@ test("reentrant timeout callback during finalization cannot remove a live applet
   assert.equal(applet._cleanupComplete, false);
   assert.notEqual(applet.menu, null);
   assert.equal(applet._statusActiveState, null);
-  assert.equal(applet._statusLastGood.schema_version, 2);
+  assert.equal(applet._statusLastGood.schema_version, 4);
   assert.equal(fixture.activeTimers("timeout").length, 0);
 });
 
@@ -2291,7 +2307,7 @@ test("exact python error row is accepted and aggregates to python unavailable sn
   const fixture = loadApplet();
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
   const payload = {
-    schema_version: 2,
+    schema_version: 4,
     mode: "read_only",
     counts: {
       tracked: 2,
@@ -2333,6 +2349,7 @@ test("exact python error row is accepted and aggregates to python unavailable sn
       agents: [],
       truncated: false,
     },
+    resource: sampleResource(),
     raw_output: "not_returned",
   };
 
@@ -2345,7 +2362,7 @@ test("exact python error row mixed with a normal row is accepted", () => {
   const fixture = loadApplet();
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
   const payload = {
-    schema_version: 2,
+    schema_version: 4,
     mode: "read_only",
     counts: {
       tracked: 2,
@@ -2387,6 +2404,7 @@ test("exact python error row mixed with a normal row is accepted", () => {
       agents: [],
       truncated: false,
     },
+    resource: sampleResource(),
     raw_output: "not_returned",
   };
 
@@ -2484,7 +2502,7 @@ test("validator rejects syntactically valid but backend-impossible row combinati
 
   for (const { name, payload } of cases) {
     assert.equal(applet._maybeApplyStatusPayload(payload), false, name);
-    assert.equal(applet._statusLastGood?.schema_version, 2);
+    assert.equal(applet._statusLastGood?.schema_version, 4);
   }
 });
 
@@ -2662,7 +2680,7 @@ test("packet accessor exceptions fail closed and refresh recovers", async () => 
   statusItem.activate();
   fixture.subprocesses[1].emitDone();
   await Promise.resolve();
-  assert.equal(applet._statusLastGood.schema_version, 2);
+  assert.equal(applet._statusLastGood.schema_version, 4);
 });
 
 test("pipe accessor exceptions fail closed and refresh recovers", async () => {
@@ -2699,7 +2717,7 @@ test("pipe accessor exceptions fail closed and refresh recovers", async () => {
   statusItem.activate();
   fixture.subprocesses[1].emitDone();
   await Promise.resolve();
-  assert.equal(applet._statusLastGood.schema_version, 2);
+  assert.equal(applet._statusLastGood.schema_version, 4);
 });
 
 test("process success accessor exceptions fail closed and pending refresh recovers", async () => {
@@ -2736,7 +2754,7 @@ test("process success accessor exceptions fail closed and pending refresh recove
 
   fixture.subprocesses[1].emitDone();
   await Promise.resolve();
-  assert.equal(applet._statusLastGood.schema_version, 2);
+  assert.equal(applet._statusLastGood.schema_version, 4);
   assert.equal(applet._statusViewState, "ready");
 });
 
@@ -3489,7 +3507,7 @@ test("schema v2 bridge degradation keeps managed rows and shows native diagnosti
   assert.equal(applet._nativeBeeRowItems[1].actor.visible, false);
 });
 
-test("argv uses schema-version 2 before validated pinned ids", () => {
+test("argv uses schema-version 4 before validated pinned ids", () => {
   const fixture = loadApplet();
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
 
@@ -3497,7 +3515,76 @@ test("argv uses schema-version 2 before validated pinned ids", () => {
   applet.menu.items[0].activate();
 
   const argv = Array.from(fixture.launcherSpawns.at(-1).argv);
-  assert.deepEqual(argv.slice(1), ["applet-status", "--schema-version", "2", "a2", "b3", "c100"]);
+  assert.deepEqual(argv.slice(1), ["applet-status", "--schema-version", "4", "a2", "b3", "c100"]);
+});
+
+test("applet invalid or mismatched resource generation is unavailable", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const good = samplePayload();
+
+  assert.equal(applet._resourceGenerationHighWater, 0);
+  assert.equal(applet._maybeApplyStatusPayload(good), true);
+  assert.equal(applet._statusLastGood.resource.generation, 7);
+  assert.equal(applet._statusLastGood.resource.state, "ready");
+  assert.equal(applet._resourceGenerationHighWater, 7);
+
+  const malformed = samplePayload();
+  malformed.resource.generation = "7";
+  assert.equal(applet._maybeApplyStatusPayload(malformed), true);
+  assert.equal(JSON.stringify(applet._statusLastGood.resource), JSON.stringify({
+    schema_version: 1,
+    generation: 0,
+    state: "unavailable",
+    bottleneck: "unknown",
+    trend: {},
+    confidence: "low",
+    preferred_profiles: [],
+    avoid_profiles: [],
+    raw_output: "not_returned",
+  }));
+  assert.equal(applet._resourceGenerationHighWater, 7);
+
+  const duplicateProfile = samplePayload();
+  duplicateProfile.resource.preferred_profiles = ["cpu_low", "cpu_low"];
+  assert.equal(applet._maybeApplyStatusPayload(duplicateProfile), true);
+  assert.equal(applet._statusLastGood.resource.state, "unavailable");
+  assert.equal(applet._resourceGenerationHighWater, 7);
+
+  const mismatched = samplePayload();
+  mismatched.resource.generation = 6;
+  assert.equal(applet._maybeApplyStatusPayload(mismatched), true);
+  assert.equal(applet._statusLastGood.resource.state, "unavailable");
+  assert.equal(applet._statusLastGood.resource.generation, 0);
+  assert.equal(applet._resourceGenerationHighWater, 7);
+
+  assert.equal(applet._maybeApplyStatusPayload(good), true);
+  assert.equal(applet._statusLastGood.resource.generation, 7);
+  assert.equal(applet._resourceGenerationHighWater, 7);
+
+  const newer = samplePayload();
+  newer.resource.generation = 8;
+  assert.equal(applet._maybeApplyStatusPayload(newer), true);
+  assert.equal(applet._statusLastGood.resource.generation, 8);
+  assert.equal(applet._resourceGenerationHighWater, 8);
+
+  assert.equal(applet._cleanupStatusResources(), true);
+  assert.equal(applet._resourceGenerationHighWater, 0);
+});
+
+test("applet never reads monitor path or spawns second status process", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const before = fixture.launcherSpawns.length;
+
+  applet._refreshStatus();
+
+  assert.equal(fixture.launcherSpawns.length, before + 1);
+  assert.deepEqual(
+    Array.from(fixture.launcherSpawns.at(-1).argv).slice(1, 4),
+    ["applet-status", "--schema-version", "4"]
+  );
+  assert.doesNotMatch(source, /resource-snapshot-v1\.json|codex-master-resource-monitor/);
 });
 
 test("refresh-on-open and bounded opt-in background timer preserve single-flight", () => {

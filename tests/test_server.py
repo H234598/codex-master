@@ -25,7 +25,7 @@ from codex_master import __version__
 from codex_master.hive.types import TaskComplexity
 from codex_master.hive.state import HiveStateStore
 from codex_master.resource_cgroup import CgroupPreflightV1, CgroupProfileV1, PreparedAgentScope
-from codex_master.resource_monitor import LegacyPressureV1, ResourceGateFacts
+from codex_master.resource_monitor import LegacyPressureV1, ResourceGateFacts, ResourceOperatorStatus
 from codex_master.selection.task_classification import TaskClassificationRequest, TaskClassifier
 from codex_master.usage_snapshot import UsageSnapshot
 
@@ -4531,7 +4531,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(master_applet_status_props["agents"]["items"]["type"], "string")
         self.assertEqual(master_applet_status_props["agents"]["items"]["maxLength"], MAX_AGENT_SELECTOR_TEXT)
         self.assertEqual(master_applet_status_props["schema_version"]["type"], "integer")
-        self.assertEqual(master_applet_status_props["schema_version"]["enum"], [1, 2])
+        self.assertEqual(master_applet_status_props["schema_version"]["enum"], [1, 2, 3, 4])
         self.assertEqual(master_applet_status_props["schema_version"]["default"], 1)
         self.assertEqual(assign_props["task"]["maxLength"], MAX_TASK_TEXT)
         self.assertEqual(assign_props["context"]["maxItems"], MAX_ASSIGNMENT_LIST_ITEMS)
@@ -22923,6 +22923,19 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["schema_version"], 1)
         mock_applet_status.assert_called_once_with(["a1", "b1"], schema_version=1)
 
+    @patch("codex_master.server.applet_status")
+    def test_validated_master_applet_status_keeps_schema_v3_route(self, mock_applet_status) -> None:
+        expected = {"schema_version": 3, "raw_output": "not_returned"}
+        mock_applet_status.return_value = expected
+
+        result = server_module.call_validated_tool(
+            "master_applet_status",
+            {"agents": [], "schema_version": 3},
+        )
+
+        self.assertEqual(result, expected)
+        mock_applet_status.assert_called_once_with([], schema_version=3)
+
     @patch("codex_master.server._start_agent_with_lease_unlocked", return_value={"status": "started"})
     @patch("codex_master.server.agent_lifecycle_lock")
     def test_direct_start_agent_with_lease_acquires_lifecycle_lock(self, mock_lock, mock_unlocked) -> None:
@@ -28739,6 +28752,102 @@ class AppletStatusContractTest(unittest.TestCase):
 
 
 class CliLifecycleTest(unittest.TestCase):
+    @staticmethod
+    def _resource_operator_status(reason_codes: tuple[str, ...] = ("resource_ready",)) -> ResourceOperatorStatus:
+        return ResourceOperatorStatus(
+            schema_version=1,
+            generation=23,
+            state="ready",
+            bottleneck="io",
+            current={"cpu": 12.0, "io": 18.0, "memory": 31.0},
+            mean_1m={"cpu": 11.0, "io": 17.0, "memory": 30.0},
+            mean_10m={"cpu": 10.0, "io": 16.0, "memory": 29.0},
+            peak_10m={"cpu": 20.0, "io": 25.0, "memory": 40.0},
+            trend={"cpu": "stable", "io": "rising", "memory": "falling"},
+            confidence="high",
+            preferred_profiles=("cpu_low",),
+            avoid_profiles=("io_high",),
+            reason_codes=reason_codes,
+        )
+
+    def test_local_resource_status_has_only_operator_projection_and_fixed_formats(self) -> None:
+        expected_fields = {
+            "schema_version",
+            "generation",
+            "state",
+            "bottleneck",
+            "current",
+            "mean_1m",
+            "mean_10m",
+            "peak_10m",
+            "trend",
+            "confidence",
+            "preferred_profiles",
+            "avoid_profiles",
+            "reason_codes",
+            "raw_output",
+        }
+        for format_name in ("compact", "json", "markdown"):
+            with self.subTest(format=format_name), patch.object(
+                server_module,
+                "_read_resource_operator_status",
+                return_value=self._resource_operator_status(),
+            ) as reader, patch.object(
+                server_module, "_fleet_initialize_recovery_startup_state", side_effect=AssertionError
+            ), patch.object(
+                server_module, "_publish_startup_fleet_inventory", side_effect=AssertionError
+            ), patch.object(
+                server_module, "swap_agent_inventory", side_effect=AssertionError
+            ), patch("builtins.print") as print_output:
+                result = main_cli(["resource-status", "--format", format_name])
+
+            self.assertEqual(result, 0)
+            reader.assert_called_once_with()
+            rendered = print_output.call_args.args[0]
+            self.assertIsInstance(rendered, str)
+            if format_name == "json":
+                payload = json.loads(rendered)
+                self.assertEqual(set(payload), expected_fields)
+                self.assertEqual(payload["generation"], 23)
+                self.assertEqual(payload["raw_output"], "not_returned")
+            elif format_name == "markdown":
+                self.assertIn("| generation | 23 |", rendered)
+                self.assertIn("| raw_output | not_returned |", rendered)
+            else:
+                self.assertIn("generation=23", rendered)
+                self.assertIn("raw_output=not_returned", rendered)
+
+        with patch.object(server_module, "_read_resource_operator_status") as reader:
+            with self.assertRaises(SystemExit) as raised:
+                server_module._resource_status_cli(["--format", "yaml"])
+        self.assertEqual(raised.exception.code, 2)
+        reader.assert_not_called()
+        self.assertNotIn("resource_status", {tool["name"] for tool in server_module.TOOLS})
+
+    def test_local_resource_status_redacts_paths_sensors_pid_scope_history_stdout_stderr_and_secrets(self) -> None:
+        marker = "/home/secret/sensor0 pid=4242 scope=agent.scope history stdout stderr sk-secret"
+        with patch.object(
+            server_module, "_read_resource_operator_status", side_effect=RuntimeError(marker)
+        ), patch("builtins.print") as print_output:
+            result = main_cli(["resource-status", "--format", "json"])
+
+        self.assertEqual(result, 1)
+        rendered = print_output.call_args.args[0]
+        self.assertEqual(json.loads(rendered), {"error": "resource_status_unavailable"})
+        for forbidden in ("/home/secret", "sensor0", "4242", "agent.scope", "history", "stdout", "stderr", "sk-secret"):
+            self.assertNotIn(forbidden, rendered)
+
+        with patch.object(
+            server_module,
+            "_read_resource_operator_status",
+            return_value=self._resource_operator_status(("sensor0",)),
+        ), patch("builtins.print") as print_output:
+            result = main_cli(["resource-status", "--format", "json"])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(json.loads(print_output.call_args.args[0]), {"error": "resource_status_unavailable"})
+        self.assertNotIn("sensor0", print_output.call_args.args[0])
+
     def setUp(self) -> None:
         # CLI lifecycle tests model the master process, not an Agentin home.
         # Keep that explicit when the suite itself runs inside a managed Codex

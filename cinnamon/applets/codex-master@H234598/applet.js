@@ -57,12 +57,19 @@ const APPLET_OVERVIEW_MAX_ARRAY_LENGTH = 64;
 const APPLET_OVERVIEW_MAX_STRING_LENGTH = 128;
 const APPLET_OVERVIEW_MAX_WARNING_LENGTH = 64;
 const APPLET_ACTION_COMMAND = "applet-action";
-const APPLET_STATUS_SCHEMA_VERSION = 2;
+const APPLET_STATUS_SCHEMA_VERSION = 4;
 const MAX_ENVIRONMENT_KEYS = 256;
 let appletErrorLogCount = 0;
 const APPLET_STATUS_REQUIRED_FIELDS = [
-    "schema_version", "mode", "counts", "agents", "native_agents", "raw_output",
+    "schema_version", "mode", "counts", "agents", "native_agents", "resource", "raw_output",
 ];
+const APPLET_RESOURCE_REQUIRED_FIELDS = [
+    "schema_version", "generation", "state", "bottleneck", "trend", "confidence",
+    "preferred_profiles", "avoid_profiles", "raw_output",
+];
+const APPLET_RESOURCE_STATES = new Set(["ready", "blocked", "unavailable"]);
+const APPLET_RESOURCE_BOTTLENECKS = new Set(["cpu", "io", "memory", "thermal", "cgroup", "unknown"]);
+const APPLET_RESOURCE_TRENDS = new Set(["rising", "stable", "falling"]);
 const APPLET_STATUS_REQUIRED_ROW_FIELDS = [
     "agent", "activity_state", "backend_state", "control_state", "auth_state", "identity_state", "lease_state",
     "allowed_action", "context_token", "limit_state", "blocked_until_utc",
@@ -165,6 +172,7 @@ FlottenmanagementApplet.prototype = {
         this._statusPendingRefresh = false;
         this._statusGeneration = 0;
         this._statusActiveGeneration = 0;
+        this._resourceGenerationHighWater = 0;
         this._statusLastGood = null;
         this._statusActiveState = null;
         this._statusViewState = "initializing";
@@ -1423,15 +1431,76 @@ FlottenmanagementApplet.prototype = {
     },
 
     _maybeApplyStatusPayload(payload) {
-        if (!this._isValidAppletStatusPayload(payload)) {
+        const normalized = this._normalizeAppletResource(payload);
+        if (!this._isValidAppletStatusPayload(normalized)) {
             return false;
         }
-        this._statusLastGood = payload;
+        if (normalized.resource.state !== "unavailable") {
+            this._resourceGenerationHighWater = Math.max(
+                this._resourceGenerationHighWater,
+                normalized.resource.generation
+            );
+        }
+        this._statusLastGood = normalized;
         this._armedAction = null;
         this._actionsAwaitingRefresh = false;
-        this._updateActionBindings(payload);
+        this._updateActionBindings(normalized);
         this._statusViewState = "ready";
         return this._renderStatusSafely();
+    },
+
+    _unavailableResource() {
+        return {
+            schema_version: 1,
+            generation: 0,
+            state: "unavailable",
+            bottleneck: "unknown",
+            trend: {},
+            confidence: "low",
+            preferred_profiles: [],
+            avoid_profiles: [],
+            raw_output: APPLET_STATUS_RAW_OUTPUT,
+        };
+    },
+
+    _normalizeAppletResource(payload) {
+        if (!payload || typeof payload !== "object") return payload;
+        const resource = payload.resource;
+        const resourceValid = this._isValidResourceStatus(resource);
+        const generationMismatch = resourceValid
+            && resource.state !== "unavailable"
+            && resource.generation < this._resourceGenerationHighWater;
+        if (resourceValid && !generationMismatch) return payload;
+        return { ...payload, resource: this._unavailableResource() };
+    },
+
+    _isValidResourceStatus(resource) {
+        if (!resource || typeof resource !== "object") return false;
+        if (!this._hasExactFields(resource, APPLET_RESOURCE_REQUIRED_FIELDS)) return false;
+        if (resource.schema_version !== 1 || resource.raw_output !== APPLET_STATUS_RAW_OUTPUT) return false;
+        if (!Number.isSafeInteger(resource.generation) || resource.generation < 0) return false;
+        if (!APPLET_RESOURCE_STATES.has(resource.state) || !APPLET_RESOURCE_BOTTLENECKS.has(resource.bottleneck)) return false;
+        if (!resource.trend || typeof resource.trend !== "object" || Array.isArray(resource.trend)) return false;
+        if (!Array.isArray(resource.preferred_profiles) || resource.preferred_profiles.length > 8) return false;
+        if (!Array.isArray(resource.avoid_profiles) || resource.avoid_profiles.length > 8) return false;
+        const validProfile = (value) => typeof value === "string" && /^[a-z][a-z0-9_-]{0,31}$/.test(value);
+        if (!resource.preferred_profiles.every(validProfile) || !resource.avoid_profiles.every(validProfile)) return false;
+        if (new Set(resource.preferred_profiles).size !== resource.preferred_profiles.length) return false;
+        if (new Set(resource.avoid_profiles).size !== resource.avoid_profiles.length) return false;
+        if (resource.confidence === "high") {
+            if (!this._hasExactFields(resource.trend, ["cpu", "io", "memory"])) return false;
+            if (![resource.trend.cpu, resource.trend.io, resource.trend.memory].every((value) => APPLET_RESOURCE_TRENDS.has(value))) return false;
+        } else if (resource.confidence !== "low" || Object.keys(resource.trend).length !== 0) {
+            return false;
+        }
+        if (resource.state === "unavailable") {
+            return resource.generation === 0
+                && resource.bottleneck === "unknown"
+                && resource.confidence === "low"
+                && resource.preferred_profiles.length === 0
+                && resource.avoid_profiles.length === 0;
+        }
+        return resource.generation > 0;
     },
 
     _isValidAppletActionPayload(payload, request) {
@@ -1900,7 +1969,9 @@ FlottenmanagementApplet.prototype = {
         const stale = this._statusViewState === "stale" ? " · veraltet" : "";
         const unavailable = this._statusViewState === "unavailable" ? " · nicht verfügbar" : "";
         const configuration = this._settingsValid ? "" : "Konfigurationsfehler · ";
-        const summary = `${configuration}Aktivität: ${activity} · Backend: ${backend} · Modus: Schnellsteuerung${stale}${unavailable}`;
+        const resourceState = payload && payload.resource ? payload.resource.state : "unavailable";
+        const resource = resourceState === "ready" ? "bereit" : resourceState === "blocked" ? "blockiert" : "nicht verfügbar";
+        const summary = `${configuration}Aktivität: ${activity} · Backend: ${backend} · Ressourcen: ${resource} · Modus: Schnellsteuerung${stale}${unavailable}`;
         this.set_applet_tooltip(summary);
         this._setMenuItemText(this._statusSummaryItem, summary);
 
@@ -2178,6 +2249,7 @@ FlottenmanagementApplet.prototype = {
     _cleanupStatusResources() {
         let success = true;
         let statusClean = true;
+        this._resourceGenerationHighWater = 0;
         this._statusLastGood = null;
         this._armedAction = null;
         this._actionInFlight = false;
