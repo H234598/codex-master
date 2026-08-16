@@ -13,20 +13,27 @@ import pytest
 from codex_master.hive import state as hive_state_module
 from codex_master.hive.state import HiveStateStore
 from codex_master.resource_monitor import (
+    ResourceClocks,
+    ResourceInputPaths,
+    ResourceSampleV1,
     ResourceSnapshotError,
     ResourceSnapshotV1,
     ResourceGateFacts,
     ResourceOperatorStatus,
     ResourceSchedulerSnapshot,
+    ThermalCandidate,
     ThermalPolicyV1,
     TrendAssessmentV1,
+    build_monitor_snapshot,
     build_resource_gate_facts,
     build_resource_operator_status,
     build_resource_scheduler_snapshot,
     classify_trend,
+    collect_resource_sample,
     parse_snapshot_document,
     read_resource_snapshot,
     read_thermal_policy,
+    resolve_thermal_policy,
     write_resource_snapshot,
     write_thermal_policy,
 )
@@ -36,6 +43,72 @@ NOW = datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc)
 BOOT_ID = "123e4567-e89b-12d3-a456-426614174000"
 SNAPSHOT_PATH = PurePosixPath("resources/resource-snapshot-v1.json")
 THERMAL_POLICY_PATH = PurePosixPath("resources/thermal-policy-v1.json")
+
+
+class FakeResourceBackend:
+    def __init__(self, kernel: dict[Path, bytes], sensors: bytes | BaseException) -> None:
+        self.kernel = kernel
+        self.sensors = sensors
+        self.reads: list[tuple[Path, int]] = []
+        self.sensor_calls: list[dict[str, object]] = []
+
+    def read_private_kernel_bytes(self, path: Path, *, max_bytes: int) -> bytes:
+        self.reads.append((path, max_bytes))
+        try:
+            return self.kernel[path]
+        except KeyError as error:
+            raise RuntimeError("missing fake input") from error
+
+    def run_sensors_json(self, **kwargs: object) -> bytes:
+        self.sensor_calls.append(kwargs)
+        if isinstance(self.sensors, BaseException):
+            raise self.sensors
+        return self.sensors
+
+
+def resource_paths() -> ResourceInputPaths:
+    return ResourceInputPaths()
+
+
+def resource_clocks(*, monotonic_ns: int = 10_000_000_000, now_utc: datetime = NOW) -> ResourceClocks:
+    return ResourceClocks(now_utc=lambda: now_utc, monotonic_ns=lambda: monotonic_ns)
+
+
+def resource_kernel_document(paths: ResourceInputPaths) -> dict[Path, bytes]:
+    return {
+        paths.loadavg: b"1.00 0.50 0.25 1/100 42\n",
+        paths.meminfo: (
+            b"MemTotal:       1048576 kB\nMemFree:        131072 kB\nMemAvailable:  524288 kB\n"
+            b"Buffers:          1024 kB\nCached:          2048 kB\nSwapCached:         0 kB\n"
+        ),
+        paths.stat: (
+            b"cpu  10 0 10 70 0 0 0 0 0 0\ncpu0 5 0 5 35 0 0 0 0 0 0\n"
+            b"intr 1 0 0\nctxt 1\nbtime 1\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n"
+        ),
+        paths.psi_cpu: b"some avg10=1.00 avg60=1.00 avg300=1.00 total=1\n",
+        paths.psi_io: b"some avg10=2.00 avg60=2.00 avg300=2.00 total=1\nfull avg10=1.00 avg60=1.00 avg300=1.00 total=1\n",
+        paths.psi_memory: b"some avg10=3.00 avg60=3.00 avg300=3.00 total=1\nfull avg10=1.00 avg60=1.00 avg300=1.00 total=1\n",
+        paths.boot_id: (BOOT_ID + "\n").encode("ascii"),
+    }
+
+
+def sensor_document(*, include_formula: bool = False, show_in_panel: object | None = None) -> bytes:
+    payload: dict[str, object] = {
+        "coretemp-isa-0000": {
+            "Adapter": "ISA adapter",
+            "Package id 0": {
+                "temp1_input": 70.0,
+                "temp1_max": 80.0,
+                "temp1_crit": 100.0,
+            },
+        }
+    }
+    sensor = payload["coretemp-isa-0000"]["Package id 0"]  # type: ignore[index]
+    if include_formula:
+        sensor["user_formula"] = "x+1"  # type: ignore[index]
+    if show_in_panel is not None:
+        sensor["show_in_panel"] = show_in_panel  # type: ignore[index]
+    return json.dumps(payload).encode("utf-8")
 
 
 def snapshot_document() -> dict[str, object]:
@@ -447,3 +520,260 @@ def test_thermal_policy_only_contains_normalized_derived_values_not_applet_confi
     )
     with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
         read_thermal_policy(store)
+
+
+def test_proc_and_psi_parsers_reject_malformed_duplicate_negative_nonfinite_overflow_and_unknown_inputs() -> None:
+    paths = resource_paths()
+    kernel = resource_kernel_document(paths)
+    candidates = [ThermalCandidate("coretemp-isa-0000", "ISA adapter", "Package id 0", high=90.0)]
+
+    invalid_inputs = (
+        (paths.loadavg, b"-1.00 0.50 0.25 1/100 42\n"),
+        (paths.meminfo, b"MemTotal: 1048576 kB\nMemTotal: 1 kB\nMemAvailable: 524288 kB\n"),
+        (paths.stat, b"cpu  1 2 x 4\n"),
+        (paths.psi_cpu, b"some avg10=NaN avg60=1.00 avg300=1.00 total=1\n"),
+        (paths.psi_io, b"some avg10=2.00 avg60=2.00 avg300=2.00 total=1\n"),
+        (paths.psi_memory, b"some avg10=2e999 avg60=2.00 avg300=2.00 total=1\nfull avg10=1.00 avg60=1.00 avg300=1.00 total=1\n"),
+        (paths.boot_id, b"not-a-uuid\n"),
+    )
+    for path, payload in invalid_inputs:
+        candidate_kernel = dict(kernel)
+        candidate_kernel[path] = payload
+        backend = FakeResourceBackend(candidate_kernel, sensor_document())
+        with pytest.raises(ResourceSnapshotError, match="^resource_monitor_unavailable$"):
+            collect_resource_sample(
+                backend, paths, clocks=resource_clocks(), candidates=candidates, completed_sample_count=10
+            )
+
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        ResourceInputPaths(loadavg=Path("relative"))
+
+
+def test_sensor_runner_parser_and_thermal_policy_are_bounded_fixed_and_fail_closed() -> None:
+    paths = resource_paths()
+    kernel = resource_kernel_document(paths)
+    candidates = [ThermalCandidate("coretemp-isa-0000", "ISA adapter", "Package id 0", high=90.0)]
+    backend = FakeResourceBackend(kernel, sensor_document())
+
+    sample = collect_resource_sample(
+        backend, paths, clocks=resource_clocks(), candidates=candidates, completed_sample_count=10
+    )
+
+    assert sample.thermal_state == "ready"
+    assert sample.thermal_policy == ThermalPolicyV1(schema_version=1, sensor_thresholds={"coretemp-isa-0000:isa_adapter:package_id_0": 90.0})
+    assert backend.sensor_calls == [
+        {
+            "argv": ("/usr/bin/sensors", "-j"),
+            "environment": {"LC_ALL": "C", "LANG": "C", "PATH": "/usr/bin:/bin"},
+            "stdin_closed": True,
+            "timeout_seconds": 1.0,
+            "max_stdout_bytes": 512 * 1024,
+            "max_stderr_bytes": 16 * 1024,
+        }
+    ]
+
+    invalid_sensors = (
+        b'{"coretemp-isa-0000":{"Adapter":"ISA adapter","Package id 0":{"temp1_input":NaN}}}',
+        b'{"coretemp-isa-0000":{},"coretemp-isa-0000":{}}',
+        sensor_document(include_formula=True),
+        sensor_document(show_in_panel=False),
+    )
+    for document in invalid_sensors:
+        with pytest.raises(ResourceSnapshotError, match="^temperature_monitor_unavailable$"):
+            collect_resource_sample(
+                FakeResourceBackend(kernel, document),
+                paths,
+                clocks=resource_clocks(),
+                candidates=candidates,
+                completed_sample_count=10,
+            )
+
+def test_thermal_policy_prefers_configured_high_then_max_then_ninety_percent_crit_and_rejects_unknown_sensor() -> None:
+    document = json.loads(sensor_document())
+    configured = ThermalCandidate("coretemp-isa-0000", "ISA adapter", "Package id 0", high=90.0)
+    automatic = ThermalCandidate("coretemp-isa-0000", "ISA adapter", "Package id 0")
+    assert resolve_thermal_policy(document, configured_candidates=[configured]) == ThermalPolicyV1(
+        schema_version=1,
+        sensor_thresholds={"coretemp-isa-0000:isa_adapter:package_id_0": 90.0},
+    )
+    assert resolve_thermal_policy(document, configured_candidates=[automatic]) == ThermalPolicyV1(
+        schema_version=1,
+        sensor_thresholds={"coretemp-isa-0000:isa_adapter:package_id_0": 80.0},
+    )
+    reading = document["coretemp-isa-0000"]["Package id 0"]
+    del reading["temp1_max"]
+    assert resolve_thermal_policy(document, configured_candidates=[automatic]) == ThermalPolicyV1(
+        schema_version=1,
+        sensor_thresholds={"coretemp-isa-0000:isa_adapter:package_id_0": 90.0},
+    )
+    document["unknown-chip"] = {"Adapter": "Unknown", "temp": {"temp1_input": 10.0, "temp1_crit": 80.0}}
+    with pytest.raises(ResourceSnapshotError, match="^temperature_monitor_unavailable$"):
+        resolve_thermal_policy(document, configured_candidates=[automatic])
+
+
+def test_kernel_parsers_accept_standard_extra_lines_but_reject_duplicate_or_malformed_target_lines() -> None:
+    paths = resource_paths()
+    kernel = resource_kernel_document(paths)
+    candidates = [ThermalCandidate("coretemp-isa-0000", "ISA adapter", "Package id 0")]
+    sample = collect_resource_sample(
+        FakeResourceBackend(kernel, sensor_document()),
+        paths,
+        clocks=resource_clocks(),
+        candidates=candidates,
+        completed_sample_count=10,
+    )
+    assert sample.current["cpu"] == pytest.approx(22.22222222222222)
+
+    duplicate_meminfo = dict(kernel)
+    duplicate_meminfo[paths.meminfo] += b"MemAvailable: 1 kB\n"
+    duplicate_cpu = dict(kernel)
+    duplicate_cpu[paths.stat] = kernel[paths.stat] + b"cpu 1 0 0 9 0 0 0 0 0 0\n"
+    malformed_cpu = dict(kernel)
+    malformed_cpu[paths.stat] = b"cpu 1 0 malformed 9\ncpu0 1 0 0 9\n"
+    for invalid in (duplicate_meminfo, duplicate_cpu, malformed_cpu):
+        with pytest.raises(ResourceSnapshotError, match="^resource_monitor_unavailable$"):
+            collect_resource_sample(
+                FakeResourceBackend(invalid, sensor_document()),
+                paths,
+                clocks=resource_clocks(),
+                candidates=candidates,
+                completed_sample_count=10,
+            )
+
+
+def test_collect_resource_sample_redacts_short_numeric_aggregate_cpu_line() -> None:
+    paths = resource_paths()
+    kernel = resource_kernel_document(paths)
+    kernel[paths.stat] = b"cpu 1 2 3 4\n"
+
+    with pytest.raises(ResourceSnapshotError, match="^resource_monitor_unavailable$"):
+        collect_resource_sample(
+            FakeResourceBackend(kernel, sensor_document()),
+            paths,
+            clocks=resource_clocks(),
+            candidates=[ThermalCandidate("coretemp-isa-0000", "ISA adapter", "Package id 0")],
+            completed_sample_count=10,
+        )
+
+
+def test_completed_sample_count_is_mandatory_and_only_tenth_valid_sample_leaves_warmup() -> None:
+    paths = resource_paths()
+    kernel = resource_kernel_document(paths)
+    candidates = [ThermalCandidate("coretemp-isa-0000", "ISA adapter", "Package id 0")]
+    backend = FakeResourceBackend(kernel, sensor_document())
+
+    with pytest.raises(TypeError):
+        collect_resource_sample(backend, paths, clocks=resource_clocks(), candidates=candidates)
+    for count in range(10):
+        sample = collect_resource_sample(
+            backend,
+            paths,
+            clocks=resource_clocks(),
+            candidates=candidates,
+            completed_sample_count=count,
+        )
+        assert sample.thermal_state == "warming_up"
+    ready = collect_resource_sample(
+        backend,
+        paths,
+        clocks=resource_clocks(),
+        candidates=candidates,
+        completed_sample_count=10,
+    )
+    assert ready.thermal_state == "ready"
+
+
+def test_g3_cannot_accept_or_construct_claimed_cgroup_readiness() -> None:
+    paths = resource_paths()
+    kernel = resource_kernel_document(paths)
+    candidates = [ThermalCandidate("coretemp-isa-0000", "ISA adapter", "Package id 0")]
+    with pytest.raises(TypeError):
+        collect_resource_sample(
+            FakeResourceBackend(kernel, sensor_document()),
+            paths,
+            clocks=resource_clocks(),
+            candidates=candidates,
+            cgroup_state="ready",
+            completed_sample_count=10,
+        )
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        ResourceSampleV1(
+            boot_id=BOOT_ID,
+            observed_at_utc=NOW,
+            observed_monotonic_ns=1,
+            current={"cpu": 1.0, "io": 1.0, "memory": 1.0},
+            cgroup_state="ready",
+            thermal_state="warming_up",
+            thermal_policy=None,
+        )
+
+
+def test_thermal_states_and_ten_one_hz_samples_build_one_complete_generation() -> None:
+    paths = resource_paths()
+    kernel = resource_kernel_document(paths)
+    candidates = [ThermalCandidate("coretemp-isa-0000", "ISA adapter", "Package id 0")]
+
+    ready = collect_resource_sample(
+        FakeResourceBackend(kernel, sensor_document()),
+        paths,
+        clocks=resource_clocks(),
+        candidates=candidates,
+        completed_sample_count=10,
+    )
+    warming = collect_resource_sample(
+        FakeResourceBackend(kernel, sensor_document()),
+        paths,
+        clocks=resource_clocks(),
+        candidates=candidates,
+        completed_sample_count=9,
+    )
+    empty = collect_resource_sample(
+        FakeResourceBackend(kernel, b"{}"), paths, clocks=resource_clocks(), candidates=candidates, completed_sample_count=10
+    )
+    unavailable = collect_resource_sample(
+        FakeResourceBackend(kernel, RuntimeError("runner failed")),
+        paths,
+        clocks=resource_clocks(),
+        candidates=candidates,
+        completed_sample_count=10,
+    )
+    assert ready.thermal_state == "ready"
+    assert warming.thermal_state == "warming_up"
+    assert empty.thermal_state == "no_valid_sensors"
+    assert unavailable.thermal_state == "monitor_unavailable"
+
+    samples = [
+        collect_resource_sample(
+            FakeResourceBackend(kernel, sensor_document()),
+            paths,
+            clocks=resource_clocks(
+                monotonic_ns=10_000_000_000 + index * 1_000_000_000,
+                now_utc=NOW + timedelta(seconds=index),
+            ),
+            candidates=candidates,
+            completed_sample_count=index + 1,
+        )
+        for index in range(10)
+    ]
+    snapshot = build_monitor_snapshot(
+        samples,
+        prior_generation=7,
+        clocks=resource_clocks(monotonic_ns=19_000_000_000, now_utc=NOW + timedelta(seconds=9)),
+    )
+    assert snapshot.generation == 8
+    assert snapshot.confidence == "high"
+    assert snapshot.thermal_state == "ready"
+    assert snapshot.mean_10m["cpu"] == pytest.approx(sum(sample.current["cpu"] for sample in samples) / 10)
+
+    with pytest.raises(ResourceSnapshotError, match="^temperature_monitor_unavailable$"):
+        build_monitor_snapshot(
+            samples[:9],
+            prior_generation=7,
+            clocks=resource_clocks(monotonic_ns=18_000_000_000, now_utc=NOW + timedelta(seconds=8)),
+        )
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        build_monitor_snapshot(
+            samples + [samples[-1]],
+            prior_generation=7,
+            clocks=resource_clocks(monotonic_ns=20_000_000_000, now_utc=NOW + timedelta(seconds=10)),
+        )
