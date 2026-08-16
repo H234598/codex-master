@@ -20226,11 +20226,19 @@ class ServerHelpersTest(unittest.TestCase):
                 )
                 process.joinpath("exe").symlink_to(executable)
                 process.joinpath("cwd").symlink_to("/", target_is_directory=True)
+            resolve_original = Path.resolve
+            gnome_fixture_exe = proc_root / "102" / "exe"
+
+            def resolve_fixture_gnome_exe(path: Path, *args: Any, **kwargs: Any) -> Path:
+                if path == gnome_fixture_exe:
+                    return path.readlink()
+                return resolve_original(path, *args, **kwargs)
+
             with patch.dict(
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
-                clear=True,
-            ):
+                clear=False,
+            ), patch.object(Path, "resolve", new=resolve_fixture_gnome_exe):
                 summary = agent_home_process_summary("a", proc_root)
                 guard = agent_identity_guard(True, summary, pane_process_id=100)
 
@@ -20309,11 +20317,19 @@ class ServerHelpersTest(unittest.TestCase):
                 )
                 process.joinpath("exe").symlink_to(executable)
                 process.joinpath("cwd").symlink_to("/", target_is_directory=True)
+            resolve_original = Path.resolve
+            gnome_fixture_exe = proc_root / "202" / "exe"
+
+            def resolve_fixture_gnome_exe(path: Path, *args: Any, **kwargs: Any) -> Path:
+                if path == gnome_fixture_exe:
+                    return path.readlink()
+                return resolve_original(path, *args, **kwargs)
+
             with patch.dict(
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
-                clear=True,
-            ):
+                clear=False,
+            ), patch.object(Path, "resolve", new=resolve_fixture_gnome_exe):
                 summary = agent_home_process_summary("a", proc_root)
                 guard = agent_identity_guard(True, summary, pane_process_id=100)
 
