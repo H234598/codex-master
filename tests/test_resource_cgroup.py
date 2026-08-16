@@ -573,6 +573,7 @@ class _FakeSystemdRunner:
         target_slice_stdout: bytes | None = None,
         timeout: bool = False,
         show_stdout: bytes | None = None,
+        scope_delegate_controllers: str = "cpu cpuset memory pids io",
     ) -> None:
         self.collision = collision
         self.control_group = control_group
@@ -581,6 +582,7 @@ class _FakeSystemdRunner:
         self.target_slice_stdout = target_slice_stdout
         self.timeout = timeout
         self.show_stdout = show_stdout
+        self.scope_delegate_controllers = scope_delegate_controllers
         self.calls: list[tuple[str, ...]] = []
         self.started: list[tuple[str, ...]] = []
         self.stopped: list[str] = []
@@ -626,9 +628,22 @@ class _FakeSystemdRunner:
             if self.show_stdout is not None:
                 return self._result(returncode=0, stdout=self.show_stdout)
             control_group = self.control_group or f"{self.target_slice_control_group}/{self.unit_name}"
+            values = {
+                "ControlGroup": control_group,
+                "MainPID": "4241",
+                "DelegateControllers": self.scope_delegate_controllers,
+            }
+            properties = tuple(
+                argument.split("=", 1)[1]
+                for argument in argv
+                if argument.startswith("--property=")
+            )
+            assert properties and all(property_name in values for property_name in properties)
             return self._result(
                 returncode=0,
-                stdout=f"ControlGroup={control_group}\nMainPID=4241\n".encode(),
+                stdout="".join(
+                    f"{property_name}={values[property_name]}\n" for property_name in properties
+                ).encode(),
             )
         if argv[0] == "/usr/bin/systemctl" and argv[3] == "stop":
             self.stopped.append(argv[4])
@@ -748,6 +763,16 @@ def test_systemd_adapter_uses_fixed_argv_internal_unit_and_one_internal_gate_rel
     ]
     assert runner.gate.releases == [b"c" * 64 + b"\n"]
     assert (
+        "/usr/bin/systemctl",
+        "--user",
+        "--no-pager",
+        "show",
+        scope.unit_name,
+        "--property=ControlGroup",
+        "--property=MainPID",
+        "--property=DelegateControllers",
+    ) in runner.calls
+    assert (
         "/usr/bin/tmux",
         "-L",
         "scope_socket-1",
@@ -826,6 +851,50 @@ def test_systemd_adapter_denies_missing_wrong_or_non_delegated_target_slice_befo
             assert runner.stopped == ["codex-master-resource-" + "d" * 32 + ".scope"]
         else:
             assert runner.started == []
+
+
+def test_systemd_adapter_rejects_scope_delegate_controller_superset_before_release(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = _FakeSystemdRunner(
+        scope_delegate_controllers="cpu cpuset memory pids io hugetlb"
+    )
+    adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
+
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        start_verified_scope(
+            adapter,
+            profile=_profile(),
+            socket_name="scope_socket-1",
+            session_name="scope-session.1",
+        )
+
+    assert len(runner.started) == 1
+    assert runner.gate.releases == []
+    assert runner.stopped == ["codex-master-resource-" + "d" * 32 + ".scope"]
+
+
+def test_systemd_adapter_allows_parent_controller_supersets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = _FakeSystemdRunner()
+    adapter = _systemd_adapter(
+        monkeypatch,
+        tmp_path,
+        runner,
+        slice_controllers=b"cpu cpuset memory pids io hugetlb\n",
+        slice_subtree=b"cpu cpuset memory pids io hugetlb\n",
+    )
+    monkeypatch.setattr(adapter, "_read_tmux_children", lambda _pid: (4243,))
+
+    scope = start_verified_scope(
+        adapter,
+        profile=_profile(),
+        socket_name="scope_socket-1",
+        session_name="scope-session.1",
+    )
+
+    assert scope.unit_name == "codex-master-resource-" + "d" * 32 + ".scope"
 
 
 @pytest.mark.parametrize(
