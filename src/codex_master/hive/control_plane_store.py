@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import math
 from pathlib import PurePosixPath
 from typing import cast
 
@@ -70,22 +71,20 @@ class HiveControlPlaneStore:
     ) -> dict[str, object]:
         """CAS-replace the Task-9 aggregate through the existing root lock."""
 
+        revision = _expected_revision(expected_revision)
+        candidate = _validate_document(document)
+        if candidate["revision"] != revision:
+            raise HiveStateError("stale_control_plane_revision")
         moment = _utc_time(now)
         with self._state.locked():
             persisted = self._load_task9_locked()
-            candidate = _validate_document(document)
-            revision = persisted["revision"]
+            persisted_revision = persisted["revision"]
             updated = _parse_utc_timestamp(persisted["updated_at_utc"])
-            if (
-                type(expected_revision) is not int
-                or expected_revision < 0
-                or candidate["revision"] != expected_revision
-                or revision != expected_revision
-            ):
+            if persisted_revision != revision:
                 raise HiveStateError("stale_control_plane_revision")
             if moment < updated:
                 raise HiveStateError("control_plane_state_unavailable")
-            candidate["revision"] = revision + 1
+            candidate["revision"] = persisted_revision + 1
             candidate["created_at_utc"] = persisted["created_at_utc"]
             candidate["updated_at_utc"] = moment.isoformat()
             self._state.replace_json_locked(_TASK9_PATH, candidate)
@@ -115,11 +114,18 @@ def _empty_document(now: datetime) -> dict[str, object]:
     }
 
 
+def _expected_revision(value: int) -> int:
+    if type(value) is not int or value < 0:
+        raise HiveStateError("stale_control_plane_revision")
+    return value
+
+
 def _validate_document(value: Mapping[str, object]) -> dict[str, object]:
-    if not isinstance(value, Mapping):
+    if type(value) is not dict:
         raise HiveStateError("control_plane_state_unavailable")
+    _validate_json_value(value)
     try:
-        document = cast(dict[str, object], deepcopy(dict(value)))
+        document = cast(dict[str, object], deepcopy(value))
     except (TypeError, ValueError, RecursionError) as exc:
         raise HiveStateError("control_plane_state_unavailable") from exc
     if set(document) != _TASK9_KEYS:
@@ -137,6 +143,27 @@ def _validate_document(value: Mapping[str, object]) -> dict[str, object]:
     if updated < created:
         raise HiveStateError("control_plane_state_unavailable")
     return document
+
+
+def _validate_json_value(value: object) -> None:
+    value_type = type(value)
+    if value is None or value_type in {bool, int, str}:
+        return
+    if value_type is float:
+        if math.isfinite(value):
+            return
+        raise HiveStateError("control_plane_state_unavailable")
+    if value_type is list:
+        for item in value:
+            _validate_json_value(item)
+        return
+    if value_type is dict:
+        for key, item in value.items():
+            if type(key) is not str:
+                raise HiveStateError("control_plane_state_unavailable")
+            _validate_json_value(item)
+        return
+    raise HiveStateError("control_plane_state_unavailable")
 
 
 def _parse_utc_timestamp(value: object) -> datetime:

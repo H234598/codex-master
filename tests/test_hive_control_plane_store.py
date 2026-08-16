@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path, PurePosixPath
-from typing import Iterator
+from typing import Iterator, Mapping
 
 import pytest
 
@@ -36,6 +36,7 @@ class RecordingStore(HiveStateStore):
     def __init__(self, root: Path) -> None:
         super().__init__(root)
         self.locked_calls = 0
+        self.lock_depth = 0
         self.reads: list[PurePosixPath] = []
         self.replacements: list[PurePosixPath] = []
 
@@ -43,7 +44,11 @@ class RecordingStore(HiveStateStore):
     def locked(self) -> Iterator[HiveStateStore]:
         self.locked_calls += 1
         with super().locked() as held:
-            yield held
+            self.lock_depth += 1
+            try:
+                yield held
+            finally:
+                self.lock_depth -= 1
 
     def read_json_locked(self, relative: PurePosixPath, *, max_bytes: int) -> dict[str, object]:
         self.reads.append(relative)
@@ -61,6 +66,22 @@ class RecordingStore(HiveStateStore):
     ) -> None:
         self.replacements.append(relative)
         super().replace_json_locked(relative, payload, encoded=encoded)
+
+
+class LockAwareMapping(Mapping[str, object]):
+    def __init__(self, state: RecordingStore) -> None:
+        self._state = state
+
+    def __iter__(self) -> Iterator[str]:
+        assert self._state.lock_depth == 0
+        return iter(_empty_document())
+
+    def __len__(self) -> int:
+        return len(_empty_document())
+
+    def __getitem__(self, key: str) -> object:
+        assert self._state.lock_depth == 0
+        return _empty_document()[key]
 
 
 def test_module_exports_only_hive_control_plane_store() -> None:
@@ -165,6 +186,65 @@ def test_replace_increments_revision_preserves_created_updates_time_and_returns_
     assert replaced["grants"] == [{"grant_id": "grant-one"}]
     replaced["grants"].clear()  # type: ignore[union-attr]
     assert control.load_task9()["grants"] == [{"grant_id": "grant-one"}]
+
+
+def test_replace_valid_standard_json_candidate_returns_exact_following_load(tmp_path: Path) -> None:
+    state = HiveStateStore(tmp_path / "state")
+    control = HiveControlPlaneStore(state)
+    control.initialize_task9(now=NOW)
+    candidate = control.load_task9()
+    candidate["messages"].append({"message_id": "message-one", "nested": [None, True, 1, 1.5, {"key": "value"}]})  # type: ignore[union-attr]
+    candidate["by_message_id"] = {"message-one": {"sequence": 1}}
+
+    replaced = control.replace_task9(candidate, expected_revision=0, now=NOW + timedelta(minutes=1))
+
+    assert replaced == control.load_task9()
+
+
+def test_replace_checks_expected_revision_and_custom_mapping_before_root_lock(tmp_path: Path) -> None:
+    state = RecordingStore(tmp_path / "state")
+    control = HiveControlPlaneStore(state)
+    control.initialize_task9(now=NOW)
+    candidate = control.load_task9()
+    before = state.locked_calls
+
+    with pytest.raises(HiveStateError, match="^stale_control_plane_revision$"):
+        control.replace_task9(candidate, expected_revision=True, now=NOW + timedelta(minutes=1))  # type: ignore[arg-type]
+    assert state.locked_calls == before
+
+    with pytest.raises(HiveStateError, match="^control_plane_state_unavailable$"):
+        control.replace_task9(LockAwareMapping(state), expected_revision=0, now=NOW + timedelta(minutes=1))
+    assert state.locked_calls == before
+
+
+@pytest.mark.parametrize(
+    "invalid_index",
+    (
+        {1: "integer-key"},
+        {True: "boolean-key"},
+        {"message-one": float("nan")},
+        {"message-one": float("inf")},
+        {"message-one": float("-inf")},
+        {"message-one": ("tuple",)},
+    ),
+)
+def test_replace_rejects_nonstandard_json_candidate_before_root_lock_without_mutation(
+    tmp_path: Path, invalid_index: dict[object, object]
+) -> None:
+    state = RecordingStore(tmp_path / "state")
+    control = HiveControlPlaneStore(state)
+    path = tmp_path / "state" / TASK9_PATH
+    control.initialize_task9(now=NOW)
+    candidate = control.load_task9()
+    candidate["by_message_id"] = invalid_index
+    before = path.read_bytes()
+    locked_before = state.locked_calls
+
+    with pytest.raises(HiveStateError, match="^control_plane_state_unavailable$"):
+        control.replace_task9(candidate, expected_revision=0, now=NOW + timedelta(minutes=1))
+
+    assert state.locked_calls == locked_before
+    assert path.read_bytes() == before
 
 
 def test_mutations_use_one_reentrant_root_lock_and_one_atomic_replace(tmp_path: Path) -> None:
