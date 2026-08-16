@@ -1305,6 +1305,54 @@ def _resource_monitor_unit_directives(text: str) -> dict[str, str]:
     return directives
 
 
+def _systemd_unit_sections(text: str) -> dict[str, dict[str, str]]:
+    sections: dict[str, dict[str, str]] = {}
+    current: dict[str, str] | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+            assert section and section not in sections
+            current = sections.setdefault(section, {})
+            continue
+        assert current is not None
+        key, separator, value = line.partition("=")
+        assert separator == "=" and key and key not in current
+        current[key] = value
+    return sections
+
+
+def test_h2_slice_is_documentation_only_without_parent_resource_policy() -> None:
+    root = Path(__file__).resolve().parents[1]
+    slice_unit = root / "systemd" / "user" / "codex-master.slice"
+
+    assert _systemd_unit_sections(slice_unit.read_text(encoding="utf-8")) == {
+        "Unit": {
+            "Description": "Codex Master Resource Slice",
+            "Documentation": "man:systemd.slice(5)",
+        }
+    }
+
+
+def test_h2_system_user_manager_template_delegates_exact_controller_set_only() -> None:
+    root = Path(__file__).resolve().parents[1]
+    template = root / "systemd" / "system" / "user@.service.d" / "50-codex-master-delegation.conf"
+
+    assert _systemd_unit_sections(template.read_text(encoding="utf-8")) == {
+        "Service": {"Delegate": "cpu cpuset memory pids io"}
+    }
+
+
+def test_h2_resource_monitor_is_slice_anchor_with_exact_delegation() -> None:
+    service = Path(__file__).resolve().parents[1] / "systemd" / "user" / "codex-master-resource-monitor.service"
+    sections = _systemd_unit_sections(service.read_text(encoding="utf-8"))
+
+    assert sections["Service"]["Slice"] == "codex-master.slice"
+    assert sections["Service"]["Delegate"] == "cpu cpuset memory pids io"
+
+
 def test_resource_monitor_unit_has_exact_hardening_allowlist_including_keyring_clock_hostname_personality_and_mdwx() -> None:
     service = Path(__file__).resolve().parents[1] / "systemd" / "user" / "codex-master-resource-monitor.service"
     assert service.is_file()

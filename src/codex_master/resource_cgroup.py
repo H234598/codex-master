@@ -812,6 +812,7 @@ class SystemdUserCgroupAdapter:
                 unit_name,
                 "--property=ControlGroup",
                 "--property=MainPID",
+                "--property=DelegateControllers",
             )
         )
         if result.returncode != 0:
@@ -820,14 +821,19 @@ class SystemdUserCgroupAdapter:
             lines = result.stdout.decode("ascii").splitlines()
         except UnicodeDecodeError:
             _fail()
-        if len(lines) != 2 or any("=" not in line for line in lines):
+        if len(lines) != 3 or any("=" not in line for line in lines):
             _fail()
         values = dict(line.split("=", 1) for line in lines)
-        if set(values) != {"ControlGroup", "MainPID"} or len(values) != len(lines):
+        if set(values) != {"ControlGroup", "MainPID", "DelegateControllers"} or len(
+            values
+        ) != len(lines):
             _fail()
         control_group = _canonical_control_group(values["ControlGroup"])
         gate_pid = _parse_positive_pid(values["MainPID"])
+        delegated = _parse_controller_set(f"{values['DelegateControllers']}\n".encode("ascii"))
         if control_group != f"{expected_slice_control_group}/{unit_name}":
+            _fail()
+        if delegated != REQUIRED_CONTROLLERS:
             _fail()
         return control_group, gate_pid
 
@@ -860,7 +866,7 @@ class SystemdUserCgroupAdapter:
             "--collect",
             f"--unit={unit_name}",
             f"--slice={CODEX_MASTER_SLICE}",
-            "--property=Delegate=yes",
+            "--property=Delegate=cpu cpuset memory pids io",
             f"--property=AllowedCPUs={profile.cpuset_expression}",
             f"--property=CPUQuota={profile.cpu_quota_percent}%",
             f"--property=CPUWeight={profile.cpu_weight}",
