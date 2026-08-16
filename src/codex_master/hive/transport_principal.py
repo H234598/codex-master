@@ -115,7 +115,12 @@ class TransportEvidenceVerifier(Protocol):
     """Verify opaque transport evidence against one injected UTC instant."""
 
     def verify(self, evidence: object, *, now: datetime) -> VerifiedTransportClaims:
-        """Return bounded, immutable claims or raise TransportPrincipalError."""
+        """Return bounded, immutable claims.
+
+        Expected evidence rejection MUST raise TransportPrincipalError without sensitive details.
+        Unexpected implementation errors MUST NOT contain raw evidence or secrets and intentionally
+        propagate for visibility.
+        """
 
 
 class TransportPrincipalAdapter:
