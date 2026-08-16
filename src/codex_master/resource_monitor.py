@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import PurePosixPath
 from types import MappingProxyType
 from typing import Literal
 from uuid import UUID
+
+from codex_master.hive.state import HiveStateError, HiveStateStore
 
 
 _SCHEMA_VERSION = 1
@@ -22,6 +26,11 @@ _CGROUP_STATES = frozenset(("ready", "unavailable", "preflight_failed"))
 _GATE_STATES = frozenset(("ready", "blocked"))
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _PROFILE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+_SENSOR_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_:-]{0,127}$")
+_RESOURCE_DOCUMENT_MAX_BYTES = 64 * 1024
+_RESOURCE_SNAPSHOT_PATH = PurePosixPath("resources/resource-snapshot-v1.json")
+_THERMAL_POLICY_PATH = PurePosixPath("resources/thermal-policy-v1.json")
+_THERMAL_POLICY_FIELDS = frozenset(("schema_version", "sensor_thresholds"))
 _SNAPSHOT_FIELDS = frozenset(
     (
         "schema_version",
@@ -51,6 +60,27 @@ _SNAPSHOT_FIELDS = frozenset(
 
 class ResourceSnapshotError(ValueError):
     """A data-sparse resource snapshot validation error."""
+
+
+@dataclass(frozen=True, slots=True)
+class ThermalPolicyV1:
+    """Normalized thermal thresholds, without applet or host configuration."""
+
+    schema_version: int
+    sensor_thresholds: Mapping[str, float]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "schema_version", _require_schema_version(self.schema_version))
+        if not isinstance(self.sensor_thresholds, Mapping) or len(self.sensor_thresholds) > 256:
+            _invalid()
+        normalized: dict[str, float] = {}
+        for sensor, threshold in self.sensor_thresholds.items():
+            if not isinstance(sensor, str) or not _SENSOR_IDENTIFIER.fullmatch(sensor):
+                _invalid()
+            if type(threshold) not in {int, float} or not math.isfinite(threshold) or not 0 < threshold <= 200:
+                _invalid()
+            normalized[sensor] = float(threshold)
+        object.__setattr__(self, "sensor_thresholds", MappingProxyType(normalized))
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,6 +410,233 @@ def parse_snapshot_document(
         cgroup_state=payload["cgroup_state"],
         thermal_state=payload["thermal_state"],
     )
+
+
+def _require_state(value: object) -> HiveStateStore:
+    if not isinstance(value, HiveStateStore):
+        _invalid()
+    return value
+
+
+def _reject_duplicate_pairs(pairs: list[tuple[object, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if not isinstance(key, str) or key in result:
+            _invalid()
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(_value: str) -> object:
+    _invalid()
+
+
+def _validate_document_tree(value: object, *, depth: int = 0) -> None:
+    if depth > 16:
+        _invalid()
+    if value is None:
+        return
+    if isinstance(value, str):
+        if len(value) > 128:
+            _invalid()
+        return
+    if type(value) is bool:
+        _invalid()
+    if type(value) is int:
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            _invalid()
+        return
+    if isinstance(value, Mapping):
+        if len(value) > 256:
+            _invalid()
+        for key, item in value.items():
+            if not isinstance(key, str) or len(key) > 128:
+                _invalid()
+            _validate_document_tree(item, depth=depth + 1)
+        return
+    if isinstance(value, list):
+        if len(value) > 256:
+            _invalid()
+        for item in value:
+            _validate_document_tree(item, depth=depth + 1)
+        return
+    _invalid()
+
+
+def _decode_resource_document(raw: object) -> Mapping[str, object]:
+    if type(raw) is not bytes or len(raw) > _RESOURCE_DOCUMENT_MAX_BYTES:
+        _invalid()
+    try:
+        decoded = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
+        _invalid()
+    _validate_document_tree(decoded)
+    if not isinstance(decoded, Mapping):
+        _invalid()
+    return decoded
+
+
+def _snapshot_from_stored_document(payload: Mapping[str, object]) -> ResourceSnapshotV1:
+    if set(payload) != _SNAPSHOT_FIELDS:
+        _invalid()
+    return ResourceSnapshotV1(
+        schema_version=payload["schema_version"],
+        boot_id=_require_canonical_boot_id(payload["boot_id"]),
+        generation=payload["generation"],
+        observed_at_utc=_parse_utc(payload["observed_at_utc"]),
+        observed_monotonic_ns=payload["observed_monotonic_ns"],
+        freshness=payload["freshness"],
+        gate_state=payload["gate_state"],
+        reason_codes=payload["reason_codes"],
+        current=payload["current"],
+        mean_1m=payload["mean_1m"],
+        mean_10m=payload["mean_10m"],
+        peak_10m=payload["peak_10m"],
+        normalized_pressure=payload["normalized_pressure"],
+        normalized_headroom=payload["normalized_headroom"],
+        trend=payload["trend"],
+        bottleneck=payload["bottleneck"],
+        preferred_profiles=payload["preferred_profiles"],
+        avoid_profiles=payload["avoid_profiles"],
+        confidence=payload["confidence"],
+        cgroup_state=payload["cgroup_state"],
+        thermal_state=payload["thermal_state"],
+    )
+
+
+def _thermal_policy_from_document(payload: Mapping[str, object]) -> ThermalPolicyV1:
+    if set(payload) != _THERMAL_POLICY_FIELDS:
+        _invalid()
+    return ThermalPolicyV1(
+        schema_version=payload["schema_version"],
+        sensor_thresholds=payload["sensor_thresholds"],
+    )
+
+
+def _snapshot_document(snapshot: ResourceSnapshotV1) -> Mapping[str, object]:
+    if not isinstance(snapshot, ResourceSnapshotV1):
+        _invalid()
+    return {
+        "schema_version": snapshot.schema_version,
+        "boot_id": snapshot.boot_id,
+        "generation": snapshot.generation,
+        "observed_at_utc": snapshot.observed_at_utc.isoformat().replace("+00:00", "Z"),
+        "observed_monotonic_ns": snapshot.observed_monotonic_ns,
+        "freshness": snapshot.freshness,
+        "gate_state": snapshot.gate_state,
+        "reason_codes": list(snapshot.reason_codes),
+        "current": dict(snapshot.current),
+        "mean_1m": dict(snapshot.mean_1m),
+        "mean_10m": dict(snapshot.mean_10m),
+        "peak_10m": dict(snapshot.peak_10m),
+        "normalized_pressure": dict(snapshot.normalized_pressure),
+        "normalized_headroom": dict(snapshot.normalized_headroom),
+        "trend": dict(snapshot.trend),
+        "bottleneck": snapshot.bottleneck,
+        "preferred_profiles": list(snapshot.preferred_profiles),
+        "avoid_profiles": list(snapshot.avoid_profiles),
+        "confidence": snapshot.confidence,
+        "cgroup_state": snapshot.cgroup_state,
+        "thermal_state": snapshot.thermal_state,
+    }
+
+
+def _encode_resource_document(payload: Mapping[str, object]) -> bytes:
+    try:
+        raw = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, RecursionError):
+        _invalid()
+    if len(raw) > _RESOURCE_DOCUMENT_MAX_BYTES:
+        _invalid()
+    return raw
+
+
+def read_resource_snapshot(
+    state: HiveStateStore, *, now_utc: datetime, expected_boot_id: str
+) -> ResourceSnapshotV1:
+    """Read exactly one fresh snapshot from the authorized state owner."""
+
+    store = _require_state(state)
+    try:
+        raw = store.read_private_bytes(_RESOURCE_SNAPSHOT_PATH, max_bytes=_RESOURCE_DOCUMENT_MAX_BYTES)
+    except HiveStateError:
+        _invalid()
+    return parse_snapshot_document(
+        _decode_resource_document(raw), now_utc=now_utc, expected_boot_id=expected_boot_id
+    )
+
+
+def write_resource_snapshot(state: HiveStateStore, snapshot: ResourceSnapshotV1) -> None:
+    """Persist one newer snapshot without repairing corrupt prior state."""
+
+    store = _require_state(state)
+    document = _snapshot_document(snapshot)
+    raw = _encode_resource_document(document)
+    try:
+        with store.locked():
+            try:
+                previous = _snapshot_from_stored_document(
+                    _decode_resource_document(
+                        store.read_private_bytes(_RESOURCE_SNAPSHOT_PATH, max_bytes=_RESOURCE_DOCUMENT_MAX_BYTES)
+                    )
+                )
+            except HiveStateError as exc:
+                if str(exc) != "state_not_found":
+                    raise
+                previous = None
+            if previous is not None and previous.boot_id == snapshot.boot_id and (
+                snapshot.generation <= previous.generation
+                or snapshot.observed_monotonic_ns <= previous.observed_monotonic_ns
+            ):
+                _invalid()
+            store.replace_private_bytes(_RESOURCE_SNAPSHOT_PATH, raw)
+    except HiveStateError:
+        _invalid()
+
+
+def read_thermal_policy(state: HiveStateStore) -> ThermalPolicyV1 | None:
+    """Read the independent normalized thermal policy, if one was derived."""
+
+    store = _require_state(state)
+    try:
+        raw = store.read_private_bytes(_THERMAL_POLICY_PATH, max_bytes=_RESOURCE_DOCUMENT_MAX_BYTES)
+    except HiveStateError as exc:
+        if str(exc) == "state_not_found":
+            return None
+        _invalid()
+    return _thermal_policy_from_document(_decode_resource_document(raw))
+
+
+def write_thermal_policy(state: HiveStateStore, policy: ThermalPolicyV1) -> None:
+    """Persist normalized derived thermal data as its own document."""
+
+    store = _require_state(state)
+    if not isinstance(policy, ThermalPolicyV1):
+        _invalid()
+    raw = _encode_resource_document(
+        {
+            "schema_version": policy.schema_version,
+            "sensor_thresholds": dict(policy.sensor_thresholds),
+        }
+    )
+    try:
+        with store.locked():
+            try:
+                existing = store.read_private_bytes(_THERMAL_POLICY_PATH, max_bytes=_RESOURCE_DOCUMENT_MAX_BYTES)
+            except HiveStateError as exc:
+                if str(exc) != "state_not_found":
+                    raise
+            else:
+                _thermal_policy_from_document(_decode_resource_document(existing))
+            store.replace_private_bytes(_THERMAL_POLICY_PATH, raw)
+    except HiveStateError:
+        _invalid()
 
 
 def build_resource_gate_facts(snapshot: ResourceSnapshotV1) -> ResourceGateFacts:

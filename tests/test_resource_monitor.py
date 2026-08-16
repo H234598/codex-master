@@ -1,27 +1,41 @@
 from __future__ import annotations
 
+import json
 import math
+import os
 import unittest
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path, PurePosixPath
 
+import pytest
+
+from codex_master.hive import state as hive_state_module
+from codex_master.hive.state import HiveStateStore
 from codex_master.resource_monitor import (
     ResourceSnapshotError,
     ResourceSnapshotV1,
     ResourceGateFacts,
     ResourceOperatorStatus,
     ResourceSchedulerSnapshot,
+    ThermalPolicyV1,
     TrendAssessmentV1,
     build_resource_gate_facts,
     build_resource_operator_status,
     build_resource_scheduler_snapshot,
     classify_trend,
     parse_snapshot_document,
+    read_resource_snapshot,
+    read_thermal_policy,
+    write_resource_snapshot,
+    write_thermal_policy,
 )
 
 
 NOW = datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc)
 BOOT_ID = "123e4567-e89b-12d3-a456-426614174000"
+SNAPSHOT_PATH = PurePosixPath("resources/resource-snapshot-v1.json")
+THERMAL_POLICY_PATH = PurePosixPath("resources/thermal-policy-v1.json")
 
 
 def snapshot_document() -> dict[str, object]:
@@ -258,3 +272,178 @@ class ResourceMonitorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _snapshot(payload: dict[str, object] | None = None) -> ResourceSnapshotV1:
+    return parse_snapshot_document(
+        snapshot_document() if payload is None else payload,
+        now_utc=NOW,
+        expected_boot_id=BOOT_ID,
+    )
+
+
+def _snapshot_bytes(payload: dict[str, object] | None = None) -> bytes:
+    return json.dumps(snapshot_document() if payload is None else payload).encode("utf-8")
+
+
+def test_resource_document_reader_rejects_nonregular_mode_owner_link_partial_duplicate_key_nan_and_overlimit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = HiveStateStore(tmp_path / "state")
+    invalid_documents = (
+        b"{",
+        b'{"schema_version":1,"schema_version":1}',
+        b'{"schema_version":NaN}',
+        b" " * (64 * 1024 + 1),
+    )
+    for document in invalid_documents:
+        store.replace_private_bytes(SNAPSHOT_PATH, document)
+        with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+            read_resource_snapshot(store, now_utc=NOW, expected_boot_id=BOOT_ID)
+
+    path = tmp_path / "state" / "resources" / "resource-snapshot-v1.json"
+    path.write_bytes(_snapshot_bytes())
+    path.chmod(0o644)
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        read_resource_snapshot(store, now_utc=NOW, expected_boot_id=BOOT_ID)
+
+    path.chmod(0o600)
+    expected_uid = os.geteuid()
+    monkeypatch.setattr(hive_state_module.os, "geteuid", lambda: expected_uid + 1)
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        read_resource_snapshot(store, now_utc=NOW, expected_boot_id=BOOT_ID)
+    monkeypatch.undo()
+
+    path.unlink()
+    hardlink_source = tmp_path / "snapshot-source.json"
+    hardlink_source.write_bytes(_snapshot_bytes())
+    hardlink_source.chmod(0o600)
+    os.link(hardlink_source, path)
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        read_resource_snapshot(store, now_utc=NOW, expected_boot_id=BOOT_ID)
+
+
+def test_resource_document_reader_rejects_generation_regression_wrong_boot_stale_future_and_time_rollback(
+    tmp_path: Path,
+) -> None:
+    store = HiveStateStore(tmp_path / "state")
+    snapshot = _snapshot()
+    write_resource_snapshot(store, snapshot)
+
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        write_resource_snapshot(store, replace(snapshot, generation=6))
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        write_resource_snapshot(store, replace(snapshot, generation=8, observed_monotonic_ns=1))
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        read_resource_snapshot(store, now_utc=NOW, expected_boot_id="123e4567-e89b-12d3-a456-426614174001")
+
+    stale = snapshot_document()
+    stale["observed_at_utc"] = (NOW - timedelta(seconds=4)).isoformat()
+    store.replace_private_bytes(SNAPSHOT_PATH, _snapshot_bytes(stale))
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        read_resource_snapshot(store, now_utc=NOW, expected_boot_id=BOOT_ID)
+
+    future = snapshot_document()
+    future["observed_at_utc"] = (NOW + timedelta(seconds=3)).isoformat()
+    store.replace_private_bytes(SNAPSHOT_PATH, _snapshot_bytes(future))
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        read_resource_snapshot(store, now_utc=NOW, expected_boot_id=BOOT_ID)
+
+
+def test_resource_document_reader_reads_one_document_once_and_never_mixes_generation(tmp_path: Path) -> None:
+    class CountingStore(HiveStateStore):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.reads: list[PurePosixPath] = []
+
+        def read_private_bytes(self, relative: PurePosixPath, *, max_bytes: int) -> bytes:
+            self.reads.append(relative)
+            return super().read_private_bytes(relative, max_bytes=max_bytes)
+
+    store = CountingStore(tmp_path / "state")
+    write_resource_snapshot(store, _snapshot())
+    write_thermal_policy(
+        store,
+        ThermalPolicyV1(schema_version=1, sensor_thresholds={"cpu_package": 95.0}),
+    )
+    store.reads.clear()
+
+    snapshot = read_resource_snapshot(store, now_utc=NOW, expected_boot_id=BOOT_ID)
+
+    assert snapshot.generation == 7
+    assert store.reads == [SNAPSHOT_PATH]
+
+
+def test_resource_documents_use_only_authorized_injected_hive_state_store_and_fixed_resources_relative_paths(
+    tmp_path: Path,
+) -> None:
+    class RecordingStore(HiveStateStore):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.paths: list[PurePosixPath] = []
+
+        def read_private_bytes(self, relative: PurePosixPath, *, max_bytes: int) -> bytes:
+            self.paths.append(relative)
+            return super().read_private_bytes(relative, max_bytes=max_bytes)
+
+        def replace_private_bytes(self, relative: PurePosixPath, payload: bytes) -> None:
+            self.paths.append(relative)
+            super().replace_private_bytes(relative, payload)
+
+    store = RecordingStore(tmp_path / "state")
+    write_resource_snapshot(store, _snapshot())
+    assert read_resource_snapshot(store, now_utc=NOW, expected_boot_id=BOOT_ID).generation == 7
+    write_thermal_policy(
+        store,
+        ThermalPolicyV1(schema_version=1, sensor_thresholds={"cpu_package": 95.0}),
+    )
+    assert read_thermal_policy(store) == ThermalPolicyV1(
+        schema_version=1, sensor_thresholds={"cpu_package": 95.0}
+    )
+    assert set(store.paths) == {SNAPSHOT_PATH, THERMAL_POLICY_PATH}
+
+
+def test_resource_monitor_rejects_path_root_factory_home_environment_and_second_store_or_lock_api(
+    tmp_path: Path,
+) -> None:
+    store = HiveStateStore(tmp_path / "state")
+
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        read_resource_snapshot(object(), now_utc=NOW, expected_boot_id=BOOT_ID)  # type: ignore[arg-type]
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        write_resource_snapshot(store, object())  # type: ignore[arg-type]
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        write_thermal_policy(store, object())  # type: ignore[arg-type]
+
+
+def test_snapshot_stale_persistence_is_unavailable_without_cross_document_atomicity_claim(tmp_path: Path) -> None:
+    store = HiveStateStore(tmp_path / "state")
+    stale = snapshot_document()
+    stale["observed_at_utc"] = (NOW - timedelta(seconds=4)).isoformat()
+    store.replace_private_bytes(SNAPSHOT_PATH, _snapshot_bytes(stale))
+    write_thermal_policy(
+        store,
+        ThermalPolicyV1(schema_version=1, sensor_thresholds={"cpu_package": 95.0}),
+    )
+
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        read_resource_snapshot(store, now_utc=NOW, expected_boot_id=BOOT_ID)
+    assert read_thermal_policy(store) == ThermalPolicyV1(
+        schema_version=1, sensor_thresholds={"cpu_package": 95.0}
+    )
+
+
+def test_thermal_policy_only_contains_normalized_derived_values_not_applet_configuration(tmp_path: Path) -> None:
+    store = HiveStateStore(tmp_path / "state")
+    policy = ThermalPolicyV1(schema_version=1, sensor_thresholds={"cpu_package": 95.0})
+    write_thermal_policy(store, policy)
+
+    document = json.loads(store.read_private_bytes(THERMAL_POLICY_PATH, max_bytes=64 * 1024))
+    assert document == {"schema_version": 1, "sensor_thresholds": {"cpu_package": 95.0}}
+
+    store.replace_private_bytes(
+        THERMAL_POLICY_PATH,
+        b'{"schema_version":1,"sensor_thresholds":{"cpu_package":95.0},"show_in_panel":true}',
+    )
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        read_thermal_policy(store)
