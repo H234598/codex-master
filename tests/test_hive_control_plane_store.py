@@ -51,6 +51,7 @@ class RecordingStore(HiveStateStore):
                 self.lock_depth -= 1
 
     def read_json_locked(self, relative: PurePosixPath, *, max_bytes: int) -> dict[str, object]:
+        assert self.lock_depth > 0
         self.reads.append(relative)
         return dict(super().read_json_locked(relative, max_bytes=max_bytes))
 
@@ -64,6 +65,7 @@ class RecordingStore(HiveStateStore):
         *,
         encoded: bytes | None = None,
     ) -> None:
+        assert self.lock_depth > 0
         self.replacements.append(relative)
         super().replace_json_locked(relative, payload, encoded=encoded)
 
@@ -237,6 +239,39 @@ def test_replace_rejects_nonstandard_json_candidate_before_root_lock_without_mut
     control.initialize_task9(now=NOW)
     candidate = control.load_task9()
     candidate["by_message_id"] = invalid_index
+    before = path.read_bytes()
+    locked_before = state.locked_calls
+
+    with pytest.raises(HiveStateError, match="^control_plane_state_unavailable$"):
+        control.replace_task9(candidate, expected_revision=0, now=NOW + timedelta(minutes=1))
+
+    assert state.locked_calls == locked_before
+    assert path.read_bytes() == before
+
+
+def _cyclic_messages() -> list[object]:
+    messages: list[object] = []
+    messages.append(messages)
+    return messages
+
+
+def _deep_messages() -> list[object]:
+    messages: list[object] = []
+    for _ in range(2_000):
+        messages = [messages]
+    return messages
+
+
+@pytest.mark.parametrize("build_messages", (_cyclic_messages, _deep_messages))
+def test_replace_normalizes_recursive_candidate_validation_before_root_lock_without_mutation(
+    tmp_path: Path, build_messages: callable[[], list[object]]
+) -> None:
+    state = RecordingStore(tmp_path / "state")
+    control = HiveControlPlaneStore(state)
+    path = tmp_path / "state" / TASK9_PATH
+    control.initialize_task9(now=NOW)
+    candidate = control.load_task9()
+    candidate["messages"] = build_messages()
     before = path.read_bytes()
     locked_before = state.locked_calls
 

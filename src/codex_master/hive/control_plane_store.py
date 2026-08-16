@@ -123,7 +123,10 @@ def _expected_revision(value: int) -> int:
 def _validate_document(value: Mapping[str, object]) -> dict[str, object]:
     if type(value) is not dict:
         raise HiveStateError("control_plane_state_unavailable")
-    _validate_json_value(value)
+    try:
+        _validate_json_value(value)
+    except RecursionError as exc:
+        raise HiveStateError("control_plane_state_unavailable") from exc
     try:
         document = cast(dict[str, object], deepcopy(value))
     except (TypeError, ValueError, RecursionError) as exc:
