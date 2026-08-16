@@ -172,6 +172,7 @@ FlottenmanagementApplet.prototype = {
         this._statusPendingRefresh = false;
         this._statusGeneration = 0;
         this._statusActiveGeneration = 0;
+        this._resourceGenerationHighWater = 0;
         this._statusLastGood = null;
         this._statusActiveState = null;
         this._statusViewState = "initializing";
@@ -1434,6 +1435,12 @@ FlottenmanagementApplet.prototype = {
         if (!this._isValidAppletStatusPayload(normalized)) {
             return false;
         }
+        if (normalized.resource.state !== "unavailable") {
+            this._resourceGenerationHighWater = Math.max(
+                this._resourceGenerationHighWater,
+                normalized.resource.generation
+            );
+        }
         this._statusLastGood = normalized;
         this._armedAction = null;
         this._actionsAwaitingRefresh = false;
@@ -1459,12 +1466,10 @@ FlottenmanagementApplet.prototype = {
     _normalizeAppletResource(payload) {
         if (!payload || typeof payload !== "object") return payload;
         const resource = payload.resource;
-        const previous = this._statusLastGood && this._statusLastGood.resource;
         const resourceValid = this._isValidResourceStatus(resource);
         const generationMismatch = resourceValid
-            && this._isValidResourceStatus(previous)
-            && previous.state !== "unavailable"
-            && resource.generation < previous.generation;
+            && resource.state !== "unavailable"
+            && resource.generation < this._resourceGenerationHighWater;
         if (resourceValid && !generationMismatch) return payload;
         return { ...payload, resource: this._unavailableResource() };
     },
@@ -2244,6 +2249,7 @@ FlottenmanagementApplet.prototype = {
     _cleanupStatusResources() {
         let success = true;
         let statusClean = true;
+        this._resourceGenerationHighWater = 0;
         this._statusLastGood = null;
         this._armedAction = null;
         this._actionInFlight = false;

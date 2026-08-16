@@ -25926,7 +25926,7 @@ TOOLS: list[dict[str, Any]] = [
                     "maxItems": MAX_APPLET_AGENTS,
                     "items": text_schema(MAX_AGENT_SELECTOR_TEXT),
                 },
-                "schema_version": {"type": "integer", "enum": [1, 2, 4], "default": 1},
+                "schema_version": {"type": "integer", "enum": [1, 2, 3, 4], "default": 1},
             },
             "additionalProperties": False,
         },

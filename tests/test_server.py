@@ -4531,7 +4531,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(master_applet_status_props["agents"]["items"]["type"], "string")
         self.assertEqual(master_applet_status_props["agents"]["items"]["maxLength"], MAX_AGENT_SELECTOR_TEXT)
         self.assertEqual(master_applet_status_props["schema_version"]["type"], "integer")
-        self.assertEqual(master_applet_status_props["schema_version"]["enum"], [1, 2, 4])
+        self.assertEqual(master_applet_status_props["schema_version"]["enum"], [1, 2, 3, 4])
         self.assertEqual(master_applet_status_props["schema_version"]["default"], 1)
         self.assertEqual(assign_props["task"]["maxLength"], MAX_TASK_TEXT)
         self.assertEqual(assign_props["context"]["maxItems"], MAX_ASSIGNMENT_LIST_ITEMS)
@@ -22922,6 +22922,19 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(result["schema_version"], 1)
         mock_applet_status.assert_called_once_with(["a1", "b1"], schema_version=1)
+
+    @patch("codex_master.server.applet_status")
+    def test_validated_master_applet_status_keeps_schema_v3_route(self, mock_applet_status) -> None:
+        expected = {"schema_version": 3, "raw_output": "not_returned"}
+        mock_applet_status.return_value = expected
+
+        result = server_module.call_validated_tool(
+            "master_applet_status",
+            {"agents": [], "schema_version": 3},
+        )
+
+        self.assertEqual(result, expected)
+        mock_applet_status.assert_called_once_with([], schema_version=3)
 
     @patch("codex_master.server._start_agent_with_lease_unlocked", return_value={"status": "started"})
     @patch("codex_master.server.agent_lifecycle_lock")

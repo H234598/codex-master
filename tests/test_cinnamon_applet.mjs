@@ -3523,9 +3523,11 @@ test("applet invalid or mismatched resource generation is unavailable", () => {
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
   const good = samplePayload();
 
+  assert.equal(applet._resourceGenerationHighWater, 0);
   assert.equal(applet._maybeApplyStatusPayload(good), true);
   assert.equal(applet._statusLastGood.resource.generation, 7);
   assert.equal(applet._statusLastGood.resource.state, "ready");
+  assert.equal(applet._resourceGenerationHighWater, 7);
 
   const malformed = samplePayload();
   malformed.resource.generation = "7";
@@ -3541,18 +3543,33 @@ test("applet invalid or mismatched resource generation is unavailable", () => {
     avoid_profiles: [],
     raw_output: "not_returned",
   }));
+  assert.equal(applet._resourceGenerationHighWater, 7);
 
   const duplicateProfile = samplePayload();
   duplicateProfile.resource.preferred_profiles = ["cpu_low", "cpu_low"];
   assert.equal(applet._maybeApplyStatusPayload(duplicateProfile), true);
   assert.equal(applet._statusLastGood.resource.state, "unavailable");
+  assert.equal(applet._resourceGenerationHighWater, 7);
 
-  assert.equal(applet._maybeApplyStatusPayload(good), true);
   const mismatched = samplePayload();
   mismatched.resource.generation = 6;
   assert.equal(applet._maybeApplyStatusPayload(mismatched), true);
   assert.equal(applet._statusLastGood.resource.state, "unavailable");
   assert.equal(applet._statusLastGood.resource.generation, 0);
+  assert.equal(applet._resourceGenerationHighWater, 7);
+
+  assert.equal(applet._maybeApplyStatusPayload(good), true);
+  assert.equal(applet._statusLastGood.resource.generation, 7);
+  assert.equal(applet._resourceGenerationHighWater, 7);
+
+  const newer = samplePayload();
+  newer.resource.generation = 8;
+  assert.equal(applet._maybeApplyStatusPayload(newer), true);
+  assert.equal(applet._statusLastGood.resource.generation, 8);
+  assert.equal(applet._resourceGenerationHighWater, 8);
+
+  assert.equal(applet._cleanupStatusResources(), true);
+  assert.equal(applet._resourceGenerationHighWater, 0);
 });
 
 test("applet never reads monitor path or spawns second status process", () => {
