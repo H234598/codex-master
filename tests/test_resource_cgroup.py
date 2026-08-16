@@ -271,9 +271,17 @@ def test_topology_rejects_core_type_enoent_after_bound_parent_and_optional_non_l
         parse_cpu_topology(adapter)
 
 
-def test_optional_core_type_rejects_extreme_decimal_cpu_path_with_canonical_error() -> None:
+def test_optional_core_type_rejects_extreme_decimal_cpu_path_with_canonical_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cgroup_root = tmp_path / "cgroup"
+    cpu_root = tmp_path / "cpu"
+    cgroup_root.mkdir()
+    cpu_root.mkdir()
+    monkeypatch.setattr(resource_cgroup, "CGROUP_ROOT", cgroup_root)
+    monkeypatch.setattr(resource_cgroup, "CPU_TOPOLOGY_ROOT", cpu_root)
     adapter = resource_cgroup.SystemdUserCgroupAdapter(runner=_FakeSystemdRunner())
-    path = resource_cgroup.CPU_TOPOLOGY_ROOT / f"cpu{'9' * 5000}" / "topology" / "core_type"
+    path = cpu_root / f"cpu{'9' * 5000}" / "topology" / "core_type"
 
     with pytest.raises(CgroupPreflightError) as captured:
         adapter.read_optional_cpu_topology_bytes(path, max_bytes=4096)
