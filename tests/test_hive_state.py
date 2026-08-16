@@ -64,3 +64,97 @@ def test_state_store_rejects_malformed_and_oversized_documents(tmp_path: Path) -
         store.read_json(PurePosixPath("broken.json"), max_bytes=4096)
     with pytest.raises(HiveStateError, match="state_oversize"):
         store.replace_json(PurePosixPath("large.json"), {"x": "a" * (4 * 1024 * 1024)})
+
+
+def test_hive_state_raw_private_bytes_keep_nofollow_hardlink_parent_swap_and_atomic_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = HiveStateStore(tmp_path / "state")
+    relative = PurePosixPath("resources/snapshot.bin")
+
+    store.replace_private_bytes(relative, b"first")
+    store.replace_private_bytes(relative, b"second")
+
+    path = tmp_path / "state" / "resources" / "snapshot.bin"
+    assert store.read_private_bytes(relative, max_bytes=64) == b"second"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert not list(path.parent.glob(".snapshot.bin.*"))
+
+    path.chmod(0o644)
+    with pytest.raises(HiveStateError, match="state_file_untrusted"):
+        store.read_private_bytes(relative, max_bytes=64)
+    path.chmod(0o600)
+
+    expected_uid = os.geteuid()
+    monkeypatch.setattr(HiveStateStore, "_validate_private_directory", staticmethod(lambda _info: None))
+    monkeypatch.setattr("codex_master.hive.state.os.geteuid", lambda: expected_uid + 1)
+    with pytest.raises(HiveStateError, match="state_file_untrusted"):
+        store.read_private_bytes(relative, max_bytes=64)
+    monkeypatch.undo()
+
+    path.unlink()
+    hardlink_source = tmp_path / "hardlink-source.bin"
+    hardlink_source.write_bytes(b"hardlinked")
+    hardlink_source.chmod(0o600)
+    os.link(hardlink_source, path)
+    with pytest.raises(HiveStateError, match="state_file_untrusted"):
+        store.read_private_bytes(relative, max_bytes=64)
+
+    path.unlink()
+    parent = path.parent
+    displaced_parent = tmp_path / "displaced-resources"
+    parent.rename(displaced_parent)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    parent.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(HiveStateError, match="state_directory_untrusted"):
+        store.read_private_bytes(relative, max_bytes=64)
+
+
+def test_private_bytes_reject_root_swap_inside_and_after_held_store_lock(tmp_path: Path) -> None:
+    store = HiveStateStore(tmp_path / "state")
+    relative = PurePosixPath("resources/snapshot.bin")
+    store.replace_private_bytes(relative, b"old")
+
+    root = tmp_path / "state"
+    displaced_root = tmp_path / "displaced-state"
+    replacement_path = root / "resources" / "snapshot.bin"
+
+    with store.locked():
+        root.rename(displaced_root)
+        root.mkdir(mode=0o700)
+        replacement_path.parent.mkdir(mode=0o700)
+        replacement_path.write_bytes(b"new")
+        replacement_path.chmod(0o600)
+
+        locked_read_error: HiveStateError | None = None
+        locked_write_error: HiveStateError | None = None
+        try:
+            store.read_private_bytes(relative, max_bytes=64)
+        except HiveStateError as exc:
+            locked_read_error = exc
+        try:
+            store.replace_private_bytes(relative, b"replacement")
+        except HiveStateError as exc:
+            locked_write_error = exc
+
+    assert str(locked_read_error) == "state_root_untrusted"
+    assert str(locked_write_error) == "state_root_untrusted"
+    assert (displaced_root / "resources" / "snapshot.bin").read_bytes() == b"old"
+    assert replacement_path.read_bytes() == b"new"
+
+    reacquired_read_error: HiveStateError | None = None
+    reacquired_write_error: HiveStateError | None = None
+    try:
+        store.read_private_bytes(relative, max_bytes=64)
+    except HiveStateError as exc:
+        reacquired_read_error = exc
+    try:
+        store.replace_private_bytes(relative, b"replacement")
+    except HiveStateError as exc:
+        reacquired_write_error = exc
+
+    assert str(reacquired_read_error) == "state_root_untrusted"
+    assert str(reacquired_write_error) == "state_root_untrusted"
+    assert (displaced_root / "resources" / "snapshot.bin").read_bytes() == b"old"
+    assert replacement_path.read_bytes() == b"new"
