@@ -224,6 +224,8 @@ class SystemdUserCommandRunner(Protocol):
 class CgroupSystemAdapter(Protocol):
     def read_bounded_cgroup_bytes(self, path: Path, *, max_bytes: int) -> bytes: ...
 
+    def read_optional_cpu_topology_bytes(self, path: Path, *, max_bytes: int) -> bytes | None: ...
+
     def inspect_preflight(self) -> CgroupPreflightV1: ...
 
     def start_held_scope(
@@ -286,7 +288,9 @@ def _bind_directory(path: Path) -> _BoundDirectory:
         raise CgroupPreflightError("cgroup_preflight_failed") from exc
 
 
-def _read_bounded_under(bound: _BoundDirectory, path: Path, *, max_bytes: int) -> bytes:
+def _read_bounded_under(
+    bound: _BoundDirectory, path: Path, *, max_bytes: int, allow_missing_leaf: bool = False
+) -> bytes | None:
     if type(max_bytes) is not int or not 0 < max_bytes <= MAX_CGROUP_READ_BYTES:
         _fail()
     if not hasattr(os, "O_NOFOLLOW"):
@@ -312,7 +316,12 @@ def _read_bounded_under(bound: _BoundDirectory, path: Path, *, max_bytes: int) -
             descriptors.append(child)
             if not stat.S_ISDIR(os.fstat(child).st_mode):
                 _fail()
-        descriptor = os.open(parts[-1], file_flags, dir_fd=descriptors[-1])
+        try:
+            descriptor = os.open(parts[-1], file_flags, dir_fd=descriptors[-1])
+        except FileNotFoundError:
+            if allow_missing_leaf:
+                return None
+            raise
         descriptors.append(descriptor)
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
@@ -517,11 +526,14 @@ class SystemdUserCgroupAdapter:
         else:
             canonical = _canonical_control_group(f"/{control_group}")
             candidate = self._cgroup_root.path / canonical / name
-        return _read_bounded_under(
+        payload = _read_bounded_under(
             self._cgroup_root,
             candidate,
             max_bytes=MAX_CGROUP_READ_BYTES,
         )
+        if payload is None:
+            _fail()
+        return payload
 
     def read_bounded_cgroup_bytes(self, path: Path, *, max_bytes: int) -> bytes:
         candidate = Path(path)
@@ -532,8 +544,27 @@ class SystemdUserCgroupAdapter:
                 candidate.relative_to(CPU_TOPOLOGY_ROOT)
             except ValueError:
                 _fail()
-            return _read_bounded_under(_bind_directory(CPU_TOPOLOGY_ROOT), candidate, max_bytes=max_bytes)
-        return _read_bounded_under(self._cgroup_root, candidate, max_bytes=max_bytes)
+            payload = _read_bounded_under(
+                _bind_directory(CPU_TOPOLOGY_ROOT), candidate, max_bytes=max_bytes
+            )
+        else:
+            payload = _read_bounded_under(self._cgroup_root, candidate, max_bytes=max_bytes)
+        if payload is None:
+            _fail()
+        return payload
+
+    def read_optional_cpu_topology_bytes(self, path: Path, *, max_bytes: int) -> bytes | None:
+        candidate = Path(path)
+        try:
+            candidate.relative_to(CPU_TOPOLOGY_ROOT)
+        except ValueError:
+            _fail()
+        return _read_bounded_under(
+            _bind_directory(CPU_TOPOLOGY_ROOT),
+            candidate,
+            max_bytes=max_bytes,
+            allow_missing_leaf=True,
+        )
 
     def _target_slice_control_group(self, *, allow_missing: bool = False) -> str | None:
         result = self._run(
@@ -553,6 +584,10 @@ class SystemdUserCgroupAdapter:
         line = _read_single_line(result.stdout)
         key, separator, value = line.partition("=")
         if key != "ControlGroup" or not separator:
+            _fail()
+        if value == "":
+            if allow_missing:
+                return None
             _fail()
         return _canonical_control_group(value)
 
@@ -915,6 +950,28 @@ def _read_text(backend: CgroupSystemAdapter, path: Path) -> str:
     return text[:-1]
 
 
+def _read_optional_cpu_topology_text(
+    backend: CgroupSystemAdapter, path: Path
+) -> str | None:
+    try:
+        raw = backend.read_optional_cpu_topology_bytes(
+            path, max_bytes=MAX_CGROUP_READ_BYTES
+        )
+    except Exception as exc:
+        raise CgroupPreflightError("cgroup_preflight_failed") from exc
+    if raw is None:
+        return None
+    if type(raw) is not bytes or not 1 <= len(raw) <= MAX_CGROUP_READ_BYTES:
+        _fail()
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        _fail()
+    if not text.endswith("\n") or text.count("\n") != 1:
+        _fail()
+    return text[:-1]
+
+
 def _parse_decimal(value: str) -> int:
     if not value or not value.isascii() or not value.isdecimal() or (len(value) > 1 and value[0] == "0"):
         _fail()
@@ -956,20 +1013,33 @@ def parse_cpu_topology(backend: CgroupSystemAdapter) -> CpuTopologyV1:
     cpus = _parse_cpu_set(_read_text(backend, CPU_PRESENT_PATH))
     groups: dict[tuple[int, int], list[int]] = {}
     kinds: dict[tuple[int, int], str] = {}
+    present_kinds = 0
+    missing_kinds = 0
     for cpu in cpus:
         root = CPU_TOPOLOGY_ROOT / f"cpu{cpu}" / "topology"
         package = _parse_decimal(_read_text(backend, root / "physical_package_id"))
         core = _parse_decimal(_read_text(backend, root / "core_id"))
-        kind = _read_text(backend, root / "core_type")
-        if kind not in {"performance", "efficiency"}:
-            _fail()
+        kind = _read_optional_cpu_topology_text(backend, root / "core_type")
         key = package, core
-        prior = kinds.setdefault(key, kind)
-        if prior != kind:
-            _fail()
+        if kind is None:
+            missing_kinds += 1
+        else:
+            present_kinds += 1
+            if kind not in {"performance", "efficiency"}:
+                _fail()
+            prior = kinds.setdefault(key, kind)
+            if prior != kind:
+                _fail()
         groups.setdefault(key, []).append(cpu)
+    if present_kinds and missing_kinds:
+        _fail()
     physical_cores = tuple(tuple(cpus) for _key, cpus in sorted(groups.items()))
-    efficiency = tuple(cpu for key, cpus in sorted(groups.items()) if kinds[key] == "efficiency" for cpu in cpus)
+    efficiency = tuple(
+        cpu
+        for key, cpus in sorted(groups.items())
+        if kinds.get(key) == "efficiency"
+        for cpu in cpus
+    )
     return CpuTopologyV1(physical_cores=physical_cores, efficiency_cpus=efficiency)
 
 

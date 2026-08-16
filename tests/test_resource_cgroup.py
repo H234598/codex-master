@@ -49,6 +49,12 @@ class FakeCgroupAdapter:
             raise CgroupPreflightError("cgroup_preflight_failed")
         return self.documents[path]
 
+    def read_optional_cpu_topology_bytes(self, path: Path, *, max_bytes: int) -> bytes | None:
+        self.events.append(f"read-optional:{path}")
+        if max_bytes != 4096:
+            raise CgroupPreflightError("cgroup_preflight_failed")
+        return self.documents.get(path)
+
     def inspect_preflight(self) -> CgroupPreflightV1:
         self.events.append("inspect")
         if self.fail_at == "inspect":
@@ -130,6 +136,15 @@ def _topology_documents(*, present: bytes = b"0-11\n", malformed: bool = False) 
     return documents
 
 
+def _nonhybrid_topology_documents() -> dict[Path, bytes]:
+    documents = _topology_documents()
+    for cpu in range(12):
+        prefix = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+        del documents[prefix / "core_type"]
+        documents[prefix / "core_id"] = f"{cpu // 2 if cpu < 4 else cpu}\n".encode()
+    return documents
+
+
 def test_preflight_requires_unified_v2_and_cpu_cpuset_memory_pids_io_delegation() -> None:
     invalid = (
         {"unified_v2": False},
@@ -146,7 +161,62 @@ def test_resource_cgroup_is_the_only_sys_cpu_topology_cpuset_and_cgroup_parser_o
     topology = parse_cpu_topology(adapter)
 
     assert topology.efficiency_cpus == tuple(range(4, 12))
-    assert all(event.startswith("read:/sys/devices/system/cpu/") for event in adapter.events)
+    assert all(event.split(":", 1)[-1].startswith("/sys/devices/system/cpu/") for event in adapter.events)
+
+
+def test_topology_uses_nonhybrid_route_only_when_every_core_type_leaf_is_cleanly_missing() -> None:
+    documents = _nonhybrid_topology_documents()
+    topology = parse_cpu_topology(FakeCgroupAdapter(documents=documents))
+
+    assert topology == CpuTopologyV1(
+        physical_cores=((0, 1), (2, 3), (4,), (5,), (6,), (7,), (8,), (9,), (10,), (11,)),
+        efficiency_cpus=(),
+    )
+
+    documents[Path("/sys/devices/system/cpu/cpu0/topology/core_type")] = b"performance\n"
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        parse_cpu_topology(FakeCgroupAdapter(documents=documents))
+
+
+def test_topology_missing_core_type_does_not_hide_unreadable_malformed_or_symlink_leaf(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    malformed = _topology_documents()
+    malformed[Path("/sys/devices/system/cpu/cpu0/topology/core_type")] = b"unknown\n"
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        parse_cpu_topology(FakeCgroupAdapter(documents=malformed))
+
+    class _UnreadableCoreTypeAdapter(FakeCgroupAdapter):
+        def read_optional_cpu_topology_bytes(
+            self, path: Path, *, max_bytes: int
+        ) -> bytes | None:
+            if path.name == "core_type":
+                raise PermissionError("denied")
+            return super().read_optional_cpu_topology_bytes(path, max_bytes=max_bytes)
+
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        parse_cpu_topology(_UnreadableCoreTypeAdapter(documents=_nonhybrid_topology_documents()))
+
+    cgroup_root = tmp_path / "cgroup"
+    cpu_root = tmp_path / "cpu"
+    topology_root = cpu_root / "cpu0" / "topology"
+    cgroup_root.mkdir()
+    topology_root.mkdir(parents=True)
+    (cpu_root / "present").write_bytes(b"0\n")
+    (topology_root / "physical_package_id").write_bytes(b"0\n")
+    (topology_root / "core_id").write_bytes(b"0\n")
+    monkeypatch.setattr(resource_cgroup, "CGROUP_ROOT", cgroup_root)
+    monkeypatch.setattr(resource_cgroup, "CPU_TOPOLOGY_ROOT", cpu_root)
+    monkeypatch.setattr(resource_cgroup, "CPU_PRESENT_PATH", cpu_root / "present")
+    adapter = resource_cgroup.SystemdUserCgroupAdapter(runner=_FakeSystemdRunner())
+    assert parse_cpu_topology(adapter) == CpuTopologyV1(
+        physical_cores=((0,),), efficiency_cpus=()
+    )
+
+    (topology_root / "target").write_bytes(b"performance\n")
+    (topology_root / "core_type").symlink_to("target")
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        parse_cpu_topology(adapter)
 
 
 def test_preflight_rejects_missing_subtree_controller_or_effective_parent_cpuset() -> None:
@@ -746,6 +816,37 @@ def test_integration_precondition_classifier_skips_only_clean_absence_and_fails_
     monkeypatch.setattr(malformed_adapter, "_user_bus_socket_present", lambda: True)
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
         malformed_adapter.integration_precondition_reason()
+
+
+def test_empty_target_slice_control_group_is_missing_only_for_integration_classifier(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = _FakeSystemdRunner(target_slice_stdout=b"ControlGroup=\n")
+    adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
+    monkeypatch.setattr(adapter, "_user_bus_socket_present", lambda: True)
+
+    assert adapter.integration_precondition_reason() == "requires_target_slice"
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        adapter.inspect_preflight()
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    (
+        b"ControlGroup\n",
+        b"Other=\n",
+        b"ControlGroup=/user.slice/codex-master.slice\nUnexpected=value\n",
+    ),
+)
+def test_integration_precondition_rejects_malformed_target_slice_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stdout: bytes
+) -> None:
+    runner = _FakeSystemdRunner(target_slice_stdout=stdout)
+    adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
+    monkeypatch.setattr(adapter, "_user_bus_socket_present", lambda: True)
+
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        adapter.integration_precondition_reason()
 
 
 def test_systemd_adapter_denies_collision_timeout_overflow_and_path_traversal_before_release(
