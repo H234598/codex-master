@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 import pytest
 
 from codex_master.hive import state as hive_state_module
+from codex_master import resource_monitor as resource_monitor_module
 from codex_master.hive.state import HiveStateStore
 from codex_master.resource_monitor import (
     ResourceClocks,
@@ -33,6 +34,7 @@ from codex_master.resource_monitor import (
     classify_trend,
     collect_resource_sample,
     parse_snapshot_document,
+    read_resource_gate_facts,
     read_resource_snapshot,
     read_thermal_policy,
     resolve_thermal_policy,
@@ -153,6 +155,22 @@ class ResourceMonitorTests(unittest.TestCase):
             now_utc=NOW,
             expected_boot_id=BOOT_ID,
         )
+
+    def test_current_boot_id_reader_uses_fixed_backend_path_once_without_sensors(self) -> None:
+        paths = resource_paths()
+        backend = FakeResourceBackend(
+            {paths.boot_id: (BOOT_ID + "\n").encode("ascii")},
+            RuntimeError("sensors must not run"),
+        )
+
+        result = resource_monitor_module.read_current_resource_boot_id(
+            backend=backend,
+            paths=paths,
+        )
+
+        self.assertEqual(result, BOOT_ID)
+        self.assertEqual(backend.reads, [(paths.boot_id, 128)])
+        self.assertEqual(backend.sensor_calls, [])
 
     def test_snapshot_rejects_unknown_schema_generation_zero_nonfinite_bool_and_unknown_fields(self) -> None:
         invalid_payloads: list[dict[str, object]] = []
@@ -648,6 +666,27 @@ def test_resource_document_reader_reads_one_document_once_and_never_mixes_genera
     snapshot = read_resource_snapshot(store, now_utc=NOW, expected_boot_id=BOOT_ID)
 
     assert snapshot.generation == 7
+    assert store.reads == [SNAPSHOT_PATH]
+
+
+def test_resource_gate_facts_reader_reads_one_validated_snapshot_once(tmp_path: Path) -> None:
+    class CountingStore(HiveStateStore):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.reads: list[PurePosixPath] = []
+
+        def read_private_bytes(self, relative: PurePosixPath, *, max_bytes: int) -> bytes:
+            self.reads.append(relative)
+            return super().read_private_bytes(relative, max_bytes=max_bytes)
+
+    store = CountingStore(tmp_path / "state")
+    snapshot = _snapshot()
+    write_resource_snapshot(store, snapshot)
+    store.reads.clear()
+
+    facts = read_resource_gate_facts(store, now_utc=NOW, expected_boot_id=BOOT_ID)
+
+    assert facts == build_resource_gate_facts(snapshot)
     assert store.reads == [SNAPSHOT_PATH]
 
 

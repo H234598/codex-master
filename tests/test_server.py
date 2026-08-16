@@ -23,8 +23,12 @@ from unittest.mock import Mock, patch
 import codex_master.server as server_module
 from codex_master import __version__
 from codex_master.hive.types import TaskComplexity
+from codex_master.hive.state import HiveStateStore
+from codex_master.resource_cgroup import CgroupPreflightV1, CgroupProfileV1, PreparedAgentScope
+from codex_master.resource_monitor import LegacyPressureV1, ResourceGateFacts
 from codex_master.selection.task_classification import TaskClassificationRequest, TaskClassifier
 from codex_master.usage_snapshot import UsageSnapshot
+
 
 from codex_master.server import (
     AgentError,
@@ -203,6 +207,20 @@ from codex_master.server import (
     watchdog_output_changed_since_marker,
     system_resource_snapshot,
 )
+
+
+def fake_g5_start_scope_for_test(session: str) -> tuple[Any, PreparedAgentScope]:
+    return (
+        SimpleNamespace(monotonic_ns=lambda: 0, cgroup_adapter=None),
+        PreparedAgentScope(
+            unit_name="g5-test.scope",
+            socket_name="g5-0123456789abcdef0123",
+            session_name=session,
+            control_group="/user.slice/g5-test.scope",
+            gate_pid=1,
+            challenge="a" * 64,
+        ),
+    )
 
 
 def complex_task_profile():
@@ -771,6 +789,1257 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["allowed"])
         self.assertEqual(result["available_slots"], 8)
 
+    def test_g5_offer_reads_one_injected_fresh_facts_snapshot(self) -> None:
+        class FakeCgroupAdapter:
+            def inspect_preflight(self) -> CgroupPreflightV1:
+                return CgroupPreflightV1(
+                    unified_v2=True,
+                    controllers=frozenset({"cpu", "cpuset", "memory", "pids", "io"}),
+                    subtree_controllers=frozenset({"cpu", "cpuset", "memory", "pids", "io"}),
+                    parent_effective_cpuset=(0, 1),
+                    io_physical_isolation_proven=False,
+                )
+
+        facts = ResourceGateFacts(
+            generation=7,
+            observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+            observed_monotonic_ns=1,
+            gate_state="ready",
+            reason_codes=(),
+            current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
+            available_memory_mib=8192,
+            legacy_pressure=LegacyPressureV1(
+                load_per_cpu=0.25,
+                cpu_busy_percent=25.0,
+                io_wait_percent=0.0,
+                available_memory_percent=50.0,
+            ),
+            normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
+            normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
+            bottleneck="unknown",
+            cgroup_state="unavailable",
+            thermal_state="ready",
+        )
+        profile = CgroupProfileV1(
+            cpuset_cpus=(0, 1),
+            cpu_quota_percent=750,
+            cpu_weight=50,
+            memory_high_bytes=8 * 1024**3,
+            memory_max_bytes=9 * 1024**3,
+            memory_swap_max_bytes=8 * 1024**3,
+            io_weight=50,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = server_module.ResourceGateRuntime(
+                state=HiveStateStore(Path(directory)),
+                expected_boot_id="123e4567-e89b-12d3-a456-426614174000",
+                now_utc=lambda: datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+                monotonic_ns=lambda: 0,
+                cgroup_profile=profile,
+                cgroup_adapter=FakeCgroupAdapter(),
+                h2_ready=True,
+            )
+            with patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0), server_module._resource_gate_runtime_scope(runtime), patch(
+                "codex_master.server.read_resource_gate_facts", return_value=facts
+            ) as read_facts, patch("codex_master.server._total_running_agent_count", return_value=2):
+                result = agent_spawn_offers()
+            with patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0), server_module._resource_gate_runtime_scope(runtime), patch(
+                "codex_master.server.read_resource_gate_facts", return_value=facts
+            ) as denied_read_facts, patch("codex_master.server._total_running_agent_count", return_value=10):
+                denied = agent_spawn_offers()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["offers"], [{"route": "mcp_host"}])
+        self.assertEqual(result["reason_codes"], [])
+        read_facts.assert_called_once_with(
+            runtime.state,
+            now_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+            expected_boot_id="123e4567-e89b-12d3-a456-426614174000",
+        )
+        denied_read_facts.assert_called_once_with(
+            runtime.state,
+            now_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+            expected_boot_id="123e4567-e89b-12d3-a456-426614174000",
+        )
+        self.assertFalse(denied["ok"])
+        self.assertEqual(denied["offers"], [])
+        self.assertEqual(denied["reason_codes"], ["running_agent_limit"])
+
+    def test_resource_gate_snapshot_denies_blocked_facts_without_recognized_reason(self) -> None:
+        def facts(*, gate_state: str, reason_codes: tuple[str, ...]) -> ResourceGateFacts:
+            return ResourceGateFacts(
+                generation=7,
+                observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+                observed_monotonic_ns=1,
+                gate_state=gate_state,
+                reason_codes=reason_codes,
+                current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
+                available_memory_mib=8192,
+                legacy_pressure=LegacyPressureV1(
+                    load_per_cpu=0.25,
+                    cpu_busy_percent=25.0,
+                    io_wait_percent=0.0,
+                    available_memory_percent=50.0,
+                ),
+                normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
+                normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
+                bottleneck="unknown",
+                cgroup_state="unavailable",
+                thermal_state="ready",
+            )
+
+        cases = (
+            ("blocked_empty", facts(gate_state="blocked", reason_codes=()), False, ["resource_snapshot_invalid"]),
+            ("blocked_unknown", facts(gate_state="blocked", reason_codes=("unknown_reason",)), False, ["resource_snapshot_invalid"]),
+            ("blocked_filtered", facts(gate_state="blocked", reason_codes=("cgroup_preflight_failed",)), False, ["resource_snapshot_invalid"]),
+            ("blocked_known", facts(gate_state="blocked", reason_codes=("cpu_pressure_high",)), False, ["cpu_pressure_high"]),
+            ("ready_unknown", facts(gate_state="ready", reason_codes=("unknown_reason",)), True, []),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = server_module.ResourceGateRuntime(
+                state=HiveStateStore(Path(directory)),
+                expected_boot_id="123e4567-e89b-12d3-a456-426614174000",
+                now_utc=lambda: datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+                monotonic_ns=lambda: 0,
+                cgroup_profile=None,
+                cgroup_adapter=None,
+            )
+            for name, gate_facts, expected_ok, expected_reasons in cases:
+                with self.subTest(name=name), server_module._resource_gate_runtime_scope(runtime), patch(
+                    "codex_master.server.read_resource_gate_facts", return_value=gate_facts
+                ):
+                    result = server_module._resource_gate_snapshot(running_agents_override=2)
+
+                self.assertEqual(result["ok"], expected_ok)
+                self.assertEqual(result["reason_codes"], expected_reasons)
+                self.assertEqual(result["raw_output"], "not_returned")
+
+    def test_g5_product_composer_reads_one_authorized_hive_state_facts_snapshot_for_offer(self) -> None:
+        facts = ResourceGateFacts(
+            generation=7,
+            observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+            observed_monotonic_ns=1,
+            gate_state="ready",
+            reason_codes=(),
+            current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
+            available_memory_mib=8192,
+            legacy_pressure=LegacyPressureV1(
+                load_per_cpu=0.25,
+                cpu_busy_percent=25.0,
+                io_wait_percent=0.0,
+                available_memory_percent=50.0,
+            ),
+            normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
+            normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
+            bottleneck="unknown",
+            cgroup_state="unavailable",
+            thermal_state="ready",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state = HiveStateStore(Path(directory))
+            hive_runtime = SimpleNamespace(state=state)
+            with patch.object(server_module, "build_current_hive_runtime", return_value=hive_runtime) as build_runtime, patch(
+                "codex_master.server.read_current_resource_boot_id",
+                return_value="123e4567-e89b-12d3-a456-426614174000",
+            ), patch(
+                "codex_master.server.read_resource_gate_facts", return_value=facts
+            ) as read_facts, patch(
+                "codex_master.server._total_running_agent_count", return_value=1
+            ), patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0):
+                result = agent_spawn_offers()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason_codes"], ["cgroup_preflight_failed"])
+        build_runtime.assert_called_once_with(repository_roots={}, materialize_principals=False)
+        read_facts.assert_called_once()
+        self.assertIs(read_facts.call_args.args[0], state)
+
+    def test_g5_direct_pressure_decision_composes_one_authorized_hive_state_facts_snapshot(self) -> None:
+        facts = ResourceGateFacts(
+            generation=7,
+            observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+            observed_monotonic_ns=1,
+            gate_state="ready",
+            reason_codes=(),
+            current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
+            available_memory_mib=8192,
+            legacy_pressure=LegacyPressureV1(
+                load_per_cpu=0.25,
+                cpu_busy_percent=25.0,
+                io_wait_percent=0.0,
+                available_memory_percent=50.0,
+            ),
+            normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
+            normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
+            bottleneck="unknown",
+            cgroup_state="unavailable",
+            thermal_state="ready",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state = HiveStateStore(Path(directory))
+            with patch.object(
+                server_module, "build_current_hive_runtime", return_value=SimpleNamespace(state=state)
+            ) as build_runtime, patch(
+                "codex_master.server.read_current_resource_boot_id",
+                return_value="123e4567-e89b-12d3-a456-426614174000",
+            ), patch(
+                "codex_master.server.read_resource_gate_facts", return_value=facts
+            ) as read_facts, patch(
+                "codex_master.server._total_running_agent_count", return_value=1
+            ), patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0):
+                result = spawn_admission_decision()
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason_codes"], ["cgroup_preflight_failed"])
+        build_runtime.assert_called_once_with(repository_roots={}, materialize_principals=False)
+        read_facts.assert_called_once()
+        self.assertIs(read_facts.call_args.args[0], state)
+
+    def test_g5_ollama_status_composes_one_product_facts_snapshot(self) -> None:
+        """Removing the central status decision must deny before cgroup preflight."""
+        facts = ResourceGateFacts(
+            generation=7,
+            observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+            observed_monotonic_ns=1,
+            gate_state="ready",
+            reason_codes=(),
+            current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
+            available_memory_mib=8192,
+            legacy_pressure=LegacyPressureV1(0.25, 25.0, 0.0, 50.0),
+            normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
+            normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
+            bottleneck="unknown",
+            cgroup_state="unavailable",
+            thermal_state="ready",
+        )
+        descriptor = server_module.AgentDescriptor(
+            agent_id="o1",
+            series_prefix="o",
+            ordinal=1,
+            label="Ollama One",
+            runner=server_module.RunnerKind.CODEX_CLI,
+            provider=server_module.Provider.OLLAMA_LOCAL,
+            model="local-model",
+            account_id=None,
+            home=Path("/synthetic/o1"),
+            session="ollama-one",
+            enabled=True,
+            task_profile="simple_only",
+        )
+        inventory = server_module.InventorySnapshot(
+            ("o1",), {"o1": descriptor}, {"o-series": ("o1",)}, {"o1": 0}, ("o",)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            state = HiveStateStore(Path(directory))
+            with patch.object(
+                server_module, "build_current_hive_runtime", return_value=SimpleNamespace(state=state)
+            ) as build_runtime, patch(
+                "codex_master.server.read_current_resource_boot_id",
+                return_value="123e4567-e89b-12d3-a456-426614174000",
+            ), patch(
+                "codex_master.server.read_resource_gate_facts", return_value=facts
+            ) as read_facts, patch(
+                "codex_master.server.current_agent_inventory", return_value=inventory
+            ), patch(
+                "codex_master.server.effective_observation_inventory", return_value=(inventory, True)
+            ), patch(
+                "codex_master.server._total_running_agent_count", return_value=1
+            ), patch("codex_master.server.tmux_alive", return_value=False), patch.object(
+                server_module, "_SPAWN_WARMUP_UNTIL_NS", 0
+            ):
+                result = server_module.ollama_resource_status("o1", task="read one file")
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason_codes"], ["cgroup_preflight_failed"])
+        build_runtime.assert_called_once_with(repository_roots={}, materialize_principals=False)
+        read_facts.assert_called_once()
+        self.assertIs(read_facts.call_args.args[0], state)
+
+    def test_g5_mcp_start_and_assignment_routes_keep_composer_scope(self) -> None:
+        """Removing either MCP scope must leave its unlocked product route uncomposed."""
+        events: list[str] = []
+
+        @contextlib.contextmanager
+        def composer() -> Any:
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+        def lifecycle(_agent: str, fn: Any, **_kwargs: Any) -> dict[str, Any]:
+            return fn()
+
+        with patch("codex_master.server.agent_ids", return_value=("o1",)), patch(
+            "codex_master.server.require_broad_mutation_confirmation", return_value={"allowed": True}
+        ), patch("codex_master.server.call_agent_lifecycle", side_effect=lifecycle), patch(
+            "codex_master.server._start_agent_with_lease_unlocked", return_value={"status": "started"}
+        ), patch("codex_master.server._resource_gate_composer_scope", side_effect=composer):
+            start_result = call_tool("agent_start", {"agent": "o1"})
+
+        self.assertEqual(start_result["results"][0]["status"], "started")
+        self.assertEqual(events, ["enter", "exit"])
+
+        assignment_args = {
+            "agent_assign": {"agent": "o1", "role": "arbeitsbiene", "task": "fix", "scope": ["src"], "write_paths": ["src/x.py"]},
+            "agent_assign_readonly": {"agent": "o1", "task": "read", "scope": ["src"]},
+            "agent_assign_live_data": {"agent": "o1", "task": "read", "scope": ["src"], "live_data_topic": "weather"},
+            "agent_assign_write": {"agent": "o1", "task": "fix", "scope": ["src"], "write_paths": ["src/x.py"]},
+        }
+        for tool_name, tool_args in assignment_args.items():
+            with self.subTest(tool_name=tool_name):
+                events.clear()
+                with patch("codex_master.server.single_agent_id", return_value="o1"), patch(
+                    "codex_master.server._headless_descriptor", return_value=None
+                ), patch("codex_master.server._ollama_descriptor", return_value=SimpleNamespace()), patch(
+                    "codex_master.server.call_agent_lifecycle", side_effect=lifecycle
+                ), patch("codex_master.server._assign_agent_unlocked", return_value={"status": "assigned"}), patch(
+                    "codex_master.server._resource_gate_composer_scope", side_effect=composer
+                ):
+                    assign_result = call_tool(tool_name, tool_args)
+
+                self.assertEqual(assign_result["status"], "assigned")
+                self.assertEqual(events, ["enter", "exit"])
+
+    def test_g5_direct_assign_and_applet_start_keep_composer_scope(self) -> None:
+        """Removing either direct product scope must bypass the shared G5 composer."""
+        events: list[str] = []
+
+        @contextlib.contextmanager
+        def composer() -> Any:
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+        descriptor = SimpleNamespace(provider=server_module.Provider.OLLAMA_LOCAL)
+        with patch("codex_master.server.require_fleet_recovery_ready"), patch(
+            "codex_master.server.canonical_agent_id", return_value="o1"
+        ), patch("codex_master.server._headless_descriptor", return_value=None), patch(
+            "codex_master.server._ollama_descriptor", return_value=descriptor
+        ), patch("codex_master.server.agent_lifecycle_lock", return_value=contextlib.nullcontext()), patch(
+            "codex_master.server._assign_agent_unlocked", return_value={"status": "assigned"}
+        ), patch("codex_master.server._resource_gate_composer_scope", side_effect=composer):
+            result = assign_agent("o1", role="arbeitsbiene", task="fix", scope=["src"], write_paths=["src/x.py"])
+
+        self.assertEqual(result["status"], "assigned")
+        self.assertEqual(events, ["enter", "exit"])
+
+        events.clear()
+        row = {
+            "agent": "o1", "activity_state": "sleeping", "backend_state": "ok", "control_state": "ready",
+            "auth_state": "ready", "identity_state": "stopped", "lease_state": "unclaimed",
+        }
+        usage = {"state": "clear", "blocked": False, "blocked_until_utc": None}
+        admission = {"allowed": True, "available_slots": 2, "reason_codes": []}
+        with patch("codex_master.server.normalize_applet_agents", return_value=["o1"]):
+            token = server_module.issue_applet_action_token(
+                "start", "o1", server_module.applet_action_state(row, usage, admission), b"k" * 32
+            )
+        with patch("codex_master.server.normalize_applet_agents", return_value=["o1"]), patch(
+            "codex_master.server.current_agent_inventory", return_value=SimpleNamespace(agents={"o1": object()})
+        ), patch(
+            "codex_master.server.agent_lifecycle_lock", return_value=contextlib.nullcontext()
+        ), patch(
+            "codex_master.server.read_applet_action_key", return_value=b"k" * 32
+        ), patch("codex_master.server.applet_agent_observation", return_value=row), patch(
+            "codex_master.server.codex_usage_watchdog_status", return_value=usage
+        ), patch(
+            "codex_master.server.spawn_admission_decision",
+            side_effect=AssertionError("applet start must not preview resource facts"),
+        ), patch(
+            "codex_master.server.read_meta", return_value={}
+        ), patch("codex_master.server._start_agent_with_lease_unlocked", return_value={"status": "started"}), patch(
+            "codex_master.server._resource_gate_composer_scope", side_effect=composer
+        ):
+            applet_result = server_module.applet_action("start", "o1", token)
+
+        self.assertEqual(applet_result["state"], "running")
+        self.assertEqual(events, ["enter", "exit"])
+
+    def test_g5_product_start_reads_facts_then_denies_missing_h2_before_tmux(self) -> None:
+        facts = ResourceGateFacts(
+            generation=7,
+            observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+            observed_monotonic_ns=1,
+            gate_state="ready",
+            reason_codes=(),
+            current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
+            available_memory_mib=8192,
+            legacy_pressure=LegacyPressureV1(
+                load_per_cpu=0.25,
+                cpu_busy_percent=25.0,
+                io_wait_percent=0.0,
+                available_memory_percent=50.0,
+            ),
+            normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
+            normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
+            bottleneck="unknown",
+            cgroup_state="unavailable",
+            thermal_state="ready",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = root / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(0o700)
+            state = HiveStateStore(root / "hive")
+            config = {"label": "A", "runner": runner, "home": root / "home", "session": "g5session"}
+            with patch.dict("codex_master.server.AGENTS", {"a": config}, clear=True), patch.object(
+                server_module, "build_current_hive_runtime", return_value=SimpleNamespace(state=state)
+            ), patch(
+                "codex_master.server.read_current_resource_boot_id",
+                return_value="123e4567-e89b-12d3-a456-426614174000",
+            ), patch(
+                "codex_master.server.read_resource_gate_facts", return_value=facts
+            ) as read_facts, patch(
+                "codex_master.server._total_running_agent_count", return_value=0
+            ), patch(
+                "codex_master.server.require_fleet_recovery_ready"
+            ), patch(
+                "codex_master.server.ensure_state"
+            ), patch(
+                "codex_master.server.agent_lifecycle_lock", return_value=contextlib.nullcontext()
+            ), patch(
+                "codex_master.server.spawn_admission_lock", return_value=contextlib.nullcontext()
+            ), patch(
+                "codex_master.server.tmux_alive", return_value=False
+            ), patch(
+                "codex_master.server.run_tmux"
+            ) as run_tmux:
+                with self.assertRaises(AgentCapacityError) as raised:
+                    start_agent("a", cwd=directory)
+
+        self.assertEqual(raised.exception.payload["reason_codes"], ["cgroup_preflight_failed"])
+        read_facts.assert_called_once()
+        self.assertIs(read_facts.call_args.args[0], state)
+        run_tmux.assert_not_called()
+
+    def test_g5_missing_typed_cgroup_injection_denies_after_facts_without_host_fallback(self) -> None:
+        snapshot = {
+            "ok": True,
+            "_g5_facts": True,
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
+            "io_psi_percent": 0.0,
+            "available_memory_percent": 50.0,
+            "available_memory_mib": 1024,
+            "running_agents": 1,
+            "reason_codes": [],
+        }
+        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+            result = spawn_admission_decision()
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason_codes"], ["cgroup_preflight_failed"])
+
+    def test_g5_pressure_disabled_resume_skips_cgroup_and_warmup_but_keeps_cap(self) -> None:
+        free_slots = {
+            "ok": True,
+            "_g5_facts": True,
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
+            "io_psi_percent": 0.0,
+            "available_memory_percent": 50.0,
+            "available_memory_mib": 1024,
+            "running_agents": 9,
+            "reason_codes": [],
+        }
+        at_cap = {**free_slots, "running_agents": 10}
+        previous = server_module._SPAWN_WARMUP_UNTIL_NS
+        try:
+            server_module._SPAWN_WARMUP_UNTIL_NS = 1
+            with patch("codex_master.server.system_resource_snapshot", return_value=free_slots):
+                resumed = spawn_admission_decision(enforce_pressure=False)
+            with patch("codex_master.server.system_resource_snapshot", return_value=at_cap):
+                capped = spawn_admission_decision(enforce_pressure=False)
+        finally:
+            server_module._SPAWN_WARMUP_UNTIL_NS = previous
+
+        self.assertTrue(resumed["allowed"])
+        self.assertEqual(resumed["reason_codes"], [])
+        self.assertFalse(capped["allowed"])
+        self.assertEqual(capped["reason_codes"], ["running_agent_limit"])
+
+    def test_replacement_reservation_counts_once_but_final_admission_still_applies(self) -> None:
+        snapshot = {
+            "ok": True,
+            "_g5_facts": True,
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
+            "io_psi_percent": 0.0,
+            "available_memory_percent": 50.0,
+            "available_memory_mib": 1024,
+            "running_agents": 10,
+            "reason_codes": [],
+        }
+
+        without_reservation = server_module._resource_admission_decision(
+            snapshot=snapshot,
+            enforce_pressure=False,
+        )
+        with_reservation = server_module._resource_admission_decision(
+            snapshot=snapshot,
+            enforce_pressure=False,
+            reserved_slots=1,
+        )
+
+        self.assertEqual(without_reservation["reason_codes"], ["running_agent_limit"])
+        self.assertTrue(with_reservation["allowed"])
+        self.assertEqual(with_reservation["available_slots"], 1)
+
+    def test_g5_replacement_without_runtime_denies_before_tmux(self) -> None:
+        process_summary = {
+            "process_count": 0,
+            "external_process_count": 0,
+            "managed_process_count": 0,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = root / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            state = root / "state"
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": root, "session": "g5session"}},
+                clear=False,
+            ), patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
+                "codex_master.server.tmux_alive", return_value=False
+            ), patch(
+                "codex_master.server.require_managed_replacement_reservation",
+                return_value={"allowed": True, "reservation_id": "r", "managed_session": "g5session"},
+            ), patch(
+                "codex_master.server.agent_home_process_summary", return_value=process_summary
+            ), patch(
+                "codex_master.server._total_running_agent_count", return_value=10
+            ), patch(
+                "codex_master.server.run_tmux",
+                return_value=subprocess.CompletedProcess(["tmux"], 0, "", ""),
+            ) as run_tmux:
+                with self.assertRaises(AgentCapacityError) as raised:
+                    start_agent("a", cwd=directory, replacement_reservation_id="r")
+
+        self.assertEqual(raised.exception.payload["reason_codes"], ["resource_snapshot_invalid"])
+        run_tmux.assert_not_called()
+
+    def test_private_g5_tmux_router_uses_validated_meta_socket_and_public_meta_redacts_it(self) -> None:
+        socket_name = "g5-0123456789abcdef0123"
+        descriptor = server_module.AgentDescriptor(
+            "r1", "r", 1, "Registry R1", server_module.RunnerKind.CODEX_CLI,
+            server_module.Provider.OPENAI_CHATGPT, DEFAULT_AGENT_MODEL, None,
+            Path("/home/r1"), "g5session", True, Path("/runner"),
+        )
+        inventory = server_module.InventorySnapshot(
+            ("r1",), {"r1": descriptor}, {"r-series": ("r1",)}, {"r1": 0}, ("r",)
+        )
+        with server_module.temporary_agent_inventory(inventory), patch(
+            "codex_master.server.read_meta",
+            return_value={"agent": "r1", "session": "g5session", "tmux_socket": socket_name},
+        ), patch(
+            "codex_master.server.run_tmux",
+            return_value=subprocess.CompletedProcess(["tmux"], 0, "", ""),
+        ) as run_tmux:
+            self.assertTrue(server_module.tmux_alive("g5session"))
+
+        self.assertEqual(run_tmux.call_args.args[0], ["-L", socket_name, "has-session", "-t", "g5session"])
+        self.assertEqual(
+            server_module.public_agent_meta({"agent": "r1", "session": "g5session", "tmux_socket": socket_name}),
+            {"agent": "r1", "session": "g5session"},
+        )
+
+    def test_private_tmux_router_denies_missing_or_ambiguous_inventory_session_before_default_command(self) -> None:
+        descriptor = server_module.AgentDescriptor(
+            "r1", "r", 1, "Registry R1", server_module.RunnerKind.CODEX_CLI,
+            server_module.Provider.OPENAI_CHATGPT, DEFAULT_AGENT_MODEL, None,
+            Path("/home/r1"), "g5session", True, Path("/runner"),
+        )
+        second = server_module.AgentDescriptor(
+            "r2", "r", 2, "Registry R2", server_module.RunnerKind.CODEX_CLI,
+            server_module.Provider.OPENAI_CHATGPT, DEFAULT_AGENT_MODEL, None,
+            Path("/home/r2"), "g5session", True, Path("/runner"),
+        )
+        inventories = (
+            server_module.InventorySnapshot(
+                ("r1",), {"r1": descriptor}, {"r-series": ("r1",)}, {"r1": 0}, ("r",)
+            ),
+            server_module.InventorySnapshot(
+                ("r1", "r2"),
+                {"r1": descriptor, "r2": second},
+                {"r-series": ("r1", "r2")},
+                {"r1": 0, "r2": 1},
+                ("r",),
+            ),
+        )
+        for inventory, session in ((inventories[0], "other-session"), (inventories[1], "g5session")):
+            with self.subTest(session=session), server_module.temporary_agent_inventory(inventory), patch(
+                "codex_master.server._run_bounded_command"
+            ) as run_command:
+                with self.assertRaisesRegex(AgentError, "private tmux routing metadata is invalid"):
+                    run_tmux(["has-session", "-t", session], check=False)
+            run_command.assert_not_called()
+
+    def test_observational_private_tmux_routes_project_unavailable_without_default_command(self) -> None:
+        def descriptor(agent: str, ordinal: int, session: str) -> server_module.AgentDescriptor:
+            return server_module.AgentDescriptor(
+                agent,
+                "r",
+                ordinal,
+                f"Registry {agent}",
+                server_module.RunnerKind.CODEX_CLI,
+                server_module.Provider.OPENAI_CHATGPT,
+                DEFAULT_AGENT_MODEL,
+                None,
+                Path(f"/home/{agent}"),
+                session,
+                True,
+                Path("/runner"),
+            )
+
+        active_descriptor = descriptor("r1", 1, "g5session")
+        active_inventory = server_module.InventorySnapshot(
+            ("r1",), {"r1": active_descriptor}, {"r-series": ("r1",)}, {"r1": 0}, ("r",)
+        )
+        missing_inventory = server_module.InventorySnapshot(
+            ("r1",), {"r1": descriptor("r1", 1, "other-session")}, {"r-series": ("r1",)}, {"r1": 0}, ("r",)
+        )
+        second_descriptor = descriptor("r2", 2, "g5session")
+        ambiguous_inventory = server_module.InventorySnapshot(
+            ("r1", "r2"),
+            {"r1": active_descriptor, "r2": second_descriptor},
+            {"r-series": ("r1", "r2")},
+            {"r1": 0, "r2": 1},
+            ("r",),
+        )
+        summary = {
+            "process_count": 0,
+            "managed_process_count": 0,
+            "external_process_count": 0,
+            "managed_process_ids": [],
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        }
+        for route_inventory in (missing_inventory, ambiguous_inventory):
+            with self.subTest(agent_ids=route_inventory.agent_ids), server_module.temporary_agent_inventory(
+                active_inventory
+            ), patch(
+                "codex_master.server.effective_observation_inventory", return_value=(route_inventory, True)
+            ), patch("codex_master.server.read_meta", return_value={}) as read_meta, patch(
+                "codex_master.server.agent_home_process_summary", return_value=summary
+            ), patch("codex_master.server.latest_assignment_summary", return_value=None), patch(
+                "codex_master.server.agent_auth_status", return_value={}
+            ), patch("codex_master.server.agent_lease_status", return_value={}), patch(
+                "codex_master.server.codex_usage_watchdog_status", return_value={}
+            ), patch("codex_master.server.agent_limit_state", return_value={"limited": False}), patch(
+                "codex_master.server.ensure_state"
+            ), patch(
+                "codex_master.server.ensure_agent_lease_available",
+                return_value={"state": "unclaimed", "raw_output": "not_returned"},
+            ), patch("codex_master.server.require_fleet_recovery_ready"), patch(
+                "codex_master.server._run_bounded_command"
+            ) as run_command:
+                status = server_module.status_agent("r1", initialize_state=False)
+                self.assertFalse(status["running"])
+                self.assertFalse(status["tmux_scan_available"])
+                self.assertEqual(status["response_state"]["state"], "tmux_routing_unavailable")
+                self.assertFalse(status["identity_guard"]["ok"])
+                self.assertEqual(status["identity_guard"]["state"], "tmux_routing_unavailable")
+
+                self.assertEqual(server_module.pane_tail("r1", 4), "")
+                read_meta.reset_mock()
+                tail = safe_tail("r1", lines=4, chars=64, source="pane")
+                self.assertEqual(tail["output"], "")
+                self.assertFalse(tail["tmux_scan_available"])
+                self.assertIsNone(tail["raw_log"])
+                read_meta.assert_not_called()
+
+                with self.assertRaisesRegex(AgentError, "private tmux routing metadata is invalid"):
+                    send_agent("r1", "hello")
+
+            run_command.assert_not_called()
+
+    def test_managed_inventory_counts_private_g5_session_without_default_socket_probe(self) -> None:
+        socket_name = "g5-0123456789abcdef0123"
+        descriptor = server_module.AgentDescriptor(
+            "r1", "r", 1, "Registry R1", server_module.RunnerKind.CODEX_CLI,
+            server_module.Provider.OPENAI_CHATGPT, DEFAULT_AGENT_MODEL, None,
+            Path("/home/r1"), "g5session", True, Path("/runner"),
+        )
+        snapshot = server_module.InventorySnapshot(
+            ("r1",), {"r1": descriptor}, {"r-series": ("r1",)}, {"r1": 0}, ("r",)
+        )
+        private_alive = subprocess.CompletedProcess(["tmux"], 0, "", "")
+        with server_module.temporary_agent_inventory(snapshot), patch(
+            "codex_master.server.read_meta",
+            return_value={"agent": "r1", "session": "g5session", "tmux_socket": socket_name},
+        ), patch(
+            "codex_master.server.run_tmux", side_effect=[private_alive]
+        ) as run_tmux:
+            sessions = server_module._managed_tmux_session_ids()
+
+        self.assertEqual(sessions, frozenset({"g5session"}))
+        self.assertEqual(run_tmux.call_args_list[0].args[0], ["-L", socket_name, "has-session", "-t", "g5session"])
+
+    def test_private_g5_tmux_router_routes_send_paste_and_buffer(self) -> None:
+        socket_name = "g5-0123456789abcdef0123"
+        completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
+        descriptor = server_module.AgentDescriptor(
+            "r1", "r", 1, "Registry R1", server_module.RunnerKind.CODEX_CLI,
+            server_module.Provider.OPENAI_CHATGPT, DEFAULT_AGENT_MODEL, None,
+            Path("/home/r1"), "g5session", True, Path("/runner"),
+        )
+        inventory = server_module.InventorySnapshot(
+            ("r1",), {"r1": descriptor}, {"r-series": ("r1",)}, {"r1": 0}, ("r",)
+        )
+        with server_module.temporary_agent_inventory(inventory), patch(
+            "codex_master.server.read_meta",
+            return_value={"agent": "r1", "session": "g5session", "tmux_socket": socket_name},
+        ), patch("codex_master.server.require_fleet_recovery_ready"), patch(
+            "codex_master.server.require_invocation_status"
+        ), patch(
+            "codex_master.server.agent_lifecycle_lock", return_value=contextlib.nullcontext()
+        ), patch("codex_master.server.tmux_alive", return_value=True), patch(
+            "codex_master.server.require_managed_tmux_session"
+        ), patch(
+            "codex_master.server.wait_agent_input_ready", return_value={"ready": True, "raw_output": "not_returned"}
+        ), patch(
+            "codex_master.server.run_tmux", return_value=completed
+        ) as run_tmux:
+            result = send_agent("r1", "hello")
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(len(run_tmux.call_args_list), 3)
+        for call in run_tmux.call_args_list:
+            self.assertEqual(call.args[0][:2], ["-L", socket_name])
+
+    def test_private_g5_post_start_lifecycle_never_uses_default_tmux(self) -> None:
+        socket_name = "g5-0123456789abcdef0123"
+        process_summary = {
+            "process_count": 1,
+            "external_process_count": 0,
+            "managed_process_count": 1,
+            "managed_process_ids": [123],
+            "managed_root_process_ids": [123],
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        }
+        stopped_summary = {**process_summary, "process_count": 0, "managed_process_count": 0, "managed_process_ids": []}
+        stopped = {"value": False}
+        fail_paste = {"value": False}
+
+        def fake_tmux(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(args[:2], ["-L", socket_name])
+            if "display-message" in args:
+                return subprocess.CompletedProcess(["tmux"], 0, "123\n", "")
+            if "capture-pane" in args:
+                return subprocess.CompletedProcess(["tmux"], 0, "", "")
+            if "paste-buffer" in args and fail_paste["value"]:
+                return subprocess.CompletedProcess(["tmux"], 1, "", "")
+            if "kill-session" in args:
+                stopped["value"] = True
+            return subprocess.CompletedProcess(["tmux"], 0, "", "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            meta_dir = state / "meta"
+            raw_dir = state / "raw"
+            meta_dir.mkdir(parents=True)
+            raw_dir.mkdir()
+            descriptor = server_module.AgentDescriptor(
+                "r1",
+                "r",
+                1,
+                "Registry R1",
+                server_module.RunnerKind.CODEX_CLI,
+                server_module.Provider.OLLAMA_LOCAL,
+                "local-model",
+                None,
+                root / "home",
+                "g5session",
+                True,
+                root / "codex",
+            )
+            inventory = server_module.InventorySnapshot(
+                ("r1",),
+                {"r1": descriptor},
+                {"r-series": ("r1",)},
+                {"r1": 0},
+                ("r",),
+            )
+            with server_module.temporary_agent_inventory(inventory), patch(
+                "codex_master.server.META_DIR", meta_dir
+            ), patch("codex_master.server.RAW_DIR", raw_dir), patch(
+                "codex_master.server.run_tmux", side_effect=fake_tmux
+            ) as run_tmux, patch(
+                "codex_master.server.ollama_resource_status",
+                return_value={"allowed": True, "reason_codes": [], "raw_output": "not_returned"},
+            ), patch(
+                "codex_master.server.agent_home_process_summary",
+                side_effect=lambda _agent: stopped_summary if stopped["value"] else process_summary,
+            ), patch(
+                "codex_master.server.latest_assignment_summary", return_value=None
+            ), patch(
+                "codex_master.server.agent_auth_status", return_value={"state": "not_applicable", "raw_output": "not_returned"}
+            ), patch(
+                "codex_master.server.agent_limit_state", return_value={"state": "ready", "raw_output": "not_returned"}
+            ), patch(
+                "codex_master.server.agent_response_state", return_value={"state": "running_idle", "raw_output": "not_returned"}
+            ), patch(
+                "codex_master.server.agent_lease_status", return_value={"state": "held", "held_by_this_server": True, "raw_output": "not_returned"}
+            ), patch("codex_master.server.ensure_agent_lease_available"), patch(
+                "codex_master.server.release_agent", return_value={"lease": {"state": "free", "raw_output": "not_returned"}}
+            ), patch(
+                "codex_master.server.require_invocation_status"
+            ), patch(
+                "codex_master.server.wait_agent_input_ready", return_value={"ready": True, "raw_output": "not_returned"}
+            ), patch(
+                "codex_master.server.agent_lifecycle_lock", return_value=contextlib.nullcontext()
+            ), patch("codex_master.server.require_managed_tmux_session"):
+                server_module.write_meta(
+                    "r1",
+                    {"agent": "r1", "session": "g5session", "tmux_socket": socket_name},
+                )
+                count = server_module._managed_tmux_session_count()
+                admission = server_module._resource_admission_decision(
+                    snapshot={"running_agents": 1},
+                    agent="r1",
+                    inventory=inventory,
+                    enforce_pressure=False,
+                )
+                alive = server_module.tmux_alive("g5session")
+                pid = server_module.pane_pid("g5session")
+                status = server_module.status_agent("r1", initialize_state=False)
+                sent = send_agent("r1", "hello")
+                fail_paste["value"] = True
+                with self.assertRaisesRegex(AgentError, "tmux paste-buffer failed"):
+                    send_agent("r1", "fail")
+                interrupted = interrupt_agent("r1", force=True)
+                stopped_result = stop_agent("r1")
+                raw_log = raw_dir / "failed.log"
+                raw_log.write_text("", encoding="utf-8")
+                server_module.cleanup_failed_start("g5session", raw_log, kill_session=True)
+
+        self.assertEqual(count, 1)
+        self.assertTrue(admission["allowed"])
+        self.assertEqual(admission["running_ollama_agents"], 1)
+        self.assertTrue(alive)
+        self.assertEqual(pid, 123)
+        self.assertTrue(status["running"])
+        self.assertEqual(status["pid"], 123)
+        self.assertEqual(sent["status"], "sent")
+        self.assertEqual(interrupted["status"], "interrupt_sent")
+        self.assertEqual(stopped_result["status"], "stopped")
+        self.assertFalse(raw_log.exists())
+        self.assertEqual(server_module.public_agent_meta({"agent": "r1", "session": "g5session", "tmux_socket": socket_name}), {"agent": "r1", "session": "g5session"})
+        self.assertGreaterEqual(run_tmux.call_count, 8)
+
+    def test_public_resource_gate_status_is_exact_reason_only_projection(self) -> None:
+        projected = server_module._public_resource_gate_status(
+            {
+                "allowed": False,
+                "reason_codes": ["memory_pressure_high"],
+                "resource_snapshot": {"available_memory_mib": 8192, "running_agents": 9},
+                "available_slots": 1,
+                "running_ollama_agents": 2,
+                "errors": [{"rule": "private"}],
+            }
+        )
+
+        self.assertEqual(
+            projected,
+            {
+                "allowed": False,
+                "reason_codes": ["memory_pressure_high"],
+                "raw_output": "not_returned",
+            },
+        )
+
+    def test_agent_status_mcp_dispatch_redacts_resource_gate_to_exact_allowlist(self) -> None:
+        process_summary = {
+            "process_count": 0,
+            "external_process_count": 0,
+            "managed_process_count": 0,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        }
+        sensitive_gate = {
+            "allowed": False,
+            "reason_codes": ["memory_pressure_high"],
+            "resource_snapshot": {"available_memory_mib": 8123, "socket": "g5-SECRET"},
+            "available_slots": 1,
+            "running_ollama_agents": 2,
+            "max_concurrent_ollama_agents": 2,
+            "errors": [{"rule": "private"}],
+        }
+        descriptor = SimpleNamespace(
+            provider=server_module.Provider.OLLAMA_LOCAL,
+            model="local-model",
+            task_profile="simple_only",
+        )
+        with patch.dict(
+            "codex_master.server.AGENTS",
+            {"a": {"label": "A", "runner": Path("/runner"), "home": Path("/home/a"), "session": "g5session"}},
+            clear=False,
+        ), patch("codex_master.server.agent_ids", return_value=["a"]), patch(
+            "codex_master.server._ollama_descriptor", return_value=descriptor
+        ), patch("codex_master.server.ollama_resource_status", return_value=sensitive_gate), patch(
+            "codex_master.server.read_meta", return_value={}
+        ), patch("codex_master.server.agent_home_process_summary", return_value=process_summary), patch(
+            "codex_master.server.tmux_alive", return_value=False
+        ), patch("codex_master.server.latest_assignment_summary", return_value=None), patch(
+            "codex_master.server.agent_auth_status", return_value={"state": "not_applicable", "raw_output": "not_returned"}
+        ), patch("codex_master.server.agent_limit_state", return_value={"state": "ready", "raw_output": "not_returned"}), patch(
+            "codex_master.server.agent_response_state", return_value={"state": "stopped", "raw_output": "not_returned"}
+        ), patch("codex_master.server.agent_lease_status", return_value={"state": "free", "raw_output": "not_returned"}):
+            response = handle_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 97,
+                    "method": "tools/call",
+                    "params": {"name": "agent_status", "arguments": {"agent": "a"}},
+                }
+            )
+
+        self.assertIsNotNone(response)
+        payload = json.loads(response["result"]["content"][0]["text"])["results"][0]
+        self.assertEqual(
+            payload["resource_gate"],
+            {
+                "allowed": False,
+                "reason_codes": ["memory_pressure_high"],
+                "raw_output": "not_returned",
+            },
+        )
+        self.assertNotIn("8123", json.dumps(payload, sort_keys=True))
+        self.assertNotIn("g5-SECRET", json.dumps(payload, sort_keys=True))
+
+    def test_g5_warmup_boundary_is_exactly_fifteen_monotonic_seconds(self) -> None:
+        snapshot = {
+            "ok": True,
+            "_g5_facts": True,
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
+            "io_psi_percent": 0.0,
+            "available_memory_percent": 50.0,
+            "available_memory_mib": 1024,
+            "running_agents": 1,
+            "reason_codes": [],
+        }
+        profile = CgroupProfileV1(
+            cpuset_cpus=(0,), cpu_quota_percent=750, cpu_weight=50,
+            memory_high_bytes=8 * 1024**3, memory_max_bytes=9 * 1024**3,
+            memory_swap_max_bytes=8 * 1024**3, io_weight=50,
+        )
+        preflight = CgroupPreflightV1(
+            unified_v2=True,
+            controllers=frozenset({"cpu", "cpuset", "memory", "pids", "io"}),
+            subtree_controllers=frozenset({"cpu", "cpuset", "memory", "pids", "io"}),
+            parent_effective_cpuset=(0,), io_physical_isolation_proven=False,
+        )
+        adapter = SimpleNamespace(inspect_preflight=lambda: preflight)
+        previous = server_module._SPAWN_WARMUP_UNTIL_NS
+        try:
+            server_module._SPAWN_WARMUP_UNTIL_NS = 115_000_000_000
+            with tempfile.TemporaryDirectory() as directory:
+                runtime = server_module.ResourceGateRuntime(
+                    state=HiveStateStore(Path(directory)),
+                    expected_boot_id="123e4567-e89b-12d3-a456-426614174000",
+                    now_utc=lambda: datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+                    monotonic_ns=lambda: 100_000_000_000,
+                    cgroup_profile=profile,
+                    cgroup_adapter=adapter,
+                    h2_ready=True,
+                )
+                with server_module._resource_gate_runtime_scope(runtime), patch(
+                    "codex_master.server.system_resource_snapshot", return_value=snapshot
+                ):
+                    blocked = spawn_admission_decision()
+                runtime_after = server_module.ResourceGateRuntime(
+                    state=runtime.state,
+                    expected_boot_id=runtime.expected_boot_id,
+                    now_utc=runtime.now_utc,
+                    monotonic_ns=lambda: 115_000_000_000,
+                    cgroup_profile=profile,
+                    cgroup_adapter=adapter,
+                    h2_ready=True,
+                )
+                with server_module._resource_gate_runtime_scope(runtime_after), patch(
+                    "codex_master.server.system_resource_snapshot", return_value=snapshot
+                ):
+                    allowed = spawn_admission_decision()
+        finally:
+            server_module._SPAWN_WARMUP_UNTIL_NS = previous
+
+        self.assertEqual(blocked["reason_codes"], ["spawn_warmup_active"])
+        self.assertTrue(allowed["allowed"])
+
+    def test_g5_replacement_reads_fresh_facts_once_then_confirms_scope_before_warmup(self) -> None:
+        class FakeCgroupAdapter:
+            def __init__(self) -> None:
+                self.events: list[str] = []
+                self.socket_name: str | None = None
+
+            def inspect_preflight(self) -> CgroupPreflightV1:
+                self.events.append("preflight")
+                return CgroupPreflightV1(
+                    unified_v2=True,
+                    controllers=frozenset({"cpu", "cpuset", "memory", "pids", "io"}),
+                    subtree_controllers=frozenset({"cpu", "cpuset", "memory", "pids", "io"}),
+                    parent_effective_cpuset=(0,),
+                    io_physical_isolation_proven=False,
+                )
+
+            def start_held_scope(self, *, profile: CgroupProfileV1, socket_name: str, session_name: str) -> PreparedAgentScope:
+                self.events.append("scope")
+                self.socket_name = socket_name
+                return PreparedAgentScope(
+                    unit_name="g5-test.scope",
+                    socket_name=socket_name,
+                    session_name=session_name,
+                    control_group="/user.slice/g5-test.scope",
+                    gate_pid=1,
+                    challenge="a" * 64,
+                )
+
+            def verify_scope(self, scope: PreparedAgentScope, profile: CgroupProfileV1) -> None:
+                self.events.append("scope_verified")
+
+            def release_scope(self, scope: PreparedAgentScope) -> int:
+                self.events.append("released")
+                return 2
+
+            def verify_tmux_membership_and_inheritance(self, scope: PreparedAgentScope, tmux_pid: int) -> None:
+                self.events.append("inheritance")
+
+            def cleanup_new_scope(self, scope: PreparedAgentScope) -> None:
+                self.events.append("cleanup")
+
+        facts = ResourceGateFacts(
+            generation=7,
+            observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+            observed_monotonic_ns=1,
+            gate_state="ready",
+            reason_codes=(),
+            current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
+            available_memory_mib=8192,
+            legacy_pressure=LegacyPressureV1(0.25, 25.0, 0.0, 50.0),
+            normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
+            normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
+            bottleneck="unknown",
+            cgroup_state="unavailable",
+            thermal_state="ready",
+        )
+        profile = CgroupProfileV1(
+            cpuset_cpus=(0,), cpu_quota_percent=750, cpu_weight=50,
+            memory_high_bytes=8 * 1024**3, memory_max_bytes=9 * 1024**3,
+            memory_swap_max_bytes=8 * 1024**3, io_weight=50,
+        )
+        adapter = FakeCgroupAdapter()
+        process_summary = {
+            "process_count": 0, "external_process_count": 0, "managed_process_count": 0,
+            "external_processes": [], "external_processes_truncated": False, "raw_output": "not_returned",
+        }
+        lock_state = {"held": False}
+
+        @contextlib.contextmanager
+        def tracked_spawn_lock() -> Any:
+            self.assertFalse(lock_state["held"])
+            lock_state["held"] = True
+            try:
+                yield
+            finally:
+                lock_state["held"] = False
+
+        def tracked_run_tmux(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if "pipe-pane" in args:
+                self.assertTrue(lock_state["held"])
+            return subprocess.CompletedProcess(["tmux"], 0, "", "")
+
+        write_meta_original = server_module.write_meta
+
+        def tracked_write_meta(agent: str, data: dict[str, Any]) -> None:
+            self.assertTrue(lock_state["held"])
+            write_meta_original(agent, data)
+
+        warmup_original = server_module._start_g5_warmup
+
+        def tracked_warmup(runtime: Any) -> None:
+            self.assertTrue(lock_state["held"])
+            warmup_original(runtime)
+
+        previous = server_module._SPAWN_WARMUP_UNTIL_NS
+        try:
+            server_module._SPAWN_WARMUP_UNTIL_NS = 0
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                runner = root / "codex"
+                runner.write_text("#!/bin/sh\n", encoding="utf-8")
+                runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+                state = root / "state"
+                runtime = server_module.ResourceGateRuntime(
+                    state=HiveStateStore(root / "hive-state"),
+                    expected_boot_id="123e4567-e89b-12d3-a456-426614174000",
+                    now_utc=lambda: datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+                    monotonic_ns=lambda: 100_000_000_000,
+                    cgroup_profile=profile,
+                    cgroup_adapter=adapter,
+                    h2_ready=True,
+                )
+                with server_module._resource_gate_runtime_scope(runtime), patch.dict(
+                    "codex_master.server.AGENTS",
+                    {"a": {"label": "A", "runner": runner, "home": root, "session": "g5session"}},
+                    clear=False,
+                ), patch("codex_master.server.STATE_ROOT", state), patch(
+                    "codex_master.server.RAW_DIR", state / "raw"
+                ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                    "codex_master.server.LOCK_DIR", state / "locks"
+                ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
+                    "codex_master.server.tmux_alive", return_value=False
+                ), patch("codex_master.server.agent_home_process_summary", return_value=process_summary), patch(
+                    "codex_master.server._total_running_agent_count", return_value=10
+                ), patch(
+                    "codex_master.server.require_managed_replacement_reservation",
+                    return_value={"allowed": True, "reservation_id": "r", "managed_session": "g5session"},
+                ), patch("codex_master.server.read_resource_gate_facts", return_value=facts) as read_facts, patch(
+                    "codex_master.server.agent_base_args", return_value=[]
+                ), patch(
+                    "codex_master.server.spawn_admission_lock", side_effect=tracked_spawn_lock
+                ), patch("codex_master.server.run_tmux", side_effect=tracked_run_tmux) as run_tmux, patch(
+                    "codex_master.server.write_meta", side_effect=tracked_write_meta
+                ), patch("codex_master.server._start_g5_warmup", side_effect=tracked_warmup), patch(
+                    "codex_master.server.pane_pid", return_value=3
+                ):
+                    result = start_agent("a", cwd=directory, replacement_reservation_id="r")
+                    warmup_until = server_module._SPAWN_WARMUP_UNTIL_NS
+        finally:
+            server_module._SPAWN_WARMUP_UNTIL_NS = previous
+
+        self.assertEqual(result["status"], "started")
+        self.assertEqual(read_facts.call_count, 1)
+        self.assertEqual(adapter.events, ["preflight", "preflight", "scope", "scope_verified", "released", "inheritance"])
+        self.assertEqual(warmup_until, 115_000_000_000)
+        self.assertEqual(
+            [
+                call.args[0][2]
+                for call in run_tmux.call_args_list
+                if call.args[0][:2] == ["-L", adapter.socket_name]
+            ],
+            ["send-keys", "pipe-pane"],
+        )
+
+    def test_second_g5_start_waits_for_private_publication_then_sees_warmup(self) -> None:
+        process_summary = {
+            "process_count": 0,
+            "external_process_count": 0,
+            "managed_process_count": 0,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        }
+        first_pipe_entered = threading.Event()
+        release_first_pipe = threading.Event()
+        second_called = threading.Event()
+        outcomes: dict[str, Any] = {}
+        admission_calls = 0
+        admission_lock = threading.Lock()
+        runtime = SimpleNamespace(monotonic_ns=lambda: 100_000_000_000, cgroup_adapter=None)
+
+        def fake_admission(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            nonlocal admission_calls
+            with admission_lock:
+                admission_calls += 1
+                call_number = admission_calls
+            if call_number == 1:
+                return {"allowed": True, "reason_codes": []}
+            self.assertGreater(server_module._SPAWN_WARMUP_UNTIL_NS, 0)
+            second_called.set()
+            raise AgentCapacityError(
+                "capacity unavailable",
+                {"reason_codes": ["spawn_warmup_active"], "raw_output": "not_returned"},
+            )
+
+        def fake_scope(session: str) -> tuple[Any, PreparedAgentScope]:
+            return runtime, PreparedAgentScope(
+                unit_name="g5-test.scope",
+                socket_name="g5-0123456789abcdef0123",
+                session_name=session,
+                control_group="/user.slice/g5-test.scope",
+                gate_pid=1,
+                challenge="a" * 64,
+            )
+
+        def fake_tmux(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if "pipe-pane" in args and "asession" in args:
+                first_pipe_entered.set()
+                self.assertTrue(release_first_pipe.wait(2))
+            return subprocess.CompletedProcess(["tmux"], 0, "", "")
+
+        previous = server_module._SPAWN_WARMUP_UNTIL_NS
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                runner = root / "codex"
+                runner.write_text("#!/bin/sh\n", encoding="utf-8")
+                runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+                state = root / "state"
+                agents = {
+                    agent: {"label": agent.upper(), "runner": runner, "home": root / agent, "session": f"{agent}session"}
+                    for agent in ("a", "b")
+                }
+
+                def start_in_thread(agent: str) -> None:
+                    try:
+                        outcomes[agent] = start_agent(agent, cwd=directory)
+                    except Exception as exc:  # pragma: no cover - asserted below
+                        outcomes[agent] = exc
+
+                with patch.dict("codex_master.server.AGENTS", agents, clear=False), patch(
+                    "codex_master.server.STATE_ROOT", state
+                ), patch("codex_master.server.RAW_DIR", state / "raw"), patch(
+                    "codex_master.server.META_DIR", state / "meta"
+                ), patch("codex_master.server.LOCK_DIR", state / "locks"), patch(
+                    "codex_master.server.LEASE_DIR", state / "leases"
+                ), patch("codex_master.server.tmux_alive", return_value=False), patch(
+                    "codex_master.server.agent_home_process_summary", return_value=process_summary
+                ), patch("codex_master.server.require_spawn_capacity", side_effect=fake_admission), patch(
+                    "codex_master.server._g5_start_scope", side_effect=fake_scope
+                ), patch("codex_master.server.agent_base_args", return_value=[]), patch(
+                    "codex_master.server.prune_raw_logs"
+                ), patch("codex_master.server.run_tmux", side_effect=fake_tmux):
+                    first = threading.Thread(target=start_in_thread, args=("a",))
+                    second = threading.Thread(target=start_in_thread, args=("b",))
+                    first.start()
+                    if not first_pipe_entered.wait(2):
+                        first.join(2)
+                        self.fail(f"first start did not reach pipe-pane: {outcomes!r}")
+                    second.start()
+                    self.assertFalse(second_called.wait(0.1))
+                    release_first_pipe.set()
+                    first.join(2)
+                    second.join(2)
+        finally:
+            server_module._SPAWN_WARMUP_UNTIL_NS = previous
+
+        self.assertEqual(outcomes["a"]["status"], "started")
+        self.assertIsInstance(outcomes["b"], AgentCapacityError)
+        self.assertEqual(outcomes["b"].payload["reason_codes"], ["spawn_warmup_active"])
+
     def test_spawn_admission_fails_closed_for_missing_cpu_busy_evidence(self) -> None:
         snapshot = {
             "ok": True,
@@ -985,35 +2254,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("deaktiv", rendered)
         self.assertNotIn("temporarily_unenforced", rendered)
 
-    def test_ollama_start_path_uses_central_metric_denial(self) -> None:
-        inventory = SimpleNamespace(
-            agents={
-                "o1": SimpleNamespace(
-                    enabled=True,
-                    provider=server_module.Provider.OLLAMA_LOCAL,
-                    task_profile="simple_only",
-                )
-            },
-            agent_ids=("o1",),
-        )
-        snapshot = {
-            "ok": True,
-            "load_per_cpu": 0.25,
-            "cpu_busy_percent": 25.0,
-            "io_wait_percent": 0.0,
-            "running_agents": 2,
-        }
-        with patch("codex_master.server.require_fleet_recovery_ready"), patch(
-            "codex_master.server.current_agent_inventory", return_value=inventory
-        ), patch("codex_master.server._headless_descriptor", return_value=None), patch(
-            "codex_master.server.system_resource_snapshot", return_value=snapshot
-        ):
-            with self.assertRaises(AgentCapacityError) as raised:
-                server_module._start_agent_with_lease_unlocked("o1")
-
-        self.assertIn("memory_metrics_unavailable", raised.exception.payload["reason_codes"])
-
-    def test_ollama_start_reuses_one_composed_admission_context(self) -> None:
+    def test_ollama_lease_start_defers_resource_decision_to_final_start(self) -> None:
         descriptor = SimpleNamespace(
             enabled=True,
             provider=server_module.Provider.OLLAMA_LOCAL,
@@ -1021,12 +2262,6 @@ class ServerHelpersTest(unittest.TestCase):
             task_profile="simple_only",
         )
         inventory = SimpleNamespace(agents={"o1": descriptor}, agent_ids=("o1",))
-        admission = {
-            "allowed": True,
-            "reason_codes": [],
-            "errors": [],
-            "resource_snapshot": {"ok": True},
-        }
         observed: list[Any] = []
 
         def fake_start(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
@@ -1038,8 +2273,9 @@ class ServerHelpersTest(unittest.TestCase):
         ), patch("codex_master.server._headless_descriptor", return_value=None), patch(
             "codex_master.server._ollama_descriptor", return_value=descriptor
         ), patch(
-            "codex_master.server._resource_admission_decision", return_value=admission
-        ) as compose, patch(
+            "codex_master.server._resource_admission_decision",
+            side_effect=AssertionError("ollama preview must not read facts"),
+        ), patch(
             "codex_master.server.claim_agent", return_value={"status": "claimed", "lease": {"state": "held"}}
         ), patch("codex_master.server.agent_config", return_value={"session": "o1-session"}), patch(
             "codex_master.server.tmux_alive", return_value=False
@@ -1049,10 +2285,9 @@ class ServerHelpersTest(unittest.TestCase):
             result = server_module._start_agent_with_lease_unlocked("o1")
 
         self.assertEqual(result["status"], "started")
-        compose.assert_called_once_with(agent="o1", task=None, role="arbeitsbiene")
-        self.assertEqual(observed, [admission])
+        self.assertEqual(observed, [None])
 
-    def test_ollama_assign_reuses_one_composed_admission_context(self) -> None:
+    def test_ollama_assign_uses_central_spawn_admission_without_context_reuse(self) -> None:
         descriptor = SimpleNamespace(
             enabled=True,
             provider=server_module.Provider.OLLAMA_LOCAL,
@@ -1077,7 +2312,10 @@ class ServerHelpersTest(unittest.TestCase):
         with patch("codex_master.server.require_fleet_recovery_ready"), patch(
             "codex_master.server.current_agent_inventory", return_value=inventory
         ), patch("codex_master.server._ollama_descriptor", return_value=descriptor), patch(
-            "codex_master.server._resource_admission_decision", return_value=admission
+            "codex_master.server._resource_admission_decision",
+            side_effect=AssertionError("assignment must use spawn admission owner"),
+        ), patch(
+            "codex_master.server.spawn_admission_decision", return_value=admission
         ) as compose, patch("codex_master.server.scope_check", return_value={"allowed": True}), patch(
             "codex_master.server.resolver_class_for_agent", return_value="arbeitsbiene"
         ), patch(
@@ -1397,7 +2635,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["allowed"])
         self.assertEqual(result["available_slots"], 0)
-        self.assertEqual(result["reason_codes"], ["running_agent_limit"])
+        self.assertEqual(result["reason_codes"], ["running_agent_limit", "resource_snapshot_invalid"])
         self.assertEqual(
             result["errors"],
             [
@@ -1417,16 +2655,22 @@ class ServerHelpersTest(unittest.TestCase):
             "bridge_state": "ready",
             "counts": {"active": 3, "unconfirmed": 2, "overflow": 0},
         }
+        healthy_snapshot = {
+            "ok": True,
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
+            "available_memory_percent": 50.0,
+            "available_memory_mib": 8192,
+            "running_agents": 9,
+            "reason_codes": [],
+        }
         with patch(
             "codex_master.server._managed_tmux_session_ids",
             return_value=frozenset({"q1", "q2", "q3", "q4"}),
         ), patch(
             "codex_master.server.native_agent_status", return_value=native
-        ), patch("codex_master.server.os.cpu_count", return_value=4), patch(
-            "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
-        ), patch("codex_master.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
-            "codex_master.server._resource_meminfo", return_value=(50.0, 8192.0)
-        ), patch("codex_master.server._effective_cpu_count", return_value=4), patch(
+        ), patch("codex_master.server.system_resource_snapshot", return_value=healthy_snapshot), patch(
             "codex_master.server._fresh_native_reservation_count", return_value=0
         ):
             one_slot = spawn_admission_decision(1)
@@ -1457,7 +2701,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["allowed"])
         self.assertIsNone(result["available_slots"])
-        self.assertEqual(result["reason_codes"], ["session_metrics_unavailable"])
+        self.assertEqual(result["reason_codes"], ["session_metrics_unavailable", "resource_snapshot_invalid"])
         self.assertEqual(
             result["errors"],
             [
@@ -1471,7 +2715,7 @@ class ServerHelpersTest(unittest.TestCase):
             ],
         )
 
-    def test_system_resource_snapshot_counts_only_managed_tmux_sessions(self) -> None:
+    def test_system_resource_snapshot_counts_only_managed_tmux_sessions_without_host_metric_fallback(self) -> None:
         meminfo = "MemTotal:       16384 kB\nMemAvailable:    8192 kB\n"
         tmux = subprocess.CompletedProcess(["tmux", "list-sessions"], 0, "managed-session\nforeign-session\n", "")
         agents = {"a1": {"session": "managed-session"}}
@@ -1492,16 +2736,14 @@ class ServerHelpersTest(unittest.TestCase):
             snapshot = system_resource_snapshot()
 
         self.assertEqual(snapshot["running_agents"], 1)
-        self.assertEqual(snapshot["load_per_cpu"], 0.25)
-        self.assertEqual(snapshot["available_memory_percent"], 50.0)
-        self.assertEqual(snapshot["available_memory_mib"], 8.0)
-        self.assertTrue(snapshot["ok"])
-        self.assertEqual(snapshot["reason_codes"], [])
+        self.assertFalse(snapshot["ok"])
+        self.assertEqual(snapshot["reason_codes"], ["resource_snapshot_invalid"])
+        self.assertNotIn("load_per_cpu", snapshot)
         payload = json.dumps(snapshot)
         self.assertNotIn("foreign-session", payload)
         self.assertNotIn("/proc/meminfo", payload)
 
-    def test_recent_cpu_usage_separates_busy_cpu_from_io_wait(self) -> None:
+    def test_recent_cpu_usage_has_no_server_side_proc_fallback(self) -> None:
         first = "cpu 100 0 0 800 0 0 0 0 0 0\n"
         second = "cpu 110 0 0 810 5 0 0 0 0 0\n"
         with patch("codex_master.server.Path.read_text", side_effect=[first, second]), patch(
@@ -1509,7 +2751,7 @@ class ServerHelpersTest(unittest.TestCase):
         ):
             usage = server_module._recent_cpu_usage()
 
-        self.assertEqual(usage, (40.0, 20.0))
+        self.assertIsNone(usage)
 
     def test_spawn_admission_counts_load_pressure_without_busy_cpu_pressure(self) -> None:
         snapshot = {
@@ -1586,7 +2828,7 @@ class ServerHelpersTest(unittest.TestCase):
             "codex_master.server.system_resource_snapshot", return_value=snapshot
         ), patch(
             "codex_master.server.tmux_alive",
-            side_effect=lambda session: session in {"o1-session", "o2-session"},
+            side_effect=lambda session, **_kwargs: session in {"o1-session", "o2-session"},
         ):
             result = server_module.ollama_resource_status("o1")
 
@@ -1662,7 +2904,7 @@ class ServerHelpersTest(unittest.TestCase):
                 text=True,
             )
 
-    def test_system_resource_snapshot_fails_closed_for_missing_memory_evidence(self) -> None:
+    def test_system_resource_snapshot_fails_closed_without_injected_facts(self) -> None:
         with patch("codex_master.server.os.cpu_count", return_value=4), patch(
             "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
         ), patch("codex_master.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
@@ -1679,20 +2921,26 @@ class ServerHelpersTest(unittest.TestCase):
             snapshot = system_resource_snapshot()
 
         self.assertFalse(snapshot["ok"])
-        self.assertEqual(snapshot["reason_codes"], ["memory_metrics_unavailable"])
+        self.assertEqual(snapshot["reason_codes"], ["resource_snapshot_invalid"])
         self.assertNotIn("/proc/meminfo", json.dumps(snapshot))
 
-    def test_system_resource_snapshot_fails_closed_when_cpu_count_is_unavailable(self) -> None:
+    def test_system_resource_snapshot_never_derives_cpu_state_when_facts_are_missing(self) -> None:
         with patch("codex_master.server.os.cpu_count", return_value=None), patch(
             "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
         ), patch("codex_master.server.Path.read_text", return_value="MemTotal: 16384 kB\nMemAvailable: 8192 kB\n"), patch(
             "codex_master.server.run_tmux",
             return_value=subprocess.CompletedProcess(["tmux"], 0, "", ""),
-        ):
+        ), patch(
+            "codex_master.server.native_agent_status",
+            return_value={
+                "bridge_state": "ready",
+                "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
+            },
+        ), patch("codex_master.server._fresh_native_reservation_count", return_value=0):
             snapshot = system_resource_snapshot()
 
         self.assertFalse(snapshot["ok"])
-        self.assertIn("cpu_metrics_unavailable", snapshot["reason_codes"])
+        self.assertEqual(snapshot["reason_codes"], ["resource_snapshot_invalid"])
 
     def test_spawn_admission_allows_load_and_memory_at_policy_boundaries(self) -> None:
         snapshot = {
@@ -13079,7 +14327,11 @@ class ServerHelpersTest(unittest.TestCase):
             ), patch(
                 "codex_master.server.require_spawn_capacity",
                 return_value=ADMITTED_SPAWN_DECISION,
-            ), patch("codex_master.server.prune_raw_logs"), patch(
+            ), patch(
+                "codex_master.server._g5_start_scope", side_effect=fake_g5_start_scope_for_test
+            ), patch("codex_master.server._start_g5_warmup"), patch(
+                "codex_master.server.prune_raw_logs"
+            ), patch(
                 "codex_master.server.apply_agent_introduction_policy",
                 return_value="SHARED_POLICY",
             ) as introduction_policy:
@@ -19103,11 +20355,19 @@ class ServerHelpersTest(unittest.TestCase):
                 )
                 process.joinpath("exe").symlink_to(executable)
                 process.joinpath("cwd").symlink_to("/", target_is_directory=True)
+            resolve_original = Path.resolve
+            gnome_fixture_exe = proc_root / "102" / "exe"
+
+            def resolve_fixture_gnome_exe(path: Path, *args: Any, **kwargs: Any) -> Path:
+                if path == gnome_fixture_exe:
+                    return path.readlink()
+                return resolve_original(path, *args, **kwargs)
+
             with patch.dict(
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
-            ):
+            ), patch.object(Path, "resolve", new=resolve_fixture_gnome_exe):
                 summary = agent_home_process_summary("a", proc_root)
                 guard = agent_identity_guard(True, summary, pane_process_id=100)
 
@@ -19186,11 +20446,19 @@ class ServerHelpersTest(unittest.TestCase):
                 )
                 process.joinpath("exe").symlink_to(executable)
                 process.joinpath("cwd").symlink_to("/", target_is_directory=True)
+            resolve_original = Path.resolve
+            gnome_fixture_exe = proc_root / "202" / "exe"
+
+            def resolve_fixture_gnome_exe(path: Path, *args: Any, **kwargs: Any) -> Path:
+                if path == gnome_fixture_exe:
+                    return path.readlink()
+                return resolve_original(path, *args, **kwargs)
+
             with patch.dict(
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
                 clear=False,
-            ):
+            ), patch.object(Path, "resolve", new=resolve_fixture_gnome_exe):
                 summary = agent_home_process_summary("a", proc_root)
                 guard = agent_identity_guard(True, summary, pane_process_id=100)
 
@@ -21837,7 +23105,13 @@ class ServerHelpersTest(unittest.TestCase):
                     start_agent("a", cwd=tmpdir)
 
         self.assertIs(raised.exception, capacity_error)
-        require_capacity.assert_called_once_with(1)
+        require_capacity.assert_called_once_with(
+            1,
+            agent=None,
+            task=None,
+            role="arbeitsbiene",
+            reserved_slots=0,
+        )
         run_tmux_mock.assert_not_called()
 
     def test_parallel_new_starts_serialize_admission_and_second_rechecks_capacity(self) -> None:
@@ -21848,7 +23122,7 @@ class ServerHelpersTest(unittest.TestCase):
         admission_entries = 0
         admission_depths_at_spawn: list[int] = []
         capacity_seen_running_agents: list[int] = []
-        new_session_agents: list[str] = []
+        started_agents: list[str] = []
         results: dict[str, dict[str, Any]] = {}
         failures: list[BaseException] = []
 
@@ -21876,7 +23150,7 @@ class ServerHelpersTest(unittest.TestCase):
                 admission_mutex.release()
                 return False
 
-        def require_capacity(required_slots: int = 1) -> dict[str, Any]:
+        def require_capacity(required_slots: int = 1, **_kwargs: Any) -> dict[str, Any]:
             nonlocal running_agents
             with state_mutex:
                 capacity_seen_running_agents.append(running_agents)
@@ -21900,11 +23174,11 @@ class ServerHelpersTest(unittest.TestCase):
 
         def fake_run_tmux(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
             nonlocal running_agents
-            if args[0] == "new-session":
+            if args[2] == "send-keys":
                 with state_mutex:
                     admission_depths_at_spawn.append(admission_entries)
                     running_agents += 1
-                    new_session_agents.append(args[args.index("-s") + 1])
+                    started_agents.append(args[args.index("-t") + 1])
             return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
         def run(agent: str, cwd: str) -> None:
@@ -21948,7 +23222,11 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.require_spawn_capacity", side_effect=require_capacity, create=True
             ) as capacity_gate, patch("codex_master.server.tmux_alive", return_value=False), patch(
                 "codex_master.server.agent_home_process_summary", return_value=process_summary
-            ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux), patch(
+            ), patch(
+                "codex_master.server._g5_start_scope", side_effect=fake_g5_start_scope_for_test
+            ), patch("codex_master.server._start_g5_warmup"), patch(
+                "codex_master.server.run_tmux", side_effect=fake_run_tmux
+            ), patch(
                 "codex_master.server.pane_pid", return_value=123
             ), patch("codex_master.server.write_meta"):
                 first = threading.Thread(target=run, args=("a1", tmpdir))
@@ -21964,7 +23242,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(capacity_gate.call_count, 2)
         self.assertEqual(capacity_seen_running_agents, [0, 1])
         self.assertEqual(admission_depths_at_spawn, [1])
-        self.assertEqual(len(new_session_agents), 1)
+        self.assertEqual(len(started_agents), 1)
         self.assertEqual(len(results), 1)
         self.assertEqual(next(iter(results.values()))["status"], "started")
         self.assertEqual(len(failures), 1)
@@ -22331,16 +23609,15 @@ class ServerHelpersTest(unittest.TestCase):
             runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
 
             def fake_run_tmux(args, **_kwargs):
-                if args and args[0] == "new-session":
-                    return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
-                if args and args[0] == "pipe-pane":
+                command = args[2] if args[:1] == ["-L"] else args[0]
+                if command == "pipe-pane":
                     return subprocess.CompletedProcess(
                         ["tmux", *args],
                         1,
                         "",
                         f"SECRET_PIPE_OUTPUT_SHOULD_NOT_RETURN {tmpdir}",
                     )
-                if args and args[0] == "kill-session":
+                if command == "kill-session":
                     return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
                 return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
 
@@ -22351,17 +23628,19 @@ class ServerHelpersTest(unittest.TestCase):
                 clear=False,
             ), patch("codex_master.server.RAW_DIR", Path(tmpdir)), patch(
                 "codex_master.server.META_DIR", Path(tmpdir)
-            ), patch("codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION):
+            ), patch("codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION), patch(
+                "codex_master.server._g5_start_scope", side_effect=fake_g5_start_scope_for_test
+            ):
                 with self.assertRaisesRegex(RuntimeError, "pipe-pane failed") as raised:
                     start_agent("a", cwd=tmpdir)
 
-            new_session_calls = [call for call in mock_run_tmux.call_args_list if call.args[0][0] == "new-session"]
-            self.assertEqual(len(new_session_calls), 1)
-            start_command = new_session_calls[0].args[0][-1]
+            send_key_calls = [call for call in mock_run_tmux.call_args_list if "send-keys" in call.args[0]]
+            self.assertEqual(len(send_key_calls), 1)
+            start_command = send_key_calls[0].args[0][-2]
             self.assertIn(f"--model {DEFAULT_AGENT_MODEL}", start_command)
             self.assertIn(f'model="{DEFAULT_AGENT_MODEL}"', start_command)
             self.assertIn('model_reasoning_effort="medium"', start_command)
-            kill_calls = [call for call in mock_run_tmux.call_args_list if call.args[0][0] == "kill-session"]
+            kill_calls = [call for call in mock_run_tmux.call_args_list if "kill-session" in call.args[0]]
             self.assertEqual(len(kill_calls), 1)
             self.assertFalse(any(Path(tmpdir).glob("*.log")))
             error_text = str(raised.exception)
@@ -22380,7 +23659,8 @@ class ServerHelpersTest(unittest.TestCase):
             ]
 
             def fake_run_tmux(args, **_kwargs):
-                code = 1 if args[0] == "pipe-pane" else 0
+                command = args[2] if args[:1] == ["-L"] else args[0]
+                code = 1 if command == "pipe-pane" else 0
                 return subprocess.CompletedProcess(["tmux", *args], code, "", "")
 
             with patch.dict(
@@ -22398,6 +23678,8 @@ class ServerHelpersTest(unittest.TestCase):
                 return_value={"held_by_this_server": True},
             ), patch("codex_master.server.release_agent") as mock_release, patch(
                 "codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
+            ), patch(
+                "codex_master.server._g5_start_scope", side_effect=fake_g5_start_scope_for_test
             ):
                 with self.assertRaisesRegex(AgentError, "tmux pipe-pane failed"):
                     start_agent(
@@ -22433,11 +23715,13 @@ class ServerHelpersTest(unittest.TestCase):
                 clear=False,
             ), patch("codex_master.server.RAW_DIR", root), patch(
                 "codex_master.server.META_DIR", root
-            ), patch("codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION):
+            ), patch("codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION), patch(
+                "codex_master.server._g5_start_scope", side_effect=fake_g5_start_scope_for_test
+            ):
                 with self.assertRaisesRegex(AgentError, "meta failed"):
                     start_agent("a", cwd=tmpdir)
 
-            kill_calls = [call for call in mock_run_tmux.call_args_list if call.args[0][0] == "kill-session"]
+            kill_calls = [call for call in mock_run_tmux.call_args_list if "kill-session" in call.args[0]]
             leftover_logs = list(root.glob("*.log"))
 
         self.assertEqual(len(kill_calls), 1)
@@ -22470,11 +23754,19 @@ class ServerHelpersTest(unittest.TestCase):
                 "",
                 f"SECRET_STOP_OUTPUT_SHOULD_NOT_RETURN {tmpdir}",
             )
+            descriptor = server_module.AgentDescriptor(
+                "a", "a", 1, "A", server_module.RunnerKind.CODEX_CLI,
+                server_module.Provider.OPENAI_CHATGPT, DEFAULT_AGENT_MODEL, None,
+                Path(tmpdir), "test_session", True, Path(tmpdir) / "codex",
+            )
+            inventory = server_module.InventorySnapshot(
+                ("a",), {"a": descriptor}, {"a-series": ("a",)}, {"a": 0}, ("a",)
+            )
             with patch.dict(
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": Path(tmpdir) / "codex", "home": Path(tmpdir), "session": "test_session"}},
                 clear=False,
-            ):
+            ), server_module.temporary_agent_inventory(inventory):
                 with self.assertRaisesRegex(AgentError, "tmux stop failed") as raised:
                     stop_agent("a")
 
@@ -22550,11 +23842,19 @@ class ServerHelpersTest(unittest.TestCase):
         self, mock_run_tmux, _mock_pane_pid, _mock_processes, _mock_alive, _mock_lease
     ) -> None:
         mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux", "kill-session"], 1, "", "")
+        descriptor = server_module.AgentDescriptor(
+            "a", "a", 1, "A", server_module.RunnerKind.CODEX_CLI,
+            server_module.Provider.OPENAI_CHATGPT, DEFAULT_AGENT_MODEL, None,
+            Path("/tmp/home"), "test_session", True, Path("/tmp/codex"),
+        )
+        inventory = server_module.InventorySnapshot(
+            ("a",), {"a": descriptor}, {"a-series": ("a",)}, {"a": 0}, ("a",)
+        )
         with patch.dict(
             "codex_master.server.AGENTS",
             {"a": {"label": "A", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "test_session"}},
             clear=False,
-        ), patch(
+        ), server_module.temporary_agent_inventory(inventory), patch(
             "codex_master.server.release_agent",
             return_value={"lease": {"state": "unclaimed", "held_by_this_server": False}},
         ) as mock_release:
@@ -22697,6 +23997,8 @@ class ServerHelpersTest(unittest.TestCase):
                     "raw_output": "not_returned",
                 },
             ), patch("codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION), patch(
+                "codex_master.server._g5_start_scope", side_effect=fake_g5_start_scope_for_test
+            ), patch("codex_master.server._start_g5_warmup"), patch(
                 "codex_master.server.prune_raw_logs"
             ) as mock_prune:
                 result = start_agent("a", cwd=tmpdir)
@@ -22744,6 +24046,8 @@ class ServerHelpersTest(unittest.TestCase):
                     "reason_codes": [],
                     "raw_output": "not_returned",
                 },
+            ), patch(
+                "codex_master.server._g5_start_scope", side_effect=fake_g5_start_scope_for_test
             ):
                 with self.assertRaisesRegex(RuntimeError, "tmux start failed"):
                     start_agent("a", cwd=tmpdir)
@@ -22767,23 +24071,38 @@ class ServerHelpersTest(unittest.TestCase):
             "external_processes_truncated": False,
             "raw_output": "not_returned",
         }
-        new_session_targets: list[str] = []
+        started_sessions: list[str] = []
+        runtime = SimpleNamespace(monotonic_ns=lambda: 100_000_000_000, cgroup_adapter=None)
+
+        def fake_g5_start_scope(session: str) -> tuple[Any, PreparedAgentScope]:
+            return runtime, PreparedAgentScope(
+                unit_name="g5-test.scope",
+                socket_name=(
+                    "g5-0123456789abcdef0123"
+                    if session == "session-a1"
+                    else "g5-1123456789abcdef0123"
+                ),
+                session_name=session,
+                control_group="/user.slice/g5-test.scope",
+                gate_pid=1,
+                challenge="a" * 64,
+            )
 
         def fake_run_tmux(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
-            if args[0] == "list-sessions":
+            if args[:1] == ["list-sessions"]:
                 return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
-            if args[0] == "new-session":
-                target = args[args.index("-s") + 1]
-                new_session_targets.append(target)
+            if args[2] == "send-keys":
+                target = args[args.index("-t") + 1]
+                started_sessions.append(target)
                 return subprocess.CompletedProcess(
                     ["tmux", *args],
                     1 if target == "session-a1" else 0,
                     "",
                     "",
                 )
-            if args[0] == "pipe-pane":
+            if args[2] in {"pipe-pane", "kill-session"}:
                 return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
-            raise AssertionError(f"unexpected tmux command: {args[0]}")
+            raise AssertionError(f"unexpected tmux command: {args!r}")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -22809,6 +24128,8 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.require_spawn_capacity", side_effect=[admission, admission]
             ) as require_capacity, patch("codex_master.server.tmux_alive", return_value=False), patch(
                 "codex_master.server.agent_home_process_summary", return_value=process_summary
+            ), patch(
+                "codex_master.server._g5_start_scope", side_effect=fake_g5_start_scope
             ), patch("codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}), patch(
                 "codex_master.server.release_agent"
             ) as release_agent_mock, patch(
@@ -22829,10 +24150,71 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertTrue(first_raw_log_removed)
         self.assertTrue(second_raw_log_exists)
-        self.assertEqual(new_session_targets, ["session-a1", "session-a2"])
-        self.assertEqual([call.args for call in require_capacity.call_args_list], [(1,), (1,)])
+        self.assertEqual(started_sessions, ["session-a1", "session-a2"])
+        self.assertEqual(
+            [call.args for call in require_capacity.call_args_list],
+            [(1,), (1,)],
+        )
         release_agent_mock.assert_called_once_with("a1", force=True)
         self.assertEqual(second["status"], "started")
+
+    def test_g5_scope_start_failure_cleans_raw_log_and_releases_start_lease(self) -> None:
+        admission = {
+            "allowed": True,
+            "required_slots": 1,
+            "available_slots": 1,
+            "reason_codes": [],
+            "raw_output": "not_returned",
+        }
+        process_summary = {
+            "process_count": 0,
+            "external_process_count": 0,
+            "managed_process_count": 0,
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        }
+        scope_error = AgentCapacityError(
+            "capacity unavailable",
+            {"reason_codes": ["cgroup_preflight_failed"], "raw_output": "not_returned"},
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            state = root / "state"
+            runner = root / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": root, "session": "session-a"}},
+                clear=True,
+            ), patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.RAW_DIR", state / "raw"
+            ), patch("codex_master.server.META_DIR", state / "meta"), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch("codex_master.server.LEASE_DIR", state / "leases"), patch(
+                "codex_master.server.require_spawn_capacity", return_value=admission
+            ), patch("codex_master.server.tmux_alive", return_value=False), patch(
+                "codex_master.server.agent_home_process_summary", return_value=process_summary
+            ), patch("codex_master.server.prune_raw_logs"), patch(
+                "codex_master.server._g5_start_scope", side_effect=scope_error
+            ), patch(
+                "codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}
+            ), patch("codex_master.server.release_agent") as release_agent_mock, patch(
+                "codex_master.server.run_tmux"
+            ) as run_tmux_mock, patch("codex_master.server.now_id", return_value="scope"):
+                with self.assertRaisesRegex(AgentCapacityError, "capacity unavailable"):
+                    start_agent(
+                        "a",
+                        cwd=tmpdir,
+                        lease={"held_by_this_server": True},
+                        release_lease_on_failure=True,
+                    )
+                raw_log_removed = not (state / "raw" / "scope-a.log").exists()
+
+        self.assertTrue(raw_log_removed)
+        release_agent_mock.assert_called_once_with("a", force=True)
+        run_tmux_mock.assert_not_called()
 
     @patch("codex_master.server.ensure_state")
     @patch("codex_master.server.write_meta")
@@ -22863,14 +24245,17 @@ class ServerHelpersTest(unittest.TestCase):
                 },
             ), patch(
                 "codex_master.server.require_spawn_capacity", return_value=ADMITTED_SPAWN_DECISION
+            ), patch(
+                "codex_master.server._g5_start_scope", side_effect=fake_g5_start_scope_for_test
             ):
                 with self.assertRaisesRegex(RuntimeError, "tmux start failed"):
                     start_agent("a", cwd=tmpdir)
 
-            kill_calls = [call for call in mock_run_tmux.call_args_list if call.args[0][0] == "kill-session"]
+            kill_calls = [call for call in mock_run_tmux.call_args_list if "kill-session" in call.args[0]]
             leftover_logs = list(Path(tmpdir).glob("*.log"))
 
-        self.assertEqual(kill_calls, [])
+        self.assertEqual(len(kill_calls), 1)
+        self.assertEqual(kill_calls[0].args[0][:2], ["-L", "g5-0123456789abcdef0123"])
         self.assertEqual(leftover_logs, [])
 
     @patch("codex_master.server.ensure_state")
@@ -24446,10 +25831,23 @@ class ServerHelpersTest(unittest.TestCase):
 
     def test_model_switch_restarts_only_inactive_agentin(self) -> None:
         lease = {"state": "held", "holder": "test", "held_by_this_server": True}
+
+        def inventory_for(home: Path) -> server_module.InventorySnapshot:
+            descriptor = server_module.AgentDescriptor(
+                "a", "a", 1, "A", server_module.RunnerKind.CODEX_CLI,
+                server_module.Provider.OPENAI_CHATGPT, DEFAULT_AGENT_MODEL, None,
+                home, "session-a", True, home / "codex",
+            )
+            return server_module.InventorySnapshot(
+                ("a",), {"a": descriptor}, {"a-series": ("a",)}, {"a": 0}, ("a",)
+            )
+
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
             agent = {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}
-            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
+            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), server_module.temporary_agent_inventory(
+                inventory_for(home)
+            ), patch(
                 "codex_master.server.tmux_alive", return_value=True
             ), patch("codex_master.server.pane_pid", return_value=123), patch(
                 "codex_master.server.agent_home_process_summary",
@@ -24488,7 +25886,9 @@ class ServerHelpersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
             agent = {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}
-            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
+            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), server_module.temporary_agent_inventory(
+                inventory_for(home)
+            ), patch(
                 "codex_master.server.tmux_alive", return_value=True
             ), patch("codex_master.server.pane_pid", return_value=123), patch(
                 "codex_master.server.agent_home_process_summary",
@@ -24532,7 +25932,17 @@ class ServerHelpersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
             agent = {"label": "Q3", "runner": home / "codex", "home": home, "session": "q3-session"}
-            with patch.dict("codex_master.server.AGENTS", {"q3": agent}, clear=False), patch(
+            descriptor = server_module.AgentDescriptor(
+                "q3", "q", 3, "Q3", server_module.RunnerKind.CODEX_CLI,
+                server_module.Provider.OPENAI_CHATGPT, DEFAULT_AGENT_MODEL, None,
+                home, "q3-session", True, home / "codex",
+            )
+            inventory = server_module.InventorySnapshot(
+                ("q3",), {"q3": descriptor}, {"q-series": ("q3",)}, {"q3": 0}, ("q",)
+            )
+            with patch.dict("codex_master.server.AGENTS", {"q3": agent}, clear=False), server_module.temporary_agent_inventory(
+                inventory
+            ), patch(
                 "codex_master.server.tmux_alive", return_value=True
             ), patch("codex_master.server.require_managed_tmux_session", return_value={"ok": True}), patch("codex_master.server.read_meta", return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(home)}), patch(
                 "codex_master.server.status_agent", return_value={"response_state": {"state": "running_idle"}}
@@ -24569,7 +25979,17 @@ class ServerHelpersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
             agent = {"label": "Q3", "runner": home / "codex", "home": home, "session": "q3-session"}
-            with patch.dict("codex_master.server.AGENTS", {"q3": agent}, clear=False), patch(
+            descriptor = server_module.AgentDescriptor(
+                "q3", "q", 3, "Q3", server_module.RunnerKind.CODEX_CLI,
+                server_module.Provider.OPENAI_CHATGPT, DEFAULT_AGENT_MODEL, None,
+                home, "q3-session", True, home / "codex",
+            )
+            inventory = server_module.InventorySnapshot(
+                ("q3",), {"q3": descriptor}, {"q-series": ("q3",)}, {"q3": 0}, ("q",)
+            )
+            with patch.dict("codex_master.server.AGENTS", {"q3": agent}, clear=False), server_module.temporary_agent_inventory(
+                inventory
+            ), patch(
                 "codex_master.server.tmux_alive", return_value=True
             ), patch("codex_master.server.require_managed_tmux_session", return_value={"ok": True}), patch(
                 "codex_master.server.read_meta", return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(home)}
@@ -24643,6 +26063,14 @@ class ServerHelpersTest(unittest.TestCase):
             root = Path(tmpdir) / "state"
             record_path = root / "native-agents.json"
             lock_path = root / "locks" / "native.lock"
+            descriptor = server_module.AgentDescriptor(
+                "q3", "q", 3, "Q3", server_module.RunnerKind.CODEX_CLI,
+                server_module.Provider.OPENAI_CHATGPT, DEFAULT_AGENT_MODEL, None,
+                root, "q3-session", True, root / "codex",
+            )
+            inventory = server_module.InventorySnapshot(
+                ("q3",), {"q3": descriptor}, {"q-series": ("q3",)}, {"q3": 0}, ("q",)
+            )
             with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
                 "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
             ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
@@ -24651,7 +26079,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.AGENTS",
                 {"q3": {"label": "Q3", "runner": root / "codex", "home": root, "session": "q3-session"}},
                 clear=False,
-            ), patch("codex_master.server.tmux_alive", return_value=True), patch(
+            ), server_module.temporary_agent_inventory(inventory), patch("codex_master.server.tmux_alive", return_value=True), patch(
                 "codex_master.server.require_managed_tmux_session", return_value={"ok": True}
             ), patch("codex_master.server.read_meta", return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(root)}), patch(
                 "codex_master.server.status_agent", return_value={"response_state": {"state": "running_idle"}}
@@ -24700,7 +26128,17 @@ class ServerHelpersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
             agent = {"label": "b1", "runner": home / "codex", "home": home, "session": "b1-session"}
-            with patch.dict("codex_master.server.AGENTS", {"b1": agent}, clear=False), patch(
+            descriptor = server_module.AgentDescriptor(
+                "b1", "b", 1, "B1", server_module.RunnerKind.CODEX_CLI,
+                server_module.Provider.OPENAI_CHATGPT, DEFAULT_AGENT_MODEL, None,
+                home, "b1-session", True, home / "codex",
+            )
+            inventory = server_module.InventorySnapshot(
+                ("b1",), {"b1": descriptor}, {"b-series": ("b1",)}, {"b1": 0}, ("b",)
+            )
+            with patch.dict("codex_master.server.AGENTS", {"b1": agent}, clear=False), server_module.temporary_agent_inventory(
+                inventory
+            ), patch(
                 "codex_master.server.tmux_alive", return_value=True
             ), patch("codex_master.server.require_managed_tmux_session", return_value={"ok": True}), patch(
                 "codex_master.server.read_meta", return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(home)}
@@ -24778,7 +26216,17 @@ class ServerHelpersTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
             agent = {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}
-            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), patch(
+            descriptor = server_module.AgentDescriptor(
+                "a", "a", 1, "A", server_module.RunnerKind.CODEX_CLI,
+                server_module.Provider.OPENAI_CHATGPT, DEFAULT_AGENT_MODEL, None,
+                home, "session-a", True, home / "codex",
+            )
+            inventory = server_module.InventorySnapshot(
+                ("a",), {"a": descriptor}, {"a-series": ("a",)}, {"a": 0}, ("a",)
+            )
+            with patch.dict("codex_master.server.AGENTS", {"a": agent}, clear=False), server_module.temporary_agent_inventory(
+                inventory
+            ), patch(
                 "codex_master.server.tmux_alive", return_value=True
             ), patch("codex_master.server.pane_pid", return_value=123), patch(
                 "codex_master.server.agent_home_process_summary",
@@ -27010,28 +28458,28 @@ class AppletStatusContractTest(unittest.TestCase):
     def test_pane_pid_returns_none_for_leading_zeros(self, mock_run_tmux, _mock_tmux_alive) -> None:
         mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "00123\n", "")
 
-        self.assertIsNone(pane_pid("a1"))
+        self.assertIsNone(pane_pid(AGENTS["a1"]["session"]))
 
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.run_tmux")
     def test_pane_pid_returns_none_for_overlong_numeric_text(self, mock_run_tmux, _mock_tmux_alive) -> None:
         mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, f"{'2' * 5000}\n", "")
 
-        self.assertIsNone(pane_pid("a1"))
+        self.assertIsNone(pane_pid(AGENTS["a1"]["session"]))
 
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.run_tmux")
     def test_pane_pid_returns_none_for_unicode_digits(self, mock_run_tmux, _mock_tmux_alive) -> None:
         mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "１２３\n", "")
 
-        self.assertIsNone(pane_pid("a1"))
+        self.assertIsNone(pane_pid(AGENTS["a1"]["session"]))
 
     @patch("codex_master.server.tmux_alive", return_value=True)
     @patch("codex_master.server.run_tmux")
     def test_pane_pid_returns_none_for_zero(self, mock_run_tmux, _mock_tmux_alive) -> None:
         mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "0\n", "")
 
-        self.assertIsNone(pane_pid("a1"))
+        self.assertIsNone(pane_pid(AGENTS["a1"]["session"]))
 
     @patch(
         "codex_master.server.agent_lease_status",
@@ -27785,11 +29233,19 @@ class CliLifecycleTest(unittest.TestCase):
         mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "SECRET_OUTPUT", "SECRET_ERROR")
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            descriptor = server_module.AgentDescriptor(
+                "a", "a", 1, "A", server_module.RunnerKind.CODEX_CLI,
+                server_module.Provider.OPENAI_CHATGPT, DEFAULT_AGENT_MODEL, None,
+                root / "home", "session-a", True, root / "codex",
+            )
+            inventory = server_module.InventorySnapshot(
+                ("a",), {"a": descriptor}, {"a-series": ("a",)}, {"a": 0}, ("a",)
+            )
             with patch.dict(
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
                 clear=False,
-            ):
+            ), server_module.temporary_agent_inventory(inventory):
                 result = send_agent("a", "hello", True)
 
         self.assertEqual(result["status"], "sent")
@@ -27820,6 +29276,14 @@ class CliLifecycleTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             state = root / "state"
+            descriptor = server_module.AgentDescriptor(
+                "a", "a", 1, "A", server_module.RunnerKind.CODEX_CLI,
+                server_module.Provider.OPENAI_CHATGPT, DEFAULT_AGENT_MODEL, None,
+                root / "home", "session-a", True, root / "codex",
+            )
+            inventory = server_module.InventorySnapshot(
+                ("a",), {"a": descriptor}, {"a-series": ("a",)}, {"a": 0}, ("a",)
+            )
             with patch("codex_master.server.STATE_ROOT", state), patch(
                 "codex_master.server.RAW_DIR", state / "raw"
             ), patch("codex_master.server.META_DIR", state / "meta"), patch(
@@ -27828,7 +29292,7 @@ class CliLifecycleTest(unittest.TestCase):
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": root / "codex", "home": root / "home", "session": "session-a"}},
                 clear=False,
-            ):
+            ), server_module.temporary_agent_inventory(inventory):
                 result = interrupt_agent("a")
 
         self.assertEqual(result["status"], "interrupt_sent")
@@ -29340,7 +30804,7 @@ class CliLifecycleTest(unittest.TestCase):
                         "a": {"label": "A", "runner": Path(tmp_home) / "a-runner", "home": Path(tmp_home) / "a", "session": "session-a"},
                         "b": {"label": "B", "runner": Path(tmp_home) / "b-runner", "home": Path(tmp_home) / "b", "session": "session-b"},
                     },
-                    clear=False,
+                    clear=True,
                 ):
                     (Path(tmp_home) / "a-runner").write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
                     (Path(tmp_home) / "a").mkdir(parents=True)
@@ -32163,7 +33627,7 @@ class NativeAgentRegistryTest(unittest.TestCase):
 
         self.assertFalse(result["allowed"])
         self.assertIsNone(result["available_slots"])
-        self.assertEqual(result["reason_codes"], ["session_metrics_unavailable"])
+        self.assertEqual(result["reason_codes"], ["session_metrics_unavailable", "resource_snapshot_invalid"])
 
     def test_session_start_preserves_parallel_parent_records_and_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
