@@ -692,7 +692,11 @@ class SystemdUserCgroupAdapter:
         ):
             _fail()
         cpu_text = relative.parts[0][3:]
-        if not cpu_text or str(_parse_decimal(cpu_text)) != cpu_text:
+        if (
+            not cpu_text
+            or len(cpu_text) > len(str(MAX_CPU_INDEX))
+            or str(_parse_decimal(cpu_text)) != cpu_text
+        ):
             _fail()
         return _read_optional_core_type_under(
             _bind_directory(CPU_TOPOLOGY_ROOT), candidate, max_bytes=max_bytes

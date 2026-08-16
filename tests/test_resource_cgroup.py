@@ -271,6 +271,17 @@ def test_topology_rejects_core_type_enoent_after_bound_parent_and_optional_non_l
         parse_cpu_topology(adapter)
 
 
+def test_optional_core_type_rejects_extreme_decimal_cpu_path_with_canonical_error() -> None:
+    adapter = resource_cgroup.SystemdUserCgroupAdapter(runner=_FakeSystemdRunner())
+    path = resource_cgroup.CPU_TOPOLOGY_ROOT / f"cpu{'9' * 5000}" / "topology" / "core_type"
+
+    with pytest.raises(CgroupPreflightError) as captured:
+        adapter.read_optional_cpu_topology_bytes(path, max_bytes=4096)
+
+    assert type(captured.value) is CgroupPreflightError
+    assert captured.value.args == ("cgroup_preflight_failed",)
+
+
 def test_preflight_rejects_missing_subtree_controller_or_effective_parent_cpuset() -> None:
     profile = _profile()
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
