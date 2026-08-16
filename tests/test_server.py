@@ -1225,7 +1225,7 @@ class ServerHelpersTest(unittest.TestCase):
             "io_wait_percent": 0.0,
             "io_psi_percent": 0.0,
             "available_memory_percent": 50.0,
-            "available_memory_mib": 1024,
+            "available_memory_mib": 8192,
             "running_agents": 1,
             "reason_codes": [],
         }
@@ -1737,7 +1737,7 @@ class ServerHelpersTest(unittest.TestCase):
             "io_wait_percent": 0.0,
             "io_psi_percent": 0.0,
             "available_memory_percent": 50.0,
-            "available_memory_mib": 1024,
+            "available_memory_mib": 8192,
             "running_agents": 1,
             "reason_codes": [],
         }
@@ -2122,7 +2122,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(raised.exception.payload["reason_codes"], ["session_metrics_unavailable"])
 
-    def test_ollama_admission_uses_one_snapshot_and_stable_global_precedence(self) -> None:
+    def test_total_ten_ollama_and_existing_pressure_precedence_remain_unchanged_by_ram_policy(self) -> None:
         inventory = SimpleNamespace(
             agents={
                 f"o{index}": SimpleNamespace(
@@ -2139,8 +2139,8 @@ class ServerHelpersTest(unittest.TestCase):
             "load_per_cpu": 0.25,
             "cpu_busy_percent": 95.0,
             "io_wait_percent": 0.0,
-            "available_memory_percent": 60.0,
-            "available_memory_mib": 8192,
+            "available_memory_percent": 100.0,
+            "available_memory_mib": 7 * 1024 - 1,
             "running_agents": 10,
         }
         with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
@@ -2151,7 +2151,12 @@ class ServerHelpersTest(unittest.TestCase):
         read_snapshot.assert_called_once_with()
         self.assertEqual(
             result["reason_codes"],
-            ["running_agent_limit", "ollama_concurrency_limit", "cpu_pressure_high"],
+            [
+                "running_agent_limit",
+                "ollama_concurrency_limit",
+                "cpu_pressure_high",
+                "memory_pressure_high",
+            ],
         )
         self.assertFalse(result["allowed"])
 
@@ -2463,7 +2468,7 @@ class ServerHelpersTest(unittest.TestCase):
             if not allowed:
                 self.assertEqual(result["reason_codes"], ["cpu_pressure_high"])
 
-    def test_spawn_resource_policy_exposes_exact_default_thresholds(self) -> None:
+    def test_spawn_policy_uses_exact_memavailable_seven_gib_and_has_no_percent_or_1024_floor(self) -> None:
         self.assertEqual(
             spawn_resource_policy(),
             {
@@ -2471,8 +2476,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "max_load_per_cpu": 1.75,
                 "max_cpu_busy_percent": 90.0,
                 "max_io_wait_percent": 50.0,
-                "min_available_memory_percent": 20.0,
-                "min_available_memory_mib": 1024,
+                "min_available_memory_mib": 7 * 1024,
                 "max_running_agents": 10,
                 "ollama_concurrency_limit_enabled": True,
                 "ollama_max_concurrent_agents": 2,
@@ -2489,7 +2493,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "cpu_busy_percent": 100.0,
                 "io_wait_percent": 100.0,
                 "available_memory_percent": 0.0,
-                "available_memory_mib": 0.0,
+                "available_memory_mib": 0,
                 "running_agents": 9,
                 "reason_codes": ["cpu_pressure_high", "memory_pressure_high"],
             },
@@ -2942,14 +2946,13 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(snapshot["ok"])
         self.assertEqual(snapshot["reason_codes"], ["resource_snapshot_invalid"])
 
-    def test_spawn_admission_allows_load_and_memory_at_policy_boundaries(self) -> None:
+    def test_memavailable_exactly_seven_gib_allows_memory_gate_when_all_other_metrics_are_green(self) -> None:
         snapshot = {
             "ok": True,
             "load_per_cpu": 1.75,
             "cpu_busy_percent": 25.0,
             "io_wait_percent": 0.0,
-            "available_memory_percent": 20.0,
-            "available_memory_mib": 1024,
+            "available_memory_mib": 7 * 1024,
             "running_agents": 5,
         }
         with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
@@ -2976,46 +2979,58 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["available_slots"], 4)
         self.assertEqual(result["reason_codes"], ["insufficient_slots"])
 
+    def test_memavailable_below_seven_gib_denies_even_when_percent_is_high(self) -> None:
+        snapshot = {
+            "ok": True,
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
+            "available_memory_percent": 100.0,
+            "available_memory_mib": 7 * 1024 - 1,
+            "running_agents": 2,
+        }
+        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+            result = spawn_admission_decision()
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason_codes"], ["memory_pressure_high"])
+
     def test_spawn_admission_enforces_pressure_and_blocks_at_ten_agents(self) -> None:
         cases = (
-            ("load_per_cpu", 1.750001, False, "cpu_pressure_high"),
-            ("available_memory_percent", 19.999, False, "memory_pressure_high"),
-            ("available_memory_mib", 1023.999, False, "memory_pressure_high"),
-            ("running_agents", 10, False, "running_agent_limit"),
+            ("load_per_cpu", 1.750001, "cpu_pressure_high"),
+            ("running_agents", 10, "running_agent_limit"),
         )
-        for field, value, allowed, reason in cases:
+        for field, value, reason in cases:
+            snapshot = {
+                "ok": True,
+                "load_per_cpu": value if field == "load_per_cpu" else 0.25,
+                "cpu_busy_percent": 95.0 if field == "load_per_cpu" else 25.0,
+                "io_wait_percent": 0.0,
+                "available_memory_mib": 8192,
+                "running_agents": value if field == "running_agents" else 2,
+            }
             with self.subTest(field=field), patch(
-                "codex_master.server.system_resource_snapshot",
-                return_value={
-                    "ok": True,
-                    "load_per_cpu": value if field == "load_per_cpu" else 0.25,
-                    "cpu_busy_percent": 95.0 if field == "load_per_cpu" else 25.0,
-                    "io_wait_percent": 0.0,
-                    "available_memory_percent": value if field == "available_memory_percent" else 60.0,
-                    "available_memory_mib": value if field == "available_memory_mib" else 8192,
-                    "running_agents": value if field == "running_agents" else 2,
-                },
+                "codex_master.server.system_resource_snapshot", return_value=snapshot
             ):
                 result = spawn_admission_decision()
 
-            self.assertEqual(result["allowed"], allowed)
+            self.assertFalse(result["allowed"])
             self.assertIn(reason, result["reason_codes"])
 
-    def test_spawn_admission_rejects_non_finite_negative_and_boolean_metrics(self) -> None:
+    def test_spawn_admission_rejects_non_finite_negative_and_boolean_cpu_or_session_metrics(self) -> None:
         cases = (
             ("load_per_cpu", float("nan"), "cpu_metrics_unavailable"),
             ("load_per_cpu", float("inf"), "cpu_metrics_unavailable"),
             ("load_per_cpu", -1.0, "cpu_metrics_unavailable"),
             ("load_per_cpu", True, "cpu_metrics_unavailable"),
-            ("available_memory_percent", float("nan"), "memory_metrics_unavailable"),
-            ("available_memory_mib", -1.0, "memory_metrics_unavailable"),
             ("running_agents", True, "session_metrics_unavailable"),
         )
         for field, value, reason in cases:
             snapshot = {
                 "ok": True,
                 "load_per_cpu": 0.25,
-                "available_memory_percent": 60.0,
+                "cpu_busy_percent": 25.0,
+                "io_wait_percent": 0.0,
                 "available_memory_mib": 8192,
                 "running_agents": 2,
             }
@@ -3027,6 +3042,35 @@ class ServerHelpersTest(unittest.TestCase):
 
             self.assertFalse(result["allowed"])
             self.assertIn(reason, result["reason_codes"])
+
+    def test_missing_boolean_nonfinite_negative_or_noninteger_memavailable_fails_closed(self) -> None:
+        cases = (
+            ("available_memory_mib", None),
+            ("available_memory_mib", True),
+            ("available_memory_mib", "7168"),
+            ("available_memory_mib", float("nan")),
+            ("available_memory_mib", float("inf")),
+            ("available_memory_mib", -1),
+            ("available_memory_mib", -1.0),
+            ("available_memory_mib", 7167.5),
+        )
+        for field, value in cases:
+            snapshot = {
+                "ok": True,
+                "load_per_cpu": 0.25,
+                "cpu_busy_percent": 25.0,
+                "io_wait_percent": 0.0,
+                "available_memory_mib": 8192,
+                "running_agents": 2,
+            }
+            snapshot[field] = value
+            with self.subTest(field=field, value=value), patch(
+                "codex_master.server.system_resource_snapshot", return_value=snapshot
+            ):
+                result = spawn_admission_decision()
+
+            self.assertFalse(result["allowed"])
+            self.assertEqual(result["reason_codes"], ["memory_metrics_unavailable"])
 
     def test_spawn_admission_rejects_invalid_policy_and_keeps_output_data_sparse(self) -> None:
         with patch(
