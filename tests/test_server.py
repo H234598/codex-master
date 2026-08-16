@@ -20229,7 +20229,7 @@ class ServerHelpersTest(unittest.TestCase):
             with patch.dict(
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
-                clear=False,
+                clear=True,
             ):
                 summary = agent_home_process_summary("a", proc_root)
                 guard = agent_identity_guard(True, summary, pane_process_id=100)
@@ -20312,7 +20312,7 @@ class ServerHelpersTest(unittest.TestCase):
             with patch.dict(
                 "codex_master.server.AGENTS",
                 {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
-                clear=False,
+                clear=True,
             ):
                 summary = agent_home_process_summary("a", proc_root)
                 guard = agent_identity_guard(True, summary, pane_process_id=100)
