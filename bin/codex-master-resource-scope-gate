@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""Release one held scope gate into a fixed absolute argv without a shell."""
+
+from __future__ import annotations
+
+import os
+import re
+import secrets
+import sys
+
+
+_TMUX_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_TMUX_PATH = "/usr/bin/tmux"
+
+
+def _reject() -> None:
+    os._exit(64)
+
+
+def _valid_name(value: object) -> bool:
+    return isinstance(value, str) and _TMUX_NAME.fullmatch(value) is not None and ".." not in value
+
+
+def main() -> None:
+    arguments = sys.argv[1:]
+    if len(arguments) != 2:
+        _reject()
+    socket_name, session_name = arguments
+    if not _valid_name(socket_name) or not _valid_name(session_name):
+        _reject()
+    challenge = secrets.token_hex(32)
+    try:
+        sys.stdout.buffer.write(f"{challenge}\n".encode("ascii"))
+        sys.stdout.buffer.flush()
+    except OSError:
+        _reject()
+    expected = f"{challenge}\n".encode("ascii")
+    try:
+        received = sys.stdin.buffer.read(len(expected) + 1)
+    except OSError:
+        _reject()
+    if received != expected:
+        _reject()
+    try:
+        os.execve(
+            _TMUX_PATH,
+            [_TMUX_PATH, "-L", socket_name, "new-session", "-d", "-s", session_name],
+            {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+        )
+    except OSError:
+        os._exit(127)
+
+
+if __name__ == "__main__":
+    main()
