@@ -10,6 +10,16 @@ const source = fs.readFileSync(
   path.join(root, "cinnamon/applets/codex-master@H234598/applet.js"),
   "utf8"
 );
+const settingsSchema = JSON.parse(fs.readFileSync(
+  path.join(root, "cinnamon/applets/codex-master@H234598/settings-schema.json"),
+  "utf8"
+));
+const START_CONTEXT_VALUE = "c3RhcnQ.c2ln";
+const STOP_CONTEXT_VALUE = "c3RvcA.c2ln";
+const OTHER_CONTEXT_VALUE = "YW5kZXJl.c2ln";
+const MALFORMED_CONTEXT_VALUE = "attacker token";
+const EXTRA_FIELD = "secret";
+const EXTRA_VALUE = "must-not-be-stored";
 
 function makeBytes(value) {
   return typeof value === "string" ? new TextEncoder().encode(value) : value;
@@ -74,7 +84,7 @@ function samplePayload() {
         identity_state: "stopped",
         lease_state: "unclaimed",
         allowed_action: "start",
-        context_token: "c3RhcnQ.c2ln",
+        context_token: START_CONTEXT_VALUE,
         limit_state: "clear",
         blocked_until_utc: null,
       },
@@ -99,6 +109,61 @@ function sampleNativeAgent(overrides = {}) {
     agent_type: "explorer",
     activity_state: "active",
     updated_at_utc: "1970-01-01T00:16:40+00:00",
+    ...overrides,
+  };
+}
+
+function sampleOverviewPayload(overrides = {}) {
+  return {
+    generation: 7,
+    created_at: "2026-08-15T12:00:00+00:00",
+    integration_freshness: "fresh",
+    series: [
+      {
+        prefix: "a",
+        display_name: "Alpha",
+        provider: "openai",
+        runner: "codex",
+        model: "gpt-5",
+        active_count: 1,
+        total_count: 1,
+        agent_ids: ["a1"],
+      },
+    ],
+    agents: [
+      {
+        agent_id: "a1",
+        series_display: "Alpha",
+        provider: "openai",
+        runner: "codex",
+        model: "gpt-5",
+        account_id: "acct-1",
+        account_label: "Primary",
+        state: "running",
+        principal_role: null,
+        dispatch_id: null,
+        limit_short_remaining_percent: 75.5,
+        limit_short_reset_at: "2026-08-15T13:00:00+00:00",
+        limit_week_remaining_percent: 90,
+        limit_week_reset_at: "2026-08-22T12:00:00+00:00",
+        cost_last_hour_percentage_points: 2.5,
+        usage_freshness: "fresh",
+      },
+    ],
+    account_limits: [
+      {
+        account_id: "acct-1",
+        account_label: "Primary",
+        provider: "openai",
+        short_remaining_percent: 75.5,
+        short_reset_at: "2026-08-15T13:00:00+00:00",
+        week_remaining_percent: 90,
+        week_reset_at: "2026-08-22T12:00:00+00:00",
+        cost_last_hour_percentage_points: 2.5,
+        usage_freshness: "fresh",
+      },
+    ],
+    warnings: [],
     ...overrides,
   };
 }
@@ -129,6 +194,10 @@ function loadApplet() {
     "refresh-on-open": true,
     "background-refresh": false,
     "refresh-interval-seconds": 60,
+    "overview-interval-seconds": 30,
+    "overview-session-no-active-only": false,
+    "overview-compact": true,
+    "overview-detail": true,
     "terminal-command": "ghostty",
     "panel-icon": "hive-01-core",
     "settings-icon": "hive-02-queen-crown",
@@ -142,6 +211,8 @@ function loadApplet() {
     "DISPLAY",
     "DBUS_SESSION_BUS_ADDRESS",
     "XDG_RUNTIME_DIR",
+    "CODEX_USAGE_INTEGRATION_STATE_HOME",
+    "XDG_STATE_HOME",
     "DESKTOP_STARTUP_ID",
     "XDG_ACTIVATION_TOKEN",
     "LANG",
@@ -542,7 +613,13 @@ function loadApplet() {
     },
     timeout_add_seconds(_priority, seconds, callback) {
       const id = timeoutId += 1;
-      timeouts.push({ id, callback, cancelled: false, kind: "background", seconds });
+      timeouts.push({
+        id,
+        callback,
+        cancelled: false,
+        kind: callback && callback.__codexOverviewTimer ? "overview" : "background",
+        seconds,
+      });
       return id;
     },
     source_remove(id) {
@@ -697,6 +774,277 @@ function queuePayloadProcess(fixture, payload, { exitCode = 0, holdEof = false, 
     };
   });
 }
+
+test("overview settings expose the approved defaults", () => {
+  assert.equal(settingsSchema["overview-interval-seconds"].default, 30);
+  assert.equal(settingsSchema["overview-session-no-active-only"].default, false);
+  assert.equal(settingsSchema["overview-compact"].default, true);
+  assert.equal(settingsSchema["overview-detail"].default, true);
+
+  const { main } = loadApplet();
+  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  assert.equal(applet.overviewIntervalSeconds, 30);
+  assert.equal(applet.overviewSessionNoActiveOnly, false);
+  assert.equal(applet.overviewCompact, true);
+  assert.equal(applet.overviewDetail, true);
+});
+
+test("overview argv is shell-free and adds only explicit session flag", () => {
+  const first = loadApplet();
+  first.setHome("/tmp/overview-home");
+  const firstApplet = first.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  firstApplet._refreshOverview();
+  assert.deepEqual(Array.from(first.launcherSpawns[0].argv), [
+    "/tmp/overview-home/.local/bin/codex-master-mcp",
+    "fleet",
+    "overview",
+    "--format",
+    "json",
+  ]);
+
+  const second = loadApplet();
+  second.setSetting("overview-session-no-active-only", true);
+  const secondApplet = second.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  secondApplet._refreshOverview();
+  assert.deepEqual(Array.from(second.launcherSpawns[0].argv), [
+    "/home/tester/.local/bin/codex-master-mcp",
+    "fleet",
+    "overview",
+    "--format",
+    "json",
+    "--no-active-only",
+  ]);
+});
+
+test("overview launcher preserves only approved state roots and strips foreign environment", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  applet._refreshOverview();
+  const launch = fixture.launcherSpawns[0];
+  assert.ok(!launch.unsetCalls.includes("CODEX_USAGE_INTEGRATION_STATE_HOME"));
+  assert.ok(!launch.unsetCalls.includes("XDG_STATE_HOME"));
+  assert.ok(launch.unsetCalls.includes("UNEXPECTED_INJECTOR"));
+  assert.equal(launch.envCalls.some((call) => call.key === "CODEX_USAGE_INTEGRATION_STATE_HOME"), false);
+  assert.equal(launch.envCalls.some((call) => call.key === "XDG_STATE_HOME"), false);
+});
+
+test("overview refresh is single-flight and separate from status state", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const statusState = applet._statusViewState;
+  applet._refreshOverview();
+  applet._refreshOverview();
+  assert.equal(fixture.subprocesses.length, 1);
+  assert.equal(fixture.activeTimers("timeout").length, 1);
+  assert.equal(applet._statusViewState, statusState);
+  assert.equal(applet._statusLastGood, null);
+  applet.on_applet_removed_from_panel();
+  assert.equal(fixture.activeTimers("timeout").length, 0);
+  assert.equal(fixture.subprocesses[0].forceExitCount, 1);
+});
+
+test("malformed overview stays unavailable and preserves status state", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const statusPayload = samplePayload();
+  applet._statusLastGood = statusPayload;
+  applet._statusViewState = "ready";
+  queuePayloadProcess(fixture, { ...sampleOverviewPayload(), account_limits: "bad" });
+  applet._refreshOverview();
+  fixture.subprocesses[0].emitDone();
+  assert.equal(applet._overviewViewState, "unavailable");
+  assert.equal(applet._statusViewState, "ready");
+  assert.deepEqual(applet._statusLastGood, statusPayload);
+});
+
+test("overview accepts fresh, stale, and unavailable data with data-sparse rendering", () => {
+  for (const [freshness, expectedText] of [["fresh", "frisch"], ["stale", "veraltet"]]) {
+    const fixture = loadApplet();
+    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+    queuePayloadProcess(fixture, sampleOverviewPayload({
+      integration_freshness: freshness,
+      agents: sampleOverviewPayload().agents.map((row) => ({ ...row, usage_freshness: freshness })),
+      account_limits: sampleOverviewPayload().account_limits.map((row) => ({ ...row, usage_freshness: freshness })),
+    }));
+    applet._refreshOverview();
+    fixture.subprocesses[0].emitDone();
+    assert.match(getMenuItemText(applet._overviewSummaryItem), new RegExp(expectedText));
+    assert.match(getMenuItemText(applet._overviewSummaryItem), /acct-1/);
+  }
+
+  const unavailable = loadApplet();
+  const unavailableApplet = unavailable.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  queuePayloadProcess(unavailable, sampleOverviewPayload({
+    integration_freshness: "unavailable",
+    series: [],
+    agents: [],
+    account_limits: [],
+    warnings: ["usage_unavailable"],
+  }));
+  unavailableApplet._refreshOverview();
+  unavailable.subprocesses[0].emitDone();
+  assert.match(getMenuItemText(unavailableApplet._overviewSummaryItem), /nicht verfügbar/);
+  assert.equal(getMenuItemText(unavailableApplet._overviewDetailItem), "Übersicht Details: —");
+});
+
+test("overview settings validate strictly and restart only overview work", () => {
+  const cases = [
+    ["overview-interval-seconds", "30", 30],
+    ["overview-session-no-active-only", "true", false],
+    ["overview-compact", 1, true],
+    ["overview-detail", 0, true],
+  ];
+  for (const [key, value, expected] of cases) {
+    const fixture = loadApplet();
+    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+    fixture.setSetting(key, value);
+    const property = {
+      "overview-interval-seconds": "overviewIntervalSeconds",
+      "overview-session-no-active-only": "overviewSessionNoActiveOnly",
+      "overview-compact": "overviewCompact",
+      "overview-detail": "overviewDetail",
+    }[key];
+    assert.equal(applet[property], expected, key);
+    assert.equal(applet._settingsValid, false, key);
+    assert.equal(fixture.subprocesses.length, 0, key);
+  }
+});
+
+test("overview timeout and late callbacks never touch status state", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const statusPayload = samplePayload();
+  applet._statusLastGood = statusPayload;
+  applet._statusViewState = "ready";
+  queuePayloadProcess(fixture, sampleOverviewPayload(), { holdEof: true });
+  applet._refreshOverview();
+  const process = fixture.subprocesses[0];
+  fixture.runTimeouts();
+  assert.equal(process.forceExitCount, 1);
+  assert.equal(applet._statusViewState, "ready");
+  assert.deepEqual(applet._statusLastGood, statusPayload);
+  applet.on_applet_removed_from_panel();
+  applet._statusLastGood = statusPayload;
+  applet._statusViewState = "ready";
+  process.stdout.releaseEof();
+  process.stderr.releaseEof();
+  process.emitDone();
+  assert.equal(applet._statusViewState, "ready");
+  assert.deepEqual(applet._statusLastGood, statusPayload);
+});
+
+test("opening menu starts first overview refresh and then one overview timer", () => {
+  const fixture = loadApplet();
+  queuePayloadProcess(fixture, samplePayload());
+  queuePayloadProcess(fixture, sampleOverviewPayload());
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+
+  applet.on_applet_clicked();
+  assert.equal(fixture.subprocesses.length, 2);
+  assert.equal(applet._overviewInFlight, true);
+  assert.equal(fixture.activeTimers("overview").length, 0);
+
+  fixture.subprocesses[0].emitDone();
+  fixture.subprocesses[1].emitDone();
+  assert.equal(applet._overviewInFlight, false);
+  assert.equal(fixture.activeTimers("overview").length, 1);
+});
+
+test("overview rejects null created_at and non-exact series totals", () => {
+  for (const payload of [
+    sampleOverviewPayload({ created_at: null }),
+    sampleOverviewPayload({
+      series: sampleOverviewPayload().series.map((row) => ({ ...row, total_count: row.agent_ids.length + 1 })),
+    }),
+    sampleOverviewPayload({ integration_freshness: "fresh", warnings: ["usage_unavailable"] }),
+    sampleOverviewPayload({
+      integration_freshness: "fresh",
+      agents: sampleOverviewPayload().agents.map((row) => ({ ...row, usage_freshness: "stale" })),
+    }),
+  ]) {
+    const fixture = loadApplet();
+    const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+    queuePayloadProcess(fixture, payload);
+    applet._refreshOverview();
+    fixture.subprocesses[0].emitDone();
+    assert.equal(applet._overviewViewState, "unavailable");
+    assert.equal(getMenuItemText(applet._overviewSummaryItem), "Übersicht: nicht verfügbar");
+  }
+});
+
+test("overview UTC validation compares calendar components and keeps null reset optional", () => {
+  const { main } = loadApplet();
+  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  for (const value of [
+    "2026-02-29T00:00:00Z",
+    "2026-02-31T00:00:00Z",
+    "2026-04-31T00:00:00+00:00",
+    "2026-01-01T24:00:00Z",
+    "2026-01-01T00:60:00Z",
+    "2026-01-01T00:00:60Z",
+  ]) {
+    assert.equal(applet._overviewUtc(value), false, value);
+  }
+  assert.equal(applet._overviewUtc("2024-02-29T00:00:00Z"), true);
+  assert.equal(applet._overviewUtc("2026-01-01T00:00:00+00:00"), true);
+  assert.equal(applet._overviewUtc(null), true);
+});
+
+test("overview agents must map into series while inactive series members may be omitted", () => {
+  const { main } = loadApplet();
+  const applet = main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  const foreignAgent = sampleOverviewPayload({
+    agents: sampleOverviewPayload().agents.map((row) => ({ ...row, agent_id: "b1" })),
+  });
+  assert.equal(applet._isValidOverviewPayload(foreignAgent), false);
+
+  const activeSubset = sampleOverviewPayload({
+    series: sampleOverviewPayload().series.map((row) => ({
+      ...row,
+      agent_ids: ["a1", "b1"],
+      total_count: 2,
+      active_count: 1,
+    })),
+  });
+  assert.equal(applet._isValidOverviewPayload(activeSubset), true);
+});
+
+test("overview setting changes replace timer or cancel active IO without status mutation", () => {
+  const fixture = loadApplet();
+  const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
+  queuePayloadProcess(fixture, sampleOverviewPayload());
+  applet._refreshOverview();
+  fixture.subprocesses[0].emitDone();
+  const firstTimer = fixture.activeTimers("overview")[0];
+  assert.equal(firstTimer.seconds, 30);
+
+  fixture.setSetting("overview-interval-seconds", 60);
+  const secondTimers = fixture.activeTimers("overview");
+  assert.equal(secondTimers.length, 1);
+  assert.equal(secondTimers[0].seconds, 60);
+  assert.notEqual(secondTimers[0].id, firstTimer.id);
+
+  fixture.setProcessFactory(() => new (class {
+    constructor() {
+      this.forceExitCount = 0;
+      this.waitCallbacks = [];
+      this.stdout = fixture.makeStream([], true);
+      this.stderr = fixture.makeStream([], true);
+    }
+    get_stdout_pipe() { return this.stdout; }
+    get_stderr_pipe() { return this.stderr; }
+    get_successful() { return true; }
+    force_exit() { this.forceExitCount += 1; }
+    wait_async(_, callback) { this.waitCallbacks.push(callback); }
+  })());
+  secondTimers[0].callback();
+  assert.equal(applet._overviewInFlight, true);
+  const process = fixture.subprocesses.at(-1);
+  fixture.setSetting("overview-detail", false);
+  assert.equal(process.forceExitCount, 1);
+  assert.equal(applet._overviewInFlight, false);
+  assert.equal(applet._statusInFlight, false);
+});
 
 test("metadata failure is safe", () => {
   const { main } = loadApplet();
@@ -2028,7 +2376,7 @@ test("exact python error row mixed with a normal row is accepted", () => {
         identity_state: "stopped",
         lease_state: "unclaimed",
         allowed_action: "start",
-        context_token: "c3RhcnQ.c2ln",
+        context_token: START_CONTEXT_VALUE,
         limit_state: "clear",
         blocked_until_utc: null,
       },
@@ -2162,10 +2510,10 @@ test("validator rejects missing/invalid counts, raw_output and duplicate/foreign
   badRaw.raw_output = "other";
 
   const badTopLevelExtra = JSON.parse(JSON.stringify(good));
-  badTopLevelExtra.secret = "must-not-be-stored";
+  badTopLevelExtra[EXTRA_FIELD] = EXTRA_VALUE;
 
   const badRowExtra = JSON.parse(JSON.stringify(good));
-  badRowExtra.agents[0].secret = "must-not-be-stored";
+  badRowExtra.agents[0][EXTRA_FIELD] = EXTRA_VALUE;
 
   const badRowAggregateState = JSON.parse(JSON.stringify(good));
   badRowAggregateState.agents[0].control_state = "mixed";
@@ -2635,6 +2983,10 @@ test("settings schema contains the bounded fleet settings and Ghostty terminal d
 
   assert.deepEqual(Object.keys(schema).sort(), [
     "background-refresh",
+    "overview-compact",
+    "overview-detail",
+    "overview-interval-seconds",
+    "overview-session-no-active-only",
     "panel-display",
     "panel-icon",
     "refresh-interval-seconds",
@@ -2646,6 +2998,10 @@ test("settings schema contains the bounded fleet settings and Ghostty terminal d
   assert.equal(schema["tracked-agents"].default, "a1,b1");
   assert.equal(schema["refresh-on-open"].default, true);
   assert.equal(schema["background-refresh"].default, false);
+  assert.equal(schema["overview-interval-seconds"].default, 30);
+  assert.equal(schema["overview-session-no-active-only"].default, false);
+  assert.equal(schema["overview-compact"].default, true);
+  assert.equal(schema["overview-detail"].default, true);
   assert.equal(schema["terminal-command"].default, "ghostty");
   assert.equal(schema["panel-icon"].default, "hive-01-core");
   assert.equal(schema["settings-icon"].default, "hive-02-queen-crown");
@@ -2896,7 +3252,7 @@ test("quick control preallocates fixed rows and validates one start plus safe st
     control_state: "ready",
     identity_state: "verified",
     allowed_action: "stop",
-    context_token: "c3RvcA.c2ln",
+    context_token: STOP_CONTEXT_VALUE,
   };
 
   assert.equal(applet._maybeApplyStatusPayload(payload), true);
@@ -2910,13 +3266,13 @@ test("quick control preallocates fixed rows and validates one start plus safe st
   duplicateStart.agents[0] = {
     ...duplicateStart.agents[1],
     agent: "a1",
-    context_token: "YW5kZXJl.c2ln",
+    context_token: OTHER_CONTEXT_VALUE,
   };
   realignCounts(duplicateStart);
   assert.equal(applet._maybeApplyStatusPayload(duplicateStart), false);
 
   const malformedToken = JSON.parse(JSON.stringify(payload));
-  malformedToken.agents[1].context_token = "attacker token";
+  malformedToken.agents[1].context_token = MALFORMED_CONTEXT_VALUE;
   assert.equal(applet._maybeApplyStatusPayload(malformedToken), false);
 });
 
@@ -2930,7 +3286,7 @@ test("start confirmation launches one fixed action argv then exactly one status 
     activity_state: "running",
     identity_state: "verified",
     allowed_action: "stop",
-    context_token: "c3RvcA.c2ln",
+    context_token: STOP_CONTEXT_VALUE,
   };
   realignCounts(refreshed);
   queuePayloadProcess(fixture, {
@@ -3149,7 +3505,7 @@ test("refresh-on-open and bounded opt-in background timer preserve single-flight
   const applet = fixture.main({ uuid: "codex-master@H234598" }, "top", 24, 1);
 
   applet.on_applet_clicked();
-  assert.equal(fixture.subprocesses.length, 1, "default refresh-on-open starts one refresh");
+  assert.equal(fixture.subprocesses.length, 2, "menu-open starts status and overview refreshes");
 
   fixture.setSetting("refresh-interval-seconds", 5);
   fixture.setSetting("background-refresh", true);
@@ -3157,11 +3513,11 @@ test("refresh-on-open and bounded opt-in background timer preserve single-flight
   assert.equal(background.length, 1);
   assert.equal(background[0].seconds, 15);
   background[0].callback();
-  assert.equal(fixture.subprocesses.length, 1, "timer cannot overlap active refresh");
+  assert.equal(fixture.subprocesses.length, 2, "timer cannot overlap active status refresh");
   assert.equal(applet._statusPendingRefresh, true);
 
   fixture.subprocesses[0].emitDone();
-  assert.equal(fixture.subprocesses.length, 2, "pending refresh is coalesced once");
+  assert.equal(fixture.subprocesses.length, 3, "pending status refresh is coalesced once");
   fixture.setSetting("background-refresh", false);
   assert.equal(fixture.activeTimers("background").length, 0);
 });

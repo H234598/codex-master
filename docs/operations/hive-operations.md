@@ -32,14 +32,33 @@ Private state is bounded, lock-protected, no-follow, and redacted at public
 boundaries. Real provider credentials and external pilot approval remain
 operational gates.
 
+The hourly Goddess Reporter, its UTC bucket contract, single-leader lock,
+Vault writer, CLI commands, and degraded-state semantics are documented in
+[`goddess-reporting.md`](goddess-reporting.md).
+
 ## Runtime assembly and recovery
 
 The server-side admission adapter must be built from one explicit
 `HiveRuntime` bundle containing the validated Hive config, principal registry,
-repository registry, and authority engine. `build_current_hive_runtime` keeps
+repository registry, authority engine, and private `HiveEventStore`.
+`build_current_hive_runtime` keeps
 local repository roots caller-supplied because paths are not part of the
 public configuration; principal materialization is opt-in and exact config
 parity is required.
+
+`HiveEventStore` persists bounded, payload-free assignment, queue, and completion
+metadata under the Hive state root. Pass this store explicitly to
+`execute_server_queen_assignment()` when the Queen path is productive. The
+adapter records `queued` before callbacks and a sanitized terminal/blocked
+status afterward. Persistence failure before execution blocks the call; failure
+after execution is returned as `event_persistence: failed`. Pure transition
+helpers remain side-effect-free.
+
+For the persistent admission path, construct
+`FileCompletionJournal(..., event_store=runtime.events)`. It emits idempotent
+`executing` and `completed` events alongside the recovery journal. Recovery
+remains based on the completion journal; the reporter never treats a missing
+event as successful execution.
 
 When an executor is attached, pass a private `FileCompletionJournal` to the
 runtime adapter. It durably records only a bounded admission revision and

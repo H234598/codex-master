@@ -1,0 +1,14 @@
+{
+  "accounts": [
+    {
+      "account_id": "alpha",
+      "freshness": {
+        "captured_at": "2026-08-15T11:29:00Z",
+        "stale": true
+      },
+      "status": "partial"
+    }
+  ],
+  "generated_at": "2026-08-15T11:30:00Z",
+  "schema_version": 1
+}

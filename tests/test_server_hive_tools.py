@@ -4,6 +4,7 @@ import pytest
 
 from codex_master import server
 from codex_master.hive.dispatch import HiveDispatchError
+from codex_master.hive.events import HiveEventStore
 from codex_master.hive.messages import validate_message
 
 
@@ -58,6 +59,31 @@ def test_server_queen_adapter_accepts_only_explicit_injected_callbacks() -> None
             queen_id="queen-codex-master", dispatch_id="dispatch-one",
             workpackage={**queen_workpackage(), "repo_id": "foreign-repo"}, context=context,
         )
+
+
+def test_server_queen_adapter_persists_queue_and_completion_events(tmp_path) -> None:
+    events = HiveEventStore(tmp_path / "hive")
+    context = server.build_server_queen_assignment_context(
+        confirmed_accounts={"sha256:" + "a" * 64}, primary_models={"gpt-primary"},
+        create_teamlead_principal=lambda _plan: "lead",
+        create_specialist_principal=lambda _plan: "specialist",
+        issue_grant=lambda _plan: "grant",
+        reserve_admission=lambda _plan: "admission",
+        execute_assignment=lambda _plan: {"status": "accepted"},
+        compensate=lambda *_args: None,
+    )
+
+    result = server.execute_server_queen_assignment(
+        queen_id="queen-codex-master",
+        dispatch_id="dispatch-one",
+        workpackage=queen_workpackage(),
+        context=context,
+        event_store=events,
+    )
+
+    assert result["reason_code"] == "assignment_executed"
+    _, report_events = events.read_report_sources()
+    assert [event["status"] for event in report_events] == ["queued", "completed"]
 
 
 def test_server_pause_preview_is_checkpointed_and_never_selection_driven() -> None:

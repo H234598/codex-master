@@ -1,0 +1,13 @@
+[Unit]
+Description=Codex Master Göttinnenbericht stündlich ausführen
+Documentation=man:systemd.timer(5)
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5m
+AccuracySec=1m
+Persistent=true
+Unit=codex-master-goddess-report.service
+
+[Install]
+WantedBy=timers.target

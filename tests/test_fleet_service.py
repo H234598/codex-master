@@ -1,23 +1,30 @@
 from __future__ import annotations
 
 import os
+import json
 import threading
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
 from codex_master.fleet_registry import (
     AuthKind,
     FleetAccount,
+    FleetAccountV2,
     FleetSeries,
+    FleetSeriesMember,
+    FleetSeriesV2,
     FleetSnapshot,
+    FleetSnapshotV2,
     LimitState,
     Provider,
     RunnerKind,
     SecretState,
+    fleet_document,
 )
 from codex_master.fleet_runners import ProbeResult, ProviderError
 
@@ -70,6 +77,223 @@ def _service(tmp_path: Path, snapshot: FleetSnapshot | None = None):
 
 def _configured_snapshot(*, generation: int = 2) -> FleetSnapshot:
     return FleetSnapshot(1, generation, (_account(secret_state=SecretState.CONFIGURED),), (_series(),))
+
+
+def test_registry_snapshot_reads_registry_only_without_clock_or_limits(tmp_path: Path) -> None:
+    from codex_master.fleet_service import FleetPaths, FleetPrivateIO, FleetService
+
+    expected = _configured_snapshot(generation=7)
+    paths = FleetPaths.from_state_root(tmp_path)
+    calls: list[str] = []
+
+    def read_text(path: Path, _maximum: int, _error: str) -> str:
+        calls.append("registry")
+        assert path == paths.registry
+        return json.dumps(fleet_document(expected))
+
+    io = FleetPrivateIO(
+        ensure_dir=lambda _path: None,
+        read_text=read_text,
+        replace_text=lambda *_args: (_ for _ in ()).throw(AssertionError("write")),
+        read_bytes=lambda *_args: (_ for _ in ()).throw(AssertionError("sidecar")),
+        replace_bytes=lambda *_args: (_ for _ in ()).throw(AssertionError("write")),
+        remove_file=lambda *_args: (_ for _ in ()).throw(AssertionError("write")),
+        lock=lambda: (_ for _ in ()).throw(AssertionError("lock")),
+        utc_now=lambda: (_ for _ in ()).throw(AssertionError("clock")),
+    )
+    service = FleetService(paths, io, pool_root=tmp_path / "pool", read_only=True)
+
+    assert service.registry_snapshot() == expected
+    assert calls == ["registry"]
+
+
+def test_registry_snapshot_v2_never_calls_clock_sidecar_lock_or_write_callbacks(tmp_path: Path) -> None:
+    expected = FleetSnapshotV2(
+        2,
+        7,
+        (FleetAccountV2(
+            "g-account", "G account", Provider.GEMINI_API, AuthKind.API_KEY,
+            SecretState.CONFIGURED, LimitState.READY, True, None, None, None,
+            None, "hmac-sha256:" + "a" * 64,
+        ),),
+        (FleetSeriesV2(
+            "g", "G series", RunnerKind.GEMINI_CLI, Provider.GEMINI_API,
+            "gemini-test", True, "generic", "standard",
+            (FleetSeriesMember(
+                "11111111-1111-4111-8111-111111111111", 1, "g-account", True,
+            ),),
+        ),),
+    )
+    from codex_master.fleet_service import FleetPaths, FleetPrivateIO, FleetService
+
+    paths = FleetPaths.from_state_root(tmp_path)
+    callback_calls = {"registry": 0, "ensure": 0}
+
+    def ensure_dir(_path: Path) -> None:
+        callback_calls["ensure"] += 1
+
+    def read_text(path: Path, _maximum: int, _error: str) -> str:
+        callback_calls["registry"] += 1
+        assert path == paths.registry
+        return json.dumps(fleet_document(expected))
+
+    io = FleetPrivateIO(
+        ensure_dir=ensure_dir,
+        read_text=read_text,
+        replace_text=lambda *_args: (_ for _ in ()).throw(AssertionError("write")),
+        read_bytes=lambda *_args: (_ for _ in ()).throw(AssertionError("sidecar")),
+        replace_bytes=lambda *_args: (_ for _ in ()).throw(AssertionError("write")),
+        remove_file=lambda *_args: (_ for _ in ()).throw(AssertionError("write")),
+        lock=lambda: (_ for _ in ()).throw(AssertionError("lock")),
+        utc_now=lambda: (_ for _ in ()).throw(AssertionError("clock")),
+    )
+    service = FleetService(paths, io, pool_root=tmp_path / "pool", read_only=True)
+
+    assert service.registry_snapshot() == expected
+    assert callback_calls == {"registry": 1, "ensure": 2}
+
+
+def _synthetic_g_binding_state(tmp_path: Path):
+    service, paths = _service(tmp_path, _configured_snapshot())
+    salt_path = paths.secrets / ".credential-binding-salt"
+    salt_path.write_bytes(bytes(range(32)))
+    salt_path.chmod(0o600)
+    secret_path = paths.secrets / "shared.secret"
+    secret_path.write_bytes(b"synthetic-secret")
+    secret_path.chmod(0o600)
+    return service, paths
+
+
+def test_g_binding_evidence_never_creates_salt_or_mutates_registry(tmp_path: Path) -> None:
+    from codex_master.fleet_service import FleetSecretError
+
+    service, paths = _service(tmp_path, _configured_snapshot())
+    callback_called: list[bool] = []
+    with pytest.raises(FleetSecretError, match="credential_binding_unknown"):
+        service._with_g_migration_binding_evidence(
+            ("shared",),
+            expected_generation=2,
+            callback=lambda _snapshot, _bindings: callback_called.append(True),
+        )
+    assert callback_called == []
+    assert not (paths.secrets / ".credential-binding-salt").exists()
+    assert service.load().generation == 2
+
+
+def test_g_binding_evidence_returns_immutable_redacted_hmac_mapping(tmp_path: Path) -> None:
+    service, paths = _synthetic_g_binding_state(tmp_path)
+    seen: list[tuple[FleetSnapshot, MappingProxyType]] = []
+
+    def callback(snapshot: FleetSnapshot, bindings: MappingProxyType) -> dict[str, object]:
+        seen.append((snapshot, bindings))
+        with pytest.raises(TypeError):
+            bindings["other"] = "not-allowed"  # type: ignore[index]
+        return {"generation": snapshot.generation, "binding": bindings["shared"]}
+
+    result = service._with_g_migration_binding_evidence(
+        ("shared",), expected_generation=2, callback=callback
+    )
+
+    assert result["generation"] == 2
+    assert isinstance(result["binding"], str)
+    assert result["binding"].startswith("hmac-sha256:")
+    assert len(seen) == 1
+    assert seen[0][0].generation == 2
+    assert type(seen[0][1]) is MappingProxyType
+    rendered = repr(result)
+    assert "synthetic-secret" not in rendered
+    assert bytes(range(32)).hex() not in rendered
+    assert paths.registry.exists()
+
+
+@pytest.mark.parametrize("salt_kind", ["mode", "symlink"])
+def test_g_binding_evidence_rejects_unsafe_salt_without_mutation(
+    tmp_path: Path, salt_kind: str
+) -> None:
+    from codex_master.fleet_service import FleetSecretError
+
+    service, paths = _synthetic_g_binding_state(tmp_path)
+    salt_path = paths.secrets / ".credential-binding-salt"
+    original = bytes(range(32))
+    if salt_kind == "mode":
+        salt_path.chmod(0o644)
+    else:
+        target = tmp_path / "salt-target"
+        target.write_bytes(original)
+        target.chmod(0o600)
+        salt_path.unlink()
+        salt_path.symlink_to(target)
+    callback_called: list[bool] = []
+
+    with pytest.raises(FleetSecretError, match="credential_binding_unknown"):
+        service._with_g_migration_binding_evidence(
+            ("shared",),
+            expected_generation=2,
+            callback=lambda _snapshot, _bindings: callback_called.append(True),
+        )
+    assert callback_called == []
+    assert service.load().generation == 2
+    if salt_kind == "mode":
+        assert salt_path.read_bytes() == original
+        assert salt_path.stat().st_mode & 0o777 == 0o644
+    else:
+        assert salt_path.is_symlink()
+
+
+@pytest.mark.parametrize("account_ids, expected_generation", [("shared", 2), (("missing",), 2), (("shared",), 1)])
+def test_g_binding_evidence_rejects_invalid_account_or_generation(
+    tmp_path: Path, account_ids: object, expected_generation: int
+) -> None:
+    from codex_master.fleet_service import FleetSecretError
+
+    service, _paths = _service(tmp_path, _configured_snapshot())
+    callback_called: list[bool] = []
+    with pytest.raises(FleetSecretError, match="credential_binding_unknown"):
+        service._with_g_migration_binding_evidence(
+            account_ids,
+            expected_generation=expected_generation,
+            callback=lambda _snapshot, _bindings: callback_called.append(True),
+        )
+    assert callback_called == []
+    assert service.load().generation == 2
+
+
+@pytest.mark.parametrize("sidecar_kind", ["missing", "unreadable", "rotated"])
+def test_g_binding_evidence_rejects_sidecar_drift_without_callback(
+    tmp_path: Path, sidecar_kind: str
+) -> None:
+    from codex_master.fleet_service import FleetSecretError
+
+    service, paths = _synthetic_g_binding_state(tmp_path)
+    secret_path = paths.secrets / "shared.secret"
+    if sidecar_kind == "missing":
+        secret_path.unlink()
+    else:
+        real_io = service._io
+
+        def read_bytes(path: Path, limit: int, error: str) -> bytes | None:
+            if path == secret_path and sidecar_kind == "unreadable":
+                raise OSError("synthetic-sidecar-error")
+            value = real_io.read_bytes(path, limit, error)
+            if path == secret_path and sidecar_kind == "rotated":
+                path.write_bytes(b"rotated-sidecar")
+                path.chmod(0o600)
+            return value
+
+        service = type(service)(
+            paths,
+            replace(real_io, read_bytes=read_bytes),
+            pool_root=tmp_path / "pool",
+        )
+    callback_called: list[bool] = []
+    with pytest.raises(FleetSecretError, match="credential_binding_unknown"):
+        service._with_g_migration_binding_evidence(
+            ("shared",),
+            expected_generation=2,
+            callback=lambda _snapshot, _bindings: callback_called.append(True),
+        )
+    assert callback_called == []
+    assert service.load().generation == 2
 
 
 def test_missing_registry_loads_initial_private_layout(tmp_path: Path) -> None:
@@ -210,6 +434,95 @@ def test_gemini_rate_reservation_blocks_bursts_across_service_instances(tmp_path
     assert raised.value.reason == "gemini_local_rate_limit"
     assert raised.value.retry_after_seconds >= 60
     assert reservation.reservation_id in paths.rate_limits.read_text(encoding="utf-8")
+
+
+def test_tier1_quota_profile_keeps_provider_quotas_dashboard_driven(tmp_path: Path) -> None:
+    service, _ = _service(tmp_path, _configured_snapshot())
+
+    tier1 = service.gemini_quota_profile("the-hive-1")
+    tier1_lite = service.gemini_quota_profile(
+        "the-hive-1", model="gemini-3.1-flash-lite"
+    )
+    tier1_flash = service.gemini_quota_profile("the-hive-1", model="gemini-3-flash")
+    unknown = service.gemini_quota_profile("the-hive-11")
+
+    assert tier1["billing_tier"] == "tier1"
+    assert service.project_limit_identity("the-hive-1")["billing_group"] == "the-hive-account-1"
+    assert tier1["rpm_limit"] is None
+    assert tier1_lite["rpm_limit"] == 4000
+    assert tier1_lite["tpm_limit"] == 4_000_000
+    assert tier1_lite["rpd_limit"] == 150_000
+    assert tier1_flash["rpm_limit"] == 1000
+    assert tier1_flash["tpm_limit"] == 2_000_000
+    assert tier1_flash["rpd_limit"] == 10_000
+    assert type(service).gemini_quota_limits("tier0", "gemini-3.1-flash-lite") == {
+        "rpm": 15,
+        "tpm": 250_000,
+        "rpd": 500,
+    }
+    assert tier1["spend_rate_limit_usd_per_10_minutes"] == 10.0
+    assert tier1["billing_cap_usd_per_month"] == 250.0
+    assert tier1["local_request_interval_seconds"] == 4
+    tier0 = service.gemini_quota_profile("the-hive-4", model="gemini-3-flash")
+    assert tier0["billing_tier"] == "tier0"
+    assert tier0["rpm_limit"] == 5
+    assert tier0["tpm_limit"] == 250_000
+    assert tier0["rpd_limit"] == 20
+    assert tier0["spend_rate_limit_usd_per_10_minutes"] is None
+    assert service.gemini_quota_profile("the-hive-3")["billing_tier"] == "tier0"
+    assert service.gemini_quota_profile("the-hive-3")["limits_by_model"] == {}
+    assert unknown["billing_tier"] == "unknown"
+    assert unknown["local_request_interval_seconds"] == 60
+
+
+def test_gemini_billing_group_profile_and_registry_override(tmp_path: Path) -> None:
+    registry_account = replace(
+        _account("the-hive-1", secret_state=SecretState.CONFIGURED),
+        billing_group="registry-billing-account",
+    )
+    snapshot = FleetSnapshot(1, 2, (registry_account,), (_series(account_id="the-hive-1"),))
+    service, _ = _service(tmp_path, snapshot)
+
+    assert service.gemini_quota_profile("the-hive-1")["billing_group"] == "the-hive-account-1"
+    assert service.project_limit_identity("the-hive-1")["billing_group"] == "registry-billing-account"
+
+
+def test_gemini_usage_status_reports_observations_without_fake_quota_percentages(tmp_path: Path) -> None:
+    service, _ = _service(tmp_path, _configured_snapshot())
+    service.record_gemini_usage(
+        "the-hive-1",
+        model="gemini-3.1-flash-lite",
+        input_tokens=120,
+        output_tokens=30,
+    )
+
+    status = service.gemini_usage_status("the-hive-1")
+
+    assert status["rpm_observed"] == 1
+    assert status["tpm_observed"] == 120
+    assert status["rpd_observed"] == 1
+    assert status["quota_evaluation"]["state"] == "within_limits"
+    assert status["quota_evaluation"]["limits"] == {
+        "rpm": 4000,
+        "tpm": 4_000_000,
+        "rpd": 150_000,
+    }
+    assert status["quota_evaluation"]["utilization_percent"] == {
+        "rpm": 0.03,
+        "tpm": 0.0,
+        "rpd": 0.0,
+    }
+    assert status["spend_evaluation"]["state"] == "billing_export_required"
+
+
+def test_gemini_rate_status_exposes_quota_profile_before_first_request(tmp_path: Path) -> None:
+    service, _ = _service(tmp_path, _configured_snapshot())
+
+    status = service.gemini_rate_status("the-hive-1")
+
+    assert status["allowed"] is True
+    assert status["billing_tier"] == "tier1"
+    assert status["local_request_interval_seconds"] == 4
 
 
 def test_gemini_rate_reservation_applies_exponential_429_cooldown(tmp_path: Path) -> None:

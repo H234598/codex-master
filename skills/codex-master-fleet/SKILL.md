@@ -30,13 +30,42 @@ not show it; test the user's model IDs instead of assuming they are unavailable.
 
 ## Model Policy
 
-- Managed Agentinnen run on `gpt-5.4-mini` by default with medium
-  reasoning effort.
-- Exploriererin/read-only assignments keep `gpt-5.4-mini`.
-- Arbeitsbiene write assignments are marked for `gpt-5.3-codex-spark` with low
-  reasoning effort.
-- If a running Codex TUI cannot switch model mid-session, the assignment still
-  carries `Modell: gpt-5.3-codex-spark` as the required escalation signal.
+- Treat `codex-agent-classes.json` and `codex-model-policy.json` as authoritative.
+  Before the first start or assignment for a series, request
+  `agent_selection_options`; cache its `generation` and refresh when
+  `options_changed` is true. Do not reconstruct or force a stale model list.
+- Send an offered class/lifecycle/model/reasoning tuple when possible. Omitted
+  fields are resolved once by the shared start/assignment resolver: simple
+  ephemeral write defaults to Spark/low; read-only ephemeral defaults to
+  Luna/medium; medium or complex work rejects Spark as below task capability
+  and selects at least Luna; binding defaults to Luna/high; persistent workers
+  default to Luna/xhigh.
+- Compatible explicit choices win. For a worker, an explicitly unknown or
+  unavailable model falls back to Luna, never Spark; preserve a compatible
+  explicit effort or clamp it to replacement-model and class/lifecycle bounds.
+  Spark is only the no-model default for a simple write. Class-incompatible or
+  too-weak choices still fall back inside hard bounds. Always report requested
+  and effective values plus `reason_codes` immediately; the requesting model
+  may stop or choose another offered tuple. Goettin, Gottbiene, and Koenigin
+  stay Sol-bound; Teamleiterin is a separate exact Terra policy.
+- Class and lifecycle minima remain hard. Workers may move Spark -> Luna ->
+  Terra -> Sol only inside offered class, lifecycle, model-effort, and class
+  bounds. Persistent workers require `xhigh`; only Goettin and Gottbiene use
+  `max`; `ultra` is forbidden.
+- Leadership classes are always persistent. Goettin and Gottbiene use Sol/max;
+  Koenigin uses Sol/xhigh. The current Sol default is `gpt-5.6-sol`, but any
+  offered Sol-family ID with the exact class effort is valid. Missing Sol or
+  required effort fails closed; never fall back to Terra, Luna, or Spark.
+  Teamleiterin uses exactly `gpt-5.6-terra`/`xhigh`, with
+  `xhigh` as both minimum and maximum effort; never downgrade her to Spark,
+  Luna, Sol, or another effort.
+- The first `agent_selection_options` offer must visibly include Teamleiterin
+  with only `class=teamleiterin`, `lifecycle=persistent`,
+  `model=gpt-5.6-terra`, and `reasoning=xhigh`. Policy still fixes `xhigh` as
+  both minimum and maximum effort. A required unavailable model or effort is a
+  hard error: `required_model_unavailable:gpt-5.6-terra` or
+  `required_model_effort_unavailable:gpt-5.6-terra:xhigh`; do not apply a
+  fallback, especially for Teamleiterin.
 
 ## Fleet Policy
 
@@ -47,10 +76,16 @@ not show it; test the user's model IDs instead of assuming they are unavailable.
 - Give Agentinnen modern female names unless the user requests a fixed name.
 - The main instance is the Teamleiterin. It may inspect and integrate, but
   should mainly coordinate, test, commit, push, and release.
-- Default eigene-Bienen fleet size is 2-3 Bienen. Maximum is 6, only for
-  independent tasks. In addition, fremde Bienen may be spawned directly through
-  MCP/plugin control surfaces; use 1-2 by default when delegation helps, with
-  leases, auth checks, and write scopes as the safety boundary.
+- Only the Koenigin may restart or reload Masterjet, install it, or synchronize
+  its plugin cache. Other roles may inspect status and provide verification or
+  a reload recommendation, but must not perform these lifecycle actions.
+- Temporary global cap is 10 Bienen total across running Masterjet sessions and
+  active or unconfirmed native Subagentinnen. At 10, spawn no further Biene.
+  Existing CPU, load, I/O-wait, RAM, host-pressure, and Ollama two-agent
+  thresholds remain configured and are enforced; they are additional admission
+  gates below the global cap. In addition, fremde Bienen may be spawned
+  directly through MCP/plugin control surfaces, with leases, auth checks, and
+  write scopes as the safety boundary.
 - Exploriererinnen read, analyze, and report concise context packages only.
 - Arbeitsbienen may write only in assigned files or isolated workspaces.
 - Before assigning writes, inspect `git status --short` and avoid overlapping
@@ -357,7 +392,9 @@ Exploriererin:
 [EXPLORER_BEE_TASK]
 Name: {moderner weiblicher Name}
 Rolle: Exploriererin
-Modell: gpt-5.4-mini
+Auswahl: {aktuelle agent_selection_options generation plus angebotenes Tupel}
+Lifecycle: ephemeral
+Komplexitaet: {simple/medium/complex}
 Scope: {Dateien/Ordner/Webthema}
 Darf schreiben: nein
 Darf eigene Subagentinnen starten: {ja/nein, nur lesend im Scope}
@@ -371,7 +408,9 @@ Arbeitsbiene:
 [WORK_BEE_TASK]
 Name: {moderner weiblicher Name}
 Rolle: Arbeitsbiene
-Modell: gpt-5.3-codex-spark
+Auswahl: {aktuelle agent_selection_options generation plus angebotenes Tupel}
+Lifecycle: {ephemeral/binding/persistent}
+Komplexitaet: {simple/medium/complex}
 Scope: {Dateien/Ordner}
 Darf schreiben: ja, nur {genaue Pfade}
 Darf eigene Subagentinnen starten: {ja/nein, nur innerhalb Scope und Schreibpfaden}

@@ -1,0 +1,47 @@
+{
+  "accounts": [
+    {
+      "account_id": "alpha",
+      "cost_windows": [
+        {
+          "consumed_percentage_points": 25.0,
+          "coverage": "complete",
+          "limit_window_seconds": 18000,
+          "lookback_seconds": 3600,
+          "pool": "primary",
+          "sample_count": 4
+        }
+      ],
+      "freshness": {
+        "captured_at": "2026-08-15T11:59:00Z",
+        "stale": false
+      },
+      "limits": [
+        {
+          "pool": "primary",
+          "remaining_percent": 75.0,
+          "reset_at": "2026-08-15T13:00:00Z",
+          "used_percent": 25.0,
+          "window_seconds": 18000
+        }
+      ],
+      "status": "ok",
+      "usage_resets": {
+        "available": 100,
+        "known": true,
+        "redeem_capability": false
+      }
+    },
+    {
+      "account_id": "outsider",
+      "freshness": {
+        "captured_at": "2026-08-15T11:59:00Z",
+        "stale": false
+      },
+      "status": "unknown"
+    }
+  ],
+  "generated_at": "2026-08-15T12:00:00Z",
+  "schema_version": 1,
+  "source_commit": "synthetic-task6"
+}

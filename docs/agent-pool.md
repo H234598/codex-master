@@ -100,8 +100,8 @@ executable wrappers, minimal configs, runtime directories, and an installed pool
 marker. It does not start Agentinnen and does not copy auth by default.
 
 Running Agentinnen are driven through tmux. The Masterjet pastes text into the
-Codex TUI and submits with `C-Enter`; plain `Enter` can remain in the composer
-for multi-line or wrapped prompts in current Codex CLI builds.
+Codex TUI and submits with plain `Enter`. Multi-line prompts use bracketed-paste
+markers so the complete prompt remains one composer entry before submission.
 Before pasting, `send`, `assign-*`, and `report-request` wait briefly for a
 visible Codex TUI input prompt marker in the current visible pane tail. If the
 TUI is still starting, only shows starter text, or only startup warnings are

@@ -25,6 +25,30 @@
     "step": 15,
     "units": "Sekunden"
   },
+  "overview-interval-seconds": {
+    "type": "spinbutton",
+    "description": "Fleet-Overview-Intervall",
+    "default": 30,
+    "min": 15,
+    "max": 3600,
+    "step": 15,
+    "units": "Sekunden"
+  },
+  "overview-session-no-active-only": {
+    "type": "switch",
+    "description": "Overview sessionsbasiert vollständig anzeigen",
+    "default": false
+  },
+  "overview-compact": {
+    "type": "switch",
+    "description": "Overview kompakt anzeigen",
+    "default": true
+  },
+  "overview-detail": {
+    "type": "switch",
+    "description": "Overview-Agentdetails anzeigen",
+    "default": true
+  },
   "terminal-command": {
     "type": "entry",
     "description": "Terminal für Flottenstatus",

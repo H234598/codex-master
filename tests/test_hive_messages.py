@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -33,6 +34,43 @@ def test_message_validation_is_typed_bounded_and_public_payload_free() -> None:
     message = validate_message(message_payload())
     assert message.public()["raw_output"] == "not_returned"
     assert "payload" not in message.public()
+
+
+def test_message_preserves_distinct_non_null_causation_at_wire_and_direct_boundary() -> None:
+    payload = message_payload()
+    payload["causation_id"] = "msg-parent"
+
+    wire = validate_message(payload)
+    direct = replace(wire)
+
+    assert (wire.message_id, wire.correlation_id, wire.causation_id) == (
+        "msg-one",
+        "req-one",
+        "msg-parent",
+    )
+    assert direct == wire
+    assert direct.public() == wire.public()
+
+
+def test_hive_message_constructor_rejects_self_causation_without_value_leak() -> None:
+    message = validate_message(message_payload())
+
+    with pytest.raises(HiveMessageError, match=r"^message_self_causation$") as raised:
+        replace(message, causation_id=message.message_id)
+
+    assert str(raised.value) == "message_self_causation"
+    assert message.message_id not in str(raised.value)
+
+
+def test_message_wire_boundary_rejects_self_causation_without_value_leak() -> None:
+    payload = message_payload()
+    payload["causation_id"] = payload["message_id"]
+
+    with pytest.raises(HiveMessageError, match=r"^message_self_causation$") as raised:
+        validate_message(payload)
+
+    assert str(raised.value) == "message_self_causation"
+    assert payload["message_id"] not in str(raised.value)
 
 
 @pytest.mark.parametrize(

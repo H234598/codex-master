@@ -22,6 +22,7 @@ import json
 import math
 import os
 import re
+import selectors
 import shutil
 import shlex
 import signal
@@ -32,9 +33,11 @@ import threading
 import time
 import tomllib
 import uuid
+from collections.abc import Collection
 from pathlib import Path
+from functools import partial
 from types import MappingProxyType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from codex_master import __version__
 from codex_master.fleet_registry import (
@@ -43,6 +46,7 @@ from codex_master.fleet_registry import (
     FleetAccount,
     FleetSeries,
     FleetSnapshot,
+    FleetSnapshotV2,
     FleetValidationError,
     InventorySnapshot,
     LimitState,
@@ -50,12 +54,40 @@ from codex_master.fleet_registry import (
     RunnerKind,
     SecretState,
     build_inventory,
+    fleet_document,
     plan_account_disable,
     plan_account_upsert,
     plan_series_apply,
     plan_series_delete,
     plan_series_disable,
     normalize_fleet_document,
+)
+from codex_master.fleet_overview import (
+    build_fleet_overview,
+    enrich_fleet_overview_usage,
+    render_fleet_overview,
+)
+from codex_master.goddess_reporting import (
+    ReporterStateStore,
+    aggregate_task_rows,
+    bucket_start,
+    build_hourly_report,
+    eligible_buckets,
+    render_markdown,
+)
+from codex_master.goddess_supervisor import (
+    ReporterLeaderBusy,
+    ReporterLeaderLease,
+    active_reporter_required,
+    reporter_leader_active,
+)
+from codex_master.vault_output import write_hourly_report
+from codex_master.usage_snapshot import (
+    UsageSnapshot,
+    default_runner,
+    load_account_usage_v1,
+    read_account_usage_cache_v1,
+    read_active_launcher_v1,
 )
 from codex_master.fleet_snapshot import (
     FleetSnapshot as FleetWatchdogSnapshot,
@@ -88,6 +120,27 @@ from codex_master.fleet_recovery import (
     plan_reconciliation,
     recovery_document,
     normalize_recovery_document,
+    GMigrationAlias,
+    GMigrationHomeIdentity,
+    GMigrationJournal,
+    GMigrationPhase,
+    g_migration_alias_view,
+    g_migration_journal_document,
+    normalize_g_migration_journal,
+)
+from codex_master.fleet_migration_apply import (
+    GMigrationApplyError,
+    GMigrationManifest,
+    GMigrationPrepared,
+    _materialize_g_migration_locked,
+    _preflight_g_migration,
+)
+from codex_master.fleet_migration_materialization import MemberIdAllocation
+from codex_master.fleet_inplace import (
+    InplaceError,
+    QHomeUpdate,
+    apply_series_update as apply_q_series_update,
+    recover_series_update as recover_q_series_update,
 )
 from codex_master.fleet_service import (
     FleetConflictError,
@@ -96,6 +149,7 @@ from codex_master.fleet_service import (
     FleetRateLimitError,
     FleetSecretError,
     FleetService,
+    MAX_EVENT_BYTES,
 )
 from codex_master.fleet_runners import (
     FleetRunnerError,
@@ -131,6 +185,19 @@ from codex_master.admission import (
 )
 from codex_master.admission_journal import CompletionJournal
 from codex_master.admission_runtime import AdmissionGate, RuntimeGateDecision, ServerAdmissionRuntime
+from codex_master.agent_resolver import (
+    LEADERSHIP_CLASS_IDS,
+    LIFECYCLE_ALIASES,
+    LIFECYCLE_RANK,
+    ModelPolicy,
+    REASONING_RANK,
+    ResolutionDecision,
+    ResolutionRequest,
+    build_selection_offer,
+    policies_from_catalogs,
+    resolve_agent_selection,
+    validate_canonical_agent_tuple,
+)
 from codex_master.hive.admission import create_assignment_admission
 from codex_master.hive.authority import AuthorityEngine, DelegationGrant
 from codex_master.hive.cli import add_hive_cli_parsers, run_hive_cli
@@ -145,12 +212,20 @@ from codex_master.hive.dispatch import (
     plan_queen_assignment,
     request_cooperative_pause,
 )
+from codex_master.hive.events import HiveEventError, HiveEventStore
 from codex_master.hive.messages import HiveMessage
 from codex_master.hive.repositories import RepositoryRegistry
 from codex_master.hive.config import load_agent_class_catalog, load_hive_config
 from codex_master.hive.runtime import HiveRuntime, build_hive_runtime
 from codex_master.hive.tools import call_hive_tool, hive_tool_definitions
+from codex_master.selection.model_policy import load_model_policy
+from codex_master.selection.task_classification import (
+    TaskClassificationRequest,
+    TaskClassifier,
+    TaskProfile,
+)
 from codex_master.selection_service import SelectionRequest, SelectionService
+from codex_master.hive.types import TaskComplexity
 
 
 STATE_ROOT = Path(
@@ -158,6 +233,9 @@ STATE_ROOT = Path(
     or os.environ.get("CODEX_AGENT_MCP_STATE")
     or "~/.local/state/codex-master-mcp"
 ).expanduser()
+GODDESS_REPORT_STATE_FILE = STATE_ROOT / "goddess-reporter" / "state.json"
+GODDESS_REPORT_LEADER_FILE = STATE_ROOT / "goddess-reporter" / "leader.lock"
+DEFAULT_PROGRAMMING_VAULT = Path.home() / "Dokumente" / "Obsidian_Vaults" / "Teladi_Programming"
 LEGACY_STATE_ROOT = Path("~/.local/state/codex-agent-mcp").expanduser()
 RAW_DIR = STATE_ROOT / "raw"
 META_DIR = STATE_ROOT / "meta"
@@ -170,10 +248,11 @@ ADMISSION_STATE_FILE = STATE_ROOT / "admission-state.json"
 ADMISSION_LOCK_FILE = STATE_ROOT / "admission-state.lock"
 TEAMLEADER_REGISTRY_FILE = STATE_ROOT / "teamleaders.json"
 LEGACY_META_DIR = LEGACY_STATE_ROOT / "meta"
-DEFAULT_AGENT_MODEL = "gpt-5.4-mini"
+DEFAULT_AGENT_MODEL = "gpt-5.6-luna"
 DEFAULT_AGENT_MODEL_EFFORT = "medium"
 WRITE_AGENT_MODEL = "gpt-5.3-codex-spark"
 WRITE_AGENT_MODEL_EFFORT = "low"
+CODEX_USAGE_LEGACY_MAIN_MODEL = "gpt-5.4-mini"
 BASE_ARGS = [
     "--model",
     DEFAULT_AGENT_MODEL,
@@ -192,11 +271,36 @@ HEADLESS_META_KEY = "headless_job"
 DEFAULT_HEADLESS_TIMEOUT_SECONDS = 600
 
 
-def agent_base_args(model: str, reasoning_effort: str) -> list[str]:
-    if model not in {DEFAULT_AGENT_MODEL, WRITE_AGENT_MODEL}:
+def agent_base_args(model: str, reasoning_effort: str, *, agent_class: str | None = None) -> list[str]:
+    model_registry = load_model_policy(repo_root() / "codex-model-policy.json")
+    definition = model_registry.get_exact(model)
+    if definition is None or not definition.enabled or definition.spawn_behavior != "manual":
+        if agent_class in LEADERSHIP_CLASS_IDS:
+            raise AgentError("unsupported routed agent tuple")
         raise AgentError("unsupported routed agent model")
-    if reasoning_effort not in {DEFAULT_AGENT_MODEL_EFFORT, WRITE_AGENT_MODEL_EFFORT}:
-        raise AgentError("unsupported routed reasoning effort")
+    if agent_class in LEADERSHIP_CLASS_IDS:
+        class_catalog = load_agent_class_catalog(repo_root() / "codex-agent-classes.json")
+        classes, models = policies_from_catalogs(class_catalog, model_registry)
+        class_policy = next((item for item in classes if item.class_id == agent_class), None)
+        model_policy = next((item for item in models if item.model_id == model), None)
+        if (
+            class_policy is None
+            or model_policy is None
+            or len(class_policy.allowed_lifecycles) != 1
+            or class_policy.default_lifecycle != "persistent"
+        ):
+            raise AgentError("unsupported routed agent tuple")
+        try:
+            validate_canonical_agent_tuple(
+                class_policy,
+                model_policy,
+                class_policy.default_lifecycle,
+                reasoning_effort,
+            )
+        except ValueError as exc:
+            raise AgentError("unsupported routed agent tuple") from exc
+    elif reasoning_effort not in definition.reasoning_levels or reasoning_effort == "max":
+        raise AgentError("unsupported routed agent tuple")
     return [
         "--model",
         model,
@@ -285,11 +389,17 @@ MAX_TOOL_CATALOG_BYTES = 1024 * 1024
 MAX_ERROR_CHARS = 1200
 MAX_META_BYTES = 64 * 1024
 RESOURCE_MEMINFO_PATH = Path("/proc/meminfo")
-RESOURCE_MAX_LOAD_PER_CPU = 0.85
+RESOURCE_PROC_STAT_PATH = Path("/proc/stat")
+RESOURCE_MAX_LOAD_PER_CPU = 1.75
+RESOURCE_MAX_CPU_BUSY_PERCENT = 90.0
+RESOURCE_MAX_IO_WAIT_PERCENT = 50.0
+RESOURCE_CPU_SAMPLE_SECONDS = 0.05
 RESOURCE_MIN_AVAILABLE_MEMORY_PERCENT = 20.0
 RESOURCE_MIN_AVAILABLE_MEMORY_MIB = 1024
-RESOURCE_MAX_RUNNING_AGENTS = 6
+RESOURCE_MAX_RUNNING_AGENTS = 10
+RESOURCE_PRESSURE_LIMITS_ENABLED = True
 OLLAMA_MAX_CONCURRENT_AGENTS = 2
+OLLAMA_CONCURRENCY_LIMIT_ENABLED = True
 OLLAMA_SIMPLE_TASK_MAX_CHARS = 800
 SPAWN_OFFER_TTL_SECONDS = 5
 SPAWN_OFFER_RETRY_AFTER_SECONDS = 15
@@ -300,6 +410,7 @@ RESOURCE_REASON_CODES = frozenset(
         "session_metrics_unavailable",
         "policy_invalid",
         "cpu_pressure_high",
+        "io_pressure_high",
         "memory_pressure_high",
         "running_agent_limit",
         "insufficient_slots",
@@ -308,6 +419,7 @@ RESOURCE_REASON_CODES = frozenset(
 MAX_CODEX_USAGE_SNAPSHOT_BYTES = 64 * 1024
 MAX_CODEX_USAGE_DECISION_BYTES = 64 * 1024
 MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID = 512
+MAX_OLLAMA_RESPONSE_BYTES = 256 * 1024
 MAX_CODEX_CONFIG_BYTES = 1024 * 1024
 MAX_PLUGIN_MANIFEST_BYTES = 64 * 1024
 MAX_POOL_SPEC_BYTES = 256 * 1024
@@ -333,10 +445,14 @@ PLUGIN_CACHE_EXCLUDED_NAMES = (".git", ".pytest_cache", ".mypy_cache", ".ruff_ca
 PLUGIN_CACHE_EXCLUDED_SUFFIXES = (".pyc", ".pyo", ".swp", ".swo", ".tmp", ".bak", ".orig", ".rej", "~")
 COMMAND_TIMEOUT_RETURN_CODE = 124
 COMMAND_UNAVAILABLE_RETURN_CODE = 127
+COMMAND_OUTPUT_LIMIT_RETURN_CODE = 125
 DEFAULT_TMUX_TIMEOUT_SECONDS = 10
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 120
+MAX_COMMAND_STDOUT_BYTES = 2 * 1024 * 1024
+MAX_COMMAND_STDERR_BYTES = 256 * 1024
 SERIES_DISABLE_TIMEOUT_SECONDS = 30.0
 DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS = 10
+MAX_MCP_PROBE_OUTPUT_BYTES = 256 * 1024
 RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS = 120
 FLEET_DESKTOP_ENTRY_NAME = "de.teladi.CodexMaster.ControlCenter.desktop"
 MAX_FLEET_DESKTOP_ENTRY_BYTES = 16 * 1024
@@ -402,10 +518,14 @@ APPLET_ACTION_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
 NATIVE_AGENT_REGISTRY_FILE = STATE_ROOT / "native-agents.json"
 NATIVE_AGENT_REGISTRY_LOCK_FILE = LOCK_DIR / "native-agents.lock"
 MAX_NATIVE_AGENT_RECORDS = 64
+MAX_NATIVE_SESSION_RECORDS = 64
 MAX_NATIVE_AGENT_REGISTRY_BYTES = 64 * 1024
+MAX_NATIVE_TRANSCRIPT_HEADER_BYTES = 64 * 1024
 MAX_NATIVE_APPLET_AGENTS = 6
 NATIVE_AGENT_ACTIVE_SECONDS = 2 * 60 * 60
 NATIVE_AGENT_RETENTION_SECONDS = 24 * 60 * 60
+NATIVE_AGENT_RESERVATION_TTL_SECONDS = 30
+MAX_NATIVE_AGENT_RESERVATIONS = 64
 NATIVE_AGENT_LOCK_TIMEOUT_SECONDS = 0.1
 NATIVE_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 NATIVE_AGENT_TYPE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -533,7 +653,7 @@ PLUGIN_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+_-]{0,199}$")
 RELEASE_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+(?:[A-Za-z0-9.+_-]*)?$")
 BRACKETED_PASTE_BEGIN = "\x1b[200~"
 BRACKETED_PASTE_END = "\x1b[201~"
-CODEX_TUI_SUBMIT_KEY = "C-Enter"
+CODEX_TUI_SUBMIT_KEY = "Enter"
 CODEX_TUI_TRUST_PROMPT_SUBMIT_KEY = "Enter"
 CODEX_TUI_INPUT_MARKERS = ("›",)
 CODEX_TUI_INPUT_MARKER_WINDOW_LINES = 8
@@ -638,6 +758,35 @@ def default_agentin_name(agent: str) -> str:
     return f"{base} {agent.upper()}"
 
 
+def apply_agent_introduction_policy(
+    prompt: str | None,
+    *,
+    agent_class: str | None,
+    name: str | None,
+) -> str | None:
+    if agent_class is None:
+        return prompt
+    profile = load_agent_class_catalog(repo_root() / "codex-agent-classes.json").get(agent_class)
+    if profile is None or not profile.introduces_to_user:
+        return prompt
+    stable_name = name.strip() if name else None
+    name_instruction = (
+        f'Verwende dabei den stabilen Namen "{stable_name}" und behalte ihn ueber deine gesamte Lebensdauer bei.'
+        if stable_name
+        else "Waehle dafuer einmal einen stabilen Namen und behalte ihn ueber deine gesamte Lebensdauer bei."
+    )
+    policy = "\n".join(
+        [
+            "[USER_INTRODUCTION_POLICY]",
+            "Nur wenn dies dein erstes tatsaechliches direktes Gespraech mit einem User ist, stelle dich einmal vor.",
+            name_instruction,
+            "Rein interne Agentin-zu-Agentin-Kommunikation loest keine Vorstellung aus.",
+            "Stelle dich nach diesem ersten direkten User-Gespraech nicht erneut vor und benenne dich nicht neu.",
+        ]
+    )
+    return f"{policy}\n\n{prompt}" if prompt else policy
+
+
 def build_agent_config(agent: str) -> dict[str, Any]:
     key = agent_env_key(agent)
     legacy_key = legacy_agent_env_key(agent)
@@ -668,12 +817,17 @@ def build_agent_config(agent: str) -> dict[str, Any]:
 AGENTS = {agent: build_agent_config(agent) for agent in AGENT_IDS}
 _ACTIVE_AGENT_INVENTORY: InventorySnapshot | None = None
 _ACTIVE_AGENT_INVENTORY_LOCK = threading.RLock()
+_ACTIVE_G_ALIAS_VIEW: tuple[int, Mapping[str, str]] | None = None
 _FLEET_STARTUP_ERROR: str | None = None
 _LEGACY_INVENTORY_CACHE: InventorySnapshot | None = None
 _LEGACY_INVENTORY_FINGERPRINT: tuple[tuple[str, str], ...] | None = None
 _ACTIVE_AGENT_INVENTORY_FINGERPRINT: tuple[tuple[str, str], ...] | None = None
 _WATCHDOG_SNAPSHOT: contextvars.ContextVar[FleetWatchdogSnapshot | None] = contextvars.ContextVar(
     "codex_master_watchdog_snapshot",
+    default=None,
+)
+_RESOURCE_ADMISSION_CONTEXT: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "codex_master_resource_admission_context",
     default=None,
 )
 RUNNER_EXECUTION_FDS: dict[str, int] = {}
@@ -809,14 +963,40 @@ def published_agent_inventory() -> tuple[InventorySnapshot, bool]:
     return _legacy_inventory(), False
 
 
+def effective_observation_inventory() -> tuple[InventorySnapshot | None, bool]:
+    """Resolve one read-only inventory for startup, status, and admission."""
+
+    published, is_published = published_agent_inventory()
+    if is_published:
+        return published, True
+    fleet_paths = FleetPaths.from_state_root(STATE_ROOT)
+    if not path_present_no_follow(fleet_paths.registry):
+        return published, False
+    try:
+        fleet = _readonly_fleet_service().load()
+        if not fleet.series:
+            return published, False
+        provider_inventory = build_inventory(fleet, AGENT_POOL_ROOT)
+        preserved = legacy_agent_inventory({"b92": AGENTS["b92"]}) if "b92" in AGENTS else None
+        return (
+            merge_agent_inventories(provider_inventory, preserved)
+            if preserved is not None
+            else provider_inventory,
+            True,
+        )
+    except Exception:
+        return None, False
+
+
 def swap_agent_inventory(snapshot: InventorySnapshot | None) -> InventorySnapshot | None:
     if snapshot is not None and not isinstance(snapshot, InventorySnapshot):
         raise AgentError("inventory_snapshot_required")
-    global _ACTIVE_AGENT_INVENTORY, _ACTIVE_AGENT_INVENTORY_FINGERPRINT
+    global _ACTIVE_AGENT_INVENTORY, _ACTIVE_AGENT_INVENTORY_FINGERPRINT, _ACTIVE_G_ALIAS_VIEW
     with _ACTIVE_AGENT_INVENTORY_LOCK:
         previous = _ACTIVE_AGENT_INVENTORY
         _ACTIVE_AGENT_INVENTORY = snapshot
         _ACTIVE_AGENT_INVENTORY_FINGERPRINT = _agent_config_fingerprint() if snapshot is not None else None
+        _ACTIVE_G_ALIAS_VIEW = None
     return previous
 
 
@@ -828,11 +1008,20 @@ def publish_agent_inventory(snapshot: InventorySnapshot) -> None:
 
 @contextlib.contextmanager
 def temporary_agent_inventory(snapshot: InventorySnapshot | None):
-    previous = swap_agent_inventory(snapshot)
+    global _ACTIVE_AGENT_INVENTORY, _ACTIVE_AGENT_INVENTORY_FINGERPRINT, _ACTIVE_G_ALIAS_VIEW
+    with _ACTIVE_AGENT_INVENTORY_LOCK:
+        previous = _ACTIVE_AGENT_INVENTORY
+        previous_alias_view = _ACTIVE_G_ALIAS_VIEW
+        _ACTIVE_AGENT_INVENTORY = snapshot
+        _ACTIVE_AGENT_INVENTORY_FINGERPRINT = _agent_config_fingerprint() if snapshot is not None else None
+        _ACTIVE_G_ALIAS_VIEW = None
     try:
         yield
     finally:
-        swap_agent_inventory(previous)
+        with _ACTIVE_AGENT_INVENTORY_LOCK:
+            _ACTIVE_AGENT_INVENTORY = previous
+            _ACTIVE_AGENT_INVENTORY_FINGERPRINT = _agent_config_fingerprint() if previous is not None else None
+            _ACTIVE_G_ALIAS_VIEW = previous_alias_view
 
 
 def agent_config(agent: str, snapshot: InventorySnapshot | None = None) -> Mapping[str, Any]:
@@ -879,6 +1068,15 @@ def pinned_legacy_agent_configs() -> Mapping[str, Mapping[str, Any]]:
             raise AgentError("legacy_agent_inventory_invalid")
         configs[agent] = MappingProxyType(dict(config))
     return MappingProxyType(configs)
+
+
+def _g_alias_resolution_view(journal: GMigrationJournal) -> tuple[int, Mapping[str, str]]:
+    if type(journal) is not GMigrationJournal:
+        raise AgentError("fleet_alias_conflict")
+    try:
+        return journal.expected_registry_generation + 1, g_migration_alias_view(journal)
+    except Exception:
+        raise AgentError("fleet_alias_conflict") from None
 
 
 def _legacy_fleet_analysis(*, include_running: bool) -> tuple[FleetSnapshot | None, dict[str, Any]]:
@@ -1036,9 +1234,34 @@ ABSOLUTE_PATH_RE = re.compile(r"(?<![\w.-])(?:/[^\s\"'<>:;,)}\]]+)+")
 class AgentError(RuntimeError):
     """Raised for expected agent-control failures."""
 
+    def __init__(self, message: str, payload: dict[str, Any] | None = None):
+        super().__init__(message)
+        if payload is not None:
+            self.payload = payload
+
+
+class HeadlessWriteScopeError(AgentError):
+    """Raised when headless writes lack an enforceable filesystem boundary."""
+
+    def __init__(self) -> None:
+        super().__init__("headless_write_scope_unenforced")
+        self.payload = {
+            "code": "headless_write_scope_unenforced",
+            "explanation": "headless writes lack isolated worktree and diff attribution",
+            "action": "use an isolated worktree or submit a read-only headless assignment",
+        }
+
 
 class FleetRecoveryBlockedError(AgentError):
     """Raised when a fleet mutation is blocked by an unresolved recovery journal."""
+
+    def __init__(self, message: str, payload: dict[str, Any]):
+        super().__init__(message)
+        self.payload = payload
+
+
+class FleetInplaceUpdateError(AgentError):
+    """Raised with the structured, path-free Q in-place failure contract."""
 
     def __init__(self, message: str, payload: dict[str, Any]):
         super().__init__(message)
@@ -1073,10 +1296,52 @@ class AgentCapacityError(AgentError):
         self.payload = payload
 
 
+def _public_resource_snapshot(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    safe: dict[str, Any] = {}
+    for key in ("ok", "load_per_cpu", "cpu_busy_percent", "io_wait_percent", "available_memory_percent", "available_memory_mib", "running_agents"):
+        item = value.get(key)
+        if key == "ok":
+            if isinstance(item, bool):
+                safe[key] = item
+        elif key == "running_agents":
+            if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
+                safe[key] = item
+        elif _finite_resource_number(item):
+            safe[key] = item
+    reason_codes = value.get("reason_codes")
+    if isinstance(reason_codes, list) and all(
+        isinstance(item, str) and item in RESOURCE_REASON_CODES for item in reason_codes
+    ):
+        safe["reason_codes"] = list(dict.fromkeys(reason_codes))
+    return safe
+
+
 def public_error_payload(exc: Exception) -> dict[str, Any]:
     payload: dict[str, Any] = {"error": safe_error_text(exc)}
-    if isinstance(exc, (AgentBusyError, AgentInputNotReadyError, AgentCapacityError, FleetRecoveryBlockedError)):
+    if isinstance(
+        exc,
+        (
+            AgentBusyError,
+            AgentInputNotReadyError,
+            AgentCapacityError,
+            HeadlessWriteScopeError,
+            FleetRecoveryBlockedError,
+            FleetInplaceUpdateError,
+        ),
+    ):
         payload.update(exc.payload)
+    elif isinstance(exc, AgentError) and hasattr(exc, "payload"):
+        payload.update(exc.payload)
+    if isinstance(exc, AgentCapacityError) and payload.get("error_code") == "ollama_admission_denied":
+        payload["error"] = "ollama_admission_denied"
+    if "resource_snapshot" in payload:
+        safe_snapshot = _public_resource_snapshot(payload["resource_snapshot"])
+        if safe_snapshot is None:
+            payload.pop("resource_snapshot", None)
+        else:
+            payload["resource_snapshot"] = safe_snapshot
     return payload
 
 
@@ -1847,6 +2112,16 @@ def require_teamleader_tool_access() -> dict[str, Any]:
     return status
 
 
+def verified_principal_class(status: Mapping[str, Any]) -> str:
+    """Translate the locally verified MCP role into its catalog authority."""
+
+    if status.get("authorized") is not True:
+        raise AgentError("verified principal is required")
+    if status.get("role") == "teamleader":
+        return "teamleiterin"
+    raise AgentError("verified principal role is unsupported")
+
+
 def normalize_agent_selector_text(agent: str) -> str:
     return str(agent).strip().lower()
 
@@ -2042,26 +2317,31 @@ def _selection_series_value(value: Any, inventory: InventorySnapshot) -> tuple[s
 
 def _selection_usage_details(
     account: str,
-    cache: dict[str, tuple[bool, bool, UsageObservation | None, bool]],
+    series_prefix: str,
+    cache: dict[tuple[str, str], tuple[bool, bool, UsageObservation | None, bool, bool]],
     *,
     now: _dt.datetime,
-) -> tuple[bool, bool, UsageObservation | None, bool]:
+) -> tuple[bool, bool, UsageObservation | None, bool, bool]:
     """Return SP1/SP0-safe usage facts without exposing the source payload."""
 
-    if account in cache:
-        return cache[account]
-    details = (False, False, None, False)
+    cache_key = (account, series_prefix)
+    if cache_key in cache:
+        return cache[cache_key]
+    details = (False, False, None, False, False)
     try:
         snapshot = read_codex_usage_snapshot(account)
         if snapshot:
             identity = snapshot.get("account", snapshot.get("agent"))
             if identity != account:
                 raise AgentError("could_not_read_codex_usage_snapshot")
-            state = _codex_usage_watchdog_state_from_snapshot(snapshot, now=now.timestamp())
+            state = _codex_usage_watchdog_state_from_snapshot(
+                snapshot, now=now.timestamp(), series_prefix=series_prefix
+            )
             payload = state.get("usage_v2")
             windows = normalize_usage_v2(payload) if payload is not None else None
-            if windows is not None:
-                sp1a = usage_windows_usable_for_sp1(windows, now)
+            eligibility = state.get("usage_eligibility", {})
+            if windows is not None and isinstance(eligibility, Mapping):
+                sp1a = usage_windows_usable_for_sp1(windows, now) and eligibility.get("eligible", True)
                 observation: UsageObservation | None = None
                 for window in windows:
                     reset_kind = {
@@ -2085,11 +2365,17 @@ def _selection_usage_details(
                     if observation.is_passive_sp0_due(now):
                         break
                     observation = None
-                details = (sp1a, bool(state.get("blocked")), observation, True)
+                details = (
+                    sp1a,
+                    bool(state.get("blocked")) or not eligibility.get("eligible", True),
+                    observation,
+                    True,
+                    eligibility.get("reason_code") == "q_weekly_remaining_below_threshold",
+                )
     except (AgentError, SelectionError, TypeError, ValueError):
         # A malformed or unavailable usage source may not activate SP0/SP1.
-        details = (False, False, None, False)
-    cache[account] = details
+        details = (False, False, None, False, False)
+    cache[cache_key] = details
     return details
 
 
@@ -2139,12 +2425,13 @@ def fleet_selection_preview(
     except (AgentError, FleetValidationError, ValueError) as exc:
         raise AgentError("selection_state_unavailable") from exc
     now = _dt.datetime.now(_dt.timezone.utc)
-    usage_cache: dict[str, tuple[bool, bool, UsageObservation | None, bool]] = {}
+    usage_cache: dict[tuple[str, str], tuple[bool, bool, UsageObservation | None, bool, bool]] = {}
     candidates: list[SelectionCandidate] = []
     usage_accounts: set[str] = set()
     usage_observed_accounts: set[str] = set()
     usage_sp1_accounts: set[str] = set()
     usage_blocked_accounts: set[str] = set()
+    q_weekly_denied_accounts: set[str] = set()
 
     for agent_id in inventory.agent_ids:
         descriptor = inventory.agents[agent_id]
@@ -2170,8 +2457,9 @@ def fleet_selection_preview(
         usage_blocked = False
         if descriptor.account_id:
             usage_accounts.add(descriptor.account_id)
-            usage_sp1a, usage_blocked, usage_observation, usage_known = _selection_usage_details(
+            usage_sp1a, usage_blocked, usage_observation, usage_known, q_weekly_denied = _selection_usage_details(
                 descriptor.account_id,
+                descriptor.series_prefix,
                 usage_cache,
                 now=now,
             )
@@ -2181,6 +2469,8 @@ def fleet_selection_preview(
                 usage_sp1_accounts.add(descriptor.account_id)
             if usage_blocked:
                 usage_blocked_accounts.add(descriptor.account_id)
+                if q_weekly_denied:
+                    q_weekly_denied_accounts.add(descriptor.account_id)
         lease = agent_lease_status(agent_id, initialize_state=False)
         lease_available = lease.get("state") in {"unclaimed", "expired"}
         model_id = descriptor.model or DEFAULT_AGENT_MODEL
@@ -2273,6 +2563,14 @@ def fleet_selection_preview(
             "executable": admission.executable,
             "reason": admission.reason,
             "missing_gates": list(admission.missing_gates),
+            "error_code": (
+                "q_weekly_remaining_below_threshold"
+                if q_weekly_denied_accounts else None
+            ),
+            "fallback_hint": (
+                "use a non-q series or wait for the verified q-series weekly reset"
+                if q_weekly_denied_accounts else None
+            ),
         },
         "result_limit": preview_limit,
         "raw_output": "not_returned",
@@ -2336,13 +2634,46 @@ def canonical_agent_id(
     snapshot: InventorySnapshot | None = None,
 ) -> str:
     normalized = normalize_agent_selector_text(agent)
-    inventory = snapshot or current_agent_inventory()
+    if snapshot is None:
+        with _ACTIVE_AGENT_INVENTORY_LOCK:
+            inventory = _ACTIVE_AGENT_INVENTORY
+            g_alias_view = _ACTIVE_G_ALIAS_VIEW
+        using_fallback_inventory = inventory is None
+        if inventory is None:
+            inventory = current_agent_inventory()
+            g_alias_view = None
+    else:
+        inventory = snapshot
+        with _ACTIVE_AGENT_INVENTORY_LOCK:
+            g_alias_view = _ACTIVE_G_ALIAS_VIEW if _ACTIVE_AGENT_INVENTORY is snapshot else None
+        using_fallback_inventory = False
+    g_alias_capable_inventory = "g" in getattr(inventory, "series_prefixes", ())
     if normalized.isdecimal():
         return ordinal_agent_id(normalized, snapshot=inventory)
     if normalized in inventory.agents:
         return normalized
     if normalized in LEGACY_AGENT_ALIASES and LEGACY_AGENT_ALIASES[normalized] in inventory.agents:
         return LEGACY_AGENT_ALIASES[normalized]
+    if g_alias_view is None:
+        if using_fallback_inventory or not g_alias_capable_inventory:
+            raise AgentError("unknown agent; expected a concrete id like a1, b1, c1 or a selector like both/all/a-series")
+        raise AgentError("fleet_alias_unavailable")
+    if (
+        type(g_alias_view) is not tuple
+        or len(g_alias_view) != 2
+        or type(g_alias_view[0]) is not int
+        or g_alias_view[0] < 1
+        or type(g_alias_view[1]) is not MappingProxyType
+        or any(type(key) is not str or type(value) is not str for key, value in g_alias_view[1].items())
+    ):
+        raise AgentError("fleet_alias_conflict")
+    try:
+        target = g_alias_view[1][normalized]
+    except KeyError:
+        raise AgentError("fleet_alias_unavailable") from None
+    if target in g_alias_view[1] or target not in inventory.agents:
+        raise AgentError("fleet_alias_conflict")
+    return target
     raise AgentError("unknown agent; expected a concrete id like a1, b1, c1 or a selector like both/all/a-series")
 
 
@@ -2428,15 +2759,37 @@ def run_tmux(
 ) -> subprocess.CompletedProcess[str]:
     command = ["tmux", *args]
     try:
-        return subprocess.run(
+        completed = _run_bounded_command(
             command,
-            input=input_text,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=check,
             timeout=timeout,
+            input_text=input_text,
+            cwd=None,
+            env=None,
+            pass_fds=(),
         )
+        if check and completed.returncode != 0:
+            raise subprocess.CalledProcessError(
+                completed.returncode,
+                completed.args,
+                output=completed.stdout,
+                stderr=completed.stderr,
+            )
+        return completed
+    except _CommandOutputLimit:
+        completed = subprocess.CompletedProcess(
+            command,
+            COMMAND_OUTPUT_LIMIT_RETURN_CODE,
+            "",
+            "command output exceeded configured limit",
+        )
+        if check:
+            raise subprocess.CalledProcessError(
+                completed.returncode,
+                completed.args,
+                output=completed.stdout,
+                stderr=completed.stderr,
+            )
+        return completed
     except subprocess.TimeoutExpired as exc:
         cp = timeout_completed_process(command, exc, "tmux command")
         if check:
@@ -2459,17 +2812,36 @@ def run_command(
     pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(
+        completed = _run_bounded_command(
             args,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=check,
             cwd=cwd,
             env=env,
             timeout=timeout,
             pass_fds=pass_fds,
         )
+        if check and completed.returncode != 0:
+            raise subprocess.CalledProcessError(
+                completed.returncode,
+                completed.args,
+                output=completed.stdout,
+                stderr=completed.stderr,
+            )
+        return completed
+    except _CommandOutputLimit:
+        completed = subprocess.CompletedProcess(
+            args,
+            COMMAND_OUTPUT_LIMIT_RETURN_CODE,
+            "",
+            "command output exceeded configured limit",
+        )
+        if check:
+            raise subprocess.CalledProcessError(
+                completed.returncode,
+                completed.args,
+                output=completed.stdout,
+                stderr=completed.stderr,
+            )
+        return completed
     except subprocess.TimeoutExpired as exc:
         cp = timeout_completed_process(args, exc, "command")
         if check:
@@ -2480,6 +2852,104 @@ def run_command(
         if check:
             raise subprocess.CalledProcessError(cp.returncode, cp.args, output=cp.stdout, stderr=cp.stderr) from exc
         return cp
+
+
+class _CommandOutputLimit(Exception):
+    pass
+
+
+def _terminate_command_process(process: subprocess.Popen[bytes]) -> None:
+    pid = getattr(process, "pid", None)
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=1)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _run_bounded_command(
+    args: list[str],
+    *,
+    cwd: Path | str | None,
+    env: dict[str, str] | None,
+    timeout: float,
+    pass_fds: tuple[int, ...],
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        args,
+        stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=cwd,
+        env=env,
+        close_fds=True,
+        start_new_session=True,
+        pass_fds=pass_fds,
+    )
+    stdout = process.stdout
+    stderr = process.stderr
+    if stdout is None or stderr is None:
+        _terminate_command_process(process)
+        raise OSError("command output pipe unavailable")
+    selector = selectors.DefaultSelector()
+    buffers = {stdout: bytearray(), stderr: bytearray()}
+    limits = {stdout: MAX_COMMAND_STDOUT_BYTES, stderr: MAX_COMMAND_STDERR_BYTES}
+    deadline = time.monotonic() + timeout
+    try:
+        if process.stdin is not None:
+            try:
+                process.stdin.write(input_text.encode("utf-8") if input_text is not None else b"")
+            except BrokenPipeError:
+                pass
+            finally:
+                process.stdin.close()
+        selector.register(stdout, selectors.EVENT_READ)
+        selector.register(stderr, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_command_process(process)
+                raise subprocess.TimeoutExpired(args, timeout)
+            ready = selector.select(remaining)
+            if not ready:
+                _terminate_command_process(process)
+                raise subprocess.TimeoutExpired(args, timeout)
+            for key, _ in ready:
+                stream = key.fileobj
+                buffer = buffers[stream]
+                limit = limits[stream]
+                chunk = os.read(stream.fileno(), min(8192, limit + 1 - len(buffer)))
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                buffer.extend(chunk)
+                if len(buffer) > limit:
+                    _terminate_command_process(process)
+                    raise _CommandOutputLimit()
+        try:
+            returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            _terminate_command_process(process)
+            raise
+        return subprocess.CompletedProcess(
+            args,
+            returncode,
+            bytes(buffers[stdout]).decode("utf-8", errors="replace"),
+            bytes(buffers[stderr]).decode("utf-8", errors="replace"),
+        )
+    finally:
+        selector.close()
+        stdout.close()
+        stderr.close()
 
 
 def mcp_initialize_probe_payload() -> str:
@@ -2652,19 +3122,22 @@ def mcp_command_startup_self_test(
 ) -> dict[str, Any]:
     command = [str(command_path)]
     try:
-        cp = subprocess.run(
+        cp = _run_mcp_probe(
             command,
-            input=mcp_initialize_probe_payload(),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
+            input_text=mcp_initialize_probe_payload(),
             timeout=timeout,
         )
     except OSError:
         return {
             "ok": False,
             "status": "unavailable",
+            "timeout_seconds": timeout,
+            "raw_output": "not_returned",
+        }
+    except _McpProbeOutputLimit:
+        return {
+            "ok": False,
+            "status": "failed",
             "timeout_seconds": timeout,
             "raw_output": "not_returned",
         }
@@ -2703,13 +3176,9 @@ def mcp_command_tools_list_self_test(
 ) -> dict[str, Any]:
     command = [str(command_path)]
     try:
-        cp = subprocess.run(
+        cp = _run_mcp_probe(
             command,
-            input=mcp_tools_list_probe_payload(),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
+            input_text=mcp_tools_list_probe_payload(),
             timeout=timeout,
         )
     except OSError:
@@ -2717,6 +3186,15 @@ def mcp_command_tools_list_self_test(
         return {
             "ok": False,
             "status": "unavailable",
+            "timeout_seconds": timeout,
+            **tools_result,
+            "raw_output": "not_returned",
+        }
+    except _McpProbeOutputLimit:
+        tools_result = mcp_tools_list_probe_result("", required_tool, required_tools=required_tools)
+        return {
+            "ok": False,
+            "status": "failed",
             "timeout_seconds": timeout,
             **tools_result,
             "raw_output": "not_returned",
@@ -2753,6 +3231,94 @@ def mcp_command_tools_list_self_test(
         **tools_result,
         "raw_output": "not_returned",
     }
+
+
+class _McpProbeOutputLimit(Exception):
+    pass
+
+
+def _terminate_mcp_probe(process: subprocess.Popen[bytes]) -> None:
+    pid = getattr(process, "pid", None)
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=1)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _run_mcp_probe(
+    command: list[str],
+    *,
+    input_text: str,
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        start_new_session=True,
+    )
+    stream = process.stdout
+    if stream is None:
+        _terminate_mcp_probe(process)
+        raise OSError("MCP probe stdout unavailable")
+    selector = selectors.DefaultSelector()
+    output = bytearray()
+    deadline = time.monotonic() + timeout
+    try:
+        if process.stdin is not None:
+            try:
+                process.stdin.write(input_text.encode("utf-8"))
+            except BrokenPipeError:
+                pass
+            finally:
+                process.stdin.close()
+        selector.register(stream, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_mcp_probe(process)
+                raise subprocess.TimeoutExpired(command, timeout)
+            ready = selector.select(remaining)
+            if not ready:
+                _terminate_mcp_probe(process)
+                raise subprocess.TimeoutExpired(command, timeout)
+            for key, _ in ready:
+                chunk = os.read(
+                    key.fileobj.fileno(),
+                    min(8192, MAX_MCP_PROBE_OUTPUT_BYTES + 1 - len(output)),
+                )
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                output.extend(chunk)
+                if len(output) > MAX_MCP_PROBE_OUTPUT_BYTES:
+                    _terminate_mcp_probe(process)
+                    raise _McpProbeOutputLimit()
+        try:
+            returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            _terminate_mcp_probe(process)
+            raise
+        return subprocess.CompletedProcess(
+            command,
+            returncode,
+            bytes(output).decode("utf-8", errors="replace"),
+            "",
+        )
+    finally:
+        selector.close()
+        stream.close()
 
 
 def tmux_alive(session: str) -> bool:
@@ -3097,6 +3663,101 @@ def fleet_read_optional_private_text(path: Path, max_bytes: int, error_text: str
     )
 
 
+def _fleet_registry_read_lock_is_current(
+    lock_path: Path,
+    *,
+    parent_fd: int,
+    file_fd: int,
+    expected_parent_stat: os.stat_result,
+    expected_lock_stat: os.stat_result,
+) -> bool:
+    try:
+        parent_path_stat = lock_path.parent.lstat()
+        parent_fd_stat = os.fstat(parent_fd)
+        lock_path_stat = os.stat(lock_path.name, dir_fd=parent_fd, follow_symlinks=False)
+        lock_fd_stat = os.fstat(file_fd)
+    except OSError:
+        return False
+    return (
+        source_identity_matches(parent_fd_stat, expected_parent_stat)
+        and source_identity_matches(parent_fd_stat, parent_path_stat)
+        and source_identity_with_snapshot_matches(lock_fd_stat, expected_lock_stat)
+        and source_identity_with_snapshot_matches(lock_fd_stat, lock_path_stat)
+        and source_identity_with_snapshot_matches(lock_path_stat, expected_lock_stat)
+        and stat_module.S_ISREG(lock_fd_stat.st_mode)
+        and getattr(lock_fd_stat, "st_nlink", 1) == 1
+        and stat_module.S_ISREG(lock_path_stat.st_mode)
+        and getattr(lock_path_stat, "st_nlink", 1) == 1
+    )
+
+
+@contextlib.contextmanager
+def _fleet_registry_read_lock(lock_path: Path) -> Iterator[None]:
+    error_text = "fleet_overview_unavailable"
+    parent_fd = -1
+    file_fd = -1
+    locked = False
+    try:
+        stats = _fleet_optional_stats(lock_path, error_text)
+        if stats is None:
+            raise AgentError(error_text)
+        expected_parent_stat, expected_lock_stat = stats
+        if (
+            not stat_module.S_ISDIR(expected_parent_stat.st_mode)
+            or not stat_module.S_ISREG(expected_lock_stat.st_mode)
+            or getattr(expected_lock_stat, "st_nlink", 1) != 1
+        ):
+            raise AgentError(error_text)
+        parent_fd = open_directory_no_follow_matching(
+            lock_path.parent,
+            expected_parent_stat,
+            error_text=error_text,
+            changed_text=error_text,
+        )
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        file_fd = os.open(lock_path.name, flags, dir_fd=parent_fd)
+        opened_stat = os.fstat(file_fd)
+        if (
+            not source_identity_with_snapshot_matches(opened_stat, expected_lock_stat)
+            or not stat_module.S_ISREG(opened_stat.st_mode)
+            or getattr(opened_stat, "st_nlink", 1) != 1
+        ):
+            raise AgentError(error_text)
+        fcntl.flock(file_fd, fcntl.LOCK_SH)
+        locked = True
+        if not _fleet_registry_read_lock_is_current(
+            lock_path,
+            parent_fd=parent_fd,
+            file_fd=file_fd,
+            expected_parent_stat=expected_parent_stat,
+            expected_lock_stat=expected_lock_stat,
+        ):
+            raise AgentError(error_text)
+        yield
+        if not _fleet_registry_read_lock_is_current(
+            lock_path,
+            parent_fd=parent_fd,
+            file_fd=file_fd,
+            expected_parent_stat=expected_parent_stat,
+            expected_lock_stat=expected_lock_stat,
+        ):
+            raise AgentError(error_text)
+    except (AgentError, OSError):
+        raise AgentError(error_text) from None
+    finally:
+        if locked and file_fd >= 0:
+            with contextlib.suppress(OSError):
+                fcntl.flock(file_fd, fcntl.LOCK_UN)
+        if file_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(file_fd)
+        if parent_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(parent_fd)
+
+
 def replace_private_bytes(
     path: Path,
     data: bytes,
@@ -3334,6 +3995,9 @@ _LIFECYCLE_LOCK_STACK: contextvars.ContextVar[tuple[str, ...]] = contextvars.Con
 )
 _NATIVE_AGENT_REGISTRY_LOCK_STACK: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
     "codex_master_native_agent_registry_lock_stack", default=()
+)
+_SPAWN_ADMISSION_LOCK_STACK: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "codex_master_spawn_admission_lock_stack", default=()
 )
 _PLUGIN_CACHE_LOCK_HELD: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "codex_master_plugin_cache_lock_held", default=False
@@ -3575,7 +4239,7 @@ def _normalize_native_agent_timestamp(value: Any) -> float | None:
 
 
 def _native_agent_registry_payload() -> dict[str, Any]:
-    return {"schema_version": 1, "agents": []}
+    return {"schema_version": 2, "agents": [], "sessions": [], "reservations": []}
 
 
 def _validate_native_agent_identifier(name: str, pattern: re.Pattern[str]) -> bool:
@@ -3587,7 +4251,8 @@ def _native_agent_registry_is_stale(last_update: float, now: float) -> bool:
 
 
 def _native_agent_normalize_registry(payload: dict[str, Any]) -> dict[str, Any]:
-    if payload.get("schema_version") != 1 or not isinstance(payload.get("agents"), list):
+    schema_version = payload.get("schema_version")
+    if schema_version not in (1, 2) or not isinstance(payload.get("agents"), list):
         return _native_agent_registry_payload()
     normalized: list[dict[str, Any]] = []
     for candidate in payload["agents"]:
@@ -3604,7 +4269,7 @@ def _native_agent_normalize_registry(payload: dict[str, Any]) -> dict[str, Any]:
             continue
         if not _validate_native_agent_identifier(agent_type, NATIVE_AGENT_TYPE_RE):
             continue
-        if activity_state not in ("active", "unconfirmed"):
+        if activity_state not in ("active", "unconfirmed", "completed"):
             continue
         updated_at_ts = _normalize_native_agent_timestamp(updated_at)
         if updated_at_ts is None:
@@ -3618,7 +4283,83 @@ def _native_agent_normalize_registry(payload: dict[str, Any]) -> dict[str, Any]:
                 "updated_at": updated_at_ts,
             }
         )
-    return {"schema_version": 1, "agents": normalized}
+    normalized = normalized[-MAX_NATIVE_AGENT_RECORDS:]
+
+    session_candidates: list[dict[str, Any]]
+    if schema_version == 2:
+        if not isinstance(payload.get("sessions"), list):
+            return _native_agent_registry_payload()
+        session_candidates = payload["sessions"]
+    else:
+        session_candidates = [
+            {
+                "session_id": record["session_id"],
+                "activity_state": "active",
+                "updated_at": record["updated_at"],
+            }
+            for record in normalized
+        ]
+
+    sessions_by_id: dict[str, dict[str, Any]] = {}
+    for candidate in session_candidates:
+        if not isinstance(candidate, dict):
+            continue
+        session_id = candidate.get("session_id")
+        activity_state = candidate.get("activity_state")
+        managed_session = candidate.get("managed_session")
+        updated_at_ts = _normalize_native_agent_timestamp(candidate.get("updated_at"))
+        if not _validate_native_agent_identifier(session_id, NATIVE_AGENT_ID_RE):
+            continue
+        if activity_state not in ("active", "ended") or updated_at_ts is None:
+            continue
+        current = sessions_by_id.get(session_id)
+        if current is None or updated_at_ts >= current["updated_at"]:
+            normalized_session = {
+                "session_id": session_id,
+                "activity_state": activity_state,
+                "updated_at": updated_at_ts,
+            }
+            if isinstance(managed_session, str) and _validate_native_agent_identifier(
+                managed_session, NATIVE_AGENT_ID_RE
+            ):
+                normalized_session["managed_session"] = managed_session
+            sessions_by_id[session_id] = normalized_session
+    sessions = list(sessions_by_id.values())[-MAX_NATIVE_SESSION_RECORDS:]
+    reservations: list[dict[str, Any]] = []
+    now = time.time()
+    candidates = payload.get("reservations", []) if schema_version == 2 else []
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            reservation_id = candidate.get("reservation_id")
+            kind = candidate.get("kind")
+            created_at = _normalize_native_agent_timestamp(candidate.get("created_at"))
+            parent_session_id = candidate.get("parent_session_id")
+            managed_session = candidate.get("managed_session")
+            if (
+                not _validate_native_agent_identifier(reservation_id, NATIVE_AGENT_ID_RE)
+                or kind not in {"native_spawn", "managed_replacement"}
+                or created_at is None
+                or now - created_at > NATIVE_AGENT_RESERVATION_TTL_SECONDS
+            ):
+                continue
+            row = {"reservation_id": reservation_id, "kind": kind, "created_at": created_at}
+            if kind == "native_spawn":
+                if not _validate_native_agent_identifier(parent_session_id, NATIVE_AGENT_ID_RE):
+                    continue
+                row["parent_session_id"] = parent_session_id
+            elif not _validate_native_agent_identifier(managed_session, NATIVE_AGENT_ID_RE):
+                continue
+            else:
+                row["managed_session"] = managed_session
+            reservations.append(row)
+    return {
+        "schema_version": 2,
+        "agents": normalized,
+        "sessions": sessions,
+        "reservations": reservations[-MAX_NATIVE_AGENT_RESERVATIONS:],
+    }
 
 
 def _read_native_agent_registry() -> tuple[dict[str, Any], str]:
@@ -3640,17 +4381,235 @@ def _read_native_agent_registry() -> tuple[dict[str, Any], str]:
         return payload, "degraded"
     normalized = _native_agent_normalize_registry(loaded)
     if normalized != loaded:
-        degraded = True
+        stale_only = (
+            loaded.get("schema_version") == 2
+            and loaded.get("agents") == normalized.get("agents")
+            and loaded.get("sessions") == normalized.get("sessions")
+            and isinstance(loaded.get("reservations"), list)
+            and all(
+                isinstance(row, dict)
+                and row.get("kind") in {"native_spawn", "managed_replacement"}
+                and isinstance(row.get("created_at"), (int, float))
+                and time.time() - row["created_at"] > NATIVE_AGENT_RESERVATION_TTL_SECONDS
+                for row in loaded["reservations"]
+            )
+        )
+        if stale_only:
+            _write_native_agent_registry(normalized)
+        else:
+            degraded = True
     return normalized, "degraded" if degraded else "ready"
 
 
 def _write_native_agent_registry(payload: dict[str, Any]) -> None:
     safe_payload = _native_agent_normalize_registry(payload)
     safe_payload["agents"] = safe_payload["agents"][:MAX_NATIVE_AGENT_RECORDS]
+    safe_payload["sessions"] = safe_payload["sessions"][:MAX_NATIVE_SESSION_RECORDS]
     replace_private_text(
         NATIVE_AGENT_REGISTRY_FILE,
         json.dumps(safe_payload, sort_keys=True) + "\n",
     )
+
+
+def _trusted_managed_tmux_session_for_home() -> str | None:
+    try:
+        home = active_codex_home_path()
+        snapshot, _registry_backed = effective_observation_inventory()
+        if snapshot is None:
+            return None
+        matches = {
+            (agent_id, descriptor.session)
+            for agent_id, descriptor in snapshot.agents.items()
+            if normalized_compare_path(descriptor.home) == home
+            and isinstance(descriptor.session, str)
+            and _validate_native_agent_identifier(descriptor.session, NATIVE_AGENT_ID_RE)
+        }
+        if len(matches) != 1:
+            return None
+        agent_id, session = next(iter(matches))
+        require_managed_tmux_session(agent_id)
+        return session
+    except (AgentError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _native_subagent_parent_from_transcript(payload: Mapping[str, Any], session_id: str) -> str | None:
+    raw_path = payload.get("transcript_path")
+    if not isinstance(raw_path, str) or not raw_path or len(raw_path) > MAX_PATH_TEXT:
+        return None
+    path = Path(raw_path)
+    sessions_root = active_codex_home_path() / "sessions"
+    if not path.is_absolute() or path.parts[: len(sessions_root.parts)] != sessions_root.parts:
+        return None
+    relative_parts = path.parts[len(sessions_root.parts) :]
+    if not relative_parts or any(part in {"", ".", ".."} for part in relative_parts):
+        return None
+
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = file_fd = -1
+    try:
+        directory_fd = os.open(sessions_root.anchor, directory_flags)
+        for part in (*sessions_root.parts[1:], *relative_parts[:-1]):
+            child_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = child_fd
+        file_fd = os.open(relative_parts[-1], file_flags, dir_fd=directory_fd)
+        opened = os.fstat(file_fd)
+        if (
+            not stat_module.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or getattr(opened, "st_nlink", 1) != 1
+        ):
+            return None
+        chunks: list[bytes] = []
+        remaining = MAX_NATIVE_TRANSCRIPT_HEADER_BYTES + 1
+        while remaining:
+            chunk = os.read(file_fd, min(4096, remaining))
+            if not chunk:
+                break
+            newline = chunk.find(b"\n")
+            chunks.append(chunk if newline < 0 else chunk[:newline])
+            if newline >= 0:
+                break
+            remaining -= len(chunk)
+        header = b"".join(chunks)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
+    if not header or len(header) > MAX_NATIVE_TRANSCRIPT_HEADER_BYTES:
+        return None
+    try:
+        record = json.loads(header.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        return None
+    if not isinstance(record, dict) or record.get("type") != "session_meta":
+        return None
+    metadata = record.get("payload")
+    if not isinstance(metadata, dict) or metadata.get("id") != session_id:
+        return None
+    source = metadata.get("source")
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    thread_spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+    parent_session_id = thread_spawn.get("parent_thread_id") if isinstance(thread_spawn, dict) else None
+    if not _validate_native_agent_identifier(parent_session_id, NATIVE_AGENT_ID_RE):
+        return None
+    return parent_session_id
+
+
+def _native_tool_name_matches(value: Any, name: str) -> bool:
+    return isinstance(value, str) and value in {name, f"multi_agent_v1__{name}"}
+
+
+def activate_native_agent_resume(payload: Any, *, now: float | None = None) -> dict[str, Any]:
+    if not isinstance(payload, dict) or payload.get("hook_event_name") != "PreToolUse":
+        return {"allowed": False, "error_code": "invalid_pretooluse_input", "reason_codes": ["invalid_input"]}
+    if not _native_tool_name_matches(payload.get("tool_name"), "send_input"):
+        return {"allowed": False, "error_code": "invalid_pretooluse_input", "reason_codes": ["invalid_input"]}
+    session_id = payload.get("session_id")
+    tool_input = payload.get("tool_input")
+    target = tool_input.get("target") if isinstance(tool_input, dict) else None
+    if not _validate_native_agent_identifier(session_id, NATIVE_AGENT_ID_RE) or not _validate_native_agent_identifier(
+        target, NATIVE_AGENT_ID_RE
+    ):
+        return {"allowed": False, "error_code": "invalid_pretooluse_input", "reason_codes": ["invalid_input"]}
+    timestamp = _normalize_native_agent_timestamp(now)
+    if now is not None and timestamp is None:
+        return {"allowed": False, "error_code": "invalid_pretooluse_input", "reason_codes": ["invalid_input"]}
+    if timestamp is None:
+        timestamp = time.time()
+
+    with spawn_admission_lock(), native_agent_registry_lock():
+        registry, state = _read_native_agent_registry()
+        if state != "ready":
+            return {
+                "allowed": False,
+                "error_code": "spawn_capacity_unavailable",
+                "reason_codes": ["session_metrics_unavailable"],
+            }
+        matches = [
+            record
+            for record in registry["agents"]
+            if record["session_id"] == session_id and record["agent_id"] == target
+        ]
+        if len(matches) != 1:
+            return {
+                "allowed": False,
+                "error_code": "spawn_capacity_unavailable",
+                "reason_codes": ["session_metrics_unavailable"],
+            }
+        record = matches[0]
+        if record["activity_state"] == "completed":
+            # Resuming completed subagent turn does not spawn another process.
+            # Keep global slot accounting, but do not block on transient host
+            # pressure that applies to new work.
+            admission = spawn_admission_decision(enforce_pressure=False)
+            if admission.get("allowed") is not True:
+                return {
+                    "allowed": False,
+                    "error_code": "spawn_capacity_unavailable",
+                    "reason_codes": admission.get("reason_codes", ["session_metrics_unavailable"]),
+                    "errors": admission.get("errors", []),
+                }
+        record["activity_state"] = "active"
+        record["updated_at"] = timestamp
+        _write_native_agent_registry(registry)
+    return {"allowed": True}
+
+
+def _native_completed_agent_ids_from_tool_event(payload: Mapping[str, Any]) -> frozenset[str]:
+    tool_name = payload.get("tool_name")
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return frozenset()
+    if _native_tool_name_matches(tool_name, "close_agent"):
+        target = tool_input.get("id", tool_input.get("target"))
+        return (
+            frozenset({target})
+            if _validate_native_agent_identifier(target, NATIVE_AGENT_ID_RE)
+            else frozenset()
+        )
+    if not _native_tool_name_matches(tool_name, "wait_agent"):
+        return frozenset()
+    requested = tool_input.get("ids")
+    if not isinstance(requested, list):
+        return frozenset()
+    requested_ids = {
+        value for value in requested if _validate_native_agent_identifier(value, NATIVE_AGENT_ID_RE)
+    }
+    if len(requested_ids) != len(requested):
+        return frozenset()
+    response = payload.get("tool_response")
+    if isinstance(response, str):
+        if len(response) > MAX_NATIVE_AGENT_REGISTRY_BYTES:
+            return frozenset()
+        try:
+            response = json.loads(response)
+        except (json.JSONDecodeError, RecursionError):
+            return frozenset()
+    if not isinstance(response, dict) or response.get("timed_out") is True:
+        return frozenset()
+    statuses = response.get("status")
+    if not isinstance(statuses, dict):
+        return frozenset()
+    terminal: set[str] = set()
+    for agent_id in requested_ids:
+        status = statuses.get(agent_id)
+        if isinstance(status, dict):
+            is_terminal = any(key in status for key in ("completed", "errored"))
+        else:
+            is_terminal = isinstance(status, str) and status in {
+                "interrupted",
+                "shutdown",
+                "not_found",
+            }
+        if is_terminal:
+            terminal.add(agent_id)
+    return frozenset(terminal)
 
 
 def record_native_agent_event(payload: Any, *, now: float | None = None) -> None:
@@ -3667,24 +4626,95 @@ def record_native_agent_event(payload: Any, *, now: float | None = None) -> None
     agent_type = payload.get("agent_type")
     if not _validate_native_agent_identifier(session_id, NATIVE_AGENT_ID_RE):
         return
-    if event_name not in {"SessionStart", "SubagentStart", "SubagentStop", "SessionEnd"}:
+    if event_name not in {
+        "SessionStart",
+        "UserPromptSubmit",
+        "PostToolUse",
+        "SubagentStart",
+        "SubagentStop",
+        "Stop",
+        "SessionEnd",
+    }:
         return
-    if event_name == "SessionStart":
-        with native_agent_registry_lock():
-            _write_native_agent_registry(_native_agent_registry_payload())
+    if event_name in {"SubagentStart", "SubagentStop"} and not _validate_native_agent_identifier(
+        agent_id, NATIVE_AGENT_ID_RE
+    ):
         return
-    if event_name != "SessionEnd" and not _validate_native_agent_identifier(agent_id, NATIVE_AGENT_ID_RE):
-        return
-    if event_name in {"SubagentStop", "SessionEnd"} and not _validate_native_agent_identifier(agent_id, NATIVE_AGENT_ID_RE):
-        if event_name == "SubagentStop":
-            return
-    if event_name != "SessionEnd" and not _validate_native_agent_identifier(agent_type, NATIVE_AGENT_TYPE_RE):
+    if event_name == "SubagentStart" and not _validate_native_agent_identifier(
+        agent_type, NATIVE_AGENT_TYPE_RE
+    ):
         return
 
-    with native_agent_registry_lock():
+    with contextlib.ExitStack() as lock_stack:
+        if event_name in {"UserPromptSubmit", "SubagentStart"}:
+            lock_stack.enter_context(spawn_admission_lock())
+        lock_stack.enter_context(native_agent_registry_lock())
         registry, _state = _read_native_agent_registry()
         current = registry["agents"]
+        if event_name == "PostToolUse":
+            completed_ids = _native_completed_agent_ids_from_tool_event(payload)
+            for record in current:
+                if record["session_id"] == session_id and record["agent_id"] in completed_ids:
+                    record["activity_state"] = "completed"
+                    record["updated_at"] = timestamp
+            _write_native_agent_registry(registry)
+            return
+        if event_name in {"UserPromptSubmit", "Stop"}:
+            activity_state = "active" if event_name == "UserPromptSubmit" else "completed"
+            matched = False
+            for record in current:
+                if record["agent_id"] == session_id:
+                    record["activity_state"] = activity_state
+                    record["updated_at"] = timestamp
+                    matched = True
+            if event_name == "UserPromptSubmit" and not matched:
+                parent_session_id = _native_subagent_parent_from_transcript(payload, session_id)
+                if parent_session_id is not None:
+                    current.append(
+                        {
+                            "session_id": parent_session_id,
+                            "agent_id": session_id,
+                            "agent_type": "subagent",
+                            "activity_state": "active",
+                            "updated_at": timestamp,
+                        }
+                    )
+                    if len(current) > MAX_NATIVE_AGENT_RECORDS:
+                        current[:] = current[-MAX_NATIVE_AGENT_RECORDS:]
+            _write_native_agent_registry(registry)
+            return
+        sessions = registry["sessions"]
+        session_state = "ended" if event_name == "SessionEnd" else "active"
+        managed_session = _trusted_managed_tmux_session_for_home()
+        sessions[:] = [record for record in sessions if record["session_id"] != session_id]
+        session_record = {
+            "session_id": session_id,
+            "activity_state": session_state,
+            "updated_at": timestamp,
+        }
+        if managed_session is not None:
+            session_record["managed_session"] = managed_session
+        sessions.append(session_record)
+        if len(sessions) > MAX_NATIVE_SESSION_RECORDS:
+            sessions[:] = sessions[-MAX_NATIVE_SESSION_RECORDS:]
+        if event_name == "SessionStart":
+            for record in current:
+                if record["session_id"] == session_id and record["activity_state"] != "completed":
+                    record["activity_state"] = "unconfirmed"
+                    record["updated_at"] = timestamp
+            _write_native_agent_registry(registry)
+            return
         if event_name == "SubagentStart":
+            reservations = registry.get("reservations", [])
+            matching = [
+                index
+                for index, record in enumerate(reservations)
+                if isinstance(record, dict)
+                and record.get("kind") == "native_spawn"
+                and record.get("parent_session_id") == session_id
+            ]
+            if matching:
+                reservations.pop(matching[0])
             for record in current:
                 if record["session_id"] == session_id and record["agent_id"] == agent_id:
                     record["agent_type"] = agent_type
@@ -3706,37 +4736,80 @@ def record_native_agent_event(payload: Any, *, now: float | None = None) -> None
             _write_native_agent_registry(registry)
             return
         if event_name == "SubagentStop":
-            next_records = [
-                record
-                for record in current
-                if not (
-                    record["session_id"] == session_id and record["agent_id"] == agent_id
-                )
-            ]
-            registry["agents"] = next_records
+            for record in current:
+                if record["session_id"] == session_id and record["agent_id"] == agent_id:
+                    record["activity_state"] = "completed"
+                    record["updated_at"] = timestamp
             _write_native_agent_registry(registry)
             return
         if event_name == "SessionEnd":
-            changed = False
             for record in current:
-                if record["session_id"] == session_id:
+                if record["session_id"] == session_id and record["activity_state"] != "completed":
                     record["activity_state"] = "unconfirmed"
-                    changed = True
-            if changed:
-                _write_native_agent_registry(registry)
+                    record["updated_at"] = timestamp
+            _write_native_agent_registry(registry)
             return
 
 
-def native_agent_status(*, now: float | None = None) -> dict[str, Any]:
+def native_agent_status(
+    *,
+    now: float | None = None,
+    expected_parent_sessions: int | None = None,
+    expected_parent_session_ids: Collection[str] | None = None,
+) -> dict[str, Any]:
     timestamp = _normalize_native_agent_timestamp(now)
     if timestamp is None:
         timestamp = time.time()
+    expected_ids: frozenset[str] | None = None
+    if expected_parent_session_ids is not None:
+        if not isinstance(expected_parent_session_ids, Collection) or isinstance(
+            expected_parent_session_ids, (str, bytes)
+        ):
+            expected_ids = frozenset({"__invalid_expected_parent_session_ids__"})
+        else:
+            expected_ids = frozenset(
+                value
+                for value in expected_parent_session_ids
+                if isinstance(value, str) and _validate_native_agent_identifier(value, NATIVE_AGENT_ID_RE)
+            )
+            if len(expected_ids) != len(expected_parent_session_ids):
+                expected_ids = frozenset({"__invalid_expected_parent_session_ids__"})
+    minimum_coverage = 1
+    if expected_parent_sessions is not None:
+        if (
+            isinstance(expected_parent_sessions, bool)
+            or not isinstance(expected_parent_sessions, int)
+            or expected_parent_sessions < 0
+        ):
+            minimum_coverage = MAX_NATIVE_SESSION_RECORDS + 1
+        else:
+            minimum_coverage = max(minimum_coverage, expected_parent_sessions)
     try:
         with native_agent_registry_lock():
             registry, bridge_state = _read_native_agent_registry()
-            if bridge_state == "degraded":
+            fresh_session_records = [
+                record
+                for record in registry["sessions"]
+                if record["activity_state"] == "active"
+                and not _native_agent_registry_is_stale(record["updated_at"], timestamp)
+            ]
+            fresh_session_ids = {record["session_id"] for record in fresh_session_records}
+            fresh_managed_sessions = {
+                record["managed_session"]
+                for record in fresh_session_records
+                if isinstance(record.get("managed_session"), str)
+            }
+            coverage_sessions = fresh_managed_sessions if expected_ids is not None else fresh_session_ids
+            coverage_missing = (
+                expected_ids is not None
+                and (
+                    "__invalid_expected_parent_session_ids__" in expected_ids
+                    or not expected_ids <= coverage_sessions
+                )
+            )
+            if bridge_state == "degraded" or coverage_missing or len(coverage_sessions) < minimum_coverage:
                 return {
-                    "bridge_state": bridge_state,
+                    "bridge_state": "degraded",
                     "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
                     "agents": [],
                     "truncated": False,
@@ -3745,6 +4818,8 @@ def native_agent_status(*, now: float | None = None) -> dict[str, Any]:
             kept: list[dict[str, Any]] = []
             for record in records:
                 if _native_agent_registry_is_stale(record["updated_at"], timestamp):
+                    continue
+                if record["activity_state"] == "completed":
                     continue
                 stale = timestamp - record["updated_at"] > NATIVE_AGENT_ACTIVE_SECONDS
                 agent_state = "unconfirmed" if stale else record["activity_state"]
@@ -3760,6 +4835,8 @@ def native_agent_status(*, now: float | None = None) -> dict[str, Any]:
             unconfirmed_count = 0
             for record in records:
                 if _native_agent_registry_is_stale(record["updated_at"], timestamp):
+                    continue
+                if record["activity_state"] == "completed":
                     continue
                 if timestamp - record["updated_at"] > NATIVE_AGENT_ACTIVE_SECONDS:
                     unconfirmed_count += 1
@@ -3800,10 +4877,15 @@ def normalize_int_field(value: Any, *, field: str, minimum: int, maximum: int) -
 
 def spawn_resource_policy() -> dict[str, Any]:
     return {
+        "pressure_limits_enabled": RESOURCE_PRESSURE_LIMITS_ENABLED,
         "max_load_per_cpu": RESOURCE_MAX_LOAD_PER_CPU,
+        "max_cpu_busy_percent": RESOURCE_MAX_CPU_BUSY_PERCENT,
+        "max_io_wait_percent": RESOURCE_MAX_IO_WAIT_PERCENT,
         "min_available_memory_percent": RESOURCE_MIN_AVAILABLE_MEMORY_PERCENT,
         "min_available_memory_mib": RESOURCE_MIN_AVAILABLE_MEMORY_MIB,
         "max_running_agents": RESOURCE_MAX_RUNNING_AGENTS,
+        "ollama_concurrency_limit_enabled": OLLAMA_CONCURRENCY_LIMIT_ENABLED,
+        "ollama_max_concurrent_agents": OLLAMA_MAX_CONCURRENT_AGENTS,
         "raw_output": "not_returned",
     }
 
@@ -3849,7 +4931,62 @@ def _resource_meminfo() -> tuple[float, float] | None:
     return available_kib / total_kib * 100.0, available_kib / 1024.0
 
 
-def _managed_tmux_session_count() -> int | None:
+def _cpu_counters() -> tuple[int, int, int] | None:
+    try:
+        text = RESOURCE_PROC_STAT_PATH.read_text(encoding="utf-8", errors="replace")
+    except (OSError, UnicodeError):
+        return None
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts or parts[0] != "cpu" or len(parts) < 9:
+            continue
+        try:
+            values = [int(item) for item in parts[1:9]]
+        except (TypeError, ValueError):
+            return None
+        if any(value < 0 for value in values):
+            return None
+        total = sum(values)
+        idle = values[3]
+        io_wait = values[4]
+        busy = total - idle - io_wait
+        if total <= 0 or busy < 0:
+            return None
+        return total, busy, io_wait
+    return None
+
+
+def _recent_cpu_usage() -> tuple[float, float] | None:
+    first = _cpu_counters()
+    if first is None:
+        return None
+    try:
+        time.sleep(RESOURCE_CPU_SAMPLE_SECONDS)
+    except (OSError, OverflowError, ValueError):
+        return None
+    second = _cpu_counters()
+    if second is None:
+        return None
+    total_delta = second[0] - first[0]
+    if total_delta <= 0:
+        return None
+    busy_percent = (second[1] - first[1]) / total_delta * 100.0
+    io_wait_percent = (second[2] - first[2]) / total_delta * 100.0
+    if not (0.0 <= busy_percent <= 100.0 and 0.0 <= io_wait_percent <= 100.0):
+        return None
+    return busy_percent, io_wait_percent
+
+
+def _effective_cpu_count() -> int | None:
+    try:
+        affinity = os.sched_getaffinity(0)
+    except (AttributeError, OSError, TypeError):
+        return None
+    count = len(affinity)
+    return count if count > 0 else None
+
+
+def _managed_tmux_session_ids() -> frozenset[str] | None:
     try:
         completed = run_tmux(["list-sessions", "-F", "#{session_name}"], check=False)
         if completed.returncode != 0:
@@ -3866,21 +5003,227 @@ def _managed_tmux_session_count() -> int | None:
                 )
             ):
                 return None
-            return 0
-        snapshot = current_agent_inventory()
+            return frozenset()
+        snapshot, _registry_backed = effective_observation_inventory()
+        if snapshot is None:
+            return None
         configured_sessions = {
             agent_config(agent, snapshot).get("session") for agent in snapshot.agent_ids
         }
         listed_sessions = {
             line.strip() for line in completed.stdout.splitlines() if line.strip()
         }
-        return len(configured_sessions & listed_sessions)
+        return frozenset(configured_sessions & listed_sessions)
     except (AttributeError, OSError, TypeError, ValueError):
         return None
 
 
+def _managed_tmux_session_count() -> int | None:
+    session_ids = _managed_tmux_session_ids()
+    return None if session_ids is None else len(session_ids)
+
+
+def _fresh_native_reservation_count(
+    now: float | None = None, *, managed_ids: frozenset[str] | None = None
+) -> int | None:
+    timestamp = time.time() if now is None else now
+    try:
+        if managed_ids is None:
+            managed_ids = _managed_tmux_session_ids()
+        if managed_ids is None:
+            return None
+        with native_agent_registry_lock():
+            registry, state = _read_native_agent_registry()
+            if state != "ready":
+                return 0 if not NATIVE_AGENT_REGISTRY_FILE.exists() else None
+            return sum(
+                1
+                for row in registry.get("reservations", [])
+                if isinstance(row, dict)
+                and (
+                    row.get("kind") == "native_spawn"
+                    or (row.get("kind") == "managed_replacement" and row.get("managed_session") not in managed_ids)
+                )
+                and isinstance(row.get("created_at"), (int, float))
+                and 0 <= timestamp - row["created_at"] <= NATIVE_AGENT_RESERVATION_TTL_SECONDS
+            )
+    except (AgentError, OSError, TypeError, ValueError):
+        return None
+
+
+def reserve_native_agent_spawn(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict) or payload.get("hook_event_name") != "PreToolUse":
+        return {"allowed": False, "reason_codes": ["invalid_input"]}
+    if payload.get("tool_name") not in {"spawn_agent", "multi_agent_v1__spawn_agent"}:
+        return {"allowed": False, "reason_codes": ["invalid_input"]}
+    parent_session_id = payload.get("session_id")
+    if not _validate_native_agent_identifier(parent_session_id, NATIVE_AGENT_ID_RE):
+        return {"allowed": False, "reason_codes": ["invalid_input"]}
+    with spawn_admission_lock():
+        admission = spawn_admission_decision()
+        if admission.get("allowed") is not True:
+            return {
+                "allowed": False,
+                "error_code": "spawn_capacity_unavailable",
+                "reason_codes": admission.get("reason_codes", ["session_metrics_unavailable"]),
+                "errors": admission.get("errors", []),
+            }
+        with native_agent_registry_lock():
+            registry, state = _read_native_agent_registry()
+            if state != "ready":
+                return {"allowed": False, "error_code": "spawn_capacity_unavailable", "reason_codes": ["session_metrics_unavailable"]}
+            now = time.time()
+            if not any(
+                row.get("session_id") == parent_session_id
+                and row.get("activity_state") == "active"
+                and isinstance(row.get("updated_at"), (int, float))
+                and 0 <= now - row["updated_at"] <= NATIVE_AGENT_RETENTION_SECONDS
+                for row in registry.get("sessions", [])
+                if isinstance(row, dict)
+            ):
+                return {"allowed": False, "error_code": "spawn_capacity_unavailable", "reason_codes": ["session_metrics_unavailable"]}
+            reservations = registry.setdefault("reservations", [])
+            reservations.append(
+                {
+                    "reservation_id": uuid.uuid4().hex,
+                    "kind": "native_spawn",
+                    "created_at": time.time(),
+                    "parent_session_id": parent_session_id,
+                }
+            )
+            _write_native_agent_registry(registry)
+            return {"allowed": True, "reservation_id": reservations[-1]["reservation_id"]}
+
+
+def reserve_managed_replacement(managed_session: Any) -> dict[str, Any]:
+    """Reserve a concrete, schema-2-covered managed session replacement."""
+    if not _validate_native_agent_identifier(managed_session, NATIVE_AGENT_ID_RE):
+        return {"allowed": False, "error_code": "spawn_capacity_unavailable", "reason_codes": ["session_metrics_unavailable"]}
+    with spawn_admission_lock():
+        managed_ids = _managed_tmux_session_ids()
+        if managed_ids is None or managed_session not in managed_ids:
+            return {"allowed": False, "error_code": "spawn_capacity_unavailable", "reason_codes": ["session_metrics_unavailable"]}
+        coverage = native_agent_status(expected_parent_session_ids={managed_session})
+        if coverage.get("bridge_state") != "ready":
+            return {"allowed": False, "error_code": "spawn_capacity_unavailable", "reason_codes": ["session_metrics_unavailable"]}
+        with native_agent_registry_lock():
+            registry, state = _read_native_agent_registry()
+            if state != "ready":
+                return {"allowed": False, "error_code": "spawn_capacity_unavailable", "reason_codes": ["session_metrics_unavailable"]}
+            reservations = registry.setdefault("reservations", [])
+            if any(
+                row.get("kind") == "managed_replacement" and row.get("managed_session") == managed_session
+                for row in reservations if isinstance(row, dict)
+            ):
+                return {"allowed": False, "error_code": "spawn_capacity_unavailable", "reason_codes": ["running_agent_limit"]}
+            total = _total_running_agent_count(managed_ids=managed_ids)
+            if total is None:
+                return {"allowed": False, "error_code": "spawn_capacity_unavailable", "reason_codes": ["session_metrics_unavailable"]}
+            if total > RESOURCE_MAX_RUNNING_AGENTS:
+                return {"allowed": False, "error_code": "spawn_capacity_unavailable", "reason_codes": ["running_agent_limit"]}
+            reservation = {
+                "reservation_id": uuid.uuid4().hex,
+                "kind": "managed_replacement",
+                "created_at": time.time(),
+                "managed_session": managed_session,
+            }
+            reservations.append(reservation)
+            _write_native_agent_registry(registry)
+            return {"allowed": True, "reservation_id": reservation["reservation_id"]}
+
+
+def require_managed_replacement_reservation(
+    reservation_id: Any, managed_session: Any, *, now: float | None = None
+) -> dict[str, Any]:
+    if not _validate_native_agent_identifier(reservation_id, NATIVE_AGENT_ID_RE) or not _validate_native_agent_identifier(
+        managed_session, NATIVE_AGENT_ID_RE
+    ):
+        return {"allowed": False, "error_code": "spawn_capacity_unavailable", "reason_codes": ["session_metrics_unavailable"]}
+    timestamp = time.time() if now is None else now
+    with spawn_admission_lock():
+        with native_agent_registry_lock():
+            registry, state = _read_native_agent_registry()
+            if state != "ready":
+                return {"allowed": False, "error_code": "spawn_capacity_unavailable", "reason_codes": ["session_metrics_unavailable"]}
+            for row in registry.get("reservations", []):
+                if (
+                    isinstance(row, dict)
+                    and row.get("reservation_id") == reservation_id
+                    and row.get("kind") == "managed_replacement"
+                    and row.get("managed_session") == managed_session
+                    and isinstance(row.get("created_at"), (int, float))
+                    and 0 <= timestamp - row["created_at"] <= NATIVE_AGENT_RESERVATION_TTL_SECONDS
+                ):
+                    return {"allowed": True, "reservation_id": reservation_id, "managed_session": managed_session}
+    return {"allowed": False, "error_code": "spawn_capacity_unavailable", "reason_codes": ["session_metrics_unavailable"]}
+
+
+def complete_managed_replacement(reservation_id: str, managed_session: str) -> dict[str, Any]:
+    with spawn_admission_lock():
+        with native_agent_registry_lock():
+            registry, state = _read_native_agent_registry()
+            if state != "ready":
+                raise AgentError("replacement reservation unavailable")
+            rows = registry.get("reservations", [])
+            for index, row in enumerate(rows):
+                if isinstance(row, dict) and row.get("reservation_id") == reservation_id and row.get("kind") == "managed_replacement" and row.get("managed_session") == managed_session:
+                    rows.pop(index)
+                    _write_native_agent_registry(registry)
+                    return {"allowed": True, "reservation_id": reservation_id}
+    raise AgentError("replacement reservation unavailable")
+
+
+def _raise_replacement_capacity_denied(decision: Mapping[str, Any]) -> None:
+    reason_codes = [
+        item for item in decision.get("reason_codes", [])
+        if isinstance(item, str) and item in RESOURCE_REASON_CODES
+    ]
+    if not reason_codes:
+        reason_codes = ["session_metrics_unavailable"]
+    errors = decision.get("errors")
+    if not isinstance(errors, list):
+        errors = spawn_error_details(reason_codes)
+    raise AgentCapacityError(
+        "replacement reservation unavailable",
+        {
+            "error_code": decision.get("error_code") if isinstance(decision.get("error_code"), str) else "spawn_capacity_unavailable",
+            "retryable": True,
+            "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS,
+            "reason_codes": reason_codes,
+            "errors": errors,
+        },
+    )
+
+
+def _total_running_agent_count(*, managed_ids: frozenset[str] | None = None) -> int | None:
+    if managed_ids is None:
+        managed_ids = _managed_tmux_session_ids()
+    if managed_ids is None:
+        managed = _managed_tmux_session_count()
+        native = native_agent_status()
+    else:
+        managed = len(managed_ids)
+        native = native_agent_status()
+    counts = native.get("counts") if isinstance(native, dict) else None
+    if managed is None or native.get("bridge_state") != "ready" or not isinstance(counts, dict):
+        return None
+    active = counts.get("active")
+    unconfirmed = counts.get("unconfirmed")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in (active, unconfirmed)
+    ):
+        return None
+    reservations = _fresh_native_reservation_count(managed_ids=managed_ids)
+    if reservations is None:
+        return None
+    return managed + active + unconfirmed + reservations
+
+
 def system_resource_snapshot(*, running_agents_override: int | None = None) -> dict[str, Any]:
     load_per_cpu: float | None = None
+    cpu_busy_percent: float | None = None
+    io_wait_percent: float | None = None
     available_memory_percent: float | None = None
     available_memory_mib: float | None = None
     running_agents: int | None = None
@@ -3901,6 +5244,12 @@ def system_resource_snapshot(*, running_agents_override: int | None = None) -> d
     else:
         reason_codes.append("cpu_metrics_unavailable")
 
+    cpu_usage = _recent_cpu_usage()
+    if cpu_usage is not None:
+        cpu_busy_percent, io_wait_percent = cpu_usage
+    else:
+        reason_codes.append("cpu_metrics_unavailable")
+
     memory = _resource_meminfo()
     if memory is None:
         reason_codes.append("memory_metrics_unavailable")
@@ -3908,7 +5257,7 @@ def system_resource_snapshot(*, running_agents_override: int | None = None) -> d
         available_memory_percent, available_memory_mib = memory
 
     if running_agents_override is None:
-        running_agents = _managed_tmux_session_count()
+        running_agents = _total_running_agent_count()
     elif (
         isinstance(running_agents_override, int)
         and not isinstance(running_agents_override, bool)
@@ -3923,10 +5272,14 @@ def system_resource_snapshot(*, running_agents_override: int | None = None) -> d
     return {
         "ok": not reason_codes,
         "load_per_cpu": load_per_cpu,
+        "logical_cpu_count": cpu_count,
+        "effective_cpu_count": _effective_cpu_count(),
+        "cpu_busy_percent": cpu_busy_percent,
+        "io_wait_percent": io_wait_percent,
         "available_memory_percent": available_memory_percent,
         "available_memory_mib": available_memory_mib,
         "running_agents": running_agents,
-        "reason_codes": reason_codes,
+        "reason_codes": list(dict.fromkeys(reason_codes)),
         "raw_output": "not_returned",
     }
 
@@ -3934,13 +5287,22 @@ def system_resource_snapshot(*, running_agents_override: int | None = None) -> d
 def _valid_spawn_policy(policy: Any) -> bool:
     return (
         isinstance(policy, dict)
+        and policy.get("pressure_limits_enabled") is True
         and _finite_resource_number(policy.get("max_load_per_cpu"), minimum=0.0)
+        and _finite_resource_number(policy.get("max_cpu_busy_percent"), minimum=0.0)
+        and policy["max_cpu_busy_percent"] <= 100.0
+        and _finite_resource_number(policy.get("max_io_wait_percent"), minimum=0.0)
+        and policy["max_io_wait_percent"] <= 100.0
         and _finite_resource_number(policy.get("min_available_memory_percent"), minimum=0.0)
         and policy["min_available_memory_percent"] <= 100.0
         and _finite_resource_number(policy.get("min_available_memory_mib"), minimum=0.0)
         and isinstance(policy.get("max_running_agents"), int)
         and not isinstance(policy["max_running_agents"], bool)
-        and 1 <= policy["max_running_agents"] <= 6
+        and 1 <= policy["max_running_agents"] <= 10
+        and policy.get("ollama_concurrency_limit_enabled") is True
+        and isinstance(policy.get("ollama_max_concurrent_agents"), int)
+        and not isinstance(policy["ollama_max_concurrent_agents"], bool)
+        and 1 <= policy["ollama_max_concurrent_agents"] <= policy["max_running_agents"]
     )
 
 
@@ -3951,95 +5313,305 @@ def _admission_result(
     available_slots: int | None,
     reason_codes: list[str],
 ) -> dict[str, Any]:
-    return {
+    reason_codes = list(dict.fromkeys(reason_codes))
+    result = {
         "allowed": allowed,
         "required_slots": required_slots,
         "available_slots": available_slots,
         "reason_codes": reason_codes,
         "raw_output": "not_returned",
     }
+    if reason_codes:
+        result["errors"] = spawn_error_details(
+            reason_codes,
+            required_slots=required_slots,
+            available_slots=available_slots,
+        )
+    return result
+
+
+def spawn_error_details(
+    reason_codes: Iterable[str],
+    *,
+    required_slots: int = 1,
+    available_slots: int | None = None,
+) -> list[dict[str, str]]:
+    """Translate stable admission codes into data-sparse operator errors."""
+
+    configured = {
+        "cpu_metrics_unavailable": (
+            "CPU-Messung nicht verfuegbar",
+            "CPU-/Load-Werte konnten nicht verlaesslich ermittelt werden.",
+            "Bei aktivierten Druckgrenzen ist belastbare CPU-Evidenz erforderlich.",
+            "Messzugriff reparieren oder nach Wiederherstellung erneut versuchen.",
+        ),
+        "memory_metrics_unavailable": (
+            "Speichermessung nicht verfuegbar",
+            "Verfuegbarer Arbeitsspeicher konnte nicht verlaesslich ermittelt werden.",
+            "Bei aktivierten Druckgrenzen ist belastbare Speicherevidenz erforderlich.",
+            "Messzugriff reparieren oder nach Wiederherstellung erneut versuchen.",
+        ),
+        "session_metrics_unavailable": (
+            "Gesamtzahl nicht bestimmbar",
+            "Laufende und unbestaetigte Bienen konnten nicht verlaesslich gezaehlt werden.",
+            "Ohne belastbare Gesamtzahl wird kein Spawn zugelassen.",
+            "Tmux- und Native-Agent-Registry pruefen, dann erneut versuchen.",
+        ),
+        "policy_invalid": (
+            "Ressourcenpolicy ungueltig",
+            "Konfigurierte Grenzwerte oder Enforcement-Flags sind ungueltig.",
+            "Ungueltige Policy blockiert jeden Spawn fail-closed.",
+            "Policykonfiguration korrigieren und Masterjet neu laden.",
+        ),
+        "cpu_pressure_high": (
+            "CPU-Druck zu hoch",
+            "CPU-Auslastung ueberschreitet die konfigurierte aktive Grenze.",
+            f"Aktive Grenze: Load/CPU-Policy mit maximal {RESOURCE_MAX_CPU_BUSY_PERCENT:g} Prozent CPU.",
+            "CPU-Last senken oder erneut versuchen.",
+        ),
+        "io_pressure_high": (
+            "I/O-Druck zu hoch",
+            "I/O-Wait ueberschreitet die konfigurierte aktive Grenze.",
+            f"Aktive Grenze: maximal {RESOURCE_MAX_IO_WAIT_PERCENT:g} Prozent I/O-Wait.",
+            "I/O-Last senken oder erneut versuchen.",
+        ),
+        "memory_pressure_high": (
+            "Speicherdruck zu hoch",
+            "Verfuegbarer Arbeitsspeicher unterschreitet die konfigurierte aktive Grenze.",
+            f"Aktive Grenze: mindestens {RESOURCE_MIN_AVAILABLE_MEMORY_PERCENT:g} Prozent und {RESOURCE_MIN_AVAILABLE_MEMORY_MIB} MiB frei.",
+            "Speicher freigeben oder erneut versuchen.",
+        ),
+        "ollama_concurrency_limit": (
+            "Ollama-Parallelgrenze erreicht",
+            f"Bereits {OLLAMA_MAX_CONCURRENT_AGENTS} Ollama-Bienen laufen.",
+            f"Konfigurierte Ollama-Grenze: {OLLAMA_MAX_CONCURRENT_AGENTS} gleichzeitig; das aktive Admission-Gate ist verbindlich.",
+            "Ollama-Biene beenden oder erneut versuchen.",
+        ),
+        "ollama_simple_task_only": (
+            "Aufgabe fuer Ollama zu komplex",
+            "Gewaehlte Ollama-Serie akzeptiert nur einfache, begrenzte Aufgaben.",
+            "Capability-Gate bleibt unabhaengig vom Ressourcenstatus aktiv.",
+            "Aufgabe vereinfachen oder eine passende Codex-Serie waehlen.",
+        ),
+    }
+    details: list[dict[str, str]] = []
+    for code in dict.fromkeys(reason_codes):
+        if code == "running_agent_limit":
+            free = max(0, available_slots or 0)
+            running = RESOURCE_MAX_RUNNING_AGENTS - (available_slots or 0)
+            row = (
+                "Globale Bienengrenze erreicht",
+                f"{running} von {RESOURCE_MAX_RUNNING_AGENTS} Gesamtslots sind belegt; {free} sind frei.",
+                "Ab 10 laufenden oder unbestaetigten Bienen ist jeder weitere Spawn verboten.",
+                "Mindestens eine Biene beenden und erneut versuchen.",
+            )
+        elif code == "insufficient_slots":
+            free = max(0, available_slots or 0)
+            row = (
+                "Zu wenige Gesamtslots",
+                f"{required_slots} Slots angefordert, aber nur {free} von {RESOURCE_MAX_RUNNING_AGENTS} Slots sind frei.",
+                "Angeforderte Slots muessen vollstaendig unter die globale Zehnergrenze passen.",
+                "Weniger Bienen anfordern oder laufende Bienen beenden.",
+            )
+        else:
+            row = configured.get(code)
+        if row is None:
+            continue
+        details.append({
+            "code": code,
+            "title": row[0],
+            "explanation": row[1],
+            "rule": row[2],
+            "action": row[3],
+        })
+    return details
+
+
+def _resource_pressure_reason_codes(snapshot: Mapping[str, Any], policy: Mapping[str, Any]) -> list[str]:
+    fallback = [
+        "cpu_metrics_unavailable",
+        "memory_metrics_unavailable",
+        "session_metrics_unavailable",
+    ]
+    if not isinstance(snapshot, Mapping) or not isinstance(policy, Mapping):
+        return fallback
+    declared = snapshot.get("reason_codes")
+    if declared is not None and (
+        not isinstance(declared, list)
+        or any(not isinstance(item, str) or item not in RESOURCE_REASON_CODES for item in declared)
+    ):
+        return fallback
+    snapshot_ok = snapshot.get("ok")
+    if not isinstance(snapshot_ok, bool) or (snapshot_ok is False and not declared):
+        return fallback
+    reasons: list[str] = []
+    load_per_cpu = snapshot.get("load_per_cpu")
+    cpu_busy_percent = snapshot.get("cpu_busy_percent")
+    io_wait_percent = snapshot.get("io_wait_percent")
+    if (
+        not _finite_resource_number(load_per_cpu)
+        or not _finite_resource_number(cpu_busy_percent)
+        or not _finite_resource_number(io_wait_percent)
+    ):
+        reasons.append("cpu_metrics_unavailable")
+    else:
+        if (
+            load_per_cpu > policy["max_load_per_cpu"]
+            or cpu_busy_percent > policy["max_cpu_busy_percent"]
+        ):
+            reasons.append("cpu_pressure_high")
+        if io_wait_percent > policy["max_io_wait_percent"]:
+            reasons.append("io_pressure_high")
+    memory_percent = snapshot.get("available_memory_percent")
+    memory_mib = snapshot.get("available_memory_mib")
+    if not _finite_resource_number(memory_percent) or not _finite_resource_number(memory_mib):
+        reasons.append("memory_metrics_unavailable")
+    elif (
+        memory_percent < policy["min_available_memory_percent"]
+        or memory_mib < policy["min_available_memory_mib"]
+    ):
+        reasons.append("memory_pressure_high")
+    for reason in declared or ():
+        if reason not in reasons:
+            reasons.append(reason)
+    return list(dict.fromkeys(reasons))
+
+
+@contextlib.contextmanager
+def _resource_admission_scope(admission: dict[str, Any]) -> Iterator[None]:
+    token = _RESOURCE_ADMISSION_CONTEXT.set(admission)
+    try:
+        yield
+    finally:
+        _RESOURCE_ADMISSION_CONTEXT.reset(token)
+
+
+def _resource_admission_decision(
+    *,
+    agent: str | None = None,
+    task: str | None = None,
+    role: str = "arbeitsbiene",
+    required_slots: int = 1,
+    snapshot: Mapping[str, Any] | None = None,
+    inventory: Any = None,
+    enforce_pressure: bool = True,
+) -> dict[str, Any]:
+    """Compose one resource snapshot with capacity, provider, then pressure precedence."""
+
+    snapshot = system_resource_snapshot() if snapshot is None else snapshot
+    policy = spawn_resource_policy()
+    if not _valid_spawn_policy(policy):
+        result = _admission_result(
+            required_slots=required_slots,
+            allowed=False,
+            available_slots=None,
+            reason_codes=["policy_invalid"],
+        )
+    elif not isinstance(snapshot, Mapping):
+        result = _admission_result(
+            required_slots=required_slots,
+            allowed=False,
+            available_slots=None,
+            reason_codes=[
+                "cpu_metrics_unavailable",
+                "memory_metrics_unavailable",
+                "session_metrics_unavailable",
+            ],
+        )
+    else:
+        pressure_reasons = (
+            _resource_pressure_reason_codes(snapshot, policy)
+            if enforce_pressure and policy["pressure_limits_enabled"]
+            else []
+        )
+        capacity_reasons: list[str] = []
+        running_agents = snapshot.get("running_agents")
+        available_slots: int | None = None
+        if (
+            isinstance(running_agents, int)
+            and not isinstance(running_agents, bool)
+            and running_agents >= 0
+        ):
+            available_slots = policy["max_running_agents"] - running_agents
+            if running_agents >= policy["max_running_agents"]:
+                capacity_reasons.append("running_agent_limit")
+            elif available_slots < required_slots:
+                capacity_reasons.append("insufficient_slots")
+        else:
+            capacity_reasons.append("session_metrics_unavailable")
+
+        reasons = list(capacity_reasons)
+        running_ollama: int | None = None
+        descriptor = None
+        if agent is not None:
+            try:
+                inventory = current_agent_inventory() if inventory is None else inventory
+                descriptor = inventory.agents.get(agent)
+            except (AttributeError, TypeError, ValueError):
+                descriptor = None
+                inventory = None
+        if descriptor is not None and descriptor.provider is Provider.OLLAMA_LOCAL:
+            running_ollama = 0
+            count_known = True
+            try:
+                candidates = inventory.agent_ids
+                agents = inventory.agents
+                for candidate in candidates:
+                    item = agents[candidate]
+                    if item.provider is not Provider.OLLAMA_LOCAL:
+                        continue
+                    try:
+                        alive = tmux_alive(item.session)
+                    except Exception:
+                        count_known = False
+                        break
+                    if type(alive) is not bool:
+                        count_known = False
+                        break
+                    if alive:
+                        running_ollama += 1
+            except (AttributeError, KeyError, TypeError, ValueError):
+                count_known = False
+            if not count_known:
+                reasons.append("session_metrics_unavailable")
+            elif policy["ollama_concurrency_limit_enabled"] and running_ollama >= policy["ollama_max_concurrent_agents"]:
+                reasons.append("ollama_concurrency_limit")
+        reasons.extend(pressure_reasons)
+        if descriptor is not None and descriptor.provider is Provider.OLLAMA_LOCAL:
+            task_ok = task is None or _ollama_simple_task_allowed(task, role)
+            if descriptor.task_profile == "simple_only" and not task_ok:
+                reasons.append("ollama_simple_task_only")
+
+        result = _admission_result(
+            required_slots=required_slots,
+            allowed=not reasons,
+            available_slots=available_slots,
+            reason_codes=reasons,
+        )
+        if running_ollama is not None:
+            result["running_ollama_agents"] = running_ollama
+
+    if agent is not None:
+        result["resource_snapshot"] = snapshot
+    return result
 
 
 def spawn_admission_decision(
     required_slots: int = 1,
     *,
     running_agents_override: int | None = None,
+    enforce_pressure: bool = True,
 ) -> dict[str, Any]:
-    required_slots = normalize_int_field(required_slots, field="required_slots", minimum=1, maximum=6)
+    required_slots = normalize_int_field(required_slots, field="required_slots", minimum=1, maximum=10)
     snapshot = (
         system_resource_snapshot()
         if running_agents_override is None
         else system_resource_snapshot(running_agents_override=running_agents_override)
     )
-    policy = spawn_resource_policy()
-    if not _valid_spawn_policy(policy):
-        return _admission_result(
-            required_slots=required_slots,
-            allowed=False,
-            available_slots=None,
-            reason_codes=["policy_invalid"],
-        )
-    if not isinstance(snapshot, dict):
-        return _admission_result(
-            required_slots=required_slots,
-            allowed=False,
-            available_slots=None,
-            reason_codes=["cpu_metrics_unavailable", "memory_metrics_unavailable", "session_metrics_unavailable"],
-        )
-    if snapshot.get("ok") is not True:
-        reasons = [
-            reason
-            for reason in snapshot.get("reason_codes", [])
-            if reason in RESOURCE_REASON_CODES
-        ]
-        if not reasons:
-            reasons = [
-                "cpu_metrics_unavailable",
-                "memory_metrics_unavailable",
-                "session_metrics_unavailable",
-            ]
-        return _admission_result(
-            required_slots=required_slots,
-            allowed=False,
-            available_slots=None,
-            reason_codes=reasons,
-        )
-
-    reasons: list[str] = []
-    load_per_cpu = snapshot.get("load_per_cpu")
-    if not _finite_resource_number(load_per_cpu):
-        reasons.append("cpu_metrics_unavailable")
-    elif load_per_cpu > policy["max_load_per_cpu"]:
-        reasons.append("cpu_pressure_high")
-
-    memory_percent = snapshot.get("available_memory_percent")
-    memory_mib = snapshot.get("available_memory_mib")
-    if not _finite_resource_number(memory_percent) or not _finite_resource_number(memory_mib):
-        reasons.append("memory_metrics_unavailable")
-    else:
-        if memory_percent < policy["min_available_memory_percent"] or memory_mib < policy["min_available_memory_mib"]:
-            reasons.append("memory_pressure_high")
-
-    running_agents = snapshot.get("running_agents")
-    available_slots: int | None = None
-    if (
-        isinstance(running_agents, int)
-        and not isinstance(running_agents, bool)
-        and running_agents >= 0
-    ):
-        available_slots = policy["max_running_agents"] - running_agents
-        if running_agents >= policy["max_running_agents"]:
-            reasons.append("running_agent_limit")
-        elif available_slots < required_slots:
-            reasons.append("insufficient_slots")
-    else:
-        reasons.append("session_metrics_unavailable")
-
-    return _admission_result(
+    return _resource_admission_decision(
         required_slots=required_slots,
-        allowed=not reasons,
-        available_slots=available_slots,
-        reason_codes=reasons,
+        snapshot=snapshot,
+        enforce_pressure=enforce_pressure,
     )
 
 
@@ -4061,6 +5633,7 @@ def require_spawn_capacity(required_slots: int = 1) -> dict[str, Any]:
             "retryable": True,
             "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS,
             "reason_codes": reason_codes,
+            "errors": admission.get("errors", spawn_error_details(reason_codes)),
         },
     )
 
@@ -4079,47 +5652,37 @@ def _ollama_simple_task_allowed(task: str, role: str) -> bool:
 def ollama_resource_status(agent: str, *, task: str | None = None, role: str = "arbeitsbiene") -> dict[str, Any]:
     """Return the conservative local admission decision for Ollama."""
 
-    descriptor = current_agent_inventory().agents.get(agent)
+    inventory = current_agent_inventory()
+    descriptor = inventory.agents.get(agent)
     if descriptor is None or descriptor.provider is not Provider.OLLAMA_LOCAL:
         return {"allowed": True, "provider": "not_ollama", "raw_output": "not_returned"}
     snapshot = system_resource_snapshot()
-    running_ollama = 0
-    for candidate in current_agent_inventory().agent_ids:
-        item = current_agent_inventory().agents[candidate]
-        if item.provider is Provider.OLLAMA_LOCAL:
-            with contextlib.suppress(Exception):
-                running_ollama += 1 if tmux_alive(item.session) else 0
-    reasons = list(snapshot.get("reason_codes", [])) if isinstance(snapshot, dict) else ["cpu_metrics_unavailable"]
-    if snapshot.get("load_per_cpu") is not None and snapshot["load_per_cpu"] > RESOURCE_MAX_LOAD_PER_CPU:
-        reasons.append("cpu_pressure_high")
-    if snapshot.get("available_memory_percent") is not None and (
-        snapshot["available_memory_percent"] < RESOURCE_MIN_AVAILABLE_MEMORY_PERCENT
-        or snapshot.get("available_memory_mib", 0) < RESOURCE_MIN_AVAILABLE_MEMORY_MIB
-    ):
-        reasons.append("memory_pressure_high")
-    if running_ollama >= OLLAMA_MAX_CONCURRENT_AGENTS:
-        reasons.append("ollama_concurrency_limit")
-    task_ok = task is None or _ollama_simple_task_allowed(task, role)
-    if descriptor.task_profile == "simple_only" and not task_ok:
-        reasons.append("ollama_simple_task_only")
+    decision = _resource_admission_decision(
+        agent=agent,
+        task=task,
+        role=role,
+        snapshot=snapshot,
+        inventory=inventory,
+    )
+    reason_codes = decision.get("reason_codes", [])
     return {
-        "allowed": not reasons,
+        "allowed": decision.get("allowed") is True,
         "provider": "ollama_local",
         "agent": agent,
         "task_profile": descriptor.task_profile,
-        "running_ollama_agents": running_ollama,
+        "running_ollama_agents": decision.get("running_ollama_agents"),
         "max_concurrent_ollama_agents": OLLAMA_MAX_CONCURRENT_AGENTS,
-        "resource_snapshot": snapshot,
-        "reason_codes": sorted(set(reasons)),
-        "benchmark_policy": "single_agent_default; two_agent_cap_after_local_benchmark",
+        "concurrency_limit_enforced": OLLAMA_CONCURRENCY_LIMIT_ENABLED,
+        "temporary_global_agent_cap": RESOURCE_MAX_RUNNING_AGENTS,
+        "resource_snapshot": decision.get("resource_snapshot"),
+        "reason_codes": reason_codes,
+        "errors": decision.get("errors", []),
+        "benchmark_policy": "single_agent_default; two_agent_cap_active",
         "raw_output": "not_returned",
     }
 
 
-def require_ollama_admission(agent: str, *, task: str | None = None, role: str = "arbeitsbiene") -> None:
-    decision = ollama_resource_status(agent, task=task, role=role)
-    if decision.get("allowed") is True:
-        return
+def _raise_ollama_admission_denied(decision: Mapping[str, Any]) -> None:
     raise AgentCapacityError(
         "Ollama admission denied",
         {
@@ -4127,9 +5690,17 @@ def require_ollama_admission(agent: str, *, task: str | None = None, role: str =
             "retryable": True,
             "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS,
             "reason_codes": decision.get("reason_codes", ["ollama_resource_unavailable"]),
+            "errors": decision.get("errors", []),
             "resource_snapshot": decision.get("resource_snapshot"),
         },
     )
+
+
+def require_ollama_admission(agent: str, *, task: str | None = None, role: str = "arbeitsbiene") -> None:
+    decision = ollama_resource_status(agent, task=task, role=role)
+    if decision.get("allowed") is True:
+        return
+    _raise_ollama_admission_denied(decision)
 
 
 def _spawn_priority_routes() -> tuple[str, ...]:
@@ -4147,7 +5718,7 @@ def _spawn_priority_routes() -> tuple[str, ...]:
 
 
 def agent_spawn_offers(required_slots: int = 1) -> dict[str, Any]:
-    required_slots = normalize_int_field(required_slots, field="required_slots", minimum=1, maximum=6)
+    required_slots = normalize_int_field(required_slots, field="required_slots", minimum=1, maximum=10)
     admission = spawn_admission_decision(required_slots)
     routes = _spawn_priority_routes()
     allowed = admission.get("allowed") is True
@@ -4164,7 +5735,7 @@ def agent_spawn_offers(required_slots: int = 1) -> dict[str, Any]:
     if not allowed and not reason_codes:
         reason_codes = ["session_metrics_unavailable"]
     retryable = not allowed
-    return {
+    result = {
         "ok": allowed,
         "offers": offers,
         "offer_count": len(offers),
@@ -4176,6 +5747,16 @@ def agent_spawn_offers(required_slots: int = 1) -> dict[str, Any]:
         "reason_codes": reason_codes,
         "raw_output": "not_returned",
     }
+    if not allowed:
+        result["errors"] = admission.get(
+            "errors",
+            spawn_error_details(
+                reason_codes,
+                required_slots=required_slots,
+                available_slots=admission.get("available_slots"),
+            ),
+        )
+    return result
 
 
 def normalize_lease_seconds(value: Any) -> int:
@@ -5147,15 +6728,16 @@ def validate_codex_usage_routing_decision(
         max_chars=MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID,
         required=decision != "blocked",
     )
-    expected_model = {
-        "spark": WRITE_AGENT_MODEL,
-        "main": DEFAULT_AGENT_MODEL,
-        "credits": DEFAULT_AGENT_MODEL,
-        "blocked": None,
-        "unchanged": None,
+    expected_models = {
+        "spark": {WRITE_AGENT_MODEL},
+        "main": {DEFAULT_AGENT_MODEL, CODEX_USAGE_LEGACY_MAIN_MODEL},
+        "credits": {DEFAULT_AGENT_MODEL, CODEX_USAGE_LEGACY_MAIN_MODEL},
+        "blocked": {None},
+        "unchanged": {None},
     }[decision]
-    if model != expected_model:
+    if model not in expected_models:
         raise AgentError("codex-usage routing model does not match decision")
+    selected_model = DEFAULT_AGENT_MODEL if model == CODEX_USAGE_LEGACY_MAIN_MODEL else model
     if decision == "credits" and payload.get("paid_overage_allowed") is not True:
         raise AgentError("codex-usage credits decision lacks explicit paid policy")
     if not isinstance(payload.get("paid_overage_allowed"), bool):
@@ -5166,7 +6748,7 @@ def validate_codex_usage_routing_decision(
         "backend_account_id": backend_account_id,
         "role": role,
         "decision": decision,
-        "model": model,
+        "model": selected_model,
         "reason": bounded_text(payload.get("reason"), field="routing reason", max_chars=120),
         "usage_state": bounded_text(
             payload.get("usage_state"), field="routing usage_state", max_chars=32
@@ -5177,6 +6759,12 @@ def validate_codex_usage_routing_decision(
         ),
         "raw_output": "not_returned",
     }
+    if model == CODEX_USAGE_LEGACY_MAIN_MODEL:
+        result["model_fallback"] = {
+            "requested": model,
+            "selected": selected_model,
+            "reason": "legacy_main_model_replaced",
+        }
     threshold = payload.get("threshold_percent")
     if threshold is not None:
         if (
@@ -5234,6 +6822,251 @@ def validate_codex_usage_routing_decision(
         if blocked_resets:
             result["blocked_until_utc"] = max(blocked_resets)[1]
     return result
+
+
+def resolve_runtime_agent_selection(
+    *,
+    role: str,
+    routing: Mapping[str, Any] | None,
+    task_profile: TaskProfile,
+    requested_class: str | None = None,
+    requested_lifecycle: str | None = None,
+    requested_model: str | None = None,
+    requested_reasoning: str | None = None,
+    authority_class: str | None = None,
+) -> ResolutionDecision:
+    """Resolve the one model decision consumed by start and assign.
+
+    ``authority_class=None`` is reserved for trusted in-process callers. MCP
+    callers always bind a verified or fail-safe principal class before reaching
+    this shared resolver path.
+    """
+
+    scope_kind = "read" if role == "exploriererin" else "write" if role == "arbeitsbiene" else "unknown"
+    class_catalog = load_agent_class_catalog(repo_root() / "codex-agent-classes.json")
+    classes, models = policies_from_catalogs(
+        class_catalog,
+        load_model_policy(repo_root() / "codex-model-policy.json"),
+    )
+    if authority_class is not None:
+        allowed_class_ids = delegable_nonleadership_class_ids(
+            authority_class,
+            class_catalog,
+        )
+        classes = tuple(item for item in classes if item.class_id in allowed_class_ids)
+    available_models = available_model_ids_for_routing(models, routing)
+    try:
+        return resolve_agent_selection(
+            ResolutionRequest(
+                scope_kind=scope_kind,
+                complexity=task_profile.complexity.value,
+                requested_class=requested_class,
+                requested_lifecycle=requested_lifecycle,
+                requested_model=requested_model,
+                requested_reasoning=requested_reasoning,
+                required_capabilities=task_profile.required_capabilities,
+                spark_eligible=task_profile.spark_eligible,
+            ),
+            classes=classes,
+            models=models,
+            available_models=available_models,
+        )
+    except ValueError as exc:
+        if str(exc).startswith(("required_model_unavailable:", "required_model_effort_unavailable:")):
+            raise AgentError(str(exc)) from exc
+        raise
+
+
+def classify_runtime_task(request: TaskClassificationRequest) -> TaskProfile:
+    return TaskClassifier().classify(request)
+
+
+def available_model_ids_for_routing(
+    models: tuple[ModelPolicy, ...], routing: Mapping[str, Any] | None
+) -> set[str]:
+    available = {item.model_id for item in models}
+    if routing is not None and routing.get("decision") != "spark":
+        available -= {item.model_id for item in models if item.family == "spark"}
+    return available
+
+
+def public_task_profile(profile: TaskProfile) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "complexity": profile.complexity.value,
+        "spark_eligible": profile.spark_eligible,
+        "reason_codes": list(profile.reason_codes),
+        "required_capabilities": list(profile.required_capabilities),
+        "raw_output": "not_returned",
+    }
+
+
+def _complexity_override(value: Any) -> TaskComplexity | None:
+    if not isinstance(value, str):
+        raise AgentError("complexity must be simple, medium, complex, or unknown")
+    normalized = value.strip().lower()
+    if normalized not in {"simple", "medium", "complex", "unknown"}:
+        raise AgentError("complexity must be simple, medium, complex, or unknown")
+    return {
+        "simple": TaskComplexity.SIMPLE,
+        "medium": TaskComplexity.MEDIUM,
+        "complex": TaskComplexity.COMPLEX,
+        "unknown": None,
+    }[normalized]
+
+
+def public_resolution_decision(decision: ResolutionDecision | None) -> dict[str, Any] | None:
+    if decision is None:
+        return None
+    return {
+        "schema_version": 1,
+        "class": decision.class_id,
+        "lifecycle": decision.lifecycle,
+        "model": decision.model,
+        "reasoning": decision.reasoning,
+        "requested": {
+            "class": decision.requested_class,
+            "lifecycle": decision.requested_lifecycle,
+            "model": decision.requested_model,
+            "reasoning": decision.requested_reasoning,
+        },
+        "fallback": decision.fallback,
+        "reason_codes": list(decision.reason_codes),
+        "raw_output": "not_returned",
+    }
+
+
+def _resolver_target_selection_inputs(
+    agent: str,
+    requested_class: str | None,
+    authority_class: str | None,
+) -> tuple[str | None, str | None]:
+    descriptor = current_agent_inventory().agents.get(agent)
+    verified_leadership_target = bool(
+        descriptor is not None
+        and getattr(descriptor, "series_prefix", None) == "q"
+        and (authority_class is None or authority_class in LEADERSHIP_CLASS_IDS)
+    )
+    if verified_leadership_target:
+        return "teamleiterin", None
+    return requested_class, authority_class
+
+
+def resolver_class_for_agent(
+    agent: str,
+    requested_class: str | None,
+    *,
+    authority_class: str | None = "arbeitsbiene",
+) -> str | None:
+    resolved_class, _resolver_authority = _resolver_target_selection_inputs(
+        agent,
+        requested_class,
+        authority_class,
+    )
+    return resolved_class
+
+
+def delegable_nonleadership_class_ids(
+    authority_class: str,
+    class_catalog: Mapping[str, Any],
+) -> frozenset[str]:
+    """Return the non-leading classes available to one bound principal."""
+
+    authority = class_catalog.get(authority_class)
+    if authority is None:
+        raise AgentError("verified principal class is unknown")
+    allowed: set[str] = set()
+    pending = list(authority.delegation_targets)
+    while pending:
+        class_id = pending.pop()
+        if class_id in allowed:
+            continue
+        profile = class_catalog.get(class_id)
+        if profile is None:
+            continue
+        allowed.add(class_id)
+        pending.extend(profile.delegation_targets)
+    allowed -= LEADERSHIP_CLASS_IDS
+    if not allowed and authority_class not in LEADERSHIP_CLASS_IDS:
+        allowed.add(authority_class)
+    if not allowed:
+        raise AgentError("verified principal cannot delegate to a non-leading class")
+    return frozenset(allowed)
+
+
+def agent_selection_options(
+    agent: str,
+    *,
+    principal_class: str | None = None,
+    requester_class: str | None = None,
+    known_generation: str | None = None,
+) -> dict[str, Any]:
+    """Return one advisory, account-aware first-round resolver offer.
+
+    ``requester_class`` remains only as an explicit trusted in-process adapter.
+    The public MCP schema cannot supply it. Calls without a bound principal
+    fail safe to the smallest non-leading authority.
+    """
+
+    agent = canonical_agent_id(agent)
+    class_catalog = load_agent_class_catalog(repo_root() / "codex-agent-classes.json")
+    if principal_class is not None and requester_class is not None:
+        raise AgentError("selection authority is ambiguous")
+    authority_class = principal_class or requester_class or "arbeitsbiene"
+    classes, models = policies_from_catalogs(
+        class_catalog,
+        load_model_policy(repo_root() / "codex-model-policy.json"),
+    )
+    target_class, _resolver_authority = _resolver_target_selection_inputs(agent, None, authority_class)
+    if target_class == "teamleiterin":
+        classes = tuple(item for item in classes if item.class_id == target_class)
+    else:
+        allowed_class_ids = delegable_nonleadership_class_ids(
+            authority_class,
+            class_catalog,
+        )
+        classes = tuple(item for item in classes if item.class_id in allowed_class_ids)
+    routing = codex_usage_routing_decision(agent, role="arbeitsbiene")
+    if routing.get("decision") == "blocked" or routing.get("model") is None:
+        raise AgentError(
+            "codex-usage blocked selection offer: "
+            f"reason={routing.get('reason') or 'unknown'}"
+        )
+    available_models = available_model_ids_for_routing(models, routing)
+    try:
+        offer = build_selection_offer(
+            classes=classes,
+            models=models,
+            available_models=available_models,
+        )
+    except ValueError as exc:
+        if str(exc).startswith(("required_model_unavailable:", "required_model_effort_unavailable:")):
+            raise AgentError(str(exc)) from exc
+        raise
+    if target_class == "teamleiterin" and not offer.options:
+        if "gpt-5.6-terra" not in available_models:
+            raise AgentError("required_model_unavailable:gpt-5.6-terra")
+        raise AgentError("required_model_effort_unavailable:gpt-5.6-terra:xhigh")
+    return {
+        "schema_version": 1,
+        "generation": offer.generation,
+        "options_changed": known_generation != offer.generation,
+        "classes": list(offer.classes),
+        "lifecycles": list(offer.lifecycles),
+        "models": list(offer.models),
+        "reasoning_levels": list(offer.reasoning_levels),
+        "options": [
+            {
+                "class": item.class_id,
+                "lifecycle": item.lifecycle,
+                "model": item.model,
+                "reasoning": item.reasoning,
+            }
+            for item in offer.options
+        ],
+        "availability_reason": routing.get("reason"),
+        "raw_output": "not_returned",
+    }
 
 
 def managed_raw_dirs() -> tuple[Path, ...]:
@@ -5855,6 +7688,52 @@ def resolve_proc_cwd(pid_dir: Path) -> tuple[Path | None, bool]:
         return None, True
 
 
+def _proc_is_exact_inherited_home_session_helper(
+    pid_dir: Path,
+    status: dict[str, str],
+    argv: list[str],
+) -> bool:
+    signatures = {
+        ("/usr/bin/dbus-daemon", "--session"): Path("/usr/bin/dbus-daemon"),
+        (
+            "/usr/bin/dbus-daemon",
+            "--syslog-only",
+            "--fork",
+            "--print-pid",
+            "5",
+            "--print-address",
+            "7",
+            "--session",
+        ): Path("/usr/bin/dbus-daemon"),
+        (
+            "/usr/bin/gnome-keyring-daemon",
+            "--start",
+            "--foreground",
+            "--components=secrets",
+        ): Path("/usr/bin/gnome-keyring-daemon"),
+    }
+    expected_executable = signatures.get(tuple(argv))
+    ppid_parts = status.get("PPid", "").split()
+    if expected_executable is None or len(ppid_parts) != 1 or not ppid_parts[0].isdigit():
+        return False
+    parent_pid = int(ppid_parts[0])
+    if parent_pid != 1:
+        parent_dir = pid_dir.parent / str(parent_pid)
+        parent_status = read_proc_status(parent_dir)
+        if (
+            parent_status.get("Name") != "systemd"
+            or parent_status.get("PPid", "").split() != ["1"]
+            or read_proc_cmdline(parent_dir) != ["/usr/lib/systemd/systemd", "--user"]
+        ):
+            return False
+    try:
+        executable = (pid_dir / "exe").resolve(strict=True)
+        current_dir = (pid_dir / "cwd").resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    return executable == expected_executable and current_dir == Path("/")
+
+
 def same_path_text(left: str, right: Path) -> bool:
     if not isinstance(left, str) or not left.strip():
         return False
@@ -5939,6 +7818,19 @@ def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[di
                 env.get("CODEX_AGENT_MCP") == "1" or env.get("CODEX_MASTER_MCP") == "1"
             ) and proc_is_codex_like(status, read_proc_cmdline(pid_dir))
         if not matches_home:
+            continue
+        if (
+            not managed
+            and env is not None
+            and bool(env.get("CODEX_HOME"))
+            and env.get("CODEX_AGENT_MCP") == "1"
+            and env.get("CODEX_MASTER_MCP") == "1"
+            and _proc_is_exact_inherited_home_session_helper(
+                pid_dir,
+                status,
+                read_proc_cmdline(pid_dir),
+            )
+        ):
             continue
         ppid_parts = status.get("PPid", "0").split()
         ppid = int(ppid_parts[0]) if ppid_parts and ppid_parts[0].isdigit() else None
@@ -6376,10 +8268,19 @@ def start_agent(
     release_lease_on_failure: bool = False,
     model: str = DEFAULT_AGENT_MODEL,
     model_reasoning_effort: str | None = None,
+    agent_class: str | None = None,
+    name: str | None = None,
+    replacement_reservation_id: str | None = None,
 ) -> dict[str, Any]:
     require_fleet_recovery_ready("agent_start")
     agent = canonical_agent_id(agent)
     with agent_lifecycle_lock(agent):
+        name_args = {"name": name} if name is not None else {}
+        replacement_args = (
+            {"replacement_reservation_id": replacement_reservation_id}
+            if replacement_reservation_id is not None
+            else {}
+        )
         return _start_agent_unlocked(
             agent,
             cwd,
@@ -6388,6 +8289,9 @@ def start_agent(
             release_lease_on_failure,
             model,
             model_reasoning_effort,
+            agent_class,
+            **name_args,
+            **replacement_args,
         )
 
 
@@ -6399,12 +8303,19 @@ def _start_agent_unlocked(
     release_lease_on_failure: bool = False,
     model: str = DEFAULT_AGENT_MODEL,
     model_reasoning_effort: str | None = None,
+    agent_class: str | None = None,
+    name: str | None = None,
+    replacement_reservation_id: str | None = None,
 ) -> dict[str, Any]:
     require_fleet_recovery_ready("agent_start")
     agent = canonical_agent_id(agent)
     ollama_descriptor = _ollama_descriptor(agent)
+    admission = _RESOURCE_ADMISSION_CONTEXT.get()
     if ollama_descriptor is not None:
-        require_ollama_admission(agent, task=prompt, role="arbeitsbiene")
+        if admission is None:
+            admission = _resource_admission_decision(agent=agent, task=prompt, role="arbeitsbiene")
+        if admission.get("allowed") is not True:
+            _raise_ollama_admission_denied(admission)
     ensure_state()
     cfg = agent_config(agent)
     runner = cfg["runner"]
@@ -6420,6 +8331,10 @@ def _start_agent_unlocked(
     ):
         raise AgentError(f"runner for agent {agent} must be a regular executable file")
     if tmux_alive(session):
+        if replacement_reservation_id is not None:
+            _raise_replacement_capacity_denied(
+                {"error_code": "spawn_capacity_unavailable", "reason_codes": ["session_metrics_unavailable"]}
+            )
         process_summary = agent_home_process_summary(agent)
         if process_summary["external_process_count"] is None:
             raise AgentError(f"agent {agent} CODEX_HOME process scan is unavailable; retry before starting")
@@ -6442,7 +8357,12 @@ def _start_agent_unlocked(
         }
 
     with spawn_admission_lock():
-        require_spawn_capacity(1)
+        if replacement_reservation_id is not None:
+                validation = require_managed_replacement_reservation(replacement_reservation_id, session)
+                if validation.get("allowed") is not True:
+                    _raise_replacement_capacity_denied(validation)
+        elif admission is None:
+            require_spawn_capacity(1)
         process_summary = agent_home_process_summary(agent)
         identity_guard = agent_identity_guard(False, process_summary)
         if process_summary["external_process_count"] is None:
@@ -6461,6 +8381,9 @@ def _start_agent_unlocked(
 
         close_runner_execution_fd(agent)
         cwd = bounded_text(cwd, field="cwd", max_chars=MAX_PATH_TEXT) if cwd is not None else None
+        name = bounded_text(name, field="name", max_chars=MAX_AGENTIN_NAME) if name is not None else None
+        prompt = bounded_text(prompt, field="prompt", max_chars=MAX_SEND_TEXT, strip=False) if prompt is not None else None
+        prompt = apply_agent_introduction_policy(prompt, agent_class=agent_class, name=name)
         prompt = bounded_text(prompt, field="prompt", max_chars=MAX_SEND_TEXT, strip=False) if prompt is not None else None
         start_cwd = Path(cwd or os.getcwd()).expanduser().resolve()
         if not start_cwd.exists() or not start_cwd.is_dir():
@@ -6476,7 +8399,7 @@ def _start_agent_unlocked(
         routed_args = (
             ["--yolo", "-s", "danger-full-access"]
             if ollama_descriptor is not None
-            else agent_base_args(model, reasoning_effort)
+            else agent_base_args(model, reasoning_effort, agent_class=agent_class)
         )
 
         runner_execution_path = open_runner_execution_path(agent, runner, runner_stat)
@@ -7222,57 +9145,10 @@ def run_headless_assignment(
 
 
 def _headless_route_candidates(agent: str, skill: str | None, required_skills: list[str] | None = None) -> list[str]:
-    """Choose the requested Gemini bee first, then another fresh ready series."""
+    """Return only the explicitly requested identity; fallback needs opt-in."""
 
-    requested = canonical_agent_id(agent)
-    service = current_fleet_service()
-    inventory = current_agent_inventory()
-    ordered = [requested] + [item for item in inventory.agent_ids if item != requested]
-    candidates: list[str] = []
-    probed_accounts: set[str] = set()
-    for candidate in ordered:
-        descriptor = inventory.agents.get(candidate)
-        if descriptor is None or descriptor.runner is not RunnerKind.GEMINI_CLI or not descriptor.enabled:
-            continue
-        with contextlib.suppress(AgentError, OSError, ValueError):
-            status = status_agent(candidate, initialize_state=False)
-            identity = status.get("identity_guard")
-            response = status.get("response_state")
-            if (
-                isinstance(identity, Mapping)
-                and identity.get("ok") is not True
-            ) or (
-                isinstance(response, Mapping)
-                and response.get("state") == "headless_identity_unverified"
-            ):
-                continue
-        with contextlib.suppress(Exception):
-            sync_gemini_skill_home(candidate)
-        gate = _headless_admission_gate(
-            candidate,
-            inventory=inventory,
-            probed_accounts=probed_accounts,
-        )
-        if not gate.allowed:
-            continue
-        if gate.account_id is not None:
-            rate_status = getattr(service, "gemini_rate_status", None)
-            if callable(rate_status):
-                rate = rate_status(gate.account_id)
-                if rate.get("allowed") is not True:
-                    continue
-        lease = agent_lease_status(candidate)
-        if lease.get("state") == "held":
-            continue
-        if HEADLESS_JOBS.status(candidate).get("status") in {"running", "cancelling"}:
-            continue
-        required = list(required_skills or [])
-        if skill and skill not in required:
-            required.insert(0, skill)
-        if any(not skill_matches(candidate, item) for item in required):
-            continue
-        candidates.append(candidate)
-    return candidates
+    del skill, required_skills
+    return [canonical_agent_id(agent)]
 
 
 def _assign_headless_agent(
@@ -7327,20 +9203,12 @@ def _assign_headless_agent(
         raise AgentError("exploriererin assignments must not include write paths")
     if role == "arbeitsbiene" and not write_paths:
         raise AgentError("arbeitsbiene assignments require at least one explicit write path")
-    scope_result = scope_check(scope, write_paths)
-    if role == "arbeitsbiene" and not scope_result["allowed"]:
-        raise AgentError("write paths must stay inside scope")
+    if role == "arbeitsbiene":
+        raise HeadlessWriteScopeError()
     matches = skill_matches(agent, skill) if skill else []
     missing_skills = [item for item in required_skills if not skill_matches(agent, item)]
     if missing_skills and not allow_missing_skill:
-        # Skill provisioning may have just repaired the managed home.  Re-read
-        # the inventory before failing so a ready alternate series can be used.
-        candidates = _headless_route_candidates(requested_agent, skill, required_skills)
-        if not candidates:
-            raise AgentError(f"skill not found for agent {agent}")
-        agent = candidates[0]
-        descriptor = _headless_descriptor(agent)
-        matches = skill_matches(agent, skill)
+        raise AgentError(f"skill not found for agent {agent}")
     subagent_admission = spawn_admission_decision(1) if allow_subagents else None
     prompt = assignment_prompt(
         agent=agent, role=role, task=task, scope=scope, skill=skill,
@@ -7352,18 +9220,6 @@ def _assign_headless_agent(
     )
     if len(prompt) > MAX_ASSIGNMENT_TEXT:
         raise AgentError(f"assignment prompt exceeds {MAX_ASSIGNMENT_TEXT} characters")
-    candidates = _headless_route_candidates(agent, skill, required_skills)
-    if not candidates:
-        first_gate = current_fleet_service().account_gate(agent)
-        if first_gate.allowed:
-            candidates = [agent]
-        else:
-            raise AgentError(first_gate.reason)
-    agent = candidates[0]
-    descriptor = _headless_descriptor(agent)
-    if descriptor is None:
-        raise AgentError("headless_runner_unavailable")
-    matches = skill_matches(agent, skill) if skill else []
     with agent_lifecycle_lock(agent):
         claim = _claim_agent_unlocked(agent)
         lease = claim["lease"]
@@ -7403,7 +9259,6 @@ def _assign_headless_agent(
             if release_on_completion:
                 release_start_lease_if_safe(agent, lease, True)
             raise
-    fallback_attempts: list[dict[str, Any]] = []
     try:
         result = _run_headless_process(
             agent, prompt, lease, timeout_seconds,
@@ -7411,17 +9266,6 @@ def _assign_headless_agent(
             release_lease_on_completion=release_on_completion,
         )
     except FleetRateLimitError as exc:
-        # A second admission check can race the read-only route preview.  A
-        # local limiter hit is therefore a routable failure, not a reason to
-        # strand the assignment on the first series.
-        fallback_attempts.append({
-            "agent": agent,
-            "status": "exception",
-            "reason": exc.reason,
-            "retry_after_seconds": exc.retry_after_seconds,
-        })
-        if len(candidates) <= 1:
-            raise
         result = {
             "agent": agent,
             "assignment_id": assignment_id,
@@ -7431,48 +9275,6 @@ def _assign_headless_agent(
             "error": {"kind": exc.reason, "retryable": True},
             "raw_output": "not_returned",
         }
-    failure = result.get("error") if isinstance(result, dict) else None
-    should_fallback = (
-        isinstance(failure, dict)
-        and failure.get("kind") in {"account_limited", "provider_unavailable", "runner_failed"}
-    ) or (isinstance(result, dict) and result.get("status") == "timeout")
-    if should_fallback:
-        for fallback_agent in candidates[1:]:
-            try:
-                with agent_lifecycle_lock(fallback_agent):
-                    fallback_claim = _claim_agent_unlocked(fallback_agent)
-                    fallback_lease = fallback_claim["lease"]
-                    fallback_owned = fallback_claim["status"] in {"claimed", "claimed_expired"}
-                    fallback_marker = _headless_marker(fallback_agent)
-                    fallback_marker.update({"state": "ready", "assignment_id": assignment_id})
-                    _write_headless_marker(fallback_agent, fallback_marker)
-                    fallback_result = _run_headless_process(
-                        fallback_agent,
-                        prompt,
-                        fallback_lease,
-                        timeout_seconds,
-                        role=role,
-                        assignment_id=assignment_id,
-                        release_lease_on_completion=fallback_owned,
-                    )
-                fallback_attempts.append({
-                    "agent": fallback_agent,
-                    "status": fallback_result.get("status"),
-                    "error": fallback_result.get("error"),
-                })
-                result = fallback_result
-                agent = fallback_agent
-                if result.get("status") == "completed":
-                    break
-            except Exception as exc:
-                fallback_attempts.append({
-                    "agent": fallback_agent,
-                    "status": "exception",
-                    "reason": str(exc) if isinstance(exc, (AgentError, FleetRateLimitError)) else type(exc).__name__.lower(),
-                })
-                continue
-    if fallback_attempts:
-        result["fallback_attempts"] = fallback_attempts
     result.update({
         "role": role,
         "requested_agent": requested_agent,
@@ -7494,15 +9296,28 @@ def start_agent_with_lease(
     prompt: Any = None,
     *,
     allow_unauthenticated: bool = False,
+    agent_class: str | None = None,
+    lifecycle: str | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    complexity: str = "unknown",
+    name: str | None = None,
 ) -> dict[str, Any]:
     require_fleet_recovery_ready("agent_start")
     agent = canonical_agent_id(agent)
     with agent_lifecycle_lock(agent):
+        name_args = {"name": name} if name is not None else {}
         return _start_agent_with_lease_unlocked(
             agent,
             cwd,
             prompt,
             allow_unauthenticated=allow_unauthenticated,
+            agent_class=agent_class,
+            lifecycle=lifecycle,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            complexity=complexity,
+            **name_args,
         )
 
 
@@ -7512,15 +9327,35 @@ def _start_agent_with_lease_unlocked(
     prompt: Any = None,
     *,
     allow_unauthenticated: bool = False,
+    agent_class: str | None = None,
+    lifecycle: str | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    complexity: str = "unknown",
+    authority_class: str | None = None,
+    name: str | None = None,
 ) -> dict[str, Any]:
     require_fleet_recovery_ready("agent_start")
     agent = canonical_agent_id(agent)
     headless_descriptor = _headless_descriptor(agent)
     if headless_descriptor is not None:
         return _start_headless_agent_unlocked(agent)
+    task_profile = classify_runtime_task(
+        TaskClassificationRequest(
+            objective="agent_start",
+            scope_kind="write",
+            changed_files=(),
+            task_phase="unknown",
+            complexity_override=_complexity_override(complexity),
+        )
+    )
     ollama_descriptor = _ollama_descriptor(agent)
+    admission: dict[str, Any] | None = None
+    selection: ResolutionDecision | None = None
     if ollama_descriptor is not None:
-        require_ollama_admission(agent, task=prompt, role="arbeitsbiene")
+        admission = _resource_admission_decision(agent=agent, task=prompt, role="arbeitsbiene")
+        if admission.get("allowed") is not True:
+            _raise_ollama_admission_denied(admission)
         auth_gate = {
             "authenticated": True,
             "provider": Provider.OLLAMA_LOCAL.value,
@@ -7541,14 +9376,25 @@ def _start_agent_with_lease_unlocked(
             agent,
             role="arbeitsbiene",
         )
-        selected_model = routing["model"] if routing else DEFAULT_AGENT_MODEL
-        if selected_model is None:
+        if routing is not None and routing["model"] is None:
             raise AgentError("codex-usage blocked Agentin start before model launch")
-        selected_effort = (
-            WRITE_AGENT_MODEL_EFFORT
-            if selected_model == WRITE_AGENT_MODEL
-            else DEFAULT_AGENT_MODEL_EFFORT
+        requested_target_class, resolver_authority = _resolver_target_selection_inputs(
+            agent,
+            agent_class,
+            authority_class,
         )
+        selection = resolve_runtime_agent_selection(
+            role="arbeitsbiene",
+            routing=routing,
+            task_profile=task_profile,
+            requested_class=requested_target_class,
+            requested_lifecycle=lifecycle,
+            requested_model=model,
+            requested_reasoning=reasoning_effort,
+            authority_class=resolver_authority,
+        )
+        selected_model = selection.model
+        selected_effort = selection.reasoning
 
     def validate_existing_session(result: dict[str, Any]) -> None:
         if result.get("status") != "already_running":
@@ -7571,10 +9417,12 @@ def _start_agent_with_lease_unlocked(
     claim = claim_agent(agent)
     lease = claim["lease"]
     release_on_completion = claim["status"] in {"claimed", "claimed_expired"}
+    name_args = {"name": name} if name is not None else {}
     result: dict[str, Any] | None = None
-    if tmux_alive(agent_config(agent)["session"]):
-        try:
-            result = start_agent(
+
+    def invoke_start() -> dict[str, Any]:
+        if admission is None:
+            return start_agent(
                 agent,
                 cwd,
                 prompt,
@@ -7582,7 +9430,25 @@ def _start_agent_with_lease_unlocked(
                 release_lease_on_failure=release_on_completion,
                 model=selected_model,
                 model_reasoning_effort=selected_effort,
+                agent_class=selection.class_id if selection is not None else None,
+                **name_args,
             )
+        with _resource_admission_scope(admission):
+            return start_agent(
+                agent,
+                cwd,
+                prompt,
+                lease=lease,
+                release_lease_on_failure=release_on_completion,
+                model=selected_model,
+                model_reasoning_effort=selected_effort,
+                agent_class=selection.class_id if selection is not None else None,
+                **name_args,
+            )
+
+    if tmux_alive(agent_config(agent)["session"]):
+        try:
+            result = invoke_start()
             validate_existing_session(result)
             remember_agent_routing(agent, routing)
         except Exception:
@@ -7606,17 +9472,10 @@ def _start_agent_with_lease_unlocked(
             result["lease"] = release["lease"]
         result["auth_gate"] = auth_gate
         result["routing"] = routing
+        result["selection"] = public_resolution_decision(selection)
         return result
     try:
-        result = start_agent(
-            agent,
-            cwd,
-            prompt,
-            lease=lease,
-            release_lease_on_failure=release_on_completion,
-            model=selected_model,
-            model_reasoning_effort=selected_effort,
-        )
+        result = invoke_start()
     except Exception:
         release_start_lease_if_safe(
             agent,
@@ -7644,6 +9503,7 @@ def _start_agent_with_lease_unlocked(
         result["lease"] = release["lease"]
     result["auth_gate"] = auth_gate
     result["routing"] = routing
+    result["selection"] = public_resolution_decision(selection)
     return result
 
 
@@ -8718,20 +10578,15 @@ def require_invocation_status(
         raise AgentError(f"{operation} blocked by unknown agent status")
     running = tmux_alive(descriptor.session)
     process_summary = agent_home_process_summary(agent)
-    managed_ids = process_summary.get("managed_process_ids")
-    managed_count = process_summary.get("managed_process_count")
-    cheap_pane_identity = (
-        managed_ids[0]
-        if running
-        and managed_count == 1
-        and isinstance(managed_ids, list)
-        and len(managed_ids) == 1
+    pane_process_identity = (
+        pane_pid(descriptor.session)
+        if running and "managed_process_ids" in process_summary
         else None
     )
     identity = agent_identity_guard(
         running,
         process_summary,
-        pane_process_id=cheap_pane_identity,
+        pane_process_id=pane_process_identity,
     )
     # A few embedders expose only the historical process_count field.  The
     # real scanner always emits the complete managed/external fields; accept
@@ -9000,6 +10855,8 @@ def codex_usage_watchdog_status(
     include_assignment_history: bool = True,
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
+    descriptor = current_agent_inventory().agents.get(agent)
+    series_prefix = getattr(descriptor, "series_prefix", None)
     meta = read_meta(agent)
     if meta.get("meta_error"):
         raise AgentError("could_not_read_codex_usage_watchdog_metadata")
@@ -9062,7 +10919,9 @@ def codex_usage_watchdog_status(
         snapshot_identity = snapshot["account"] if "account" in snapshot else snapshot.get("agent")
         if snapshot_identity != snapshot_account:
             raise AgentError("could_not_read_codex_usage_snapshot")
-        state = _codex_usage_watchdog_state_from_snapshot(snapshot, now=now)
+        state = _codex_usage_watchdog_state_from_snapshot(
+            snapshot, now=now, series_prefix=series_prefix
+        )
         state["account"] = snapshot_account
         state["account_mapping"] = account_mapping
         if state["state"] == "blocked":
@@ -9119,7 +10978,9 @@ def codex_usage_status_with_routing(
         and status.get("state") == "missing"
     )
     needs_routing_check = needs_routing_check or (
-        force_policy_check and isinstance(status.get("account"), str)
+        force_policy_check
+        and isinstance(status.get("account"), str)
+        and not status.get("blocked")
     )
     if needs_routing_check:
         auth = agent_auth_status(agent)
@@ -9178,7 +11039,21 @@ def ensure_agent_not_blocked_by_codex_usage(agent: str) -> dict[str, Any]:
         blocked_until = status.get("blocked_until_utc")
         reason = status.get("reason") or "codex usage limit reached"
         detail = f"; blocked_until_utc={blocked_until}" if blocked_until else ""
-        raise AgentError(f"agent {canonical_agent_id(agent)} is blocked by codex-usage watchdog: {reason}{detail}")
+        payload = None
+        if status.get("reason_code") == "q_weekly_remaining_below_threshold":
+            payload = {
+                "error_code": "q_weekly_remaining_below_threshold",
+                "reason_code": status["reason_code"],
+                "reason": reason,
+                "blocked_until": blocked_until,
+                "remaining_percent": status.get("remaining_percent"),
+                "threshold_percent": status.get("threshold_percent"),
+                "fallback_hint": status.get("fallback_hint"),
+            }
+        raise AgentError(
+            f"agent {canonical_agent_id(agent)} is blocked by codex-usage watchdog: {reason}{detail}",
+            payload,
+        )
     return status
 
 
@@ -9190,7 +11065,7 @@ def _codex_usage_watchdog_state_from_marker(marker: dict[str, Any], *, now: floa
     if blocked_until_ts is None:
         raise AgentError("could_not_read_codex_usage_watchdog_marker")
     if blocked_until_ts > now:
-        return {
+        state = {
             "agent": agent or "unknown",
             "account": account,
             "state": "blocked",
@@ -9200,6 +11075,10 @@ def _codex_usage_watchdog_state_from_marker(marker: dict[str, Any], *, now: floa
             "source": "marker",
             "raw_output": "not_returned",
         }
+        for field in ("reason_code", "remaining_percent", "threshold_percent", "fallback_hint"):
+            if field in marker:
+                state[field] = marker[field]
+        return state
     return {
         "agent": agent or "unknown",
         "account": account,
@@ -9229,6 +11108,54 @@ def _codex_usage_timestamp(value: Any, *, required: bool = False) -> str | None:
     if timestamp is None:
         raise AgentError("could_not_read_codex_usage_snapshot")
     return _dt.datetime.fromtimestamp(timestamp, _dt.timezone.utc).isoformat()
+
+
+Q_WEEKLY_THRESHOLD_PERCENT = 10.0
+
+
+def codex_usage_eligibility(
+    windows: Iterable[Mapping[str, Any]],
+    *,
+    series_prefix: str | None,
+    now: float,
+) -> dict[str, Any]:
+    """Make the single q-series weekly eligibility decision for all consumers."""
+
+    result: dict[str, Any] = {
+        "eligible": True,
+        "reason_code": None,
+        "remaining_percent": None,
+        "threshold_percent": Q_WEEKLY_THRESHOLD_PERCENT,
+        "blocked_until_utc": None,
+        "fallback_hint": "use a non-q series or wait for the verified q-series weekly reset",
+    }
+    if series_prefix != "q":
+        return result
+    for window in windows:
+        if (
+            window.get("window_kind") != "fixed"
+            or window.get("budget_key") != "codex_usage_weekly"
+            or window.get("confidence") != "verified"
+        ):
+            continue
+        remaining = window.get("quantity_value")
+        reset_at = window.get("reset_at_utc")
+        reset_ts = parse_utc_timestamp(reset_at) if reset_at is not None else None
+        if (
+            isinstance(remaining, (int, float))
+            and not isinstance(remaining, bool)
+            and remaining < Q_WEEKLY_THRESHOLD_PERCENT
+            and reset_ts is not None
+            and reset_ts > now
+        ):
+            result.update(
+                eligible=False,
+                reason_code="q_weekly_remaining_below_threshold",
+                remaining_percent=float(remaining),
+                blocked_until_utc=(_dt.datetime.fromtimestamp(reset_ts, _dt.timezone.utc).isoformat() if reset_ts else None),
+            )
+            return result
+    return result
 
 
 def _codex_usage_v2_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any] | None:
@@ -9340,7 +11267,9 @@ def _codex_usage_v2_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any] | 
     return payload
 
 
-def _codex_usage_watchdog_state_from_snapshot(snapshot: dict[str, Any], *, now: float) -> dict[str, Any]:
+def _codex_usage_watchdog_state_from_snapshot(
+    snapshot: dict[str, Any], *, now: float, series_prefix: str | None = None
+) -> dict[str, Any]:
     identity = snapshot["account"] if "account" in snapshot else snapshot.get("agent")
     agent = str(identity or "")
     blocked_until_ts = parse_utc_timestamp(snapshot.get("blocked_until"))
@@ -9358,6 +11287,11 @@ def _codex_usage_watchdog_state_from_snapshot(snapshot: dict[str, Any], *, now: 
     if status == "blocked" and blocked_until_ts is None:
         raise AgentError("could_not_read_codex_usage_snapshot")
     usage_v2 = _codex_usage_v2_from_snapshot(snapshot)
+    eligibility = codex_usage_eligibility(
+        usage_v2["limit_windows"] if usage_v2 is not None else (),
+        series_prefix=series_prefix,
+        now=now,
+    )
     if status == "blocked" and blocked_until_ts is not None and blocked_until_ts > now:
         state = {
             "agent": agent or "unknown",
@@ -9372,7 +11306,26 @@ def _codex_usage_watchdog_state_from_snapshot(snapshot: dict[str, Any], *, now: 
         }
         if usage_v2 is not None:
             state["usage_v2"] = usage_v2
+        state["usage_eligibility"] = eligibility
         return state
+    if usage_v2 is not None and not eligibility["eligible"]:
+        return {
+            "agent": agent or "unknown",
+            "account": agent or None,
+            "usage_status": status,
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": eligibility["blocked_until_utc"],
+            "reason": "verified q-series weekly remaining below threshold",
+            "reason_code": eligibility["reason_code"],
+            "remaining_percent": eligibility["remaining_percent"],
+            "threshold_percent": eligibility["threshold_percent"],
+            "fallback_hint": eligibility["fallback_hint"],
+            "source": "snapshot",
+            "raw_output": "not_returned",
+            "usage_v2": usage_v2,
+            "usage_eligibility": eligibility,
+        }
     if usage_v2 is not None:
         exhausted = [window for window in usage_v2["limit_windows"] if window["exhausted"]]
         parsed_resets = [parse_utc_timestamp(window.get("reset_at_utc")) for window in exhausted]
@@ -9393,6 +11346,7 @@ def _codex_usage_watchdog_state_from_snapshot(snapshot: dict[str, Any], *, now: 
                     "source": "snapshot",
                     "raw_output": "not_returned",
                     "usage_v2": usage_v2,
+                    "usage_eligibility": eligibility,
                 }
                 return state
     state = {
@@ -9412,6 +11366,7 @@ def _codex_usage_watchdog_state_from_snapshot(snapshot: dict[str, Any], *, now: 
     }
     if usage_v2 is not None:
         state["usage_v2"] = usage_v2
+        state["usage_eligibility"] = eligibility
     return state
 
 
@@ -9981,6 +11936,7 @@ def _usage_watchdog_agent_unlocked(agent: str, *, dry_run: bool) -> dict[str, An
         codex_usage_watchdog_status(agent, include_assignment_history=not dry_run),
         persist_account=not dry_run,
         include_assignment_history=not dry_run,
+        force_policy_check=True,
     )
     base["usage_watchdog"] = usage_watchdog
 
@@ -9991,6 +11947,9 @@ def _usage_watchdog_agent_unlocked(agent: str, *, dry_run: bool) -> dict[str, An
             "reason": usage_watchdog.get("reason"),
             "source": usage_watchdog.get("source"),
         }
+        for field in ("reason_code", "remaining_percent", "threshold_percent", "fallback_hint"):
+            if field in usage_watchdog:
+                marker[field] = usage_watchdog[field]
         if isinstance(usage_watchdog.get("account"), str):
             marker["account"] = usage_watchdog["account"]
         if not running:
@@ -10525,6 +12484,7 @@ def assignment_prompt(
     requires_search: bool = False,
     live_data_topic: str | None = None,
     required_skills: list[str] | None = None,
+    agent_class: str | None = None,
 ) -> str:
     display_name = (name or default_agentin_name(agent)).strip()
     required = list(required_skills or [])
@@ -10565,36 +12525,32 @@ def assignment_prompt(
     if subagents_permitted:
         subagent_lines.extend(
             [
-                "Vor jedem Spawn frisch pruefen: load1 / logical_cpu_count <= 0.85.",
-                "Linux MemAvailable muss >= 20 % und >= 1024 MiB sein.",
-                "Fehlende oder ungueltige Messung bedeutet: nicht spawnen.",
+                "Vor jedem Spawn frisch pruefen: insgesamt maximal 10 laufende oder unbestaetigte Bienen.",
+                "Ab 10 Bienen keine weitere Biene starten.",
             ]
         )
     elif allow_subagents and subagent_reason_codes:
         subagent_lines.append(f"Ressourcenfreigabe: {', '.join(subagent_reason_codes)}")
 
     if role == "exploriererin":
-        return "\n".join(
-            [
-                "[EXPLORER_BEE_TASK]",
-                f"Name: {display_name}",
-                "Rolle: Exploriererin",
-                f"Modell: {model}",
-                legacy_skill_line,
-                f"Mindestskills: {skill_line}",
-                f"Scope:\n{bullet_block(scope)}",
-                "Darf schreiben: nein",
-                *subagent_lines,
-                f"Web-/Live-Daten:\n{search_block}",
-                f"Stabiler Kontext:\n{bullet_block(context)}",
-                f"Aufgabe: {task}",
-                f"Blacklist / Grenzen:\n{bullet_block(forbidden)}",
-                "Rueckgabe: knappe Fakten, relevante Dateien/Zeilen, Empfehlung",
-            ]
-        )
-
-    return "\n".join(
-        [
+        lines = [
+            "[EXPLORER_BEE_TASK]",
+            f"Name: {display_name}",
+            "Rolle: Exploriererin",
+            f"Modell: {model}",
+            legacy_skill_line,
+            f"Mindestskills: {skill_line}",
+            f"Scope:\n{bullet_block(scope)}",
+            "Darf schreiben: nein",
+            *subagent_lines,
+            f"Web-/Live-Daten:\n{search_block}",
+            f"Stabiler Kontext:\n{bullet_block(context)}",
+            f"Aufgabe: {task}",
+            f"Blacklist / Grenzen:\n{bullet_block(forbidden)}",
+            "Rueckgabe: knappe Fakten, relevante Dateien/Zeilen, Empfehlung",
+        ]
+    else:
+        lines = [
             "[WORK_BEE_TASK]",
             f"Name: {display_name}",
             "Rolle: Arbeitsbiene",
@@ -10610,13 +12566,11 @@ def assignment_prompt(
             f"Blacklist / Grenzen:\n{bullet_block(forbidden)}",
             "Rueckgabe: Root Cause, Aenderung, Tests, offene Risiken",
         ]
+    return apply_agent_introduction_policy(
+        "\n".join(lines),
+        agent_class=agent_class,
+        name=name,
     )
-
-
-def assignment_model(role: str) -> str:
-    if role == "arbeitsbiene":
-        return WRITE_AGENT_MODEL
-    return DEFAULT_AGENT_MODEL
 
 
 def ensure_assignment_session_model(
@@ -10626,6 +12580,8 @@ def ensure_assignment_session_model(
     reasoning_effort: str | None,
     lease: dict[str, Any],
     release_lease_on_failure: bool = False,
+    agent_class: str | None = None,
+    name: str | None = None,
 ) -> dict[str, Any]:
     agent = canonical_agent_id(agent)
     cfg = agent_config(agent)
@@ -10656,17 +12612,27 @@ def ensure_assignment_session_model(
             "routed model differs from active session; controlled restart requires "
             f"an inactive Agentin; current_state={response_state}"
         )
-    cp = run_tmux(["kill-session", "-t", cfg["session"]], check=False)
-    if cp.returncode != 0:
-        raise AgentError(f"tmux model-switch stop failed for agent {agent}")
-    restarted = start_agent(
-        agent,
-        cwd=meta.get("cwd"),
-        lease=lease,
-        release_lease_on_failure=release_lease_on_failure,
-        model=model,
-        model_reasoning_effort=reasoning_effort,
-    )
+    with spawn_admission_lock():
+        replacement = reserve_managed_replacement(cfg["session"])
+        if replacement.get("allowed") is not True:
+            _raise_replacement_capacity_denied(replacement)
+        replacement_id = replacement["reservation_id"]
+        cp = run_tmux(["kill-session", "-t", cfg["session"]], check=False)
+        if cp.returncode != 0:
+            raise AgentError(f"tmux model-switch stop failed for agent {agent}")
+        name_args = {"name": name} if name is not None else {}
+        restarted = start_agent(
+            agent,
+            cwd=meta.get("cwd"),
+            lease=lease,
+            release_lease_on_failure=release_lease_on_failure,
+            model=model,
+            model_reasoning_effort=reasoning_effort,
+            agent_class=agent_class,
+            replacement_reservation_id=replacement_id,
+            **name_args,
+        )
+        complete_managed_replacement(reservation_id=replacement_id, managed_session=cfg["session"])
     return {
         "status": "restarted",
         "previous_model": current_model,
@@ -10707,10 +12673,29 @@ def _assign_agent_unlocked(
     operation: str = "agent_assign",
     lease: dict[str, Any] | None = None,
     required_skills: Any = None,
+    agent_class: str | None = None,
+    lifecycle: str | None = None,
+    requested_model: str | None = None,
+    requested_reasoning: str | None = None,
+    complexity: str = "unknown",
+    task_phase: str = "unknown",
+    fully_specified: bool = False,
+    reversible: bool = False,
+    low_risk: bool = False,
+    root_cause_known: bool = False,
+    security_sensitive: bool = False,
+    concurrency: bool = False,
+    migration: bool = False,
+    data_change: bool = False,
+    cross_repository: bool = False,
+    architecture: bool = False,
+    ci_or_release: bool = False,
+    authority_class: str | None = None,
 ) -> dict[str, Any]:
     require_fleet_recovery_ready("agent_assign")
     agent = canonical_agent_id(agent)
     ollama_descriptor = _ollama_descriptor(agent)
+    admission: dict[str, Any] | None = None
     if ollama_descriptor is not None:
         auth_gate = {
             "authenticated": True,
@@ -10750,10 +12735,35 @@ def _assign_agent_unlocked(
         raise AgentError("exploriererin assignments must not include write paths")
     if role == "arbeitsbiene" and not write_paths:
         raise AgentError("arbeitsbiene assignments require at least one explicit write path")
-    require_ollama_admission(agent, task=task, role=role)
+    if ollama_descriptor is not None:
+        admission = _resource_admission_decision(agent=agent, task=task, role=role)
+        if admission.get("allowed") is not True:
+            _raise_ollama_admission_denied(admission)
     scope_result = scope_check(scope, write_paths)
     if role == "arbeitsbiene" and not scope_result["allowed"]:
         raise AgentError("write paths must stay inside scope")
+    complexity_override = _complexity_override(complexity)
+    task_profile = classify_runtime_task(
+        TaskClassificationRequest(
+            objective=task,
+            scope_kind="read" if role == "exploriererin" else "write",
+            changed_files=tuple(write_paths),
+            requires_subagents=allow_subagents,
+            complexity_override=complexity_override,
+            task_phase=task_phase,
+            fully_specified=fully_specified,
+            reversible=reversible,
+            low_risk=low_risk,
+            root_cause_known=root_cause_known,
+            security_sensitive=security_sensitive,
+            concurrency=concurrency,
+            migration=migration,
+            data_change=data_change,
+            cross_repository=cross_repository,
+            architecture=architecture,
+            ci_or_release=ci_or_release,
+        )
+    )
 
     matches: list[dict[str, str]] = []
     if skill:
@@ -10762,6 +12772,7 @@ def _assign_agent_unlocked(
     if missing_skills and not allow_missing_skill:
         raise AgentError(f"skill not found for agent {agent}")
 
+    selection: ResolutionDecision | None = None
     if ollama_descriptor is not None:
         routing = None
         model = ollama_descriptor.model
@@ -10785,13 +12796,28 @@ def _assign_agent_unlocked(
                 f"reason={routing.get('reason') or 'unknown'}; "
                 f"policy_source={routing.get('policy_source') or 'unknown'}"
             )
-        model = routing["model"] if routing is not None else DEFAULT_AGENT_MODEL
-        reasoning_effort = (
-            WRITE_AGENT_MODEL_EFFORT
-            if model == WRITE_AGENT_MODEL
-            else DEFAULT_AGENT_MODEL_EFFORT
+        requested_target_class, resolver_authority = _resolver_target_selection_inputs(
+            agent,
+            agent_class,
+            authority_class,
         )
-    subagent_admission = spawn_admission_decision(1) if allow_subagents else None
+        selection = resolve_runtime_agent_selection(
+            role=role,
+            routing=routing,
+            task_profile=task_profile,
+            requested_class=requested_target_class,
+            requested_lifecycle=lifecycle,
+            requested_model=requested_model,
+            requested_reasoning=requested_reasoning,
+            authority_class=resolver_authority,
+        )
+        model = selection.model
+        reasoning_effort = selection.reasoning
+    subagent_admission = (
+        admission if allow_subagents and admission is not None
+        else spawn_admission_decision(1) if allow_subagents
+        else None
+    )
     subagents_permitted = bool(
         allow_subagents
         and isinstance(subagent_admission, dict)
@@ -10822,6 +12848,15 @@ def _assign_agent_unlocked(
         requires_search=requires_search,
         live_data_topic=live_data_topic,
         required_skills=required_skills,
+        agent_class=(
+            selection.class_id
+            if selection is not None
+            else resolver_class_for_agent(
+                agent,
+                agent_class,
+                authority_class=authority_class,
+            )
+        ),
     )
     if len(prompt) > MAX_ASSIGNMENT_TEXT:
         raise AgentError(f"assignment prompt exceeds {MAX_ASSIGNMENT_TEXT} characters")
@@ -10832,13 +12867,28 @@ def _assign_agent_unlocked(
     model_switch: dict[str, Any] | None = None
     sent: dict[str, Any] | None = None
     try:
-        model_switch = ensure_assignment_session_model(
-            agent,
-            model=model,
-            reasoning_effort=reasoning_effort,
-            lease=lease,
-            release_lease_on_failure=release_on_failure,
-        )
+        name_args = {"name": name} if name is not None else {}
+        if admission is None:
+            model_switch = ensure_assignment_session_model(
+                agent,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                lease=lease,
+                release_lease_on_failure=release_on_failure,
+                agent_class=selection.class_id if selection is not None else None,
+                **name_args,
+            )
+        else:
+            with _resource_admission_scope(admission):
+                model_switch = ensure_assignment_session_model(
+                    agent,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    lease=lease,
+                    release_lease_on_failure=release_on_failure,
+                    agent_class=selection.class_id if selection is not None else None,
+                    **name_args,
+                )
         sent = send_agent(agent, prompt, enter, operation=operation)
         remember_agent_routing(agent, routing)
     except Exception:
@@ -10855,6 +12905,8 @@ def _assign_agent_unlocked(
         "model": model,
         "model_reasoning_effort": reasoning_effort,
         "model_switch": model_switch,
+        "selection": public_resolution_decision(selection),
+        "task_profile": public_task_profile(task_profile),
         "group_id": group_id,
         "job_id": job_id,
         "skill": {
@@ -10909,6 +12961,8 @@ def _assign_agent_unlocked(
         "model": model,
         "model_reasoning_effort": reasoning_effort,
         "model_switch": model_switch,
+        "selection": public_resolution_decision(selection),
+        "task_profile": public_task_profile(task_profile),
         "routing": routing,
         "group_id": group_id,
         "job_id": job_id,
@@ -10941,6 +12995,144 @@ def redact_list(items: list[str], max_items: int = 50) -> list[str]:
     return safe_items
 
 
+_RESOLUTION_SELECTION_REASON_CODES = frozenset(
+    {
+        "class_auto_selected",
+        "default_model_unavailable",
+        "lifecycle_alias_normalized",
+        "lifecycle_defaulted",
+        "model_defaulted",
+        "requested_class_unavailable",
+        "requested_lifecycle_outside_class",
+        "requested_model_below_task_minimum",
+        "requested_model_capability_mismatch",
+        "requested_model_outside_class",
+        "requested_model_unavailable",
+        "requested_model_unknown",
+        "requested_reasoning_outside_limits",
+        "requested_reasoning_unsupported",
+        "reasoning_defaulted",
+        "spark_model_capability_mismatch",
+    }
+)
+
+
+def _sanitize_assignment_selection(value: Any) -> dict[str, Any] | None:
+    schema_version = value.get("schema_version") if isinstance(value, dict) else None
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool) or schema_version != 1:
+        return None
+
+    try:
+        class_catalog = load_agent_class_catalog(repo_root() / "codex-agent-classes.json")
+        classes, models = policies_from_catalogs(
+            class_catalog,
+            load_model_policy(repo_root() / "codex-model-policy.json"),
+        )
+    except Exception:
+        return None
+
+    classes_by_id = {item.class_id: item for item in classes}
+    models_by_id = {item.model_id: item for item in models}
+    effective_values = {
+        key: value.get(key)
+        for key in ("class", "lifecycle", "model", "reasoning")
+    }
+    if any(not isinstance(item, str) for item in effective_values.values()):
+        return None
+
+    class_policy = classes_by_id.get(effective_values["class"])
+    model_policy = models_by_id.get(effective_values["model"])
+    if class_policy is None or model_policy is None:
+        return None
+    scope_kind = "write" if "write" in class_policy.supported_scopes else "read"
+    try:
+        decision = resolve_agent_selection(
+            ResolutionRequest(
+                scope_kind=scope_kind,
+                complexity="simple" if model_policy.family == "spark" else "complex",
+                requested_class=effective_values["class"],
+                requested_lifecycle=effective_values["lifecycle"],
+                requested_model=effective_values["model"],
+                requested_reasoning=effective_values["reasoning"],
+                spark_eligible=model_policy.family == "spark",
+            ),
+            classes=classes,
+            models=models,
+            available_models={item.model_id for item in models},
+        )
+    except Exception:
+        return None
+    if (
+        decision.class_id != effective_values["class"]
+        or decision.lifecycle != effective_values["lifecycle"]
+        or decision.model != effective_values["model"]
+        or decision.reasoning != effective_values["reasoning"]
+    ):
+        return None
+
+    sanitized: dict[str, Any] = {
+        "schema_version": 1,
+        "class": decision.class_id,
+        "lifecycle": decision.lifecycle,
+        "model": decision.model,
+        "reasoning": decision.reasoning,
+    }
+
+    requested = value.get("requested")
+    if isinstance(requested, dict):
+        requested_safe: dict[str, Any] = {}
+        requested_class = requested.get("class")
+        if requested_class is None:
+            requested_safe["class"] = None
+        elif isinstance(requested_class, str) and requested_class in classes_by_id:
+            requested_safe["class"] = requested_class
+
+        requested_lifecycle = requested.get("lifecycle")
+        if requested_lifecycle is None:
+            requested_safe["lifecycle"] = None
+        elif isinstance(requested_lifecycle, str) and (
+            requested_lifecycle in LIFECYCLE_RANK
+            or requested_lifecycle in LIFECYCLE_ALIASES
+        ):
+            requested_safe["lifecycle"] = requested_lifecycle
+
+        requested_model = requested.get("model")
+        if requested_model is None:
+            requested_safe["model"] = None
+        elif isinstance(requested_model, str) and requested_model in models_by_id:
+            requested_safe["model"] = requested_model
+
+        requested_reasoning = requested.get("reasoning")
+        if requested_reasoning is None:
+            requested_safe["reasoning"] = None
+        elif isinstance(requested_reasoning, str) and requested_reasoning in REASONING_RANK:
+            requested_model_policy = (
+                models_by_id.get(requested_model) if isinstance(requested_model, str) else None
+            ) or model_policy
+            if requested_reasoning in requested_model_policy.reasoning_levels:
+                requested_safe["reasoning"] = requested_reasoning
+
+        if requested_safe:
+            sanitized["requested"] = requested_safe
+
+    fallback = value.get("fallback")
+    if isinstance(fallback, bool):
+        sanitized["fallback"] = fallback
+
+    reason_codes = value.get("reason_codes")
+    if isinstance(reason_codes, list):
+        sanitized["reason_codes"] = list(
+            dict.fromkeys(
+                code
+                for code in reason_codes
+                if isinstance(code, str) and code in _RESOLUTION_SELECTION_REASON_CODES
+            )
+        )[:32]
+
+    sanitized["raw_output"] = "not_returned"
+    return sanitized
+
+
 def sanitize_assignment_record(record: dict[str, Any]) -> dict[str, Any]:
     sanitized = {
         key: record[key]
@@ -10954,6 +13146,8 @@ def sanitize_assignment_record(record: dict[str, Any]) -> dict[str, Any]:
             "model_reasoning_effort",
             "model_switch",
             "routing",
+            "selection",
+            "task_profile",
             "group_id",
             "job_id",
             "skill",
@@ -11029,6 +13223,29 @@ def sanitize_assignment_record(record: dict[str, Any]) -> dict[str, Any]:
             elif nested_value is None or isinstance(nested_value, (bool, int)):
                 safe_value[nested_key] = nested_value
         sanitized[key] = safe_value
+    selection = _sanitize_assignment_selection(sanitized.get("selection"))
+    if selection is None:
+        sanitized.pop("selection", None)
+    else:
+        sanitized["selection"] = selection
+    profile = sanitized.get("task_profile")
+    if isinstance(profile, dict):
+        reason_codes = profile.get("reason_codes")
+        required_capabilities = profile.get("required_capabilities")
+        sanitized["task_profile"] = {
+            "schema_version": profile.get("schema_version") if isinstance(profile.get("schema_version"), int) else 1,
+            "complexity": profile.get("complexity") if isinstance(profile.get("complexity"), str) else "unknown",
+            "spark_eligible": profile.get("spark_eligible") if isinstance(profile.get("spark_eligible"), bool) else False,
+            "reason_codes": [item for item in reason_codes if isinstance(item, str)][:32]
+            if isinstance(reason_codes, list)
+            else [],
+            "required_capabilities": [item for item in required_capabilities if isinstance(item, str)][:32]
+            if isinstance(required_capabilities, list)
+            else [],
+            "raw_output": "not_returned",
+        }
+    else:
+        sanitized.pop("task_profile", None)
     sanitized["prompt_output"] = "not_returned"
     sanitized["response_output"] = "not_returned"
     return sanitized
@@ -15332,9 +17549,61 @@ def call_authenticated_agent_mutation(
     return result
 
 
-def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+def call_tool(
+    name: str,
+    args: dict[str, Any],
+    *,
+    principal_class: str | None = None,
+) -> dict[str, Any]:
+    authority_class = principal_class or "arbeitsbiene"
     if name in {tool["name"] for tool in hive_tool_definitions()}:
         return dict(call_hive_tool(name, args))
+    if name == "fleet_overview":
+        overview_format = str(args.get("format", "json"))
+        rendered = _fleet_overview_local_admin(
+            active_only=bool_arg(args, "active_only", True),
+            format=overview_format,
+        )
+        if overview_format == "json":
+            overview: object = json.loads(rendered)
+            if not bool_arg(args, "include_limits", True) and isinstance(overview, dict):
+                overview.pop("account_limits", None)
+                for row in overview.get("agents", ()):
+                    if isinstance(row, dict):
+                        for key in tuple(row):
+                            if "limit" in key or "cost_last_hour" in key:
+                                row.pop(key, None)
+        else:
+            overview = rendered
+        return {"overview": overview, "format": overview_format, "raw_output": "not_returned"}
+    if name == "fleet_status_compact":
+        rendered = _fleet_overview_local_admin(active_only=True, format="compact")
+        return {"status": rendered, "raw_output": "not_returned"}
+    if name == "goddess_report_status":
+        return _goddess_report_status_local()
+    if name == "goddess_report_list":
+        return _goddess_report_list_local(
+            limit=int_arg(args, "limit", 24),
+            from_value=args.get("from"),
+            to_value=args.get("to"),
+        )
+    if name == "goddess_report_run":
+        raw_bucket = args.get("bucket_start")
+        bucket = None
+        if raw_bucket is not None:
+            if not isinstance(raw_bucket, str):
+                raise AgentError("bucket_start must be RFC3339")
+            try:
+                bucket = _dt.datetime.fromisoformat(raw_bucket.replace("Z", "+00:00"))
+                if bucket.tzinfo is None or bucket.utcoffset() is None:
+                    raise ValueError
+            except ValueError as exc:
+                raise AgentError("bucket_start must be RFC3339") from exc
+        return _goddess_report_run_local(
+            bucket=bucket,
+            partial=bool_arg(args, "partial", False),
+            replace=bool_arg(args, "replace", False),
+        )
     if name == "agent_spawn_offers":
         return agent_spawn_offers(int_arg(args, "required_slots", 1))
     if name == "agent_start":
@@ -15354,6 +17623,13 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                     args.get("cwd"),
                     args.get("prompt"),
                     allow_unauthenticated=allow_unauthenticated,
+                    agent_class=args.get("class") if isinstance(args.get("class"), str) else None,
+                    lifecycle=args.get("lifecycle") if isinstance(args.get("lifecycle"), str) else None,
+                    model=args.get("model") if isinstance(args.get("model"), str) else None,
+                    reasoning_effort=args.get("reasoning_effort") if isinstance(args.get("reasoning_effort"), str) else None,
+                    complexity=str(args.get("complexity", "unknown")),
+                    authority_class=authority_class,
+                    **({"name": args["name"]} if "name" in args else {}),
                 ),
             ),
         )
@@ -15374,7 +17650,11 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return result
     if name == "agent_status":
         selected = agent_ids(str(args.get("agent", "all")))
-        return paged_multi_agent_result(selected, args, status_agent)
+        return paged_multi_agent_result(
+            selected,
+            args,
+            lambda agent: status_agent(agent, initialize_state=False),
+        )
     if name == "agent_wait":
         selected_agent = single_agent_id(str(args.get("agent", "")), "agent_wait")
         return wait_agent(
@@ -15420,6 +17700,20 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name == "agent_capabilities":
         selected = agent_ids(str(args.get("agent", "all")))
         return paged_multi_agent_result(selected, args, capabilities_agent)
+    if name == "agent_selection_options":
+        selected_agent = single_agent_id(str(args.get("agent", "")), "agent_selection_options")
+        if "requester_class" in args:
+            raise AgentError("requester_class cannot establish authority")
+        known_generation = (
+            bounded_text(args.get("known_generation"), field="known_generation", max_chars=80)
+            if args.get("known_generation") is not None
+            else None
+        )
+        return agent_selection_options(
+            selected_agent,
+            principal_class=authority_class,
+            known_generation=known_generation,
+        )
     if name == "agent_routing_decision":
         selected_agent = single_agent_id(str(args.get("agent", "")), "agent_routing_decision")
         role = str(args.get("role", "arbeitsbiene"))
@@ -15492,6 +17786,9 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 allow_subagents=bool_arg(args, "allow_subagents", False),
                 allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
                 operation="agent_assign",
+                authority_class=authority_class,
+                **resolver_request_args(args),
+                **task_evidence_args(args),
             ),
         )
     if name == "agent_assign_readonly":
@@ -15515,6 +17812,8 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 allow_subagents=bool_arg(args, "allow_subagents", False),
                 allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
                 operation="agent_assign_readonly",
+                authority_class=authority_class,
+                **resolver_request_args(args),
             ),
         )
     if name == "agent_assign_live_data":
@@ -15540,6 +17839,8 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 requires_search=True,
                 live_data_topic=args.get("live_data_topic") if isinstance(args.get("live_data_topic"), str) else None,
                 operation="agent_assign_live_data",
+                authority_class=authority_class,
+                **resolver_request_args(args),
             ),
         )
     if name == "agent_assign_write":
@@ -15564,6 +17865,9 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 allow_subagents=bool_arg(args, "allow_subagents", False),
                 allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
                 operation="agent_assign_write",
+                authority_class=authority_class,
+                **resolver_request_args(args),
+                **task_evidence_args(args),
             ),
         )
     if name == "agent_assignments":
@@ -15903,6 +18207,85 @@ def allow_broad_selector_schema() -> dict[str, Any]:
             f"Required when a mutating selector resolves to more than {MAX_MUTATING_AGENTS_WITHOUT_CONFIRM} "
             "Agentinnen."
         ),
+    }
+
+
+def resolver_request_schema() -> dict[str, Any]:
+    return {
+        "class": {"type": "string", "maxLength": 128},
+        "lifecycle": {"type": "string", "enum": ["ephemeral", "invocation", "binding", "persistent"]},
+        "model": {"type": "string", "maxLength": 128},
+        "reasoning_effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]},
+        "complexity": {"type": "string", "enum": ["simple", "medium", "complex", "unknown"], "default": "unknown"},
+    }
+
+
+def resolver_request_args(args: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "agent_class": args.get("class") if isinstance(args.get("class"), str) else None,
+        "lifecycle": args.get("lifecycle") if isinstance(args.get("lifecycle"), str) else None,
+        "requested_model": args.get("model") if isinstance(args.get("model"), str) else None,
+        "requested_reasoning": args.get("reasoning_effort") if isinstance(args.get("reasoning_effort"), str) else None,
+        "complexity": str(args.get("complexity", "unknown")),
+    }
+
+
+def task_evidence_schema() -> dict[str, Any]:
+    return {
+        "task_phase": {"type": "string", "enum": ["atomic_fix", "diagnosis", "unknown"], "default": "unknown"},
+        "fully_specified": {"type": "boolean", "default": False},
+        "reversible": {"type": "boolean", "default": False},
+        "low_risk": {"type": "boolean", "default": False},
+        "root_cause_known": {"type": "boolean", "default": False},
+        "security_sensitive": {"type": "boolean", "default": False},
+        "concurrency": {"type": "boolean", "default": False},
+        "migration": {"type": "boolean", "default": False},
+        "data_change": {"type": "boolean", "default": False},
+        "cross_repository": {"type": "boolean", "default": False},
+        "architecture": {"type": "boolean", "default": False},
+        "ci_or_release": {"type": "boolean", "default": False},
+    }
+
+
+def task_evidence_args(args: Mapping[str, Any]) -> dict[str, Any]:
+    values = dict(args)
+    task_phase = values.get("task_phase", "unknown")
+    return {
+        "task_phase": task_phase if task_phase in {"atomic_fix", "diagnosis", "unknown"} else "unknown",
+        **{
+            name: bool_arg(values, name, False)
+            for name in (
+                "fully_specified",
+                "reversible",
+                "low_risk",
+                "root_cause_known",
+                "security_sensitive",
+                "concurrency",
+                "migration",
+                "data_change",
+                "cross_repository",
+                "architecture",
+                "ci_or_release",
+            )
+        },
+    }
+
+
+def task_evidence_cli_args(args: Any) -> dict[str, Any]:
+    return {
+        "complexity": args.complexity,
+        "task_phase": args.task_phase,
+        "fully_specified": args.fully_specified,
+        "reversible": args.reversible,
+        "low_risk": args.low_risk,
+        "root_cause_known": args.root_cause_known,
+        "security_sensitive": args.security_sensitive,
+        "concurrency": args.concurrency,
+        "migration": args.migration,
+        "data_change": args.data_change,
+        "cross_repository": args.cross_repository,
+        "architecture": args.architecture,
+        "ci_or_release": args.ci_or_release,
     }
 
 
@@ -16398,6 +18781,7 @@ def _fleet_artifact_builder(
     *,
     codex_executable: Path | None,
     gemini_executable: Path | None,
+    include_portable_skills: bool = True,
 ) -> Any:
     close_state = {"cleanup_pending": False}
     with contextlib.ExitStack() as stack:
@@ -16442,7 +18826,7 @@ def _fleet_artifact_builder(
                 taskset_stat=taskset_stat,
                 true_executable=true_executable,
                 true_stat=true_stat,
-                include_portable_skills=True,
+                include_portable_skills=include_portable_skills,
             )
 
         def validate() -> None:
@@ -16630,8 +19014,6 @@ def _fleet_tree_entries(
 
     def visit(current_fd: int, prefix: str, depth: int) -> None:
         nonlocal entry_count
-        if depth > 8:
-            raise AgentError(error)
         current_fd_stat = os.fstat(current_fd)
         prefix_is_gemini_runtime = (
             allow_gemini_runtime
@@ -16642,6 +19024,8 @@ def _fleet_tree_entries(
                 or prefix.startswith(".gemini/tmp/")
             )
         )
+        if depth > 8:
+            raise AgentError(error)
         if prefix_is_gemini_runtime:
             if (
                 current_fd_stat.st_uid != os.geteuid()
@@ -17889,7 +20273,8 @@ def _fleet_managed_home_state(
             runtime_files = {
                 path
                 for path in actual_files
-                if path.startswith(".gemini/history/") or path.startswith(".gemini/tmp/")
+                if path.startswith(".gemini/history/")
+                or path.startswith(".gemini/tmp/")
             }
             runtime_directories = {
                 path
@@ -18937,6 +21322,279 @@ def _fleet_apply_managed_update(
     return stored, cleanup_pending, len(create_ids), len(update_ids), len(remove_ids)
 
 
+_Q_INPLACE_MANAGED_FILES = {
+    "codex",
+    "config.toml",
+    FLEET_AGENT_MARKER_FILE,
+}
+
+
+def _fleet_q_inplace_failure(
+    core_code: str,
+    *,
+    server_code: str | None = None,
+) -> FleetInplaceUpdateError:
+    code = server_code or {
+        "registry_conflict": "generation_conflict",
+        "registry_cas_uncertain": "fleet_registry_commit_uncertain",
+        "rollback_diverged": "fleet_update_rollback_diverged",
+        "roll_forward_diverged": "fleet_update_recovery_diverged",
+        "generation_ambiguous": "fleet_registry_commit_diverged",
+        "recovery_diverged": "fleet_update_recovery_diverged",
+        "managed_drift": "fleet_home_changed",
+        "home_drift": "fleet_home_changed",
+        "unsafe_home": "fleet_home_content_invalid",
+        "unsafe_managed_leaf": "fleet_home_content_invalid",
+        "transaction_contains_foreign_entry": "fleet_recovery_incomplete",
+        "transaction_exists": "fleet_recovery_incomplete",
+        "invalid_journal": "fleet_recovery_incomplete",
+    }.get(core_code, "fleet_managed_update_failed")
+    retained = core_code in {
+        "registry_cas_uncertain",
+        "rollback_diverged",
+        "roll_forward_diverged",
+        "generation_ambiguous",
+        "recovery_diverged",
+        "transaction_contains_foreign_entry",
+        "transaction_exists",
+        "invalid_journal",
+    }
+    return FleetInplaceUpdateError(
+        code,
+        {
+            "code": code,
+            "explanation": (
+                "Der transaktionale Q-Serien-Updatezustand ist nicht eindeutig bestaetigt."
+                if retained
+                else "Der transaktionale Q-Serien-Updatepfad hat die Aenderung sicher abgebrochen."
+            ),
+            "rule": (
+                "Q-Homes bleiben bestehen; nur codex, config.toml und der Fleet-Marker "
+                "duerfen unter genau einem Registry-CAS geaendert werden."
+            ),
+            "action": (
+                "Recovery-Zustand und autoritative Generation pruefen; nicht manuell migrieren."
+                if retained
+                else "Autoritative Generation neu laden, Ursache beheben und erneut planen."
+            ),
+        },
+    )
+
+
+def _fleet_q_inplace_transaction_root(paths: FleetPaths) -> Path:
+    return paths.root / "q-inplace"
+
+
+def _fleet_q_inplace_pending_transaction(transaction_root: Path) -> str | None:
+    try:
+        root_stat = transaction_root.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise _fleet_q_inplace_failure("invalid_journal") from None
+    try:
+        _fleet_private_directory_stat(root_stat, "fleet_recovery_incomplete")
+        root_fd = os.open(
+            transaction_root,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            if not source_identity_matches(os.fstat(root_fd), root_stat):
+                raise _fleet_q_inplace_failure("invalid_journal")
+            names = os.listdir(root_fd)
+            for name in names:
+                if re.fullmatch(r"[0-9a-f]{32}", name) is None:
+                    raise _fleet_q_inplace_failure("transaction_contains_foreign_entry")
+                child = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                _fleet_private_directory_stat(child, "fleet_recovery_incomplete")
+        finally:
+            os.close(root_fd)
+    except FleetInplaceUpdateError:
+        raise
+    except (AgentError, OSError):
+        raise _fleet_q_inplace_failure("invalid_journal") from None
+    if len(names) > 1:
+        raise _fleet_q_inplace_failure("transaction_exists")
+    return names[0] if names else None
+
+
+def _fleet_recover_pending_q_inplace(service: FleetService, paths: FleetPaths) -> None:
+    transaction_root = _fleet_q_inplace_transaction_root(paths)
+    transaction_id = _fleet_q_inplace_pending_transaction(transaction_root)
+    if transaction_id is None:
+        return
+    try:
+        authoritative = service.load()
+        inventory = build_inventory(authoritative, AGENT_POOL_ROOT)
+        homes = {
+            agent_id: descriptor.home
+            for agent_id, descriptor in inventory.agents.items()
+            if descriptor.series_prefix == "q"
+        }
+        recover_q_series_update(
+            homes,
+            transaction_root=transaction_root,
+            transaction_id=transaction_id,
+            authoritative_generation=authoritative.generation,
+        )
+    except InplaceError as exc:
+        server_code = (
+            "fleet_update_recovery_diverged"
+            if exc.code in {"rollback_diverged", "roll_forward_diverged"}
+            else None
+        )
+        raise _fleet_q_inplace_failure(exc.code, server_code=server_code) from None
+    except FleetInplaceUpdateError:
+        raise
+    except Exception:
+        raise _fleet_q_inplace_failure("registry_cas_uncertain") from None
+    _fleet_publish_stored(service, authoritative)
+
+
+def _fleet_q_inplace_eligible(
+    existing: FleetSeries,
+    candidate: FleetSeries,
+    materialization: Mapping[str, tuple[str, ...]],
+) -> bool:
+    expected_ids = tuple(f"q{ordinal}" for ordinal in range(1, candidate.count + 1))
+    return (
+        existing.prefix == candidate.prefix == "q"
+        and existing.count == candidate.count == 3
+        and existing.runner is candidate.runner is RunnerKind.CODEX_CLI
+        and existing.provider is candidate.provider is Provider.OPENAI_CHATGPT
+        and existing.skill_profile == candidate.skill_profile == "teamleiterin"
+        and existing.task_profile == candidate.task_profile == "standard"
+        and not materialization["create_ids"]
+        and not materialization["remove_ids"]
+        and materialization["update_ids"] == expected_ids
+    )
+
+
+def _fleet_apply_q_inplace_update(
+    service: FleetService,
+    current: FleetSnapshot,
+    planned: FleetSnapshot,
+    candidate: FleetSeries,
+    materialization: Mapping[str, tuple[str, ...]],
+    *,
+    codex_executable: Path | None,
+) -> FleetSnapshot:
+    paths = FleetPaths.from_state_root(STATE_ROOT)
+    transaction_root = _fleet_q_inplace_transaction_root(paths)
+    ensure_private_dir(transaction_root)
+    planned_inventory = build_inventory(planned, AGENT_POOL_ROOT)
+    with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+        AGENT_POOL_ROOT,
+        ensure=False,
+        error_text="fleet_pool_root_invalid",
+        require_private=True,
+    ) as root:
+        if not _fleet_root_marker_state(root):
+            raise AgentError("fleet_pool_marker_required")
+    stored: FleetSnapshot | None = None
+    updates: list[QHomeUpdate] = []
+    with _fleet_artifact_builder(
+        candidate.runner,
+        codex_executable=codex_executable,
+        gemini_executable=None,
+        include_portable_skills=False,
+    ) as build_artifacts:
+        for agent_id in materialization["update_ids"]:
+            descriptor = planned_inventory.agents[agent_id]
+            artifacts = build_artifacts(descriptor)
+            files = _fleet_artifact_files(artifacts)
+            if set(files) != _Q_INPLACE_MANAGED_FILES:
+                raise _fleet_q_inplace_failure(
+                    "invalid_request",
+                    server_code="fleet_q_inplace_scope_invalid",
+                )
+            updates.append(
+                QHomeUpdate(
+                    home_id=agent_id,
+                    home=descriptor.home,
+                    wrapper=files["codex"][0],
+                    config=files["config.toml"][0],
+                    marker=files[FLEET_AGENT_MARKER_FILE][0],
+                )
+            )
+        build_artifacts.validate()  # type: ignore[attr-defined]
+
+        def registry_cas(old_generation: int, new_generation: int) -> bool:
+            nonlocal stored
+            if (
+                old_generation != current.generation
+                or new_generation != planned.generation
+            ):
+                raise RuntimeError("generation mismatch")
+            build_artifacts.validate()  # type: ignore[attr-defined]
+            try:
+                stored = service.commit_snapshot(
+                    planned,
+                    expected_generation=old_generation,
+                )
+            except FleetConflictError:
+                return False
+            if stored.generation != new_generation:
+                raise RuntimeError("generation mismatch")
+            build_artifacts.validate()  # type: ignore[attr-defined]
+            return True
+
+        try:
+            apply_q_series_update(
+                tuple(updates),
+                transaction_root=transaction_root,
+                transaction_id=uuid.uuid4().hex,
+                old_generation=current.generation,
+                new_generation=planned.generation,
+                registry_cas=registry_cas,
+            )
+        except InplaceError as exc:
+            if exc.code != "registry_cas_uncertain":
+                raise _fleet_q_inplace_failure(exc.code) from None
+            try:
+                authoritative = service.load()
+                transaction_id = _fleet_q_inplace_pending_transaction(transaction_root)
+                if transaction_id is None:
+                    raise _fleet_q_inplace_failure("invalid_journal")
+                recover_q_series_update(
+                    {item.home_id: item.home for item in updates},
+                    transaction_root=transaction_root,
+                    transaction_id=transaction_id,
+                    authoritative_generation=authoritative.generation,
+                )
+            except FleetInplaceUpdateError:
+                raise
+            except InplaceError as recovery_error:
+                server_code = (
+                    "fleet_update_recovery_diverged"
+                    if recovery_error.code in {"rollback_diverged", "roll_forward_diverged"}
+                    else None
+                )
+                raise _fleet_q_inplace_failure(
+                    recovery_error.code,
+                    server_code=server_code,
+                ) from None
+            except Exception:
+                raise _fleet_q_inplace_failure("registry_cas_uncertain") from None
+            if authoritative.generation == planned.generation:
+                _fleet_publish_stored(service, authoritative)
+                raise _fleet_q_inplace_failure(
+                    "registry_cas_uncertain",
+                    server_code="fleet_registry_commit_failed_after_cas",
+                ) from None
+            raise _fleet_q_inplace_failure(
+                "registry_cas_uncertain",
+                server_code="fleet_registry_commit_failed",
+            ) from None
+        build_artifacts.validate()  # type: ignore[attr-defined]
+    if stored is None:
+        raise _fleet_q_inplace_failure("registry_cas_uncertain")
+    _fleet_publish_stored(service, stored)
+    return stored
+
+
 def fleet_series_apply(
     *,
     prefix: str,
@@ -18954,6 +21612,10 @@ def fleet_series_apply(
     gemini_executable: Path | None = None,
 ) -> dict[str, Any]:
     service = current_fleet_service()
+    fleet_paths = FleetPaths.from_state_root(STATE_ROOT)
+    if prefix == "q":
+        with fleet_mutation_lock(fleet_paths):
+            _fleet_recover_pending_q_inplace(service, fleet_paths)
     plan, current, planned, existing, candidate, materialization = _fleet_series_plan_with_service(
         service,
         prefix=prefix,
@@ -18978,10 +21640,37 @@ def fleet_series_apply(
         or existing.task_profile != candidate.task_profile
     )
     prepared_recovery_entries: tuple[RecoveryEntry, ...] = ()
-    with fleet_mutation_lock(FleetPaths.from_state_root(STATE_ROOT)):
+    with fleet_mutation_lock(fleet_paths):
+        if candidate.prefix == "q":
+            _fleet_recover_pending_q_inplace(service, fleet_paths)
         if managed_changed and any(
             plan[name] for name in ("create_count", "update_count", "remove_count")
         ):
+            if candidate.prefix == "q":
+                if not _fleet_q_inplace_eligible(existing, candidate, materialization):
+                    raise _fleet_q_inplace_failure(
+                        "invalid_request",
+                        server_code="fleet_q_inplace_scope_invalid",
+                    )
+                stored = _fleet_apply_q_inplace_update(
+                    service,
+                    current,
+                    planned,
+                    candidate,
+                    materialization,
+                    codex_executable=codex_executable,
+                )
+                return {
+                    "mutation_performed": True,
+                    "generation": stored.generation,
+                    "created_count": 0,
+                    "kept_count": 0,
+                    "updated_count": len(materialization["update_ids"]),
+                    "removed_count": 0,
+                    "cleanup_pending": False,
+                    "pool_root": "not_returned",
+                    "raw_output": "not_returned",
+                }
             prepared_recovery_entries = _fleet_prepare_managed_update_recovery_entries(
                 current,
                 planned,
@@ -19020,7 +21709,7 @@ def fleet_series_apply(
                 "pool_root": "not_returned",
                 "raw_output": "not_returned",
             }
-    with fleet_mutation_lock(FleetPaths.from_state_root(STATE_ROOT)):
+    with fleet_mutation_lock(fleet_paths):
         enabling = existing is not None and not existing.enabled and candidate.enabled
         registry_only = not any(
             materialization[name]
@@ -21424,7 +24113,12 @@ def pane_pid_from_text(text: str) -> int | None:
 
 
 def managed_applet_inventory(snapshot: InventorySnapshot | None = None) -> dict[str, Any]:
-    selected = snapshot or current_agent_inventory()
+    if snapshot is None:
+        selected, _registry_backed = effective_observation_inventory()
+        if selected is None:
+            raise AgentError("fleet_registry_unavailable")
+    else:
+        selected = snapshot
     inventory = run_tmux(
         ["list-sessions", "-F", "#{session_name}"],
         check=False,
@@ -21757,7 +24451,7 @@ def applet_status_v2(agents: Any) -> dict[str, Any]:
     )
 
     try:
-        native_agents = native_agent_status()
+        native_agents = native_agent_status(expected_parent_sessions=len(running_agents))
     except AgentError:
         native_agents = {
             "bridge_state": "degraded",
@@ -21982,6 +24676,10 @@ def native_agent_registry_lock(
 
 @contextlib.contextmanager
 def spawn_admission_lock() -> Any:
+    held_locks = _SPAWN_ADMISSION_LOCK_STACK.get()
+    if "spawn-admission" in held_locks:
+        yield
+        return
     ensure_private_dir(STATE_ROOT)
     ensure_private_dir(LOCK_DIR)
     lock_path = LOCK_DIR / "spawn-admission.lock"
@@ -21990,9 +24688,11 @@ def spawn_admission_lock() -> Any:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
         except OSError as exc:
             raise AgentError("could not acquire spawn admission lock") from exc
+        token = _SPAWN_ADMISSION_LOCK_STACK.set((*held_locks, "spawn-admission"))
         try:
             yield
         finally:
+            _SPAWN_ADMISSION_LOCK_STACK.reset(token)
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
             except OSError:
@@ -22006,22 +24706,24 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "required_slots": {"type": "integer", "minimum": 1, "maximum": 6, "default": 1}
+                "required_slots": {"type": "integer", "minimum": 1, "maximum": 10, "default": 1}
             },
             "additionalProperties": False,
         },
     },
     {
         "name": "agent_start",
-        "description": "Start selected Codex Agentinnen in persistent tmux sessions with gpt-5.4-mini, --yolo -s danger-full-access --search. Does not return raw output.",
+        "description": "Start selected Codex Agentinnen in tmux through the shared class/lifecycle/model/reasoning resolver. Does not return raw output.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "agent": agent_selector_schema(default="both"),
                 "cwd": text_schema(MAX_PATH_TEXT, description="Working directory. Defaults to the MCP server cwd."),
                 "prompt": text_schema(MAX_SEND_TEXT, description="Optional initial prompt passed to Codex."),
+                "name": text_schema(MAX_AGENTIN_NAME),
                 "allow_unauthenticated": allow_unauthenticated_schema(),
                 "allow_broad_selector": allow_broad_selector_schema(),
+                **resolver_request_schema(),
             },
             "additionalProperties": False,
         },
@@ -22293,6 +24995,19 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "agent_selection_options",
+        "description": "Return first-round allowed classes, lifecycles, models, reasoning levels, and valid combinations for one target series account.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["agent"],
+            "properties": {
+                "agent": agent_selector_schema(single=True),
+                "known_generation": {"type": "string", "maxLength": 80},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "agent_routing_decision",
         "description": "Dry-run der codex-usage Modell- und Credit-Entscheidung fuer eine Agentin; sendet keinen Prompt.",
         "inputSchema": {
@@ -22341,6 +25056,8 @@ TOOLS: list[dict[str, Any]] = [
                     "default": DEFAULT_HEADLESS_TIMEOUT_SECONDS,
                     "description": "Maximum runtime in seconds; applies only to headless agents.",
                 },
+                **resolver_request_schema(),
+                **task_evidence_schema(),
             },
             "additionalProperties": False,
         },
@@ -22373,6 +25090,7 @@ TOOLS: list[dict[str, Any]] = [
                     "default": DEFAULT_HEADLESS_TIMEOUT_SECONDS,
                     "description": "Maximum runtime in seconds; applies only to headless agents.",
                 },
+                **resolver_request_schema(),
             },
             "additionalProperties": False,
         },
@@ -22409,6 +25127,7 @@ TOOLS: list[dict[str, Any]] = [
                     "default": DEFAULT_HEADLESS_TIMEOUT_SECONDS,
                     "description": "Maximum runtime in seconds; applies only to headless agents.",
                 },
+                **resolver_request_schema(),
             },
             "additionalProperties": False,
         },
@@ -22442,6 +25161,8 @@ TOOLS: list[dict[str, Any]] = [
                     "default": DEFAULT_HEADLESS_TIMEOUT_SECONDS,
                     "description": "Maximum runtime in seconds; applies only to headless agents.",
                 },
+                **resolver_request_schema(),
+                **task_evidence_schema(),
             },
             "additionalProperties": False,
         },
@@ -22827,6 +25548,47 @@ TOOLS: list[dict[str, Any]] = [
         "description": "Return structured diagnostics for installation, MCP registration, runners, and tmux sessions. Does not return raw output.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
+    {
+        "name": "fleet_overview",
+        "description": "Return the canonical fleet overview shared by CLI, applet, and MCP.",
+        "inputSchema": {"type": "object", "properties": {
+            "active_only": {"type": "boolean", "default": True},
+            "include_limits": {"type": "boolean", "default": True},
+            "format": text_schema(16, enum=["json", "compact"]),
+        }, "additionalProperties": False},
+    },
+    {
+        "name": "fleet_status_compact",
+        "description": "Return a short active fleet status table for status questions.",
+        "inputSchema": {"type": "object", "properties": {
+            "scope": text_schema(32, enum=["global", "repository"]),
+            "repository": text_schema(128),
+            "include_cost_last_hour": {"type": "boolean", "default": False},
+        }, "additionalProperties": False},
+    },
+    {
+        "name": "goddess_report_status",
+        "description": "Return reporter requirement, latest bucket, state, and Vault health without raw report data.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "goddess_report_run",
+        "description": "Generate one sanitized hourly Goddess report; final reports are immutable unless replace is explicit.",
+        "inputSchema": {"type": "object", "properties": {
+            "bucket_start": text_schema(64),
+            "partial": {"type": "boolean", "default": False},
+            "replace": {"type": "boolean", "default": False},
+        }, "additionalProperties": False},
+    },
+    {
+        "name": "goddess_report_list",
+        "description": "List bounded reporter bucket metadata without returning report contents.",
+        "inputSchema": {"type": "object", "properties": {
+            "from": text_schema(64),
+            "to": text_schema(64),
+            "limit": {"type": "integer", "minimum": 1, "maximum": 744, "default": 24},
+        }, "additionalProperties": False},
+    },
 ]
 
 # Hive diagnostics are additive and read-only.  Their schemas are deliberately
@@ -22871,14 +25633,29 @@ def compact_optional_args(args: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in args.items() if value is not None}
 
 
-def call_validated_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+def call_validated_tool(
+    name: str,
+    args: dict[str, Any],
+    *,
+    principal_class: str | None = None,
+) -> dict[str, Any]:
     validated_name, validated_args = validate_tool_call(name, compact_optional_args(args))
+    if principal_class is not None:
+        return call_tool(
+            validated_name,
+            validated_args,
+            principal_class=principal_class,
+        )
     return call_tool(validated_name, validated_args)
 
 
 def call_teamleader_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
-    require_teamleader_tool_access()
-    return call_validated_tool(name, args)
+    status = require_teamleader_tool_access()
+    return call_validated_tool(
+        name,
+        args,
+        principal_class=verified_principal_class(status),
+    )
 
 
 def teamleader_tool_catalog() -> list[dict[str, Any]]:
@@ -23010,15 +25787,21 @@ def handle_rpc(msg: dict[str, Any], *, enforce_master_role: bool = False) -> dic
         return reply(rpc_result(message_id, {"prompts": []}))
     if method == "tools/call":
         try:
+            principal_class = None
             if enforce_master_role:
-                require_teamleader_tool_access()
+                status = require_teamleader_tool_access()
+                principal_class = verified_principal_class(status)
             params = msg.get("params", {})
             if params is None:
                 params = {}
             if not isinstance(params, dict):
                 raise AgentError("tools/call params must be an object")
             name, args = validate_tool_call(params.get("name"), params.get("arguments", {}))
-            payload = call_tool(name, args)
+            payload = (
+                call_tool(name, args, principal_class=principal_class)
+                if principal_class is not None
+                else call_tool(name, args)
+            )
             text = json.dumps(payload, indent=2, sort_keys=True)
             return reply(rpc_result(message_id, {"content": [{"type": "text", "text": text}], "isError": False}))
         except Exception as exc:
@@ -23209,12 +25992,14 @@ def ollama_local_benchmark(*, model: str = "llama3.2:3b", concurrency: int = 1) 
     })
     started = time.perf_counter()
     try:
-        completed = subprocess.run(
+        completed = _run_bounded_stdout_command(
             ["curl", "-fsS", "--max-time", "45", "-H", "Content-Type: application/json",
              "-d", payload, "http://127.0.0.1:11434/api/generate"],
-            check=False, capture_output=True, text=True,
+            timeout=50,
+            max_bytes=MAX_OLLAMA_RESPONSE_BYTES,
+            error_code="ollama_benchmark_unavailable",
         )
-    except (OSError, ValueError) as exc:
+    except AgentError as exc:
         raise AgentError("ollama_benchmark_unavailable") from exc
     elapsed = time.perf_counter() - started
     try:
@@ -23240,6 +26025,86 @@ def ollama_local_benchmark(*, model: str = "llama3.2:3b", concurrency: int = 1) 
     }
 
 
+def _run_bounded_stdout_command(
+    argv: list[str],
+    *,
+    timeout: float,
+    max_bytes: int,
+    error_code: str,
+) -> subprocess.CompletedProcess[str]:
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or any(not isinstance(value, str) or not value for value in argv)
+        or isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not 0 < timeout <= 300
+        or isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)
+        or not 1 <= max_bytes <= 4 * 1024 * 1024
+        or not isinstance(error_code, str)
+        or not error_code
+    ):
+        raise AgentError("bounded_command_invalid")
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=False,
+        )
+    except (OSError, ValueError) as exc:
+        raise AgentError(error_code) from exc
+    stream = process.stdout
+    if stream is None:
+        _terminate_bounded_process(process)
+        raise AgentError(error_code)
+    selector = selectors.DefaultSelector()
+    output = bytearray()
+    deadline = time.monotonic() + float(timeout)
+    try:
+        selector.register(stream, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_bounded_process(process)
+                raise AgentError(error_code)
+            ready = selector.select(remaining)
+            if not ready:
+                _terminate_bounded_process(process)
+                raise AgentError(error_code)
+            for key, _ in ready:
+                chunk = os.read(key.fileobj.fileno(), min(8192, max_bytes + 1 - len(output)))
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                output.extend(chunk)
+                if len(output) > max_bytes:
+                    _terminate_bounded_process(process)
+                    raise AgentError(error_code)
+        return subprocess.CompletedProcess(
+            argv,
+            process.wait(),
+            bytes(output).decode("utf-8", "replace"),
+            "",
+        )
+    finally:
+        selector.close()
+        stream.close()
+
+
+def _terminate_bounded_process(process: subprocess.Popen[bytes]) -> None:
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def _publish_startup_fleet_inventory() -> None:
     """Publish dynamic series only when the registry contains materialized series.
 
@@ -23248,22 +26113,13 @@ def _publish_startup_fleet_inventory() -> None:
     """
 
     global _FLEET_STARTUP_ERROR
-    fleet_paths = FleetPaths.from_state_root(STATE_ROOT)
-    if not path_present_no_follow(fleet_paths.registry):
-        return
-    try:
-        snapshot = _readonly_fleet_service().load()
-        if snapshot.series:
-            provider_inventory = build_inventory(snapshot, AGENT_POOL_ROOT)
-            preserved = legacy_agent_inventory({"b92": AGENTS["b92"]}) if "b92" in AGENTS else None
-            publish_agent_inventory(
-                merge_agent_inventories(provider_inventory, preserved)
-                if preserved is not None else provider_inventory
-            )
-        else:
-            swap_agent_inventory(None)
-    except Exception:
+    snapshot, registry_backed = effective_observation_inventory()
+    if snapshot is None:
         _FLEET_STARTUP_ERROR = "fleet_registry_unavailable"
+    elif registry_backed:
+        publish_agent_inventory(snapshot)
+    else:
+        swap_agent_inventory(None)
 
 
 def serve_mcp() -> int:
@@ -23314,8 +26170,478 @@ def print_json(payload: Any) -> int:
     return 0
 
 
+def _resolve_codex_usage_state_home() -> Path | None:
+    def authorized(value: object) -> Path | None:
+        if type(value) is not str or not value or "\x00" in value:
+            return None
+        if "." in value.split("/") or ".." in value.split("/"):
+            return None
+        try:
+            path = Path(value)
+        except (TypeError, ValueError):
+            return None
+        return path if path.is_absolute() else None
+
+    for name in ("CODEX_USAGE_INTEGRATION_STATE_HOME", "XDG_STATE_HOME"):
+        if name in os.environ:
+            return authorized(os.environ[name])
+    try:
+        return authorized(str(Path.home() / ".local" / "state"))
+    except Exception:
+        return None
+
+
+def _fleet_overview_local_admin(
+    *,
+    active_only: bool,
+    format: str,
+    clock: Callable[[], _dt.datetime] | None = None,
+    usage_clock: Callable[[], _dt.datetime] | None = None,
+) -> str:
+    if type(active_only) is not bool or format not in {"compact", "json", "markdown"}:
+        raise AgentError("fleet_overview_unavailable")
+    selected_clock = clock if clock is not None else (lambda: _dt.datetime.now(_dt.timezone.utc))
+    selected_usage_clock = (
+        usage_clock if usage_clock is not None else (lambda: _dt.datetime.now(_dt.timezone.utc))
+    )
+    paths = FleetPaths.from_state_root(STATE_ROOT)
+    try:
+        with _fleet_registry_read_lock(paths.lock):
+            created_at = selected_clock()
+            if (
+                not isinstance(created_at, _dt.datetime)
+                or created_at.tzinfo is None
+                or created_at.utcoffset() != _dt.timedelta(0)
+            ):
+                raise AgentError("fleet_overview_unavailable")
+            service = _readonly_fleet_service()
+            snapshot = service.registry_snapshot()
+            inventory = build_inventory(snapshot, AGENT_POOL_ROOT)
+            overview = build_fleet_overview(
+                snapshot,
+                inventory,
+                active_only=active_only,
+                contexts=None,
+                created_at=created_at,
+            )
+        try:
+            state_home = _resolve_codex_usage_state_home()
+        except Exception:
+            state_home = None
+        if state_home is None:
+            usage_snapshot = UsageSnapshot((), "unavailable", True, ("usage_unavailable",))
+        else:
+            try:
+                usage_snapshot = load_account_usage_v1(
+                    active_release_reader=partial(read_active_launcher_v1, state_home=state_home),
+                    runner=default_runner,
+                    cache_reader=partial(read_account_usage_cache_v1, state_home=state_home),
+                    known_account_ids=frozenset(account.account_id for account in snapshot.accounts),
+                    clock=selected_usage_clock,
+                )
+            except Exception:
+                usage_snapshot = UsageSnapshot((), "unavailable", True, ("usage_unavailable",))
+        enriched_overview = enrich_fleet_overview_usage(overview, usage_snapshot)
+        return render_fleet_overview(enriched_overview, format=format)
+    except Exception:
+        raise AgentError("fleet_overview_unavailable") from None
+
+
+def _fleet_overview_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="codex-master-mcp fleet overview")
+    parser.add_argument("--format", choices=("compact", "json", "markdown"), default="compact")
+    active = parser.add_mutually_exclusive_group()
+    active.add_argument("--active-only", dest="active_only", action="store_true", default=True)
+    active.add_argument("--no-active-only", dest="active_only", action="store_false")
+    args = parser.parse_args(argv)
+    try:
+        print(_fleet_overview_local_admin(active_only=args.active_only, format=args.format))
+        return 0
+    except Exception:
+        print(json.dumps(public_error_payload(AgentError("fleet_overview_unavailable")), indent=2, sort_keys=True))
+        return 1
+
+
+def _goddess_report_state() -> ReporterStateStore:
+    return ReporterStateStore(GODDESS_REPORT_STATE_FILE)
+
+
+def _goddess_report_leader() -> ReporterLeaderLease:
+    return ReporterLeaderLease(GODDESS_REPORT_LEADER_FILE)
+
+
+def _goddess_vault_root() -> Path:
+    configured = os.environ.get("CODEX_PROGRAMMING_VAULT")
+    root = Path(configured).expanduser() if configured else DEFAULT_PROGRAMMING_VAULT
+    if not root.is_absolute():
+        raise AgentError("goddess_report_vault_unavailable")
+    return root
+
+
+def _goddess_binding_status(now: _dt.datetime) -> tuple[bool | None, str | None]:
+    try:
+        runtime = build_current_hive_runtime(repository_roots={}, materialize_principals=False, now=lambda: now)
+        principals = runtime.principals.list(limit=256)
+        principal_rows = tuple(item.public() for item in principals)
+        binding_rows = runtime.principals.public_bindings()
+        return (
+            active_reporter_required(principal_rows, binding_rows, now=now),
+            None,
+        )
+    except Exception:
+        return None, "hive_binding_state_unavailable"
+
+
+def _goddess_report_status_local() -> dict[str, Any]:
+    now = _dt.datetime.now(_dt.timezone.utc)
+    state = _goddess_report_state().load()
+    buckets = state.get("buckets", {})
+    records = [dict(value, bucket_id=key) for key, value in buckets.items() if isinstance(value, dict)]
+    records.sort(key=lambda value: str(value.get("bucket_id", "")))
+    required, binding_error = _goddess_binding_status(now)
+    try:
+        leader = reporter_leader_active(GODDESS_REPORT_LEADER_FILE)
+    except Exception:
+        leader = False
+        binding_error = binding_error or "goddess_report_leader_unavailable"
+    status_error = binding_error
+    if required is True and not leader:
+        status_error = status_error or "goddess_report_leader_missing"
+    latest = records[-1] if records else None
+    return {
+        "reporter_required": required,
+        "reporter_leader": leader,
+        "state": "degraded" if status_error else "ready",
+        "last_final_bucket": latest.get("bucket_id") if latest and latest.get("status") == "final" else None,
+        "bucket_count": len(records),
+        "vault": str(_goddess_vault_root()),
+        "error": status_error,
+        "raw_output": "not_returned",
+    }
+
+
+def _goddess_report_run_local(
+    *,
+    bucket: _dt.datetime | None,
+    partial: bool,
+    replace: bool,
+) -> dict[str, Any]:
+    if type(partial) is not bool or type(replace) is not bool:
+        raise AgentError("invalid goddess report flags")
+    leader = _goddess_report_leader()
+    try:
+        leader.acquire()
+    except ReporterLeaderBusy:
+        return {
+            "ok": False,
+            "status": "busy",
+            "changed": False,
+            "vault_path": None,
+            "state": None,
+            "error": "goddess_report_leader_busy",
+            "raw_output": "not_returned",
+        }
+    try:
+        if bucket is not None:
+            return _goddess_report_run_unlocked(bucket=bucket, partial=partial, replace=replace)
+        now = _dt.datetime.now(_dt.timezone.utc)
+        targets = eligible_buckets(
+            now=now,
+            last_final=_goddess_last_final_bucket(_goddess_report_state().load()),
+        )
+        reports: list[dict[str, Any]] = []
+        for target in targets:
+            try:
+                reports.append(
+                    _goddess_report_run_unlocked(
+                        bucket=target,
+                        partial=partial,
+                        replace=replace,
+                    )
+                )
+            except Exception:
+                reports.append(
+                    {
+                        "ok": False,
+                        "bucket_id": target.isoformat(),
+                        "changed": False,
+                        "error": "goddess_report_bucket_failed",
+                        "raw_output": "not_returned",
+                    }
+                )
+        return {
+            "ok": all(item.get("ok") is True for item in reports),
+            "status": "batch" if reports else "idle",
+            "changed": any(item.get("changed") is True for item in reports),
+            "reports": reports,
+            "raw_output": "not_returned",
+        }
+    finally:
+        leader.release()
+
+
+def _goddess_last_final_bucket(payload: Mapping[str, object]) -> _dt.datetime | None:
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("buckets"), Mapping):
+        return None
+    latest: _dt.datetime | None = None
+    for bucket_id, record in payload["buckets"].items():
+        if not isinstance(bucket_id, str) or not isinstance(record, Mapping):
+            continue
+        if record.get("status") != "final" or "/PT1H" not in bucket_id:
+            continue
+        raw_start = bucket_id.split("/PT1H", 1)[0]
+        try:
+            parsed = _dt.datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            continue
+        parsed = parsed.astimezone(_dt.timezone.utc)
+        if parsed != bucket_start(parsed):
+            continue
+        if latest is None or parsed > latest:
+            latest = parsed
+    return latest
+
+
+def _goddess_read_jsonl_source(
+    path: Path,
+    *,
+    max_bytes: int,
+    error_label: str,
+) -> tuple[tuple[dict[str, object], ...], str | None]:
+    if not path_present_no_follow(path):
+        return (), f"{error_label} nicht vorhanden"
+    try:
+        text = read_private_regular_text(path, max_bytes, f"could_not_read_{error_label}")
+    except Exception:
+        return (), f"{error_label} nicht verfügbar"
+    records: list[dict[str, object]] = []
+    malformed = 0
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except (TypeError, json.JSONDecodeError, RecursionError):
+            malformed += 1
+            continue
+        if isinstance(value, dict):
+            records.append(value)
+        else:
+            malformed += 1
+    warning = f"{error_label}: {malformed} ungültige Einträge verworfen" if malformed else None
+    return tuple(records), warning
+
+
+def _goddess_report_task_rows(
+    bucket: _dt.datetime,
+) -> tuple[tuple[dict[str, str], ...], tuple[dict[str, str], ...], tuple[str, ...]]:
+    assignments, assignment_warning = _goddess_read_jsonl_source(
+        ASSIGNMENT_LOG,
+        max_bytes=MAX_ASSIGNMENT_LOG_BYTES,
+        error_label="Assignmentquelle",
+    )
+    events, event_warning = _goddess_read_jsonl_source(
+        FleetPaths.from_state_root(STATE_ROOT).events,
+        max_bytes=MAX_EVENT_BYTES,
+        error_label="Abschlussereignisquelle",
+    )
+    hive_warning: str | None = None
+    try:
+        hive_assignments, hive_events = HiveEventStore(STATE_ROOT / "hive").read_report_sources()
+    except HiveEventError:
+        hive_assignments, hive_events = (), ()
+        hive_warning = "Hive-Ereignisquelle nicht verfügbar"
+    assignments = (*assignments, *hive_assignments)
+    events = (*events, *hive_events)
+    try:
+        completed, pending = aggregate_task_rows(bucket, assignments=assignments, events=events)
+    except (TypeError, ValueError):
+        return (), (), ("Taskaggregation wegen ungültiger Zeitdaten nicht verfügbar",)
+    warnings = tuple(value for value in (assignment_warning, event_warning, hive_warning) if value is not None)
+    if not assignments and not events and not warnings:
+        warnings = ("Taskaggregation: keine Ereignisse im lokalen Rückhaltepuffer",)
+    if assignments and not events:
+        warnings += ("Taskaggregation: ohne Abschlussereignisse werden Aufgaben nicht als erledigt angenommen",)
+    return completed, pending, warnings
+
+
+def _goddess_report_run_unlocked(
+    *,
+    bucket: _dt.datetime | None,
+    partial: bool,
+    replace: bool,
+) -> dict[str, Any]:
+    now = _dt.datetime.now(_dt.timezone.utc)
+    start = bucket_start(bucket or (now - _dt.timedelta(hours=1)))
+    data_quality: list[str] = []
+    agents: list[dict[str, object]] = []
+    usage_accounts: list[dict[str, object]] = []
+    completed_tasks, pending_tasks, task_quality = _goddess_report_task_rows(start)
+    data_quality.extend(task_quality)
+    try:
+        overview = json.loads(_fleet_overview_local_admin(active_only=False, format="json"))
+        for row in overview.get("agents", ()):
+            if not isinstance(row, dict):
+                continue
+            agents.append(
+                {
+                    "agent_id": row.get("agent_id"),
+                    "series": row.get("series_display"),
+                    "provider": row.get("provider"),
+                    "account_id": row.get("account_id"),
+                    "account_label": row.get("account_label"),
+                    "state": row.get("state"),
+                }
+            )
+        for row in overview.get("account_limits", ()):
+            if not isinstance(row, dict):
+                continue
+            cost = row.get("cost_last_hour_percentage_points")
+            costs = () if cost is None else ({"consumed_percentage_points": cost},)
+            usage_accounts.append({"account_id": row.get("account_id"), "cost_windows": costs})
+        data_quality.extend(str(value) for value in overview.get("warnings", ()) if isinstance(value, str))
+    except Exception:
+        data_quality.append("Fleet-/Usageübersicht nicht verfügbar")
+    report = build_hourly_report(
+        start,
+        completed=completed_tasks,
+        pending=pending_tasks,
+        agents=agents,
+        usage_accounts=usage_accounts,
+        data_quality=data_quality,
+    )
+    content = render_markdown(report, created_at=now, final=not partial)
+    vault_path: Path | None = None
+    vault_error: str | None = None
+    try:
+        vault_path = write_hourly_report(
+            _goddess_vault_root(),
+            start,
+            content,
+            replace=replace,
+        )
+    except Exception:
+        vault_error = "goddess_report_vault_unavailable"
+    state_record = None
+    if vault_error is None:
+        state_record, changed = _goddess_report_state().record(
+            start,
+            content,
+            vault_path=vault_path,
+            final=not partial,
+            replace=replace,
+        )
+    else:
+        changed = False
+    return {
+        "ok": vault_error is None,
+        "bucket_id": report.bucket_id,
+        "status": "partial" if partial else "final",
+        "changed": changed,
+        "vault_path": str(vault_path) if vault_path else None,
+        "state": state_record,
+        "error": vault_error,
+        "markdown": content,
+        "raw_output": "not_returned",
+    }
+
+
+def _parse_report_timestamp(value: object, field: str) -> _dt.datetime | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise AgentError(f"{field} must be RFC3339")
+    try:
+        parsed = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise AgentError(f"{field} must be RFC3339") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise AgentError(f"{field} must be RFC3339")
+    return parsed.astimezone(_dt.timezone.utc)
+
+
+def _goddess_report_list_local(
+    *,
+    limit: int,
+    from_value: object = None,
+    to_value: object = None,
+) -> dict[str, Any]:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 744:
+        raise AgentError("goddess report limit is invalid")
+    from_timestamp = _parse_report_timestamp(from_value, "from")
+    to_timestamp = _parse_report_timestamp(to_value, "to")
+    if from_timestamp is not None and to_timestamp is not None and from_timestamp > to_timestamp:
+        raise AgentError("from must not be later than to")
+    buckets = _goddess_report_state().load().get("buckets", {})
+    entries = [dict(value, bucket_id=key) for key, value in buckets.items() if isinstance(value, dict)]
+    if from_timestamp is not None or to_timestamp is not None:
+        filtered: list[dict[str, Any]] = []
+        for entry in entries:
+            bucket_id = entry.get("bucket_id")
+            if not isinstance(bucket_id, str) or "/PT1H" not in bucket_id:
+                continue
+            try:
+                timestamp = _dt.datetime.fromisoformat(bucket_id.split("/PT1H", 1)[0].replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+                continue
+            timestamp = timestamp.astimezone(_dt.timezone.utc)
+            if from_timestamp is not None and timestamp < from_timestamp:
+                continue
+            if to_timestamp is not None and timestamp > to_timestamp:
+                continue
+            filtered.append(entry)
+        entries = filtered
+    entries.sort(key=lambda value: str(value.get("bucket_id", "")), reverse=True)
+    return {"reports": entries[:limit], "raw_output": "not_returned"}
+
+
+def _goddess_report_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="codex-master-mcp goddess report")
+    sub = parser.add_subparsers(dest="report_command", required=True)
+    sub.add_parser("status")
+    run = sub.add_parser("run")
+    run.add_argument("--bucket-start")
+    run.add_argument("--partial", action="store_true")
+    run.add_argument("--replace", action="store_true")
+    listing = sub.add_parser("list")
+    listing.add_argument("--from", dest="from_value")
+    listing.add_argument("--to", dest="to_value")
+    listing.add_argument("--limit", type=int, default=24)
+    args = parser.parse_args(argv)
+    try:
+        if args.report_command == "status":
+            return print_json(_goddess_report_status_local())
+        if args.report_command == "run":
+            return print_json(
+                _goddess_report_run_local(
+                    bucket=_parse_report_timestamp(args.bucket_start, "bucket-start"),
+                    partial=args.partial,
+                    replace=args.replace,
+                )
+            )
+        return print_json(
+            _goddess_report_list_local(
+                limit=args.limit,
+                from_value=args.from_value,
+                to_value=args.to_value,
+            )
+        )
+    except Exception:
+        print_json({"error": "goddess_report_unavailable"})
+        return 1
+
+
 def main_cli(argv: list[str]) -> int:
     """Run one CLI request with a request-scoped fleet inventory projection."""
+
+    if argv[:2] == ["fleet", "overview"]:
+        return _fleet_overview_cli(argv[2:])
+    if argv[:2] == ["goddess", "report"]:
+        return _goddess_report_cli(argv[2:])
 
     global _FLEET_STARTUP_ERROR
     previous_inventory = swap_agent_inventory(None)
@@ -23470,6 +26796,24 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_routing_decision.add_argument("--group-id")
     p_routing_decision.add_argument("--job-id")
 
+    def add_task_evidence_options(parser_obj: argparse.ArgumentParser) -> None:
+        parser_obj.add_argument("--complexity", choices=["simple", "medium", "complex", "unknown"], default="unknown")
+        parser_obj.add_argument("--task-phase", choices=["atomic_fix", "diagnosis", "unknown"], default="unknown")
+        for option in (
+            "fully-specified",
+            "reversible",
+            "low-risk",
+            "root-cause-known",
+            "security-sensitive",
+            "concurrency",
+            "migration",
+            "data-change",
+            "cross-repository",
+            "architecture",
+            "ci-or-release",
+        ):
+            parser_obj.add_argument(f"--{option}", action="store_true")
+
     p_assign = sub.add_parser("assign")
     p_assign.add_argument("agent")
     p_assign.add_argument("--role", choices=["exploriererin", "arbeitsbiene"], required=True)
@@ -23487,6 +26831,7 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_assign.add_argument("--allow-missing-skill", action="store_true")
     p_assign.add_argument("--allow-subagents", action="store_true")
     p_assign.add_argument("--allow-unauthenticated", action="store_true")
+    add_task_evidence_options(p_assign)
 
     p_assign_readonly = sub.add_parser("assign-readonly")
     p_assign_readonly.add_argument("agent")
@@ -23537,6 +26882,17 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_assign_write.add_argument("--allow-missing-skill", action="store_true")
     p_assign_write.add_argument("--allow-subagents", action="store_true")
     p_assign_write.add_argument("--allow-unauthenticated", action="store_true")
+    p_assign_write.add_argument("--class", dest="agent_class")
+    p_assign_write.add_argument(
+        "--lifecycle",
+        choices=["ephemeral", "invocation", "binding", "persistent"],
+    )
+    p_assign_write.add_argument("--model")
+    p_assign_write.add_argument(
+        "--reasoning-effort",
+        choices=["low", "medium", "high", "xhigh", "max"],
+    )
+    add_task_evidence_options(p_assign_write)
 
     p_assignments = sub.add_parser("assignments")
     p_assignments.add_argument("agent", nargs="?", default="all", help=AGENT_SELECTOR_DESCRIPTION)
@@ -24048,6 +27404,7 @@ def _main_cli_impl(argv: list[str]) -> int:
                         "allow_missing_skill": args.allow_missing_skill,
                         "allow_subagents": args.allow_subagents,
                         "allow_unauthenticated": True if args.allow_unauthenticated else None,
+                        **task_evidence_cli_args(args),
                     },
                 )
             )
@@ -24116,6 +27473,11 @@ def _main_cli_impl(argv: list[str]) -> int:
                         "allow_missing_skill": args.allow_missing_skill,
                         "allow_subagents": args.allow_subagents,
                         "allow_unauthenticated": True if args.allow_unauthenticated else None,
+                        **({"class": args.agent_class} if args.agent_class else {}),
+                        **({"lifecycle": args.lifecycle} if args.lifecycle else {}),
+                        **({"model": args.model} if args.model else {}),
+                        **({"reasoning_effort": args.reasoning_effort} if args.reasoning_effort else {}),
+                        **task_evidence_cli_args(args),
                     },
                 )
             )
@@ -24830,11 +28192,48 @@ def execute_server_queen_assignment(
     dispatch_id: str,
     workpackage: Mapping[str, object],
     context: QueenAssignmentExecutionContext | None = None,
+    event_store: HiveEventStore | None = None,
 ) -> Mapping[str, object]:
     """Run the shared Queen planner through the closed server-side adapter."""
 
+    if event_store is not None and not isinstance(event_store, HiveEventStore):
+        raise AgentError("invalid_hive_event_store")
     plan = plan_queen_assignment(queen_id=queen_id, dispatch_id=dispatch_id, workpackage=workpackage)
-    return execute_queen_assignment(plan, context)
+    if event_store is not None:
+        try:
+            event_store.append_queue_transition(
+                plan.workpackage_id,
+                "queued",
+                dispatch_id=plan.dispatch_id,
+                repo_id=plan.repo_id,
+                agent_id=plan.agent_id,
+            )
+        except HiveEventError as exc:
+            raise AgentError("hive_event_persistence_failed") from exc
+    result = dict(execute_queen_assignment(plan, context))
+    if event_store is None:
+        return result
+    reason_code = result.get("reason_code")
+    status = {
+        "assignment_executed": "completed",
+        "shadow_only": "planned",
+        "pilot_gate_blocked": "blocked",
+        "assignment_transaction_failed": "failed",
+    }.get(reason_code, "failed")
+    try:
+        event_store.append_queue_transition(
+            plan.workpackage_id,
+            status,
+            dispatch_id=plan.dispatch_id,
+            repo_id=plan.repo_id,
+            agent_id=plan.agent_id,
+        )
+    except HiveEventError:
+        result["event_persistence"] = "failed"
+    else:
+        result["event_persistence"] = "recorded"
+    result["raw_output"] = "not_returned"
+    return result
 
 
 def server_cooperative_pause_preview(
@@ -26854,6 +30253,12 @@ def _fleet_recovery_entry_action(
 
     if action is RecoveryActionKind.VERIFY_CREATED:
         return target_exists and _fleet_existing_home_ok(target, {})
+    if action is RecoveryActionKind.VERIFY_UNCHANGED:
+        return (
+            not target_exists
+            if state is DescriptorState.ABSENT
+            else target_exists and not hidden_exists and _fleet_existing_home_ok(target, {})
+        )
     if action is RecoveryActionKind.RETAIN_QUARANTINE:
         return True
     if action is RecoveryActionKind.QUARANTINE_CREATED:
@@ -26949,6 +30354,7 @@ def _fleet_recovery_reconcile_entries(
                     errors.append(
                         {
                             RecoveryActionKind.QUARANTINE_CREATED: "fleet_create_rollback_diverged",
+                            RecoveryActionKind.VERIFY_UNCHANGED: "fleet_recovery_incomplete",
                             RecoveryActionKind.VERIFY_CREATED: "fleet_recovery_incomplete",
                             RecoveryActionKind.RESTORE_BACKUP: "fleet_update_rollback_diverged",
                             RecoveryActionKind.RESTORE_TOMBSTONE: "fleet_tombstone_rollback_diverged",
@@ -26979,6 +30385,12 @@ def _fleet_verify_recovery_journal(
         target = AGENT_POOL_ROOT / entry.agent_id
         if action.kind is RecoveryActionKind.VERIFY_CREATED:
             if not _fleet_existing_home_ok(target, {}):
+                return False
+        elif action.kind is RecoveryActionKind.VERIFY_UNCHANGED:
+            if action.descriptor_state is DescriptorState.ABSENT:
+                if path_present_no_follow(target):
+                    return False
+            elif not _fleet_existing_home_ok(target, {}):
                 return False
         elif action.kind is RecoveryActionKind.RESTORE_BACKUP:
             if not _fleet_existing_home_ok(target, {}):
@@ -27308,6 +30720,737 @@ def _fleet_peek_optional_private_text(
             os.close(file_fd)
         if directory_fd >= 0:
             os.close(directory_fd)
+
+
+_G_MIGRATION_JOURNAL_NAME = "g-series-migration.json"
+_G_MIGRATION_CRASHED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "codex_master_g_migration_crashed",
+    default=False,
+)
+
+
+def _g_migration_crash_point(_point: str) -> None:
+    """Private test seam; production has no crash injection."""
+
+
+def _g_migration_checkpoint(point: str) -> None:
+    try:
+        _g_migration_crash_point(point)
+    except BaseException:
+        _G_MIGRATION_CRASHED.set(True)
+        raise
+
+
+def _g_migration_paths(service: FleetService) -> FleetPaths:
+    paths = getattr(service, "_paths", None)
+    if not isinstance(paths, FleetPaths):
+        raise AgentError("migration_service_invalid")
+    return paths
+
+
+def _g_migration_pool_root(pool_root: Path) -> Path:
+    if not isinstance(pool_root, Path) or not pool_root.is_absolute():
+        raise AgentError("migration_pool_root_invalid")
+    try:
+        root_stat = pool_root.lstat()
+    except OSError as exc:
+        raise AgentError("migration_pool_root_invalid") from exc
+    _fleet_private_directory_stat(root_stat, "migration_pool_root_invalid")
+    return pool_root
+
+
+def _g_migration_journal_path(paths: FleetPaths) -> Path:
+    return paths.root / _G_MIGRATION_JOURNAL_NAME
+
+
+def _g_migration_journal_stat(path: Path, *, missing_ok: bool) -> os.stat_result | None:
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise AgentError("migration_journal_invalid") from None
+    except OSError as exc:
+        raise AgentError("migration_journal_invalid") from exc
+    if (
+        not stat_module.S_ISREG(current.st_mode)
+        or getattr(current, "st_nlink", 1) != 1
+        or stat_module.S_IMODE(current.st_mode) != 0o600
+    ):
+        raise AgentError("migration_journal_invalid")
+    return current
+
+
+def _g_migration_read_journal(service: FleetService, paths: FleetPaths) -> GMigrationJournal | None:
+    try:
+        root_stat = paths.root.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise AgentError("migration_journal_invalid") from exc
+    _fleet_private_directory_stat(root_stat, "migration_journal_invalid")
+    path = _g_migration_journal_path(paths)
+    if _g_migration_journal_stat(path, missing_ok=True) is None:
+        return None
+    io = getattr(service, "_io", None)
+    try:
+        text = io.read_text(path, MAX_RECOVERY_DOCUMENT_BYTES, "migration_journal_invalid")
+        if text is None:
+            raise AgentError("migration_journal_invalid")
+        return normalize_g_migration_journal(json.loads(text))
+    except AgentError:
+        raise
+    except Exception as exc:
+        raise AgentError("migration_journal_invalid") from exc
+
+
+def _g_migration_store_journal(
+    service: FleetService,
+    paths: FleetPaths,
+    journal: GMigrationJournal,
+) -> None:
+    path = _g_migration_journal_path(paths)
+    document = g_migration_journal_document(journal)
+    text = json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    io = getattr(service, "_io", None)
+    try:
+        io.ensure_dir(paths.root)
+        io.replace_text(path, text)
+        _g_migration_journal_stat(path, missing_ok=False)
+        loaded = _g_migration_read_journal(service, paths)
+        if loaded != journal:
+            raise AgentError("migration_journal_write_verification_failed")
+    except AgentError:
+        raise
+    except Exception as exc:
+        raise AgentError("migration_journal_write_failed") from exc
+
+
+def _g_migration_remove_journal(service: FleetService, paths: FleetPaths) -> None:
+    path = _g_migration_journal_path(paths)
+    if _g_migration_journal_stat(path, missing_ok=True) is None:
+        return
+    io = getattr(service, "_io", None)
+    try:
+        remover = getattr(io, "remove_file", None)
+        if remover is None or not remover(path):
+            raise AgentError("migration_journal_remove_failed")
+    except AgentError:
+        raise
+    except Exception as exc:
+        raise AgentError("migration_journal_remove_failed") from exc
+
+
+def _g_migration_digest(value: object) -> str:
+    try:
+        payload = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except Exception as exc:
+        raise AgentError("migration_journal_invalid") from exc
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+def _g_migration_plan_document(prepared: GMigrationPrepared) -> dict[str, object]:
+    plan = prepared.plan
+    return {
+        "source_generation": plan.source_generation,
+        "target_prefix": plan.target_prefix,
+        "g_relocation_target": plan.g_relocation_target,
+        "members": [
+            {
+                "migration_identity": member.migration_identity,
+                "source_prefix": member.source_prefix,
+                "source_ordinal": member.source_ordinal,
+                "account_id": member.account_id,
+                "target_ordinal": member.target_ordinal,
+                "disposition": member.disposition,
+                "reason_code": member.reason_code,
+            }
+            for member in plan.members
+        ],
+    }
+
+
+def _g_migration_file_identity(path: Path, error: str) -> tuple[os.stat_result, FileIdentity]:
+    try:
+        current = path.lstat()
+    except OSError as exc:
+        raise AgentError(error) from exc
+    _fleet_private_directory_stat(current, error)
+    return current, FileIdentity(
+        current.st_dev,
+        current.st_ino,
+        current.st_mode,
+        current.st_uid,
+        current.st_gid,
+        current.st_nlink,
+    )
+
+
+def _g_migration_identity_matches(path: Path, expected: FileIdentity, error: str) -> os.stat_result:
+    current, _identity = _g_migration_file_identity(path, error)
+    if current.st_dev != expected.dev or current.st_ino != expected.ino:
+        raise AgentError(error)
+    return current
+
+
+def _g_migration_target_map(
+    prepared: GMigrationPrepared,
+    source_ids: tuple[str, ...],
+) -> dict[str, str | None]:
+    by_identity = {member.migration_identity: member for member in prepared.plan.members}
+    result: dict[str, str | None] = {}
+    for source_id in source_ids:
+        identity = f"v1:{source_id.rstrip('0123456789')}:{source_id[len(source_id.rstrip('0123456789')):]}"
+        member = by_identity.get(identity)
+        if member is None:
+            result[source_id] = source_id
+        elif member.disposition == "g_member" and member.target_ordinal is not None:
+            result[source_id] = f"g{member.target_ordinal}"
+        elif member.disposition == "retired_duplicate_credential":
+            result[source_id] = None
+        else:
+            raise AgentError("migration_manifest_invalid")
+    targets = [target for target in result.values() if target is not None]
+    if len(targets) != len(set(targets)):
+        raise AgentError("migration_home_collision")
+    return result
+
+
+def _g_migration_idle_home(agent_id: str, descriptor: AgentDescriptor, inventory: InventorySnapshot) -> None:
+    try:
+        lease = agent_lease_status(agent_id, initialize_state=False, snapshot=inventory)
+    except Exception as exc:
+        raise AgentError("migration_session_unknown") from exc
+    if not isinstance(lease, Mapping) or lease.get("state") not in {"unclaimed", "expired"}:
+        raise AgentError("migration_session_active")
+    try:
+        tmux_state = _fleet_tmux_state(descriptor.session)
+    except Exception as exc:
+        raise AgentError("migration_session_unknown") from exc
+    if tmux_state != "stopped":
+        raise AgentError("migration_session_active")
+    try:
+        processes = pool_home_processes(descriptor.home)
+    except Exception as exc:
+        raise AgentError("migration_session_unknown") from exc
+    if processes is None:
+        raise AgentError("migration_session_unknown")
+    if processes:
+        raise AgentError("migration_session_active")
+
+
+def _g_migration_home_records(
+    inventory: InventorySnapshot,
+    pool_root: Path,
+    source_ids: tuple[str, ...],
+) -> dict[str, tuple[FileIdentity, Path]]:
+    records: dict[str, tuple[FileIdentity, Path]] = {}
+    root = pool_root.absolute()
+    for agent_id in source_ids:
+        descriptor = inventory.agents.get(agent_id)
+        if type(descriptor) is not AgentDescriptor:
+            raise AgentError("migration_manifest_invalid")
+        home = descriptor.home
+        if not isinstance(home, Path) or home.absolute().parent != root or home.name != agent_id:
+            raise AgentError("migration_home_external")
+        _g_migration_idle_home(agent_id, descriptor, inventory)
+        _current, identity = _g_migration_file_identity(home, "migration_home_state_unknown")
+        records[agent_id] = (identity, home)
+    return records
+
+
+def _g_migration_journal_for_prepared(
+    snapshot: FleetSnapshot,
+    manifest: GMigrationManifest,
+    prepared: GMigrationPrepared,
+    records: Mapping[str, tuple[FileIdentity, Path]],
+    migration_id: str,
+    target_map: Mapping[str, str | None],
+    bindings: Mapping[str, str],
+) -> GMigrationJournal:
+    allocation_by_identity = {item.migration_identity: item.member_id for item in prepared.allocations}
+    aliases: list[GMigrationAlias] = []
+    for source_id in sorted(target_map):
+        target = target_map[source_id]
+        if target is None or target == source_id:
+            continue
+        identity = f"v1:{source_id.rstrip('0123456789')}:{source_id[len(source_id.rstrip('0123456789')):]}"
+        member_id = allocation_by_identity.get(identity)
+        if member_id is None:
+            raise AgentError("migration_manifest_invalid")
+        aliases.append(
+            GMigrationAlias(
+                source_id,
+                target,
+                member_id,
+                snapshot.generation + 1,
+                migration_id,
+            )
+        )
+    home_identities = tuple(
+        GMigrationHomeIdentity(
+            agent_id,
+            records[agent_id][0],
+            f".codex-g-migrate-{target_map[agent_id] or f'retired-{agent_id}'}-{migration_id[:8]}",
+        )
+        for agent_id in sorted(records)
+    )
+    source_document = fleet_document(snapshot)
+    plan_document = _g_migration_plan_document(prepared)
+    binding_document = [(account_id, bindings[account_id]) for account_id in sorted(bindings)]
+    journal = GMigrationJournal(
+        1,
+        migration_id,
+        manifest.manifest_version,
+        manifest.expected_registry_generation,
+        manifest.source_projection_digest,
+        _g_migration_digest(source_document),
+        _g_migration_digest(plan_document),
+        _g_migration_digest(fleet_document(prepared.candidate)),
+        _g_migration_digest(binding_document),
+        prepared.allocations,
+        tuple(sorted(records)),
+        home_identities,
+        tuple(aliases),
+        GMigrationPhase.PREPARED,
+        None,
+        (),
+    )
+    g_migration_alias_view(journal)
+    return journal
+
+
+def _g_migration_stage_homes(
+    pool_root: Path,
+    journal: GMigrationJournal,
+) -> None:
+    for home in journal.home_identities:
+        source = pool_root / home.agent_id
+        rollback = pool_root / home.rollback_name
+        if path_present_no_follow(rollback):
+            raise AgentError("migration_home_collision")
+        _g_migration_identity_matches(source, home.identity, "migration_home_state_unknown")
+        try:
+            os.rename(source, rollback)
+        except OSError as exc:
+            if exc.errno == errno.EXDEV:
+                raise AgentError("migration_home_cross_device") from None
+            raise AgentError("migration_home_stage_failed") from exc
+        _g_migration_identity_matches(rollback, home.identity, "migration_home_stage_failed")
+
+
+def _g_migration_materialize_homes(pool_root: Path, journal: GMigrationJournal) -> None:
+    for home in journal.home_identities:
+        rollback = pool_root / home.rollback_name
+        target_name = _g_migration_target_from_home(home)
+        if target_name is None:
+            continue
+        target = pool_root / target_name
+        if path_present_no_follow(target):
+            raise AgentError("migration_home_collision")
+        _g_migration_identity_matches(rollback, home.identity, "migration_home_stage_failed")
+        try:
+            os.rename(rollback, target)
+        except OSError as exc:
+            if exc.errno == errno.EXDEV:
+                raise AgentError("migration_home_cross_device") from None
+            raise AgentError("migration_home_materialize_failed") from exc
+        _g_migration_identity_matches(target, home.identity, "migration_home_materialize_failed")
+
+
+def _g_migration_target_from_home(home: GMigrationHomeIdentity) -> str | None:
+    marker = home.rollback_name.removeprefix(".codex-g-migrate-")
+    target, separator, _suffix = marker.rpartition("-")
+    if not separator or re.fullmatch(
+        r"[a-z](?:[a-z0-9_-]*[-_][a-z0-9_-]*)?(?:[1-9]|[1-9][0-9]|100)\Z",
+        target,
+    ) is None and not target.startswith("retired-"):
+        raise AgentError("migration_journal_invalid")
+    return None if target.startswith("retired-") else target
+
+
+def _g_migration_rollback_homes(pool_root: Path, journal: GMigrationJournal) -> None:
+    for home in reversed(journal.home_identities):
+        source = pool_root / home.agent_id
+        rollback = pool_root / home.rollback_name
+        target_name = _g_migration_target_from_home(home)
+        target = None if target_name is None else pool_root / target_name
+        source_present = path_present_no_follow(source)
+        rollback_present = path_present_no_follow(rollback)
+        target_present = target is not None and path_present_no_follow(target)
+        if source_present and rollback_present:
+            raise AgentError("migration_home_rollback_diverged")
+        if target_present and target != source and (rollback_present or source_present):
+            raise AgentError("migration_home_rollback_diverged")
+        if source_present and target == source and target_present:
+            _g_migration_identity_matches(source, home.identity, "migration_home_rollback_diverged")
+            continue
+        if rollback_present:
+            _g_migration_identity_matches(rollback, home.identity, "migration_home_rollback_diverged")
+            move_from = rollback
+        elif target_present:
+            assert target is not None
+            _g_migration_identity_matches(target, home.identity, "migration_home_rollback_diverged")
+            move_from = target
+        elif source_present:
+            _g_migration_identity_matches(source, home.identity, "migration_home_rollback_diverged")
+            continue
+        else:
+            raise AgentError("migration_home_rollback_diverged")
+        if path_present_no_follow(source):
+            raise AgentError("migration_home_rollback_diverged")
+        try:
+            os.rename(move_from, source)
+        except OSError as exc:
+            if exc.errno == errno.EXDEV:
+                raise AgentError("migration_home_cross_device") from None
+            raise AgentError("migration_home_rollback_failed") from exc
+        _g_migration_identity_matches(source, home.identity, "migration_home_rollback_failed")
+
+
+def _g_migration_remove_retired(pool_root: Path, journal: GMigrationJournal) -> None:
+    for home in journal.home_identities:
+        if _g_migration_target_from_home(home) is not None:
+            continue
+        path = pool_root / home.rollback_name
+        if not path_present_no_follow(path):
+            continue
+        _g_migration_identity_matches(path, home.identity, "migration_home_cleanup_failed")
+        if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+            raise AgentError("migration_home_cleanup_failed")
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            raise AgentError("migration_home_cleanup_failed") from exc
+
+
+def _g_migration_verify_homes(pool_root: Path, journal: GMigrationJournal) -> None:
+    for home in journal.home_identities:
+        target_name = _g_migration_target_from_home(home)
+        rollback = pool_root / home.rollback_name
+        if path_present_no_follow(rollback):
+            raise AgentError("migration_home_materialize_failed")
+        if target_name is None:
+            continue
+        _g_migration_identity_matches(
+            pool_root / target_name,
+            home.identity,
+            "migration_home_materialize_failed",
+        )
+
+
+def _g_migration_candidate_matches(
+    snapshot: object,
+    journal: GMigrationJournal,
+) -> bool:
+    return (
+        type(snapshot) is FleetSnapshotV2
+        and snapshot.generation == journal.expected_registry_generation + 1
+        and _g_migration_digest(fleet_document(snapshot)) == journal.candidate_digest
+    )
+
+
+def _g_migration_publish_alias_view(
+    snapshot: FleetSnapshotV2,
+    pool_root: Path,
+    journal: GMigrationJournal,
+) -> None:
+    if (
+        type(snapshot) is not FleetSnapshotV2
+        or not isinstance(pool_root, Path)
+        or type(journal) is not GMigrationJournal
+    ):
+        raise AgentError("fleet_alias_conflict")
+    try:
+        g_alias_view = MappingProxyType(dict(g_migration_alias_view(journal)))
+        if snapshot.generation != journal.expected_registry_generation + 1:
+            raise ValueError("generation mismatch")
+        inventory = build_inventory(snapshot, pool_root)
+        inventory_fingerprint = _agent_config_fingerprint()
+    except Exception:
+        raise AgentError("fleet_alias_conflict") from None
+    global _ACTIVE_AGENT_INVENTORY, _ACTIVE_AGENT_INVENTORY_FINGERPRINT, _ACTIVE_G_ALIAS_VIEW
+    with _ACTIVE_AGENT_INVENTORY_LOCK:
+        _ACTIVE_AGENT_INVENTORY = inventory
+        _ACTIVE_AGENT_INVENTORY_FINGERPRINT = inventory_fingerprint
+        _ACTIVE_G_ALIAS_VIEW = (snapshot.generation, g_alias_view)
+
+
+def _g_migration_mark_degraded(
+    service: FleetService,
+    paths: FleetPaths,
+    journal: GMigrationJournal,
+    authoritative_generation: int | None = None,
+) -> None:
+    if authoritative_generation != journal.expected_registry_generation + 1:
+        authoritative_generation = None
+    degraded = dataclass_replace(
+        journal,
+        phase=GMigrationPhase.DEGRADED,
+        authoritative_generation=authoritative_generation,
+        blocking_error_codes=("migration_recovery_degraded",),
+    )
+    _g_migration_store_journal(service, paths, degraded)
+
+
+def _g_migration_recover_locked(
+    service: FleetService,
+    pool_root: Path,
+    paths: FleetPaths,
+    journal: GMigrationJournal,
+) -> FleetSnapshotV2 | None:
+    _g_migration_pool_root(pool_root)
+    current = service.load()
+    if type(current) is FleetSnapshot and current.generation == journal.expected_registry_generation:
+        try:
+            _g_migration_rollback_homes(pool_root, journal)
+            rolled_back = dataclass_replace(
+                journal,
+                phase=GMigrationPhase.ROLLED_BACK,
+                authoritative_generation=None,
+                blocking_error_codes=(),
+            )
+            _g_migration_store_journal(service, paths, rolled_back)
+            _g_migration_remove_journal(service, paths)
+            return None
+        except AgentError:
+            _g_migration_mark_degraded(service, paths, journal)
+            raise AgentError("migration_recovery_degraded") from None
+    if _g_migration_candidate_matches(current, journal):
+        try:
+            _g_migration_remove_retired(pool_root, journal)
+            _g_migration_verify_homes(pool_root, journal)
+            _g_migration_publish_alias_view(current, pool_root, journal)
+            complete = dataclass_replace(
+                journal,
+                phase=GMigrationPhase.COMPLETE,
+                authoritative_generation=current.generation,
+                blocking_error_codes=(),
+            )
+            _g_migration_store_journal(service, paths, complete)
+            _g_migration_remove_journal(service, paths)
+            return current
+        except AgentError:
+            _g_migration_mark_degraded(service, paths, journal, current.generation)
+            raise AgentError("migration_recovery_degraded") from None
+    _g_migration_mark_degraded(
+        service,
+        paths,
+        journal,
+        getattr(current, "generation", None),
+    )
+    raise AgentError("migration_recovery_degraded")
+
+
+def _apply_g_series_migration_for_authorized_caller(
+    *,
+    service: FleetService,
+    manifest: GMigrationManifest,
+    pool_root: Path,
+) -> FleetSnapshotV2:
+    paths = _g_migration_paths(service)
+    crash_token = _G_MIGRATION_CRASHED.set(False)
+    journal: GMigrationJournal | None = None
+    cas_committed = False
+    try:
+        with fleet_mutation_lock(paths):
+            current = service.load()
+            journal = _g_migration_read_journal(service, paths)
+            if journal is not None:
+                recovered = _g_migration_recover_locked(service, pool_root, paths, journal)
+                if recovered is None:
+                    raise AgentError("migration_recovery_rolled_back")
+                return recovered
+            pool_root = _g_migration_pool_root(pool_root)
+            if type(current) is not FleetSnapshot:
+                raise AgentError("migration_manifest_invalid")
+            try:
+                inventory = build_inventory(current, pool_root)
+                preflight = _preflight_g_migration(current, inventory, manifest)
+                records = _g_migration_home_records(
+                    inventory,
+                    pool_root,
+                    preflight.source_ids,
+                )
+                prepared_holder: dict[str, GMigrationPrepared] = {}
+
+                def prepare(locked_snapshot: FleetSnapshot, bindings: Mapping[str, str]):
+                    if locked_snapshot != current:
+                        raise AgentError("generation_conflict")
+                    locked_preflight = _preflight_g_migration(locked_snapshot, inventory, manifest)
+                    prepared = _materialize_g_migration_locked(
+                        locked_snapshot,
+                        bindings,
+                        locked_preflight,
+                        (),
+                        uuid.uuid4,
+                    )
+                    if type(prepared.allocations) is not tuple or not prepared.allocations:
+                        raise AgentError("migration_manifest_invalid")
+                    try:
+                        allocation_uuids = tuple(uuid.UUID(item.member_id) for item in prepared.allocations)
+                    except (AttributeError, TypeError, ValueError):
+                        raise AgentError("migration_manifest_invalid") from None
+                    if any(
+                        type(item) is not MemberIdAllocation
+                        or parsed.version != 4
+                        or str(parsed) != item.member_id
+                        for item, parsed in zip(prepared.allocations, allocation_uuids)
+                    ):
+                        raise AgentError("migration_manifest_invalid")
+                    migration_id = allocation_uuids[0].hex
+                    target_map = _g_migration_target_map(prepared, locked_preflight.source_ids)
+                    source_set = set(locked_preflight.source_ids)
+                    if any(
+                        target is not None
+                        and target not in source_set
+                        and path_present_no_follow(pool_root / target)
+                        for target in target_map.values()
+                    ):
+                        raise AgentError("migration_home_collision")
+                    built_journal = _g_migration_journal_for_prepared(
+                        locked_snapshot,
+                        manifest,
+                        prepared,
+                        records,
+                        migration_id,
+                        target_map,
+                        bindings,
+                    )
+                    _g_migration_store_journal(service, paths, built_journal)
+                    prepared_holder["value"] = prepared
+                    _g_migration_checkpoint("after_g_journal")
+                    return built_journal
+
+                account_ids = tuple(
+                    sorted(
+                        account.account_id
+                        for account in current.accounts
+                        if account.provider is Provider.GEMINI_API
+                    )
+                )
+                journal = service._with_g_migration_binding_evidence(
+                    account_ids,
+                    expected_generation=current.generation,
+                    callback=prepare,
+                )
+                prepared = prepared_holder["value"]
+            except GMigrationApplyError as exc:
+                raise AgentError(exc.code) from None
+            except FleetSecretError:
+                raise AgentError("credential_binding_unknown") from None
+            except AgentError:
+                raise
+            except Exception:
+                if _G_MIGRATION_CRASHED.get():
+                    raise
+                raise AgentError("migration_manifest_invalid") from None
+
+            try:
+                _g_migration_stage_homes(pool_root, journal)
+                staged = dataclass_replace(journal, phase=GMigrationPhase.HOMES_STAGED)
+                _g_migration_store_journal(service, paths, staged)
+                journal = staged
+                _g_migration_checkpoint("after_home_stage")
+                _g_migration_materialize_homes(pool_root, journal)
+                _g_migration_checkpoint("after_home_materialize")
+                aliases_staged = dataclass_replace(journal, phase=GMigrationPhase.ALIASES_STAGED)
+                _g_migration_store_journal(service, paths, aliases_staged)
+                journal = aliases_staged
+                _g_migration_checkpoint("after_alias_prepare")
+                pending = dataclass_replace(journal, phase=GMigrationPhase.CAS_PENDING)
+                _g_migration_store_journal(service, paths, pending)
+                journal = pending
+                try:
+                    stored = service.commit_snapshot(
+                        prepared.candidate,
+                        expected_generation=current.generation,
+                    )
+                except Exception as exc:
+                    observed = service.load()
+                    if _g_migration_candidate_matches(observed, journal):
+                        stored = observed
+                    else:
+                        if type(observed) is FleetSnapshot and observed.generation == current.generation:
+                            raise AgentError(str(exc) if str(exc) == "generation_conflict" else "migration_registry_commit_failed") from None
+                        cas_committed = True
+                        raise AgentError("migration_recovery_degraded") from None
+                if not _g_migration_candidate_matches(stored, journal):
+                    cas_committed = True
+                    raise AgentError("migration_recovery_degraded")
+                cas_committed = True
+                committed = dataclass_replace(
+                    journal,
+                    phase=GMigrationPhase.CAS_COMMITTED,
+                    authoritative_generation=stored.generation,
+                )
+                _g_migration_store_journal(service, paths, committed)
+                journal = committed
+                _g_migration_checkpoint("after_registry_cas")
+                _g_migration_remove_retired(pool_root, journal)
+                _g_migration_verify_homes(pool_root, journal)
+                verified = dataclass_replace(journal, phase=GMigrationPhase.VERIFIED)
+                _g_migration_store_journal(service, paths, verified)
+                journal = verified
+                _g_migration_publish_alias_view(stored, pool_root, journal)
+                _g_migration_checkpoint("after_inventory_publish")
+                published = dataclass_replace(
+                    journal,
+                    phase=GMigrationPhase.PUBLISHED,
+                    authoritative_generation=stored.generation,
+                )
+                _g_migration_store_journal(service, paths, published)
+                journal = published
+                complete = dataclass_replace(journal, phase=GMigrationPhase.COMPLETE)
+                _g_migration_store_journal(service, paths, complete)
+                _g_migration_remove_journal(service, paths)
+                return stored
+            except Exception:
+                if _G_MIGRATION_CRASHED.get():
+                    raise
+                if cas_committed:
+                    _g_migration_mark_degraded(
+                        service,
+                        paths,
+                        journal,
+                        getattr(service.load(), "generation", None),
+                    )
+                    raise AgentError("migration_recovery_degraded") from None
+                try:
+                    _g_migration_rollback_homes(pool_root, journal)
+                    rolled_back = dataclass_replace(
+                        journal,
+                        phase=GMigrationPhase.ROLLED_BACK,
+                        authoritative_generation=None,
+                        blocking_error_codes=(),
+                    )
+                    _g_migration_store_journal(service, paths, rolled_back)
+                    _g_migration_remove_journal(service, paths)
+                except AgentError:
+                    _g_migration_mark_degraded(service, paths, journal)
+                    raise AgentError("migration_recovery_degraded") from None
+                raise
+    finally:
+        _G_MIGRATION_CRASHED.reset(crash_token)
+
+
+def _recover_g_series_migration_for_authorized_caller(
+    *,
+    service: FleetService,
+    pool_root: Path,
+) -> FleetSnapshotV2 | None:
+    paths = _g_migration_paths(service)
+    with fleet_mutation_lock(paths):
+        journal = _g_migration_read_journal(service, paths)
+        if journal is None:
+            return None
+        return _g_migration_recover_locked(service, pool_root, paths, journal)
 
 
 

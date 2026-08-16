@@ -15,6 +15,7 @@ from codex_master.admission import (
 )
 from codex_master.admission_journal import CompletionJournalError, FileCompletionJournal
 from codex_master.admission_runtime import ADMISSION_RUNTIME_GATES, AdmissionRuntimeError, RuntimeGateDecision, ServerAdmissionRuntime
+from codex_master.hive.events import HiveEventStore
 from codex_master.selection_service import SelectionService
 
 
@@ -81,6 +82,23 @@ def test_file_completion_journal_survives_reload_without_result_values(tmp_path:
     raw = (tmp_path / "journal" / "admission-completion.json").read_text(encoding="utf-8")
     assert "must-not-persist" not in raw
     assert "api_token" not in raw
+
+
+def test_file_completion_journal_can_emit_sanitized_hive_events(tmp_path: Path) -> None:
+    record = executing_record()
+    events = HiveEventStore(tmp_path / "events", now=lambda: NOW)
+    journal = FileCompletionJournal(tmp_path / "journal", event_store=events, now=lambda: NOW)
+
+    journal.record_started(record, "assign")
+    journal.record_started(record, "assign")
+    journal.record_completed(record, "assign", {"status": "ok", "api_token": "must-not-persist"})
+    journal.record_completed(record, "assign", {"status": "ok", "api_token": "must-not-persist"})
+
+    _, report_events = events.read_report_sources()
+
+    assert [event["status"] for event in report_events] == ["executing", "completed"]
+    raw = (tmp_path / "events" / "events.jsonl").read_text(encoding="utf-8")
+    assert "must-not-persist" not in raw
 
 
 def test_file_completion_journal_is_idempotent_but_rejects_revision_or_operation_conflicts(tmp_path: Path) -> None:

@@ -630,9 +630,15 @@ class FileAdmissionStore(AdmissionStore):
         if current.st_size > MAX_ADMISSION_STATE_BYTES:
             raise AdmissionError("admission_state_too_large")
         try:
-            with self._state_path.open("r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            with self._state_path.open("rb") as handle:
+                raw = handle.read(MAX_ADMISSION_STATE_BYTES + 1)
+        except (OSError, UnicodeError) as exc:
+            raise AdmissionError("invalid_admission_state") from exc
+        if len(raw) > MAX_ADMISSION_STATE_BYTES:
+            raise AdmissionError("admission_state_too_large")
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
             raise AdmissionError("invalid_admission_state") from exc
         if not isinstance(payload, Mapping) or payload.get("schema_version") != 1:
             raise AdmissionError("unsupported_admission_state_schema")

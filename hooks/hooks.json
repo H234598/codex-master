@@ -1,6 +1,51 @@
 {
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "spawn_agent|multi_agent_v1__spawn_agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${PLUGIN_ROOT}/hooks/native_spawn_admission.py",
+            "timeout": 1
+          }
+        ]
+      },
+      {
+        "matcher": "send_input|multi_agent_v1__send_input",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${PLUGIN_ROOT}/hooks/native_bee_event.py",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "wait_agent|multi_agent_v1__wait_agent|close_agent|multi_agent_v1__close_agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${PLUGIN_ROOT}/hooks/native_bee_event.py",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
     "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${PLUGIN_ROOT}/hooks/native_bee_event.py",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
       {
         "hooks": [
           {
@@ -23,6 +68,17 @@
       }
     ],
     "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${PLUGIN_ROOT}/hooks/native_bee_event.py",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "Stop": [
       {
         "hooks": [
           {

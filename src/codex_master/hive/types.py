@@ -66,6 +66,7 @@ class DispatchPriority(str, Enum):
 
 class TaskComplexity(str, Enum):
     SIMPLE = "simple"
+    MEDIUM = "medium"
     COMPLEX = "complex"
     UNKNOWN = "unknown"
 

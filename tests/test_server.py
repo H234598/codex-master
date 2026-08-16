@@ -1,5 +1,6 @@
 import base64
 import contextlib
+import functools
 import hashlib
 import io
 import json
@@ -7,6 +8,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import tomllib
@@ -14,11 +16,15 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import os
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
 import codex_master.server as server_module
 from codex_master import __version__
+from codex_master.hive.types import TaskComplexity
+from codex_master.selection.task_classification import TaskClassificationRequest, TaskClassifier
+from codex_master.usage_snapshot import UsageSnapshot
 
 from codex_master.server import (
     AgentError,
@@ -199,6 +205,22 @@ from codex_master.server import (
 )
 
 
+def complex_task_profile():
+    return TaskClassifier().classify(
+        TaskClassificationRequest(
+            "Resolve the confirmed complex assignment.",
+            "write",
+            changed_files=("src/example.py",),
+            task_phase="atomic_fix",
+            fully_specified=True,
+            reversible=True,
+            low_risk=True,
+            root_cause_known=True,
+            complexity_override=TaskComplexity.COMPLEX,
+        )
+    )
+
+
 class FakeStdin:
     def __init__(self, data: bytes):
         self.buffer = io.BytesIO(data)
@@ -213,17 +235,306 @@ ADMITTED_SPAWN_DECISION = {
 }
 
 
+def create_test_q_series(pool: Path, executable: Path):
+    from codex_master.fleet_registry import (
+        AuthKind,
+        FleetAccount,
+        FleetSnapshot,
+        LimitState,
+        Provider,
+        SecretState,
+    )
+
+    service = server_module.current_fleet_service()
+    account = FleetAccount(
+        "q-account",
+        "Q Account",
+        Provider.OPENAI_CHATGPT,
+        AuthKind.CHATGPT_SESSION,
+        SecretState.CONFIGURED,
+        LimitState.READY,
+        True,
+        None,
+        datetime.now(timezone.utc).isoformat(),
+        None,
+    )
+    service.commit_snapshot(
+        FleetSnapshot(1, 2, (account,), ()),
+        expected_generation=1,
+    )
+    server_module.fleet_series_apply(
+        prefix="q",
+        count=3,
+        runner="codex_cli",
+        provider="openai_chatgpt",
+        model="old-model",
+        account_id="q-account",
+        expected_generation=2,
+        skill_profile="teamleiterin",
+        codex_executable=executable,
+    )
+    return service
+
+
+def create_test_observation_fleet(pool: Path):
+    from codex_master.fleet_registry import (
+        AuthKind,
+        FleetAccount,
+        FleetSeries,
+        FleetSnapshot,
+        LimitState,
+        Provider,
+        RunnerKind,
+        SecretState,
+    )
+
+    service = server_module.current_fleet_service()
+    account = FleetAccount(
+        "q-account",
+        "Q Account",
+        Provider.OPENAI_CHATGPT,
+        AuthKind.CHATGPT_SESSION,
+        SecretState.CONFIGURED,
+        LimitState.READY,
+        True,
+        None,
+        datetime.now(timezone.utc).isoformat(),
+        None,
+    )
+    service.commit_snapshot(
+        FleetSnapshot(
+            1,
+            2,
+            (account,),
+            (
+                FleetSeries(
+                    "b",
+                    "B",
+                    1,
+                    RunnerKind.CODEX_CLI,
+                    Provider.OPENAI_CHATGPT,
+                    "gpt-5.4",
+                    "q-account",
+                    True,
+                    "teamleiterin",
+                ),
+                FleetSeries(
+                    "q",
+                    "Q",
+                    3,
+                    RunnerKind.CODEX_CLI,
+                    Provider.OPENAI_CHATGPT,
+                    "gpt-5.4",
+                    "q-account",
+                    True,
+                    "teamleiterin",
+                ),
+            ),
+        ),
+        expected_generation=1,
+    )
+    return service
+
+
+def _canonical_usage_status(*, confidence: str = "verified", windows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    if windows is None:
+        windows = [{
+            "window_id": "codex_usage_0_weekly",
+            "budget_key": "codex_usage_weekly",
+            "applies_to_model_ids": [],
+            "applies_to_model_roles": [],
+            "quantity_semantics": "remaining",
+            "quantity_unit": "percent",
+            "quantity_value": 80,
+            "capacity": 100,
+            "absolute_remaining": 80,
+            "window_kind": "fixed",
+            "constraint_relation": "conjunctive",
+            "reset_at_utc": "2099-01-08T00:00:00+00:00",
+            "reset_kind": "fixed",
+            "observed_at_utc": "2099-01-01T00:00:00+00:00",
+            "source": "codex-usage-app-server",
+            "confidence": confidence,
+            "includes_inflight_usage": False,
+            "blocked": False,
+            "exhausted": False,
+        }]
+    return {
+        "agent": "b1",
+        "account": "BW_B",
+        "account_mapping": "routing",
+        "state": "clear",
+        "blocked": False,
+        "usage_v2": {"schema_version": 2, "limit_windows": windows},
+        "usage_eligibility": {
+            "eligible": True,
+            "reason_code": None,
+            "remaining_percent": None,
+            "threshold_percent": 10.0,
+            "blocked_until_utc": None,
+            "fallback_hint": "use a non-q series or wait for the verified q-series weekly reset",
+        },
+    }
+
+
+def _synthetic_alias_inventory() -> Any:
+    descriptor = server_module.AgentDescriptor(
+        agent_id="g1",
+        series_prefix="g",
+        ordinal=1,
+        label="Synthetic G1",
+        runner=server_module.RunnerKind.GEMINI_CLI,
+        provider=server_module.Provider.GEMINI_API,
+        model="synthetic-model",
+        account_id="synthetic-account",
+        home=Path("/synthetic/g1"),
+        session="synthetic-g1",
+        enabled=True,
+    )
+    return server_module.InventorySnapshot(
+        ("g1",),
+        {"g1": descriptor},
+        {"g-series": ("g1",)},
+        {"g1": 0},
+        ("g",),
+    )
+
+
+def _synthetic_alias_journal(
+    pairs: tuple[tuple[str, str], ...],
+    *,
+    alias_generation: int = 219,
+) -> Any:
+    migration_id = "a" * 32
+    aliases = tuple(
+        server_module.GMigrationAlias(
+            old_agent_id,
+            current_agent_id,
+            f"0000000{index + 1}-0000-4000-8000-000000000000",
+            alias_generation,
+            migration_id,
+        )
+        for index, (old_agent_id, current_agent_id) in enumerate(pairs)
+    )
+    digest = "sha256:" + "0" * 64
+    return server_module.GMigrationJournal(
+        1,
+        migration_id,
+        1,
+        218,
+        digest,
+        digest,
+        digest,
+        digest,
+        digest,
+        (),
+        tuple(sorted({old_agent_id for old_agent_id, _ in pairs})),
+        (),
+        aliases,
+        server_module.GMigrationPhase.ALIASES_STAGED,
+        None,
+        (),
+    )
+
+
+def _synthetic_alias_snapshot(*, generation: int = 219) -> Any:
+    from codex_master.fleet_registry import FleetAccountV2, FleetSeriesMember, FleetSeriesV2
+
+    account = FleetAccountV2(
+        "g-account",
+        "Synthetic G",
+        server_module.Provider.GEMINI_API,
+        server_module.AuthKind.API_KEY,
+        server_module.SecretState.CONFIGURED,
+        server_module.LimitState.READY,
+        True,
+        None,
+        None,
+        None,
+    )
+    member = FleetSeriesMember(
+        "00000001-0000-4000-8000-000000000000",
+        1,
+        "g-account",
+        True,
+    )
+    series = FleetSeriesV2(
+        "g",
+        "Synthetic G",
+        server_module.RunnerKind.GEMINI_CLI,
+        server_module.Provider.GEMINI_API,
+        "synthetic-model",
+        True,
+        "generic",
+        "standard",
+        (member,),
+    )
+    return server_module.FleetSnapshotV2(2, generation, (account,), (series,))
+
+
+def _overview_cli_test_snapshot(*, generation: int = 9) -> Any:
+    from codex_master.fleet_registry import (
+        AuthKind,
+        FleetAccount,
+        FleetSeries,
+        FleetSnapshot,
+        LimitState,
+        Provider,
+        RunnerKind,
+        SecretState,
+    )
+
+    return FleetSnapshot(
+        1,
+        generation,
+        (
+            FleetAccount(
+                "overview-account",
+                "Overview account",
+                Provider.GEMINI_API,
+                AuthKind.API_KEY,
+                SecretState.CONFIGURED,
+                LimitState.READY,
+                True,
+                None,
+                None,
+                None,
+            ),
+        ),
+        (
+            FleetSeries(
+                "g",
+                "Overview series",
+                1,
+                RunnerKind.GEMINI_CLI,
+                Provider.GEMINI_API,
+                "gemini-test",
+                "overview-account",
+                True,
+            ),
+        ),
+    )
+
+
 class ServerHelpersTest(unittest.TestCase):
+    def test_bounded_stdout_command_rejects_oversized_output(self) -> None:
+        with self.assertRaises(server_module.AgentError) as context:
+            server_module._run_bounded_stdout_command(
+                [sys.executable, "-c", "print('x' * 100000)"],
+                timeout=5,
+                max_bytes=1024,
+                error_code="test_output_too_large",
+            )
+        self.assertEqual(str(context.exception), "test_output_too_large")
+
     def test_spawn_offer_docs_cover_operation_and_security_contract(self) -> None:
         readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
 
         for term in (
             "agent_spawn_offers",
             "spawn-offers",
-            "0.85",
-            "20 %",
-            "1024 MiB",
-            "6",
+            "Ressourcendruck-Grenzen bleiben mit ihren bisherigen Werten konfiguriert und aktiv",
+            "10",
             "5 Sekunden",
             "15 Sekunden",
             "advisory",
@@ -231,7 +542,7 @@ class ServerHelpersTest(unittest.TestCase):
             "developer_vm",
             "sandbox",
             "native Subagentinnen",
-            "nicht technisch erzwungen",
+            "Pre-Spawn-Hook",
         ):
             with self.subTest(term=term):
                 self.assertIn(term, readme)
@@ -287,7 +598,7 @@ class ServerHelpersTest(unittest.TestCase):
                     "required_slots": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 6,
+                        "maximum": 10,
                         "default": 1,
                     }
                 },
@@ -448,6 +759,8 @@ class ServerHelpersTest(unittest.TestCase):
         snapshot = {
             "ok": True,
             "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
             "available_memory_percent": 60.0,
             "available_memory_mib": 8192,
             "running_agents": 2,
@@ -456,9 +769,359 @@ class ServerHelpersTest(unittest.TestCase):
             result = spawn_admission_decision(2)
 
         self.assertTrue(result["allowed"])
-        self.assertEqual(result["available_slots"], 4)
+        self.assertEqual(result["available_slots"], 8)
 
-    def test_spawn_admission_fails_closed_without_memory_evidence(self) -> None:
+    def test_spawn_admission_fails_closed_for_missing_cpu_busy_evidence(self) -> None:
+        snapshot = {
+            "ok": True,
+            "load_per_cpu": 0.25,
+            "io_wait_percent": 0.0,
+            "available_memory_percent": 60.0,
+            "available_memory_mib": 8192,
+            "running_agents": 2,
+        }
+        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+            result = spawn_admission_decision()
+
+        self.assertFalse(result["allowed"])
+        self.assertIn("cpu_metrics_unavailable", result["reason_codes"])
+
+    def test_spawn_admission_fails_closed_for_missing_snapshot_ok(self) -> None:
+        snapshot = {
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
+            "available_memory_percent": 60.0,
+            "available_memory_mib": 8192,
+            "running_agents": 2,
+        }
+        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+            result = spawn_admission_decision()
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(
+            result["reason_codes"],
+            ["cpu_metrics_unavailable", "memory_metrics_unavailable", "session_metrics_unavailable"],
+        )
+
+    def test_ollama_admission_uses_central_metric_denial(self) -> None:
+        inventory = SimpleNamespace(
+            agents={"o1": SimpleNamespace(provider=server_module.Provider.OLLAMA_LOCAL, task_profile="simple_only")},
+            agent_ids=("o1",),
+        )
+        snapshot = {
+            "ok": True,
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
+            "running_agents": 2,
+        }
+        with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
+            "codex_master.server.system_resource_snapshot", return_value=snapshot
+        ), patch("codex_master.server.tmux_alive", return_value=False):
+            with self.assertRaises(AgentCapacityError) as raised:
+                server_module.require_ollama_admission("o1")
+
+        self.assertIn("memory_metrics_unavailable", raised.exception.payload["reason_codes"])
+
+    def test_ollama_admission_fails_closed_when_session_count_is_unknown(self) -> None:
+        inventory = SimpleNamespace(
+            agents={
+                f"o{index}": SimpleNamespace(
+                    provider=server_module.Provider.OLLAMA_LOCAL,
+                    task_profile="simple_only",
+                    session=f"o{index}-session",
+                )
+                for index in (1, 2)
+            },
+            agent_ids=("o1", "o2"),
+        )
+        snapshot = {
+            "ok": True,
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
+            "available_memory_percent": 60.0,
+            "available_memory_mib": 8192,
+            "running_agents": 2,
+        }
+        with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
+            "codex_master.server.system_resource_snapshot", return_value=snapshot
+        ), patch("codex_master.server.tmux_alive", side_effect=OSError("tmux secret /private/session")):
+            with self.assertRaises(AgentCapacityError) as raised:
+                server_module.require_ollama_admission("o1")
+
+        self.assertEqual(raised.exception.payload["reason_codes"], ["session_metrics_unavailable"])
+
+    def test_ollama_admission_uses_one_snapshot_and_stable_global_precedence(self) -> None:
+        inventory = SimpleNamespace(
+            agents={
+                f"o{index}": SimpleNamespace(
+                    provider=server_module.Provider.OLLAMA_LOCAL,
+                    task_profile="simple_only",
+                    session=f"o{index}-session",
+                )
+                for index in (1, 2, 3)
+            },
+            agent_ids=("o1", "o2", "o3"),
+        )
+        snapshot = {
+            "ok": True,
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 95.0,
+            "io_wait_percent": 0.0,
+            "available_memory_percent": 60.0,
+            "available_memory_mib": 8192,
+            "running_agents": 10,
+        }
+        with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
+            "codex_master.server.system_resource_snapshot", return_value=snapshot
+        ) as read_snapshot, patch("codex_master.server.tmux_alive", return_value=True):
+            result = server_module.ollama_resource_status("o1")
+
+        read_snapshot.assert_called_once_with()
+        self.assertEqual(
+            result["reason_codes"],
+            ["running_agent_limit", "ollama_concurrency_limit", "cpu_pressure_high"],
+        )
+        self.assertFalse(result["allowed"])
+
+    def test_ollama_admission_precedes_pressure_without_global_limit(self) -> None:
+        inventory = SimpleNamespace(
+            agents={
+                f"o{index}": SimpleNamespace(
+                    provider=server_module.Provider.OLLAMA_LOCAL,
+                    task_profile="simple_only",
+                    session=f"o{index}-session",
+                )
+                for index in (1, 2, 3)
+            },
+            agent_ids=("o1", "o2", "o3"),
+        )
+        snapshot = {
+            "ok": True,
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 95.0,
+            "io_wait_percent": 0.0,
+            "available_memory_percent": 60.0,
+            "available_memory_mib": 8192,
+            "running_agents": 9,
+        }
+        with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
+            "codex_master.server.system_resource_snapshot", return_value=snapshot
+        ), patch("codex_master.server.tmux_alive", return_value=True):
+            result = server_module.ollama_resource_status("o1")
+
+        self.assertEqual(result["reason_codes"], ["ollama_concurrency_limit", "cpu_pressure_high"])
+        self.assertFalse(result["allowed"])
+
+    def test_ollama_admission_reports_pressure_without_capacity_or_ollama_limit(self) -> None:
+        inventory = SimpleNamespace(
+            agents={
+                "o1": SimpleNamespace(
+                    provider=server_module.Provider.OLLAMA_LOCAL,
+                    task_profile="simple_only",
+                    session="o1-session",
+                )
+            },
+            agent_ids=("o1",),
+        )
+        snapshot = {
+            "ok": True,
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 95.0,
+            "io_wait_percent": 0.0,
+            "available_memory_percent": 60.0,
+            "available_memory_mib": 8192,
+            "running_agents": 0,
+        }
+        with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
+            "codex_master.server.system_resource_snapshot", return_value=snapshot
+        ), patch("codex_master.server.tmux_alive", return_value=False):
+            result = server_module.ollama_resource_status("o1")
+
+        self.assertEqual(result["reason_codes"], ["cpu_pressure_high"])
+        self.assertFalse(result["allowed"])
+
+    def test_public_ollama_denial_redacts_snapshot_and_exception_details(self) -> None:
+        inventory = SimpleNamespace(
+            agents={
+                "o1": SimpleNamespace(
+                    provider=server_module.Provider.OLLAMA_LOCAL,
+                    task_profile="simple_only",
+                    session="/private/session-secret",
+                )
+            },
+            agent_ids=("o1",),
+        )
+        snapshot = {
+            "ok": True,
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
+            "available_memory_percent": None,
+            "available_memory_mib": None,
+            "running_agents": 2,
+            "raw_output": "raw /private/proc output",
+        }
+        with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
+            "codex_master.server.system_resource_snapshot", return_value=snapshot
+        ), patch("codex_master.server.tmux_alive", side_effect=RuntimeError("tmux exception /private/session")):
+            with self.assertRaises(AgentCapacityError) as raised:
+                server_module.require_ollama_admission("o1")
+
+        public = public_error_payload(raised.exception)
+        self.assertEqual(public["error_code"], "ollama_admission_denied")
+        self.assertEqual(public["error"], "ollama_admission_denied")
+        self.assertNotIn("raw_output", public.get("resource_snapshot", {}))
+        self.assertNotIn("/private", json.dumps(public))
+        self.assertNotIn("tmux exception", json.dumps(public))
+
+    def test_resource_error_recommendations_never_disable_active_enforcement(self) -> None:
+        details = server_module.spawn_error_details(
+            ["cpu_pressure_high", "io_pressure_high", "memory_pressure_high", "ollama_concurrency_limit"]
+        )
+        rendered = json.dumps(details).casefold()
+        self.assertNotIn("deaktiv", rendered)
+        self.assertNotIn("temporarily_unenforced", rendered)
+
+    def test_ollama_start_path_uses_central_metric_denial(self) -> None:
+        inventory = SimpleNamespace(
+            agents={
+                "o1": SimpleNamespace(
+                    enabled=True,
+                    provider=server_module.Provider.OLLAMA_LOCAL,
+                    task_profile="simple_only",
+                )
+            },
+            agent_ids=("o1",),
+        )
+        snapshot = {
+            "ok": True,
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
+            "running_agents": 2,
+        }
+        with patch("codex_master.server.require_fleet_recovery_ready"), patch(
+            "codex_master.server.current_agent_inventory", return_value=inventory
+        ), patch("codex_master.server._headless_descriptor", return_value=None), patch(
+            "codex_master.server.system_resource_snapshot", return_value=snapshot
+        ):
+            with self.assertRaises(AgentCapacityError) as raised:
+                server_module._start_agent_with_lease_unlocked("o1")
+
+        self.assertIn("memory_metrics_unavailable", raised.exception.payload["reason_codes"])
+
+    def test_ollama_start_reuses_one_composed_admission_context(self) -> None:
+        descriptor = SimpleNamespace(
+            enabled=True,
+            provider=server_module.Provider.OLLAMA_LOCAL,
+            model="local-model",
+            task_profile="simple_only",
+        )
+        inventory = SimpleNamespace(agents={"o1": descriptor}, agent_ids=("o1",))
+        admission = {
+            "allowed": True,
+            "reason_codes": [],
+            "errors": [],
+            "resource_snapshot": {"ok": True},
+        }
+        observed: list[Any] = []
+
+        def fake_start(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            observed.append(server_module._RESOURCE_ADMISSION_CONTEXT.get())
+            return {"status": "started"}
+
+        with patch("codex_master.server.require_fleet_recovery_ready"), patch(
+            "codex_master.server.current_agent_inventory", return_value=inventory
+        ), patch("codex_master.server._headless_descriptor", return_value=None), patch(
+            "codex_master.server._ollama_descriptor", return_value=descriptor
+        ), patch(
+            "codex_master.server._resource_admission_decision", return_value=admission
+        ) as compose, patch(
+            "codex_master.server.claim_agent", return_value={"status": "claimed", "lease": {"state": "held"}}
+        ), patch("codex_master.server.agent_config", return_value={"session": "o1-session"}), patch(
+            "codex_master.server.tmux_alive", return_value=False
+        ), patch("codex_master.server.start_agent", side_effect=fake_start), patch(
+            "codex_master.server.agent_lease_status", return_value={"held_by_this_server": False}
+        ), patch("codex_master.server.remember_agent_routing"):
+            result = server_module._start_agent_with_lease_unlocked("o1")
+
+        self.assertEqual(result["status"], "started")
+        compose.assert_called_once_with(agent="o1", task=None, role="arbeitsbiene")
+        self.assertEqual(observed, [admission])
+
+    def test_ollama_assign_reuses_one_composed_admission_context(self) -> None:
+        descriptor = SimpleNamespace(
+            enabled=True,
+            provider=server_module.Provider.OLLAMA_LOCAL,
+            model="local-model",
+            task_profile="simple_only",
+            series_prefix="o",
+            skill_profile="arbeitsbiene",
+        )
+        inventory = SimpleNamespace(agents={"o1": descriptor}, agent_ids=("o1",))
+        admission = {
+            "allowed": True,
+            "reason_codes": [],
+            "errors": [],
+            "resource_snapshot": {"ok": True},
+        }
+        observed: list[Any] = []
+
+        def fake_ensure(*_args: Any, **_kwargs: Any) -> dict[str, str]:
+            observed.append(server_module._RESOURCE_ADMISSION_CONTEXT.get())
+            return {"status": "unchanged"}
+
+        with patch("codex_master.server.require_fleet_recovery_ready"), patch(
+            "codex_master.server.current_agent_inventory", return_value=inventory
+        ), patch("codex_master.server._ollama_descriptor", return_value=descriptor), patch(
+            "codex_master.server._resource_admission_decision", return_value=admission
+        ) as compose, patch("codex_master.server.scope_check", return_value={"allowed": True}), patch(
+            "codex_master.server.resolver_class_for_agent", return_value="arbeitsbiene"
+        ), patch(
+            "codex_master.server.claim_for_agent_mutation", return_value=({"state": "held"}, False)
+        ), patch("codex_master.server.ensure_assignment_session_model", side_effect=fake_ensure), patch(
+            "codex_master.server.send_agent", return_value={"status": "sent"}
+        ), patch("codex_master.server.remember_agent_routing"), patch(
+            "codex_master.server.record_assignment"
+        ):
+            result = server_module._assign_agent_unlocked(
+                "o1",
+                role="arbeitsbiene",
+                task="Fix.",
+                scope=["src"],
+                write_paths=["src/example.py"],
+                allow_unauthenticated=True,
+            )
+
+        self.assertEqual(result["status"], "assigned")
+        compose.assert_called_once_with(agent="o1", task="Fix.", role="arbeitsbiene")
+        self.assertEqual(observed, [admission])
+
+    def test_ollama_status_does_not_claim_enforcement_is_disabled(self) -> None:
+        inventory = SimpleNamespace(
+            agents={"o1": SimpleNamespace(provider=server_module.Provider.OLLAMA_LOCAL, task_profile="simple_only")},
+            agent_ids=("o1",),
+        )
+        snapshot = {
+            "ok": True,
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
+            "available_memory_percent": 60.0,
+            "available_memory_mib": 8192,
+            "running_agents": 2,
+        }
+        with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
+            "codex_master.server.system_resource_snapshot", return_value=snapshot
+        ), patch("codex_master.server.tmux_alive", return_value=False):
+            result = server_module.ollama_resource_status("o1")
+
+        self.assertNotIn("temporarily_unenforced", result["benchmark_policy"])
+
+    def test_spawn_admission_fails_closed_without_agent_count(self) -> None:
         with patch(
             "codex_master.server.system_resource_snapshot",
             return_value={"ok": False, "reason_codes": ["memory_metrics_unavailable"]},
@@ -466,11 +1129,16 @@ class ServerHelpersTest(unittest.TestCase):
             result = spawn_admission_decision()
 
         self.assertFalse(result["allowed"])
-        self.assertEqual(result["reason_codes"], ["memory_metrics_unavailable"])
+        self.assertEqual(
+            result["reason_codes"],
+            ["session_metrics_unavailable", "cpu_metrics_unavailable", "memory_metrics_unavailable"],
+        )
 
     def test_spawn_admission_fails_closed_without_snapshot_ok_evidence(self) -> None:
         snapshot = {
             "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
             "available_memory_percent": 60.0,
             "available_memory_mib": 8192,
             "running_agents": 2,
@@ -491,6 +1159,8 @@ class ServerHelpersTest(unittest.TestCase):
                 return_value={
                     "ok": ok,
                     "load_per_cpu": 0.25,
+                    "cpu_busy_percent": 25.0,
+                    "io_wait_percent": 0.0,
                     "available_memory_percent": 60.0,
                     "available_memory_mib": 8192,
                     "running_agents": 2,
@@ -504,27 +1174,321 @@ class ServerHelpersTest(unittest.TestCase):
                 ["cpu_metrics_unavailable", "memory_metrics_unavailable", "session_metrics_unavailable"],
             )
 
+    def test_spawn_admission_fails_closed_for_missing_io_wait_evidence(self) -> None:
+        snapshot = {
+            "ok": True,
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "available_memory_percent": 60.0,
+            "available_memory_mib": 8192,
+            "running_agents": 2,
+        }
+        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+            result = spawn_admission_decision()
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason_codes"], ["cpu_metrics_unavailable"])
+
+    def test_spawn_admission_denies_load_above_policy_with_healthy_other_metrics(self) -> None:
+        snapshot = {
+            "ok": True,
+            "load_per_cpu": 2.0,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
+            "available_memory_percent": 60.0,
+            "available_memory_mib": 8192,
+            "running_agents": 2,
+        }
+        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+            result = spawn_admission_decision()
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason_codes"], ["cpu_pressure_high"])
+
+    def test_spawn_admission_load_gate_keeps_exact_boundary(self) -> None:
+        for load, allowed in ((1.75, True), (1.750001, False)):
+            snapshot = {
+                "ok": True,
+                "load_per_cpu": load,
+                "cpu_busy_percent": 25.0,
+                "io_wait_percent": 0.0,
+                "available_memory_percent": 60.0,
+                "available_memory_mib": 8192,
+                "running_agents": 2,
+            }
+            with self.subTest(load=load), patch(
+                "codex_master.server.system_resource_snapshot", return_value=snapshot
+            ):
+                result = spawn_admission_decision()
+
+            self.assertEqual(result["allowed"], allowed)
+            if not allowed:
+                self.assertEqual(result["reason_codes"], ["cpu_pressure_high"])
+
     def test_spawn_resource_policy_exposes_exact_default_thresholds(self) -> None:
         self.assertEqual(
             spawn_resource_policy(),
             {
-                "max_load_per_cpu": 0.85,
+                "pressure_limits_enabled": True,
+                "max_load_per_cpu": 1.75,
+                "max_cpu_busy_percent": 90.0,
+                "max_io_wait_percent": 50.0,
                 "min_available_memory_percent": 20.0,
                 "min_available_memory_mib": 1024,
-                "max_running_agents": 6,
+                "max_running_agents": 10,
+                "ollama_concurrency_limit_enabled": True,
+                "ollama_max_concurrent_agents": 2,
                 "raw_output": "not_returned",
             },
+        )
+
+    def test_spawn_admission_enforces_host_pressure_but_caps_total_at_ten(self) -> None:
+        with patch(
+            "codex_master.server.system_resource_snapshot",
+            return_value={
+                "ok": False,
+                "load_per_cpu": 99.0,
+                "cpu_busy_percent": 100.0,
+                "io_wait_percent": 100.0,
+                "available_memory_percent": 0.0,
+                "available_memory_mib": 0.0,
+                "running_agents": 9,
+                "reason_codes": ["cpu_pressure_high", "memory_pressure_high"],
+            },
+        ):
+            allowed = spawn_admission_decision()
+        with patch(
+            "codex_master.server.system_resource_snapshot",
+            return_value={
+                "ok": True,
+                "load_per_cpu": 0.25,
+                "cpu_busy_percent": 25.0,
+                "io_wait_percent": 0.0,
+                "available_memory_percent": 60.0,
+                "available_memory_mib": 8192,
+                "running_agents": 10,
+                "reason_codes": [],
+            },
+        ):
+            blocked = spawn_admission_decision()
+
+        self.assertFalse(allowed["allowed"])
+        self.assertEqual(
+            allowed["reason_codes"],
+            ["cpu_pressure_high", "io_pressure_high", "memory_pressure_high"],
+        )
+        self.assertEqual(allowed["available_slots"], 1)
+        self.assertFalse(blocked["allowed"])
+        self.assertEqual(blocked["reason_codes"], ["running_agent_limit"])
+        self.assertEqual(blocked["errors"][0]["code"], "running_agent_limit")
+        self.assertIn("10 von 10", blocked["errors"][0]["explanation"])
+        self.assertIn("Biene beenden", blocked["errors"][0]["action"])
+
+    def test_spawn_admission_error_layer_explains_insufficient_slots_without_raw_data(self) -> None:
+        with patch(
+            "codex_master.server.system_resource_snapshot",
+            return_value={
+                "ok": True,
+                "load_per_cpu": 0.25,
+                "cpu_busy_percent": 25.0,
+                "io_wait_percent": 0.0,
+                "available_memory_percent": 60.0,
+                "available_memory_mib": 8192,
+                "running_agents": 8,
+                "reason_codes": [],
+            },
+        ):
+            result = spawn_admission_decision(3)
+
+        self.assertEqual(result["reason_codes"], ["insufficient_slots"])
+        self.assertEqual(
+            result["errors"],
+            [
+                {
+                    "code": "insufficient_slots",
+                    "title": "Zu wenige Gesamtslots",
+                    "explanation": "3 Slots angefordert, aber nur 2 von 10 Slots sind frei.",
+                    "rule": "Angeforderte Slots muessen vollstaendig unter die globale Zehnergrenze passen.",
+                    "action": "Weniger Bienen anfordern oder laufende Bienen beenden.",
+                }
+            ],
+        )
+        self.assertNotIn("/proc", json.dumps(result))
+
+    def test_system_resource_snapshot_counts_managed_and_native_bees_together(self) -> None:
+        with patch(
+            "codex_master.server._managed_tmux_session_ids",
+            return_value=frozenset({"q1", "q2", "q3", "q4"}),
+        ), patch(
+            "codex_master.server.native_agent_status",
+            return_value={
+                "bridge_state": "ready",
+                "counts": {"active": 3, "unconfirmed": 2, "overflow": 0},
+            },
+        ) as native_status, patch("codex_master.server._fresh_native_reservation_count", return_value=0):
+            snapshot = system_resource_snapshot()
+
+        self.assertEqual(snapshot["running_agents"], 9)
+        native_status.assert_called_once_with()
+
+    def test_total_count_joins_tmux_and_native_registries_without_cross_domain_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", state / "native-agents.json"
+            ), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", state / "locks" / "native-agents.lock"
+            ), patch("codex_master.server.time.time", return_value=1_001.0):
+                server_module._write_native_agent_registry(
+                    {
+                        "schema_version": 2,
+                        "sessions": [
+                            {
+                                "session_id": "queen-thread",
+                                "activity_state": "active",
+                                "updated_at": 1_000.0,
+                            }
+                        ],
+                        "agents": [
+                            {
+                                "session_id": "queen-thread",
+                                "agent_id": "mara-agent",
+                                "agent_type": "teamleader",
+                                "activity_state": "active",
+                                "updated_at": 1_000.0,
+                            },
+                            {
+                                "session_id": "queen-thread",
+                                "agent_id": "helena-agent",
+                                "agent_type": "explorer",
+                                "activity_state": "active",
+                                "updated_at": 1_000.0,
+                            },
+                        ],
+                        "reservations": [],
+                    }
+                )
+                total = server_module._total_running_agent_count(
+                    managed_ids=frozenset({"codex_agent_b1_mcp", "codex_agent_q3_mcp"})
+                )
+
+        self.assertEqual(total, 4)
+
+    def test_mixed_managed_and_native_total_blocks_at_global_limit(self) -> None:
+        native = {
+            "bridge_state": "ready",
+            "counts": {"active": 8, "unconfirmed": 0, "overflow": 2},
+        }
+        with patch(
+            "codex_master.server._managed_tmux_session_ids",
+            return_value=frozenset({"codex_agent_b1_mcp", "codex_agent_q3_mcp"}),
+        ), patch(
+            "codex_master.server.native_agent_status", return_value=native
+        ), patch(
+            "codex_master.server._fresh_native_reservation_count", return_value=0
+        ), patch("codex_master.server.os.cpu_count", return_value=4), patch(
+            "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
+        ), patch("codex_master.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
+            "codex_master.server._resource_meminfo", return_value=(60.0, 8192.0)
+        ):
+            result = spawn_admission_decision(1)
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["available_slots"], 0)
+        self.assertEqual(result["reason_codes"], ["running_agent_limit"])
+        self.assertEqual(
+            result["errors"],
+            [
+                {
+                    "code": "running_agent_limit",
+                    "title": "Globale Bienengrenze erreicht",
+                    "explanation": "10 von 10 Gesamtslots sind belegt; 0 sind frei.",
+                    "rule": "Ab 10 laufenden oder unbestaetigten Bienen ist jeder weitere Spawn verboten.",
+                    "action": "Mindestens eine Biene beenden und erneut versuchen.",
+                }
+            ],
+        )
+        self.assertEqual(result["raw_output"], "not_returned")
+
+    def test_spawn_admission_uses_only_managed_active_and_unconfirmed_total(self) -> None:
+        native = {
+            "bridge_state": "ready",
+            "counts": {"active": 3, "unconfirmed": 2, "overflow": 0},
+        }
+        with patch(
+            "codex_master.server._managed_tmux_session_ids",
+            return_value=frozenset({"q1", "q2", "q3", "q4"}),
+        ), patch(
+            "codex_master.server.native_agent_status", return_value=native
+        ), patch("codex_master.server.os.cpu_count", return_value=4), patch(
+            "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
+        ), patch("codex_master.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
+            "codex_master.server._resource_meminfo", return_value=(50.0, 8192.0)
+        ), patch("codex_master.server._effective_cpu_count", return_value=4), patch(
+            "codex_master.server._fresh_native_reservation_count", return_value=0
+        ):
+            one_slot = spawn_admission_decision(1)
+            two_slots = spawn_admission_decision(2)
+
+        self.assertTrue(one_slot["allowed"])
+        self.assertEqual(one_slot["available_slots"], 1)
+        self.assertFalse(two_slots["allowed"])
+        self.assertEqual(two_slots["available_slots"], 1)
+        self.assertEqual(two_slots["reason_codes"], ["insufficient_slots"])
+
+    def test_missing_native_session_coverage_denies_with_concrete_envelope(self) -> None:
+        native = {
+            "bridge_state": "degraded",
+            "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
+        }
+        with patch(
+            "codex_master.server._managed_tmux_session_ids",
+            return_value=frozenset({"q1", "q2", "q3", "q4"}),
+        ), patch(
+            "codex_master.server.native_agent_status", return_value=native
+        ), patch("codex_master.server.os.cpu_count", return_value=4), patch(
+            "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
+        ), patch("codex_master.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
+            "codex_master.server._resource_meminfo", return_value=(50.0, 8192.0)
+        ), patch("codex_master.server._effective_cpu_count", return_value=4):
+            result = spawn_admission_decision(1)
+
+        self.assertFalse(result["allowed"])
+        self.assertIsNone(result["available_slots"])
+        self.assertEqual(result["reason_codes"], ["session_metrics_unavailable"])
+        self.assertEqual(
+            result["errors"],
+            [
+                {
+                    "code": "session_metrics_unavailable",
+                    "title": "Gesamtzahl nicht bestimmbar",
+                    "explanation": "Laufende und unbestaetigte Bienen konnten nicht verlaesslich gezaehlt werden.",
+                    "rule": "Ohne belastbare Gesamtzahl wird kein Spawn zugelassen.",
+                    "action": "Tmux- und Native-Agent-Registry pruefen, dann erneut versuchen.",
+                }
+            ],
         )
 
     def test_system_resource_snapshot_counts_only_managed_tmux_sessions(self) -> None:
         meminfo = "MemTotal:       16384 kB\nMemAvailable:    8192 kB\n"
         tmux = subprocess.CompletedProcess(["tmux", "list-sessions"], 0, "managed-session\nforeign-session\n", "")
         agents = {"a1": {"session": "managed-session"}}
-        with patch("codex_master.server.os.cpu_count", return_value=4), patch(
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            server_module, "STATE_ROOT", Path(temporary) / "state"
+        ), patch("codex_master.server.os.cpu_count", return_value=4), patch(
             "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
-        ), patch("codex_master.server.Path.read_text", return_value=meminfo), patch(
+        ), patch("codex_master.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
+            "codex_master.server.Path.read_text", return_value=meminfo), patch(
             "codex_master.server.run_tmux", return_value=tmux
-        ), patch.dict("codex_master.server.AGENTS", agents, clear=True):
+        ), patch.dict("codex_master.server.AGENTS", agents, clear=True), patch(
+            "codex_master.server.native_agent_status",
+            return_value={
+                "bridge_state": "ready",
+                "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
+            },
+        ), patch("codex_master.server._fresh_native_reservation_count", return_value=0):
             snapshot = system_resource_snapshot()
 
         self.assertEqual(snapshot["running_agents"], 1)
@@ -536,6 +1500,102 @@ class ServerHelpersTest(unittest.TestCase):
         payload = json.dumps(snapshot)
         self.assertNotIn("foreign-session", payload)
         self.assertNotIn("/proc/meminfo", payload)
+
+    def test_recent_cpu_usage_separates_busy_cpu_from_io_wait(self) -> None:
+        first = "cpu 100 0 0 800 0 0 0 0 0 0\n"
+        second = "cpu 110 0 0 810 5 0 0 0 0 0\n"
+        with patch("codex_master.server.Path.read_text", side_effect=[first, second]), patch(
+            "codex_master.server.time.sleep"
+        ):
+            usage = server_module._recent_cpu_usage()
+
+        self.assertEqual(usage, (40.0, 20.0))
+
+    def test_spawn_admission_counts_load_pressure_without_busy_cpu_pressure(self) -> None:
+        snapshot = {
+            "ok": True,
+            "load_per_cpu": 2.0,
+            "cpu_busy_percent": 32.0,
+            "io_wait_percent": 17.0,
+            "available_memory_percent": 60.0,
+            "available_memory_mib": 8192,
+            "running_agents": 2,
+        }
+        with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
+            result = spawn_admission_decision()
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason_codes"], ["cpu_pressure_high"])
+
+    def test_spawn_admission_blocks_real_cpu_or_io_pressure(self) -> None:
+        cases = (
+            ({"load_per_cpu": 1.0, "cpu_busy_percent": 90.001, "io_wait_percent": 1.0}, "cpu_pressure_high"),
+            ({"load_per_cpu": 1.0, "cpu_busy_percent": 32.0, "io_wait_percent": 50.001}, "io_pressure_high"),
+        )
+        for metrics, reason in cases:
+            with self.subTest(reason=reason), patch(
+                "codex_master.server.system_resource_snapshot",
+                return_value={
+                    "ok": True,
+                    **metrics,
+                    "available_memory_percent": 60.0,
+                    "available_memory_mib": 8192,
+                    "running_agents": 2,
+                },
+            ):
+                result = spawn_admission_decision()
+
+            self.assertFalse(result["allowed"])
+            self.assertEqual(result["reason_codes"], [reason])
+
+    def test_ollama_admission_enforces_two_agent_concurrency_limit(self) -> None:
+        def descriptor(agent_id: str, ordinal: int) -> Any:
+            return server_module.AgentDescriptor(
+                agent_id=agent_id,
+                series_prefix="o",
+                ordinal=ordinal,
+                label=agent_id,
+                runner=server_module.RunnerKind.CODEX_CLI,
+                provider=server_module.Provider.OLLAMA_LOCAL,
+                model="local-model",
+                account_id=None,
+                home=Path(f"/synthetic/{agent_id}"),
+                session=f"{agent_id}-session",
+                enabled=True,
+                task_profile="simple_only",
+            )
+
+        inventory = server_module.InventorySnapshot(
+            ("o1", "o2", "o3"),
+            {agent_id: descriptor(agent_id, index) for index, agent_id in enumerate(("o1", "o2", "o3"), 1)},
+            {"o": ("o1", "o2", "o3")},
+            {"o1": 0, "o2": 1, "o3": 2},
+            ("o",),
+        )
+        snapshot = {
+            "ok": True,
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
+            "available_memory_percent": 60.0,
+            "available_memory_mib": 8192,
+            "running_agents": 2,
+            "reason_codes": [],
+        }
+        with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
+            "codex_master.server.system_resource_snapshot", return_value=snapshot
+        ), patch(
+            "codex_master.server.tmux_alive",
+            side_effect=lambda session: session in {"o1-session", "o2-session"},
+        ):
+            result = server_module.ollama_resource_status("o1")
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["running_ollama_agents"], 2)
+        self.assertTrue(result["concurrency_limit_enforced"])
+        self.assertEqual(result["reason_codes"], ["ollama_concurrency_limit"])
+        self.assertEqual(result["errors"][0]["code"], "ollama_concurrency_limit")
+        self.assertNotIn("/proc", json.dumps(result))
 
     def test_managed_tmux_session_count_accepts_only_known_clean_empty_exits(self) -> None:
         clean_errors = (
@@ -605,10 +1665,17 @@ class ServerHelpersTest(unittest.TestCase):
     def test_system_resource_snapshot_fails_closed_for_missing_memory_evidence(self) -> None:
         with patch("codex_master.server.os.cpu_count", return_value=4), patch(
             "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
-        ), patch("codex_master.server.Path.read_text", return_value="MemTotal: 16384 kB\n"), patch(
+        ), patch("codex_master.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
+            "codex_master.server.Path.read_text", return_value="MemTotal: 16384 kB\n"), patch(
             "codex_master.server.run_tmux",
             return_value=subprocess.CompletedProcess(["tmux"], 0, "", ""),
-        ):
+        ), patch(
+            "codex_master.server.native_agent_status",
+            return_value={
+                "bridge_state": "ready",
+                "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
+            },
+        ), patch("codex_master.server._fresh_native_reservation_count", return_value=0):
             snapshot = system_resource_snapshot()
 
         self.assertFalse(snapshot["ok"])
@@ -630,7 +1697,9 @@ class ServerHelpersTest(unittest.TestCase):
     def test_spawn_admission_allows_load_and_memory_at_policy_boundaries(self) -> None:
         snapshot = {
             "ok": True,
-            "load_per_cpu": 0.85,
+            "load_per_cpu": 1.75,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
             "available_memory_percent": 20.0,
             "available_memory_mib": 1024,
             "running_agents": 5,
@@ -640,15 +1709,17 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertTrue(result["allowed"])
         self.assertEqual(result["reason_codes"], [])
-        self.assertEqual(result["available_slots"], 1)
+        self.assertEqual(result["available_slots"], 5)
 
     def test_spawn_admission_blocks_when_required_slots_exceed_capacity(self) -> None:
         snapshot = {
             "ok": True,
             "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
             "available_memory_percent": 60.0,
             "available_memory_mib": 8192,
-            "running_agents": 2,
+            "running_agents": 6,
         }
         with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
             result = spawn_admission_decision(5)
@@ -657,19 +1728,21 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["available_slots"], 4)
         self.assertEqual(result["reason_codes"], ["insufficient_slots"])
 
-    def test_spawn_admission_blocks_load_memory_and_slot_pressure_above_boundaries(self) -> None:
+    def test_spawn_admission_enforces_pressure_and_blocks_at_ten_agents(self) -> None:
         cases = (
-            ("load_per_cpu", 0.850001, "cpu_pressure_high"),
-            ("available_memory_percent", 19.999, "memory_pressure_high"),
-            ("available_memory_mib", 1023.999, "memory_pressure_high"),
-            ("running_agents", 6, "running_agent_limit"),
+            ("load_per_cpu", 1.750001, False, "cpu_pressure_high"),
+            ("available_memory_percent", 19.999, False, "memory_pressure_high"),
+            ("available_memory_mib", 1023.999, False, "memory_pressure_high"),
+            ("running_agents", 10, False, "running_agent_limit"),
         )
-        for field, value, reason in cases:
+        for field, value, allowed, reason in cases:
             with self.subTest(field=field), patch(
                 "codex_master.server.system_resource_snapshot",
                 return_value={
                     "ok": True,
                     "load_per_cpu": value if field == "load_per_cpu" else 0.25,
+                    "cpu_busy_percent": 95.0 if field == "load_per_cpu" else 25.0,
+                    "io_wait_percent": 0.0,
                     "available_memory_percent": value if field == "available_memory_percent" else 60.0,
                     "available_memory_mib": value if field == "available_memory_mib" else 8192,
                     "running_agents": value if field == "running_agents" else 2,
@@ -677,7 +1750,7 @@ class ServerHelpersTest(unittest.TestCase):
             ):
                 result = spawn_admission_decision()
 
-            self.assertFalse(result["allowed"])
+            self.assertEqual(result["allowed"], allowed)
             self.assertIn(reason, result["reason_codes"])
 
     def test_spawn_admission_rejects_non_finite_negative_and_boolean_metrics(self) -> None:
@@ -776,25 +1849,13 @@ class ServerHelpersTest(unittest.TestCase):
             with self.assertRaises(AgentCapacityError) as raised:
                 server_module.require_spawn_capacity()
 
-        self.assertEqual(
-            raised.exception.payload,
-            {
-                "error_code": "spawn_capacity_unavailable",
-                "retryable": True,
-                "retry_after_seconds": 15,
-                "reason_codes": ["running_agent_limit"],
-            },
-        )
-        self.assertEqual(
-            public_error_payload(raised.exception),
-            {
-                "error": "capacity unavailable",
-                "error_code": "spawn_capacity_unavailable",
-                "retryable": True,
-                "retry_after_seconds": 15,
-                "reason_codes": ["running_agent_limit"],
-            },
-        )
+        self.assertEqual(raised.exception.payload["error_code"], "spawn_capacity_unavailable")
+        self.assertTrue(raised.exception.payload["retryable"])
+        self.assertEqual(raised.exception.payload["reason_codes"], ["running_agent_limit"])
+        self.assertEqual(raised.exception.payload["errors"][0]["code"], "running_agent_limit")
+        public = public_error_payload(raised.exception)
+        self.assertEqual(public["error"], "capacity unavailable")
+        self.assertEqual(public["errors"], raised.exception.payload["errors"])
 
     def test_spawn_admission_lock_rejects_unsafe_lock_paths(self) -> None:
         self.assertTrue(hasattr(server_module, "spawn_admission_lock"))
@@ -2145,6 +3206,387 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertEqual(agent_ids("4"), ["a2"])
             self.assertEqual(agent_ids("200"), ["b67"])
 
+    def test_canonical_agent_id_prefers_direct_id_then_valid_g_alias(self) -> None:
+        inventory = _synthetic_alias_inventory()
+        journal = _synthetic_alias_journal((("old-h1", "g1"),))
+        with server_module.temporary_agent_inventory(inventory):
+            server_module._g_migration_publish_alias_view(
+                _synthetic_alias_snapshot(), Path("/synthetic"), journal
+            )
+            self.assertEqual(server_module.canonical_agent_id("g1"), "g1")
+            self.assertEqual(server_module.canonical_agent_id("old-h1"), "g1")
+            self.assertEqual(
+                server_module.canonical_agent_id("old-h1", server_module.published_agent_inventory()[0]),
+                "g1",
+            )
+
+    def test_canonical_agent_id_reports_unavailable_and_conflicts_data_sparingly(self) -> None:
+        inventory = _synthetic_alias_inventory()
+        with server_module.temporary_agent_inventory(inventory):
+            with self.assertRaisesRegex(AgentError, "fleet_alias_unavailable"):
+                server_module.canonical_agent_id("old-h1")
+            server_module._g_migration_publish_alias_view(
+                _synthetic_alias_snapshot(),
+                Path("/synthetic"),
+                _synthetic_alias_journal((("old-h1", "x1"),)),
+            )
+            with self.assertRaisesRegex(AgentError, "fleet_alias_conflict"):
+                server_module.canonical_agent_id("old-h1")
+
+    def test_generic_inventory_publish_rejects_external_alias_backing_mutation(self) -> None:
+        inventory = _synthetic_alias_inventory()
+        backing = {"old-h1": "g1"}
+        with server_module.temporary_agent_inventory(inventory):
+            with self.assertRaises(TypeError):
+                server_module.publish_agent_inventory(
+                    inventory,
+                    g_alias_view=(219, MappingProxyType(backing)),
+                )
+
+            server_module._g_migration_publish_alias_view(
+                _synthetic_alias_snapshot(),
+                Path("/synthetic"),
+                _synthetic_alias_journal((("old-h1", "g1"),)),
+            )
+            backing["old-i1"] = "g1"
+            with self.assertRaisesRegex(AgentError, "fleet_alias_unavailable"):
+                server_module.canonical_agent_id("old-i1")
+
+    def test_g_alias_publish_rejects_generation_mismatch_without_state_change(self) -> None:
+        inventory = _synthetic_alias_inventory()
+        journal = _synthetic_alias_journal((("old-h1", "g1"),))
+        with server_module.temporary_agent_inventory(inventory):
+            server_module._g_migration_publish_alias_view(
+                _synthetic_alias_snapshot(), Path("/synthetic"), journal
+            )
+            before = server_module.published_agent_inventory()[0]
+            with self.assertRaisesRegex(AgentError, "fleet_alias_conflict"):
+                server_module._g_migration_publish_alias_view(
+                    _synthetic_alias_snapshot(generation=220), Path("/synthetic"), journal
+                )
+            after = server_module.published_agent_inventory()[0]
+            self.assertIs(after, before)
+            self.assertEqual(server_module.canonical_agent_id("old-h1"), "g1")
+
+    def test_g_alias_view_rejects_wrong_generation_duplicate_and_cycle(self) -> None:
+        invalid_journals = (
+            _synthetic_alias_journal((("old-h1", "g1"),), alias_generation=218),
+            _synthetic_alias_journal((("old-h1", "g1"), ("old-h1", "g2"))),
+            _synthetic_alias_journal((("old-h1", "old-i1"), ("old-i1", "old-h1"))),
+        )
+        for journal in invalid_journals:
+            with self.subTest(journal=journal):
+                with self.assertRaisesRegex(AgentError, "fleet_alias_conflict"):
+                    server_module._g_alias_resolution_view(journal)
+
+    def test_g_alias_resolution_has_no_io_and_no_public_tool_surface(self) -> None:
+        inventory = _synthetic_alias_inventory()
+        with server_module.temporary_agent_inventory(inventory):
+            server_module._g_migration_publish_alias_view(
+                _synthetic_alias_snapshot(),
+                Path("/synthetic"),
+                _synthetic_alias_journal((("old-h1", "g1"),)),
+            )
+            with patch.object(server_module, "current_agent_inventory", side_effect=AssertionError("resolver I/O")), patch.object(
+                server_module, "g_migration_alias_view", side_effect=AssertionError("second alias parser")
+            ), patch.object(server_module, "pool_load_raw_spec", side_effect=AssertionError("resolver I/O")):
+                self.assertEqual(server_module.canonical_agent_id("old-h1"), "g1")
+        tool_names = {tool["name"] for tool in server_module.TOOLS}
+        self.assertNotIn("canonical_agent_id", tool_names)
+        self.assertFalse(any("alias" in name and name != "agent_pool_validate" for name in tool_names))
+
+    def test_fleet_overview_local_admin_orders_lock_clock_snapshot_inventory_build(self) -> None:
+        events: list[str] = []
+        snapshot = _overview_cli_test_snapshot()
+        inventory = object()
+        overview = object()
+        service = Mock()
+
+        def registry_snapshot() -> object:
+            events.append("snapshot")
+            return snapshot
+
+        def inventory_builder(seen_snapshot: object, seen_pool: Path) -> object:
+            self.assertIs(seen_snapshot, snapshot)
+            self.assertEqual(seen_pool, server_module.AGENT_POOL_ROOT)
+            events.append("inventory")
+            return inventory
+
+        def overview_builder(
+            seen_snapshot: object,
+            seen_inventory: object,
+            *,
+            created_at: datetime,
+            contexts: object,
+            active_only: bool,
+        ) -> object:
+            self.assertIs(seen_snapshot, snapshot)
+            self.assertIs(seen_inventory, inventory)
+            self.assertEqual(created_at, datetime(2026, 8, 15, tzinfo=timezone.utc))
+            self.assertIsNone(contexts)
+            self.assertTrue(active_only)
+            events.append("overview")
+            return overview
+
+        def renderer(seen_overview: object, *, format: str) -> str:
+            self.assertIs(seen_overview, overview)
+            self.assertEqual(format, "compact")
+            events.append("renderer")
+            return "rendered-compact"
+
+        def enrich(seen_overview: object, usage: object) -> object:
+            self.assertIs(seen_overview, overview)
+            self.assertEqual(usage.source, "unavailable")
+            events.append("enrich")
+            return overview
+
+        service.registry_snapshot.side_effect = registry_snapshot
+
+        @contextlib.contextmanager
+        def fake_lock(_path: Path):
+            events.append("lock-enter")
+            try:
+                yield
+            finally:
+                events.append("lock-exit")
+
+        created_at = datetime(2026, 8, 15, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            server_module, "STATE_ROOT", Path(temporary) / "state"
+        ), patch.object(server_module, "AGENT_POOL_ROOT", Path(temporary) / "pool"), patch.object(
+            server_module, "_fleet_registry_read_lock", fake_lock
+        ), patch.object(server_module, "_readonly_fleet_service", return_value=service), patch.object(
+            server_module,
+            "build_inventory",
+            side_effect=inventory_builder,
+        ), patch.object(
+            server_module,
+            "build_fleet_overview",
+            side_effect=overview_builder,
+        ), patch.object(
+            server_module,
+            "_resolve_codex_usage_state_home",
+            return_value=None,
+        ), patch.object(
+            server_module,
+            "enrich_fleet_overview_usage",
+            side_effect=enrich,
+        ), patch.object(
+            server_module,
+            "render_fleet_overview",
+            side_effect=renderer,
+        ):
+            result = server_module._fleet_overview_local_admin(
+                active_only=True,
+                format="compact",
+                clock=lambda: (events.append("clock") or created_at),
+            )
+
+        self.assertEqual(result, "rendered-compact")
+        self.assertEqual(
+            events,
+            [
+                "lock-enter",
+                "clock",
+                "snapshot",
+                "inventory",
+                "overview",
+                "lock-exit",
+                "enrich",
+                "renderer",
+            ],
+        )
+
+    def test_fleet_overview_local_admin_normalizes_inventory_runtime_error(self) -> None:
+        marker = "inventory-runtime-marker"
+        snapshot = _overview_cli_test_snapshot()
+        service = Mock()
+        service.registry_snapshot.return_value = snapshot
+
+        @contextlib.contextmanager
+        def fake_lock(_path: Path):
+            yield
+
+        with patch.object(server_module, "STATE_ROOT", Path("/synthetic-state")), patch.object(
+            server_module, "_fleet_registry_read_lock", fake_lock
+        ), patch.object(
+            server_module, "_readonly_fleet_service", return_value=service
+        ), patch.object(
+            server_module, "build_inventory", side_effect=RuntimeError(marker)
+        ), patch.object(server_module, "build_fleet_overview") as build_overview, patch.object(
+            server_module, "render_fleet_overview"
+        ) as renderer:
+            with self.assertRaises(AgentError) as raised:
+                server_module._fleet_overview_local_admin(
+                    active_only=True,
+                    format="compact",
+                    clock=lambda: datetime(2026, 8, 15, tzinfo=timezone.utc),
+                )
+
+        self.assertEqual(str(raised.exception), "fleet_overview_unavailable")
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertNotIn(marker, str(raised.exception))
+        build_overview.assert_not_called()
+        renderer.assert_not_called()
+
+    def test_fleet_overview_local_admin_normalizes_renderer_key_error(self) -> None:
+        marker = "renderer-key-marker"
+        snapshot = _overview_cli_test_snapshot()
+        base_overview = object()
+        enriched_overview = object()
+        service = Mock()
+        service.registry_snapshot.return_value = snapshot
+
+        @contextlib.contextmanager
+        def fake_lock(_path: Path):
+            yield
+
+        with patch.object(server_module, "STATE_ROOT", Path("/synthetic-state")), patch.object(
+            server_module, "_fleet_registry_read_lock", fake_lock
+        ), patch.object(
+            server_module, "_readonly_fleet_service", return_value=service
+        ), patch.object(server_module, "build_inventory", return_value=object()), patch.object(
+            server_module, "build_fleet_overview", return_value=base_overview
+        ), patch.object(
+            server_module, "_resolve_codex_usage_state_home", return_value=None
+        ), patch.object(
+            server_module, "load_account_usage_v1"
+        ) as loader, patch.object(
+            server_module, "read_active_launcher_v1"
+        ) as active_reader, patch.object(
+            server_module, "read_account_usage_cache_v1"
+        ) as cache_reader, patch.object(
+            server_module, "default_runner"
+        ) as runner, patch.object(
+            server_module, "enrich_fleet_overview_usage", return_value=enriched_overview
+        ) as enrich, patch.object(
+            server_module, "render_fleet_overview", side_effect=KeyError(marker)
+        ) as renderer:
+            with self.assertRaises(AgentError) as raised:
+                server_module._fleet_overview_local_admin(
+                    active_only=True,
+                    format="compact",
+                    clock=lambda: datetime(2026, 8, 15, tzinfo=timezone.utc),
+                )
+
+        self.assertEqual(str(raised.exception), "fleet_overview_unavailable")
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertNotIn(marker, str(raised.exception))
+        self.assertEqual(
+            enrich.call_args.args,
+            (base_overview, UsageSnapshot((), "unavailable", True, ("usage_unavailable",))),
+        )
+        loader.assert_not_called()
+        active_reader.assert_not_called()
+        cache_reader.assert_not_called()
+        runner.assert_not_called()
+        renderer.assert_called_once_with(enriched_overview, format="compact")
+
+    def test_fleet_overview_local_admin_lock_failure_does_not_sample_clock(self) -> None:
+        marker = "lock-runtime-marker"
+
+        @contextlib.contextmanager
+        def failing_lock(_path: Path):
+            raise RuntimeError(marker)
+            yield
+
+        clock = Mock(side_effect=AssertionError("clock must not run"))
+        service = Mock()
+        with patch.object(server_module, "STATE_ROOT", Path("/synthetic-state")), patch.object(
+            server_module, "_fleet_registry_read_lock", failing_lock
+        ), patch.object(server_module, "_readonly_fleet_service", return_value=service) as reader, patch.object(
+            server_module, "build_inventory", side_effect=AssertionError("inventory must not run")
+        ) as inventory, patch.object(
+            server_module, "build_fleet_overview", side_effect=AssertionError("overview must not run")
+        ) as build_overview, patch.object(
+            server_module, "render_fleet_overview", side_effect=AssertionError("renderer must not run")
+        ) as renderer:
+            with self.assertRaises(AgentError) as raised:
+                server_module._fleet_overview_local_admin(
+                    active_only=True,
+                    format="compact",
+                    clock=clock,
+                )
+
+        self.assertEqual(str(raised.exception), "fleet_overview_unavailable")
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertNotIn(marker, str(raised.exception))
+        clock.assert_not_called()
+        reader.assert_not_called()
+        service.registry_snapshot.assert_not_called()
+        inventory.assert_not_called()
+        build_overview.assert_not_called()
+        renderer.assert_not_called()
+
+    def test_fleet_overview_read_lock_rejects_unsafe_paths_and_never_writes(self) -> None:
+        cases = ("missing", "symlink", "hardlink", "changed", "parent-changed", "unreadable")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "state"
+                root.mkdir(mode=0o700)
+                parent = root
+                lock = parent / "registry.lock"
+                lock.write_text("", encoding="utf-8")
+                lock.chmod(0o600)
+                target = parent / "target.lock"
+                target.write_text("", encoding="utf-8")
+                target.chmod(0o600)
+                if case == "missing":
+                    lock.unlink()
+                if case == "symlink":
+                    lock.unlink()
+                    lock.symlink_to(target)
+                elif case == "hardlink":
+                    lock.unlink()
+                    os.link(target, lock)
+                opened_flags: list[int] = []
+                original_open = server_module.os.open
+                original_flock = server_module.fcntl.flock
+                swapped = False
+
+                def tracked_open(path: object, flags: int, *args: Any, **kwargs: Any) -> int:
+                    opened_flags.append(flags)
+                    if case == "unreadable":
+                        raise PermissionError("synthetic-unreadable")
+                    return original_open(path, flags, *args, **kwargs)
+
+                def tracked_flock(fd: int, operation: int) -> None:
+                    nonlocal swapped
+                    original_flock(fd, operation)
+                    if case == "changed" and operation == server_module.fcntl.LOCK_SH and not swapped:
+                        swapped = True
+                        replacement = root / "replacement.lock"
+                        replacement.write_text("", encoding="utf-8")
+                        replacement.chmod(0o600)
+                        os.replace(replacement, lock)
+                    if case == "parent-changed" and operation == server_module.fcntl.LOCK_SH and not swapped:
+                        swapped = True
+                        root.rename(root.with_name("state-old"))
+                        root.mkdir()
+                        lock.write_text("", encoding="utf-8")
+                        lock.chmod(0o600)
+
+                with patch.object(server_module.os, "open", side_effect=tracked_open), patch.object(
+                    server_module.fcntl, "flock", side_effect=tracked_flock
+                ), patch.object(
+                    server_module, "ensure_private_dir", side_effect=AssertionError("ensure")
+                ) as ensure_dir, patch.object(
+                    server_module.os, "fchmod", side_effect=AssertionError("chmod")
+                ) as fchmod, patch.object(
+                    server_module, "open_private_regular_update", side_effect=AssertionError("update")
+                ) as write_open:
+                    with self.assertRaisesRegex(AgentError, "fleet_overview_unavailable"):
+                        with server_module._fleet_registry_read_lock(lock):
+                            self.fail("unsafe lock must not enter read context")
+
+                ensure_dir.assert_not_called()
+                write_open.assert_not_called()
+                fchmod.assert_not_called()
+                self.assertFalse(any(flags & os.O_CREAT for flags in opened_flags))
+                self.assertFalse(any(flags & os.O_RDWR for flags in opened_flags))
+                if case in {"changed", "parent-changed"}:
+                    self.assertTrue(swapped)
+
     def test_active_selector_uses_single_managed_inventory_snapshot(self) -> None:
         inventory = {
             "running_agents": ["c1", "a2"],
@@ -2156,6 +3598,85 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(selected, ["c1", "a2"])
         mock_inventory.assert_called_once_with()
+
+    def test_unpublished_dynamic_fleet_drives_managed_count_and_active_selector(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            pool = root / "pool"
+            completed = subprocess.CompletedProcess(
+                ["tmux"],
+                0,
+                "codex_agent_b1_mcp\ncodex_agent_q1_mcp\ncodex_agent_q2_mcp\ncodex_agent_q3_mcp\nforeign\n",
+                "",
+            )
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                create_test_observation_fleet(pool)
+                with patch.object(server_module, "run_tmux", return_value=completed):
+                    self.assertEqual(server_module._managed_tmux_session_count(), 4)
+                    self.assertEqual(server_module.agent_ids("active"), ["b1", "q1", "q2", "q3"])
+
+    def test_present_corrupt_fleet_registry_fails_observation_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            fleet_root = state / "fleet"
+            fleet_root.mkdir(parents=True, mode=0o700)
+            registry = fleet_root / "registry.json"
+            registry.write_text("{invalid", encoding="utf-8")
+            registry.chmod(0o600)
+            completed = subprocess.CompletedProcess(
+                ["tmux"], 0, "codex_agent_b1_mcp\n", ""
+            )
+            with patch.object(server_module, "STATE_ROOT", state), server_module.temporary_agent_inventory(
+                None
+            ), patch.object(server_module, "run_tmux", return_value=completed):
+                self.assertIsNone(server_module._managed_tmux_session_count())
+                with self.assertRaisesRegex(AgentError, "fleet_registry_unavailable"):
+                    server_module.agent_ids("active")
+
+    def test_startup_publication_uses_effective_observation_inventory(self) -> None:
+        inventory = server_module.current_agent_inventory()
+        with patch.object(
+            server_module,
+            "effective_observation_inventory",
+            return_value=(inventory, True),
+        ) as effective, patch.object(server_module, "publish_agent_inventory") as publish:
+            server_module._publish_startup_fleet_inventory()
+
+        effective.assert_called_once_with()
+        publish.assert_called_once_with(inventory)
+
+    def test_agent_status_active_requests_read_only_status(self) -> None:
+        with patch.object(server_module, "agent_ids", return_value=["b1"]), patch.object(
+            server_module, "status_agent", return_value={"agent": "b1", "running": True}
+        ) as status, patch.object(server_module, "ensure_state") as ensure, patch.object(
+            server_module, "prune_raw_logs"
+        ) as prune:
+            result = call_tool("agent_status", {"agent": "active"})
+
+        self.assertEqual(result["results"], [{"agent": "b1", "running": True}])
+        status.assert_called_once_with("b1", initialize_state=False)
+        ensure.assert_not_called()
+        prune.assert_not_called()
+
+    def test_status_active_cli_requests_read_only_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            server_module, "STATE_ROOT", Path(temporary) / "state"
+        ), patch.object(server_module, "_fleet_initialize_recovery_startup_state"), patch.object(
+            server_module, "agent_ids", return_value=["b1"]
+        ), patch.object(
+            server_module, "status_agent", return_value={"agent": "b1", "running": True}
+        ) as status, patch.object(server_module, "ensure_state") as ensure, patch.object(
+            server_module, "prune_raw_logs"
+        ) as prune, patch.object(server_module, "print_json", return_value=0):
+            result = main_cli(["status", "active"])
+
+        self.assertEqual(result, 0)
+        status.assert_called_once_with("b1", initialize_state=False)
+        ensure.assert_not_called()
+        prune.assert_not_called()
 
     def test_published_inventory_makes_d_e_f_selectable_without_restart(self) -> None:
         from codex_master.fleet_registry import build_inventory, normalize_fleet_document
@@ -3523,11 +5044,16 @@ class ServerHelpersTest(unittest.TestCase):
                 with patch.object(server_module, "agent_lease_status", return_value={"state": "unclaimed"}), patch.object(
                     server_module, "run_tmux", return_value=stopped
                 ), patch.object(server_module, "pool_home_processes", return_value=[]):
-                    result = server_module.fleet_series_apply(
-                        prefix="d", count=1, runner="codex_cli", provider="ollama_local",
-                        model="new-model", account_id=None, enabled=False,
-                        expected_generation=3, codex_executable=executable,
-                    )
+                    with patch.object(
+                        server_module,
+                        "apply_q_series_update",
+                        side_effect=AssertionError("non-Q series reached Q in-place core"),
+                    ):
+                        result = server_module.fleet_series_apply(
+                            prefix="d", count=1, runner="codex_cli", provider="ollama_local",
+                            model="new-model", account_id=None, enabled=False,
+                            expected_generation=3, codex_executable=executable,
+                        )
 
             self.assertEqual(result["updated_count"], 1)
             self.assertEqual(tomllib.loads((pool / "d1" / "config.toml").read_text())["model"], "new-model")
@@ -3535,6 +5061,554 @@ class ServerHelpersTest(unittest.TestCase):
                 json.loads((pool / "d1" / server_module.FLEET_AGENT_MARKER_FILE).read_text())["model"],
                 "new-model",
             )
+
+    def test_fleet_q_series_update_is_in_place_and_preserves_runtime_identity(self) -> None:
+        from codex_master.fleet_registry import (
+            AuthKind,
+            FleetAccount,
+            FleetSnapshot,
+            LimitState,
+            Provider,
+            SecretState,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            account = FleetAccount(
+                "q-account",
+                "Q Account",
+                Provider.OPENAI_CHATGPT,
+                AuthKind.CHATGPT_SESSION,
+                SecretState.CONFIGURED,
+                LimitState.READY,
+                True,
+                None,
+                datetime.now(timezone.utc).isoformat(),
+                None,
+            )
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                service = server_module.current_fleet_service()
+                service.commit_snapshot(
+                    FleetSnapshot(1, 2, (account,), ()),
+                    expected_generation=1,
+                )
+                server_module.fleet_series_apply(
+                    prefix="q",
+                    count=3,
+                    runner="codex_cli",
+                    provider="openai_chatgpt",
+                    model="old-model",
+                    account_id="q-account",
+                    expected_generation=2,
+                    skill_profile="teamleiterin",
+                    codex_executable=executable,
+                )
+                runtime = {
+                    "auth.json": b'{"token":"synthetic-secret"}\n',
+                    "sessions/live.jsonl": b"session\n",
+                    "logs/runtime.log": b"log\n",
+                    "skills/user/SKILL.md": b"skill\n",
+                    "plugins/local/plugin.json": b"plugin\n",
+                    "cache/blob": b"cache\n",
+                    "tmp/in-flight": b"tmp\n",
+                    "state.sqlite": b"SQLite format 3\x00runtime",
+                    "unknown/value": b"unknown\n",
+                }
+                for ordinal in range(1, 4):
+                    home = pool / f"q{ordinal}"
+                    for relative, content in runtime.items():
+                        target = home / relative
+                        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        target.write_bytes(content)
+                        target.chmod(0o600)
+
+                def runtime_snapshot() -> dict[str, tuple[int, int, bytes]]:
+                    return {
+                        str(path.relative_to(pool)): (
+                            path.stat().st_ino,
+                            stat.S_IMODE(path.stat().st_mode),
+                            path.read_bytes(),
+                        )
+                        for ordinal in range(1, 4)
+                        for path in (pool / f"q{ordinal}").rglob("*")
+                        if path.is_file()
+                        and path.name
+                        not in {"codex", "config.toml", server_module.FLEET_AGENT_MARKER_FILE}
+                    }
+
+                home_inodes = {
+                    f"q{ordinal}": (pool / f"q{ordinal}").stat().st_ino
+                    for ordinal in range(1, 4)
+                }
+                before_runtime = runtime_snapshot()
+                before_dry_run = {
+                    str(path.relative_to(pool)): (path.stat().st_ino, path.read_bytes())
+                    for path in pool.rglob("*")
+                    if path.is_file()
+                }
+                plan = server_module.fleet_series_plan(
+                    prefix="q",
+                    count=3,
+                    runner="codex_cli",
+                    provider="openai_chatgpt",
+                    model="new-model",
+                    account_id="q-account",
+                    expected_generation=3,
+                    skill_profile="teamleiterin",
+                )
+                after_dry_run = {
+                    str(path.relative_to(pool)): (path.stat().st_ino, path.read_bytes())
+                    for path in pool.rglob("*")
+                    if path.is_file()
+                }
+                self.assertFalse(plan["mutation_performed"])
+                self.assertEqual(before_dry_run, after_dry_run)
+                self.assertEqual(service.load().generation, 3)
+                with self.assertRaisesRegex(
+                    server_module.FleetInplaceUpdateError,
+                    "fleet_q_inplace_scope_invalid",
+                ):
+                    server_module.fleet_series_apply(
+                        prefix="q",
+                        count=3,
+                        runner="codex_cli",
+                        provider="openai_chatgpt",
+                        model="new-model",
+                        account_id="q-account",
+                        expected_generation=3,
+                        skill_profile="generic",
+                        codex_executable=executable,
+                    )
+                self.assertEqual(service.load().generation, 3)
+                after_scope_rejection = {
+                    str(path.relative_to(pool)): (path.stat().st_ino, path.read_bytes())
+                    for path in pool.rglob("*")
+                    if path.is_file()
+                }
+                self.assertEqual(before_dry_run, after_scope_rejection)
+
+                with patch.object(
+                    service, "commit_snapshot", wraps=service.commit_snapshot
+                ) as commit_spy, patch.object(
+                    server_module, "current_fleet_service", return_value=service
+                ), patch.object(
+                    server_module,
+                    "run_tmux",
+                    side_effect=AssertionError("active Q instance was probed or stopped"),
+                ), patch.object(
+                    server_module,
+                    "pool_home_processes",
+                    side_effect=AssertionError("active Q process tree was probed"),
+                ):
+                    result = server_module.fleet_series_apply(
+                        prefix="q",
+                        count=3,
+                        runner="codex_cli",
+                        provider="openai_chatgpt",
+                        model="new-model",
+                        account_id="q-account",
+                        expected_generation=3,
+                        skill_profile="teamleiterin",
+                        codex_executable=executable,
+                    )
+
+                self.assertEqual(commit_spy.call_count, 1)
+                self.assertEqual(result["generation"], 4)
+                self.assertEqual(result["updated_count"], 3)
+                self.assertEqual(service.load().generation, 4)
+                self.assertEqual(runtime_snapshot(), before_runtime)
+                for agent_id, inode in home_inodes.items():
+                    home = pool / agent_id
+                    self.assertEqual(home.stat().st_ino, inode)
+                    self.assertEqual(tomllib.loads((home / "config.toml").read_text())["model"], "new-model")
+                    marker = json.loads(
+                        (home / server_module.FLEET_AGENT_MARKER_FILE).read_text()
+                    )
+                    self.assertEqual(marker["managed_files"], ["codex", "config.toml"])
+
+    def test_fleet_q_series_partial_failure_rolls_back_all_homes(self) -> None:
+        import codex_master.fleet_inplace as fleet_inplace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                service = create_test_q_series(pool, executable)
+                for ordinal in range(1, 4):
+                    unknown = pool / f"q{ordinal}" / "runtime.sqlite"
+                    unknown.write_bytes(b"SQLite format 3\x00live")
+                    unknown.chmod(0o600)
+                managed_before = {
+                    str(path.relative_to(pool)): (
+                        path.read_bytes(),
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for ordinal in range(1, 4)
+                    for path in (pool / f"q{ordinal}").iterdir()
+                    if path.name
+                    in {"codex", "config.toml", server_module.FLEET_AGENT_MARKER_FILE}
+                }
+                runtime_before = {
+                    f"q{ordinal}": (
+                        (pool / f"q{ordinal}" / "runtime.sqlite").stat().st_ino,
+                        (pool / f"q{ordinal}" / "runtime.sqlite").read_bytes(),
+                    )
+                    for ordinal in range(1, 4)
+                }
+                real_replace = fleet_inplace._replace_leaf
+                replace_calls = 0
+                q3_identity = (
+                    (pool / "q3").stat().st_dev,
+                    (pool / "q3").stat().st_ino,
+                )
+
+                def fail_third_managed_write(*args, **kwargs):
+                    nonlocal replace_calls
+                    replace_calls += 1
+                    opened = os.fstat(args[0])
+                    if (opened.st_dev, opened.st_ino) == q3_identity:
+                        self.assertNotEqual(
+                            (pool / "q1" / "codex").read_bytes(),
+                            managed_before["q1/codex"][0],
+                        )
+                        self.assertNotEqual(
+                            (pool / "q2" / "codex").read_bytes(),
+                            managed_before["q2/codex"][0],
+                        )
+                        raise OSError("synthetic private failure")
+                    return real_replace(*args, **kwargs)
+
+                with patch.object(
+                    fleet_inplace,
+                    "_replace_leaf",
+                    side_effect=fail_third_managed_write,
+                ), patch.object(
+                    service,
+                    "commit_snapshot",
+                    wraps=service.commit_snapshot,
+                ) as commit_spy, patch.object(
+                    server_module,
+                    "current_fleet_service",
+                    return_value=service,
+                ):
+                    with self.assertRaises(server_module.FleetInplaceUpdateError) as raised:
+                        server_module.fleet_series_apply(
+                            prefix="q",
+                            count=3,
+                            runner="codex_cli",
+                            provider="openai_chatgpt",
+                            model="new-model",
+                            account_id="q-account",
+                            expected_generation=3,
+                            skill_profile="teamleiterin",
+                            codex_executable=executable,
+                        )
+
+                managed_after = {
+                    str(path.relative_to(pool)): (
+                        path.read_bytes(),
+                        stat.S_IMODE(path.stat().st_mode),
+                    )
+                    for ordinal in range(1, 4)
+                    for path in (pool / f"q{ordinal}").iterdir()
+                    if path.name
+                    in {"codex", "config.toml", server_module.FLEET_AGENT_MARKER_FILE}
+                }
+                runtime_after = {
+                    f"q{ordinal}": (
+                        (pool / f"q{ordinal}" / "runtime.sqlite").stat().st_ino,
+                        (pool / f"q{ordinal}" / "runtime.sqlite").read_bytes(),
+                    )
+                    for ordinal in range(1, 4)
+                }
+                payload = server_module.public_error_payload(raised.exception)
+
+            self.assertEqual(str(raised.exception), "fleet_managed_update_failed")
+            self.assertEqual(replace_calls, 3)
+            self.assertEqual(commit_spy.call_count, 0)
+            self.assertEqual(service.load().generation, 3)
+            self.assertEqual(managed_after, managed_before)
+            self.assertEqual(runtime_after, runtime_before)
+            self.assertEqual(
+                set(payload),
+                {"error", "code", "explanation", "rule", "action"},
+            )
+            self.assertEqual(payload["code"], "fleet_managed_update_failed")
+            self.assertEqual(list((state / "fleet" / "q-inplace").iterdir()), [])
+
+    def test_fleet_q_series_crash_recovery_runs_before_replanning(self) -> None:
+        real_apply = server_module.apply_q_series_update
+
+        class SyntheticCrash(BaseException):
+            pass
+
+        for crash_point in ("before_cas", "after_cas"):
+            with self.subTest(crash_point=crash_point), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                state = root / "state"
+                pool = root / "pool"
+                executable = root / "runner"
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o700)
+                with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                    server_module, "AGENT_POOL_ROOT", pool
+                ), server_module.temporary_agent_inventory(None):
+                    service = create_test_q_series(pool, executable)
+                    runtime = pool / "q1" / "sessions" / "live.jsonl"
+                    runtime.parent.mkdir(mode=0o700)
+                    runtime.write_bytes(b"live session\n")
+                    runtime.chmod(0o600)
+                    runtime_before = (runtime.stat().st_ino, runtime.read_bytes())
+                    crashed = False
+
+                    def crash_apply(*args, **kwargs):
+                        def fault(point: str) -> None:
+                            nonlocal crashed
+                            if point == crash_point:
+                                crashed = True
+                                raise SyntheticCrash
+
+                        return real_apply(*args, **kwargs, _fault=fault)
+
+                    with patch.object(
+                        service,
+                        "commit_snapshot",
+                        wraps=service.commit_snapshot,
+                    ) as commit_spy, patch.object(
+                        server_module,
+                        "current_fleet_service",
+                        return_value=service,
+                    ):
+                        with patch.object(
+                            server_module,
+                            "apply_q_series_update",
+                            side_effect=crash_apply,
+                        ), self.assertRaises(SyntheticCrash):
+                            server_module.fleet_series_apply(
+                                prefix="q",
+                                count=3,
+                                runner="codex_cli",
+                                provider="openai_chatgpt",
+                                model="new-model",
+                                account_id="q-account",
+                                expected_generation=3,
+                                skill_profile="teamleiterin",
+                                codex_executable=executable,
+                            )
+                        transaction_root = state / "fleet" / "q-inplace"
+                        self.assertEqual(len(list(transaction_root.iterdir())), 1)
+                        if crash_point == "before_cas":
+                            recovered = server_module.fleet_series_apply(
+                                prefix="q",
+                                count=3,
+                                runner="codex_cli",
+                                provider="openai_chatgpt",
+                                model="new-model",
+                                account_id="q-account",
+                                expected_generation=3,
+                                skill_profile="teamleiterin",
+                                codex_executable=executable,
+                            )
+                            self.assertEqual(recovered["generation"], 4)
+                        else:
+                            with self.assertRaisesRegex(AgentError, "generation_conflict"):
+                                server_module.fleet_series_apply(
+                                    prefix="q",
+                                    count=3,
+                                    runner="codex_cli",
+                                    provider="openai_chatgpt",
+                                    model="new-model",
+                                    account_id="q-account",
+                                    expected_generation=3,
+                                    skill_profile="teamleiterin",
+                                    codex_executable=executable,
+                                )
+
+                    self.assertTrue(crashed)
+                    self.assertEqual(commit_spy.call_count, 1)
+                    self.assertEqual(service.load().generation, 4)
+                    self.assertEqual(list(transaction_root.iterdir()), [])
+                    self.assertEqual(
+                        tomllib.loads((pool / "q3" / "config.toml").read_text())["model"],
+                        "new-model",
+                    )
+                    self.assertEqual((runtime.stat().st_ino, runtime.read_bytes()), runtime_before)
+
+    def test_fleet_q_series_cas_outcomes_reconcile_without_runtime_loss(self) -> None:
+        from codex_master.fleet_service import FleetConflictError
+
+        for outcome in ("conflict", "uncertain_before", "uncertain_after"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                state = root / "state"
+                pool = root / "pool"
+                executable = root / "runner"
+                executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                executable.chmod(0o700)
+                with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                    server_module, "AGENT_POOL_ROOT", pool
+                ), server_module.temporary_agent_inventory(None):
+                    service = create_test_q_series(pool, executable)
+                    runtime = pool / "q2" / "auth.json"
+                    runtime.write_bytes(b'{"token":"synthetic"}\n')
+                    runtime.chmod(0o600)
+                    runtime_before = (runtime.stat().st_ino, runtime.read_bytes())
+                    real_commit = service.commit_snapshot
+
+                    def commit_outcome(*args, **kwargs):
+                        if outcome == "conflict":
+                            raise FleetConflictError("generation_conflict")
+                        if outcome == "uncertain_after":
+                            real_commit(*args, **kwargs)
+                        raise TimeoutError("synthetic uncertainty")
+
+                    with patch.object(
+                        service,
+                        "commit_snapshot",
+                        side_effect=commit_outcome,
+                    ) as commit_spy, patch.object(
+                        server_module,
+                        "current_fleet_service",
+                        return_value=service,
+                    ):
+                        with self.assertRaises(server_module.FleetInplaceUpdateError) as raised:
+                            server_module.fleet_series_apply(
+                                prefix="q",
+                                count=3,
+                                runner="codex_cli",
+                                provider="openai_chatgpt",
+                                model="new-model",
+                                account_id="q-account",
+                                expected_generation=3,
+                                skill_profile="teamleiterin",
+                                codex_executable=executable,
+                            )
+
+                    expected_error = {
+                        "conflict": "generation_conflict",
+                        "uncertain_before": "fleet_registry_commit_failed",
+                        "uncertain_after": "fleet_registry_commit_failed_after_cas",
+                    }[outcome]
+                    expected_generation = 4 if outcome == "uncertain_after" else 3
+                    expected_model = "new-model" if outcome == "uncertain_after" else "old-model"
+                    self.assertEqual(str(raised.exception), expected_error)
+                    self.assertEqual(
+                        server_module.public_error_payload(raised.exception)["code"],
+                        expected_error,
+                    )
+                    self.assertEqual(commit_spy.call_count, 1)
+                    self.assertEqual(service.load().generation, expected_generation)
+                    self.assertEqual(
+                        tomllib.loads((pool / "q1" / "config.toml").read_text())["model"],
+                        expected_model,
+                    )
+                    self.assertEqual((runtime.stat().st_ino, runtime.read_bytes()), runtime_before)
+                    self.assertEqual(list((state / "fleet" / "q-inplace").iterdir()), [])
+
+    def test_fleet_q_recovery_divergence_is_structured_at_tool_boundary(self) -> None:
+        real_apply = server_module.apply_q_series_update
+
+        class SyntheticCrash(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            pool = root / "pool"
+            executable = root / "runner"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            executable.chmod(0o700)
+            with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                server_module, "AGENT_POOL_ROOT", pool
+            ), server_module.temporary_agent_inventory(None):
+                service = create_test_q_series(pool, executable)
+
+                def crash_apply(*args, **kwargs):
+                    def fault(point: str) -> None:
+                        if point == "before_cas":
+                            raise SyntheticCrash
+
+                    return real_apply(*args, **kwargs, _fault=fault)
+
+                with patch.object(
+                    server_module,
+                    "apply_q_series_update",
+                    side_effect=crash_apply,
+                ), self.assertRaises(SyntheticCrash):
+                    server_module.fleet_series_apply(
+                        prefix="q",
+                        count=3,
+                        runner="codex_cli",
+                        provider="openai_chatgpt",
+                        model="new-model",
+                        account_id="q-account",
+                        expected_generation=3,
+                        skill_profile="teamleiterin",
+                        codex_executable=executable,
+                    )
+                target = pool / "q1" / "codex"
+                target_inode = target.stat().st_ino
+                target.write_bytes(b"concurrent managed wrapper\n")
+                self.assertEqual(target.stat().st_ino, target_inode)
+                transaction_root = state / "fleet" / "q-inplace"
+                journal = next(transaction_root.iterdir()) / "journal.json"
+
+                with patch.object(
+                    service,
+                    "commit_snapshot",
+                    wraps=service.commit_snapshot,
+                ) as commit_spy, patch.object(
+                    server_module,
+                    "current_fleet_service",
+                    return_value=service,
+                ):
+                    response = server_module.handle_rpc(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "fleet_series_apply",
+                                "arguments": {
+                                    "prefix": "q",
+                                    "count": 3,
+                                    "runner": "codex_cli",
+                                    "provider": "openai_chatgpt",
+                                    "model": "new-model",
+                                    "account_id": "q-account",
+                                    "expected_generation": 3,
+                                    "skill_profile": "teamleiterin",
+                                },
+                            },
+                        }
+                    )
+
+                self.assertIsNotNone(response)
+                result = response["result"]
+                payload = json.loads(result["content"][0]["text"])
+                self.assertTrue(result["isError"])
+                self.assertEqual(payload["error"], "fleet_update_recovery_diverged")
+                self.assertEqual(payload["code"], "fleet_update_recovery_diverged")
+                self.assertTrue(payload["explanation"])
+                self.assertTrue(payload["rule"])
+                self.assertTrue(payload["action"])
+                self.assertEqual(commit_spy.call_count, 0)
+                self.assertEqual(service.load().generation, 3)
+                self.assertEqual(target.read_bytes(), b"concurrent managed wrapper\n")
+                self.assertTrue(journal.is_file())
 
     def test_fleet_series_create_rejects_existing_home_and_unsafe_executable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6879,7 +8953,7 @@ class ServerHelpersTest(unittest.TestCase):
 
     @patch("codex_master.server.status_agent")
     def test_multi_agent_status_results_are_paged_for_broad_selectors(self, mock_status_agent) -> None:
-        mock_status_agent.side_effect = lambda agent: {
+        mock_status_agent.side_effect = lambda agent, **_kwargs: {
             "agent": agent,
             "running": False,
             "raw_output": "not_returned",
@@ -6904,8 +8978,8 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["agents_limit"], 2)
         self.assertTrue(result["truncated"])
         self.assertEqual(result["raw_output"], "not_returned")
-        mock_status_agent.assert_any_call("a2")
-        mock_status_agent.assert_any_call("a3")
+        mock_status_agent.assert_any_call("a2", initialize_state=False)
+        mock_status_agent.assert_any_call("a3", initialize_state=False)
         self.assertEqual(mock_status_agent.call_count, 2)
 
     @patch("codex_master.server.call_agent_lifecycle")
@@ -7769,9 +9843,29 @@ class ServerHelpersTest(unittest.TestCase):
             (root / "tests" / "test_server.py").write_text("should not copy", encoding="utf-8")
             (root / ".git" / "config").write_text("secret", encoding="utf-8")
             (root / ".pytest_cache" / "README.md").write_text("cache", encoding="utf-8")
+            managed_home = tmp_path / "managed-teamleiterin-q1"
+            managed_home.mkdir()
+            cache = managed_home / "plugins" / "cache" / "personal" / "codex-master"
+            auth_file = managed_home / "auth.json"
+            config_file = managed_home / "config.toml"
+            trust_file = managed_home / ".codex-trust"
+            auth_file.write_text('{"token":"must-stay"}\n', encoding="utf-8")
+            config_file.write_text('[projects."q1"]\ntrust_level = "trusted"\n', encoding="utf-8")
+            trust_file.write_text("trusted\n", encoding="utf-8")
+            protected_stats = {path: path.stat().st_ino for path in (auth_file, config_file, trust_file)}
 
             with patch.dict("os.environ", {"HOME": str(tmp_path), "CODEX_HOME": ""}, clear=False):
                 result = sync_plugin_cache_from_repo(root, cache)
+
+            self.assertEqual(auth_file.read_text(encoding="utf-8"), '{"token":"must-stay"}\n')
+            self.assertEqual(config_file.read_text(encoding="utf-8"), '[projects."q1"]\ntrust_level = "trusted"\n')
+            self.assertEqual(trust_file.read_text(encoding="utf-8"), "trusted\n")
+            self.assertEqual({path: path.stat().st_ino for path in protected_stats}, protected_stats)
+            self.assertEqual(
+                {child.name for child in managed_home.iterdir()},
+                {"auth.json", "config.toml", ".codex-trust", "plugins"},
+            )
+            self.assertFalse((cache / "0.3.4+codex.test" / ".codex-trust").exists())
 
             entry = cache / "0.3.4+codex.test"
             copied_state = {
@@ -8746,7 +10840,19 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(result["response_found"])
         self.assertFalse(result["required_tool_available"])
 
-    @patch("codex_master.server.subprocess.run")
+    def test_mcp_probe_reader_rejects_oversized_output(self) -> None:
+        with self.assertRaises(server_module._McpProbeOutputLimit):
+            server_module._run_mcp_probe(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; sys.stdout.write('x' * 300000); sys.stdout.flush()",
+                ],
+                input_text="",
+                timeout=2,
+            )
+
+    @patch("codex_master.server._run_mcp_probe")
     def test_mcp_command_tools_list_self_test_is_data_sparse(self, mock_run) -> None:
         payload = {
             "jsonrpc": "2.0",
@@ -8764,7 +10870,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertNotIn("/tmp/codex-master-mcp", json.dumps(result, sort_keys=True))
 
-    @patch("codex_master.server.subprocess.run")
+    @patch("codex_master.server._run_mcp_probe")
     def test_mcp_command_tools_list_self_test_accepts_content_length_frames(self, mock_run) -> None:
         payload = {
             "jsonrpc": "2.0",
@@ -8786,7 +10892,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["tool_count"], 1)
         self.assertTrue(result["required_tool_available"])
 
-    @patch("codex_master.server.subprocess.run")
+    @patch("codex_master.server._run_mcp_probe")
     def test_mcp_command_tools_list_self_test_requires_assignment_report(self, mock_run) -> None:
         payload = {
             "jsonrpc": "2.0",
@@ -8809,7 +10915,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["required_tool_available"])
         self.assertFalse(result["required_tools_available"]["agent_assignment_report"])
 
-    @patch("codex_master.server.subprocess.run")
+    @patch("codex_master.server._run_mcp_probe")
     def test_mcp_command_tools_list_self_test_rejects_stderr_only_response(self, mock_run) -> None:
         payload = {
             "jsonrpc": "2.0",
@@ -8831,7 +10937,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["tool_count"], 0)
         self.assertFalse(result["required_tool_available"])
 
-    @patch("codex_master.server.subprocess.run", side_effect=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid"))
+    @patch("codex_master.server._run_mcp_probe", side_effect=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid"))
     def test_mcp_self_tests_fail_closed_on_invalid_command_output(self, _mock_run) -> None:
         startup = mcp_command_startup_self_test(Path("/tmp/codex-master-mcp"))
         tools = mcp_command_tools_list_self_test(Path("/tmp/codex-master-mcp"))
@@ -9295,7 +11401,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertNotIn("/home/", json.dumps(result, sort_keys=True))
 
-    @patch("codex_master.server.subprocess.run")
+    @patch("codex_master.server._run_bounded_command")
     def test_run_command_returns_bounded_timeout_result(self, mock_run) -> None:
         mock_run.side_effect = subprocess.TimeoutExpired(["git", "status"], DEFAULT_COMMAND_TIMEOUT_SECONDS)
 
@@ -9305,14 +11411,55 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("timed out", result.stderr)
         self.assertEqual(mock_run.call_args.kwargs["timeout"], DEFAULT_COMMAND_TIMEOUT_SECONDS)
 
-    @patch("codex_master.server.subprocess.run", side_effect=FileNotFoundError("git missing"))
+    def test_run_command_rejects_oversized_output(self) -> None:
+        result = run_command(
+            [
+                sys.executable,
+                "-c",
+                f"import sys; sys.stdout.write('x' * ({server_module.MAX_COMMAND_STDOUT_BYTES} + 1)); "
+                "sys.stdout.flush()",
+            ],
+            timeout=5,
+        )
+
+        self.assertEqual(result.returncode, server_module.COMMAND_OUTPUT_LIMIT_RETURN_CODE)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("output exceeded", result.stderr)
+
+    def test_run_command_check_raises_for_nonzero_exit(self) -> None:
+        with self.assertRaises(subprocess.CalledProcessError) as caught:
+            run_command(
+                [sys.executable, "-c", "raise SystemExit(3)"],
+                check=True,
+                timeout=5,
+            )
+
+        self.assertEqual(caught.exception.returncode, 3)
+
+    def test_run_tmux_rejects_oversized_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            fake_tmux = tmp_path / "tmux"
+            fake_tmux.write_text(
+                f"#!{sys.executable}\n"
+                f"import sys; sys.stdout.write('x' * ({server_module.MAX_COMMAND_STDOUT_BYTES} + 1))\n",
+                encoding="utf-8",
+            )
+            fake_tmux.chmod(0o700)
+            with patch.dict(os.environ, {"PATH": str(tmp_path)}):
+                result = run_tmux(["capture-pane"], check=False, timeout=5)
+
+        self.assertEqual(result.returncode, server_module.COMMAND_OUTPUT_LIMIT_RETURN_CODE)
+        self.assertEqual(result.stdout, "")
+
+    @patch("codex_master.server._run_bounded_command", side_effect=FileNotFoundError("git missing"))
     def test_run_command_returns_unavailable_result(self, _mock_run) -> None:
         result = run_command(["git", "status"])
 
         self.assertEqual(result.returncode, COMMAND_UNAVAILABLE_RETURN_CODE)
         self.assertIn("git missing", result.stderr)
 
-    @patch("codex_master.server.subprocess.run")
+    @patch("codex_master.server._run_bounded_command")
     def test_run_tmux_returns_bounded_timeout_result(self, mock_run) -> None:
         mock_run.side_effect = subprocess.TimeoutExpired(
             ["tmux", "capture-pane"], DEFAULT_TMUX_TIMEOUT_SECONDS, output="partial"
@@ -9325,7 +11472,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIn("timed out", result.stderr)
         self.assertEqual(mock_run.call_args.kwargs["timeout"], DEFAULT_TMUX_TIMEOUT_SECONDS)
 
-    @patch("codex_master.server.subprocess.run", side_effect=FileNotFoundError("tmux missing"))
+    @patch("codex_master.server._run_bounded_command", side_effect=FileNotFoundError("tmux missing"))
     def test_run_tmux_returns_unavailable_result(self, _mock_run) -> None:
         result = run_tmux(["has-session"], check=False)
 
@@ -10078,6 +12225,572 @@ class ServerHelpersTest(unittest.TestCase):
         missing_payload = json.loads(missing_response["result"]["content"][0]["text"])
         self.assertEqual(missing_payload["error"], "missing required argument(s) for agent_send: text")
 
+    def test_selection_offer_schema_rejects_requester_authority_spoofing(self) -> None:
+        schema = server_module.TOOL_SCHEMAS["agent_selection_options"]
+
+        self.assertNotIn("requester_class", schema["properties"])
+        for index, spoofed_class in enumerate(
+            ("teamleiterin", "koenigin", "gottbiene"),
+            start=1,
+        ):
+            with self.subTest(spoofed_class=spoofed_class), self.assertRaisesRegex(
+                AgentError,
+                "unknown argument",
+            ):
+                server_module.validate_tool_call(
+                    "agent_selection_options",
+                    {"agent": "a", "requester_class": spoofed_class},
+                )
+            response = handle_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 580 + index,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "agent_selection_options",
+                        "arguments": {
+                            "agent": "a",
+                            "requester_class": spoofed_class,
+                        },
+                    },
+                }
+            )
+            self.assertTrue(response["result"]["isError"])
+            payload = json.loads(response["result"]["content"][0]["text"])
+            self.assertEqual(
+                payload["error"],
+                "unknown argument(s) for agent_selection_options",
+            )
+
+    @patch(
+        "codex_master.server.codex_usage_routing_decision",
+        return_value={"decision": "luna", "model": "gpt-5.6-luna"},
+    )
+    def test_unverified_selection_offer_fails_safe_to_arbeitsbiene(self, _mock_routing) -> None:
+        result = call_tool("agent_selection_options", {"agent": "a"})
+
+        self.assertEqual(result["classes"], ["arbeitsbiene"])
+        self.assertNotIn("teamleiterin", result["classes"])
+        self.assertNotIn("koenigin", result["classes"])
+        self.assertNotIn("gottbiene", result["classes"])
+
+    @patch(
+        "codex_master.server.codex_usage_routing_decision",
+        return_value={"decision": "luna", "model": "gpt-5.6-luna"},
+    )
+    def test_verified_teamleader_offer_contains_only_delegable_resolver_options(
+        self,
+        _mock_routing,
+    ) -> None:
+        result = call_tool(
+            "agent_selection_options",
+            {"agent": "a"},
+            principal_class="teamleiterin",
+        )
+
+        self.assertEqual(result["classes"], ["arbeitsbiene", "spezialistin"])
+        self.assertTrue(result["options"])
+        self.assertEqual(
+            {option["class"] for option in result["options"]},
+            {"arbeitsbiene", "spezialistin"},
+        )
+        self.assertTrue(
+            all(
+                option["lifecycle"] in result["lifecycles"]
+                and option["model"] in result["models"]
+                and option["reasoning"] in result["reasoning_levels"]
+                for option in result["options"]
+            )
+        )
+        self.assertTrue(
+            {"teamleiterin", "koenigin", "gottbiene"}.isdisjoint(result["classes"])
+        )
+
+    @patch(
+        "codex_master.server.codex_usage_routing_decision",
+        return_value={"decision": "luna", "model": "gpt-5.6-luna"},
+    )
+    def test_direct_tool_call_cannot_supply_selection_offer_authority(self, _mock_routing) -> None:
+        for spoofed_class in ("teamleiterin", "koenigin", "gottbiene"):
+            with self.subTest(spoofed_class=spoofed_class), self.assertRaisesRegex(
+                AgentError,
+                "requester_class cannot establish authority",
+            ):
+                call_tool(
+                    "agent_selection_options",
+                    {"agent": "a", "requester_class": spoofed_class},
+                )
+
+    def test_runtime_selection_filters_leadership_spoofing_by_bound_authority(self) -> None:
+        for authority_class, expected_class in (
+            ("arbeitsbiene", "arbeitsbiene"),
+            ("teamleiterin", "spezialistin"),
+        ):
+            for spoofed_class in ("teamleiterin", "koenigin", "gottbiene"):
+                with self.subTest(
+                    authority_class=authority_class,
+                    spoofed_class=spoofed_class,
+                ):
+                    decision = server_module.resolve_runtime_agent_selection(
+                        role="arbeitsbiene",
+                        routing=None,
+                        task_profile=complex_task_profile(),
+                        requested_class=spoofed_class,
+                        authority_class=authority_class,
+                    )
+
+                    self.assertEqual(decision.class_id, expected_class)
+                    self.assertNotIn(
+                        decision.class_id,
+                        {"teamleiterin", "koenigin", "gottbiene"},
+                    )
+
+        permitted = server_module.resolve_runtime_agent_selection(
+            role="arbeitsbiene",
+            routing=None,
+            task_profile=complex_task_profile(),
+            requested_class="spezialistin",
+            authority_class="teamleiterin",
+        )
+        self.assertEqual(permitted.class_id, "spezialistin")
+
+    def test_trusted_internal_runtime_selection_keeps_explicit_gottbiene(self) -> None:
+        decision = server_module.resolve_runtime_agent_selection(
+            role="arbeitsbiene",
+            routing=None,
+            task_profile=complex_task_profile(),
+            requested_class="gottbiene",
+        )
+
+        self.assertEqual(
+            (decision.class_id, decision.lifecycle, decision.model, decision.reasoning),
+            ("gottbiene", "persistent", "gpt-5.6-sol", "max"),
+        )
+
+    def test_verified_rpc_binds_teamleader_principal_to_tool_call(self) -> None:
+        status = {
+            "authorized": True,
+            "role": "teamleader",
+            "visible_tool_count": len(server_module.TOOLS),
+            "raw_output": "not_returned",
+        }
+        message = {
+            "jsonrpc": "2.0",
+            "id": 58,
+            "method": "tools/call",
+            "params": {"name": "agent_status", "arguments": {"agent": "a"}},
+        }
+        with patch(
+            "codex_master.server.require_teamleader_tool_access",
+            return_value=status,
+        ), patch(
+            "codex_master.server.call_tool",
+            return_value={"ok": True},
+        ) as mock_call:
+            response = handle_rpc(message, enforce_master_role=True)
+
+        self.assertFalse(response["result"]["isError"])
+        mock_call.assert_called_once_with(
+            "agent_status",
+            {"agent": "a"},
+            principal_class="teamleiterin",
+        )
+
+    def test_start_and_assign_forward_bound_authority_to_shared_selection(self) -> None:
+        def run_lifecycle(_agent: str, fn: Any, **_kwargs: Any) -> dict[str, Any]:
+            return fn()
+
+        def run_multi(selected: list[str], fn: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {agent: fn(agent) for agent in selected}
+
+        with patch("codex_master.server.agent_ids", return_value=["a1"]), patch(
+            "codex_master.server.require_broad_mutation_confirmation",
+            return_value={"allowed": True},
+        ), patch(
+            "codex_master.server.multi_agent_result",
+            side_effect=run_multi,
+        ), patch(
+            "codex_master.server.call_agent_lifecycle",
+            side_effect=run_lifecycle,
+        ), patch(
+            "codex_master.server._start_agent_with_lease_unlocked",
+            return_value={"status": "started"},
+        ) as mock_start, patch(
+            "codex_master.server._headless_descriptor",
+            return_value=None,
+        ), patch(
+            "codex_master.server._assign_agent_unlocked",
+            return_value={"status": "assigned"},
+        ) as mock_assign:
+            call_tool(
+                "agent_start",
+                {"agent": "a1", "class": "gottbiene"},
+            )
+            call_tool(
+                "agent_start",
+                {"agent": "a1", "class": "gottbiene"},
+                principal_class="teamleiterin",
+            )
+            call_tool(
+                "agent_assign_write",
+                {
+                    "agent": "a1",
+                    "task": "Fix.",
+                    "write_paths": ["src/codex_master/server.py"],
+                    "class": "koenigin",
+                },
+            )
+            call_tool(
+                "agent_assign_write",
+                {
+                    "agent": "a1",
+                    "task": "Fix.",
+                    "write_paths": ["src/codex_master/server.py"],
+                    "class": "koenigin",
+                },
+                principal_class="teamleiterin",
+            )
+
+        self.assertEqual(
+            [call.kwargs["authority_class"] for call in mock_start.call_args_list],
+            ["arbeitsbiene", "teamleiterin"],
+        )
+        self.assertEqual(
+            [call.kwargs["authority_class"] for call in mock_assign.call_args_list],
+            ["arbeitsbiene", "teamleiterin"],
+        )
+
+    def test_start_and_assign_use_same_runtime_selection_adapter(self) -> None:
+        auth_gate = {
+            "authenticated": True,
+            "provider": "openai",
+            "state": "authenticated",
+            "raw_output": "not_returned",
+        }
+        with patch("codex_master.server.require_fleet_recovery_ready"), patch(
+            "codex_master.server._headless_descriptor",
+            return_value=None,
+        ), patch(
+            "codex_master.server._ollama_descriptor",
+            return_value=None,
+        ), patch(
+            "codex_master.server.require_authenticated_agent_for_mutation",
+            return_value=auth_gate,
+        ), patch(
+            "codex_master.server.ensure_agent_not_blocked_by_codex_usage",
+        ), patch(
+            "codex_master.server.require_ollama_admission",
+        ), patch(
+            "codex_master.server.resolve_runtime_agent_selection",
+            side_effect=AgentError("resolver sentinel"),
+        ) as resolver:
+            with self.assertRaisesRegex(AgentError, "resolver sentinel"):
+                server_module._start_agent_with_lease_unlocked(
+                    "a1",
+                    allow_unauthenticated=True,
+                    agent_class="arbeitsbiene",
+                    lifecycle="ephemeral",
+                    model="gpt-5.6-luna",
+                    reasoning_effort="medium",
+                    complexity="simple",
+                )
+            with self.assertRaisesRegex(AgentError, "resolver sentinel"):
+                server_module._assign_agent_unlocked(
+                    "a1",
+                    role="arbeitsbiene",
+                    task="Fix typo.",
+                    scope=["src"],
+                    write_paths=["src/a.py"],
+                    allow_unauthenticated=True,
+                    agent_class="arbeitsbiene",
+                    lifecycle="ephemeral",
+                    requested_model="gpt-5.6-luna",
+                    requested_reasoning="medium",
+                    complexity="simple",
+                    task_phase="atomic_fix",
+                    fully_specified=True,
+                    reversible=True,
+                    low_risk=True,
+                    root_cause_known=True,
+                )
+
+        self.assertEqual(resolver.call_count, 2)
+        self.assertIs(
+            resolver.call_args_list[0].kwargs["task_profile"].complexity,
+            TaskComplexity.UNKNOWN,
+        )
+        self.assertIs(
+            resolver.call_args_list[1].kwargs["task_profile"].complexity,
+            TaskComplexity.SIMPLE,
+        )
+
+    def test_start_without_fix_evidence_never_selects_spark(self) -> None:
+        auth_gate = {"authenticated": True, "provider": "openai", "state": "authenticated"}
+        lease = {"state": "held", "holder": "test", "held_by_this_server": True}
+        with patch("codex_master.server.require_fleet_recovery_ready"), patch(
+            "codex_master.server._headless_descriptor", return_value=None
+        ), patch("codex_master.server._ollama_descriptor", return_value=None), patch(
+            "codex_master.server.require_authenticated_agent_for_mutation", return_value=auth_gate
+        ), patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"), patch(
+            "codex_master.server.claim_agent", return_value={"status": "existing", "lease": lease}
+        ), patch("codex_master.server.tmux_alive", return_value=False), patch(
+            "codex_master.server.start_agent", return_value={"status": "started"}
+        ) as start, patch("codex_master.server.remember_agent_routing"):
+            result = server_module._start_agent_with_lease_unlocked(
+                "a1",
+                allow_unauthenticated=True,
+                complexity="simple",
+            )
+
+        self.assertEqual(start.call_args.kwargs["model"], "gpt-5.6-luna")
+        self.assertEqual(result["selection"]["model"], "gpt-5.6-luna")
+
+    def test_confirmed_assign_write_can_select_spark_and_audit_profile(self) -> None:
+        auth_gate = {"authenticated": True, "provider": "openai", "state": "authenticated"}
+        lease = {"state": "held", "holder": "test", "held_by_this_server": True}
+        with patch("codex_master.server.require_fleet_recovery_ready"), patch(
+            "codex_master.server._headless_descriptor", return_value=None
+        ), patch("codex_master.server._ollama_descriptor", return_value=None), patch(
+            "codex_master.server.require_authenticated_agent_for_mutation", return_value=auth_gate
+        ), patch("codex_master.server.require_ollama_admission"), patch(
+            "codex_master.server.ensure_agent_not_blocked_by_codex_usage"
+        ), patch("codex_master.server.scope_check", return_value={"allowed": True}), patch(
+            "codex_master.server.current_agent_inventory",
+            return_value=SimpleNamespace(
+                agents={"a1": SimpleNamespace(series_prefix="a", skill_profile="arbeitsbiene")}
+            ),
+        ), patch("codex_master.server.claim_for_agent_mutation", return_value=(lease, False)), patch(
+            "codex_master.server.ensure_assignment_session_model", return_value={"status": "unchanged"}
+        ), patch("codex_master.server.send_agent", return_value={"status": "sent"}), patch(
+            "codex_master.server.remember_agent_routing"
+        ), patch("codex_master.server.record_assignment") as record:
+            result = server_module._assign_agent_unlocked(
+                "a1",
+                role="arbeitsbiene",
+                task="Rename one local symbol and run its focused test.",
+                scope=["src"],
+                write_paths=["src/example.py"],
+                allow_unauthenticated=True,
+                task_phase="atomic_fix",
+                fully_specified=True,
+                reversible=True,
+                low_risk=True,
+                root_cause_known=True,
+            )
+
+        self.assertEqual(result["model"], "gpt-5.3-codex-spark")
+        self.assertTrue(result["task_profile"]["spark_eligible"])
+        self.assertEqual(record.call_args.args[0]["task_profile"], result["task_profile"])
+
+    def test_task_evidence_is_write_assignment_only_and_boolean_strict(self) -> None:
+        write_properties = server_module.TOOL_SCHEMAS["agent_assign_write"]["properties"]
+        readonly_properties = server_module.TOOL_SCHEMAS["agent_assign_readonly"]["properties"]
+        self.assertIn("fully_specified", write_properties)
+        self.assertNotIn("fully_specified", readonly_properties)
+        with self.assertRaisesRegex(AgentError, "fully_specified must be a boolean"):
+            server_module.validate_tool_call(
+                "agent_assign_write",
+                {
+                    "agent": "a1",
+                    "task": "Fix.",
+                    "write_paths": ["src/example.py"],
+                    "fully_specified": 1,
+                },
+            )
+
+    def test_start_and_assign_reject_missing_required_teamlead_model_before_mutation(self) -> None:
+        auth_gate = {
+            "authenticated": True,
+            "provider": "openai",
+            "state": "authenticated",
+            "raw_output": "not_returned",
+        }
+        with patch("codex_master.server.canonical_agent_id", return_value="q1"), patch(
+            "codex_master.server.require_fleet_recovery_ready"
+        ), patch(
+            "codex_master.server._headless_descriptor", return_value=None
+        ), patch(
+            "codex_master.server._ollama_descriptor", return_value=None
+        ), patch(
+            "codex_master.server.require_authenticated_agent_for_mutation", return_value=auth_gate
+        ), patch(
+            "codex_master.server.ensure_agent_not_blocked_by_codex_usage"
+        ), patch(
+            "codex_master.server.require_ollama_admission"
+        ), patch(
+            "codex_master.server.resolve_runtime_agent_selection",
+            side_effect=AgentError("required_model_unavailable:gpt-5.6-terra"),
+        ), patch("codex_master.server.start_agent") as mock_start, patch(
+            "codex_master.server.send_agent"
+        ) as mock_send:
+            with self.assertRaisesRegex(AgentError, "required_model_unavailable:gpt-5.6-terra"):
+                server_module._start_agent_with_lease_unlocked(
+                    "q1", allow_unauthenticated=True, authority_class="teamleiterin"
+                )
+            with self.assertRaisesRegex(AgentError, "required_model_unavailable:gpt-5.6-terra"):
+                server_module._assign_agent_unlocked(
+                    "q1", role="arbeitsbiene", task="Fix.", scope=["src"],
+                    write_paths=["src/a.py"], authority_class="teamleiterin",
+                    allow_unauthenticated=True,
+                )
+        mock_start.assert_not_called()
+        mock_send.assert_not_called()
+
+    def test_start_for_verified_q_teamlead_uses_exact_terra_xhigh_selection(self) -> None:
+        inventory = SimpleNamespace(
+            agents={"q1": SimpleNamespace(series_prefix="q", skill_profile="teamleiterin")},
+            agent_ids=("q1",),
+        )
+        with patch("codex_master.server.canonical_agent_id", return_value="q1"), patch(
+            "codex_master.server.current_agent_inventory", return_value=inventory
+        ), patch("codex_master.server.require_fleet_recovery_ready"), patch(
+            "codex_master.server._headless_descriptor", return_value=None
+        ), patch(
+            "codex_master.server._ollama_descriptor", return_value=None
+        ), patch(
+            "codex_master.server.require_authenticated_agent_for_mutation",
+            return_value={"authenticated": True},
+        ), patch(
+            "codex_master.server.ensure_agent_not_blocked_by_codex_usage"
+        ), patch(
+            "codex_master.server.require_ollama_admission"
+        ), patch(
+            "codex_master.server.claim_agent",
+            return_value={"status": "claimed", "lease": {"state": "held"}},
+        ), patch(
+            "codex_master.server.agent_config",
+            return_value={"session": "q1-tmux"},
+        ), patch(
+            "codex_master.server.tmux_alive", return_value=False
+        ), patch(
+            "codex_master.server.start_agent",
+            return_value={"status": "started"},
+        ) as mock_start, patch(
+            "codex_master.server.remember_agent_routing"
+        ), patch(
+            "codex_master.server.agent_lease_status",
+            return_value={"held_by_this_server": False},
+        ):
+            result = server_module._start_agent_with_lease_unlocked(
+                "q1", allow_unauthenticated=True, authority_class="teamleiterin"
+            )
+
+        self.assertEqual(
+            mock_start.call_args.kwargs["model"],
+            "gpt-5.6-terra",
+        )
+        self.assertEqual(mock_start.call_args.kwargs["model_reasoning_effort"], "xhigh")
+        self.assertEqual(mock_start.call_args.kwargs["agent_class"], "teamleiterin")
+        self.assertEqual(
+            (
+                result["selection"]["class"],
+                result["selection"]["lifecycle"],
+                result["selection"]["model"],
+                result["selection"]["reasoning"],
+            ),
+            ("teamleiterin", "persistent", "gpt-5.6-terra", "xhigh"),
+        )
+
+    def test_assign_never_promotes_skill_profile_or_unverified_q_spoof(self) -> None:
+        def assign_with(
+            descriptor: SimpleNamespace,
+            *,
+            authority_class: str,
+            agent_class: str | None = None,
+        ) -> dict[str, Any]:
+            inventory = SimpleNamespace(
+                agents={descriptor.agent_id: descriptor},
+                agent_ids=(descriptor.agent_id,),
+            )
+            lease = {
+                "state": "held",
+                "holder": "test",
+                "held_by_this_server": True,
+                "expires_at_utc": None,
+            }
+            with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
+                "codex_master.server.require_fleet_recovery_ready"
+            ), patch(
+                "codex_master.server._ollama_descriptor", return_value=None
+            ), patch(
+                "codex_master.server.require_authenticated_agent_for_mutation",
+                return_value={"authenticated": True},
+            ), patch(
+                "codex_master.server.ensure_agent_not_blocked_by_codex_usage"
+            ), patch(
+                "codex_master.server.require_ollama_admission",
+                return_value={"allowed": True},
+            ), patch(
+                "codex_master.server.ensure_assignment_session_model",
+                return_value={"status": "unchanged"},
+            ), patch(
+                "codex_master.server.send_agent",
+                return_value={"agent": descriptor.agent_id, "status": "sent"},
+            ), patch("codex_master.server.remember_agent_routing"), patch(
+                "codex_master.server.record_assignment"
+            ):
+                return server_module._assign_agent_unlocked(
+                    descriptor.agent_id,
+                    role="arbeitsbiene",
+                    task="Fix authority validation.",
+                    scope=["src"],
+                    write_paths=["src/a.py"],
+                    name="Security Probe",
+                    allow_unauthenticated=True,
+                    lease=lease,
+                    agent_class=agent_class,
+                    complexity="complex",
+                    authority_class=authority_class,
+                )
+
+        for descriptor, requested_class in (
+            (
+                SimpleNamespace(
+                    agent_id="c1",
+                    series_prefix="c",
+                    skill_profile="teamleiterin",
+                ),
+                None,
+            ),
+            (
+                SimpleNamespace(
+                    agent_id="q1",
+                    series_prefix="q",
+                    skill_profile="teamleiterin",
+                ),
+                "teamleiterin",
+            ),
+        ):
+            with self.subTest(agent=descriptor.agent_id):
+                result = assign_with(
+                    descriptor,
+                    authority_class="arbeitsbiene",
+                    agent_class=requested_class,
+                )
+                self.assertNotIn(
+                    result["selection"]["class"],
+                    {"teamleiterin", "koenigin", "gottbiene"},
+                )
+                self.assertNotEqual(result["model"], "gpt-5.6-sol")
+
+        verified_q = assign_with(
+            SimpleNamespace(
+                agent_id="q1",
+                series_prefix="q",
+                skill_profile="teamleiterin",
+            ),
+            authority_class="teamleiterin",
+        )
+        self.assertEqual(
+            (
+                verified_q["selection"]["class"],
+                verified_q["selection"]["lifecycle"],
+                verified_q["model"],
+                verified_q["model_reasoning_effort"],
+            ),
+            ("teamleiterin", "persistent", "gpt-5.6-terra", "xhigh"),
+        )
+
     def test_mcp_tool_call_enforces_schema_value_types_and_bounds(self) -> None:
         wrong_type = handle_rpc(
             {
@@ -10241,9 +12954,201 @@ class ServerHelpersTest(unittest.TestCase):
             subagent_admission={"allowed": True, "reason_codes": []},
         )
 
-        self.assertIn("Vor jedem Spawn frisch pruefen: load1 / logical_cpu_count <= 0.85.", prompt)
-        self.assertIn("Linux MemAvailable muss >= 20 % und >= 1024 MiB sein.", prompt)
-        self.assertIn("Fehlende oder ungueltige Messung bedeutet: nicht spawnen.", prompt)
+        self.assertIn("insgesamt maximal 10 laufende oder unbestaetigte Bienen", prompt)
+        self.assertIn("Ab 10 Bienen keine weitere Biene starten.", prompt)
+
+    def test_agent_introduction_policy_follows_catalog_for_all_classes(self) -> None:
+        for agent_class in ("gottbiene", "koenigin", "teamleiterin"):
+            with self.subTest(agent_class=agent_class):
+                prompt = server_module.apply_agent_introduction_policy(
+                    "TASK",
+                    agent_class=agent_class,
+                    name=None,
+                )
+
+                self.assertIn("[USER_INTRODUCTION_POLICY]", prompt)
+                self.assertIn("TASK", prompt)
+
+        for agent_class in ("spezialistin", "arbeitsbiene"):
+            with self.subTest(agent_class=agent_class):
+                self.assertEqual(
+                    server_module.apply_agent_introduction_policy(
+                        "TASK",
+                        agent_class=agent_class,
+                        name="Mila",
+                    ),
+                    "TASK",
+                )
+
+    def test_agent_introduction_policy_uses_explicit_stable_name(self) -> None:
+        prompt = server_module.apply_agent_introduction_policy(
+            "TASK",
+            agent_class="teamleiterin",
+            name="Seraphina",
+        )
+
+        self.assertIn('stabilen Namen "Seraphina"', prompt)
+        self.assertIn("ueber deine gesamte Lebensdauer bei", prompt)
+        self.assertNotIn("Waehle", prompt)
+
+    def test_agent_introduction_policy_allows_one_stable_choice_without_explicit_name(self) -> None:
+        prompt = server_module.apply_agent_introduction_policy(
+            "TASK",
+            agent_class="koenigin",
+            name=None,
+        )
+
+        self.assertIn("Waehle dafuer einmal einen stabilen Namen", prompt)
+        self.assertIn("ueber deine gesamte Lebensdauer bei", prompt)
+        self.assertNotIn(server_module.default_agentin_name("a1"), prompt)
+
+    def test_agent_introduction_policy_is_conditional_nonrepeating_and_not_internal(self) -> None:
+        prompt = server_module.apply_agent_introduction_policy(
+            "TASK",
+            agent_class="gottbiene",
+            name=None,
+        )
+        lowered = prompt.lower()
+
+        self.assertIn("erstes tatsaechliches direktes gespraech mit einem user", lowered)
+        self.assertIn("interne agentin-zu-agentin-kommunikation loest keine vorstellung aus", lowered)
+        self.assertIn("nicht erneut vor", lowered)
+        self.assertIn("benenne dich nicht neu", lowered)
+        self.assertNotIn("sofort", lowered)
+        self.assertNotIn("bei jedem auftrag", lowered)
+
+    def test_assignment_prompt_applies_introduction_policy_from_resolved_class(self) -> None:
+        prompt = assignment_prompt(
+            agent="a1",
+            role="arbeitsbiene",
+            task="Inspect src",
+            scope=["src"],
+            skill=None,
+            write_paths=["src/codex_master/server.py"],
+            context=[],
+            forbidden=[],
+            name="Seraphina",
+            model=DEFAULT_AGENT_MODEL,
+            allow_subagents=False,
+            subagent_admission=None,
+            agent_class="teamleiterin",
+        )
+
+        self.assertIn("[USER_INTRODUCTION_POLICY]", prompt)
+        self.assertIn('stabilen Namen "Seraphina"', prompt)
+        self.assertIn("[WORK_BEE_TASK]", prompt)
+
+    @patch("codex_master.server.ensure_state")
+    @patch("codex_master.server.write_meta")
+    @patch("codex_master.server.pane_pid", return_value=123)
+    @patch("codex_master.server.tmux_alive", return_value=False)
+    @patch("codex_master.server.run_tmux")
+    def test_start_and_assignment_prompt_use_same_introduction_helper(
+        self,
+        mock_run_tmux,
+        _mock_alive,
+        _mock_pane_pid,
+        _mock_write_meta,
+        _mock_ensure_state,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            runner = tmp_path / "codex"
+            raw_dir = tmp_path / "raw"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
+            raw_dir.mkdir()
+            mock_run_tmux.return_value = subprocess.CompletedProcess(["tmux"], 0, "", "")
+
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": runner, "home": tmp_path, "session": "test_session"}},
+                clear=False,
+            ), patch("codex_master.server.RAW_DIR", raw_dir), patch(
+                "codex_master.server.META_DIR", tmp_path / "meta"
+            ), patch("codex_master.server.now_id", return_value="fixed"), patch(
+                "codex_master.server.agent_home_process_summary",
+                return_value={
+                    "process_count": 0,
+                    "external_process_count": 0,
+                    "managed_process_count": 0,
+                    "external_processes": [],
+                    "external_processes_truncated": False,
+                    "raw_output": "not_returned",
+                },
+            ), patch(
+                "codex_master.server.require_spawn_capacity",
+                return_value=ADMITTED_SPAWN_DECISION,
+            ), patch("codex_master.server.prune_raw_logs"), patch(
+                "codex_master.server.apply_agent_introduction_policy",
+                return_value="SHARED_POLICY",
+            ) as introduction_policy:
+                assigned_prompt = assignment_prompt(
+                    agent="a",
+                    role="arbeitsbiene",
+                    task="Inspect src",
+                    scope=["src"],
+                    skill=None,
+                    write_paths=["src/codex_master/server.py"],
+                    context=[],
+                    forbidden=[],
+                    name="Seraphina",
+                    model=DEFAULT_AGENT_MODEL,
+                    allow_subagents=False,
+                    subagent_admission=None,
+                    agent_class="teamleiterin",
+                )
+                server_module._start_agent_unlocked(
+                    "a",
+                    cwd=tmpdir,
+                    prompt="START_TASK",
+                    model="gpt-5.6-terra",
+                    model_reasoning_effort="xhigh",
+                    agent_class="teamleiterin",
+                    name="Seraphina",
+                )
+
+        self.assertEqual(assigned_prompt, "SHARED_POLICY")
+        self.assertEqual(introduction_policy.call_count, 2)
+        self.assertEqual(
+            [call.kwargs for call in introduction_policy.call_args_list],
+            [
+                {"agent_class": "teamleiterin", "name": "Seraphina"},
+                {"agent_class": "teamleiterin", "name": "Seraphina"},
+            ],
+        )
+
+    def test_agent_start_schema_accepts_explicit_stable_name(self) -> None:
+        tool = next(item for item in server_module.TOOLS if item["name"] == "agent_start")
+
+        self.assertEqual(
+            tool["inputSchema"]["properties"]["name"],
+            server_module.text_schema(server_module.MAX_AGENTIN_NAME),
+        )
+
+    def test_call_tool_agent_start_threads_explicit_stable_name(self) -> None:
+        with patch("codex_master.server.agent_ids", return_value=["a1"]), patch(
+            "codex_master.server.require_broad_mutation_confirmation",
+            return_value={"required": False},
+        ), patch(
+            "codex_master.server.call_agent_lifecycle",
+            side_effect=lambda _agent, fn: fn(),
+        ), patch(
+            "codex_master.server._start_agent_with_lease_unlocked",
+            return_value={"agent": "a1", "status": "started"},
+        ) as start:
+            call_tool(
+                "agent_start",
+                {
+                    "agent": "a1",
+                    "prompt": "TASK",
+                    "name": "Seraphina",
+                    "class": "teamleiterin",
+                },
+                principal_class="koenigin",
+            )
+
+        self.assertEqual(start.call_args.kwargs["name"], "Seraphina")
 
     def test_subagent_admission_deny_still_sends_and_audits_effective_permission(self) -> None:
         decision = {
@@ -11006,7 +13911,7 @@ class ServerHelpersTest(unittest.TestCase):
             )
             with patch("codex_master.server.RAW_DIR", Path(tmpdir)), patch(
                 "codex_master.server.read_meta", return_value={"raw_log": str(log_path)}
-            ):
+            ), patch("codex_master.server.tmux_alive", return_value=False):
                 response = handle_rpc(
                     {
                         "jsonrpc": "2.0",
@@ -11209,7 +14114,7 @@ class ServerHelpersTest(unittest.TestCase):
             os.mkfifo(fifo_path)
             with patch("codex_master.server.RAW_DIR", raw_dir), patch(
                 "codex_master.server.read_meta", return_value={"raw_log": str(fifo_path)}
-            ):
+            ), patch("codex_master.server.tmux_alive", return_value=False):
                 response = handle_rpc(
                     {
                         "jsonrpc": "2.0",
@@ -13207,6 +16112,169 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(state["blocked_until_utc"], "2099-01-08T00:00:00+00:00")
         self.assertEqual(state["reason"], "codex usage window exhausted")
 
+    def test_verified_q_weekly_below_threshold_is_shared_block(self) -> None:
+        from codex_master import server as server_module
+
+        snapshot = {
+            "account": "BW_Q",
+            "status": "ok",
+            "captured_at": "2099-01-01T00:00:00+00:00",
+            "backend_used": "app-server",
+            "stale": False,
+            "main": {
+                "windows": [
+                    {
+                        "name": "weekly",
+                        "duration_seconds": 604800,
+                        "remaining": 9.0,
+                        "limit": 100.0,
+                        "percent": 9.0,
+                        "reset_at": "2099-01-08T00:00:00+00:00",
+                    }
+                ]
+            },
+        }
+
+        state = server_module._codex_usage_watchdog_state_from_snapshot(snapshot, now=0, series_prefix="q")
+        decision = server_module.codex_usage_eligibility(
+            state["usage_v2"]["limit_windows"], series_prefix="q", now=0
+        )
+        self.assertFalse(decision["eligible"])
+        self.assertEqual(decision["reason_code"], "q_weekly_remaining_below_threshold")
+        self.assertEqual(decision["remaining_percent"], 9.0)
+        self.assertEqual(decision["threshold_percent"], 10.0)
+        self.assertEqual(decision["blocked_until_utc"], "2099-01-08T00:00:00+00:00")
+        self.assertIn("q-series", decision["fallback_hint"])
+        self.assertEqual(state["state"], "blocked")
+        self.assertEqual(state["reason_code"], decision["reason_code"])
+
+    def test_selection_usage_details_consumes_q_weekly_decision(self) -> None:
+        from codex_master import server as server_module
+
+        snapshot = {
+            "account": "BW_Q",
+            "status": "ok",
+            "captured_at": "2099-01-01T00:00:00+00:00",
+            "backend_used": "app-server",
+            "stale": False,
+            "main": {"windows": [{
+                "name": "weekly", "duration_seconds": 604800,
+                "remaining": 9.0, "limit": 100.0, "percent": 9.0,
+                "reset_at": "2099-01-08T00:00:00+00:00",
+            }]},
+        }
+
+        with patch("codex_master.server.read_codex_usage_snapshot", return_value=snapshot), patch(
+            "codex_master.server.codex_usage_eligibility",
+            wraps=server_module.codex_usage_eligibility,
+        ) as eligibility:
+            details = server_module._selection_usage_details(
+                "BW_Q", "q", {}, now=datetime(2099, 1, 1, tzinfo=timezone.utc)
+            )
+
+        self.assertFalse(details[0])
+        self.assertTrue(details[1])
+        self.assertEqual(eligibility.call_count, 1)
+
+    def test_selection_usage_details_q_weekly_exact_threshold_is_free(self) -> None:
+        from codex_master import server as server_module
+
+        snapshot = {
+            "account": "BW_Q",
+            "status": "ok",
+            "captured_at": "2099-01-01T00:00:00+00:00",
+            "backend_used": "app-server",
+            "stale": False,
+            "main": {"windows": [
+                {"name": "5h", "duration_seconds": 18000, "remaining": 90.0,
+                 "limit": 100.0, "percent": 90.0, "reset_at": "2099-01-01T05:00:00+00:00"},
+                {"name": "weekly", "duration_seconds": 604800, "remaining": 10.0,
+                 "limit": 100.0, "percent": 10.0, "reset_at": "2099-01-08T00:00:00+00:00"},
+            ]},
+        }
+
+        with patch("codex_master.server.read_codex_usage_snapshot", return_value=snapshot):
+            details = server_module._selection_usage_details(
+                "BW_Q", "q", {}, now=datetime(2099, 1, 1, tzinfo=timezone.utc)
+            )
+
+        self.assertTrue(details[0])
+        self.assertFalse(details[1])
+
+    def test_selection_usage_details_non_q_weekly_below_threshold_is_unchanged(self) -> None:
+        from codex_master import server as server_module
+
+        snapshot = {
+            "account": "BW_B",
+            "status": "ok",
+            "captured_at": "2099-01-01T00:00:00+00:00",
+            "backend_used": "app-server",
+            "stale": False,
+            "main": {"windows": [
+                {"name": "5h", "duration_seconds": 18000, "remaining": 90.0,
+                 "limit": 100.0, "percent": 90.0, "reset_at": "2099-01-01T05:00:00+00:00"},
+                {"name": "weekly", "duration_seconds": 604800, "remaining": 9.0,
+                 "limit": 100.0, "percent": 9.0, "reset_at": "2099-01-08T00:00:00+00:00"},
+            ]},
+        }
+
+        with patch("codex_master.server.read_codex_usage_snapshot", return_value=snapshot):
+            details = server_module._selection_usage_details(
+                "BW_B", "b", {}, now=datetime(2099, 1, 1, tzinfo=timezone.utc)
+            )
+
+        self.assertTrue(details[0])
+        self.assertFalse(details[1])
+
+    def test_verified_q_weekly_exact_threshold_is_eligible(self) -> None:
+        from codex_master import server as server_module
+
+        snapshot = {
+            "account": "BW_Q",
+            "status": "ok",
+            "captured_at": "2099-01-01T00:00:00+00:00",
+            "backend_used": "app-server",
+            "stale": False,
+            "main": {
+                "windows": [{
+                    "name": "weekly", "duration_seconds": 604800,
+                    "remaining": 10.0, "limit": 100.0, "percent": 10.0,
+                    "reset_at": "2099-01-08T00:00:00+00:00",
+                }]
+            },
+        }
+
+        state = server_module._codex_usage_watchdog_state_from_snapshot(snapshot, now=0, series_prefix="q")
+        decision = server_module.codex_usage_eligibility(
+            state["usage_v2"]["limit_windows"], series_prefix="q3", now=0
+        )
+        self.assertTrue(decision["eligible"])
+        self.assertIsNone(decision["reason_code"])
+        self.assertFalse(state["blocked"])
+
+    def test_non_q_weekly_below_threshold_keeps_existing_semantics(self) -> None:
+        from codex_master import server as server_module
+
+        snapshot = {
+            "account": "BW_B",
+            "status": "ok",
+            "captured_at": "2099-01-01T00:00:00+00:00",
+            "backend_used": "app-server",
+            "stale": False,
+            "main": {"windows": [{
+                "name": "weekly", "duration_seconds": 604800,
+                "remaining": 9.0, "limit": 100.0, "percent": 9.0,
+                "reset_at": "2099-01-08T00:00:00+00:00",
+            }]},
+        }
+
+        state = server_module._codex_usage_watchdog_state_from_snapshot(snapshot, now=0)
+        decision = server_module.codex_usage_eligibility(
+            state["usage_v2"]["limit_windows"], series_prefix="b1", now=0
+        )
+        self.assertTrue(decision["eligible"])
+        self.assertFalse(state["blocked"])
+
     def test_current_codex_usage_exhausted_past_reset_is_recovered(self) -> None:
         from codex_master import server as server_module
 
@@ -13840,6 +16908,157 @@ class ServerHelpersTest(unittest.TestCase):
         route.assert_called_once_with("a1", role="arbeitsbiene")
         remember.assert_not_called()
 
+    def test_usage_admission_applies_global_policy_to_verified_non_q_usage(self) -> None:
+        from codex_master import server as server_module
+
+        status = _canonical_usage_status()
+        routing = {
+            "account": "BW_B",
+            "decision": "blocked",
+            "reason": "main_limit_at_or_below_threshold",
+            "remaining_percent": 9.0,
+            "threshold_percent": 10.0,
+        }
+        with patch("codex_master.server.codex_usage_watchdog_status", return_value=status), patch(
+            "codex_master.server.agent_auth_status", return_value={"authenticated": True}
+        ), patch("codex_master.server.codex_usage_routing_decision", return_value=routing) as route:
+            with self.assertRaises(AgentError):
+                server_module.ensure_agent_not_blocked_by_codex_usage("b1")
+
+        route.assert_called_once_with("b1", role="arbeitsbiene")
+
+    def test_usage_admission_applies_global_policy_to_verified_q_without_weekly(self) -> None:
+        from codex_master import server as server_module
+
+        status = _canonical_usage_status()
+        status["agent"] = "q1"
+        status["account"] = "BW_Q"
+        status["usage_v2"]["limit_windows"] = [
+            {
+                **status["usage_v2"]["limit_windows"][0],
+                "window_id": "codex_usage_0_five_hour",
+                "budget_key": "codex_usage_five_hour",
+                "window_kind": "rolling_5h",
+            }
+        ]
+        routing = {
+            "account": "BW_Q",
+            "decision": "blocked",
+            "reason": "main_limit_at_or_below_threshold",
+            "remaining_percent": 9.0,
+            "threshold_percent": 10.0,
+        }
+        with patch("codex_master.server.codex_usage_watchdog_status", return_value=status), patch(
+            "codex_master.server.agent_auth_status", return_value={"authenticated": True}
+        ), patch("codex_master.server.codex_usage_routing_decision", return_value=routing) as route, patch(
+            "codex_master.server.remember_agent_usage_account"
+        ):
+            with self.assertRaises(AgentError):
+                server_module.ensure_agent_not_blocked_by_codex_usage("q1")
+
+        route.assert_called_once_with("q1", role="arbeitsbiene")
+
+    def test_unverified_usage_v2_does_not_suppress_fail_closed_routing(self) -> None:
+        routing = {
+            "account": "BW_B",
+            "decision": "blocked",
+            "reason": "main_limit_at_or_below_threshold",
+            "remaining_percent": 9.0,
+            "threshold_percent": 10.0,
+            "blocked_until_utc": "2099-01-08T00:00:00+00:00",
+        }
+        for status in (
+            _canonical_usage_status(confidence="observed"),
+            _canonical_usage_status(windows=[]),
+        ):
+            with self.subTest(status=status["usage_v2"]["limit_windows"]):
+                with patch(
+                    "codex_master.server.agent_auth_status",
+                    return_value={"authenticated": True},
+                ), patch(
+                    "codex_master.server.codex_usage_routing_decision",
+                    return_value=routing,
+                ) as route:
+                    result = server_module.codex_usage_status_with_routing(
+                        "b1", status, force_policy_check=True
+                    )
+
+                self.assertTrue(result["blocked"])
+                self.assertEqual(result["source"], "routing_policy")
+                route.assert_called_once_with("b1", role="arbeitsbiene")
+
+    def test_q_usage_admission_raises_structured_weekly_denial(self) -> None:
+        from codex_master import server as server_module
+
+        status = {
+            "agent": "q1",
+            "account": "BW_Q",
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": "2099-01-08T00:00:00+00:00",
+            "reason": "verified q-series weekly remaining below threshold",
+            "reason_code": "q_weekly_remaining_below_threshold",
+            "remaining_percent": 9.0,
+            "threshold_percent": 10.0,
+            "fallback_hint": "use a non-q series or wait for the verified q-series weekly reset",
+            "usage_v2": {"limit_windows": []},
+            "usage_eligibility": {"eligible": False},
+        }
+        with patch.dict(
+            "codex_master.server.AGENTS",
+            {"q1": {"label": "Q1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-q1"}},
+            clear=True,
+        ), patch("codex_master.server.codex_usage_watchdog_status", return_value=status), patch(
+            "codex_master.server.agent_auth_status", return_value={"authenticated": True}
+        ), patch("codex_master.server.codex_usage_routing_decision") as route:
+            with self.assertRaises(AgentError) as raised:
+                server_module.ensure_agent_not_blocked_by_codex_usage("q1")
+
+        self.assertEqual(raised.exception.payload, {
+            "error_code": "q_weekly_remaining_below_threshold",
+            "reason_code": "q_weekly_remaining_below_threshold",
+            "reason": status["reason"],
+            "blocked_until": status["blocked_until_utc"],
+            "remaining_percent": 9.0,
+            "threshold_percent": 10.0,
+            "fallback_hint": status["fallback_hint"],
+        })
+        route.assert_not_called()
+
+    def test_usage_watchdog_dry_run_preserves_structured_q_marker_fields(self) -> None:
+        blocked_status = {
+            "agent": "q1",
+            "account": "BW_Q",
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": "2099-01-08T00:00:00+00:00",
+            "reason": "verified q-series weekly remaining below threshold",
+            "reason_code": "q_weekly_remaining_below_threshold",
+            "remaining_percent": 9.0,
+            "threshold_percent": 10.0,
+            "fallback_hint": "use a non-q series or wait for the verified q-series weekly reset",
+            "source": "snapshot",
+        }
+        with patch.dict(
+            "codex_master.server.AGENTS",
+            {"q1": {"label": "Q1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-q1"}},
+            clear=True,
+        ), patch("codex_master.server.tmux_alive", return_value=False), patch(
+            "codex_master.server.agent_lease_status",
+            return_value={"state": "unclaimed", "held_by_this_server": False, "raw_output": "not_returned"},
+        ), patch("codex_master.server.codex_usage_status_with_routing", return_value=blocked_status):
+            result = server_module.usage_watchdog_agent("q1", dry_run=True)
+
+        self.assertEqual(result["usage_watchdog_state"], "would_mark")
+        self.assertEqual(
+            {key: result["usage_watchdog"][key] for key in (
+                "reason_code", "remaining_percent", "threshold_percent", "fallback_hint"
+            )},
+            {key: blocked_status[key] for key in (
+                "reason_code", "remaining_percent", "threshold_percent", "fallback_hint"
+            )},
+        )
+
     def test_usage_background_check_does_not_probe_expired_auth_without_force(self) -> None:
         status = {
             "agent": "a2",
@@ -14418,6 +17637,50 @@ class ServerHelpersTest(unittest.TestCase):
         ensure_state.assert_not_called()
         lease_status.assert_called_once_with("a1", initialize_state=False)
         update_marker.assert_not_called()
+
+    def test_usage_watchdog_forces_policy_for_clear_routed_account_dry_run(self) -> None:
+        clear = {
+            "agent": "a1",
+            "account": "synthetic-account",
+            "account_mapping": "routing",
+            "state": "clear",
+            "blocked": False,
+            "blocked_until_utc": None,
+            "usage_v2": {"limit_windows": []},
+            "raw_output": "not_returned",
+        }
+        routing_block = {
+            "account": "synthetic-account",
+            "decision": "blocked",
+            "reason": "main_limit_at_or_below_threshold",
+            "remaining_percent": 2.0,
+            "threshold_percent": 10.0,
+            "blocked_until_utc": "2099-01-01T00:00:00+00:00",
+        }
+        with patch.dict(
+            "codex_master.server.AGENTS",
+            {"a1": {"label": "A1", "runner": Path("/tmp/codex"),
+                    "home": Path("/tmp/a1"), "session": "synthetic-a1"}},
+            clear=True,
+        ), patch("codex_master.server.tmux_alive", return_value=False), patch(
+            "codex_master.server.agent_lease_status",
+            return_value={"state": "unclaimed", "held_by_this_server": False,
+                          "raw_output": "not_returned"},
+        ), patch("codex_master.server.codex_usage_watchdog_status", return_value=clear), patch(
+            "codex_master.server.agent_auth_status", return_value={"authenticated": True},
+        ), patch(
+            "codex_master.server.codex_usage_routing_decision", return_value=routing_block,
+        ) as route, patch("codex_master.server.update_codex_usage_watchdog_marker") as marker:
+            result = usage_watchdog_agent("a1", dry_run=True)
+
+        self.assertEqual(result["usage_watchdog_state"], "would_mark")
+        self.assertEqual(result["action_taken"], "none")
+        self.assertTrue(result["usage_watchdog"]["blocked"])
+        self.assertEqual(result["usage_watchdog"]["source"], "routing_policy")
+        self.assertEqual(result["usage_watchdog"]["remaining_percent"], 2.0)
+        self.assertEqual(result["usage_watchdog"]["threshold_percent"], 10.0)
+        route.assert_called_once_with("a1", role="arbeitsbiene")
+        marker.assert_not_called()
 
     def test_usage_watchdog_resolves_unmapped_account_before_marking(self) -> None:
         missing = {
@@ -15797,6 +19060,384 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(summary["external_process_count"], 0)
         self.assertEqual(summary["external_processes"], [])
 
+    def test_agent_home_process_summary_ignores_exact_reparented_session_helpers(self) -> None:
+        helpers = (
+            ("101", "/usr/bin/dbus-daemon", ("/usr/bin/dbus-daemon", "--session")),
+            (
+                "102",
+                "/usr/bin/gnome-keyring-daemon",
+                (
+                    "/usr/bin/gnome-keyring-daemon",
+                    "--start",
+                    "--foreground",
+                    "--components=secrets",
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home = root / "agent-home"
+            home.mkdir()
+            proc_root = root / "proc"
+            managed = proc_root / "100"
+            managed.mkdir(parents=True)
+            managed.joinpath("environ").write_bytes(
+                f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0".encode("utf-8")
+            )
+            managed.joinpath("status").write_text(
+                "Name:\tcodex\nState:\tS (sleeping)\nPPid:\t1\n",
+                encoding="utf-8",
+            )
+            for pid, executable, argv in helpers:
+                process = proc_root / pid
+                process.mkdir()
+                process.joinpath("environ").write_bytes(
+                    f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0CODEX_MASTER_MCP=1\0".encode("utf-8")
+                )
+                process.joinpath("status").write_text(
+                    f"Name:\t{Path(executable).name}\nState:\tS (sleeping)\nPPid:\t1\n",
+                    encoding="utf-8",
+                )
+                process.joinpath("cmdline").write_bytes(
+                    b"\0".join(item.encode("utf-8") for item in argv) + b"\0"
+                )
+                process.joinpath("exe").symlink_to(executable)
+                process.joinpath("cwd").symlink_to("/", target_is_directory=True)
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                summary = agent_home_process_summary("a", proc_root)
+                guard = agent_identity_guard(True, summary, pane_process_id=100)
+
+        self.assertEqual(summary["process_count"], 1)
+        self.assertEqual(summary["managed_process_count"], 1)
+        self.assertEqual(summary["managed_process_ids"], [100])
+        self.assertEqual(summary["managed_root_process_ids"], [100])
+        self.assertEqual(summary["external_process_count"], 0)
+        self.assertEqual(summary["external_processes"], [])
+        self.assertTrue(guard["ok"])
+        self.assertEqual(guard["state"], "managed_session_running")
+
+    def test_agent_home_process_summary_ignores_live_helpers_reparented_to_user_systemd(self) -> None:
+        helpers = (
+            (
+                "201",
+                "/usr/bin/dbus-daemon",
+                (
+                    "/usr/bin/dbus-daemon",
+                    "--syslog-only",
+                    "--fork",
+                    "--print-pid",
+                    "5",
+                    "--print-address",
+                    "7",
+                    "--session",
+                ),
+            ),
+            (
+                "202",
+                "/usr/bin/gnome-keyring-daemon",
+                (
+                    "/usr/bin/gnome-keyring-daemon",
+                    "--start",
+                    "--foreground",
+                    "--components=secrets",
+                ),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            home = root / "agent-home"
+            home.mkdir()
+            proc_root = root / "proc"
+            managed = proc_root / "100"
+            managed.mkdir(parents=True)
+            managed.joinpath("environ").write_bytes(
+                f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0".encode("utf-8")
+            )
+            managed.joinpath("status").write_text(
+                "Name:\tcodex\nState:\tS (sleeping)\nPPid:\t1\n",
+                encoding="utf-8",
+            )
+            parent = proc_root / "200"
+            parent.mkdir()
+            parent.joinpath("environ").write_bytes(b"")
+            parent.joinpath("status").write_text(
+                "Name:\tsystemd\nState:\tS (sleeping)\nPPid:\t1\n",
+                encoding="utf-8",
+            )
+            parent.joinpath("cmdline").write_bytes(
+                b"/usr/lib/systemd/systemd\0--user\0"
+            )
+            for pid, executable, argv in helpers:
+                process = proc_root / pid
+                process.mkdir()
+                process.joinpath("environ").write_bytes(
+                    f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0CODEX_MASTER_MCP=1\0".encode("utf-8")
+                )
+                process.joinpath("status").write_text(
+                    f"Name:\t{Path(executable).name}\nState:\tS (sleeping)\nPPid:\t200\n",
+                    encoding="utf-8",
+                )
+                process.joinpath("cmdline").write_bytes(
+                    b"\0".join(item.encode("utf-8") for item in argv) + b"\0"
+                )
+                process.joinpath("exe").symlink_to(executable)
+                process.joinpath("cwd").symlink_to("/", target_is_directory=True)
+            with patch.dict(
+                "codex_master.server.AGENTS",
+                {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                clear=False,
+            ):
+                summary = agent_home_process_summary("a", proc_root)
+                guard = agent_identity_guard(True, summary, pane_process_id=100)
+
+        self.assertEqual(summary["process_count"], 1)
+        self.assertEqual(summary["managed_process_count"], 1)
+        self.assertEqual(summary["managed_process_ids"], [100])
+        self.assertEqual(summary["managed_root_process_ids"], [100])
+        self.assertEqual(summary["external_process_count"], 0)
+        self.assertTrue(guard["ok"])
+        self.assertEqual(guard["state"], "managed_session_running")
+
+    def test_agent_home_process_summary_keeps_non_exact_home_users_external(self) -> None:
+        cases = (
+            (
+                "independent-codex",
+                "node",
+                "/usr/bin/node",
+                ("/usr/bin/node", "/usr/local/lib/node_modules/@openai/codex/bin/codex.js"),
+                "home",
+                1,
+                False,
+            ),
+            ("unknown-process", "sleep", "/usr/bin/sleep", ("/usr/bin/sleep", "60"), "root", 1, False),
+            (
+                "helper-cwd-in-home",
+                "dbus-daemon",
+                "/usr/bin/dbus-daemon",
+                ("/usr/bin/dbus-daemon", "--session"),
+                "home",
+                1,
+                True,
+            ),
+            (
+                "helper-not-reparented",
+                "dbus-daemon",
+                "/usr/bin/dbus-daemon",
+                ("/usr/bin/dbus-daemon", "--session"),
+                "root",
+                77,
+                True,
+            ),
+            (
+                "helper-same-basename-wrong-exe",
+                "dbus-daemon",
+                "fake",
+                ("/usr/bin/dbus-daemon", "--session"),
+                "root",
+                1,
+                True,
+            ),
+            (
+                "helper-wrong-argv",
+                "dbus-daemon",
+                "/usr/bin/dbus-daemon",
+                ("/usr/bin/dbus-daemon", "--session", "--unexpected"),
+                "root",
+                1,
+                True,
+            ),
+        )
+        for case_name, name, executable, argv, cwd_kind, ppid, strong_markers in cases:
+            with self.subTest(case=case_name), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                home = root / "agent-home"
+                home.mkdir()
+                fake_executable = root / "bin" / "dbus-daemon"
+                fake_executable.parent.mkdir()
+                fake_executable.write_text("not the system helper\n", encoding="utf-8")
+                proc_root = root / "proc"
+                process = proc_root / "100"
+                process.mkdir(parents=True)
+                process.joinpath("environ").write_bytes(
+                    (
+                        f"CODEX_HOME={home}\0"
+                        + ("CODEX_AGENT_MCP=1\0CODEX_MASTER_MCP=1\0" if strong_markers else "")
+                    ).encode("utf-8")
+                )
+                process.joinpath("status").write_text(
+                    f"Name:\t{name}\nState:\tS (sleeping)\nPPid:\t{ppid}\n",
+                    encoding="utf-8",
+                )
+                process.joinpath("cmdline").write_bytes(
+                    b"\0".join(item.encode("utf-8") for item in argv) + b"\0"
+                )
+                process.joinpath("exe").symlink_to(
+                    fake_executable if executable == "fake" else executable
+                )
+                process.joinpath("cwd").symlink_to(
+                    home if cwd_kind == "home" else "/",
+                    target_is_directory=True,
+                )
+                with patch.dict(
+                    "codex_master.server.AGENTS",
+                    {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                    clear=False,
+                ):
+                    summary = agent_home_process_summary("a", proc_root)
+                    guard = agent_identity_guard(False, summary)
+
+            self.assertEqual(summary["process_count"], 1)
+            self.assertEqual(summary["external_process_count"], 1)
+            self.assertFalse(guard["ok"])
+            self.assertEqual(guard["state"], "blocked_external_home_user")
+
+    def test_agent_home_process_summary_keeps_helpers_with_incomplete_proc_evidence_external(self) -> None:
+        for missing_evidence in ("exe", "argv", "cwd", "unresolvable_exe"):
+            with self.subTest(missing_evidence=missing_evidence), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                home = root / "agent-home"
+                home.mkdir()
+                proc_root = root / "proc"
+                process = proc_root / "100"
+                process.mkdir(parents=True)
+                process.joinpath("environ").write_bytes(
+                    f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0CODEX_MASTER_MCP=1\0".encode("utf-8")
+                )
+                process.joinpath("status").write_text(
+                    "Name:\tdbus-daemon\nState:\tS (sleeping)\nPPid:\t1\n",
+                    encoding="utf-8",
+                )
+                if missing_evidence != "argv":
+                    process.joinpath("cmdline").write_bytes(
+                        b"/usr/bin/dbus-daemon\0--session\0"
+                    )
+                if missing_evidence == "unresolvable_exe":
+                    process.joinpath("exe").symlink_to("exe")
+                elif missing_evidence != "exe":
+                    process.joinpath("exe").symlink_to("/usr/bin/dbus-daemon")
+                if missing_evidence != "cwd":
+                    process.joinpath("cwd").symlink_to("/", target_is_directory=True)
+                with patch.dict(
+                    "codex_master.server.AGENTS",
+                    {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                    clear=False,
+                ):
+                    summary = agent_home_process_summary("a", proc_root)
+                    guard = agent_identity_guard(False, summary)
+
+            self.assertEqual(summary["process_count"], 1)
+            self.assertEqual(summary["external_process_count"], 1)
+            self.assertFalse(guard["ok"])
+            self.assertEqual(guard["state"], "blocked_external_home_user")
+
+    def test_agent_home_process_summary_requires_both_markers_for_direct_helpers(self) -> None:
+        environments = (
+            "CODEX_AGENT_MCP=1\0",
+            "CODEX_MASTER_MCP=1\0",
+            "",
+        )
+        for markers in environments:
+            with self.subTest(markers=markers), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                home = root / "agent-home"
+                home.mkdir()
+                proc_root = root / "proc"
+                process = proc_root / "100"
+                process.mkdir(parents=True)
+                process.joinpath("environ").write_bytes(
+                    f"CODEX_HOME={home}\0{markers}".encode("utf-8")
+                )
+                process.joinpath("status").write_text(
+                    "Name:\tdbus-daemon\nState:\tS (sleeping)\nPPid:\t1\n",
+                    encoding="utf-8",
+                )
+                process.joinpath("cmdline").write_bytes(
+                    b"/usr/bin/dbus-daemon\0--session\0"
+                )
+                process.joinpath("exe").symlink_to("/usr/bin/dbus-daemon")
+                process.joinpath("cwd").symlink_to("/", target_is_directory=True)
+                with patch.dict(
+                    "codex_master.server.AGENTS",
+                    {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                    clear=False,
+                ):
+                    summary = agent_home_process_summary("a", proc_root)
+                    guard = agent_identity_guard(False, summary)
+
+            self.assertEqual(summary["process_count"], 1)
+            self.assertEqual(summary["external_process_count"], 1)
+            self.assertFalse(guard["ok"])
+            self.assertEqual(guard["state"], "blocked_external_home_user")
+
+    def test_agent_home_process_summary_requires_exact_user_systemd_parent_evidence(self) -> None:
+        parent_cases = (
+            ("missing-parent", None, None, None),
+            ("wrong-name", "systemd-user", ("/usr/lib/systemd/systemd", "--user"), 1),
+            ("wrong-argv", "systemd", ("/usr/lib/systemd/systemd", "--system"), 1),
+            ("wrong-ppid", "systemd", ("/usr/lib/systemd/systemd", "--user"), 2),
+            ("unreadable-cmdline", "systemd", None, 1),
+        )
+        live_argv = (
+            "/usr/bin/dbus-daemon",
+            "--syslog-only",
+            "--fork",
+            "--print-pid",
+            "5",
+            "--print-address",
+            "7",
+            "--session",
+        )
+        for case_name, parent_name, parent_argv, parent_ppid in parent_cases:
+            with self.subTest(case=case_name), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                home = root / "agent-home"
+                home.mkdir()
+                proc_root = root / "proc"
+                helper = proc_root / "201"
+                helper.mkdir(parents=True)
+                helper.joinpath("environ").write_bytes(
+                    f"CODEX_HOME={home}\0CODEX_AGENT_MCP=1\0CODEX_MASTER_MCP=1\0".encode("utf-8")
+                )
+                helper.joinpath("status").write_text(
+                    "Name:\tdbus-daemon\nState:\tS (sleeping)\nPPid:\t200\n",
+                    encoding="utf-8",
+                )
+                helper.joinpath("cmdline").write_bytes(
+                    b"\0".join(item.encode("utf-8") for item in live_argv) + b"\0"
+                )
+                helper.joinpath("exe").symlink_to("/usr/bin/dbus-daemon")
+                helper.joinpath("cwd").symlink_to("/", target_is_directory=True)
+                if parent_name is not None:
+                    parent = proc_root / "200"
+                    parent.mkdir()
+                    parent.joinpath("environ").write_bytes(b"")
+                    parent.joinpath("status").write_text(
+                        f"Name:\t{parent_name}\nState:\tS (sleeping)\nPPid:\t{parent_ppid}\n",
+                        encoding="utf-8",
+                    )
+                    if case_name == "unreadable-cmdline":
+                        parent.joinpath("cmdline").mkdir()
+                    elif parent_argv is not None:
+                        parent.joinpath("cmdline").write_bytes(
+                            b"\0".join(item.encode("utf-8") for item in parent_argv) + b"\0"
+                        )
+                with patch.dict(
+                    "codex_master.server.AGENTS",
+                    {"a": {"label": "A", "runner": home / "codex", "home": home, "session": "session-a"}},
+                    clear=False,
+                ):
+                    summary = agent_home_process_summary("a", proc_root)
+                    guard = agent_identity_guard(False, summary)
+
+            self.assertEqual(summary["process_count"], 1)
+            self.assertEqual(summary["external_process_count"], 1)
+            self.assertFalse(guard["ok"])
+            self.assertEqual(guard["state"], "blocked_external_home_user")
+
     def test_agent_home_process_summary_rejects_spoofed_managed_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -17095,7 +20736,7 @@ class ServerHelpersTest(unittest.TestCase):
         mock_start_agent.return_value = {
             "agent": "a",
             "status": "already_running",
-            "meta": {"model": DEFAULT_AGENT_MODEL},
+            "meta": {"model": WRITE_AGENT_MODEL, "model_reasoning_effort": WRITE_AGENT_MODEL_EFFORT},
             "raw_output": "not_returned",
         }
 
@@ -17828,8 +21469,9 @@ class ServerHelpersTest(unittest.TestCase):
             "hi",
             lease={"state": "held", "held_by_this_server": True},
             release_lease_on_failure=True,
-            model=WRITE_AGENT_MODEL,
-            model_reasoning_effort="low",
+            model="gpt-5.6-luna",
+            model_reasoning_effort="medium",
+            agent_class="arbeitsbiene",
         )
 
     @patch("codex_master.server.applet_status")
@@ -17860,7 +21502,17 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "started")
         self.assertEqual(events, ["lock", "unlock"])
-        mock_unlocked.assert_called_once_with("a1", None, None, allow_unauthenticated=True)
+        mock_unlocked.assert_called_once_with(
+            "a1",
+            None,
+            None,
+            allow_unauthenticated=True,
+            agent_class=None,
+            lifecycle=None,
+            model=None,
+            reasoning_effort=None,
+            complexity="unknown",
+        )
 
     @patch("codex_master.server._start_agent_unlocked", return_value={"status": "started"})
     @patch("codex_master.server.agent_lifecycle_lock")
@@ -17897,6 +21549,7 @@ class ServerHelpersTest(unittest.TestCase):
             True,
             WRITE_AGENT_MODEL,
             "low",
+            None,
         )
 
     @patch("codex_master.server._assign_agent_unlocked", return_value={"status": "assigned"})
@@ -18705,8 +22358,8 @@ class ServerHelpersTest(unittest.TestCase):
             new_session_calls = [call for call in mock_run_tmux.call_args_list if call.args[0][0] == "new-session"]
             self.assertEqual(len(new_session_calls), 1)
             start_command = new_session_calls[0].args[0][-1]
-            self.assertIn("--model gpt-5.4-mini", start_command)
-            self.assertIn('model="gpt-5.4-mini"', start_command)
+            self.assertIn(f"--model {DEFAULT_AGENT_MODEL}", start_command)
+            self.assertIn(f'model="{DEFAULT_AGENT_MODEL}"', start_command)
             self.assertIn('model_reasoning_effort="medium"', start_command)
             kill_calls = [call for call in mock_run_tmux.call_args_list if call.args[0][0] == "kill-session"]
             self.assertEqual(len(kill_calls), 1)
@@ -19334,7 +22987,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn(str(real_parent), str(raised.exception))
         self.assertFalse(redirected_target.exists())
 
-    @patch("codex_master.server.subprocess.run")
+    @patch("codex_master.server._run_bounded_command")
     def test_worktree_create_pins_parent_before_git_call(self, mock_subprocess_run) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -19536,7 +23189,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn(str(link_dir), str(raised.exception))
         self.assertNotIn(str(real_dir), str(raised.exception))
 
-    @patch("codex_master.server.subprocess.run")
+    @patch("codex_master.server._run_bounded_command")
     def test_worktree_status_pins_target_before_git_call(self, mock_subprocess_run) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -19888,7 +23541,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(capabilities["result"]["isError"])
         capability_payload = json.loads(capabilities["result"]["content"][0]["text"])["results"][0]
-        self.assertEqual(capability_payload["models"]["default"], "gpt-5.4-mini")
+        self.assertEqual(capability_payload["models"]["default"], DEFAULT_AGENT_MODEL)
         self.assertEqual(capability_payload["models"]["write"], "gpt-5.3-codex-spark")
         self.assertEqual(capability_payload["master_mcp_tools"], "not_configured_for_agent")
         self.assertEqual(capability_payload["plugin_count"], 26)
@@ -19995,6 +23648,225 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertNotIn("ASSIGNMENT_PROMPT_SHOULD_NOT_LEAK", payload_text)
 
     @patch("codex_master.server.ensure_state")
+    def test_assignment_selection_round_trip_is_datensparsam(self, _mock_ensure_state) -> None:
+        selection = {
+            "schema_version": 1,
+            "class": "arbeitsbiene",
+            "lifecycle": "ephemeral",
+            "model": "gpt-5.6-luna",
+            "reasoning": "medium",
+            "requested": {
+                "class": "arbeitsbiene",
+                "lifecycle": "invocation",
+                "model": "gpt-5.3-codex-spark",
+                "reasoning": "low",
+                "secret": "SELECTION_REQUESTED_SECRET_SHOULD_NOT_LEAK",
+            },
+            "fallback": True,
+            "reason_codes": ["requested_model_capability_mismatch", "selection_secret"],
+            "raw_output": "SELECTION_RAW_PROVIDER_DATA_SHOULD_NOT_LEAK",
+            "selection_secret": "SELECTION_SECRET_SHOULD_NOT_LEAK",
+        }
+        expected_selection = {
+            "schema_version": 1,
+            "class": "arbeitsbiene",
+            "lifecycle": "ephemeral",
+            "model": "gpt-5.6-luna",
+            "reasoning": "medium",
+            "requested": {
+                "class": "arbeitsbiene",
+                "lifecycle": "invocation",
+                "model": "gpt-5.3-codex-spark",
+                "reasoning": "low",
+            },
+            "fallback": True,
+            "reason_codes": ["requested_model_capability_mismatch"],
+            "raw_output": "not_returned",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assignment_log = Path(tmpdir) / "assignments.jsonl"
+            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+                record_assignment(
+                    {
+                        "assignment_id": "selection-round-trip-a",
+                        "agent": "a",
+                        "selection": selection,
+                        "task": "TASK_SHOULD_NOT_LEAK",
+                        "prompt": "PROMPT_SHOULD_NOT_LEAK",
+                        "scope": ["/home/teladi/private/repo"],
+                        "write_paths": ["/home/teladi/private/repo/file.py"],
+                        "provider_payload": "RAW_PROVIDER_DATA_SHOULD_NOT_LEAK",
+                    }
+                )
+                listed = list_assignments("a", limit=10)
+
+        record = listed["records"][0]
+        self.assertEqual(record["selection"], expected_selection)
+        payload_text = json.dumps(listed, sort_keys=True)
+        for secret in (
+            "TASK_SHOULD_NOT_LEAK",
+            "PROMPT_SHOULD_NOT_LEAK",
+            "/home/teladi/private/repo",
+            "RAW_PROVIDER_DATA_SHOULD_NOT_LEAK",
+            "SELECTION_REQUESTED_SECRET_SHOULD_NOT_LEAK",
+            "SELECTION_RAW_PROVIDER_DATA_SHOULD_NOT_LEAK",
+            "SELECTION_SECRET_SHOULD_NOT_LEAK",
+        ):
+            self.assertNotIn(secret, payload_text)
+
+    @patch("codex_master.server.ensure_state")
+    def test_assignment_selection_discards_untrusted_required_and_requested_values(
+        self, _mock_ensure_state
+    ) -> None:
+        selection = {
+            "schema_version": 1,
+            "class": "UNTRUSTED_TASK_PAYLOAD",
+            "lifecycle": "UNTRUSTED_PROMPT_PAYLOAD",
+            "model": "UNTRUSTED_PROVIDER_DATA",
+            "reasoning": "UNTRUSTED_RAW_DATA",
+            "requested": {
+                "class": "UNTRUSTED_REQUESTED_TASK",
+                "lifecycle": "UNTRUSTED_REQUESTED_PROMPT",
+                "model": "UNTRUSTED_REQUESTED_PROVIDER",
+                "reasoning": "UNTRUSTED_REQUESTED_RAW",
+            },
+            "fallback": True,
+            "reason_codes": ["requested_model_unknown"],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assignment_log = Path(tmpdir) / "assignments.jsonl"
+            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+                record_assignment(
+                    {
+                        "assignment_id": "selection-adversarial-a",
+                        "agent": "a",
+                        "selection": selection,
+                        "task": "UNTRUSTED_TASK_PAYLOAD",
+                        "prompt": "UNTRUSTED_PROMPT_PAYLOAD",
+                        "provider_payload": "UNTRUSTED_PROVIDER_DATA",
+                    }
+                )
+                listed = list_assignments("a", limit=10)
+
+        record = listed["records"][0]
+        self.assertNotIn("selection", record)
+        payload_text = json.dumps(listed, sort_keys=True)
+        for secret in (
+            "UNTRUSTED_TASK_PAYLOAD",
+            "UNTRUSTED_PROMPT_PAYLOAD",
+            "UNTRUSTED_PROVIDER_DATA",
+            "UNTRUSTED_RAW_DATA",
+            "UNTRUSTED_REQUESTED_TASK",
+            "UNTRUSTED_REQUESTED_PROMPT",
+            "UNTRUSTED_REQUESTED_PROVIDER",
+            "UNTRUSTED_REQUESTED_RAW",
+        ):
+            self.assertNotIn(secret, payload_text)
+
+    @patch("codex_master.server.ensure_state")
+    def test_assignment_selection_omits_unknown_requested_model_but_keeps_reason(
+        self, _mock_ensure_state
+    ) -> None:
+        selection = {
+            "schema_version": 1,
+            "class": "arbeitsbiene",
+            "lifecycle": "ephemeral",
+            "model": "gpt-5.6-luna",
+            "reasoning": "medium",
+            "requested": {
+                "class": "arbeitsbiene",
+                "lifecycle": "invocation",
+                "model": "gpt-5.4-mini",
+                "reasoning": "low",
+            },
+            "fallback": True,
+            "reason_codes": ["requested_model_unknown"],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assignment_log = Path(tmpdir) / "assignments.jsonl"
+            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+                record_assignment({"assignment_id": "selection-unknown-model-a", "agent": "a", "selection": selection})
+                listed = list_assignments("a", limit=10)
+
+        safe_selection = listed["records"][0]["selection"]
+        self.assertNotIn("model", safe_selection["requested"])
+        self.assertEqual(safe_selection["requested"]["lifecycle"], "invocation")
+        self.assertEqual(safe_selection["reason_codes"], ["requested_model_unknown"])
+        self.assertNotIn("gpt-5.4-mini", json.dumps(listed, sort_keys=True))
+
+    @patch("codex_master.server.ensure_state")
+    def test_assignment_selection_drops_reasoning_without_requested_model(self, _mock_ensure_state) -> None:
+        selection = {
+            "schema_version": 1,
+            "class": "arbeitsbiene",
+            "lifecycle": "ephemeral",
+            "model": "gpt-5.6-luna",
+            "reasoning": "medium",
+            "requested": {
+                "class": "arbeitsbiene",
+                "lifecycle": "invocation",
+                "model": None,
+                "reasoning": "max",
+            },
+            "fallback": True,
+            "reason_codes": ["model_defaulted"],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assignment_log = Path(tmpdir) / "assignments.jsonl"
+            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+                record_assignment({"assignment_id": "selection-no-requested-model-a", "agent": "a", "selection": selection})
+                listed = list_assignments("a", limit=10)
+
+        safe_selection = listed["records"][0]["selection"]
+        self.assertIsNone(safe_selection["requested"]["model"])
+        self.assertNotIn("reasoning", safe_selection["requested"])
+        self.assertEqual(safe_selection["reason_codes"], ["model_defaulted"])
+
+    @patch("codex_master.server.ensure_state")
+    def test_assignment_selection_drops_reasoning_for_unknown_requested_model(self, _mock_ensure_state) -> None:
+        selection = {
+            "schema_version": 1,
+            "class": "arbeitsbiene",
+            "lifecycle": "ephemeral",
+            "model": "gpt-5.6-luna",
+            "reasoning": "medium",
+            "requested": {
+                "class": "arbeitsbiene",
+                "lifecycle": "invocation",
+                "model": "gpt-5.4-mini",
+                "reasoning": "max",
+            },
+            "fallback": True,
+            "reason_codes": ["requested_model_unknown"],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            assignment_log = Path(tmpdir) / "assignments.jsonl"
+            with patch("codex_master.server.ASSIGNMENT_LOG", assignment_log):
+                record_assignment({"assignment_id": "selection-unknown-model-reasoning-a", "agent": "a", "selection": selection})
+                listed = list_assignments("a", limit=10)
+
+        safe_selection = listed["records"][0]["selection"]
+        self.assertNotIn("model", safe_selection["requested"])
+        self.assertNotIn("reasoning", safe_selection["requested"])
+        self.assertEqual(safe_selection["reason_codes"], ["requested_model_unknown"])
+        self.assertNotIn("gpt-5.4-mini", json.dumps(listed, sort_keys=True))
+
+    @patch("codex_master.server.load_agent_class_catalog", side_effect=RuntimeError("catalog unavailable"))
+    def test_assignment_selection_fails_closed_on_catalog_error(self, _mock_load_catalog) -> None:
+        self.assertIsNone(
+            server_module._sanitize_assignment_selection(
+                {
+                    "schema_version": 1,
+                    "class": "arbeitsbiene",
+                    "lifecycle": "ephemeral",
+                    "model": "gpt-5.6-luna",
+                    "reasoning": "medium",
+                }
+            )
+        )
+
+    @patch("codex_master.server.ensure_state")
     def test_list_assignments_rejects_invalid_limits(self, _mock_ensure_state) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             assignment_log = Path(tmpdir) / "assignments.jsonl"
@@ -20099,7 +23971,7 @@ class ServerHelpersTest(unittest.TestCase):
         assignment_id = payload["assignment_id"]
         self.assertEqual(payload["status"], "assigned")
         self.assertEqual(payload["role"], "exploriererin")
-        self.assertEqual(payload["model"], WRITE_AGENT_MODEL)
+        self.assertEqual(payload["model"], "gpt-5.6-luna")
         self.assertEqual(payload["write_policy"], "read_only")
         self.assertFalse(payload["subagents_allowed"])
         self.assertEqual(payload["skill"]["requested"], "codex-security:security-scan")
@@ -20115,7 +23987,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(sent_agent, "a")
         self.assertTrue(sent_enter)
         self.assertIn("[EXPLORER_BEE_TASK]", sent_prompt)
-        self.assertIn(f"Modell: {WRITE_AGENT_MODEL}", sent_prompt)
+        self.assertIn("Modell: gpt-5.6-luna", sent_prompt)
         self.assertIn("Skill: codex-security:security-scan", sent_prompt)
         self.assertIn("Darf schreiben: nein", sent_prompt)
         self.assertIn("Darf eigene Subagentinnen starten: nein", sent_prompt)
@@ -20129,7 +24001,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(record["assignment_id"], assignment_id)
         self.assertEqual(record["agent"], "a")
         self.assertEqual(record["role"], "exploriererin")
-        self.assertEqual(record["model"], WRITE_AGENT_MODEL)
+        self.assertEqual(record["model"], "gpt-5.6-luna")
         self.assertEqual(record["scope"], ["src/codex_master/server.py"])
         self.assertEqual(record["write_policy"], "read_only")
         self.assertFalse(record["allow_subagents"])
@@ -20601,12 +24473,13 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.run_tmux",
                 return_value=subprocess.CompletedProcess(["tmux"], 0, "", ""),
             ), patch("codex_master.server.start_agent", return_value={"status": "started"}) as start:
-                result = ensure_assignment_session_model(
+                with patch("codex_master.server.reserve_managed_replacement", return_value={"allowed": True, "reservation_id": "res-model"}), patch("codex_master.server.complete_managed_replacement"):
+                    result = ensure_assignment_session_model(
                     "a",
                     model=WRITE_AGENT_MODEL,
                     reasoning_effort="low",
                     lease=lease,
-                )
+                    )
 
         self.assertEqual(result["status"], "restarted")
         self.assertEqual(start.call_args.kwargs["model"], WRITE_AGENT_MODEL)
@@ -20645,6 +24518,261 @@ class ServerHelpersTest(unittest.TestCase):
                     )
                 tmux.assert_not_called()
 
+    def test_model_switch_uses_bound_replacement_reservation_without_new_capacity(self) -> None:
+        lease = {"state": "held", "holder": "test", "held_by_this_server": True}
+        events: list[str] = []
+        @contextlib.contextmanager
+        def recording_spawn_lock() -> Any:
+            events.append("lock_enter")
+            try:
+                yield
+            finally:
+                events.append("lock_exit")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            agent = {"label": "Q3", "runner": home / "codex", "home": home, "session": "q3-session"}
+            with patch.dict("codex_master.server.AGENTS", {"q3": agent}, clear=False), patch(
+                "codex_master.server.tmux_alive", return_value=True
+            ), patch("codex_master.server.require_managed_tmux_session", return_value={"ok": True}), patch("codex_master.server.read_meta", return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(home)}), patch(
+                "codex_master.server.status_agent", return_value={"response_state": {"state": "running_idle"}}
+            ), patch("codex_master.server.spawn_admission_lock", recording_spawn_lock), patch("codex_master.server.reserve_managed_replacement", side_effect=lambda session: events.append("reserve") or {"allowed": True, "reservation_id": "res-token"}), patch(
+                "codex_master.server.run_tmux", side_effect=lambda *args, **kwargs: events.append("kill") or subprocess.CompletedProcess(["tmux"], 0, "", "")
+            ), patch("codex_master.server.start_agent", side_effect=lambda *args, **kwargs: events.append("start") or {"status": "started"}), patch(
+                "codex_master.server.complete_managed_replacement", side_effect=lambda *args, **kwargs: events.append("complete")
+            ) as complete:
+                result = ensure_assignment_session_model("q3", model=WRITE_AGENT_MODEL, reasoning_effort="low", lease=lease)
+        self.assertEqual(result["status"], "restarted")
+        self.assertLess(events.index("lock_enter"), events.index("reserve"))
+        self.assertLess(events.index("reserve"), events.index("kill"))
+        self.assertLess(events.index("kill"), events.index("start"))
+        self.assertLess(events.index("start"), events.index("complete"))
+        self.assertGreater(events.index("lock_exit"), events.index("complete"))
+        self.assertEqual(complete.call_args.kwargs["reservation_id"], "res-token")
+
+    def test_model_switch_start_failure_leaves_replacement_reserved_until_ttl(self) -> None:
+        lease = {"state": "held", "holder": "test", "held_by_this_server": True}
+        events: list[str] = []
+
+        @contextlib.contextmanager
+        def recording_spawn_lock() -> Any:
+            events.append("lock_enter")
+            try:
+                yield
+            finally:
+                events.append("lock_exit")
+
+        def failed_start(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            events.append("start_failure")
+            raise AgentError("simulated replacement start failure")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            agent = {"label": "Q3", "runner": home / "codex", "home": home, "session": "q3-session"}
+            with patch.dict("codex_master.server.AGENTS", {"q3": agent}, clear=False), patch(
+                "codex_master.server.tmux_alive", return_value=True
+            ), patch("codex_master.server.require_managed_tmux_session", return_value={"ok": True}), patch(
+                "codex_master.server.read_meta", return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(home)}
+            ), patch("codex_master.server.status_agent", return_value={"response_state": {"state": "running_idle"}}), patch(
+                "codex_master.server.spawn_admission_lock", recording_spawn_lock
+            ), patch(
+                "codex_master.server.reserve_managed_replacement",
+                side_effect=lambda session: events.append("reserve") or {"allowed": True, "reservation_id": "res-token"},
+            ), patch(
+                "codex_master.server.run_tmux",
+                side_effect=lambda *args, **kwargs: events.append("kill")
+                or subprocess.CompletedProcess(["tmux"], 0, "", ""),
+            ), patch("codex_master.server.start_agent", side_effect=failed_start), patch(
+                "codex_master.server.complete_managed_replacement"
+            ) as complete:
+                with self.assertRaisesRegex(AgentError, "simulated replacement start failure"):
+                    ensure_assignment_session_model("q3", model=WRITE_AGENT_MODEL, reasoning_effort="low", lease=lease)
+
+        self.assertLess(events.index("lock_enter"), events.index("reserve"))
+        self.assertLess(events.index("reserve"), events.index("kill"))
+        self.assertLess(events.index("kill"), events.index("start_failure"))
+        self.assertLess(events.index("start_failure"), events.index("lock_exit"))
+        complete.assert_not_called()
+
+    def test_model_switch_holds_spawn_lock_against_concurrent_native_reservation(self) -> None:
+        lease = {"state": "held", "holder": "test", "held_by_this_server": True}
+        parent_session = "019fc541-a1e2-7a63-a4bf-b307fcb78457"
+        kill_entered = threading.Event()
+        release_kill = threading.Event()
+        b_done = threading.Event()
+        a_result: list[Any] = []
+        b_result: list[Any] = []
+        errors: list[BaseException] = []
+        events: list[str] = []
+
+        def kill_and_wait(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            events.append("kill")
+            kill_entered.set()
+            self.assertTrue(release_kill.wait(1.0))
+            return subprocess.CompletedProcess(["tmux"], 0, "", "")
+
+        def run_switch() -> None:
+            try:
+                a_result.append(
+                    ensure_assignment_session_model(
+                        "q3", model=WRITE_AGENT_MODEL, reasoning_effort="low", lease=lease
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        def run_native_reservation() -> None:
+            try:
+                b_result.append(
+                    server_module.reserve_native_agent_spawn(
+                        {
+                            "hook_event_name": "PreToolUse",
+                            "tool_name": "spawn_agent",
+                            "tool_input": {"task": "parallel"},
+                            "session_id": parent_session,
+                            "cwd": "/tmp",
+                        }
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+            finally:
+                b_done.set()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "state"
+            record_path = root / "native-agents.json"
+            lock_path = root / "locks" / "native.lock"
+            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "codex_master.server.time.time", return_value=1_000.0
+            ), patch.dict(
+                "codex_master.server.AGENTS",
+                {"q3": {"label": "Q3", "runner": root / "codex", "home": root, "session": "q3-session"}},
+                clear=False,
+            ), patch("codex_master.server.tmux_alive", return_value=True), patch(
+                "codex_master.server.require_managed_tmux_session", return_value={"ok": True}
+            ), patch("codex_master.server.read_meta", return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(root)}), patch(
+                "codex_master.server.status_agent", return_value={"response_state": {"state": "running_idle"}}
+            ), patch("codex_master.server.spawn_admission_decision", return_value={"allowed": True}), patch(
+                "codex_master.server.reserve_managed_replacement",
+                side_effect=lambda session: events.append("reserve") or {"allowed": True, "reservation_id": "res-token"},
+            ), patch("codex_master.server.run_tmux", side_effect=kill_and_wait), patch(
+                "codex_master.server.start_agent", side_effect=lambda *args, **kwargs: events.append("start") or {"status": "started"}
+            ), patch("codex_master.server.complete_managed_replacement", side_effect=lambda *args, **kwargs: events.append("complete")):
+                server_module._write_native_agent_registry(
+                    {
+                        "schema_version": 2,
+                        "agents": [],
+                        "sessions": [{"session_id": parent_session, "activity_state": "active", "updated_at": 1_000.0}],
+                        "reservations": [],
+                    }
+                )
+                thread_a = threading.Thread(target=run_switch)
+                thread_a.start()
+                self.assertTrue(kill_entered.wait(1.0))
+                thread_b = threading.Thread(target=run_native_reservation)
+                thread_b.start()
+                self.assertFalse(b_done.wait(0.1))
+                self.assertEqual(json.loads(record_path.read_text(encoding="utf-8"))["reservations"], [])
+                release_kill.set()
+                thread_a.join(1.0)
+                thread_b.join(1.0)
+
+        self.assertFalse(thread_a.is_alive())
+        self.assertFalse(thread_b.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(a_result[0]["status"], "restarted")
+        self.assertTrue(b_result[0]["allowed"])
+        self.assertLess(events.index("reserve"), events.index("kill"))
+        self.assertLess(events.index("kill"), events.index("start"))
+        self.assertLess(events.index("start"), events.index("complete"))
+
+    def test_model_switch_replacement_blocks_unknown_coverage_before_kill(self) -> None:
+        lease = {"state": "held", "holder": "test", "held_by_this_server": True}
+        denial = {
+            "allowed": False,
+            "error_code": "spawn_capacity_unavailable",
+            "reason_codes": ["session_metrics_unavailable"],
+            "errors": [{"code": "session_metrics_unavailable", "title": "coverage unavailable"}],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            agent = {"label": "b1", "runner": home / "codex", "home": home, "session": "b1-session"}
+            with patch.dict("codex_master.server.AGENTS", {"b1": agent}, clear=False), patch(
+                "codex_master.server.tmux_alive", return_value=True
+            ), patch("codex_master.server.require_managed_tmux_session", return_value={"ok": True}), patch(
+                "codex_master.server.read_meta", return_value={"model": DEFAULT_AGENT_MODEL, "cwd": str(home)}
+            ), patch("codex_master.server.status_agent", return_value={"response_state": {"state": "running_idle"}}), patch(
+                "codex_master.server.reserve_managed_replacement", return_value=denial
+            ), patch("codex_master.server.run_tmux") as run_tmux, patch("codex_master.server.start_agent") as start_agent:
+                with self.assertRaises(AgentCapacityError) as raised:
+                    ensure_assignment_session_model("b1", model=WRITE_AGENT_MODEL, reasoning_effort="low", lease=lease)
+        public = public_error_payload(raised.exception)
+        self.assertEqual(public["error_code"], "spawn_capacity_unavailable")
+        self.assertTrue(public["retryable"])
+        self.assertIn("reason_codes", public)
+        self.assertEqual(public["reason_codes"], ["session_metrics_unavailable"])
+        self.assertIn("errors", public)
+        self.assertFalse(any(call.args and call.args[0] and call.args[0][0] == "new-session" for call in run_tmux.call_args_list))
+        start_agent.assert_not_called()
+
+    def test_start_with_replacement_token_fails_closed_if_session_is_already_running(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            runner = home / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(0o700)
+            agent = {"label": "Q3", "runner": runner, "home": home, "session": "q3-session"}
+            with patch.dict("codex_master.server.AGENTS", {"q3": agent}, clear=False), patch(
+                "codex_master.server.agent_config", return_value={"runner": runner, "home": home, "session": "q3-session", "label": "Q3"}
+            ), patch("codex_master.server.tmux_alive", return_value=True), patch(
+                "codex_master.server.agent_home_process_summary",
+                return_value={"external_process_count": 0, "managed_process_count": 1, "managed_process_ids": [123]},
+            ), patch("codex_master.server.require_managed_tmux_session", return_value={"ok": True}) as guard, patch(
+                "codex_master.server.require_managed_replacement_reservation"
+            ) as validate, patch("codex_master.server.require_spawn_capacity") as capacity, patch(
+                "codex_master.server.run_tmux"
+            ) as run_tmux:
+                with self.assertRaises(AgentCapacityError):
+                    server_module._start_agent_unlocked("q3", replacement_reservation_id="res-token")
+        guard.assert_not_called()
+        validate.assert_not_called()
+        capacity.assert_not_called()
+        self.assertFalse(
+            any(call.args and call.args[0] and call.args[0][0] == "new-session" for call in run_tmux.call_args_list)
+        )
+
+    def test_start_with_invalid_replacement_token_is_structured_and_never_uses_normal_capacity(self) -> None:
+        denial = {
+            "allowed": False,
+            "error_code": "spawn_capacity_unavailable",
+            "reason_codes": ["session_metrics_unavailable"],
+            "errors": [{"code": "session_metrics_unavailable", "title": "coverage unavailable"}],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            runner = home / "codex"
+            runner.write_text("#!/bin/sh\n", encoding="utf-8")
+            runner.chmod(0o700)
+            agent = {"label": "Q3", "runner": runner, "home": home, "session": "q3-session"}
+            summary = {"external_process_count": 0, "managed_process_count": 0, "managed_process_ids": [], "managed_root_process_ids": []}
+            with patch.dict("codex_master.server.AGENTS", {"q3": agent}, clear=False), patch(
+                "codex_master.server.agent_config", return_value={"runner": runner, "home": home, "session": "q3-session", "label": "Q3"}
+            ), patch("codex_master.server.tmux_alive", return_value=False), patch(
+                "codex_master.server.agent_home_process_summary", return_value=summary
+            ), patch("codex_master.server.require_managed_replacement_reservation", return_value=denial), patch(
+                "codex_master.server.require_spawn_capacity"
+            ) as capacity, patch("codex_master.server.run_tmux") as run_tmux:
+                with self.assertRaises(AgentCapacityError) as raised:
+                    server_module._start_agent_unlocked("q3", replacement_reservation_id="bad-token")
+        public = public_error_payload(raised.exception)
+        self.assertEqual(public["error_code"], "spawn_capacity_unavailable")
+        self.assertEqual(public["reason_codes"], ["session_metrics_unavailable"])
+        capacity.assert_not_called()
+        self.assertFalse(any(call.args and call.args[0] and call.args[0][0] == "new-session" for call in run_tmux.call_args_list))
+
     def test_model_switch_restarts_when_reasoning_effort_differs(self) -> None:
         lease = {"state": "held", "holder": "test", "held_by_this_server": True}
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -20678,12 +24806,13 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.run_tmux",
                 return_value=subprocess.CompletedProcess(["tmux"], 0, "", ""),
             ), patch("codex_master.server.start_agent", return_value={"status": "started"}) as start:
-                result = ensure_assignment_session_model(
-                    "a",
-                    model=DEFAULT_AGENT_MODEL,
-                    reasoning_effort=DEFAULT_AGENT_MODEL_EFFORT,
-                    lease=lease,
-                )
+                with patch("codex_master.server.reserve_managed_replacement", return_value={"allowed": True, "reservation_id": "res-model"}), patch("codex_master.server.complete_managed_replacement"):
+                    result = ensure_assignment_session_model(
+                        "a",
+                        model=DEFAULT_AGENT_MODEL,
+                        reasoning_effort=DEFAULT_AGENT_MODEL_EFFORT,
+                        lease=lease,
+                    )
 
         self.assertEqual(result["status"], "restarted")
         self.assertEqual(start.call_args.kwargs["model"], DEFAULT_AGENT_MODEL)
@@ -20727,6 +24856,66 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertTrue(mock_model.call_args.kwargs["release_lease_on_failure"])
         mock_release.assert_not_called()
+
+    def test_bound_teamleader_assign_uses_ensure_unchanged_without_restart_or_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            descriptor = SimpleNamespace(
+                agent_id="q1",
+                series_prefix="q",
+                label="Q1",
+                home=home,
+                session="q1-tmux",
+                runner_path=home / "codex",
+                enabled=True,
+                skill_profile="teamleiterin",
+            )
+            inventory = SimpleNamespace(agents={"q1": descriptor}, agent_ids=("q1",))
+            with patch(
+                "codex_master.server.ensure_assignment_session_model",
+                wraps=ensure_assignment_session_model,
+            ) as ensure_model, patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
+                "codex_master.server.agent_config",
+                return_value={"session": "q1-tmux", "home": home, "label": "Q1"},
+            ), patch(
+                "codex_master.server._headless_descriptor", return_value=None
+            ), patch("codex_master.server._ollama_descriptor", return_value=None), patch(
+                "codex_master.server.require_ollama_admission", return_value={"allowed": True}
+            ), patch(
+                "codex_master.server.require_authenticated_agent_for_mutation",
+                return_value={"authenticated": True},
+            ), patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"), patch(
+                "codex_master.server.codex_usage_routing_decision", return_value=None
+            ), patch(
+                "codex_master.server.tmux_alive", return_value=True
+            ), patch("codex_master.server.require_managed_tmux_session", return_value={"ok": True}) as require_managed_tmux_session, patch(
+                "codex_master.server.read_meta",
+                return_value={"model": "gpt-5.6-terra", "model_reasoning_effort": "xhigh"},
+            ), patch("codex_master.server.claim_for_agent_mutation", return_value=({"state": "held"}, False)), patch(
+                "codex_master.server.send_agent", return_value={"agent": "q1", "status": "sent"}
+            ), patch("codex_master.server.record_assignment"), patch(
+                "codex_master.server.run_tmux"
+            ) as run_tmux, patch("codex_master.server.start_agent") as start_agent, patch(
+                "codex_master.server.require_spawn_capacity"
+            ) as require_capacity:
+                result = assign_agent(
+                    "q1",
+                    role="exploriererin",
+                    task="Nur lesen.",
+                    scope=[],
+                    allow_unauthenticated=True,
+                    authority_class="teamleiterin",
+                )
+
+        self.assertEqual(
+            (result["model"], result["model_reasoning_effort"], result["model_switch"]["status"]),
+            ("gpt-5.6-terra", "xhigh", "unchanged"),
+        )
+        ensure_model.assert_called_once()
+        require_managed_tmux_session.assert_called_once_with("q1")
+        run_tmux.assert_not_called()
+        start_agent.assert_not_called()
+        require_capacity.assert_not_called()
 
     def test_agent_assign_keeps_fresh_lease_when_send_fails_after_model_switch(self) -> None:
         routing = {
@@ -21079,11 +25268,11 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertFalse(response["result"]["isError"])
         payload = json.loads(response["result"]["content"][0]["text"])
         self.assertTrue(payload["subagents_allowed"])
-        self.assertEqual(payload["model"], "gpt-5.3-codex-spark")
+        self.assertEqual(payload["model"], "gpt-5.6-luna")
         self.assertEqual(payload["write_policy"], "explicit_paths_only")
         sent_prompt = mock_send_agent.call_args.args[1]
         self.assertIn("[WORK_BEE_TASK]", sent_prompt)
-        self.assertIn("Modell: gpt-5.3-codex-spark", sent_prompt)
+        self.assertIn("Modell: gpt-5.6-luna", sent_prompt)
         self.assertIn("Darf eigene Subagentinnen starten: ja, nur innerhalb Scope und Schreibpfaden", sent_prompt)
 
     def test_agent_assign_enforces_role_write_and_skill_boundaries(self) -> None:
@@ -21399,6 +25588,33 @@ class ServerHelpersTest(unittest.TestCase):
         commands = [call.args[0][0] for call in mock_run_tmux.call_args_list]
         self.assertEqual(commands, ["load-buffer", "delete-buffer"])
 
+    def test_send_agent_accepts_managed_root_with_managed_child_processes(self) -> None:
+        def fake_run_tmux(args, *, input_text=None, check=True, timeout=10):
+            del input_text, check, timeout
+            return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
+
+        with patch("codex_master.server.tmux_alive", return_value=True), patch(
+            "codex_master.server.pane_pid", return_value=123
+        ), patch(
+            "codex_master.server.agent_home_process_summary",
+            return_value={
+                "process_count": 3,
+                "managed_process_count": 1,
+                "managed_process_ids": [123, 456, 789],
+                "managed_root_process_ids": [123],
+                "external_process_count": 0,
+                "external_processes": [],
+                "external_processes_truncated": False,
+                "raw_output": "not_returned",
+            },
+        ), patch(
+            "codex_master.server.wait_agent_input_ready", return_value={"ready": True}
+        ), patch("codex_master.server.run_tmux", side_effect=fake_run_tmux):
+            result = send_agent("a", "continue", enter=False)
+
+        self.assertEqual(result["status"], "sent")
+        self.assertFalse(result["submitted"])
+
     def test_send_agent_uses_bracketed_paste_for_multiline_text(self) -> None:
         calls = []
 
@@ -21428,7 +25644,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["status"], "sent")
         self.assertEqual(result["chars"], len("line 1\nline 2"))
         self.assertEqual(result["paste_mode"], "bracketed_paste")
-        self.assertEqual(CODEX_TUI_SUBMIT_KEY, "C-Enter")
+        self.assertEqual(CODEX_TUI_SUBMIT_KEY, "Enter")
         self.assertEqual(result["submit_key"], CODEX_TUI_SUBMIT_KEY)
         self.assertEqual(result["response_output"], "not_returned")
         load_call = next(call for call in calls if call["args"][0] == "load-buffer")
@@ -22911,6 +27127,127 @@ class CliLifecycleTest(unittest.TestCase):
         codex_home_patch.start()
         self.addCleanup(codex_home_patch.stop)
 
+    def test_fleet_overview_cli_early_route_skips_startup_publish_and_tools(self) -> None:
+        with patch.object(
+            server_module, "_fleet_initialize_recovery_startup_state", side_effect=AssertionError
+        ) as startup, patch.object(
+            server_module, "_publish_startup_fleet_inventory", side_effect=AssertionError
+        ) as publish, patch.object(
+            server_module, "swap_agent_inventory", side_effect=AssertionError
+        ) as swap, patch.object(
+            server_module, "call_validated_tool", side_effect=AssertionError
+        ) as call_validated, patch.object(
+            server_module, "_fleet_overview_local_admin", return_value="rendered-compact"
+        ) as adapter, patch("builtins.print") as print_output:
+            result = main_cli(["fleet", "overview"])
+
+        self.assertEqual(result, 0)
+        adapter.assert_called_once_with(active_only=True, format="compact")
+        print_output.assert_called_once_with("rendered-compact")
+        startup.assert_not_called()
+        publish.assert_not_called()
+        swap.assert_not_called()
+        call_validated.assert_not_called()
+
+    def test_fleet_overview_cli_revalidates_lock_after_body_and_redacts(self) -> None:
+        for mutation in ("lock-path", "parent-path"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                state = root / "state"
+                state.mkdir(mode=0o700)
+                lock = state / "registry.lock"
+                lock.write_bytes(b"lock")
+                lock.chmod(0o600)
+                service = Mock()
+                service.registry_snapshot.return_value = _overview_cli_test_snapshot()
+                renderer = Mock(side_effect=AssertionError("renderer must wait for context exit"))
+
+                def mutate_body(*_args: Any, **_kwargs: Any) -> object:
+                    if mutation == "lock-path":
+                        old_lock = root / "old-registry.lock"
+                        lock.rename(old_lock)
+                        lock.write_bytes(b"replacement")
+                        lock.chmod(0o600)
+                    else:
+                        old_state = root / "old-state"
+                        state.rename(old_state)
+                        state.mkdir(mode=0o700)
+                        lock.write_bytes(b"replacement")
+                        lock.chmod(0o600)
+                    return object()
+
+                with patch.object(server_module, "STATE_ROOT", state), patch.object(
+                    server_module, "AGENT_POOL_ROOT", root / "pool"
+                ), patch.object(
+                    server_module, "_fleet_initialize_recovery_startup_state", side_effect=AssertionError
+                ), patch.object(
+                    server_module, "_publish_startup_fleet_inventory", side_effect=AssertionError
+                ), patch.object(
+                    server_module, "swap_agent_inventory", side_effect=AssertionError
+                ), patch.object(
+                    server_module, "_readonly_fleet_service", return_value=service
+                ), patch.object(
+                    server_module, "build_inventory", return_value=object()
+                ), patch.object(
+                    server_module, "build_fleet_overview", side_effect=mutate_body
+                ), patch.object(
+                    server_module, "render_fleet_overview", renderer
+                ), patch("builtins.print") as print_output:
+                    result = main_cli(["fleet", "overview"])
+
+                self.assertEqual(result, 1)
+                renderer.assert_not_called()
+                print_output.assert_called_once()
+                payload = json.loads(print_output.call_args.args[0])
+                self.assertEqual(payload, {"error": "fleet_overview_unavailable"})
+                self.assertNotIn(str(root), print_output.call_args.args[0])
+
+    def test_fleet_overview_cli_redacts_internal_failure_and_returns_exit_one(self) -> None:
+        marker = "internal-marker-/secret/path"
+        with patch.object(
+            server_module, "_fleet_initialize_recovery_startup_state", side_effect=AssertionError
+        ), patch.object(
+            server_module, "_publish_startup_fleet_inventory", side_effect=AssertionError
+        ), patch.object(
+            server_module, "swap_agent_inventory", side_effect=AssertionError
+        ), patch.object(
+            server_module, "_fleet_overview_local_admin", side_effect=ValueError(marker)
+        ), patch("builtins.print") as print_output:
+            result = main_cli(["fleet", "overview", "--format", "json"])
+
+        self.assertEqual(result, 1)
+        payload = json.loads(print_output.call_args.args[0])
+        self.assertEqual(payload, {"error": "fleet_overview_unavailable"})
+        self.assertNotIn(marker, print_output.call_args.args[0])
+
+    def test_fleet_overview_cli_accepts_only_three_formats_and_active_switch(self) -> None:
+        cases = (
+            (["fleet", "overview"], True, "compact"),
+            (["fleet", "overview", "--format", "json", "--no-active-only"], False, "json"),
+            (["fleet", "overview", "--format", "markdown", "--active-only"], True, "markdown"),
+        )
+        for argv, active_only, format_name in cases:
+            with self.subTest(argv=argv), patch.object(
+                server_module, "_fleet_initialize_recovery_startup_state", side_effect=AssertionError
+            ), patch.object(
+                server_module, "_publish_startup_fleet_inventory", side_effect=AssertionError
+            ), patch.object(
+                server_module, "swap_agent_inventory", side_effect=AssertionError
+            ), patch.object(
+                server_module, "_fleet_overview_local_admin", return_value="rendered"
+            ) as adapter, patch("builtins.print") as print_output:
+                result = main_cli(argv)
+
+            self.assertEqual(result, 0)
+            adapter.assert_called_once_with(active_only=active_only, format=format_name)
+            print_output.assert_called_once_with("rendered")
+
+        with patch.object(server_module, "_fleet_overview_local_admin") as adapter:
+            with self.assertRaises(SystemExit) as raised:
+                server_module._fleet_overview_cli(["--format", "table"])
+        self.assertEqual(raised.exception.code, 2)
+        adapter.assert_not_called()
+
     def test_watchdog_systemd_service_keeps_hardening_directives(self) -> None:
         service = Path(__file__).resolve().parents[1] / "systemd" / "user" / "codex-master-watchdog.service"
         text = service.read_text(encoding="utf-8")
@@ -23164,6 +27501,245 @@ class CliLifecycleTest(unittest.TestCase):
                 "allow_missing_skill": False,
                 "allow_subagents": False,
             },
+        )
+
+    @patch("codex_master.server.print_json")
+    @patch("codex_master.server.call_tool", return_value={"status": "assigned"})
+    def test_cli_assign_write_transports_positive_task_evidence_without_model_override(
+        self, mock_call_tool, mock_print_json
+    ) -> None:
+        mock_print_json.return_value = 0
+
+        result = main_cli(
+            [
+                "assign-write",
+                "a1",
+                "--task",
+                "Rename local symbol.",
+                "--scope",
+                "src",
+                "--write-path",
+                "src/example.py",
+                "--task-phase",
+                "atomic_fix",
+                "--fully-specified",
+                "--reversible",
+                "--low-risk",
+                "--root-cause-known",
+            ]
+        )
+
+        self.assertEqual(result, 0)
+        payload = mock_call_tool.call_args.args[1]
+        self.assertEqual(payload["task_phase"], "atomic_fix")
+        self.assertTrue(payload["fully_specified"])
+        self.assertTrue(payload["reversible"])
+        self.assertTrue(payload["low_risk"])
+        self.assertTrue(payload["root_cause_known"])
+        self.assertNotIn("model", payload)
+
+    @patch("codex_master.server.print_json")
+    @patch("codex_master.server.call_tool", return_value={"status": "assigned"})
+    def test_cli_assign_write_transports_explicit_resolver_tuple(
+        self, mock_call_tool, mock_print_json
+    ) -> None:
+        mock_print_json.return_value = 0
+        argv = [
+            "assign-write",
+            "a1",
+            "--task",
+            "Fix confirmed resolver transport.",
+            "--scope",
+            "src",
+            "--write-path",
+            "src/codex_master/server.py",
+            "--class",
+            "arbeitsbiene",
+            "--lifecycle",
+            "persistent",
+            "--model",
+            "gpt-5.6-luna",
+            "--reasoning-effort",
+            "xhigh",
+            "--task-phase",
+            "atomic_fix",
+            "--fully-specified",
+            "--reversible",
+            "--low-risk",
+            "--root-cause-known",
+        ]
+
+        try:
+            result = main_cli(argv)
+        except SystemExit as exc:
+            self.fail(f"CLI rejected explicit resolver tuple: {exc}")
+
+        self.assertEqual(result, 0)
+        mock_call_tool.assert_called_once()
+        payload = mock_call_tool.call_args.args[1]
+        self.assertEqual(
+            {key: payload[key] for key in ("class", "lifecycle", "model", "reasoning_effort")},
+            {
+                "class": "arbeitsbiene",
+                "lifecycle": "persistent",
+                "model": "gpt-5.6-luna",
+                "reasoning_effort": "xhigh",
+            },
+        )
+        self.assertEqual(
+            {
+                key: payload[key]
+                for key in (
+                    "agent",
+                    "task",
+                    "scope",
+                    "write_paths",
+                    "context",
+                    "forbidden",
+                    "enter",
+                    "allow_missing_skill",
+                    "allow_subagents",
+                    "complexity",
+                    "task_phase",
+                    "fully_specified",
+                    "reversible",
+                    "low_risk",
+                    "root_cause_known",
+                    "security_sensitive",
+                    "concurrency",
+                    "migration",
+                    "data_change",
+                    "cross_repository",
+                    "architecture",
+                    "ci_or_release",
+                )
+            },
+            {
+                "agent": "a1",
+                "task": "Fix confirmed resolver transport.",
+                "scope": ["src"],
+                "write_paths": ["src/codex_master/server.py"],
+                "context": [],
+                "forbidden": [],
+                "enter": True,
+                "allow_missing_skill": False,
+                "allow_subagents": False,
+                "complexity": "unknown",
+                "task_phase": "atomic_fix",
+                "fully_specified": True,
+                "reversible": True,
+                "low_risk": True,
+                "root_cause_known": True,
+                "security_sensitive": False,
+                "concurrency": False,
+                "migration": False,
+                "data_change": False,
+                "cross_repository": False,
+                "architecture": False,
+                "ci_or_release": False,
+            },
+        )
+
+    @patch("codex_master.server.print_json")
+    def test_cli_assign_write_explicit_persistent_luna_xhigh_keeps_matching_session(
+        self, mock_print_json
+    ) -> None:
+        mock_print_json.return_value = 0
+        lease = {"state": "held", "holder": "test", "held_by_this_server": True}
+        inventory = SimpleNamespace(
+            agents={"a1": SimpleNamespace(series_prefix="a", skill_profile="arbeitsbiene")},
+            agent_ids=("a1",),
+            positions={"a1": 0},
+        )
+        argv = [
+            "assign-write",
+            "a1",
+            "--task",
+            "Fix confirmed resolver transport.",
+            "--scope",
+            "src",
+            "--write-path",
+            "src/codex_master/server.py",
+            "--class",
+            "arbeitsbiene",
+            "--lifecycle",
+            "persistent",
+            "--model",
+            "gpt-5.6-luna",
+            "--reasoning-effort",
+            "xhigh",
+            "--allow-unauthenticated",
+            "--complexity",
+            "complex",
+            "--task-phase",
+            "atomic_fix",
+            "--fully-specified",
+            "--reversible",
+            "--low-risk",
+            "--root-cause-known",
+        ]
+
+        patches = [
+            patch("codex_master.server._fleet_initialize_recovery_startup_state"),
+            patch("codex_master.server._publish_startup_fleet_inventory"),
+            patch("codex_master.server.agent_ids", return_value=["a1"]),
+            patch("codex_master.server.current_agent_inventory", return_value=inventory),
+            patch("codex_master.server.require_fleet_recovery_ready"),
+            patch("codex_master.server._headless_descriptor", return_value=None),
+            patch("codex_master.server._ollama_descriptor", return_value=None),
+            patch(
+                "codex_master.server.require_authenticated_agent_for_mutation",
+                return_value={"authenticated": True},
+            ),
+            patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"),
+            patch("codex_master.server.require_ollama_admission"),
+            patch("codex_master.server.scope_check", return_value={"allowed": True}),
+            patch("codex_master.server.claim_for_agent_mutation", return_value=(lease, False)),
+            patch("codex_master.server.agent_config", return_value={"session": "a1-session"}),
+            patch("codex_master.server.tmux_alive", return_value=True),
+            patch("codex_master.server.require_managed_tmux_session", return_value={"ok": True}),
+            patch(
+                "codex_master.server.read_meta",
+                return_value={
+                    "model": "gpt-5.6-luna",
+                    "model_reasoning_effort": "xhigh",
+                    "cwd": "/tmp",
+                },
+            ),
+            patch("codex_master.server.agent_lifecycle_lock", return_value=contextlib.nullcontext()),
+            patch("codex_master.server.send_agent", return_value={"agent": "a1", "status": "sent"}),
+            patch("codex_master.server.remember_agent_routing"),
+            patch("codex_master.server.record_assignment"),
+        ]
+        with contextlib.ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            reserve = stack.enter_context(patch("codex_master.server.reserve_managed_replacement"))
+            run_tmux = stack.enter_context(patch("codex_master.server.run_tmux"))
+            start_agent = stack.enter_context(patch("codex_master.server.start_agent"))
+            try:
+                result = main_cli(argv)
+            except SystemExit as exc:
+                self.fail(f"CLI rejected explicit resolver tuple: {exc}")
+
+        self.assertEqual(result, 0)
+        assignment = mock_print_json.call_args.args[0]
+        self.assertEqual(assignment["model"], "gpt-5.6-luna")
+        self.assertEqual(assignment["model_reasoning_effort"], "xhigh")
+        self.assertEqual(
+            (
+                assignment["selection"]["class"],
+                assignment["selection"]["lifecycle"],
+                assignment["selection"]["model"],
+                assignment["selection"]["reasoning"],
+            ),
+            ("arbeitsbiene", "persistent", "gpt-5.6-luna", "xhigh"),
+        )
+        self.assertEqual(assignment["model_switch"]["status"], "unchanged")
+        reserve.assert_not_called()
+        start_agent.assert_not_called()
+        self.assertFalse(
+            any(call.args and call.args[0] and call.args[0][0] == "kill-session" for call in run_tmux.call_args_list)
         )
 
     @patch("codex_master.server.print_json")
@@ -23979,7 +28555,7 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result["mcp"]["startup_timeout"]["status"], "updated")
         mock_run.assert_not_called()
 
-    @patch("codex_master.server.subprocess.run")
+    @patch("codex_master.server._run_mcp_probe")
     def test_mcp_command_startup_self_test_is_data_sparse(self, mock_run) -> None:
         response = (
             '{"jsonrpc":"2.0","id":1,'
@@ -23999,7 +28575,7 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertEqual(mock_run.call_args.kwargs["timeout"], DEFAULT_MCP_STARTUP_SELF_TEST_TIMEOUT_SECONDS)
 
-    @patch("codex_master.server.subprocess.run")
+    @patch("codex_master.server._run_mcp_probe")
     def test_mcp_command_startup_self_test_accepts_content_length_frames(self, mock_run) -> None:
         response = {
             "jsonrpc": "2.0",
@@ -24024,7 +28600,7 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["raw_output"], "not_returned")
 
-    @patch("codex_master.server.subprocess.run")
+    @patch("codex_master.server._run_mcp_probe")
     def test_mcp_command_startup_self_test_rejects_embedded_json(self, mock_run) -> None:
         mock_run.return_value = subprocess.CompletedProcess(
             ["codex-master-mcp"],
@@ -24044,7 +28620,7 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result["raw_output"], "not_returned")
         self.assertNotIn("SECRET", json.dumps(result, sort_keys=True))
 
-    @patch("codex_master.server.subprocess.run")
+    @patch("codex_master.server._run_mcp_probe")
     def test_mcp_command_startup_self_test_rejects_stderr_only_response(self, mock_run) -> None:
         response = (
             '{"jsonrpc":"2.0","id":1,'
@@ -24064,7 +28640,7 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["raw_output"], "not_returned")
 
-    @patch("codex_master.server.subprocess.run")
+    @patch("codex_master.server._run_mcp_probe")
     def test_mcp_command_startup_self_test_handles_missing_command(self, mock_run) -> None:
         mock_run.side_effect = FileNotFoundError("SECRET_PATH_SHOULD_NOT_RETURN")
 
@@ -27112,6 +31688,142 @@ class NativeAgentRegistryTest(unittest.TestCase):
                 self.assertNotIn("SECRET", stored)
                 self.assertNotIn("transcript", stored)
 
+    def test_completed_native_agent_is_retained_but_not_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.LOCK_DIR", lock_dir
+            ), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            ):
+                server_module.record_native_agent_event(
+                    {
+                        "hook_event_name": "SubagentStart",
+                        "session_id": "thr_parent",
+                        "agent_id": "agent_1",
+                        "agent_type": "explorer",
+                    },
+                    now=1_000.0,
+                )
+                server_module.record_native_agent_event(
+                    {
+                        "hook_event_name": "SubagentStop",
+                        "session_id": "thr_parent",
+                        "agent_id": "agent_1",
+                    },
+                    now=1_001.0,
+                )
+
+                status = server_module.native_agent_status(now=1_001.0)
+                stored = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(status["counts"], {"active": 0, "unconfirmed": 0, "overflow": 0})
+        self.assertEqual(status["agents"], [])
+        self.assertEqual(stored["agents"][0]["activity_state"], "completed")
+
+    def test_native_resume_admission_keeps_completed_agent_closed_at_global_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.LOCK_DIR", lock_dir
+            ), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            ), patch(
+                "codex_master.server._total_running_agent_count", return_value=10
+            ), patch(
+                "codex_master.server.system_resource_snapshot",
+                return_value={
+                    "ok": True,
+                    "load_per_cpu": 0.25,
+                    "cpu_busy_percent": 25.0,
+                    "io_wait_percent": 0.0,
+                    "available_memory_percent": 60.0,
+                    "available_memory_mib": 8192,
+                    "running_agents": 10,
+                    "reason_codes": [],
+                },
+            ):
+                server_module.record_native_agent_event(
+                    {
+                        "hook_event_name": "SubagentStart",
+                        "session_id": "thr_parent",
+                        "agent_id": "agent_1",
+                        "agent_type": "explorer",
+                    },
+                    now=1_000.0,
+                )
+                server_module.record_native_agent_event(
+                    {
+                        "hook_event_name": "SubagentStop",
+                        "session_id": "thr_parent",
+                        "agent_id": "agent_1",
+                    },
+                    now=1_001.0,
+                )
+                result = server_module.activate_native_agent_resume(
+                    {
+                        "hook_event_name": "PreToolUse",
+                        "session_id": "thr_parent",
+                        "tool_name": "multi_agent_v1__send_input",
+                        "tool_input": {"target": "agent_1"},
+                    },
+                    now=1_002.0,
+                )
+                stored = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason_codes"], ["running_agent_limit"])
+        self.assertEqual(stored["agents"][0]["activity_state"], "completed")
+
+    def test_nonterminal_wait_status_keeps_resumed_native_agent_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.LOCK_DIR", lock_dir
+            ), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            ):
+                server_module.record_native_agent_event(
+                    {
+                        "hook_event_name": "SubagentStart",
+                        "session_id": "thr_parent",
+                        "agent_id": "agent_1",
+                        "agent_type": "explorer",
+                    },
+                    now=1_000.0,
+                )
+                server_module.record_native_agent_event(
+                    {
+                        "hook_event_name": "PostToolUse",
+                        "session_id": "thr_parent",
+                        "tool_name": "wait_agent",
+                        "tool_input": {"ids": ["agent_1"]},
+                        "tool_response": {
+                            "status": {"agent_1": {"running": None}},
+                            "timed_out": False,
+                        },
+                    },
+                    now=1_001.0,
+                )
+                stored = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(stored["agents"][0]["activity_state"], "active")
+
     def test_subagent_stop_removes_matching_parent_and_agent(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state = Path(tmpdir) / "state"
@@ -27157,9 +31869,21 @@ class NativeAgentRegistryTest(unittest.TestCase):
                         },
                         now=1_000.0 + index,
                     )
+                server_module.record_native_agent_event(
+                    {
+                        "hook_event_name": "SubagentStart",
+                        "session_id": "other-parent",
+                        "agent_id": "other-agent",
+                        "agent_type": "worker",
+                    },
+                    now=1_002.0,
+                )
                 server_module.record_native_agent_event({"hook_event_name": "SessionEnd", "session_id": "s-parent"}, now=1_008.0)
                 status = server_module.native_agent_status(now=1_008.0)
-                self.assertEqual({entry["activity_state"] for entry in status["agents"]}, {"unconfirmed"})
+                states = {entry["display_id"]: entry["activity_state"] for entry in status["agents"]}
+                self.assertEqual(states["a-0"], "unconfirmed")
+                self.assertEqual(states["a-1"], "unconfirmed")
+                self.assertEqual(states["other-ag"], "active")
 
     def test_session_start_initializes_empty_registry(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -27175,10 +31899,306 @@ class NativeAgentRegistryTest(unittest.TestCase):
                     now=1_000.0,
                 )
 
+                stored = json.loads(record_path.read_text(encoding="utf-8"))
+                self.assertEqual(stored["schema_version"], 2)
+                self.assertEqual(stored["agents"], [])
                 self.assertEqual(
-                    json.loads(record_path.read_text(encoding="utf-8")),
-                    {"schema_version": 1, "agents": []},
+                    [
+                        {key: value for key, value in record.items() if key != "updated_at"}
+                        for record in stored["sessions"]
+                    ],
+                    [{"session_id": "thr_parent", "activity_state": "active"}],
                 )
+
+    def test_empty_registry_without_fresh_session_coverage_is_degraded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            state.mkdir(parents=True)
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.LOCK_DIR", lock_dir
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            ):
+                for document in (
+                    {"schema_version": 1, "agents": []},
+                    {"schema_version": 2, "agents": [], "sessions": []},
+                ):
+                    with self.subTest(schema_version=document["schema_version"]):
+                        record_path.write_text(json.dumps(document) + "\n", encoding="utf-8")
+                        record_path.chmod(0o600)
+                        status = server_module.native_agent_status(now=1_001.0)
+                        self.assertEqual(status["bridge_state"], "degraded")
+                        self.assertEqual(
+                            status["counts"],
+                            {"active": 0, "unconfirmed": 0, "overflow": 0},
+                        )
+
+    def test_native_status_requires_coverage_for_every_expected_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.LOCK_DIR", lock_dir
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            ):
+                server_module.record_native_agent_event(
+                    {"hook_event_name": "SessionStart", "session_id": "parent-one"},
+                    now=1_000.0,
+                )
+                covered = server_module.native_agent_status(
+                    now=1_001.0,
+                    expected_parent_sessions=1,
+                )
+                insufficient = server_module.native_agent_status(
+                    now=1_001.0,
+                    expected_parent_sessions=2,
+                )
+
+        self.assertEqual(covered["bridge_state"], "ready")
+        self.assertEqual(insufficient["bridge_state"], "degraded")
+
+    def test_native_status_requires_concrete_expected_parent_session_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.LOCK_DIR", lock_dir
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            ):
+                for thread_id, managed_id in (("thread-q1", "q1-tmux"), ("thread-q2", "q2-tmux")):
+                    with patch(
+                        "codex_master.server._trusted_managed_tmux_session_for_home",
+                        return_value=managed_id,
+                    ):
+                        server_module.record_native_agent_event(
+                            {"hook_event_name": "SessionStart", "session_id": thread_id},
+                            now=1_000.0,
+                        )
+                covered = server_module.native_agent_status(
+                    now=1_001.0,
+                    expected_parent_session_ids=frozenset({"q1-tmux", "q2-tmux"}),
+                )
+                missing = server_module.native_agent_status(
+                    now=1_001.0,
+                    expected_parent_session_ids=frozenset({"q1-tmux", "q3-tmux"}),
+                )
+
+        self.assertEqual(covered["bridge_state"], "ready")
+        self.assertEqual(missing["bridge_state"], "degraded")
+
+    def test_hook_session_id_maps_to_trusted_managed_tmux_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            home = Path(tmpdir) / "managed-q1"
+            inventory = SimpleNamespace(
+                agents={
+                    "q1": SimpleNamespace(home=home, session="q1-tmux"),
+                },
+                agent_ids=("q1",),
+            )
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", state / "native-agents.json"
+            ), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", state / "locks" / "native-agents.lock"
+            ), patch("codex_master.server.effective_observation_inventory", return_value=(inventory, True)), patch(
+                "codex_master.server.require_managed_tmux_session", return_value={"ok": True}
+            ), patch.dict(
+                os.environ, {"CODEX_HOME": str(home)}, clear=False
+            ):
+                server_module.record_native_agent_event(
+                    {"hook_event_name": "SessionStart", "session_id": "thread-q1"},
+                    now=1_000.0,
+                )
+                stored = json.loads((state / "native-agents.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(stored["sessions"][0]["session_id"], "thread-q1")
+        self.assertEqual(stored["sessions"][0]["managed_session"], "q1-tmux")
+
+    def test_untrusted_or_missing_home_identity_keeps_native_coverage_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            inventory = SimpleNamespace(
+                agents={"q1": SimpleNamespace(home=Path(tmpdir) / "managed-q1", session="q1-tmux")},
+                agent_ids=("q1",),
+            )
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", state / "native-agents.json"
+            ), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", state / "locks" / "native-agents.lock"
+            ), patch("codex_master.server.effective_observation_inventory", return_value=(inventory, True)), patch.dict(
+                os.environ, {"CODEX_HOME": str(Path(tmpdir) / "untrusted-home")}, clear=False
+            ):
+                server_module.record_native_agent_event(
+                    {"hook_event_name": "SessionStart", "session_id": "thread-untrusted"},
+                    now=1_000.0,
+                )
+                status = server_module.native_agent_status(
+                    now=1_001.0,
+                    expected_parent_session_ids=frozenset({"q1-tmux"}),
+                )
+
+        self.assertEqual(status["bridge_state"], "degraded")
+        self.assertEqual(status["counts"], {"active": 0, "unconfirmed": 0, "overflow": 0})
+
+    def test_matching_home_without_verified_running_tmux_stays_unbound(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            home = Path(tmpdir) / "managed-q1"
+            inventory = SimpleNamespace(
+                agents={"q1": SimpleNamespace(home=home, session="q1-tmux")},
+                agent_ids=("q1",),
+            )
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.LOCK_DIR", state / "locks"
+            ), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", state / "native-agents.json"
+            ), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", state / "locks" / "native-agents.lock"
+            ), patch("codex_master.server.effective_observation_inventory", return_value=(inventory, True)), patch(
+                "codex_master.server.require_managed_tmux_session",
+                side_effect=AgentError("tmux identity unavailable"),
+            ), patch.dict(os.environ, {"CODEX_HOME": str(home)}, clear=False):
+                server_module.record_native_agent_event(
+                    {"hook_event_name": "SessionStart", "session_id": "thread-q1"},
+                    now=1_000.0,
+                )
+                stored = json.loads((state / "native-agents.json").read_text(encoding="utf-8"))
+
+        self.assertNotIn("managed_session", stored["sessions"][0])
+
+    def test_native_status_does_not_count_fresh_ended_session_as_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.LOCK_DIR", lock_dir
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            ):
+                server_module.record_native_agent_event(
+                    {"hook_event_name": "SessionStart", "session_id": "parent-ended"},
+                    now=1_000.0,
+                )
+                server_module.record_native_agent_event(
+                    {"hook_event_name": "SessionEnd", "session_id": "parent-ended"},
+                    now=1_001.0,
+                )
+
+                status = server_module.native_agent_status(now=1_002.0)
+
+        self.assertEqual(status["bridge_state"], "degraded")
+        self.assertEqual(status["counts"], {"active": 0, "unconfirmed": 0, "overflow": 0})
+
+    def test_native_status_requires_active_coverage_for_every_expected_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.LOCK_DIR", lock_dir
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            ):
+                for session_id in ("parent-active", "parent-ended"):
+                    server_module.record_native_agent_event(
+                        {"hook_event_name": "SessionStart", "session_id": session_id},
+                        now=1_000.0,
+                    )
+                server_module.record_native_agent_event(
+                    {"hook_event_name": "SessionEnd", "session_id": "parent-ended"},
+                    now=1_001.0,
+                )
+
+                status = server_module.native_agent_status(
+                    now=1_002.0,
+                    expected_parent_sessions=2,
+                )
+
+        self.assertEqual(status["bridge_state"], "degraded")
+        self.assertEqual(status["counts"], {"active": 0, "unconfirmed": 0, "overflow": 0})
+
+    def test_spawn_admission_denies_when_only_ended_session_covers_managed_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.LOCK_DIR", lock_dir
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            ):
+                server_module.record_native_agent_event(
+                    {"hook_event_name": "SessionStart", "session_id": "parent-ended"},
+                    now=1_000.0,
+                )
+                server_module.record_native_agent_event(
+                    {"hook_event_name": "SessionEnd", "session_id": "parent-ended"},
+                    now=1_001.0,
+                )
+                with patch("codex_master.server._managed_tmux_session_count", return_value=1), patch(
+                    "codex_master.server.time.time", return_value=1_002.0
+                ), patch("codex_master.server.os.cpu_count", return_value=4), patch(
+                    "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
+                ), patch("codex_master.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
+                    "codex_master.server._resource_meminfo", return_value=(50.0, 8192.0)
+                ), patch("codex_master.server._effective_cpu_count", return_value=4):
+                    result = spawn_admission_decision(1)
+
+        self.assertFalse(result["allowed"])
+        self.assertIsNone(result["available_slots"])
+        self.assertEqual(result["reason_codes"], ["session_metrics_unavailable"])
+
+    def test_session_start_preserves_parallel_parent_records_and_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            with patch("codex_master.server.STATE_ROOT", state), patch(
+                "codex_master.server.LOCK_DIR", lock_dir
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path
+            ):
+                server_module.record_native_agent_event(
+                    {
+                        "hook_event_name": "SubagentStart",
+                        "session_id": "parent-one",
+                        "agent_id": "worker-one",
+                        "agent_type": "worker",
+                    },
+                    now=1_000.0,
+                )
+                server_module.record_native_agent_event(
+                    {"hook_event_name": "SessionStart", "session_id": "parent-two"},
+                    now=1_001.0,
+                )
+                stored = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            {(record["session_id"], record["agent_id"]) for record in stored["agents"]},
+            {("parent-one", "worker-one")},
+        )
+        self.assertEqual(
+            {record["session_id"] for record in stored["sessions"]},
+            {"parent-one", "parent-two"},
+        )
 
     def test_status_marks_stale_and_prunes_retention(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -27244,8 +32264,9 @@ class NativeAgentRegistryTest(unittest.TestCase):
                     )
 
                 stored = json.loads(record_path.read_text(encoding="utf-8"))
-                self.assertEqual(stored["schema_version"], 1)
+                self.assertEqual(stored["schema_version"], 2)
                 self.assertEqual(len(stored["agents"]), 64)
+                self.assertEqual(len(stored["sessions"]), 64)
 
     def test_invalid_inputs_do_not_mutate_registry(self) -> None:
         invalid_payloads = [
@@ -27323,6 +32344,330 @@ class NativeAgentRegistryTest(unittest.TestCase):
                 self.assertEqual(blocked["bridge_state"], "degraded")
 
 
+    def test_native_spawn_reservation_is_counted_and_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "state"
+            record_path = root / "native-agents.json"
+            lock_path = root / "locks" / "native.lock"
+            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "codex_master.server.time.time", return_value=1_000.0
+            ):
+                payload = {
+                "schema_version": 2,
+                "agents": [],
+                "sessions": [{"session_id": "parent", "activity_state": "active", "updated_at": 1_000.0}],
+                "reservations": [
+                    {
+                        "reservation_id": f"res-{index}",
+                        "kind": "native_spawn",
+                        "created_at": 1_000.0,
+                        "parent_session_id": "parent",
+                    }
+                    for index in range(server_module.MAX_NATIVE_AGENT_RESERVATIONS + 5)
+                ],
+                }
+                server_module._write_native_agent_registry(payload)
+                stored = json.loads(record_path.read_text(encoding="utf-8"))
+                self.assertEqual(len(stored["reservations"]), server_module.MAX_NATIVE_AGENT_RESERVATIONS)
+                self.assertEqual(
+                    server_module._fresh_native_reservation_count(now=1_000.0),
+                    server_module.MAX_NATIVE_AGENT_RESERVATIONS,
+                )
+
+    def test_native_spawn_reservation_unknown_registry_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state"
+            lock_dir = state / "locks"
+            record_path = state / "native-agents.json"
+            lock_path = lock_dir / "native-agents.lock"
+            state.mkdir()
+            record_path.write_text("not-json", encoding="utf-8")
+            with patch("codex_master.server.STATE_ROOT", state), patch("codex_master.server.LOCK_DIR", lock_dir), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path):
+                self.assertIsNone(server_module._fresh_native_reservation_count())
+
+    def test_native_spawn_reservation_rejects_missing_ended_stale_or_future_parent(self) -> None:
+        with patch("codex_master.server.spawn_admission_decision", return_value={"allowed": True}):
+            for state in (
+                [],
+                [{"session_id": "parent", "activity_state": "ended", "updated_at": 1_000.0}],
+                [{"session_id": "parent", "activity_state": "active", "updated_at": 1_000.0 - server_module.NATIVE_AGENT_RETENTION_SECONDS - 1}],
+                [{"session_id": "parent", "activity_state": "active", "updated_at": 1_001.0}],
+            ):
+                with self.subTest(state=state), tempfile.TemporaryDirectory() as tmpdir:
+                    root = Path(tmpdir) / "state"
+                    with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
+                        "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", root / "native-agents.json"
+                    ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", root / "locks" / "native.lock"), patch(
+                        "codex_master.server.time.time", return_value=1_000.0
+                    ):
+                        root.mkdir()
+                        server_module._write_native_agent_registry({"schema_version": 2, "agents": [], "sessions": state, "reservations": []})
+                        result = server_module.reserve_native_agent_spawn({"hook_event_name": "PreToolUse", "tool_name": "spawn_agent", "session_id": "parent"})
+                    self.assertFalse(result["allowed"])
+
+    def test_native_spawn_reservation_ttl_prunes_without_permanent_degraded_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "state"
+            record_path = root / "native-agents.json"
+            lock_path = root / "locks" / "native.lock"
+            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "codex_master.server.time.time", return_value=900.0
+            ):
+                server_module._write_native_agent_registry(
+                    {"schema_version": 2, "agents": [], "sessions": [], "reservations": [{"reservation_id": "019fc541-a1e2-7a63-a4bf-b307fcb78457", "kind": "native_spawn", "created_at": 900.0, "parent_session_id": "019fc541-a1e2-7a63-a4bf-b307fcb78457"}]}
+                )
+            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "codex_master.server.time.time", return_value=1_000.0
+            ):
+                with server_module.native_agent_registry_lock():
+                    registry, state = server_module._read_native_agent_registry()
+            self.assertEqual(state, "ready")
+            self.assertEqual(registry["reservations"], [])
+
+    def test_subagent_start_consumes_oldest_parent_reservation_atomically_without_double_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "state"
+            record_path = root / "native-agents.json"
+            lock_path = root / "locks" / "native.lock"
+            rid = "019fc541-a1e2-7a63-a4bf-b307fcb78457"
+            rid2 = "019fc541-a1e2-7a63-a4bf-b307fcb78458"
+            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "codex_master.server.time.time", return_value=1_000.0
+            ), patch("codex_master.server._trusted_managed_tmux_session_for_home", return_value=None):
+                server_module._write_native_agent_registry({"schema_version": 2, "agents": [], "sessions": [{"session_id": rid, "activity_state": "active", "updated_at": 1_000.0}], "reservations": [
+                    {"reservation_id": rid, "kind": "native_spawn", "created_at": 990.0, "parent_session_id": rid},
+                    {"reservation_id": rid2, "kind": "native_spawn", "created_at": 995.0, "parent_session_id": rid},
+                ]})
+                server_module.record_native_agent_event({"hook_event_name": "SubagentStart", "session_id": rid, "agent_id": rid, "agent_type": "worker"}, now=1_000.0)
+                registry, state = server_module._read_native_agent_registry()
+            self.assertEqual(state, "ready")
+            self.assertEqual(len(registry["agents"]), 1)
+            self.assertEqual([row["reservation_id"] for row in registry["reservations"]], [rid2])
+            self.assertEqual(len(registry["agents"]) + len(registry["reservations"]), 2)
+
+    def test_subagent_start_without_reservation_counts_active_conservatively(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "state"
+            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", root / "native-agents.json"
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", root / "locks" / "native.lock"), patch(
+                "codex_master.server._trusted_managed_tmux_session_for_home", return_value=None
+            ):
+                server_module.record_native_agent_event({"hook_event_name": "SubagentStart", "session_id": "019fc541-a1e2-7a63-a4bf-b307fcb78457", "agent_id": "019fc541-a1e2-7a63-a4bf-b307fcb78458", "agent_type": "worker"}, now=1_000.0)
+                result = server_module.native_agent_status(now=1_001.0)
+            self.assertEqual(result["counts"]["active"], 1)
+
+    def test_spawn_admission_lock_is_reentrant_in_same_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch("codex_master.server.STATE_ROOT", Path(tmpdir) / "state"), patch(
+            "codex_master.server.LOCK_DIR", Path(tmpdir) / "state" / "locks"
+        ):
+            with server_module.spawn_admission_lock():
+                with server_module.spawn_admission_lock():
+                    self.assertTrue(True)
+
+    def test_replacement_reservation_is_zero_while_bound_session_runs_and_one_after_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "state"
+            record_path = root / "native-agents.json"
+            lock_path = root / "locks" / "native.lock"
+            native_id = "019fc541-a1e2-7a63-a4bf-b307fcb78457"
+            replacement_id = "019fc541-a1e2-7a63-a4bf-b307fcb78458"
+            payload = {
+                "schema_version": 2,
+                "agents": [],
+                "sessions": [],
+                "reservations": [
+                    {"reservation_id": native_id, "kind": "native_spawn", "created_at": 1_000.0, "parent_session_id": native_id},
+                    {"reservation_id": replacement_id, "kind": "managed_replacement", "created_at": 1_000.0, "managed_session": "q3-session"},
+                ],
+            }
+            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "codex_master.server.time.time", return_value=1_000.0
+            ), patch("codex_master.server._managed_tmux_session_ids", side_effect=AssertionError("unexpected rescan")):
+                server_module._write_native_agent_registry(payload)
+                self.assertEqual(
+                    server_module._fresh_native_reservation_count(now=1_000.0, managed_ids=frozenset({"q3-session"})),
+                    1,
+                )
+                self.assertEqual(server_module._fresh_native_reservation_count(now=1_000.0, managed_ids=frozenset()), 2)
+
+    def test_replacement_reservation_requires_complete_schema2_coverage_before_reserving(self) -> None:
+        for total, coverage in ((None, {"bridge_state": "ready"}), (10, {"bridge_state": "degraded"})):
+            with self.subTest(total=total, coverage=coverage), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir) / "state"
+                record_path = root / "native-agents.json"
+                lock_path = root / "locks" / "native.lock"
+                with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
+                    "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+                ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                    "codex_master.server._managed_tmux_session_ids", return_value=frozenset({"q3-session"})
+                ), patch("codex_master.server._total_running_agent_count", return_value=total), patch(
+                    "codex_master.server.native_agent_status", return_value=coverage
+                ):
+                    server_module._write_native_agent_registry({"schema_version": 2, "agents": [], "sessions": [], "reservations": []})
+                    result = server_module.reserve_managed_replacement("q3-session")
+                    registry, _ = server_module._read_native_agent_registry()
+                self.assertFalse(result["allowed"])
+                self.assertEqual(result["reason_codes"], ["session_metrics_unavailable"])
+                self.assertEqual(registry["reservations"], [])
+
+    def test_replacement_reservation_allows_exactly_full_ten_without_new_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "state"
+            record_path = root / "native-agents.json"
+            lock_path = root / "locks" / "native.lock"
+            patches = [
+                patch("codex_master.server.STATE_ROOT", root),
+                patch("codex_master.server.LOCK_DIR", root / "locks"),
+                patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path),
+                patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path),
+                patch("codex_master.server._managed_tmux_session_ids", return_value=frozenset({"q3-session"})),
+                patch("codex_master.server.native_agent_status", return_value={"bridge_state": "ready"}),
+                patch("codex_master.server.time.time", return_value=1_000.0),
+            ]
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                server_module._write_native_agent_registry({"schema_version": 2, "agents": [], "sessions": [], "reservations": []})
+                with patch("codex_master.server._total_running_agent_count", return_value=10):
+                    allowed = server_module.reserve_managed_replacement("q3-session")
+                    duplicate = server_module.reserve_managed_replacement("q3-session")
+                registry, _ = server_module._read_native_agent_registry()
+            self.assertTrue(allowed["allowed"])
+            self.assertFalse(duplicate["allowed"])
+            self.assertEqual(duplicate["reason_codes"], ["running_agent_limit"])
+            self.assertEqual(len(registry["reservations"]), 1)
+            self.assertEqual(registry["reservations"][0]["managed_session"], "q3-session")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "state"
+            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", root / "native-agents.json"
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", root / "locks" / "native.lock"), patch(
+                "codex_master.server._managed_tmux_session_ids", return_value=frozenset({"q3-session"})
+            ), patch("codex_master.server.native_agent_status", return_value={"bridge_state": "ready"}), patch(
+                "codex_master.server._total_running_agent_count", return_value=11
+            ):
+                server_module._write_native_agent_registry({"schema_version": 2, "agents": [], "sessions": [], "reservations": []})
+                denied = server_module.reserve_managed_replacement("q3-session")
+                self.assertFalse(denied["allowed"])
+                self.assertEqual(denied["reason_codes"], ["running_agent_limit"])
+
+    def test_replacement_reservation_token_is_bound_to_session_and_ttl(self) -> None:
+        reservation_id = "019fc541-a1e2-7a63-a4bf-b307fcb78457"
+        session_id = "019fc541-a1e2-7a63-a4bf-b307fcb78458"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "state"
+            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", root / "native-agents.json"
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", root / "locks" / "native.lock"), patch(
+                "codex_master.server.time.time", return_value=1_000.0
+            ):
+                server_module._write_native_agent_registry({"schema_version": 2, "agents": [], "sessions": [], "reservations": [
+                    {"reservation_id": reservation_id, "kind": "managed_replacement", "created_at": 1_000.0, "managed_session": session_id}
+                ]})
+                valid = server_module.require_managed_replacement_reservation(reservation_id, session_id, now=1_000.0)
+                invalid = [
+                    server_module.require_managed_replacement_reservation("019fc541-a1e2-7a63-a4bf-b307fcb78459", session_id, now=1_000.0),
+                    server_module.require_managed_replacement_reservation(reservation_id, "019fc541-a1e2-7a63-a4bf-b307fcb78459", now=1_000.0),
+                    server_module.require_managed_replacement_reservation(reservation_id, session_id, now=1_031.0),
+                ]
+            self.assertTrue(valid["allowed"])
+            for result in invalid:
+                self.assertFalse(result["allowed"])
+                self.assertEqual(result["error_code"], "spawn_capacity_unavailable")
+                self.assertEqual(result["reason_codes"], ["session_metrics_unavailable"])
+
+    def test_complete_managed_replacement_removes_only_exact_bound_token(self) -> None:
+        target_id = "019fc541-a1e2-7a63-a4bf-b307fcb78457"
+        other_id = "019fc541-a1e2-7a63-a4bf-b307fcb78458"
+        native_id = "019fc541-a1e2-7a63-a4bf-b307fcb78459"
+        target = {
+            "reservation_id": target_id,
+            "kind": "managed_replacement",
+            "created_at": 1_000.0,
+            "managed_session": "q3-session",
+        }
+        other = {
+            "reservation_id": other_id,
+            "kind": "managed_replacement",
+            "created_at": 1_000.0,
+            "managed_session": "q2-session",
+        }
+        native = {
+            "reservation_id": native_id,
+            "kind": "native_spawn",
+            "created_at": 1_000.0,
+            "parent_session_id": "019fc541-a1e2-7a63-a4bf-b307fcb78460",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "state"
+            record_path = root / "native-agents.json"
+            lock_path = root / "locks" / "native.lock"
+            patches = (
+                patch("codex_master.server.STATE_ROOT", root),
+                patch("codex_master.server.LOCK_DIR", root / "locks"),
+                patch("codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path),
+                patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path),
+                patch("codex_master.server.time.time", return_value=1_000.0),
+            )
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                server_module._write_native_agent_registry(
+                    {"schema_version": 2, "agents": [], "sessions": [], "reservations": [target, other, native]}
+                )
+                before = json.loads(record_path.read_text(encoding="utf-8"))["reservations"]
+                with self.assertRaises(AgentError):
+                    server_module.complete_managed_replacement("019fc541-a1e2-7a63-a4bf-b307fcb78461", "q3-session")
+                self.assertEqual(json.loads(record_path.read_text(encoding="utf-8"))["reservations"], before)
+                with self.assertRaises(AgentError):
+                    server_module.complete_managed_replacement(target_id, "q2-session")
+                self.assertEqual(json.loads(record_path.read_text(encoding="utf-8"))["reservations"], before)
+                result = server_module.complete_managed_replacement(target_id, "q3-session")
+                after = json.loads(record_path.read_text(encoding="utf-8"))["reservations"]
+
+        self.assertEqual(result, {"allowed": True, "reservation_id": target_id})
+        self.assertEqual(after, [other, native])
+
+    def test_replacement_failure_reservation_counts_until_ttl(self) -> None:
+        reservation_id = "019fc541-a1e2-7a63-a4bf-b307fcb78457"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "state"
+            record_path = root / "native-agents.json"
+            lock_path = root / "locks" / "native.lock"
+            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "codex_master.server.time.time", return_value=1_000.0
+            ):
+                server_module._write_native_agent_registry({"schema_version": 2, "agents": [], "sessions": [], "reservations": [
+                    {"reservation_id": reservation_id, "kind": "managed_replacement", "created_at": 1_000.0, "managed_session": "q3-session"}
+                ]})
+                self.assertEqual(server_module._fresh_native_reservation_count(now=1_000.0, managed_ids=frozenset()), 1)
+                self.assertEqual(server_module._fresh_native_reservation_count(now=1_030.0, managed_ids=frozenset()), 1)
+            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "codex_master.server.time.time", return_value=1_031.0
+            ), server_module.native_agent_registry_lock():
+                registry, state = server_module._read_native_agent_registry()
+            self.assertEqual(state, "ready")
+            self.assertEqual(registry["reservations"], [])
+            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch("codex_master.server.time.time", return_value=1_031.0):
+                self.assertEqual(server_module._fresh_native_reservation_count(now=1_031.0, managed_ids=frozenset()), 0)
+
+
 @contextlib.contextmanager
 def native_agent_lock_blocked(path: Path) -> Any:
     lock = threading.Event()
@@ -27342,6 +32687,195 @@ def native_agent_lock_blocked(path: Path) -> Any:
     finally:
         release.set()
         thread.join(2)
+
+
+def test_usage_state_home_resolver_uses_only_absolute_authorized_roots() -> None:
+    with patch.dict(
+        os.environ,
+        {
+            "CODEX_USAGE_INTEGRATION_STATE_HOME": "/synthetic/primary",
+            "XDG_STATE_HOME": "/synthetic/xdg",
+            "HOME": "/synthetic/home-marker",
+            "PATH": "/synthetic/path-marker",
+        },
+        clear=True,
+    ):
+        assert server_module._resolve_codex_usage_state_home() == Path("/synthetic/primary")
+
+    with patch.dict(os.environ, {"XDG_STATE_HOME": "/synthetic/xdg"}, clear=True):
+        assert server_module._resolve_codex_usage_state_home() == Path("/synthetic/xdg")
+
+    with patch.dict(os.environ, {}, clear=True), patch.object(
+        server_module.Path, "home", return_value=Path("/synthetic/server-home")
+    ):
+        assert server_module._resolve_codex_usage_state_home() == Path(
+            "/synthetic/server-home/.local/state"
+        )
+
+    for name, value in (
+        ("CODEX_USAGE_INTEGRATION_STATE_HOME", "relative"),
+        ("CODEX_USAGE_INTEGRATION_STATE_HOME", "/synthetic/./state"),
+        ("CODEX_USAGE_INTEGRATION_STATE_HOME", "/synthetic/../state"),
+    ):
+        with patch.dict(os.environ, {name: value}, clear=True):
+            assert server_module._resolve_codex_usage_state_home() is None
+    with patch.object(
+        server_module.os, "environ", {"XDG_STATE_HOME": "/synthetic/state\x00marker"}
+    ):
+        assert server_module._resolve_codex_usage_state_home() is None
+
+
+def test_fleet_overview_composes_registry_then_usage_then_enrichment_and_render() -> None:
+    events: list[str] = []
+    service = Mock()
+    service.registry_snapshot.side_effect = (
+        lambda: events.append("registry") or _overview_cli_test_snapshot()
+    )
+    bounded_runner = object()
+
+    def usage_clock() -> None:
+        return None
+
+    @contextlib.contextmanager
+    def lock(_path: Path) -> Any:
+        events.append("lock-enter")
+        yield
+        events.append("lock-exit")
+
+    def registry_clock() -> Any:
+        events.append("registry-clock")
+        return datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
+
+    def inventory(_snapshot: object, _pool_root: Path) -> object:
+        events.append("inventory")
+        return object()
+
+    def base_overview(*_args: Any, **_kwargs: Any) -> object:
+        events.append("base")
+        return object()
+
+    def load_usage(**kwargs: Any) -> object:
+        events.append("usage")
+        assert kwargs["clock"] is usage_clock
+        assert kwargs["runner"] is bounded_runner
+        active_reader = kwargs["active_release_reader"]
+        cache_reader = kwargs["cache_reader"]
+        assert isinstance(active_reader, functools.partial)
+        assert isinstance(cache_reader, functools.partial)
+        assert active_reader.func is server_module.read_active_launcher_v1
+        assert cache_reader.func is server_module.read_account_usage_cache_v1
+        assert active_reader.args == ()
+        assert cache_reader.args == ()
+        assert active_reader.keywords == {"state_home": Path("/synthetic/state")}
+        assert cache_reader.keywords == {"state_home": Path("/synthetic/state")}
+        assert kwargs["known_account_ids"] == frozenset({"overview-account"})
+        return object()
+
+    def enrich(base: object, usage: object) -> object:
+        assert base is not None and usage is not None
+        events.append("enrich")
+        return object()
+
+    def render(_overview: object, *, format: str) -> str:
+        assert format == "json"
+        events.append("render")
+        return "rendered"
+
+    with patch.object(server_module, "_fleet_registry_read_lock", lock), patch.object(
+        server_module, "_readonly_fleet_service", return_value=service
+    ), patch.object(server_module, "build_inventory", side_effect=inventory), patch.object(
+        server_module, "build_fleet_overview", side_effect=base_overview
+    ), patch.object(server_module, "load_account_usage_v1", side_effect=load_usage, create=True), patch.object(
+        server_module, "enrich_fleet_overview_usage", side_effect=enrich, create=True
+    ), patch.object(server_module, "render_fleet_overview", side_effect=render), patch.object(
+        server_module, "_resolve_codex_usage_state_home", return_value=Path("/synthetic/state"), create=True
+    ), patch.object(server_module, "default_runner", bounded_runner, create=True):
+        result = server_module._fleet_overview_local_admin(
+            active_only=True,
+            format="json",
+            clock=registry_clock,
+            usage_clock=usage_clock,
+        )
+
+    assert result == "rendered"
+    assert events == [
+        "lock-enter",
+        "registry-clock",
+        "registry",
+        "inventory",
+        "base",
+        "lock-exit",
+        "usage",
+        "enrich",
+        "render",
+    ]
+    service.registry_snapshot.assert_called_once_with()
+
+
+def test_invalid_usage_state_home_fails_soft_to_unavailable_enrichment() -> None:
+    with patch.object(server_module, "_resolve_codex_usage_state_home", return_value=None, create=True), patch.object(
+        server_module, "_fleet_registry_read_lock", contextlib.nullcontext
+    ), patch.object(
+        server_module, "_readonly_fleet_service", return_value=Mock(registry_snapshot=Mock(return_value=object()))
+    ), patch.object(server_module, "build_inventory", return_value=object()), patch.object(
+        server_module, "build_fleet_overview", return_value=object()
+    ), patch.object(server_module, "load_account_usage_v1", create=True) as load_usage, patch.object(
+        server_module, "enrich_fleet_overview_usage", return_value=object(), create=True
+    ) as enrich, patch.object(server_module, "render_fleet_overview", return_value="rendered"):
+        result = server_module._fleet_overview_local_admin(
+            active_only=True,
+            format="compact",
+            clock=lambda: datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc),
+            usage_clock=lambda: datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc),
+        )
+
+    assert result == "rendered"
+    load_usage.assert_not_called()
+    enrich.assert_called_once()
+
+
+def test_usage_loader_exception_becomes_canonical_unavailable_and_render_success() -> None:
+    marker = "usage-loader-marker"
+    snapshot = _overview_cli_test_snapshot()
+    base_overview = object()
+    enriched_overview = object()
+    service = Mock()
+    service.registry_snapshot.return_value = snapshot
+
+    @contextlib.contextmanager
+    def fake_lock(_path: Path) -> Any:
+        yield
+
+    def enrich(base: object, usage: UsageSnapshot) -> object:
+        assert base is base_overview
+        assert usage == UsageSnapshot((), "unavailable", True, ("usage_unavailable",))
+        return enriched_overview
+
+    renderer = Mock(return_value="rendered")
+    with patch.object(server_module, "STATE_ROOT", Path("/synthetic-state")), patch.object(
+        server_module, "_fleet_registry_read_lock", fake_lock
+    ), patch.object(
+        server_module, "_readonly_fleet_service", return_value=service
+    ), patch.object(server_module, "build_inventory", return_value=object()), patch.object(
+        server_module, "build_fleet_overview", return_value=base_overview
+    ), patch.object(
+        server_module, "_resolve_codex_usage_state_home", return_value=Path("/synthetic/state")
+    ), patch.object(
+        server_module, "load_account_usage_v1", side_effect=RuntimeError(marker)
+    ) as loader, patch.object(
+        server_module, "enrich_fleet_overview_usage", side_effect=enrich
+    ), patch.object(server_module, "render_fleet_overview", renderer):
+        result = server_module._fleet_overview_local_admin(
+            active_only=True,
+            format="compact",
+            clock=lambda: datetime(2026, 8, 15, tzinfo=timezone.utc),
+            usage_clock=lambda: datetime(2026, 8, 15, tzinfo=timezone.utc),
+        )
+
+    assert result == "rendered"
+    assert marker not in result
+    loader.assert_called_once()
+    renderer.assert_called_once_with(enriched_overview, format="compact")
 
 if __name__ == "__main__":
     unittest.main()

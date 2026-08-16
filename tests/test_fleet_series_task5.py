@@ -15,6 +15,25 @@ from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
 from codex_master.fleet_service import FleetConflictError
 
 
+def test_v1_series_apply_remains_compatible_with_dual_schema_reader() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        executable = _runner(root)
+        with patch.object(server, "STATE_ROOT", root / "state"), patch.object(
+            server, "AGENT_POOL_ROOT", root / "pool"
+        ), server.temporary_agent_inventory(None):
+            result = server.fleet_series_apply(
+                prefix="d", count=2, runner="codex_cli", provider="ollama_local",
+                model="local-model", account_id=None, expected_generation=1,
+                codex_executable=executable,
+            )
+            snapshot = server.current_fleet_service().load()
+            inventory = server.current_agent_inventory()
+    assert result["created_count"] == 2
+    assert snapshot.schema_version == 1
+    assert inventory.agent_ids == ("d1", "d2")
+
+
 def _runner(root: Path) -> Path:
     path = root / "runner"
     path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")

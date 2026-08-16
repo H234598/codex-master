@@ -81,6 +81,7 @@ _READ_ONLY_TOOLS = {
     "agent_capabilities",
     "agent_scope_check",
     "agent_routing_decision",
+    "agent_selection_options",
     "agent_assignments",
     "agent_last_assignment_status",
     "agent_assignment_report",
@@ -114,6 +115,10 @@ _READ_ONLY_TOOLS = {
     "hive_admission_status",
     "agent_selection_preview",
     "agent_selection_status",
+    "fleet_overview",
+    "fleet_status_compact",
+    "goddess_report_status",
+    "goddess_report_list",
 }
 _MUTATING_TOOLS = {
     "agent_claim",
@@ -136,6 +141,7 @@ _MUTATING_TOOLS = {
     "fleet_series_apply",
     "fleet_series_disable",
     "fleet_series_delete",
+    "goddess_report_run",
 }
 _BROAD_TOOLS = {
     "agent_start",

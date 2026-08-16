@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "generation": 4,
+  "accounts": [],
+  "series": [
+    {
+      "prefix": "d",
+      "display_name": "Local D-Serie",
+      "count": 2,
+      "runner": "codex_cli",
+      "provider": "ollama_local",
+      "model": "local-model",
+      "account_id": null,
+      "enabled": true,
+      "skill_profile": "generic",
+      "task_profile": "standard"
+    }
+  ]
+}

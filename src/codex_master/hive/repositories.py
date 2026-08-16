@@ -8,8 +8,11 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import selectors
+import signal
 import stat
 import subprocess
+import time
 
 from codex_master.hive.types import HiveValidationError, validate_identifier
 
@@ -18,6 +21,7 @@ _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _BRANCH_RE = re.compile(r"[A-Za-z0-9._/-]{1,128}\Z")
 MAX_REMOTE_LENGTH = 512
 MAX_GIT_OUTPUT = 64 * 1024
+GIT_TIMEOUT_SECONDS = 5
 
 
 class RepositoryError(ValueError):
@@ -99,6 +103,22 @@ def _normalize_remote(value: str) -> str:
         host, separator, path = rest.partition("/")
         text = f"{scheme.lower()}://{host.lower()}{separator}{path}"
     return text.rstrip("/").removesuffix(".git")
+
+
+def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 class RepositoryRegistry:
@@ -185,21 +205,63 @@ class RepositoryRegistry:
 
     @staticmethod
     def _git(root: Path, *args: str) -> str | None:
+        process: subprocess.Popen[bytes] | None = None
+        selector: selectors.BaseSelector | None = None
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 ["git", "-C", os.fspath(root), *args],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=5,
-                check=False,
+                close_fds=True,
+                start_new_session=True,
             )
+            if process.stdout is None:
+                return None
+            selector = selectors.DefaultSelector()
+            selector.register(process.stdout, selectors.EVENT_READ)
+            chunks: list[bytes] = []
+            output_size = 0
+            deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _terminate_process_group(process)
+                    return None
+                events = selector.select(remaining)
+                if not events:
+                    _terminate_process_group(process)
+                    return None
+                for key, _ in events:
+                    chunk = os.read(key.fd, min(65536, MAX_GIT_OUTPUT + 1 - output_size))
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    output_size += len(chunk)
+                    if output_size > MAX_GIT_OUTPUT:
+                        _terminate_process_group(process)
+                        return None
+                    chunks.append(chunk)
+            try:
+                returncode = process.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                _terminate_process_group(process)
+                return None
+            if returncode != 0:
+                return None
+            try:
+                output = b"".join(chunks).decode("utf-8")
+            except UnicodeError:
+                return None
         except (OSError, subprocess.SubprocessError):
+            if process is not None:
+                _terminate_process_group(process)
             return None
-        output = completed.stdout
-        if completed.returncode != 0 or not isinstance(output, str) or len(output.encode()) > MAX_GIT_OUTPUT:
-            return None
+        finally:
+            if selector is not None:
+                selector.close()
+            if process is not None and process.stdout is not None:
+                process.stdout.close()
         value = output.strip()
         return value or None
 

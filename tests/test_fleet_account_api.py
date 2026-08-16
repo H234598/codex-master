@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
+import stat
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,8 +13,13 @@ from codex_master import server
 from codex_master.fleet_registry import (
     AuthKind,
     FleetAccount,
+    FleetAccountV2,
     FleetSeries,
+    FleetSeriesMember,
+    FleetSeriesV2,
     FleetSnapshot,
+    FleetSnapshotV2,
+    FleetValidationError,
     LimitState,
     Provider,
     RunnerKind,
@@ -20,6 +27,267 @@ from codex_master.fleet_registry import (
 )
 from codex_master.fleet_recovery import RecoveryPhase
 from codex_master.fleet_runners import ProbeResult, ProviderModelsResult
+
+
+GEMINI_PROJECT_CREDENTIAL = "local-only-secret"
+HF_MAIN_CREDENTIAL = "hf-private-token"
+HF_PROBE_CREDENTIAL = "probe-token"
+GEMINI_READY_CREDENTIAL = "gemini-private-token"
+DELETE_CREDENTIAL = "delete-private"
+OLD_PROVIDER_CREDENTIAL = "old-provider-secret"
+FIXED_BINDING_SALT = bytes(range(32))
+
+
+def v2_gemini_snapshot(*, generation: int = 2, enabled: bool = False) -> FleetSnapshotV2:
+    accounts = tuple(
+        FleetAccountV2(
+            account_id,
+            label,
+            Provider.GEMINI_API,
+            AuthKind.API_KEY,
+            SecretState.MISSING,
+            LimitState.READY,
+            enabled,
+            None,
+            None,
+            None,
+        )
+        for account_id, label in (
+            ("gemini-project-1", "Gemini one"),
+            ("gemini-project-2", "Gemini two"),
+        )
+    )
+    members = (
+        FleetSeriesMember("00000000-0000-4000-8000-000000000001", 1, "gemini-project-1", enabled),
+        FleetSeriesMember("00000000-0000-4000-8000-000000000002", 2, "gemini-project-2", enabled),
+    )
+    return FleetSnapshotV2(
+        2,
+        generation,
+        accounts,
+        (
+            FleetSeriesV2(
+                "g",
+                "Gemini G",
+                RunnerKind.GEMINI_CLI,
+                Provider.GEMINI_API,
+                "gemini-3-flash-preview",
+                enabled,
+                "generic",
+                "standard",
+                members,
+            ),
+        ),
+    )
+
+
+def v2_account(snapshot: FleetSnapshotV2, account_id: str) -> FleetAccountV2:
+    matches = [item for item in snapshot.accounts if item.account_id == account_id]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def test_v2_gemini_secret_binding_is_stable_private_and_rotation_sensitive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(server, "AGENT_POOL_ROOT", tmp_path / "pool")
+    service = server.current_fleet_service()
+    service.commit_snapshot(v2_gemini_snapshot(), expected_generation=1)
+
+    service.set_secret("gemini-project-1", "same-key", expected_generation=2)
+    first = v2_account(service.load(), "gemini-project-1").credential_binding_id
+    service.set_secret("gemini-project-2", "same-key", expected_generation=3)
+    second = v2_account(service.load(), "gemini-project-2").credential_binding_id
+
+    assert first == second
+    assert first is not None and first.startswith("hmac-sha256:")
+    salt_path = service._paths.secrets / ".credential-binding-salt"
+    assert salt_path.stat().st_size == 32
+    assert stat.S_IMODE(salt_path.stat().st_mode) == 0o600
+    service.set_secret("gemini-project-1", "rotated-key", expected_generation=4)
+    assert v2_account(service.load(), "gemini-project-1").credential_binding_id != first
+    public = json.dumps(service.public_snapshot())
+    assert first not in public
+    assert "credential_binding_id" not in public
+
+
+def test_v2_configured_gemini_without_binding_is_denied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(server, "AGENT_POOL_ROOT", tmp_path / "pool")
+    service = server.current_fleet_service()
+    snapshot = v2_gemini_snapshot(enabled=True)
+    configured = replace(
+        snapshot,
+        accounts=tuple(replace(account, secret_state=SecretState.CONFIGURED) for account in snapshot.accounts),
+    )
+    service.commit_snapshot(configured, expected_generation=1)
+
+    decision = service.account_gate("g1")
+    assert decision.reason == "credential_binding_unknown"
+    assert decision.allowed is False
+
+
+def test_second_active_v2_gemini_same_credential_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(server, "AGENT_POOL_ROOT", tmp_path / "pool")
+    service = server.current_fleet_service()
+    service.commit_snapshot(v2_gemini_snapshot(enabled=True), expected_generation=1)
+    service.set_secret("gemini-project-1", "same-key", expected_generation=2)
+
+    with pytest.raises(FleetValidationError, match="duplicate_credential_binding"):
+        service.set_secret("gemini-project-2", "same-key", expected_generation=3)
+    assert not (service._paths.secrets / "gemini-project-2.secret").exists()
+    after = service.load()
+    assert after.generation == 3
+    assert v2_account(after, "gemini-project-2").credential_binding_id is None
+
+
+def test_existing_binding_salt_wrong_mode_fails_closed_after_sidecar_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(server, "AGENT_POOL_ROOT", tmp_path / "pool")
+    service = server.current_fleet_service()
+    service.commit_snapshot(v2_gemini_snapshot(enabled=True), expected_generation=1)
+    service.set_secret("gemini-project-1", "first-key", expected_generation=2)
+    service.set_secret("gemini-project-2", "second-key", expected_generation=3)
+    before = service.load()
+    second_before = v2_account(before, "gemini-project-2")
+    salt_path = service._paths.secrets / ".credential-binding-salt"
+    salt = salt_path.read_bytes()
+    salt_path.chmod(0o644)
+
+    with pytest.raises(server.FleetSecretError, match="credential_binding_unavailable"):
+        service.set_secret("gemini-project-2", "rotated-key", expected_generation=4)
+
+    assert salt_path.read_bytes() == salt
+    assert stat.S_IMODE(salt_path.stat().st_mode) == 0o644
+    assert (service._paths.secrets / "gemini-project-2.secret").read_text() == "second-key"
+    after = service.load()
+    assert after.generation == before.generation
+    assert v2_account(after, "gemini-project-2").credential_binding_id == (
+        second_before.credential_binding_id
+    )
+
+
+def test_existing_binding_missing_salt_fails_closed_without_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(server, "AGENT_POOL_ROOT", tmp_path / "pool")
+    service = server.current_fleet_service()
+    service.commit_snapshot(v2_gemini_snapshot(enabled=True), expected_generation=1)
+    service.set_secret("gemini-project-1", "first-key", expected_generation=2)
+    before = service.load()
+    salt_path = service._paths.secrets / ".credential-binding-salt"
+    salt_path.unlink()
+
+    with pytest.raises(server.FleetSecretError, match="credential_binding_unavailable"):
+        service.set_secret("gemini-project-2", "second-key", expected_generation=3)
+
+    assert not salt_path.exists()
+    assert not (service._paths.secrets / "gemini-project-2.secret").exists()
+    after = service.load()
+    assert after.generation == before.generation
+    assert v2_account(after, "gemini-project-1").credential_binding_id == (
+        v2_account(before, "gemini-project-1").credential_binding_id
+    )
+
+
+@pytest.mark.parametrize("invalid_salt", [b"", b"invalid-salt"])
+def test_existing_binding_invalid_salt_fails_closed(
+    invalid_salt: bytes,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(server, "AGENT_POOL_ROOT", tmp_path / "pool")
+    service = server.current_fleet_service()
+    service.commit_snapshot(v2_gemini_snapshot(enabled=True), expected_generation=1)
+    service.set_secret("gemini-project-1", "first-key", expected_generation=2)
+    before = service.load()
+    salt_path = service._paths.secrets / ".credential-binding-salt"
+    salt_path.write_bytes(invalid_salt)
+    salt_path.chmod(0o600)
+
+    with pytest.raises(server.FleetSecretError, match="credential_binding_unavailable"):
+        service.set_secret("gemini-project-2", "second-key", expected_generation=3)
+
+    assert salt_path.read_bytes() == invalid_salt
+    assert not (service._paths.secrets / "gemini-project-2.secret").exists()
+    assert service.load().generation == before.generation
+
+
+def test_duplicate_binding_restores_target_sidecar_and_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(server, "AGENT_POOL_ROOT", tmp_path / "pool")
+    service = server.current_fleet_service()
+    service.commit_snapshot(v2_gemini_snapshot(enabled=True), expected_generation=1)
+    service.set_secret("gemini-project-1", "same-key", expected_generation=2)
+    service.set_secret("gemini-project-2", "old-second-key", expected_generation=3)
+    before = service.load()
+    second_before = v2_account(before, "gemini-project-2")
+
+    with pytest.raises(FleetValidationError, match="duplicate_credential_binding"):
+        service.set_secret("gemini-project-2", "same-key", expected_generation=4)
+
+    assert (service._paths.secrets / "gemini-project-2.secret").read_text() == "old-second-key"
+    after = service.load()
+    assert after.generation == before.generation
+    assert v2_account(after, "gemini-project-2").credential_binding_id == (
+        second_before.credential_binding_id
+    )
+
+
+def test_binding_hmac_fixed_vector_uses_private_domain_and_salt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(server, "AGENT_POOL_ROOT", tmp_path / "pool")
+    service = server.current_fleet_service()
+    salt_path = service._paths.secrets / ".credential-binding-salt"
+    salt_path.parent.mkdir(parents=True, exist_ok=True)
+    salt_path.write_bytes(FIXED_BINDING_SALT)
+    salt_path.chmod(0o600)
+    service.commit_snapshot(v2_gemini_snapshot(), expected_generation=1)
+
+    service.set_secret("gemini-project-1", "fixed-secret", expected_generation=2)
+    expected = "hmac-sha256:" + hmac.new(
+        FIXED_BINDING_SALT,
+        b"codex-master:gemini-credential-binding:v1\0fixed-secret",
+        hashlib.sha256,
+    ).hexdigest()
+    assert v2_account(service.load(), "gemini-project-1").credential_binding_id == expected
+
+
+def test_public_v2_account_api_redacts_binding_salt_and_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(server, "AGENT_POOL_ROOT", tmp_path / "pool")
+    service = server.current_fleet_service()
+    service.commit_snapshot(v2_gemini_snapshot(), expected_generation=1)
+    service.set_secret("gemini-project-1", "publicly-secret", expected_generation=2)
+
+    payload = json.dumps(server.fleet_account_list())
+    assert "credential_binding_id" not in payload
+    assert "publicly-secret" not in payload
+    assert ".credential-binding-salt" not in payload
 
 
 def test_account_and_series_api_is_generation_bound_and_secret_free(
@@ -42,7 +310,7 @@ def test_account_and_series_api_is_generation_bound_and_secret_free(
 
     configured = server.fleet_account_set_secret(
         account_id="gemini-project-1",
-        secret="local-only-secret",
+        secret=GEMINI_PROJECT_CREDENTIAL,
         expected_generation=2,
     )
     assert configured == {
@@ -52,8 +320,8 @@ def test_account_and_series_api_is_generation_bound_and_secret_free(
         "raw_output": "not_returned",
     }
     secret_path = tmp_path / "state" / "fleet" / "secrets" / "gemini-project-1.secret"
-    assert secret_path.read_text() == "local-only-secret"
-    assert "local-only-secret" not in json.dumps(server.fleet_account_list())
+    assert secret_path.read_text() == GEMINI_PROJECT_CREDENTIAL
+    assert GEMINI_PROJECT_CREDENTIAL not in json.dumps(server.fleet_account_list())
 
     service = server.current_fleet_service()
     current = service.load()
@@ -227,7 +495,7 @@ def test_provider_models_is_bounded_and_keeps_hf_secret_private(
     )
     server.fleet_account_set_secret(
         account_id="hf-main",
-        secret="hf-private-token",
+        secret=HF_MAIN_CREDENTIAL,
         expected_generation=2,
     )
     huggingface = server.fleet_provider_models(
@@ -235,8 +503,8 @@ def test_provider_models_is_bounded_and_keeps_hf_secret_private(
         account_id="hf-main",
     )
     assert huggingface["models"] == [{"id": "good/model", "agentic": True}]
-    assert captured == {"provider": Provider.HUGGINGFACE_INFERENCE, "secret": "hf-private-token"}
-    assert "hf-private-token" not in json.dumps(huggingface)
+    assert captured == {"provider": Provider.HUGGINGFACE_INFERENCE, "secret": HF_MAIN_CREDENTIAL}
+    assert HF_MAIN_CREDENTIAL not in json.dumps(huggingface)
 
 
 def test_provider_models_requires_configured_hf_account_without_network(
@@ -265,7 +533,7 @@ def test_account_probe_persists_only_redacted_readiness_state(
     )
     server.fleet_account_set_secret(
         account_id="hf-probe",
-        secret="probe-token",
+        secret=HF_PROBE_CREDENTIAL,
         expected_generation=2,
     )
     monkeypatch.setattr(
@@ -288,7 +556,7 @@ def test_account_probe_persists_only_redacted_readiness_state(
         "raw_output": "not_returned",
     }
     assert server.fleet_account_list()["accounts"][0]["limit_state"] == "ready"
-    assert "probe-token" not in json.dumps(server.fleet_account_list())
+    assert HF_PROBE_CREDENTIAL not in json.dumps(server.fleet_account_list())
 
 
 def test_gemini_account_probe_reports_missing_secret_without_invalidating_account(
@@ -336,7 +604,7 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
     )
     server.fleet_account_set_secret(
         account_id="gemini-ready",
-        secret="gemini-private-token",
+        secret=GEMINI_READY_CREDENTIAL,
         expected_generation=2,
     )
     monkeypatch.setattr(server.shutil, "which", lambda _name: "/usr/local/bin/gemini")
@@ -365,8 +633,8 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
         "model": "gemini-3-flash-preview",
         "raw_output": "not_returned",
     }
-    assert captured["secret"] == "gemini-private-token"
-    assert "gemini-private-token" not in json.dumps(result)
+    assert captured["secret"] == GEMINI_READY_CREDENTIAL
+    assert GEMINI_READY_CREDENTIAL not in json.dumps(result)
 
 
 def test_account_delete_requires_disabled_unbound_account_and_removes_secret(
@@ -385,7 +653,7 @@ def test_account_delete_requires_disabled_unbound_account_and_removes_secret(
     )
     server.fleet_account_set_secret(
         account_id="delete-me",
-        secret="delete-private",
+        secret=DELETE_CREDENTIAL,
         expected_generation=2,
     )
     with pytest.raises(server.AgentError, match="account_must_be_disabled"):
@@ -419,7 +687,7 @@ def test_account_provider_change_removes_old_secret_sidecar(
     )
     server.fleet_account_set_secret(
         account_id="switch-me",
-        secret="old-provider-secret",
+        secret=OLD_PROVIDER_CREDENTIAL,
         expected_generation=2,
     )
     switched = server.fleet_account_upsert(
@@ -451,7 +719,7 @@ def test_account_provider_change_cleanup_is_retryable_after_sidecar_failure(
     )
     server.fleet_account_set_secret(
         account_id="retry-me",
-        secret="old-provider-secret",
+        secret=OLD_PROVIDER_CREDENTIAL,
         expected_generation=2,
     )
     real_remove = server.FleetService.remove_secret_sidecar

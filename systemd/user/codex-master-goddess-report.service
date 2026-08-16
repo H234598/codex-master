@@ -1,0 +1,30 @@
+[Unit]
+Description=Codex Master Göttinnenbericht
+Documentation=man:systemd.service(5)
+
+[Service]
+Type=oneshot
+Environment=CODEX_MASTER_MCP_INSTANCE_ID=codex-master-goddess-report
+CapabilityBoundingSet=
+KeyringMode=private
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=%h/.local/state/codex-master-mcp %h/Dokumente/Obsidian_Vaults/Teladi_Programming
+IPAddressDeny=any
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+UMask=0077
+ExecStart=%h/.local/bin/codex-master-mcp goddess report run

@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -52,6 +53,102 @@ def global_plan(mode: str = "shadow", *, repositories: tuple[str, ...] = ("repo-
         repository_queens={repo_id: f"queen-{repo_id.removeprefix('repo-')}" for repo_id in repositories if repo_id in {"repo-one", "repo-two"}},
         user_gates=user_gates, mode=mode,
     )
+
+
+def clocked_global_plan(now: object) -> GlobalRequestPlan:
+    return plan_global_request(
+        actor_principal_id="godbee-main",
+        objective="Coordinate bounded work",
+        repositories=("repo-one",),
+        priority=DispatchPriority.DP1,
+        success_criteria=("tests pass",),
+        constraints=(),
+        repository_queens={"repo-one": "queen-one"},
+        now=now,
+    )
+
+
+@pytest.mark.parametrize(
+    ("sample", "expected"),
+    (
+        (NOW, NOW),
+        (datetime(2026, 8, 6, 14, 0, tzinfo=timezone(timedelta(hours=2))), NOW),
+    ),
+    ids=("utc", "aware_offset_canonicalized_to_utc"),
+)
+def test_global_request_plan_samples_valid_clock_once_and_canonicalizes_aware_time(
+    sample: datetime,
+    expected: datetime,
+) -> None:
+    samples: list[datetime] = []
+
+    def clock() -> datetime:
+        samples.append(sample)
+        return sample
+
+    plan = clocked_global_plan(clock)
+
+    assert samples == [sample]
+    assert plan.request.created_at_utc == expected
+
+
+@pytest.mark.parametrize(
+    "clock",
+    (
+        lambda: (_ for _ in ()).throw(HiveDispatchError("private_hive_dispatch_detail")),
+        lambda: (_ for _ in ()).throw(ValueError("private_value_detail")),
+        lambda: (_ for _ in ()).throw(TypeError("private_type_detail")),
+        lambda: "2026-08-06T12:00:00Z",
+        lambda: 1_786_017_600,
+        lambda: datetime(2026, 8, 6, 12, 0),
+    ),
+    ids=("hive_dispatch_error", "value_error", "type_error", "wrong_string", "wrong_number", "naive_datetime"),
+)
+def test_global_request_plan_rejects_adversarial_clock_without_detail_leak(
+    clock: Callable[[], object],
+) -> None:
+    samples = 0
+
+    def counted_clock() -> object:
+        nonlocal samples
+        samples += 1
+        return clock()
+
+    with pytest.raises(HiveDispatchError, match=r"^invalid_request_timestamp$") as raised:
+        clocked_global_plan(counted_clock)
+
+    assert samples == 1
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__ is True
+    assert "private_" not in str(raised.value)
+
+
+def test_global_request_plan_rejects_invalid_request_before_clock_sample() -> None:
+    samples = 0
+
+    def clock() -> datetime:
+        nonlocal samples
+        samples += 1
+        return NOW
+
+    with pytest.raises(HiveDispatchError, match=r"^godbee_actor_required$"):
+        plan_global_request(
+            actor_principal_id="queen-one",
+            objective="Coordinate bounded work",
+            repositories=("repo-one",),
+            priority=DispatchPriority.DP1,
+            success_criteria=("tests pass",),
+            constraints=(),
+            repository_queens={"repo-one": "queen-one"},
+            now=clock,
+        )
+
+    assert samples == 0
+
+
+def test_global_request_plan_rejects_noncallable_clock_without_sample() -> None:
+    with pytest.raises(HiveDispatchError, match=r"^invalid_planning_clock$"):
+        clocked_global_plan(object())
 
 
 def test_state_machines_enforce_order_and_are_idempotent_on_same_version() -> None:

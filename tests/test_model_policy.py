@@ -28,3 +28,16 @@ def test_model_policy_loader_rejects_unknown_fields_and_loads_strict_document(tm
     path.write_text('{"schema_version":1,"models":[],"secret":"no"}', encoding="utf-8")
     with pytest.raises(ModelPolicyError, match="invalid_model_policy"):
         load_model_policy(path)
+
+
+def test_model_policy_loads_resolver_metadata() -> None:
+    registry = load_model_policy(Path(__file__).resolve().parents[1] / "codex-model-policy.json")
+
+    sol = registry.get_exact("gpt-5.6-sol")
+    assert sol is not None
+    assert sol.family == "sol"
+    assert sol.rank == 40
+    assert sol.reasoning_levels == ("xhigh", "max")
+    assert sol.default_reasoning == "xhigh"
+    assert sol.spawn_behavior == "manual"
+    assert {item["family"] for item in registry.public()} == {"spark", "luna", "terra", "sol"}

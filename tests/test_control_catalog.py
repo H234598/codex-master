@@ -38,6 +38,7 @@ EXPECTED_RISKS = {
     "agent_capabilities": Risk.READ_ONLY,
     "agent_scope_check": Risk.READ_ONLY,
     "agent_routing_decision": Risk.READ_ONLY,
+    "agent_selection_options": Risk.READ_ONLY,
     "agent_assign": Risk.MUTATING,
     "agent_assign_readonly": Risk.MUTATING,
     "agent_assign_live_data": Risk.MUTATING,
@@ -90,6 +91,11 @@ EXPECTED_RISKS = {
     "hive_admission_status": Risk.READ_ONLY,
     "agent_selection_preview": Risk.READ_ONLY,
     "agent_selection_status": Risk.READ_ONLY,
+    "fleet_overview": Risk.READ_ONLY,
+    "fleet_status_compact": Risk.READ_ONLY,
+    "goddess_report_status": Risk.READ_ONLY,
+    "goddess_report_run": Risk.MUTATING,
+    "goddess_report_list": Risk.READ_ONLY,
 }
 
 
