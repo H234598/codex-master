@@ -50,10 +50,11 @@ def _ensure_private_directory(path: Path) -> None:
         raise HiveStateError("state_directory_unavailable") from exc
     if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode) or current.st_mode & 0o077:
         raise HiveStateError("state_directory_untrusted")
-    try:
-        os.chmod(path, 0o700)
-    except OSError as exc:
-        raise HiveStateError("state_directory_unavailable") from exc
+    if stat.S_IMODE(current.st_mode) != 0o700:
+        try:
+            os.chmod(path, 0o700)
+        except OSError as exc:
+            raise HiveStateError("state_directory_unavailable") from exc
 
 
 class HiveStateStore:

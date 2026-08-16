@@ -33,6 +33,45 @@ def test_state_store_uses_private_modes(tmp_path: Path) -> None:
     assert stat.S_IMODE((tmp_path / "state" / ".hive-state.lock").stat().st_mode) == 0o600
 
 
+def test_state_store_reuses_exact_0700_root_without_chmod_and_existing_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    lock = root / ".hive-state.lock"
+    lock.write_bytes(b"")
+    lock.chmod(0o600)
+    original_chmod = os.chmod
+
+    def deny_root_chmod(path: os.PathLike[str] | str, mode: int, *args: object, **kwargs: object) -> None:
+        if Path(path) == root:
+            raise PermissionError("root is read-only")
+        original_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr("codex_master.hive.state.os.chmod", deny_root_chmod)
+
+    store = HiveStateStore(root)
+    store.replace_private_bytes(PurePosixPath("resources/snapshot.bin"), b"complete")
+
+    assert store.read_private_bytes(PurePosixPath("resources/snapshot.bin"), max_bytes=64) == b"complete"
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+
+
+def test_state_store_still_rejects_untrusted_root_mode_and_root_symlink(tmp_path: Path) -> None:
+    untrusted = tmp_path / "untrusted"
+    untrusted.mkdir(mode=0o750)
+    with pytest.raises(HiveStateError, match="state_directory_untrusted"):
+        HiveStateStore(untrusted)
+
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    linked = tmp_path / "linked"
+    linked.symlink_to(target, target_is_directory=True)
+    with pytest.raises(HiveStateError, match="state_directory_untrusted"):
+        HiveStateStore(linked)
+
+
 @pytest.mark.parametrize("relative", [PurePosixPath("../escape.json"), PurePosixPath("/absolute.json")])
 def test_state_store_rejects_path_escape(tmp_path: Path, relative: PurePosixPath) -> None:
     store = HiveStateStore(tmp_path / "state")

@@ -103,6 +103,7 @@ from codex_master.resource_monitor import (
     ResourceSnapshotError,
     read_current_resource_boot_id,
     read_resource_gate_facts,
+    run_resource_monitor as run_resource_monitor_loop,
 )
 from codex_master.fleet_snapshot import (
     FleetSnapshot as FleetWatchdogSnapshot,
@@ -928,6 +929,17 @@ def _call_with_resource_gate_composer(callback: Any) -> Any:
 
     with _resource_gate_composer_scope():
         return callback()
+
+
+def run_resource_monitor() -> None:
+    """Run the monitor with only the central composer's authorized Hive state."""
+
+    runtime = _compose_resource_gate_runtime()
+    if runtime is None:
+        raise AgentError("resource_monitor_unavailable")
+    run_resource_monitor_loop(runtime.state)
+
+
 RUNNER_EXECUTION_FDS: dict[str, int] = {}
 
 
