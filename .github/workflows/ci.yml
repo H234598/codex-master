@@ -82,10 +82,13 @@ jobs:
           zero_sha=0000000000000000000000000000000000000000
           if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] && [ -n "${BASE_SHA}" ]; then
             range="${BASE_SHA}...${HEAD_SHA}"
-          elif [ -n "${BEFORE_SHA}" ] && [ "${BEFORE_SHA}" != "${zero_sha}" ]; then
+          elif [ "${GITHUB_EVENT_NAME}" = "push" ] \
+            && [ -n "${BEFORE_SHA}" ] \
+            && [ "${BEFORE_SHA}" != "${zero_sha}" ] \
+            && git rev-parse --verify --quiet "${BEFORE_SHA}^{commit}" >/dev/null \
+            && git merge-base --is-ancestor "${BEFORE_SHA}" "${HEAD_SHA}"; then
             range="${BEFORE_SHA}..${HEAD_SHA}"
           elif [ "${GITHUB_EVENT_NAME}" = "push" ] \
-            && [ "${BEFORE_SHA}" = "${zero_sha}" ] \
             && [ -n "${DEFAULT_BRANCH}" ] \
             && git rev-parse --verify --quiet "refs/remotes/origin/${DEFAULT_BRANCH}^{commit}" >/dev/null \
             && merge_base="$(git merge-base "refs/remotes/origin/${DEFAULT_BRANCH}" "${HEAD_SHA}")"; then
