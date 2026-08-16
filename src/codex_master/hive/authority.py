@@ -51,7 +51,7 @@ class AuthorityRequest:
         if self.workpackage_id is not None:
             _identifier(self.workpackage_id, "workpackage")
         _paths(self.scope, "invalid_scope")
-        _paths(self.write_paths, "invalid_write_paths")
+        _paths(self.write_paths, "invalid_write_paths", allow_empty=True)
 
 
 @dataclass(frozen=True, slots=True)
