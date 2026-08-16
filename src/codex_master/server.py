@@ -3475,6 +3475,15 @@ def tmux_alive(session: str, *, snapshot: InventorySnapshot | None = None) -> bo
     return run_tmux(args, check=False, snapshot=snapshot).returncode == 0
 
 
+def _observational_tmux_alive(session: str, *, snapshot: InventorySnapshot | None = None) -> bool | None:
+    """Return unavailable, rather than routing failure, for read-only projections."""
+
+    try:
+        return tmux_alive(session, snapshot=snapshot)
+    except AgentError:
+        return None
+
+
 def meta_path(agent: str) -> Path:
     return META_DIR / f"{agent}.json"
 
@@ -5396,6 +5405,8 @@ def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> di
     ]
     if facts.thermal_state in {"warming_up", "monitor_unavailable"}:
         declared.append("temperature_monitor_unavailable")
+    if facts.gate_state == "blocked" and not declared:
+        reasons.append("resource_snapshot_invalid")
     reasons.extend(declared)
     return {
         "ok": not reasons,
@@ -10813,7 +10824,16 @@ def status_agent(
         else agent_home_process_summary(agent)
     )
     session_snapshot = snapshot.tmux_sessions.get(session) if snapshot is not None else None
-    running = session_snapshot.alive if session_snapshot is not None else tmux_alive(session)
+    tmux_scan_available = snapshot.tmux_scan_available if snapshot is not None else None
+    tmux_routing_unavailable = False
+    if session_snapshot is not None:
+        running = session_snapshot.alive
+    else:
+        observed_running = _observational_tmux_alive(session)
+        tmux_routing_unavailable = observed_running is None
+        running = observed_running is True
+        if tmux_routing_unavailable:
+            tmux_scan_available = False
     session_pid = (
         session_snapshot.pane_pid
         if session_snapshot is not None and running and "managed_process_ids" in process_summary
@@ -10822,6 +10842,15 @@ def status_agent(
         else None
     )
     identity_guard = agent_identity_guard(running, process_summary, pane_process_id=session_pid)
+    if tmux_routing_unavailable:
+        identity_guard = {
+            **identity_guard,
+            "ok": False,
+            "state": "tmux_routing_unavailable",
+            "tmux_session_running": False,
+            "pane_process_identity_checked": False,
+            "pane_process_identity_match": None,
+        }
     if running and identity_guard["ok"] and (raw_log_identity is None or raw_log_identity[1] is None):
         recovered_path = latest_managed_raw_log(
             agent,
@@ -10868,7 +10897,9 @@ def status_agent(
     else:
         usage_watchdog = codex_usage_watchdog_status(agent, include_assignment_history=initialize_state)
     response_state = agent_response_state(running, limit_state, raw_log_info, tui_context)
-    if running and not identity_guard["ok"]:
+    if tmux_routing_unavailable:
+        response_state = {**response_state, "state": "tmux_routing_unavailable"}
+    elif running and not identity_guard["ok"]:
         response_state = {**response_state, "state": "identity_unverified"}
     return {
         "agent": agent,
@@ -10911,7 +10942,7 @@ def status_agent(
         "home_external_process_count": process_summary["external_process_count"],
         "home_external_processes_truncated": process_summary["external_processes_truncated"],
         "identity_guard": identity_guard,
-        "tmux_scan_available": snapshot.tmux_scan_available if snapshot is not None else None,
+        "tmux_scan_available": tmux_scan_available,
         "auth": (
             {"state": "not_applicable", "provider": Provider.OLLAMA_LOCAL.value, "raw_output": "not_returned"}
             if ollama_descriptor is not None
@@ -17731,7 +17762,7 @@ def pane_tail(agent: str, lines: int, *, visible_only: bool = False, verify_iden
     agent = canonical_agent_id(agent)
     cfg = agent_config(agent)
     session = cfg["session"]
-    if not tmux_alive(session):
+    if _observational_tmux_alive(session) is not True:
         return ""
     if verify_identity:
         require_managed_tmux_session(agent)
@@ -17752,8 +17783,25 @@ def safe_tail(agent: str, lines: int = 40, chars: int = 4000, source: str = "pan
     if source not in ("pane", "log"):
         raise AgentError("source must be 'pane' or 'log'")
     lease = ensure_agent_lease_available(agent)
+    session_live = _observational_tmux_alive(agent_config(agent)["session"])
+    if session_live is None:
+        return {
+            "agent": agent,
+            "source": source,
+            "lines_limit": lines,
+            "chars_limit": chars,
+            "redaction_applied": False,
+            "output_chars": 0,
+            "output_lines": 0,
+            "output_truncated": False,
+            "output_truncated_by_lines": False,
+            "output_truncated_by_chars": False,
+            "raw_log": None,
+            "lease": lease,
+            "output": "",
+            "tmux_scan_available": False,
+        }
     meta = read_meta(agent)
-    session_live = tmux_alive(agent_config(agent)["session"])
     raw_log_path: Path | None = None
     if source == "pane":
         if session_live:

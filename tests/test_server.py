@@ -865,6 +865,55 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(denied["offers"], [])
         self.assertEqual(denied["reason_codes"], ["running_agent_limit"])
 
+    def test_resource_gate_snapshot_denies_blocked_facts_without_recognized_reason(self) -> None:
+        def facts(*, gate_state: str, reason_codes: tuple[str, ...]) -> ResourceGateFacts:
+            return ResourceGateFacts(
+                generation=7,
+                observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+                observed_monotonic_ns=1,
+                gate_state=gate_state,
+                reason_codes=reason_codes,
+                current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
+                available_memory_mib=8192,
+                legacy_pressure=LegacyPressureV1(
+                    load_per_cpu=0.25,
+                    cpu_busy_percent=25.0,
+                    io_wait_percent=0.0,
+                    available_memory_percent=50.0,
+                ),
+                normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
+                normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
+                bottleneck="unknown",
+                cgroup_state="unavailable",
+                thermal_state="ready",
+            )
+
+        cases = (
+            ("blocked_empty", facts(gate_state="blocked", reason_codes=()), False, ["resource_snapshot_invalid"]),
+            ("blocked_unknown", facts(gate_state="blocked", reason_codes=("unknown_reason",)), False, ["resource_snapshot_invalid"]),
+            ("blocked_filtered", facts(gate_state="blocked", reason_codes=("cgroup_preflight_failed",)), False, ["resource_snapshot_invalid"]),
+            ("blocked_known", facts(gate_state="blocked", reason_codes=("cpu_pressure_high",)), False, ["cpu_pressure_high"]),
+            ("ready_unknown", facts(gate_state="ready", reason_codes=("unknown_reason",)), True, []),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = server_module.ResourceGateRuntime(
+                state=HiveStateStore(Path(directory)),
+                expected_boot_id="123e4567-e89b-12d3-a456-426614174000",
+                now_utc=lambda: datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+                monotonic_ns=lambda: 0,
+                cgroup_profile=None,
+                cgroup_adapter=None,
+            )
+            for name, gate_facts, expected_ok, expected_reasons in cases:
+                with self.subTest(name=name), server_module._resource_gate_runtime_scope(runtime), patch(
+                    "codex_master.server.read_resource_gate_facts", return_value=gate_facts
+                ):
+                    result = server_module._resource_gate_snapshot(running_agents_override=2)
+
+                self.assertEqual(result["ok"], expected_ok)
+                self.assertEqual(result["reason_codes"], expected_reasons)
+                self.assertEqual(result["raw_output"], "not_returned")
+
     def test_g5_product_composer_reads_one_authorized_hive_state_facts_snapshot_for_offer(self) -> None:
         facts = ResourceGateFacts(
             generation=7,
@@ -1339,6 +1388,86 @@ class ServerHelpersTest(unittest.TestCase):
             ) as run_command:
                 with self.assertRaisesRegex(AgentError, "private tmux routing metadata is invalid"):
                     run_tmux(["has-session", "-t", session], check=False)
+            run_command.assert_not_called()
+
+    def test_observational_private_tmux_routes_project_unavailable_without_default_command(self) -> None:
+        def descriptor(agent: str, ordinal: int, session: str) -> server_module.AgentDescriptor:
+            return server_module.AgentDescriptor(
+                agent,
+                "r",
+                ordinal,
+                f"Registry {agent}",
+                server_module.RunnerKind.CODEX_CLI,
+                server_module.Provider.OPENAI_CHATGPT,
+                DEFAULT_AGENT_MODEL,
+                None,
+                Path(f"/home/{agent}"),
+                session,
+                True,
+                Path("/runner"),
+            )
+
+        active_descriptor = descriptor("r1", 1, "g5session")
+        active_inventory = server_module.InventorySnapshot(
+            ("r1",), {"r1": active_descriptor}, {"r-series": ("r1",)}, {"r1": 0}, ("r",)
+        )
+        missing_inventory = server_module.InventorySnapshot(
+            ("r1",), {"r1": descriptor("r1", 1, "other-session")}, {"r-series": ("r1",)}, {"r1": 0}, ("r",)
+        )
+        second_descriptor = descriptor("r2", 2, "g5session")
+        ambiguous_inventory = server_module.InventorySnapshot(
+            ("r1", "r2"),
+            {"r1": active_descriptor, "r2": second_descriptor},
+            {"r-series": ("r1", "r2")},
+            {"r1": 0, "r2": 1},
+            ("r",),
+        )
+        summary = {
+            "process_count": 0,
+            "managed_process_count": 0,
+            "external_process_count": 0,
+            "managed_process_ids": [],
+            "external_processes": [],
+            "external_processes_truncated": False,
+            "raw_output": "not_returned",
+        }
+        for route_inventory in (missing_inventory, ambiguous_inventory):
+            with self.subTest(agent_ids=route_inventory.agent_ids), server_module.temporary_agent_inventory(
+                active_inventory
+            ), patch(
+                "codex_master.server.effective_observation_inventory", return_value=(route_inventory, True)
+            ), patch("codex_master.server.read_meta", return_value={}) as read_meta, patch(
+                "codex_master.server.agent_home_process_summary", return_value=summary
+            ), patch("codex_master.server.latest_assignment_summary", return_value=None), patch(
+                "codex_master.server.agent_auth_status", return_value={}
+            ), patch("codex_master.server.agent_lease_status", return_value={}), patch(
+                "codex_master.server.codex_usage_watchdog_status", return_value={}
+            ), patch("codex_master.server.agent_limit_state", return_value={"limited": False}), patch(
+                "codex_master.server.ensure_state"
+            ), patch(
+                "codex_master.server.ensure_agent_lease_available",
+                return_value={"state": "unclaimed", "raw_output": "not_returned"},
+            ), patch("codex_master.server.require_fleet_recovery_ready"), patch(
+                "codex_master.server._run_bounded_command"
+            ) as run_command:
+                status = server_module.status_agent("r1", initialize_state=False)
+                self.assertFalse(status["running"])
+                self.assertFalse(status["tmux_scan_available"])
+                self.assertEqual(status["response_state"]["state"], "tmux_routing_unavailable")
+                self.assertFalse(status["identity_guard"]["ok"])
+                self.assertEqual(status["identity_guard"]["state"], "tmux_routing_unavailable")
+
+                self.assertEqual(server_module.pane_tail("r1", 4), "")
+                read_meta.reset_mock()
+                tail = safe_tail("r1", lines=4, chars=64, source="pane")
+                self.assertEqual(tail["output"], "")
+                self.assertFalse(tail["tmux_scan_available"])
+                self.assertIsNone(tail["raw_log"])
+                read_meta.assert_not_called()
+
+                with self.assertRaisesRegex(AgentError, "private tmux routing metadata is invalid"):
+                    send_agent("r1", "hello")
+
             run_command.assert_not_called()
 
     def test_managed_inventory_counts_private_g5_session_without_default_socket_probe(self) -> None:
