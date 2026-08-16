@@ -36,10 +36,12 @@ class FakeCgroupAdapter:
         documents: dict[Path, bytes] | None = None,
         preflight: CgroupPreflightV1 | None = None,
         fail_at: str | None = None,
+        topology_snapshots: list[object] | None = None,
     ) -> None:
         self.documents = documents or {}
         self.preflight = preflight or _preflight()
         self.fail_at = fail_at
+        self.topology_snapshots = topology_snapshots or []
         self.events: list[str] = []
         self.cleaned: list[PreparedAgentScope] = []
 
@@ -54,6 +56,12 @@ class FakeCgroupAdapter:
         if max_bytes != 4096:
             raise CgroupPreflightError("cgroup_preflight_failed")
         return self.documents.get(path)
+
+    def capture_cpu_topology_snapshot(self, cpus: tuple[int, ...]) -> object:
+        self.events.append("snapshot:/sys/devices/system/cpu/present")
+        if self.topology_snapshots:
+            return self.topology_snapshots.pop(0)
+        return ("stable", cpus)
 
     def inspect_preflight(self) -> CgroupPreflightV1:
         self.events.append("inspect")
@@ -178,6 +186,16 @@ def test_topology_uses_nonhybrid_route_only_when_every_core_type_leaf_is_cleanly
         parse_cpu_topology(FakeCgroupAdapter(documents=documents))
 
 
+def test_topology_requires_stable_cpu_present_and_parent_snapshot() -> None:
+    adapter = FakeCgroupAdapter(
+        documents=_nonhybrid_topology_documents(),
+        topology_snapshots=[("before",), ("after",)],
+    )
+
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        parse_cpu_topology(adapter)
+
+
 def test_topology_missing_core_type_does_not_hide_unreadable_malformed_or_symlink_leaf(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -215,6 +233,40 @@ def test_topology_missing_core_type_does_not_hide_unreadable_malformed_or_symlin
 
     (topology_root / "target").write_bytes(b"performance\n")
     (topology_root / "core_type").symlink_to("target")
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        parse_cpu_topology(adapter)
+
+
+def test_topology_rejects_core_type_enoent_after_bound_parent_and_optional_non_leaf_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cgroup_root = tmp_path / "cgroup"
+    cpu_root = tmp_path / "cpu"
+    topology_root = cpu_root / "cpu0" / "topology"
+    cgroup_root.mkdir()
+    topology_root.mkdir(parents=True)
+    (cpu_root / "present").write_bytes(b"0\n")
+    (topology_root / "physical_package_id").write_bytes(b"0\n")
+    (topology_root / "core_id").write_bytes(b"0\n")
+    (topology_root / "core_type").write_bytes(b"performance\n")
+    monkeypatch.setattr(resource_cgroup, "CGROUP_ROOT", cgroup_root)
+    monkeypatch.setattr(resource_cgroup, "CPU_TOPOLOGY_ROOT", cpu_root)
+    monkeypatch.setattr(resource_cgroup, "CPU_PRESENT_PATH", cpu_root / "present")
+    adapter = resource_cgroup.SystemdUserCgroupAdapter(runner=_FakeSystemdRunner())
+
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        adapter.read_optional_cpu_topology_bytes(cpu_root / "present", max_bytes=4096)
+
+    real_open = resource_cgroup.os.open
+
+    def _race_open(path: object, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        if path == "core_type" and dir_fd is not None:
+            raise FileNotFoundError("core_type vanished after parent bind")
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(resource_cgroup.os, "open", _race_open)
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
         parse_cpu_topology(adapter)
 

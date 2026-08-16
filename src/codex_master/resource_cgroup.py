@@ -226,6 +226,8 @@ class CgroupSystemAdapter(Protocol):
 
     def read_optional_cpu_topology_bytes(self, path: Path, *, max_bytes: int) -> bytes | None: ...
 
+    def capture_cpu_topology_snapshot(self, cpus: CpuSet) -> object: ...
+
     def inspect_preflight(self) -> CgroupPreflightV1: ...
 
     def start_held_scope(
@@ -289,7 +291,7 @@ def _bind_directory(path: Path) -> _BoundDirectory:
 
 
 def _read_bounded_under(
-    bound: _BoundDirectory, path: Path, *, max_bytes: int, allow_missing_leaf: bool = False
+    bound: _BoundDirectory, path: Path, *, max_bytes: int
 ) -> bytes | None:
     if type(max_bytes) is not int or not 0 < max_bytes <= MAX_CGROUP_READ_BYTES:
         _fail()
@@ -316,12 +318,7 @@ def _read_bounded_under(
             descriptors.append(child)
             if not stat.S_ISDIR(os.fstat(child).st_mode):
                 _fail()
-        try:
-            descriptor = os.open(parts[-1], file_flags, dir_fd=descriptors[-1])
-        except FileNotFoundError:
-            if allow_missing_leaf:
-                return None
-            raise
+        descriptor = os.open(parts[-1], file_flags, dir_fd=descriptors[-1])
         descriptors.append(descriptor)
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
@@ -337,6 +334,135 @@ def _read_bounded_under(
             _fail()
         root_after = os.fstat(root_descriptor)
         if (root_after.st_dev, root_after.st_ino) != (bound.device, bound.inode):
+            _fail()
+        return bytes(payload)
+    except (OSError, ValueError) as exc:
+        raise CgroupPreflightError("cgroup_preflight_failed") from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _cpu_topology_identity_under(
+    bound: _BoundDirectory, path: Path, *, directory: bool
+) -> tuple[int, int]:
+    try:
+        relative = path.relative_to(bound.path)
+    except ValueError:
+        _fail()
+    parts = relative.parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        _fail()
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptors: list[int] = []
+    try:
+        root_descriptor = os.open(bound.path, directory_flags)
+        descriptors.append(root_descriptor)
+        root_metadata = os.fstat(root_descriptor)
+        if (root_metadata.st_dev, root_metadata.st_ino) != (bound.device, bound.inode):
+            _fail()
+        for index, part in enumerate(parts):
+            final = index == len(parts) - 1
+            descriptor = os.open(
+                part,
+                directory_flags if not final or directory else file_flags,
+                dir_fd=descriptors[-1],
+            )
+            descriptors.append(descriptor)
+        metadata = os.fstat(descriptors[-1])
+        if directory:
+            if not stat.S_ISDIR(metadata.st_mode):
+                _fail()
+        elif not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            _fail()
+        root_after = os.fstat(root_descriptor)
+        if (root_after.st_dev, root_after.st_ino) != (bound.device, bound.inode):
+            _fail()
+        return metadata.st_dev, metadata.st_ino
+    except (OSError, ValueError) as exc:
+        raise CgroupPreflightError("cgroup_preflight_failed") from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _read_optional_core_type_under(
+    bound: _BoundDirectory, path: Path, *, max_bytes: int
+) -> bytes | None:
+    if type(max_bytes) is not int or not 0 < max_bytes <= MAX_CGROUP_READ_BYTES:
+        _fail()
+    try:
+        relative = path.relative_to(bound.path)
+    except ValueError:
+        _fail()
+    parts = relative.parts
+    if len(parts) != 3 or parts[1:] != ("topology", "core_type"):
+        _fail()
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptors: list[int] = []
+    try:
+        root_descriptor = os.open(bound.path, directory_flags)
+        descriptors.append(root_descriptor)
+        root_before = os.fstat(root_descriptor)
+        if (root_before.st_dev, root_before.st_ino) != (bound.device, bound.inode):
+            _fail()
+        cpu_descriptor = os.open(parts[0], directory_flags, dir_fd=root_descriptor)
+        descriptors.append(cpu_descriptor)
+        cpu_before = os.fstat(cpu_descriptor)
+        if not stat.S_ISDIR(cpu_before.st_mode):
+            _fail()
+        topology_descriptor = os.open(parts[1], directory_flags, dir_fd=cpu_descriptor)
+        descriptors.append(topology_descriptor)
+        topology_before = os.fstat(topology_descriptor)
+        if not stat.S_ISDIR(topology_before.st_mode):
+            _fail()
+        parent_descriptors = (root_descriptor, cpu_descriptor, topology_descriptor)
+        parent_identities = tuple(
+            (metadata.st_dev, metadata.st_ino)
+            for metadata in (root_before, cpu_before, topology_before)
+        )
+        try:
+            leaf_before = os.stat(parts[2], dir_fd=topology_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            try:
+                os.stat(parts[2], dir_fd=topology_descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                if tuple((metadata.st_dev, metadata.st_ino) for metadata in map(os.fstat, parent_descriptors)) != parent_identities:
+                    _fail()
+                return None
+            _fail()
+        if not stat.S_ISREG(leaf_before.st_mode) or leaf_before.st_nlink != 1:
+            _fail()
+        descriptor = os.open(parts[2], file_flags, dir_fd=topology_descriptor)
+        descriptors.append(descriptor)
+        leaf_opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(leaf_opened.st_mode)
+            or leaf_opened.st_nlink != 1
+            or (leaf_opened.st_dev, leaf_opened.st_ino) != (leaf_before.st_dev, leaf_before.st_ino)
+        ):
+            _fail()
+        payload = bytearray()
+        while len(payload) <= max_bytes:
+            chunk = os.read(descriptor, min(1024, max_bytes + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        leaf_after = os.fstat(descriptor)
+        if len(payload) > max_bytes or (leaf_before.st_dev, leaf_before.st_ino) != (
+            leaf_after.st_dev,
+            leaf_after.st_ino,
+        ):
+            _fail()
+        if tuple((metadata.st_dev, metadata.st_ino) for metadata in map(os.fstat, parent_descriptors)) != parent_identities:
             _fail()
         return bytes(payload)
     except (OSError, ValueError) as exc:
@@ -556,15 +682,39 @@ class SystemdUserCgroupAdapter:
     def read_optional_cpu_topology_bytes(self, path: Path, *, max_bytes: int) -> bytes | None:
         candidate = Path(path)
         try:
-            candidate.relative_to(CPU_TOPOLOGY_ROOT)
+            relative = candidate.relative_to(CPU_TOPOLOGY_ROOT)
         except ValueError:
             _fail()
-        return _read_bounded_under(
-            _bind_directory(CPU_TOPOLOGY_ROOT),
-            candidate,
-            max_bytes=max_bytes,
-            allow_missing_leaf=True,
+        if (
+            len(relative.parts) != 3
+            or relative.parts[1:] != ("topology", "core_type")
+            or not relative.parts[0].startswith("cpu")
+        ):
+            _fail()
+        cpu_text = relative.parts[0][3:]
+        if not cpu_text or str(_parse_decimal(cpu_text)) != cpu_text:
+            _fail()
+        return _read_optional_core_type_under(
+            _bind_directory(CPU_TOPOLOGY_ROOT), candidate, max_bytes=max_bytes
         )
+
+    def capture_cpu_topology_snapshot(self, cpus: CpuSet) -> object:
+        canonical = _canonical_cpu_set(cpus)
+        bound = _bind_directory(CPU_TOPOLOGY_ROOT)
+        present = _cpu_topology_identity_under(bound, CPU_PRESENT_PATH, directory=False)
+        parents = tuple(
+            (
+                cpu,
+                _cpu_topology_identity_under(
+                    bound, CPU_TOPOLOGY_ROOT / f"cpu{cpu}", directory=True
+                ),
+                _cpu_topology_identity_under(
+                    bound, CPU_TOPOLOGY_ROOT / f"cpu{cpu}" / "topology", directory=True
+                ),
+            )
+            for cpu in canonical
+        )
+        return present, parents
 
     def _target_slice_control_group(self, *, allow_missing: bool = False) -> str | None:
         result = self._run(
@@ -1011,6 +1161,7 @@ def parse_cpu_topology(backend: CgroupSystemAdapter) -> CpuTopologyV1:
     """Parse only bounded, injected CPU-topology evidence."""
 
     cpus = _parse_cpu_set(_read_text(backend, CPU_PRESENT_PATH))
+    snapshot_before = backend.capture_cpu_topology_snapshot(cpus)
     groups: dict[tuple[int, int], list[int]] = {}
     kinds: dict[tuple[int, int], str] = {}
     present_kinds = 0
@@ -1031,6 +1182,10 @@ def parse_cpu_topology(backend: CgroupSystemAdapter) -> CpuTopologyV1:
             if prior != kind:
                 _fail()
         groups.setdefault(key, []).append(cpu)
+    if _parse_cpu_set(_read_text(backend, CPU_PRESENT_PATH)) != cpus:
+        _fail()
+    if backend.capture_cpu_topology_snapshot(cpus) != snapshot_before:
+        _fail()
     if present_kinds and missing_kinds:
         _fail()
     physical_cores = tuple(tuple(cpus) for _key, cpus in sorted(groups.items()))
