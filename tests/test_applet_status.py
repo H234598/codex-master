@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from codex_master import server
@@ -17,6 +18,7 @@ from codex_master.fleet_registry import (
     build_inventory,
 )
 from codex_master.fleet_service import AccountGateDecision
+from codex_master.resource_monitor import ResourceOperatorStatus
 
 
 class FakeService:
@@ -28,6 +30,138 @@ class FakeService:
 
     def account_gate(self, agent: str, **_kwargs: object) -> AccountGateDecision:
         return AccountGateDecision(agent != "d1", "limit_active" if agent == "d1" else "ready", "project", 3)
+
+
+def resource_operator_status() -> ResourceOperatorStatus:
+    return ResourceOperatorStatus(
+        schema_version=1,
+        generation=41,
+        state="blocked",
+        bottleneck="thermal",
+        current={"cpu": 12.0, "io": 8.0, "memory": 20.0},
+        mean_1m={"cpu": 11.0, "io": 7.0, "memory": 19.0},
+        mean_10m={"cpu": 10.0, "io": 6.0, "memory": 18.0},
+        peak_10m={"cpu": 13.0, "io": 9.0, "memory": 21.0},
+        trend={"cpu": "stable", "io": "rising", "memory": "falling"},
+        confidence="high",
+        preferred_profiles=("cpu_low",),
+        avoid_profiles=("io_high",),
+        reason_codes=("temperature_pressure_high",),
+    )
+
+
+def test_applet_status_v4_has_exact_resource_projection_and_one_generation(monkeypatch) -> None:
+    base = {
+        "schema_version": 2,
+        "mode": "read_only",
+        "counts": {"tracked": 0, "running": 0, "sleeping": 0, "overflow": 0},
+        "agents": [],
+        "native_agents": {
+            "bridge_state": "ready",
+            "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
+            "agents": [],
+            "truncated": False,
+        },
+        "raw_output": "not_returned",
+    }
+    reads = 0
+
+    def read_status() -> ResourceOperatorStatus:
+        nonlocal reads
+        reads += 1
+        return resource_operator_status()
+
+    monkeypatch.setattr(server, "applet_status_v2", lambda _agents: dict(base))
+    monkeypatch.setattr(server, "_read_resource_operator_status", read_status)
+
+    payload = server.applet_status(["a1"], schema_version=4)
+
+    assert reads == 1
+    assert set(payload) == {*base, "resource"}
+    assert payload["schema_version"] == 4
+    assert payload["resource"] == {
+        "schema_version": 1,
+        "generation": 41,
+        "state": "blocked",
+        "bottleneck": "thermal",
+        "trend": {"cpu": "stable", "io": "rising", "memory": "falling"},
+        "confidence": "high",
+        "preferred_profiles": ["cpu_low"],
+        "avoid_profiles": ["io_high"],
+        "raw_output": "not_returned",
+    }
+
+
+def test_applet_status_v1_to_v3_remain_byte_contract_compatible(monkeypatch) -> None:
+    row = {
+        "agent": "a1",
+        "activity_state": "sleeping",
+        "backend_state": "ok",
+        "control_state": "ready",
+        "auth_state": "ready",
+        "identity_state": "stopped",
+        "lease_state": "unclaimed",
+    }
+    monkeypatch.setattr(server, "applet_agent_observation", lambda *_args, **_kwargs: dict(row))
+    monkeypatch.setattr(
+        server,
+        "managed_applet_inventory",
+        lambda: {"running_agents": [], "overflow": 0, "visible_running_agents": []},
+    )
+    monkeypatch.setattr(
+        server,
+        "native_agent_status",
+        lambda **_kwargs: {
+            "bridge_state": "ready",
+            "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
+            "agents": [],
+            "truncated": False,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "published_agent_inventory",
+        lambda: (InventorySnapshot((), {}, {}, {}, ()), False),
+    )
+    monkeypatch.setattr(
+        server,
+        "_readonly_fleet_service",
+        lambda: (_ for _ in ()).throw(server.AgentError("fleet_registry_unavailable")),
+    )
+    monkeypatch.setattr(server, "create_fleet_snapshot", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        server,
+        "_read_resource_operator_status",
+        lambda: (_ for _ in ()).throw(AssertionError("v1-v3 must not read resources")),
+        raising=False,
+    )
+
+    payloads = [
+        server.applet_status(["a1"], schema_version=1),
+        server.applet_status([], schema_version=2),
+        server.applet_status([], schema_version=3),
+    ]
+
+    assert [json.dumps(payload, sort_keys=True, separators=(",", ":")) for payload in payloads] == [
+        (
+            '{"activity_state":"sleeping","agents":[{"activity_state":"sleeping",'
+            '"agent":"a1","auth_state":"ready","backend_state":"ok","control_state":"ready",'
+            '"identity_state":"stopped","lease_state":"unclaimed"}],"backend_state":"ok",'
+            '"control_state":"ready","counts":{"blocked":0,"issues":0,"ready":1,"running":0,'
+            '"sleeping":1,"tracked":1},"mode":"read_only","raw_output":"not_returned","schema_version":1}'
+        ),
+        (
+            '{"agents":[],"counts":{"overflow":0,"running":0,"sleeping":0,"tracked":0},'
+            '"mode":"read_only","native_agents":{"agents":[],"bridge_state":"ready",'
+            '"counts":{"active":0,"overflow":0,"unconfirmed":0},"truncated":false},'
+            '"raw_output":"not_returned","schema_version":2}'
+        ),
+        (
+            '{"dispatch_targets":[],"fleet_snapshot_degraded":true,"generation":0,'
+            '"native_agents":[],"raw_output":"not_returned","schema_version":3,'
+            '"series":[],"watchdog_snapshot_degraded":false}'
+        ),
+    ]
 
 
 def test_applet_snapshot_v3_is_series_bounded_and_filters_limited_targets(monkeypatch, tmp_path: Path) -> None:

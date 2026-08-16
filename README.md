@@ -707,9 +707,9 @@ session is available.
 
 `codex-master@H234598` is the P3/P3a read-only status applet. Its visible panel
 title is always `Flottenmanagement`. It explicitly requests applet status
-schema v2; schema v1 remains available for older callers.
+schema v4; schemas v1 through v3 remain unchanged for older callers.
 
-Each schema-v2 refresh uses one bounded tmux session inventory. Every known
+Each schema-v4 refresh uses one bounded tmux session inventory. Every known
 running codex-master Agentin is discovered automatically and shown, up to the
 fixed six-row limit. Foreign tmux sessions are ignored. `tracked-agents` no
 longer defines the visible fleet: it only pins sleeping Agentinnen into rows
@@ -724,9 +724,10 @@ separate `Native Bienen (N)` submenu, using six fixed, non-reactive child rows.
 Native rows are status-only and contain no action or context token.
 
 The applet starts at most one bounded `codex-master-mcp applet-status` child
-process, never invokes a shell, and currently exposes no start, stop,
-interrupt, auth, or lease mutation. Applet actions belong to later milestone
-P4.
+process and never reads the resource snapshot or starts a resource monitor.
+Schema v4 adds only the bounded resource gate state, bottleneck, trend,
+confidence, profile hints, and snapshot generation. Invalid or regressing
+resource generations render as unavailable. The applet never invokes a shell.
 
 The status model keeps three concerns separate:
 
@@ -738,6 +739,11 @@ A sleeping Agentin is normal and does not by itself degrade backend health.
 Failed refreshes retain the last valid snapshot and mark it as stale. Responses
 contain fixed state fields and counts only; prompts, logs, process IDs, paths,
 lease owners, lease IDs, and raw output are not returned.
+
+`resource-status --format compact|json|markdown` is a local operator CLI, not
+an MCP tool. It renders only the validated `ResourceOperatorStatus` projection;
+sensor labels, cgroup scope IDs, paths, PIDs, raw history, stdout, stderr,
+credentials, and absolute available-memory evidence are never returned.
 
 The four applet settings are:
 
@@ -806,7 +812,10 @@ Cinnamon globally.
 Useful diagnostics:
 
 ```sh
-./bin/codex-master-mcp applet-status --schema-version 2
+./bin/codex-master-mcp resource-status --format compact
+./bin/codex-master-mcp resource-status --format json
+./bin/codex-master-mcp resource-status --format markdown
+./bin/codex-master-mcp applet-status --schema-version 4
 gdbus call --session --dest org.Cinnamon --object-path /org/Cinnamon \
   --method org.Cinnamon.GetRunningXletUUIDs applet
 journalctl --user -b | grep -F codex-master@H234598
