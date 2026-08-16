@@ -41,6 +41,7 @@ _SENSORS_TIMEOUT_SECONDS = 1.0
 _ONE_SECOND_NS = 1_000_000_000
 _MAX_SAMPLE_BUCKETS = 60
 _MIN_COMPLETE_SAMPLES = 10
+_MAX_AVAILABLE_MEMORY_MIB = ((1 << 63) - 1) // 1024
 _DECIMAL = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 _RESOURCE_SNAPSHOT_PATH = PurePosixPath("resources/resource-snapshot-v1.json")
 _THERMAL_POLICY_PATH = PurePosixPath("resources/thermal-policy-v1.json")
@@ -68,6 +69,7 @@ _SNAPSHOT_FIELDS = frozenset(
         "confidence",
         "cgroup_state",
         "thermal_state",
+        "available_memory_mib",
     )
 )
 
@@ -161,6 +163,7 @@ class ResourceSampleV1:
     observed_at_utc: datetime
     observed_monotonic_ns: int
     current: Mapping[str, float]
+    available_memory_mib: int
     cgroup_state: Literal["unavailable"]
     thermal_state: Literal["warming_up", "no_valid_sensors", "ready", "monitor_unavailable"]
     thermal_policy: ThermalPolicyV1 | None
@@ -170,6 +173,7 @@ class ResourceSampleV1:
         object.__setattr__(self, "observed_at_utc", _require_utc_datetime(self.observed_at_utc))
         object.__setattr__(self, "observed_monotonic_ns", _require_positive_int(self.observed_monotonic_ns))
         object.__setattr__(self, "current", _require_metric_mapping(self.current))
+        object.__setattr__(self, "available_memory_mib", _require_available_memory_mib(self.available_memory_mib))
         if self.cgroup_state != "unavailable":
             _invalid()
         object.__setattr__(self, "cgroup_state", "unavailable")
@@ -334,6 +338,7 @@ class ResourceSnapshotV1:
     gate_state: Literal["ready", "blocked"]
     reason_codes: tuple[str, ...]
     current: Mapping[str, float]
+    available_memory_mib: int
     mean_1m: Mapping[str, float]
     mean_10m: Mapping[str, float]
     peak_10m: Mapping[str, float]
@@ -358,6 +363,7 @@ class ResourceSnapshotV1:
         object.__setattr__(self, "gate_state", _require_gate_state(self.gate_state))
         object.__setattr__(self, "reason_codes", _require_identifiers(self.reason_codes, pattern=_IDENTIFIER, maximum=16))
         object.__setattr__(self, "current", _require_metric_mapping(self.current))
+        object.__setattr__(self, "available_memory_mib", _require_available_memory_mib(self.available_memory_mib))
         object.__setattr__(self, "mean_1m", _require_metric_mapping(self.mean_1m))
         object.__setattr__(self, "mean_10m", _require_metric_mapping(self.mean_10m))
         object.__setattr__(self, "peak_10m", _require_metric_mapping(self.peak_10m))
@@ -381,6 +387,7 @@ class ResourceGateFacts:
     gate_state: str
     reason_codes: tuple[str, ...]
     current: Mapping[str, float]
+    available_memory_mib: int
     normalized_pressure: Mapping[str, int]
     normalized_headroom: Mapping[str, int]
     bottleneck: str
@@ -394,6 +401,7 @@ class ResourceGateFacts:
         object.__setattr__(self, "gate_state", _require_gate_state(self.gate_state))
         object.__setattr__(self, "reason_codes", _require_identifiers(self.reason_codes, pattern=_IDENTIFIER, maximum=16))
         object.__setattr__(self, "current", _require_metric_mapping(self.current))
+        object.__setattr__(self, "available_memory_mib", _require_available_memory_mib(self.available_memory_mib))
         object.__setattr__(self, "normalized_pressure", _require_percentage_mapping(self.normalized_pressure))
         object.__setattr__(self, "normalized_headroom", _require_percentage_mapping(self.normalized_headroom))
         object.__setattr__(self, "bottleneck", _require_bottleneck(self.bottleneck))
@@ -466,6 +474,12 @@ def _thermal_unavailable() -> None:
 
 def _require_positive_int(value: object) -> int:
     if type(value) is not int or value <= 0:
+        _invalid()
+    return value
+
+
+def _require_available_memory_mib(value: object) -> int:
+    if type(value) is not int or not 0 <= value <= _MAX_AVAILABLE_MEMORY_MIB:
         _invalid()
     return value
 
@@ -644,6 +658,7 @@ def parse_snapshot_document(
         gate_state=payload["gate_state"],
         reason_codes=payload["reason_codes"],
         current=payload["current"],
+        available_memory_mib=payload["available_memory_mib"],
         mean_1m=payload["mean_1m"],
         mean_10m=payload["mean_10m"],
         peak_10m=payload["peak_10m"],
@@ -742,6 +757,7 @@ def _snapshot_from_stored_document(payload: Mapping[str, object]) -> ResourceSna
         gate_state=payload["gate_state"],
         reason_codes=payload["reason_codes"],
         current=payload["current"],
+        available_memory_mib=payload["available_memory_mib"],
         mean_1m=payload["mean_1m"],
         mean_10m=payload["mean_10m"],
         peak_10m=payload["peak_10m"],
@@ -779,6 +795,7 @@ def _snapshot_document(snapshot: ResourceSnapshotV1) -> Mapping[str, object]:
         "gate_state": snapshot.gate_state,
         "reason_codes": list(snapshot.reason_codes),
         "current": dict(snapshot.current),
+        "available_memory_mib": snapshot.available_memory_mib,
         "mean_1m": dict(snapshot.mean_1m),
         "mean_10m": dict(snapshot.mean_10m),
         "peak_10m": dict(snapshot.peak_10m),
@@ -1164,6 +1181,7 @@ def collect_resource_sample(
         observed_at_utc=observed_at_utc,
         observed_monotonic_ns=observed_monotonic_ns,
         current={"cpu": cpu, "io": io, "memory": memory},
+        available_memory_mib=available_kib // 1024,
         cgroup_state="unavailable",
         thermal_state=thermal_state,
         thermal_policy=policy,
@@ -1238,6 +1256,7 @@ def build_monitor_snapshot(
         gate_state=gate_state,
         reason_codes=reasons,
         current=latest.current,
+        available_memory_mib=latest.available_memory_mib,
         mean_1m=means,
         mean_10m=means,
         peak_10m=peaks,
@@ -1261,6 +1280,7 @@ def build_resource_gate_facts(snapshot: ResourceSnapshotV1) -> ResourceGateFacts
         gate_state=snapshot.gate_state,
         reason_codes=snapshot.reason_codes,
         current=snapshot.current,
+        available_memory_mib=snapshot.available_memory_mib,
         normalized_pressure=snapshot.normalized_pressure,
         normalized_headroom=snapshot.normalized_headroom,
         bottleneck=snapshot.bottleneck,

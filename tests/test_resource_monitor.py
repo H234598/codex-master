@@ -4,7 +4,7 @@ import json
 import math
 import os
 import unittest
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
@@ -134,6 +134,7 @@ def snapshot_document() -> dict[str, object]:
         "confidence": "high",
         "cgroup_state": "ready",
         "thermal_state": "ready",
+        "available_memory_mib": 512,
     }
 
 
@@ -172,6 +173,72 @@ class ResourceMonitorTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 with self.assertRaisesRegex(ResourceSnapshotError, "^resource_snapshot_invalid$"):
                     self.parse(payload)
+
+    def test_snapshot_requires_strict_available_memory_mib_schema_field(self) -> None:
+        missing = snapshot_document()
+        del missing["available_memory_mib"]
+
+        unknown = snapshot_document()
+        unknown["unexpected"] = "value"
+
+        invalid_values: tuple[object, ...] = (True, 1.5, "512", -1, 1 << 63)
+        for payload in (missing, unknown):
+            with self.subTest(payload=payload):
+                with self.assertRaisesRegex(ResourceSnapshotError, "^resource_snapshot_invalid$"):
+                    self.parse(payload)
+        for value in invalid_values:
+            payload = snapshot_document()
+            payload["available_memory_mib"] = value
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ResourceSnapshotError, "^resource_snapshot_invalid$"):
+                    self.parse(payload)
+
+        self.assertEqual(self.parse().available_memory_mib, 512)
+
+    def test_available_memory_mib_revalidates_on_direct_construction_and_replace(self) -> None:
+        snapshot = self.parse()
+        facts = build_resource_gate_facts(snapshot)
+        snapshot_kwargs = {field.name: getattr(snapshot, field.name) for field in fields(ResourceSnapshotV1)}
+        facts_kwargs = {field.name: getattr(facts, field.name) for field in fields(ResourceGateFacts)}
+
+        for value in (True, 1.5, "512", -1, 1 << 63):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ResourceSnapshotError, "^resource_snapshot_invalid$"):
+                    ResourceSnapshotV1(**(snapshot_kwargs | {"available_memory_mib": value}))
+                with self.assertRaisesRegex(ResourceSnapshotError, "^resource_snapshot_invalid$"):
+                    ResourceGateFacts(**(facts_kwargs | {"available_memory_mib": value}))
+                with self.assertRaisesRegex(ResourceSnapshotError, "^resource_snapshot_invalid$"):
+                    replace(snapshot, available_memory_mib=value)
+                with self.assertRaisesRegex(ResourceSnapshotError, "^resource_snapshot_invalid$"):
+                    replace(facts, available_memory_mib=value)
+
+    def test_resource_sample_revalidates_available_memory_mib_on_direct_construction_and_replace(self) -> None:
+        paths = resource_paths()
+        sample = collect_resource_sample(
+            FakeResourceBackend(resource_kernel_document(paths), sensor_document()),
+            paths,
+            clocks=resource_clocks(),
+            candidates=[ThermalCandidate("coretemp-isa-0000", "ISA adapter", "Package id 0")],
+            completed_sample_count=10,
+        )
+        sample_kwargs = {field.name: getattr(sample, field.name) for field in fields(ResourceSampleV1)}
+
+        for value in (True, 1.5, "512", -1, 1 << 63):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ResourceSnapshotError, "^resource_snapshot_invalid$"):
+                    ResourceSampleV1(**(sample_kwargs | {"available_memory_mib": value}))
+                with self.assertRaisesRegex(ResourceSnapshotError, "^resource_snapshot_invalid$"):
+                    replace(sample, available_memory_mib=value)
+
+    def test_gate_facts_carry_available_memory_mib_but_public_projections_omit_it(self) -> None:
+        snapshot = self.parse()
+        facts = build_resource_gate_facts(snapshot)
+        operator = build_resource_operator_status(snapshot)
+        scheduler = build_resource_scheduler_snapshot(snapshot)
+
+        self.assertEqual(facts.available_memory_mib, 512)
+        for projection in (operator, scheduler):
+            self.assertNotIn("available_memory_mib", projection.__dataclass_fields__)
 
     def test_snapshot_rejects_stale_future_or_wrong_boot_without_error_details(self) -> None:
         invalid_payloads: list[dict[str, object]] = []
@@ -249,6 +316,7 @@ class ResourceMonitorTests(unittest.TestCase):
             confidence="high",
             cgroup_state="ready",
             thermal_state="ready",
+            available_memory_mib=512,
         )
         current["cpu"] = 99.0
         self.assertEqual(snapshot.current["cpu"], 12.0)
@@ -275,6 +343,7 @@ class ResourceMonitorTests(unittest.TestCase):
                 bottleneck="unknown",
                 cgroup_state="ready",
                 thermal_state="ready",
+                available_memory_mib=512,
             )
 
         with self.assertRaisesRegex(ResourceSnapshotError, "^resource_snapshot_invalid$"):
@@ -321,7 +390,7 @@ class ResourceMonitorTests(unittest.TestCase):
         operator = build_resource_operator_status(snapshot)
         scheduler = build_resource_scheduler_snapshot(snapshot)
 
-        forbidden = {"path", "label", "history", "pid", "scope", "raw_output"}
+        forbidden = {"path", "label", "history", "pid", "scope", "raw_output", "available_memory_mib"}
         for projection in (operator, scheduler):
             self.assertTrue(forbidden.isdisjoint(projection.__dataclass_fields__))
 
@@ -705,6 +774,7 @@ def test_g3_cannot_accept_or_construct_claimed_cgroup_readiness() -> None:
             cgroup_state="ready",
             thermal_state="warming_up",
             thermal_policy=None,
+            available_memory_mib=512,
         )
 
 
@@ -777,3 +847,57 @@ def test_thermal_states_and_ten_one_hz_samples_build_one_complete_generation() -
             prior_generation=7,
             clocks=resource_clocks(monotonic_ns=20_000_000_000, now_utc=NOW + timedelta(seconds=10)),
         )
+
+
+def test_collect_build_and_persist_roundtrip_available_memory_mib_from_memavailable(tmp_path: Path) -> None:
+    paths = resource_paths()
+    kernel = resource_kernel_document(paths)
+    kernel[paths.meminfo] = (
+        b"MemTotal: 2097152 kB\nMemAvailable: 1048575 kB\nMemFree: 1 kB\nBuffers: 1 kB\nCached: 1 kB\n"
+    )
+    candidates = [ThermalCandidate("coretemp-isa-0000", "ISA adapter", "Package id 0")]
+    backends: list[FakeResourceBackend] = []
+    samples: list[ResourceSampleV1] = []
+    for index in range(10):
+        backend = FakeResourceBackend(kernel, sensor_document())
+        samples.append(
+            collect_resource_sample(
+                backend,
+                paths,
+                clocks=resource_clocks(
+                    monotonic_ns=10_000_000_000 + index * 1_000_000_000,
+                    now_utc=NOW + timedelta(seconds=index),
+                ),
+                candidates=candidates,
+                completed_sample_count=index + 1,
+            )
+        )
+        backends.append(backend)
+    snapshot = build_monitor_snapshot(
+        samples,
+        prior_generation=7,
+        clocks=resource_clocks(monotonic_ns=19_000_000_000, now_utc=NOW + timedelta(seconds=9)),
+    )
+    store = HiveStateStore(tmp_path / "state")
+    write_resource_snapshot(store, snapshot)
+    persisted = read_resource_snapshot(store, now_utc=NOW + timedelta(seconds=9), expected_boot_id=BOOT_ID)
+    document = json.loads(store.read_private_bytes(SNAPSHOT_PATH, max_bytes=64 * 1024))
+
+    exact_kernel = dict(kernel)
+    exact_kernel[paths.meminfo] = b"MemTotal: 2097152 kB\nMemAvailable: 1048576 kB\nMemFree: 1 kB\n"
+    exact_sample = collect_resource_sample(
+        FakeResourceBackend(exact_kernel, sensor_document()),
+        paths,
+        clocks=resource_clocks(),
+        candidates=candidates,
+        completed_sample_count=10,
+    )
+
+    assert all(sample.available_memory_mib == 1023 for sample in samples)
+    assert all(sum(path == paths.meminfo for path, _max_bytes in backend.reads) == 1 for backend in backends)
+    assert exact_sample.available_memory_mib == 1024
+    assert snapshot.available_memory_mib == 1023
+    assert build_resource_gate_facts(snapshot).available_memory_mib == 1023
+    assert persisted.available_memory_mib == 1023
+    assert document["schema_version"] == 1
+    assert document["available_memory_mib"] == 1023
