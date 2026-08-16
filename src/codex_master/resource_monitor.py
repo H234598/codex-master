@@ -9,6 +9,7 @@ import re
 import selectors
 import stat
 import subprocess
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -931,6 +932,16 @@ def read_resource_snapshot(
     )
 
 
+def read_resource_gate_facts(
+    state: HiveStateStore, *, now_utc: datetime, expected_boot_id: str
+) -> ResourceGateFacts:
+    """Read one authorized, fresh snapshot and return its gate-only projection."""
+
+    return build_resource_gate_facts(
+        read_resource_snapshot(state, now_utc=now_utc, expected_boot_id=expected_boot_id)
+    )
+
+
 def write_resource_snapshot(state: HiveStateStore, snapshot: ResourceSnapshotV1) -> None:
     """Persist one newer snapshot without repairing corrupt prior state."""
 
@@ -1168,6 +1179,25 @@ def _parse_boot_id(raw: bytes) -> str:
         return _require_canonical_boot_id(decoded[:-1])
     except ResourceSnapshotError:
         _monitor_unavailable()
+
+
+def read_current_resource_boot_id(
+    *,
+    backend: ResourceInputBackend | None = None,
+    paths: ResourceInputPaths | None = None,
+) -> str:
+    """Read only the fixed, bounded boot identifier through monitor ownership."""
+
+    if paths is None:
+        paths = ResourceInputPaths()
+    if not isinstance(paths, ResourceInputPaths):
+        _monitor_unavailable()
+    if backend is None:
+        try:
+            backend = HostResourceInputBackend(monotonic_seconds=time.monotonic)
+        except Exception:
+            _monitor_unavailable()
+    return _parse_boot_id(_read_kernel_bytes(backend, paths.boot_id, maximum=_BOOT_ID_MAX_BYTES))
 
 
 def _decode_sensor_document(raw: object) -> Mapping[str, object]:

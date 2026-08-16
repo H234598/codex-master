@@ -13,7 +13,7 @@ import contextlib
 import contextvars
 import ctypes
 import datetime as _dt
-from dataclasses import replace as dataclass_replace
+from dataclasses import dataclass, replace as dataclass_replace
 import errno
 import fcntl
 import hashlib
@@ -88,6 +88,21 @@ from codex_master.usage_snapshot import (
     load_account_usage_v1,
     read_account_usage_cache_v1,
     read_active_launcher_v1,
+)
+from codex_master.hive.state import HiveStateStore
+from codex_master.resource_cgroup import (
+    CgroupPreflightError,
+    CgroupProfileV1,
+    CgroupSystemAdapter,
+    PreparedAgentScope,
+    require_cgroup_preflight,
+    start_verified_scope,
+)
+from codex_master.resource_monitor import (
+    ResourceGateFacts,
+    ResourceSnapshotError,
+    read_current_resource_boot_id,
+    read_resource_gate_facts,
 )
 from codex_master.fleet_snapshot import (
     FleetSnapshot as FleetWatchdogSnapshot,
@@ -268,6 +283,8 @@ BASE_ARGS = [
 
 HEADLESS_JOBS = HeadlessJobRegistry()
 HEADLESS_META_KEY = "headless_job"
+G5_TMUX_SOCKET_META_KEY = "tmux_socket"
+G5_TMUX_SOCKET_RE = re.compile(r"g5-[0-9a-f]{20}")
 DEFAULT_HEADLESS_TIMEOUT_SECONDS = 600
 
 
@@ -388,12 +405,9 @@ MAX_RPC_MESSAGE_BYTES = 1024 * 1024
 MAX_TOOL_CATALOG_BYTES = 1024 * 1024
 MAX_ERROR_CHARS = 1200
 MAX_META_BYTES = 64 * 1024
-RESOURCE_MEMINFO_PATH = Path("/proc/meminfo")
-RESOURCE_PROC_STAT_PATH = Path("/proc/stat")
 RESOURCE_MAX_LOAD_PER_CPU = 1.75
 RESOURCE_MAX_CPU_BUSY_PERCENT = 90.0
 RESOURCE_MAX_IO_WAIT_PERCENT = 50.0
-RESOURCE_CPU_SAMPLE_SECONDS = 0.05
 RESOURCE_MIN_AVAILABLE_MEMORY_PERCENT = 20.0
 RESOURCE_MIN_AVAILABLE_MEMORY_MIB = 1024
 RESOURCE_MAX_RUNNING_AGENTS = 10
@@ -414,6 +428,14 @@ RESOURCE_REASON_CODES = frozenset(
         "memory_pressure_high",
         "running_agent_limit",
         "insufficient_slots",
+        "cgroup_preflight_failed",
+        "spawn_warmup_active",
+        "temperature_pressure_high",
+        "temperature_monitor_unavailable",
+        "resource_monitor_unavailable",
+        "resource_snapshot_invalid",
+        "resource_snapshot_generation_mismatch",
+        "resource_access_denied",
     }
 )
 MAX_CODEX_USAGE_SNAPSHOT_BYTES = 64 * 1024
@@ -830,6 +852,83 @@ _RESOURCE_ADMISSION_CONTEXT: contextvars.ContextVar[dict[str, Any] | None] = con
     "codex_master_resource_admission_context",
     default=None,
 )
+_SPAWN_WARMUP_UNTIL_NS = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceGateRuntime:
+    """Already-authorized G5 dependencies; never construct state or host inputs here."""
+
+    state: HiveStateStore
+    expected_boot_id: str
+    now_utc: Callable[[], _dt.datetime]
+    monotonic_ns: Callable[[], int]
+    cgroup_profile: CgroupProfileV1 | None
+    cgroup_adapter: CgroupSystemAdapter | None
+    h2_ready: bool = False
+
+
+_RESOURCE_GATE_RUNTIME: contextvars.ContextVar[ResourceGateRuntime | None] = contextvars.ContextVar(
+    "codex_master_resource_gate_runtime",
+    default=None,
+)
+
+
+@contextlib.contextmanager
+def _resource_gate_runtime_scope(runtime: ResourceGateRuntime) -> Iterator[None]:
+    """Test/composer-only injection seam for one authorized G5 dependency set."""
+
+    if not isinstance(runtime, ResourceGateRuntime):
+        raise AgentError("resource_snapshot_invalid")
+    token = _RESOURCE_GATE_RUNTIME.set(runtime)
+    try:
+        yield
+    finally:
+        _RESOURCE_GATE_RUNTIME.reset(token)
+
+
+def _compose_resource_gate_runtime() -> ResourceGateRuntime | None:
+    """Bind one authorized Hive state to the G5 callflow; no fallback store exists."""
+
+    try:
+        hive_runtime = build_current_hive_runtime(repository_roots={}, materialize_principals=False)
+        state = hive_runtime.state
+        if not isinstance(state, HiveStateStore):
+            return None
+        expected_boot_id = read_current_resource_boot_id()
+    except Exception:
+        return None
+    return ResourceGateRuntime(
+        state=state,
+        expected_boot_id=expected_boot_id,
+        now_utc=lambda: _dt.datetime.now(_dt.timezone.utc),
+        monotonic_ns=time.monotonic_ns,
+        cgroup_profile=None,
+        cgroup_adapter=None,
+        h2_ready=False,
+    )
+
+
+@contextlib.contextmanager
+def _resource_gate_composer_scope() -> Iterator[None]:
+    """Keep one product or explicitly injected runtime through one callflow."""
+
+    if _RESOURCE_GATE_RUNTIME.get() is not None:
+        yield
+        return
+    runtime = _compose_resource_gate_runtime()
+    if runtime is None:
+        yield
+        return
+    with _resource_gate_runtime_scope(runtime):
+        yield
+
+
+def _call_with_resource_gate_composer(callback: Any) -> Any:
+    """Run one product path inside the existing idempotent G5 composer."""
+
+    with _resource_gate_composer_scope():
+        return callback()
 RUNNER_EXECUTION_FDS: dict[str, int] = {}
 
 
@@ -1299,17 +1398,10 @@ class AgentCapacityError(AgentError):
 def _public_resource_snapshot(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, Mapping):
         return None
-    safe: dict[str, Any] = {}
-    for key in ("ok", "load_per_cpu", "cpu_busy_percent", "io_wait_percent", "available_memory_percent", "available_memory_mib", "running_agents"):
-        item = value.get(key)
-        if key == "ok":
-            if isinstance(item, bool):
-                safe[key] = item
-        elif key == "running_agents":
-            if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
-                safe[key] = item
-        elif _finite_resource_number(item):
-            safe[key] = item
+    allowed = value.get("ok")
+    if not isinstance(allowed, bool):
+        return None
+    safe: dict[str, Any] = {"allowed": allowed}
     reason_codes = value.get("reason_codes")
     if isinstance(reason_codes, list) and all(
         isinstance(item, str) and item in RESOURCE_REASON_CODES for item in reason_codes
@@ -2756,8 +2848,9 @@ def run_tmux(
     input_text: str | None = None,
     check: bool = True,
     timeout: int = DEFAULT_TMUX_TIMEOUT_SECONDS,
+    snapshot: InventorySnapshot | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    command = ["tmux", *args]
+    command = ["tmux", *_route_tmux_args(args, snapshot=snapshot)]
     try:
         completed = _run_bounded_command(
             command,
@@ -3321,8 +3414,65 @@ def _run_mcp_probe(
         stream.close()
 
 
-def tmux_alive(session: str) -> bool:
-    return run_tmux(["has-session", "-t", session], check=False).returncode == 0
+def _private_tmux_socket_for_session(
+    session: str,
+    *,
+    snapshot: InventorySnapshot | None = None,
+) -> str | None:
+    if not isinstance(session, str):
+        raise AgentError("private tmux routing metadata is invalid")
+    if snapshot is None:
+        snapshot, _registry_backed = effective_observation_inventory()
+    if not isinstance(snapshot, InventorySnapshot):
+        raise AgentError("private tmux routing metadata is invalid")
+    matches = [
+        agent
+        for agent in snapshot.agent_ids
+        if snapshot.agents[agent].session == session
+    ]
+    if len(matches) != 1:
+        raise AgentError("private tmux routing metadata is invalid")
+    agent = matches[0]
+    meta = read_meta(agent, snapshot=snapshot)
+    if G5_TMUX_SOCKET_META_KEY not in meta:
+        return None
+    socket_name = meta.get(G5_TMUX_SOCKET_META_KEY)
+    if (
+        not isinstance(socket_name, str)
+        or G5_TMUX_SOCKET_RE.fullmatch(socket_name) is None
+        or meta.get("agent") != agent
+        or meta.get("session") != session
+    ):
+        raise AgentError("private tmux routing metadata is invalid")
+    return socket_name
+
+
+def _tmux_args_for_session(
+    session: str,
+    args: list[str],
+    *,
+    snapshot: InventorySnapshot | None = None,
+) -> list[str]:
+    socket_name = _private_tmux_socket_for_session(session, snapshot=snapshot)
+    return ["-L", socket_name, *args] if socket_name is not None else args
+
+
+def _route_tmux_args(args: list[str], *, snapshot: InventorySnapshot | None = None) -> list[str]:
+    if args[:1] == ["-L"]:
+        return args
+    try:
+        session_index = args.index("-t") + 1
+        session = args[session_index]
+    except (ValueError, IndexError):
+        return args
+    return _tmux_args_for_session(session, args, snapshot=snapshot)
+
+
+def tmux_alive(session: str, *, snapshot: InventorySnapshot | None = None) -> bool:
+    args = _tmux_args_for_session(session, ["has-session", "-t", session], snapshot=snapshot)
+    if snapshot is None:
+        return run_tmux(args, check=False).returncode == 0
+    return run_tmux(args, check=False, snapshot=snapshot).returncode == 0
 
 
 def meta_path(agent: str) -> Path:
@@ -3490,8 +3640,8 @@ def resolve_path_no_throw(path: Path) -> Path | None:
         return None
 
 
-def read_meta(agent: str) -> dict[str, Any]:
-    agent = canonical_agent_id(agent)
+def read_meta(agent: str, *, snapshot: InventorySnapshot | None = None) -> dict[str, Any]:
+    agent = canonical_agent_id(agent, snapshot=snapshot)
     path = meta_path(agent)
     if not path_present_no_follow(path):
         for legacy_agent in sorted(agent_record_aliases(agent) - {agent}):
@@ -3533,6 +3683,14 @@ def public_agent_meta(meta: dict[str, Any]) -> dict[str, Any]:
 
 def write_meta(agent: str, data: dict[str, Any]) -> None:
     agent = canonical_agent_id(agent)
+    socket_name = data.get(G5_TMUX_SOCKET_META_KEY)
+    if socket_name is not None and (
+        not isinstance(socket_name, str)
+        or G5_TMUX_SOCKET_RE.fullmatch(socket_name) is None
+        or data.get("agent") != agent
+        or data.get("session") != agent_config(agent).get("session")
+    ):
+        raise AgentError("private tmux routing metadata is invalid")
     path = meta_path(agent)
     replace_private_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
 
@@ -4900,121 +5058,70 @@ def _finite_resource_number(value: Any, *, minimum: float = 0.0) -> bool:
 
 
 def _resource_meminfo() -> tuple[float, float] | None:
-    try:
-        text = RESOURCE_MEMINFO_PATH.read_text(encoding="utf-8", errors="replace")
-    except (OSError, UnicodeError):
-        return None
-    values: dict[str, int] = {}
-    for line in text.splitlines():
-        key, separator, remainder = line.partition(":")
-        if separator == "" or key not in {"MemTotal", "MemAvailable"}:
-            continue
-        parts = remainder.strip().split()
-        if len(parts) != 2 or parts[1] != "kB":
-            continue
-        try:
-            value = int(parts[0])
-        except (TypeError, ValueError):
-            continue
-        if value < 0:
-            return None
-        values[key] = value
-    total_kib = values.get("MemTotal")
-    available_kib = values.get("MemAvailable")
-    if (
-        total_kib is None
-        or available_kib is None
-        or total_kib <= 0
-        or available_kib > total_kib
-    ):
-        return None
-    return available_kib / total_kib * 100.0, available_kib / 1024.0
+    """Retained private compatibility seam; G5 never reads host memory here."""
+
+    return None
 
 
 def _cpu_counters() -> tuple[int, int, int] | None:
-    try:
-        text = RESOURCE_PROC_STAT_PATH.read_text(encoding="utf-8", errors="replace")
-    except (OSError, UnicodeError):
-        return None
-    for line in text.splitlines():
-        parts = line.split()
-        if not parts or parts[0] != "cpu" or len(parts) < 9:
-            continue
-        try:
-            values = [int(item) for item in parts[1:9]]
-        except (TypeError, ValueError):
-            return None
-        if any(value < 0 for value in values):
-            return None
-        total = sum(values)
-        idle = values[3]
-        io_wait = values[4]
-        busy = total - idle - io_wait
-        if total <= 0 or busy < 0:
-            return None
-        return total, busy, io_wait
+    """Retained private compatibility seam; G5 never reads host CPU state here."""
+
     return None
 
 
 def _recent_cpu_usage() -> tuple[float, float] | None:
-    first = _cpu_counters()
-    if first is None:
-        return None
-    try:
-        time.sleep(RESOURCE_CPU_SAMPLE_SECONDS)
-    except (OSError, OverflowError, ValueError):
-        return None
-    second = _cpu_counters()
-    if second is None:
-        return None
-    total_delta = second[0] - first[0]
-    if total_delta <= 0:
-        return None
-    busy_percent = (second[1] - first[1]) / total_delta * 100.0
-    io_wait_percent = (second[2] - first[2]) / total_delta * 100.0
-    if not (0.0 <= busy_percent <= 100.0 and 0.0 <= io_wait_percent <= 100.0):
-        return None
-    return busy_percent, io_wait_percent
+    """Retained private compatibility seam; bounded monitor owns CPU deltas."""
+
+    return None
 
 
 def _effective_cpu_count() -> int | None:
-    try:
-        affinity = os.sched_getaffinity(0)
-    except (AttributeError, OSError, TypeError):
-        return None
-    count = len(affinity)
-    return count if count > 0 else None
+    """G5 has no server-side topology or affinity derivation."""
+
+    return None
 
 
 def _managed_tmux_session_ids() -> frozenset[str] | None:
     try:
-        completed = run_tmux(["list-sessions", "-F", "#{session_name}"], check=False)
-        if completed.returncode != 0:
-            if not (
-                type(completed.returncode) is int
-                and completed.returncode == 1
-                and isinstance(completed.stdout, str)
-                and completed.stdout == ""
-                and isinstance(completed.stderr, str)
-                and re.fullmatch(
-                    r"(?:no sessions|no server running on [^\r\n]+|"
-                    r"error connecting to [^\r\n]+ \(No such file or directory\))\n?",
-                    completed.stderr,
-                )
-            ):
-                return None
-            return frozenset()
         snapshot, _registry_backed = effective_observation_inventory()
         if snapshot is None:
             return None
         configured_sessions = {
             agent_config(agent, snapshot).get("session") for agent in snapshot.agent_ids
         }
-        listed_sessions = {
-            line.strip() for line in completed.stdout.splitlines() if line.strip()
+        private_sessions = {
+            session
+            for session in configured_sessions
+            if isinstance(session, str)
+            and _private_tmux_socket_for_session(session, snapshot=snapshot) is not None
         }
+        default_sessions = configured_sessions - private_sessions
+        listed_sessions: set[str] = set()
+        if default_sessions:
+            completed = run_tmux(["list-sessions", "-F", "#{session_name}"], check=False)
+            if completed.returncode != 0:
+                if not (
+                    type(completed.returncode) is int
+                    and completed.returncode == 1
+                    and isinstance(completed.stdout, str)
+                    and completed.stdout == ""
+                    and isinstance(completed.stderr, str)
+                    and re.fullmatch(
+                        r"(?:no sessions|no server running on [^\r\n]+|"
+                        r"error connecting to [^\r\n]+ \(No such file or directory\))\n?",
+                        completed.stderr,
+                    )
+                ):
+                    return None
+            else:
+                listed_sessions.update(
+                    line.strip() for line in completed.stdout.splitlines() if line.strip()
+                )
+        for session in private_sessions:
+            if tmux_alive(session, snapshot=snapshot):
+                listed_sessions.add(session)
         return frozenset(configured_sessions & listed_sessions)
-    except (AttributeError, OSError, TypeError, ValueError):
+    except (AgentError, AttributeError, OSError, TypeError, ValueError):
         return None
 
 
@@ -5220,68 +5327,95 @@ def _total_running_agent_count(*, managed_ids: frozenset[str] | None = None) -> 
     return managed + active + unconfirmed + reservations
 
 
-def system_resource_snapshot(*, running_agents_override: int | None = None) -> dict[str, Any]:
-    load_per_cpu: float | None = None
-    cpu_busy_percent: float | None = None
-    io_wait_percent: float | None = None
-    available_memory_percent: float | None = None
-    available_memory_mib: float | None = None
-    running_agents: int | None = None
-    reason_codes: list[str] = []
+def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> dict[str, Any]:
+    """Project exactly one authorized GateFacts read; never read host metrics here."""
 
-    cpu_count = os.cpu_count()
-    try:
-        load1 = os.getloadavg()[0]
-    except (AttributeError, OSError, TypeError, ValueError):
-        load1 = None
-    if (
-        isinstance(cpu_count, int)
-        and not isinstance(cpu_count, bool)
-        and cpu_count > 0
-        and _finite_resource_number(load1)
-    ):
-        load_per_cpu = load1 / cpu_count
-    else:
-        reason_codes.append("cpu_metrics_unavailable")
-
-    cpu_usage = _recent_cpu_usage()
-    if cpu_usage is not None:
-        cpu_busy_percent, io_wait_percent = cpu_usage
-    else:
-        reason_codes.append("cpu_metrics_unavailable")
-
-    memory = _resource_meminfo()
-    if memory is None:
-        reason_codes.append("memory_metrics_unavailable")
-    else:
-        available_memory_percent, available_memory_mib = memory
-
+    runtime = _RESOURCE_GATE_RUNTIME.get()
     if running_agents_override is None:
         running_agents = _total_running_agent_count()
-    elif (
-        isinstance(running_agents_override, int)
-        and not isinstance(running_agents_override, bool)
-        and running_agents_override >= 0
-    ):
+    elif type(running_agents_override) is int and running_agents_override >= 0:
         running_agents = running_agents_override
     else:
         running_agents = None
+    reasons: list[str] = []
     if running_agents is None:
-        reason_codes.append("session_metrics_unavailable")
+        reasons.append("session_metrics_unavailable")
+    if runtime is None or not isinstance(runtime.state, HiveStateStore):
+        reasons.append("resource_snapshot_invalid")
+        return {
+            "ok": False,
+            "_g5_facts": True,
+            "running_agents": running_agents,
+            "reason_codes": reasons,
+            "raw_output": "not_returned",
+        }
+    try:
+        now_utc = runtime.now_utc()
+        if (
+            not isinstance(now_utc, _dt.datetime)
+            or now_utc.tzinfo is None
+            or now_utc.utcoffset() != _dt.timedelta(0)
+        ):
+            raise ValueError
+        facts = read_resource_gate_facts(
+            runtime.state,
+            now_utc=now_utc,
+            expected_boot_id=runtime.expected_boot_id,
+        )
+        if not isinstance(facts, ResourceGateFacts):
+            raise ValueError
+        legacy = facts.legacy_pressure
+        current = facts.current
+        values = (
+            legacy.load_per_cpu,
+            legacy.cpu_busy_percent,
+            legacy.io_wait_percent,
+            legacy.available_memory_percent,
+            facts.available_memory_mib,
+            current.get("io"),
+        )
+        if any(not _finite_resource_number(value) for value in values):
+            raise ValueError
+        if facts.gate_state not in {"ready", "blocked"}:
+            raise ValueError
+    except (ResourceSnapshotError, TypeError, ValueError, AttributeError, OverflowError):
+        reasons.append("resource_snapshot_invalid")
+        return {
+            "ok": False,
+            "_g5_facts": True,
+            "running_agents": running_agents,
+            "reason_codes": list(dict.fromkeys(reasons)),
+            "raw_output": "not_returned",
+        }
 
+    # G3 records cgroup as unavailable until G5's separately injected typed preflight.
+    declared = [
+        reason
+        for reason in facts.reason_codes
+        if reason in RESOURCE_REASON_CODES and reason != "cgroup_preflight_failed"
+    ]
+    if facts.thermal_state in {"warming_up", "monitor_unavailable"}:
+        declared.append("temperature_monitor_unavailable")
+    reasons.extend(declared)
     return {
-        "ok": not reason_codes,
-        "load_per_cpu": load_per_cpu,
-        "logical_cpu_count": cpu_count,
-        "effective_cpu_count": _effective_cpu_count(),
-        "cpu_busy_percent": cpu_busy_percent,
-        "io_wait_percent": io_wait_percent,
-        "available_memory_percent": available_memory_percent,
-        "available_memory_mib": available_memory_mib,
+        "ok": not reasons,
+        "_g5_facts": True,
+        "load_per_cpu": legacy.load_per_cpu,
+        "cpu_busy_percent": legacy.cpu_busy_percent,
+        "io_wait_percent": legacy.io_wait_percent,
+        "io_psi_percent": current["io"],
+        "available_memory_percent": legacy.available_memory_percent,
+        "available_memory_mib": facts.available_memory_mib,
         "running_agents": running_agents,
-        "reason_codes": list(dict.fromkeys(reason_codes)),
+        "reason_codes": list(dict.fromkeys(reasons)),
         "raw_output": "not_returned",
     }
+
+
+def system_resource_snapshot(*, running_agents_override: int | None = None) -> dict[str, Any]:
+    """Compatibility name for G5's injected Facts-only resource snapshot."""
+
+    return _resource_gate_snapshot(running_agents_override=running_agents_override)
 
 
 def _valid_spawn_policy(policy: Any) -> bool:
@@ -5435,6 +5569,13 @@ def _resource_pressure_reason_codes(snapshot: Mapping[str, Any], policy: Mapping
     ]
     if not isinstance(snapshot, Mapping) or not isinstance(policy, Mapping):
         return fallback
+    if snapshot.get("_g5_facts") is True and snapshot.get("ok") is False:
+        declared = snapshot.get("reason_codes")
+        if isinstance(declared, list) and all(
+            isinstance(item, str) and item in RESOURCE_REASON_CODES for item in declared
+        ):
+            return list(dict.fromkeys(declared))
+        return ["resource_snapshot_invalid"]
     declared = snapshot.get("reason_codes")
     if declared is not None and (
         not isinstance(declared, list)
@@ -5462,6 +5603,12 @@ def _resource_pressure_reason_codes(snapshot: Mapping[str, Any], policy: Mapping
             reasons.append("cpu_pressure_high")
         if io_wait_percent > policy["max_io_wait_percent"]:
             reasons.append("io_pressure_high")
+    io_psi_percent = snapshot.get("io_psi_percent")
+    if snapshot.get("_g5_facts") is True:
+        if not _finite_resource_number(io_psi_percent):
+            reasons.append("resource_monitor_unavailable")
+        elif io_psi_percent > policy["max_io_wait_percent"]:
+            reasons.append("io_pressure_high")
     memory_percent = snapshot.get("available_memory_percent")
     memory_mib = snapshot.get("available_memory_mib")
     if not _finite_resource_number(memory_percent) or not _finite_resource_number(memory_mib):
@@ -5475,6 +5622,32 @@ def _resource_pressure_reason_codes(snapshot: Mapping[str, Any], policy: Mapping
         if reason not in reasons:
             reasons.append(reason)
     return list(dict.fromkeys(reasons))
+
+
+def _typed_g5_cgroup_runtime() -> tuple[CgroupProfileV1, CgroupSystemAdapter] | None:
+    runtime = _RESOURCE_GATE_RUNTIME.get()
+    if (
+        runtime is None
+        or runtime.h2_ready is not True
+        or not isinstance(runtime.cgroup_profile, CgroupProfileV1)
+        or runtime.cgroup_adapter is None
+        or not callable(getattr(runtime.cgroup_adapter, "inspect_preflight", None))
+    ):
+        return None
+    return runtime.cgroup_profile, runtime.cgroup_adapter
+
+
+def _g5_warmup_active() -> bool:
+    if _SPAWN_WARMUP_UNTIL_NS <= 0:
+        return False
+    runtime = _RESOURCE_GATE_RUNTIME.get()
+    if runtime is None:
+        return True
+    try:
+        now_ns = runtime.monotonic_ns()
+    except Exception:
+        return True
+    return type(now_ns) is not int or now_ns < _SPAWN_WARMUP_UNTIL_NS
 
 
 @contextlib.contextmanager
@@ -5495,6 +5668,7 @@ def _resource_admission_decision(
     snapshot: Mapping[str, Any] | None = None,
     inventory: Any = None,
     enforce_pressure: bool = True,
+    reserved_slots: int = 0,
 ) -> dict[str, Any]:
     """Compose one resource snapshot with capacity, provider, then pressure precedence."""
 
@@ -5528,12 +5702,19 @@ def _resource_admission_decision(
         running_agents = snapshot.get("running_agents")
         available_slots: int | None = None
         if (
+            type(reserved_slots) is not int
+            or reserved_slots < 0
+            or reserved_slots > required_slots
+        ):
+            capacity_reasons.append("session_metrics_unavailable")
+        elif (
             isinstance(running_agents, int)
             and not isinstance(running_agents, bool)
-            and running_agents >= 0
+            and running_agents >= reserved_slots
         ):
-            available_slots = policy["max_running_agents"] - running_agents
-            if running_agents >= policy["max_running_agents"]:
+            effective_running_agents = running_agents - reserved_slots
+            available_slots = policy["max_running_agents"] - effective_running_agents
+            if effective_running_agents >= policy["max_running_agents"]:
                 capacity_reasons.append("running_agent_limit")
             elif available_slots < required_slots:
                 capacity_reasons.append("insufficient_slots")
@@ -5545,7 +5726,8 @@ def _resource_admission_decision(
         descriptor = None
         if agent is not None:
             try:
-                inventory = current_agent_inventory() if inventory is None else inventory
+                if inventory is None:
+                    inventory, _registry_backed = effective_observation_inventory()
                 descriptor = inventory.agents.get(agent)
             except (AttributeError, TypeError, ValueError):
                 descriptor = None
@@ -5561,7 +5743,7 @@ def _resource_admission_decision(
                     if item.provider is not Provider.OLLAMA_LOCAL:
                         continue
                     try:
-                        alive = tmux_alive(item.session)
+                        alive = tmux_alive(item.session, snapshot=inventory)
                     except Exception:
                         count_known = False
                         break
@@ -5581,6 +5763,17 @@ def _resource_admission_decision(
             task_ok = task is None or _ollama_simple_task_allowed(task, role)
             if descriptor.task_profile == "simple_only" and not task_ok:
                 reasons.append("ollama_simple_task_only")
+        if enforce_pressure and snapshot.get("_g5_facts") is True and not reasons:
+            cgroup_runtime = _typed_g5_cgroup_runtime()
+            if cgroup_runtime is None:
+                reasons.append("cgroup_preflight_failed")
+            else:
+                try:
+                    require_cgroup_preflight(cgroup_runtime[1], cgroup_runtime[0])
+                except CgroupPreflightError:
+                    reasons.append("cgroup_preflight_failed")
+        if enforce_pressure and snapshot.get("_g5_facts") is True and not reasons and _g5_warmup_active():
+            reasons.append("spawn_warmup_active")
 
         result = _admission_result(
             required_slots=required_slots,
@@ -5601,22 +5794,47 @@ def spawn_admission_decision(
     *,
     running_agents_override: int | None = None,
     enforce_pressure: bool = True,
+    agent: str | None = None,
+    task: str | None = None,
+    role: str = "arbeitsbiene",
+    reserved_slots: int = 0,
+    inventory: Any = None,
 ) -> dict[str, Any]:
     required_slots = normalize_int_field(required_slots, field="required_slots", minimum=1, maximum=10)
-    snapshot = (
-        system_resource_snapshot()
-        if running_agents_override is None
-        else system_resource_snapshot(running_agents_override=running_agents_override)
-    )
-    return _resource_admission_decision(
-        required_slots=required_slots,
-        snapshot=snapshot,
-        enforce_pressure=enforce_pressure,
-    )
+    scope = _resource_gate_composer_scope() if enforce_pressure else contextlib.nullcontext()
+    with scope:
+        snapshot = (
+            system_resource_snapshot()
+            if running_agents_override is None
+            else system_resource_snapshot(running_agents_override=running_agents_override)
+        )
+        return _resource_admission_decision(
+            required_slots=required_slots,
+            snapshot=snapshot,
+            enforce_pressure=enforce_pressure,
+            agent=agent,
+            task=task,
+            role=role,
+            reserved_slots=reserved_slots,
+            inventory=inventory,
+        )
 
 
-def require_spawn_capacity(required_slots: int = 1) -> dict[str, Any]:
-    admission = spawn_admission_decision(required_slots)
+def require_spawn_capacity(
+    required_slots: int = 1,
+    *,
+    agent: str | None = None,
+    task: str | None = None,
+    role: str = "arbeitsbiene",
+    reserved_slots: int = 0,
+) -> dict[str, Any]:
+    admission = spawn_admission_decision(
+        required_slots,
+        agent=agent,
+        task=task,
+        role=role,
+        reserved_slots=reserved_slots,
+    )
     if admission.get("allowed") is True:
         return admission
     reason_codes = [
@@ -5656,12 +5874,11 @@ def ollama_resource_status(agent: str, *, task: str | None = None, role: str = "
     descriptor = inventory.agents.get(agent)
     if descriptor is None or descriptor.provider is not Provider.OLLAMA_LOCAL:
         return {"allowed": True, "provider": "not_ollama", "raw_output": "not_returned"}
-    snapshot = system_resource_snapshot()
-    decision = _resource_admission_decision(
+    decision = spawn_admission_decision(
+        1,
         agent=agent,
         task=task,
         role=role,
-        snapshot=snapshot,
         inventory=inventory,
     )
     reason_codes = decision.get("reason_codes", [])
@@ -5678,6 +5895,24 @@ def ollama_resource_status(agent: str, *, task: str | None = None, role: str = "
         "reason_codes": reason_codes,
         "errors": decision.get("errors", []),
         "benchmark_policy": "single_agent_default; two_agent_cap_active",
+        "raw_output": "not_returned",
+    }
+
+
+def _public_resource_gate_status(decision: Mapping[str, Any] | None) -> dict[str, Any]:
+    reason_codes = decision.get("reason_codes") if isinstance(decision, Mapping) else None
+    if not isinstance(reason_codes, list) or any(
+        not isinstance(reason, str) or reason not in RESOURCE_REASON_CODES
+        for reason in reason_codes
+    ):
+        return {
+            "allowed": False,
+            "reason_codes": ["resource_snapshot_invalid"],
+            "raw_output": "not_returned",
+        }
+    return {
+        "allowed": decision.get("allowed") is True,
+        "reason_codes": list(dict.fromkeys(reason_codes)),
         "raw_output": "not_returned",
     }
 
@@ -8188,7 +8423,10 @@ def codex_related_process_summary(proc_root: Path = Path("/proc")) -> dict[str, 
 def pane_pid(session: str) -> int | None:
     if not tmux_alive(session):
         return None
-    cp = run_tmux(["display-message", "-p", "-t", session, "#{pane_pid}"], check=False)
+    cp = run_tmux(
+        _tmux_args_for_session(session, ["display-message", "-p", "-t", session, "#{pane_pid}"]),
+        check=False,
+    )
     if cp.returncode != 0:
         return None
     text = cp.stdout.strip()
@@ -8197,7 +8435,7 @@ def pane_pid(session: str) -> int | None:
 
 def cleanup_failed_start(session: str, raw_log: Path, *, kill_session: bool) -> None:
     if kill_session and tmux_alive(session):
-        run_tmux(["kill-session", "-t", session], check=False)
+        run_tmux(_tmux_args_for_session(session, ["kill-session", "-t", session]), check=False)
     try:
         current = raw_log.lstat()
     except FileNotFoundError:
@@ -8260,6 +8498,109 @@ def release_start_lease_if_safe(
     release_agent(agent, force=True)
 
 
+def _g5_start_scope(session: str) -> tuple[ResourceGateRuntime, PreparedAgentScope]:
+    """Create only a newly verified injected scope; missing evidence remains a denial."""
+
+    runtime = _RESOURCE_GATE_RUNTIME.get()
+    if runtime is None:
+        raise AgentCapacityError(
+            "capacity unavailable",
+            {
+                "error_code": "spawn_capacity_unavailable",
+                "retryable": True,
+                "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS,
+                "reason_codes": ["cgroup_preflight_failed"],
+                "errors": spawn_error_details(["cgroup_preflight_failed"]),
+            },
+        )
+    cgroup_runtime = _typed_g5_cgroup_runtime()
+    if cgroup_runtime is None:
+        raise AgentCapacityError(
+            "capacity unavailable",
+            {
+                "error_code": "spawn_capacity_unavailable",
+                "retryable": True,
+                "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS,
+                "reason_codes": ["cgroup_preflight_failed"],
+                "errors": spawn_error_details(["cgroup_preflight_failed"]),
+            },
+        )
+    try:
+        scope = start_verified_scope(
+            cgroup_runtime[1],
+            profile=cgroup_runtime[0],
+            socket_name=f"g5-{uuid.uuid4().hex[:20]}",
+            session_name=session,
+        )
+    except CgroupPreflightError as exc:
+        raise AgentCapacityError(
+            "capacity unavailable",
+            {
+                "error_code": "spawn_capacity_unavailable",
+                "retryable": True,
+                "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS,
+                "reason_codes": ["cgroup_preflight_failed"],
+                "errors": spawn_error_details(["cgroup_preflight_failed"]),
+            },
+        ) from exc
+    return runtime, scope
+
+
+def _cleanup_g5_scope(runtime: ResourceGateRuntime | None, scope: PreparedAgentScope | None) -> None:
+    if runtime is None or scope is None:
+        return
+    with contextlib.suppress(Exception):
+        run_tmux(["-L", scope.socket_name, "kill-session", "-t", scope.session_name], check=False)
+    with contextlib.suppress(Exception):
+        adapter = runtime.cgroup_adapter
+        if adapter is not None:
+            adapter.cleanup_new_scope(scope)
+
+
+def _cleanup_failed_g5_start(
+    runtime: ResourceGateRuntime | None,
+    scope: PreparedAgentScope | None,
+    raw_log: Path,
+) -> None:
+    """Best-effort cleanup bound to one newly created private G5 session."""
+
+    _cleanup_g5_scope(runtime, scope)
+    if scope is not None:
+        with contextlib.suppress(Exception):
+            cleanup_failed_start(scope.session_name, raw_log, kill_session=False)
+
+
+def _start_g5_warmup(runtime: ResourceGateRuntime | None) -> None:
+    global _SPAWN_WARMUP_UNTIL_NS
+    if runtime is None:
+        return
+    try:
+        now_ns = runtime.monotonic_ns()
+    except Exception as exc:
+        raise AgentCapacityError(
+            "capacity unavailable",
+            {
+                "error_code": "spawn_capacity_unavailable",
+                "retryable": True,
+                "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS,
+                "reason_codes": ["resource_monitor_unavailable"],
+                "errors": spawn_error_details(["resource_monitor_unavailable"]),
+            },
+        ) from exc
+    if type(now_ns) is not int or now_ns < 0:
+        raise AgentCapacityError(
+            "capacity unavailable",
+            {
+                "error_code": "spawn_capacity_unavailable",
+                "retryable": True,
+                "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS,
+                "reason_codes": ["resource_monitor_unavailable"],
+                "errors": spawn_error_details(["resource_monitor_unavailable"]),
+            },
+        )
+    _SPAWN_WARMUP_UNTIL_NS = now_ns + 15_000_000_000
+
+
 def start_agent(
     agent: str,
     cwd: str | None = None,
@@ -8275,24 +8616,25 @@ def start_agent(
     require_fleet_recovery_ready("agent_start")
     agent = canonical_agent_id(agent)
     with agent_lifecycle_lock(agent):
-        name_args = {"name": name} if name is not None else {}
-        replacement_args = (
-            {"replacement_reservation_id": replacement_reservation_id}
-            if replacement_reservation_id is not None
-            else {}
-        )
-        return _start_agent_unlocked(
-            agent,
-            cwd,
-            prompt,
-            lease,
-            release_lease_on_failure,
-            model,
-            model_reasoning_effort,
-            agent_class,
-            **name_args,
-            **replacement_args,
-        )
+        with _resource_gate_composer_scope():
+            name_args = {"name": name} if name is not None else {}
+            replacement_args = (
+                {"replacement_reservation_id": replacement_reservation_id}
+                if replacement_reservation_id is not None
+                else {}
+            )
+            return _start_agent_unlocked(
+                agent,
+                cwd,
+                prompt,
+                lease,
+                release_lease_on_failure,
+                model,
+                model_reasoning_effort,
+                agent_class,
+                **name_args,
+                **replacement_args,
+            )
 
 
 def _start_agent_unlocked(
@@ -8310,12 +8652,8 @@ def _start_agent_unlocked(
     require_fleet_recovery_ready("agent_start")
     agent = canonical_agent_id(agent)
     ollama_descriptor = _ollama_descriptor(agent)
-    admission = _RESOURCE_ADMISSION_CONTEXT.get()
-    if ollama_descriptor is not None:
-        if admission is None:
-            admission = _resource_admission_decision(agent=agent, task=prompt, role="arbeitsbiene")
-        if admission.get("allowed") is not True:
-            _raise_ollama_admission_denied(admission)
+    g5_runtime: ResourceGateRuntime | None = None
+    g5_scope: PreparedAgentScope | None = None
     ensure_state()
     cfg = agent_config(agent)
     runner = cfg["runner"]
@@ -8358,11 +8696,16 @@ def _start_agent_unlocked(
 
     with spawn_admission_lock():
         if replacement_reservation_id is not None:
-                validation = require_managed_replacement_reservation(replacement_reservation_id, session)
-                if validation.get("allowed") is not True:
-                    _raise_replacement_capacity_denied(validation)
-        elif admission is None:
-            require_spawn_capacity(1)
+            validation = require_managed_replacement_reservation(replacement_reservation_id, session)
+            if validation.get("allowed") is not True:
+                _raise_replacement_capacity_denied(validation)
+        require_spawn_capacity(
+            1,
+            agent=agent if ollama_descriptor is not None else None,
+            task=prompt if ollama_descriptor is not None else None,
+            role="arbeitsbiene",
+            reserved_slots=1 if replacement_reservation_id is not None else 0,
+        )
         process_summary = agent_home_process_summary(agent)
         identity_guard = agent_identity_guard(False, process_summary)
         if process_summary["external_process_count"] is None:
@@ -8423,69 +8766,91 @@ def _start_agent_unlocked(
 
         command = "env CODEX_MASTER_MCP=1 CODEX_AGENT_MCP=1 " + shlex.join(argv)
         try:
-            cp = run_tmux(["new-session", "-d", "-s", session, "-c", str(start_cwd), command], check=False)
+            g5_runtime, g5_scope = _g5_start_scope(session)
         except Exception:
+            with contextlib.suppress(Exception):
+                cleanup_failed_start(session, raw_log, kill_session=False)
+            close_runner_execution_fd(agent)
+            release_start_lease_if_safe(agent, lease, release_lease_on_failure)
+            raise
+        tmux_prefix = ["-L", g5_scope.socket_name]
+        try:
+            cp = run_tmux(
+                [
+                    *tmux_prefix,
+                    "send-keys",
+                    "-t",
+                    session,
+                    f"cd {shlex.quote(str(start_cwd))} && exec {command}",
+                    "Enter",
+                ],
+                check=False,
+            )
+        except Exception:
+            _cleanup_failed_g5_start(g5_runtime, g5_scope, raw_log)
             close_runner_execution_fd(agent)
             raise
-    if cp.returncode != 0:
-        cleanup_failed_start(session, raw_log, kill_session=False)
-        close_runner_execution_fd(agent)
-        release_start_lease_if_safe(agent, lease, release_lease_on_failure)
-        raise AgentError(f"tmux start failed for agent {agent}")
+        if cp.returncode != 0:
+            _cleanup_failed_g5_start(g5_runtime, g5_scope, raw_log)
+            close_runner_execution_fd(agent)
+            release_start_lease_if_safe(agent, lease, release_lease_on_failure)
+            raise AgentError(f"tmux start failed for agent {agent}")
 
-    try:
-        pipe_command = raw_log_writer_command(raw_log)
-        pipe = run_tmux(["pipe-pane", "-o", "-t", session, pipe_command], check=False)
-    except Exception:
-        cleanup_failed_start(session, raw_log, kill_session=True)
-        close_runner_execution_fd(agent)
-        release_start_lease_if_safe(agent, lease, release_lease_on_failure)
-        raise
-    if pipe.returncode != 0:
-        cleanup_failed_start(session, raw_log, kill_session=True)
-        close_runner_execution_fd(agent)
-        release_start_lease_if_safe(agent, lease, release_lease_on_failure)
-        raise AgentError(f"tmux pipe-pane failed for agent {agent}")
+        try:
+            pipe_command = raw_log_writer_command(raw_log)
+            pipe = run_tmux([*tmux_prefix, "pipe-pane", "-o", "-t", session, pipe_command], check=False)
+        except Exception:
+            _cleanup_failed_g5_start(g5_runtime, g5_scope, raw_log)
+            close_runner_execution_fd(agent)
+            release_start_lease_if_safe(agent, lease, release_lease_on_failure)
+            raise
+        if pipe.returncode != 0:
+            _cleanup_failed_g5_start(g5_runtime, g5_scope, raw_log)
+            close_runner_execution_fd(agent)
+            release_start_lease_if_safe(agent, lease, release_lease_on_failure)
+            raise AgentError(f"tmux pipe-pane failed for agent {agent}")
 
-    data = {
-        "agent": agent,
-        "backend": "tmux",
-        "label": cfg["label"],
-        "session": session,
-        "home": str(cfg["home"]),
-        "runner": str(runner),
-        "cwd": str(start_cwd),
-        "args": routed_args,
-        "model": effective_model,
-        "model_reasoning_effort": reasoning_effort,
-        "started_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-        "run_id": run_id,
-        "raw_log": str(raw_log),
-        "raw_log_policy": "local_only_bounded_not_returned_by_default",
-        "raw_log_max_bytes": MAX_RAW_LOG_BYTES,
-    }
-    try:
-        write_meta(agent, data)
-    except Exception:
-        cleanup_failed_start(session, raw_log, kill_session=True)
-        close_runner_execution_fd(agent)
-        release_start_lease_if_safe(agent, lease, release_lease_on_failure)
-        raise
-    return {
-        "agent": agent,
-        "status": "started",
-        "backend": "tmux",
-        "session": session,
-        "pid": pane_pid(session),
-        "cwd": PATH_NOT_RETURNED,
-        "cwd_state": "set",
-        "lease": lease or agent_lease_status(agent),
-        "model": model,
-        "model_reasoning_effort": reasoning_effort,
-        "raw_log": "not_returned",
-        "raw_log_max_bytes": MAX_RAW_LOG_BYTES,
-        "raw_output": "not_returned",
-    }
+        data = {
+            "agent": agent,
+            "backend": "tmux",
+            "label": cfg["label"],
+            "session": session,
+            "home": str(cfg["home"]),
+            "runner": str(runner),
+            "cwd": str(start_cwd),
+            "args": routed_args,
+            "model": effective_model,
+            "model_reasoning_effort": reasoning_effort,
+            "started_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "run_id": run_id,
+            "raw_log": str(raw_log),
+            "raw_log_policy": "local_only_bounded_not_returned_by_default",
+            "raw_log_max_bytes": MAX_RAW_LOG_BYTES,
+            G5_TMUX_SOCKET_META_KEY: g5_scope.socket_name,
+        }
+        try:
+            write_meta(agent, data)
+            _start_g5_warmup(g5_runtime)
+        except Exception:
+            _cleanup_failed_g5_start(g5_runtime, g5_scope, raw_log)
+            close_runner_execution_fd(agent)
+            release_start_lease_if_safe(agent, lease, release_lease_on_failure)
+            raise
+        return {
+            "agent": agent,
+            "status": "started",
+            "backend": "tmux",
+            "session": session,
+            "pid": None,
+            "cwd": PATH_NOT_RETURNED,
+            "cwd_state": "set",
+            "lease": lease or agent_lease_status(agent),
+            "model": model,
+            "model_reasoning_effort": reasoning_effort,
+            "raw_log": "not_returned",
+            "raw_log_max_bytes": MAX_RAW_LOG_BYTES,
+            "raw_output": "not_returned",
+        }
 
 
 def _headless_descriptor(agent: str, snapshot: InventorySnapshot | None = None) -> AgentDescriptor | None:
@@ -9306,19 +9671,20 @@ def start_agent_with_lease(
     require_fleet_recovery_ready("agent_start")
     agent = canonical_agent_id(agent)
     with agent_lifecycle_lock(agent):
-        name_args = {"name": name} if name is not None else {}
-        return _start_agent_with_lease_unlocked(
-            agent,
-            cwd,
-            prompt,
-            allow_unauthenticated=allow_unauthenticated,
-            agent_class=agent_class,
-            lifecycle=lifecycle,
-            model=model,
-            reasoning_effort=reasoning_effort,
-            complexity=complexity,
-            **name_args,
-        )
+        with _resource_gate_composer_scope():
+            name_args = {"name": name} if name is not None else {}
+            return _start_agent_with_lease_unlocked(
+                agent,
+                cwd,
+                prompt,
+                allow_unauthenticated=allow_unauthenticated,
+                agent_class=agent_class,
+                lifecycle=lifecycle,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                complexity=complexity,
+                **name_args,
+            )
 
 
 def _start_agent_with_lease_unlocked(
@@ -9350,12 +9716,8 @@ def _start_agent_with_lease_unlocked(
         )
     )
     ollama_descriptor = _ollama_descriptor(agent)
-    admission: dict[str, Any] | None = None
     selection: ResolutionDecision | None = None
     if ollama_descriptor is not None:
-        admission = _resource_admission_decision(agent=agent, task=prompt, role="arbeitsbiene")
-        if admission.get("allowed") is not True:
-            _raise_ollama_admission_denied(admission)
         auth_gate = {
             "authenticated": True,
             "provider": Provider.OLLAMA_LOCAL.value,
@@ -9421,30 +9783,17 @@ def _start_agent_with_lease_unlocked(
     result: dict[str, Any] | None = None
 
     def invoke_start() -> dict[str, Any]:
-        if admission is None:
-            return start_agent(
-                agent,
-                cwd,
-                prompt,
-                lease=lease,
-                release_lease_on_failure=release_on_completion,
-                model=selected_model,
-                model_reasoning_effort=selected_effort,
-                agent_class=selection.class_id if selection is not None else None,
-                **name_args,
-            )
-        with _resource_admission_scope(admission):
-            return start_agent(
-                agent,
-                cwd,
-                prompt,
-                lease=lease,
-                release_lease_on_failure=release_on_completion,
-                model=selected_model,
-                model_reasoning_effort=selected_effort,
-                agent_class=selection.class_id if selection is not None else None,
-                **name_args,
-            )
+        return start_agent(
+            agent,
+            cwd,
+            prompt,
+            lease=lease,
+            release_lease_on_failure=release_on_completion,
+            model=selected_model,
+            model_reasoning_effort=selected_effort,
+            agent_class=selection.class_id if selection is not None else None,
+            **name_args,
+        )
 
     if tmux_alive(agent_config(agent)["session"]):
         try:
@@ -9459,7 +9808,8 @@ def _start_agent_with_lease_unlocked(
                 if raw_log_path is not None:
                     cleanup_failed_start(agent_config(agent)["session"], raw_log_path, kill_session=True)
                 else:
-                    run_tmux(["kill-session", "-t", agent_config(agent)["session"]], check=False)
+                    session = agent_config(agent)["session"]
+                    run_tmux(_tmux_args_for_session(session, ["kill-session", "-t", session]), check=False)
             release_start_lease_if_safe(
                 agent,
                 lease,
@@ -9495,7 +9845,8 @@ def _start_agent_with_lease_unlocked(
             if raw_log_path is not None:
                 cleanup_failed_start(agent_config(agent)["session"], raw_log_path, kill_session=True)
             else:
-                run_tmux(["kill-session", "-t", agent_config(agent)["session"]], check=False)
+                session = agent_config(agent)["session"]
+                run_tmux(_tmux_args_for_session(session, ["kill-session", "-t", session]), check=False)
         release_start_lease_if_safe(agent, lease, release_on_completion)
         raise
     if release_on_completion and agent_lease_status(agent).get("held_by_this_server"):
@@ -9572,7 +9923,7 @@ def _stop_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]:
         require_managed_tmux_session(agent)
         ensure_agent_lease_available(agent, force=force)
     if was_running:
-        cp = run_tmux(["kill-session", "-t", session], check=False)
+        cp = run_tmux(_tmux_args_for_session(session, ["kill-session", "-t", session]), check=False)
         if cp.returncode != 0:
             if cp.returncode in {COMMAND_TIMEOUT_RETURN_CODE, COMMAND_UNAVAILABLE_RETURN_CODE} or tmux_alive(session):
                 raise AgentError(f"tmux stop failed for agent {agent}")
@@ -10441,9 +10792,14 @@ def status_agent(
         }
     cfg = agent_config(agent)
     ollama_descriptor = _ollama_descriptor(agent)
-    ollama_resource = (
+    ollama_resource_decision = (
         ollama_resource_status(agent)
         if ollama_descriptor is not None
+        else None
+    )
+    ollama_resource = (
+        _public_resource_gate_status(ollama_resource_decision)
+        if ollama_resource_decision is not None
         else None
     )
     session = cfg["session"]
@@ -12617,7 +12973,10 @@ def ensure_assignment_session_model(
         if replacement.get("allowed") is not True:
             _raise_replacement_capacity_denied(replacement)
         replacement_id = replacement["reservation_id"]
-        cp = run_tmux(["kill-session", "-t", cfg["session"]], check=False)
+        cp = run_tmux(
+            _tmux_args_for_session(cfg["session"], ["kill-session", "-t", cfg["session"]]),
+            check=False,
+        )
         if cp.returncode != 0:
             raise AgentError(f"tmux model-switch stop failed for agent {agent}")
         name_args = {"name": name} if name is not None else {}
@@ -12648,7 +13007,7 @@ def assign_agent(agent: str, **kwargs: Any) -> dict[str, Any]:
     if _headless_descriptor(agent) is not None:
         return _assign_headless_agent(agent, **kwargs)
     with agent_lifecycle_lock(agent):
-        return _assign_agent_unlocked(agent, **kwargs)
+        return _call_with_resource_gate_composer(lambda: _assign_agent_unlocked(agent, **kwargs))
 
 
 def _assign_agent_unlocked(
@@ -12736,7 +13095,7 @@ def _assign_agent_unlocked(
     if role == "arbeitsbiene" and not write_paths:
         raise AgentError("arbeitsbiene assignments require at least one explicit write path")
     if ollama_descriptor is not None:
-        admission = _resource_admission_decision(agent=agent, task=task, role=role)
+        admission = spawn_admission_decision(agent=agent, task=task, role=role)
         if admission.get("allowed") is not True:
             _raise_ollama_admission_denied(admission)
     scope_result = scope_check(scope, write_paths)
@@ -17025,7 +17384,10 @@ def dismiss_codex_project_trust_prompt(agent: str, text: str) -> bool:
     session = agent_config(agent)["session"]
     with agent_lifecycle_lock(agent):
         require_managed_tmux_session(agent)
-        result = run_tmux(["send-keys", "-t", session, CODEX_TUI_TRUST_PROMPT_SUBMIT_KEY], check=False)
+        result = run_tmux(
+            _tmux_args_for_session(session, ["send-keys", "-t", session, CODEX_TUI_TRUST_PROMPT_SUBMIT_KEY]),
+            check=False,
+        )
         return result.returncode == 0
 
 
@@ -17050,7 +17412,7 @@ def dismiss_codex_update_prompt(agent: str, text: str) -> bool:
     with agent_lifecycle_lock(agent):
         require_managed_tmux_session(agent)
         for key in keys:
-            result = run_tmux(["send-keys", "-t", session, key], check=False)
+            result = run_tmux(_tmux_args_for_session(session, ["send-keys", "-t", session, key]), check=False)
             if result.returncode != 0:
                 return False
     return True
@@ -17146,20 +17508,30 @@ def send_agent(
         paste_mode = "bracketed_paste" if "\n" in text else "plain_paste"
         payload = f"{BRACKETED_PASTE_BEGIN}{text}{BRACKETED_PASTE_END}" if paste_mode == "bracketed_paste" else text
         buffer_name = f"codex-master-mcp-{agent}-{uuid.uuid4().hex}"
-        cp = run_tmux(["load-buffer", "-b", buffer_name, "-"], input_text=payload, check=False)
+        cp = run_tmux(
+            _tmux_args_for_session(session, ["load-buffer", "-b", buffer_name, "-"]),
+            input_text=payload,
+            check=False,
+        )
         if cp.returncode != 0:
             raise AgentError(f"tmux load-buffer failed for agent {agent}")
         try:
             require_managed_tmux_session(agent)
-            cp = run_tmux(["paste-buffer", "-d", "-b", buffer_name, "-t", session], check=False)
+            cp = run_tmux(
+                _tmux_args_for_session(session, ["paste-buffer", "-d", "-b", buffer_name, "-t", session]),
+                check=False,
+            )
             if cp.returncode != 0:
                 raise AgentError(f"tmux paste-buffer failed for agent {agent}")
             if enter:
-                cp = run_tmux(["send-keys", "-t", session, CODEX_TUI_SUBMIT_KEY], check=False)
+                cp = run_tmux(
+                    _tmux_args_for_session(session, ["send-keys", "-t", session, CODEX_TUI_SUBMIT_KEY]),
+                    check=False,
+                )
                 if cp.returncode != 0:
                     raise AgentError(f"tmux send submit key failed for agent {agent}")
         except Exception:
-            run_tmux(["delete-buffer", "-b", buffer_name], check=False)
+            run_tmux(_tmux_args_for_session(session, ["delete-buffer", "-b", buffer_name]), check=False)
             raise
     return {
         "agent": agent,
@@ -17236,7 +17608,7 @@ def _interrupt_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]
         release_on_failure = claim["status"] in {"claimed", "claimed_expired"}
         lease = claim["lease"]
     try:
-        cp = run_tmux(["send-keys", "-t", session, "C-c"], check=False)
+        cp = run_tmux(_tmux_args_for_session(session, ["send-keys", "-t", session, "C-c"]), check=False)
         if cp.returncode != 0:
             if cp.returncode in {COMMAND_TIMEOUT_RETURN_CODE, COMMAND_UNAVAILABLE_RETURN_CODE} or tmux_alive(session):
                 raise AgentError(f"tmux interrupt failed for agent {agent}")
@@ -17366,7 +17738,7 @@ def pane_tail(agent: str, lines: int, *, visible_only: bool = False, verify_iden
     args = ["capture-pane", "-p", "-t", session]
     if not visible_only:
         args.extend(["-S", f"-{lines}"])
-    cp = run_tmux(args, check=False)
+    cp = run_tmux(_tmux_args_for_session(session, args), check=False)
     if cp.returncode != 0:
         return ""
     return cp.stdout
@@ -17618,18 +17990,20 @@ def call_tool(
             selected,
             lambda agent: call_agent_lifecycle(
                 agent,
-                lambda: _start_agent_with_lease_unlocked(
-                    agent,
-                    args.get("cwd"),
-                    args.get("prompt"),
-                    allow_unauthenticated=allow_unauthenticated,
-                    agent_class=args.get("class") if isinstance(args.get("class"), str) else None,
-                    lifecycle=args.get("lifecycle") if isinstance(args.get("lifecycle"), str) else None,
-                    model=args.get("model") if isinstance(args.get("model"), str) else None,
-                    reasoning_effort=args.get("reasoning_effort") if isinstance(args.get("reasoning_effort"), str) else None,
-                    complexity=str(args.get("complexity", "unknown")),
-                    authority_class=authority_class,
-                    **({"name": args["name"]} if "name" in args else {}),
+                lambda: _call_with_resource_gate_composer(
+                    lambda: _start_agent_with_lease_unlocked(
+                        agent,
+                        args.get("cwd"),
+                        args.get("prompt"),
+                        allow_unauthenticated=allow_unauthenticated,
+                        agent_class=args.get("class") if isinstance(args.get("class"), str) else None,
+                        lifecycle=args.get("lifecycle") if isinstance(args.get("lifecycle"), str) else None,
+                        model=args.get("model") if isinstance(args.get("model"), str) else None,
+                        reasoning_effort=args.get("reasoning_effort") if isinstance(args.get("reasoning_effort"), str) else None,
+                        complexity=str(args.get("complexity", "unknown")),
+                        authority_class=authority_class,
+                        **({"name": args["name"]} if "name" in args else {}),
+                    )
                 ),
             ),
         )
@@ -17768,106 +18142,114 @@ def call_tool(
         selected_agent = single_agent_id(str(args.get("agent", "")), "agent_assign")
         return call_agent_lifecycle(
             selected_agent,
-            lambda: _assign_agent_unlocked(
-                selected_agent,
-                role=str(args.get("role", "")),
-                task=args.get("task"),
-                scope=args.get("scope"),
-                skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
-                required_skills=args.get("required_skills"),
-                write_paths=args.get("write_paths"),
-                context=args.get("context"),
-                forbidden=args.get("forbidden"),
-                name=args.get("name") if isinstance(args.get("name"), str) else None,
-                group_id=args.get("group_id") if isinstance(args.get("group_id"), str) else None,
-                job_id=args.get("job_id") if isinstance(args.get("job_id"), str) else None,
-                enter=bool_arg(args, "enter", True),
-                allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
-                allow_subagents=bool_arg(args, "allow_subagents", False),
-                allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
-                operation="agent_assign",
-                authority_class=authority_class,
-                **resolver_request_args(args),
-                **task_evidence_args(args),
+            lambda: _call_with_resource_gate_composer(
+                lambda: _assign_agent_unlocked(
+                    selected_agent,
+                    role=str(args.get("role", "")),
+                    task=args.get("task"),
+                    scope=args.get("scope"),
+                    skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
+                    required_skills=args.get("required_skills"),
+                    write_paths=args.get("write_paths"),
+                    context=args.get("context"),
+                    forbidden=args.get("forbidden"),
+                    name=args.get("name") if isinstance(args.get("name"), str) else None,
+                    group_id=args.get("group_id") if isinstance(args.get("group_id"), str) else None,
+                    job_id=args.get("job_id") if isinstance(args.get("job_id"), str) else None,
+                    enter=bool_arg(args, "enter", True),
+                    allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
+                    allow_subagents=bool_arg(args, "allow_subagents", False),
+                    allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
+                    operation="agent_assign",
+                    authority_class=authority_class,
+                    **resolver_request_args(args),
+                    **task_evidence_args(args),
+                )
             ),
         )
     if name == "agent_assign_readonly":
         selected_agent = single_agent_id(str(args.get("agent", "")), "agent_assign_readonly")
         return call_agent_lifecycle(
             selected_agent,
-            lambda: _assign_agent_unlocked(
-                selected_agent,
-                role="exploriererin",
-                task=args.get("task"),
-                scope=args.get("scope"),
-                skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
-                required_skills=args.get("required_skills"),
-                context=args.get("context"),
-                forbidden=args.get("forbidden"),
-                name=args.get("name") if isinstance(args.get("name"), str) else None,
-                group_id=args.get("group_id") if isinstance(args.get("group_id"), str) else None,
-                job_id=args.get("job_id") if isinstance(args.get("job_id"), str) else None,
-                enter=bool_arg(args, "enter", True),
-                allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
-                allow_subagents=bool_arg(args, "allow_subagents", False),
-                allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
-                operation="agent_assign_readonly",
-                authority_class=authority_class,
-                **resolver_request_args(args),
+            lambda: _call_with_resource_gate_composer(
+                lambda: _assign_agent_unlocked(
+                    selected_agent,
+                    role="exploriererin",
+                    task=args.get("task"),
+                    scope=args.get("scope"),
+                    skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
+                    required_skills=args.get("required_skills"),
+                    context=args.get("context"),
+                    forbidden=args.get("forbidden"),
+                    name=args.get("name") if isinstance(args.get("name"), str) else None,
+                    group_id=args.get("group_id") if isinstance(args.get("group_id"), str) else None,
+                    job_id=args.get("job_id") if isinstance(args.get("job_id"), str) else None,
+                    enter=bool_arg(args, "enter", True),
+                    allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
+                    allow_subagents=bool_arg(args, "allow_subagents", False),
+                    allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
+                    operation="agent_assign_readonly",
+                    authority_class=authority_class,
+                    **resolver_request_args(args),
+                )
             ),
         )
     if name == "agent_assign_live_data":
         selected_agent = single_agent_id(str(args.get("agent", "")), "agent_assign_live_data")
         return call_agent_lifecycle(
             selected_agent,
-            lambda: _assign_agent_unlocked(
-                selected_agent,
-                role="exploriererin",
-                task=args.get("task"),
-                scope=args.get("scope"),
-                skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
-                required_skills=args.get("required_skills"),
-                context=args.get("context"),
-                forbidden=args.get("forbidden"),
-                name=args.get("name") if isinstance(args.get("name"), str) else None,
-                group_id=args.get("group_id") if isinstance(args.get("group_id"), str) else None,
-                job_id=args.get("job_id") if isinstance(args.get("job_id"), str) else None,
-                enter=bool_arg(args, "enter", True),
-                allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
-                allow_subagents=bool_arg(args, "allow_subagents", False),
-                allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
-                requires_search=True,
-                live_data_topic=args.get("live_data_topic") if isinstance(args.get("live_data_topic"), str) else None,
-                operation="agent_assign_live_data",
-                authority_class=authority_class,
-                **resolver_request_args(args),
+            lambda: _call_with_resource_gate_composer(
+                lambda: _assign_agent_unlocked(
+                    selected_agent,
+                    role="exploriererin",
+                    task=args.get("task"),
+                    scope=args.get("scope"),
+                    skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
+                    required_skills=args.get("required_skills"),
+                    context=args.get("context"),
+                    forbidden=args.get("forbidden"),
+                    name=args.get("name") if isinstance(args.get("name"), str) else None,
+                    group_id=args.get("group_id") if isinstance(args.get("group_id"), str) else None,
+                    job_id=args.get("job_id") if isinstance(args.get("job_id"), str) else None,
+                    enter=bool_arg(args, "enter", True),
+                    allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
+                    allow_subagents=bool_arg(args, "allow_subagents", False),
+                    allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
+                    requires_search=True,
+                    live_data_topic=args.get("live_data_topic") if isinstance(args.get("live_data_topic"), str) else None,
+                    operation="agent_assign_live_data",
+                    authority_class=authority_class,
+                    **resolver_request_args(args),
+                )
             ),
         )
     if name == "agent_assign_write":
         selected_agent = single_agent_id(str(args.get("agent", "")), "agent_assign_write")
         return call_agent_lifecycle(
             selected_agent,
-            lambda: _assign_agent_unlocked(
-                selected_agent,
-                role="arbeitsbiene",
-                task=args.get("task"),
-                scope=args.get("scope"),
-                skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
-                required_skills=args.get("required_skills"),
-                write_paths=args.get("write_paths"),
-                context=args.get("context"),
-                forbidden=args.get("forbidden"),
-                name=args.get("name") if isinstance(args.get("name"), str) else None,
-                group_id=args.get("group_id") if isinstance(args.get("group_id"), str) else None,
-                job_id=args.get("job_id") if isinstance(args.get("job_id"), str) else None,
-                enter=bool_arg(args, "enter", True),
-                allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
-                allow_subagents=bool_arg(args, "allow_subagents", False),
-                allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
-                operation="agent_assign_write",
-                authority_class=authority_class,
-                **resolver_request_args(args),
-                **task_evidence_args(args),
+            lambda: _call_with_resource_gate_composer(
+                lambda: _assign_agent_unlocked(
+                    selected_agent,
+                    role="arbeitsbiene",
+                    task=args.get("task"),
+                    scope=args.get("scope"),
+                    skill=args.get("skill") if isinstance(args.get("skill"), str) else None,
+                    required_skills=args.get("required_skills"),
+                    write_paths=args.get("write_paths"),
+                    context=args.get("context"),
+                    forbidden=args.get("forbidden"),
+                    name=args.get("name") if isinstance(args.get("name"), str) else None,
+                    group_id=args.get("group_id") if isinstance(args.get("group_id"), str) else None,
+                    job_id=args.get("job_id") if isinstance(args.get("job_id"), str) else None,
+                    enter=bool_arg(args, "enter", True),
+                    allow_missing_skill=bool_arg(args, "allow_missing_skill", False),
+                    allow_subagents=bool_arg(args, "allow_subagents", False),
+                    allow_unauthenticated=bool_arg(args, "allow_unauthenticated", False),
+                    operation="agent_assign_write",
+                    authority_class=authority_class,
+                    **resolver_request_args(args),
+                    **task_evidence_args(args),
+                )
             ),
         )
     if name == "agent_assignments":
@@ -23917,7 +24299,21 @@ def applet_action_fingerprint(state: dict[str, Any]) -> str:
 
 def applet_action_fingerprint_for(action: str, state: dict[str, Any]) -> str:
     if action == "start":
-        selected = state
+        selected = {
+            key: state.get(key)
+            for key in (
+                "agent",
+                "activity_state",
+                "backend_state",
+                "control_state",
+                "auth_state",
+                "identity_state",
+                "lease_state",
+                "limit_state",
+                "blocked_until_utc",
+                "run_marker",
+            )
+        }
     elif action == "stop":
         selected = {
             key: state.get(key)
@@ -24078,7 +24474,12 @@ def applet_action_state(
     }
 
 
-def applet_action_allowed(action: str, state: dict[str, Any]) -> bool:
+def applet_action_allowed(
+    action: str,
+    state: dict[str, Any],
+    *,
+    require_capacity: bool = True,
+) -> bool:
     if action == "start":
         capacity = state.get("capacity")
         return (
@@ -24089,8 +24490,10 @@ def applet_action_allowed(action: str, state: dict[str, Any]) -> bool:
             and state.get("identity_state") == "stopped"
             and state.get("lease_state") in {"unclaimed", "expired"}
             and state.get("limit_state") == "clear"
-            and isinstance(capacity, dict)
-            and capacity.get("allowed") is True
+            and (
+                not require_capacity
+                or (isinstance(capacity, dict) and capacity.get("allowed") is True)
+            )
         )
     if action == "stop":
         return (
@@ -24483,7 +24886,8 @@ def applet_action(action: Any, agent: Any, context_token: Any) -> dict[str, Any]
     agent = normalize_applet_agents([agent])[0]
     if not isinstance(context_token, str):
         raise AgentError("applet context token is invalid")
-    with agent_lifecycle_lock(agent, timeout_seconds=APPLET_TMUX_TIMEOUT_SECONDS):
+    composer_scope = _resource_gate_composer_scope() if action == "start" else contextlib.nullcontext()
+    with agent_lifecycle_lock(agent, timeout_seconds=APPLET_TMUX_TIMEOUT_SECONDS), composer_scope:
         key = read_applet_action_key()
         claims = validate_applet_action_token(context_token, key)
         if claims["a"] != action or claims["g"] != agent:
@@ -24505,13 +24909,13 @@ def applet_action(action: Any, agent: Any, context_token: Any) -> dict[str, Any]
             )
         except AgentError:
             usage = None
-        admission = spawn_admission_decision(1) if action == "start" else None
+        admission = None
         meta = read_meta(agent)
         run_marker = meta.get("run_id") if not meta.get("meta_error") else None
         state = applet_action_state(row, usage, admission, run_marker=run_marker)
         if not hmac.compare_digest(claims["f"], applet_action_fingerprint_for(action, state)):
             raise AgentError("applet context token is stale")
-        if not applet_action_allowed(action, state):
+        if not applet_action_allowed(action, state, require_capacity=action != "start"):
             raise AgentError("applet action is no longer allowed")
 
         if action == "start":
