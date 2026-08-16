@@ -45,3 +45,29 @@ the execution-boundary modes (`off`, `shadow`, and `enforced` internally).
 The broader Hive design terms `observe` and `auto` are not accepted aliases:
 their runtime semantics are not defined by this contract, so they remain
 fail-closed until a separate policy decision specifies their gates.
+
+## Resolver offer and account availability
+
+`agent_selection_options` is the first-round resolver surface for one target
+series account. It combines the verified principal's delegable classes with the
+checked-in class and model catalogs plus current `codex-usage` availability.
+The response contains only valid class/lifecycle/model/reasoning tuples. It
+never exposes account keys or an invalid cross-product of independent lists.
+
+The offer has a stable digest in `generation`. A caller sends its last digest as
+`known_generation`; `options_changed` is true when catalog or account
+availability changed. The offer reserves no slot. Start and assignment perform
+fresh routing and feed the request through the same resolver before mutation.
+
+Spark is offered only when `codex-usage` reports Spark routing for the target
+account. If Spark becomes unavailable, the next offer omits it and the normal
+default becomes Luna. An explicit unavailable model is not silently accepted:
+the effective selection has `fallback: true` and a stable reason code such as
+`requested_model_unavailable`. Public output includes the replacement model and
+effort so the requester can accept it, choose another offered tuple, or stop.
+
+Authority is not caller-supplied data. An unverified call fails safe to
+Arbeitsbiene authority. A verified principal sees only transitively delegable
+non-leadership classes. No request can elevate its caller into any leadership
+class, including a request by a Teamleiterin for Teamleiterin authority; this
+also forbids promotion to Gottbiene or Koenigin.

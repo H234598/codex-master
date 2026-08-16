@@ -342,6 +342,87 @@ def test_generic_headless_assignment_preserves_requested_role(monkeypatch) -> No
     assert assign.call_args.kwargs["role"] == "exploriererin"
 
 
+def test_headless_assignment_never_provider_falls_back_from_explicit_target(monkeypatch) -> None:
+    descriptor = type("Descriptor", (), {"model": "gemini-3-flash-preview"})()
+    route = Mock(side_effect=AssertionError("implicit headless fallback is forbidden"))
+
+    monkeypatch.setattr(server, "canonical_agent_id", lambda _agent: "i1")
+    monkeypatch.setattr(server, "_headless_descriptor", lambda _agent: descriptor)
+    monkeypatch.setattr(server, "skill_matches", lambda *_args: [])
+    monkeypatch.setattr(server, "scope_check", lambda *_args: {"allowed": True})
+    monkeypatch.setattr(server, "assignment_prompt", lambda **_kwargs: "bounded assignment prompt")
+    monkeypatch.setattr(server, "_headless_route_candidates", route)
+    monkeypatch.setattr(server, "agent_lifecycle_lock", lambda _agent: nullcontext())
+    monkeypatch.setattr(server, "_claim_agent_unlocked", lambda _agent: {
+        "status": "already_held",
+        "lease": {"held_by_this_server": True},
+    })
+    monkeypatch.setattr(server, "record_assignment", lambda _record: None)
+    monkeypatch.setattr(server, "_headless_marker", lambda _agent: {})
+    monkeypatch.setattr(server, "_write_headless_marker", lambda _agent, _marker: None)
+    monkeypatch.setattr(
+        server,
+        "_run_headless_process",
+        lambda agent, *_args, **_kwargs: {
+            "agent": agent,
+            "status": "failed",
+            "error": {"kind": "provider_unavailable", "retryable": True},
+        },
+    )
+
+    result = server._assign_headless_agent(
+        "i1",
+        role="exploriererin",
+        task="inspect",
+        scope=[],
+        timeout_seconds=5,
+    )
+
+    assert result["agent"] == "i1"
+    assert result["requested_agent"] == "i1"
+    assert result["routed_from"] is None
+    assert result["error"]["kind"] == "provider_unavailable"
+    route.assert_not_called()
+
+
+def test_headless_write_assignment_fails_closed_before_claim_or_process(monkeypatch) -> None:
+    descriptor = type("Descriptor", (), {"model": "gemini-3-flash-preview"})()
+    claim = Mock()
+    record = Mock()
+    run = Mock()
+
+    monkeypatch.setattr(server, "canonical_agent_id", lambda _agent: "i1")
+    monkeypatch.setattr(server, "_headless_descriptor", lambda _agent: descriptor)
+    monkeypatch.setattr(server, "scope_check", lambda *_args: {"allowed": True})
+    monkeypatch.setattr(server, "_claim_agent_unlocked", claim)
+    monkeypatch.setattr(server, "record_assignment", record)
+    monkeypatch.setattr(server, "_run_headless_process", run)
+
+    with pytest.raises(server.AgentError, match="headless_write_scope_unenforced") as exc_info:
+        server._assign_headless_agent(
+            "i1",
+            role="arbeitsbiene",
+            task="fix",
+            scope=["src"],
+            write_paths=["src/file.py"],
+            timeout_seconds=5,
+        )
+
+    error = exc_info.value
+    assert error.payload == {
+        "code": "headless_write_scope_unenforced",
+        "explanation": "headless writes lack isolated worktree and diff attribution",
+        "action": "use an isolated worktree or submit a read-only headless assignment",
+    }
+    assert server.public_error_payload(error) == {
+        "error": "headless_write_scope_unenforced",
+        **error.payload,
+    }
+    claim.assert_not_called()
+    record.assert_not_called()
+    run.assert_not_called()
+
+
 def test_gemini_bootstrap_plan_is_dry_and_secret_free() -> None:
     result = server.fleet_gemini_bootstrap_plan()
 

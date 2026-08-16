@@ -17,6 +17,7 @@ from pathlib import Path, PurePosixPath
 from typing import Callable
 
 from codex_master.admission import AdmissionRecord
+from codex_master.hive.events import HiveEventError, HiveEventStore
 from codex_master.hive.state import HiveStateError, HiveStateStore
 
 
@@ -59,12 +60,16 @@ class FileCompletionJournal(CompletionJournal):
         self,
         state_root: Path,
         *,
+        event_store: HiveEventStore | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         try:
             self._state = HiveStateStore(state_root)
         except HiveStateError as exc:
             raise CompletionJournalError("invalid_completion_journal_root") from exc
+        if event_store is not None and not isinstance(event_store, HiveEventStore):
+            raise CompletionJournalError("invalid_completion_event_store")
+        self._events = event_store
         self._now = now or (lambda: datetime.now(timezone.utc))
 
     def record_started(self, admission: AdmissionRecord, operation: str) -> None:
@@ -81,11 +86,13 @@ class FileCompletionJournal(CompletionJournal):
                     raise CompletionJournalError("completion_already_recorded")
                 if current["operation_digest"] != _digest(operation):
                     raise CompletionJournalError("completion_operation_conflict")
+                self._record_event(admission, "executing")
                 return
             if len(records) >= MAX_JOURNAL_RECORDS:
                 raise CompletionJournalError("completion_journal_full")
             records[admission.admission_id] = self._started_payload(admission, operation)
             self._write_locked(records)
+        self._record_event(admission, "executing")
 
     def record_completed(
         self,
@@ -108,6 +115,7 @@ class FileCompletionJournal(CompletionJournal):
             if current["operation_digest"] != _digest(operation):
                 raise CompletionJournalError("completion_operation_conflict")
             if current["state"] == "completed":
+                self._record_event(admission, "completed")
                 return
             records[admission.admission_id] = {
                 **current,
@@ -116,6 +124,7 @@ class FileCompletionJournal(CompletionJournal):
                 "updated_at_utc": self._timestamp(),
             }
             self._write_locked(records)
+        self._record_event(admission, "completed")
 
     def execution_completed(self, admission: AdmissionRecord) -> bool:
         if not isinstance(admission, AdmissionRecord):
@@ -231,6 +240,24 @@ class FileCompletionJournal(CompletionJournal):
         if not isinstance(value, datetime) or value.tzinfo is None:
             raise CompletionJournalError("completion_clock_unavailable")
         return value.astimezone(timezone.utc).isoformat()
+
+    def _record_event(self, admission: AdmissionRecord, status: str) -> None:
+        if self._events is None:
+            return
+        try:
+            self._events.append_queue_transition(
+                admission.workpackage_id,
+                status,
+                at_utc=self._now(),
+                dispatch_id=admission.dispatch_id,
+                repo_id=admission.repo_id,
+                agent_id=admission.resource.agent_id,
+                event_id="admission-" + hashlib.sha256(
+                    f"{admission.admission_id}\0{status}".encode("utf-8")
+                ).hexdigest()[:24],
+            )
+        except HiveEventError as exc:
+            raise CompletionJournalError("completion_event_write_failed") from exc
 
 
 def _is_digest(value: object) -> bool:

@@ -18,6 +18,7 @@ from codex_master.hive.authority import (
 from codex_master.hive.principals import ExecutionBinding, Principal, PrincipalError, PrincipalRegistry
 from codex_master.hive.repositories import RepositoryBinding, RepositoryError, RepositoryRegistry, RepositoryValidation
 from codex_master.hive.state import HiveStateError, HiveStateStore
+from codex_master.hive.events import HiveEventError, HiveEventStore
 from codex_master.hive.messages import (
     AuthorizationEvidence,
     HiveMessage,
@@ -81,6 +82,8 @@ __all__ = [
     "RepositoryValidation",
     "HiveStateError",
     "HiveStateStore",
+    "HiveEventError",
+    "HiveEventStore",
     "AuthorizationEvidence",
     "HiveMessage",
     "HiveMessageError",

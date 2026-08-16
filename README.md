@@ -5,6 +5,10 @@ the local MCP control plane for a sleeping/scalable Codex Agentinnen fleet.
 The Fleet Registry is authoritative for active series; the legacy pool spec is
 kept only for compatibility.
 
+Versioned local Wiki sources start at [docs/wiki/Home.md](docs/wiki/Home.md).
+They remain canonical in this repository; no GitHub Wiki publication is implied.
+Fleet-Overview, G-Serie and Goddess-Reporting contract: [docs/operations/goddess-reporting.md](docs/operations/goddess-reporting.md).
+
 - `/home/teladi/.codex-agents/a1` through `/home/teladi/.codex-agents/a100`
 - `/home/teladi/.codex-agents/b1` through `/home/teladi/.codex-agents/b100`
 - `/home/teladi/.codex-agents/c1` through `/home/teladi/.codex-agents/c100`
@@ -35,11 +39,12 @@ large read-mostly skill/plugin/model cache files may be symlinked from a series
 template. C-series homes are intentionally unauthenticated until another
 account is available.
 
-The wrapper starts instances through their per-home `codex` launcher files
-with the default model `gpt-5.4-mini` and:
+The wrapper starts instances through their per-home `codex` launcher files.
+Before central resolution supplies an effective tuple, its base default is
+`gpt-5.6-luna` with medium reasoning:
 
 ```sh
---model gpt-5.4-mini -c 'model="gpt-5.4-mini"' -c 'model_reasoning_effort="medium"' --yolo -s danger-full-access --search
+--model gpt-5.6-luna -c 'model="gpt-5.6-luna"' -c 'model_reasoning_effort="medium"' --yolo -s danger-full-access --search
 ```
 
 It uses `tmux` as the PTY backend. Full terminal output is written only to local
@@ -186,7 +191,31 @@ registry, assignments, or shell history. Account gates require a configured
 secret and a successful admission check. Stale or unknown Gemini probes are
 checked once at invocation time, so a neighboring project does not make this
 project stale. Gemini RPM/TPM/RPD observations are project-scoped; billing
-tier and spend caps may still be shared by the billing account.
+tier and spend caps may still be shared by the billing account. The supplied
+AI Studio exports confirm Tier 1 for `the-hive-1` and `the-hive-2`, and Tier 0
+for `the-hive-3`, `the-hive-4`, `the-hive-6`, and `the-hive-10`. This is
+project-scoped evidence; the local account group is not used to infer a
+project's tier. Exact RPM/TPM/RPD limits remain model- and project-specific;
+known values are imported only for projects with a Rate Limit table in the
+supplied snapshots and unknown values are never guessed locally. Tier 1's
+documented spend guard is $10 per rolling 10 minutes and its billing-account
+cap is $250 per month. The local usage calculator reports observed RPM/TPM/RPD
+and now uses the supplied AI Studio snapshots for known project/model pairs.
+It keeps the limits model-specific and returns `model_required` or
+`limits_unknown_dashboard_required` when no applicable snapshot exists. Spend
+utilization remains `billing_export_required` because an API key alone does not
+expose billing spend.
+
+Imported rate-limit snapshots:
+
+| Model | Tier 0 | Tier 1 |
+| --- | --- | --- |
+| Gemini 3.1 Flash Lite | 15 RPM / 250K TPM / 500 RPD | 4K RPM / 4M TPM / 150K RPD |
+| Gemini 3 Flash | 5 RPM / 250K TPM / 20 RPD | 1K RPM / 2M TPM / 10K RPD |
+| Gemini 3.5 Flash | 5 RPM / 250K TPM / 20 RPD | 1K RPM / 2M TPM / 10K RPD |
+
+The snapshot source is the supplied `Tier 0 (kostenlos).mhtml` and `Tier 1
+(Billing).html`; refresh it when AI Studio changes the active project limits.
 
 `fleet_gemini_bootstrap_plan` remains a secret-free compatibility dry-plan
 helper only. It does not create the retired D/E/F series; runtime activation
@@ -233,8 +262,10 @@ loaded lazily so headless imports remain display-free. The Cinnamon adapter uses
 snapshot schema v3, at most 26 series and 25 visible rows per series page;
 limited rows are status-only. Real provider credentials, account probes,
 Ollama resource admission, and desktop-session acceptance remain explicit
-local gates. Ollama series are `simple_only`, capped at two concurrent agents,
-and reject complex or repository-changing tasks.
+local gates. Ollama series remain `simple_only` and reject complex or
+repository-changing tasks. Their configured separate two-agent resource cap
+and host-pressure gates are enforced; the global ten-Bee cap remains an
+additional upper bound.
 
 ## Tools
 
@@ -372,6 +403,8 @@ Public, secret-free configuration examples live in
   installed Agentinnen, dry-run by default
 - `agent_pool_destroy_pool`: guarded removal of installed Agentinnen homes
 - `agent_doctor`: structured diagnostics without raw output
+- `agent_selection_options`: account- and authority-filtered first-round offer
+  containing only valid class/lifecycle/model/reasoning combinations
 - `fleet_account_list`, `fleet_gemini_bootstrap_plan`, `fleet_series_list`,
   `fleet_account_upsert`, `fleet_account_set_secret`, `fleet_account_disable`,
   `fleet_account_probe`, `fleet_account_delete`, `fleet_provider_models`,
@@ -400,6 +433,74 @@ Master MCP tools.
 
 ## Local CLI
 
+### Zentraler Klassen-/Lifecycle-/Modellresolver
+
+Vor dem ersten Start oder Assignment einer Serie fragt das anfordernde Modell
+`agent_selection_options` fuer eine konkrete Ziel-Agentin ab. Die Antwort
+enthaelt nur aktuell erlaubte Klassen, Lifecycles, Modelle, Reasoning-Stufen und
+deren gueltige Kombinationen. Das Angebot ist advisory und reserviert nichts.
+Seine `generation` kann bei Folgeaufrufen als `known_generation` mitgegeben
+werden; `options_changed` meldet account- oder katalogbedingte Aenderungen.
+Beim ersten Angebot fuer eine Teamleiterin muss sichtbar genau ein legales
+Tupel erscheinen: `class=teamleiterin`, `lifecycle=persistent`,
+`model=gpt-5.6-terra`, `reasoning=xhigh`. Fuer die Policy ist `xhigh` zugleich
+Minimum und Maximum. Andere Teamleiterin-Tupel duerfen nicht angeboten werden.
+
+`agent_start`, `agent_assign` und die Assignment-Shortcuts geben ihre optionalen
+Felder `class`, `lifecycle`, `model`, `reasoning_effort` und `complexity` an
+denselben Resolver. Danach wird keine zweite Auswahl-Policy angewendet.
+Oeffentliche Lifecycles sind `ephemeral`, `binding` und `persistent`;
+`invocation` bleibt als Eingabealias erlaubt und wird als `ephemeral`
+zurueckgegeben.
+
+Kompatible explizite Angaben bleiben erhalten. Klassenprofil, Lifecycle,
+Modellfaehigkeiten, accountbezogene Verfuegbarkeit sowie Reasoning-Minimum und
+-Maximum sind harte Grenzen. Fehlt die Klasse, wird eine passende delegierbare
+Nicht-Leitungsklasse gewaehlt; Leitungsklassen werden nie automatisch
+hochgestuft. Fehlt der Lifecycle, gilt das Klassenprofil. Defaults fuer
+Arbeiterinnen:
+
+- einfacher Schreibjob plus `ephemeral`: `gpt-5.3-codex-spark`/`low`
+- Read-only oder nicht einfacher Schreibjob plus `ephemeral`:
+  `gpt-5.6-luna`/`medium`
+- `binding`: `gpt-5.6-luna`/`high`
+- `persistent`: `gpt-5.6-luna`/`xhigh`; `xhigh` ist hier zugleich Minimum
+
+Ist Spark fuer den Account nicht verfuegbar oder verwirft die Task-Pruefung ihn,
+faellt der Default auf Luna zurueck. Spark ist nur der Default fuer einen
+einfachen Schreibjob ohne Modellwunsch. Ein fuer eine Arbeiterin explizit
+angefordertes unbekanntes oder nicht verfuegbares Modell faellt sicher auf
+`gpt-5.6-luna`, nie auf Spark; ein kompatibles explizites Effort bleibt erhalten
+oder wird an Ersatzmodell sowie Klassen-/Lifecyclegrenzen geklemmt.
+Klassenfremde oder zu schwache Angaben werden ebenfalls innerhalb der harten
+Grenzen ersetzt; Gottbiene und Koenigin bleiben Sol-gebunden. `selection.fallback`,
+angeforderter und effektiver Wert sowie stabile `reason_codes` liefern die klare
+Fehl-/Fallbackmeldung. Das anfordernde Modell kann danach abbrechen oder mit
+einer anderen angebotenen Kombination neu anfragen. Gueltige Aufstiege Spark ->
+Luna -> Terra -> Sol bleiben innerhalb der Klassen- und Effortgrenzen moeglich.
+`ultra` ist nie erlaubt.
+
+Teamleiterin ist fest persistent und nutzt exakt `gpt-5.6-terra` mit `xhigh`;
+`xhigh` ist fuer sie zugleich Minimum und Maximum. Ein erforderliches Modell
+oder Effort, das nicht verfuegbar ist, ist ein harter Fehler ohne Fallback.
+`required_model_unavailable:gpt-5.6-terra` beziehungsweise
+`required_model_effort_unavailable:gpt-5.6-terra:xhigh`.
+Das gilt insbesondere fuer die Teamleiterin: Start und Assignment teilen den
+zentralen Resolver und duerfen niemals auf Sol, Luna, Spark oder ein anderes
+Effort ausweichen.
+
+Leitungsklassen sind fest persistent und stellen sich beim ersten echten
+Userkontakt mit Namen vor: Gottbiene nutzt `gpt-5.6-sol`/`max`, Koenigin nutzt
+`gpt-5.6-sol`/`xhigh`, und Teamleiterin nutzt exakt
+`gpt-5.6-terra`/`xhigh`. Fuer Koenigin, Teamleiterin und alle Arbeiterklassen
+ist `xhigh` absolute Obergrenze; nur die Gottbiene darf `max` nutzen.
+
+Der kanonische Betriebsablauf steht in
+[Selection Operations](docs/operations/selection-operations.md). Die
+versionierten Kataloge [`codex-agent-classes.json`](codex-agent-classes.json)
+und [`codex-model-policy.json`](codex-model-policy.json) bleiben autoritativ;
+README und Skill definieren keine zweite Auswahl-Policy.
+
 ### Ressourcenbewusste Spawn-Angebote
 
 `agent_spawn_offers` ist ein read-only MCP-Hinweis fuer eine moegliche lokale
@@ -420,18 +521,38 @@ PYTHONPATH=src python -m codex_master.server spawn-offers --required-slots 1
 lokale editable Installation kann auf einen anderen Quellstand zeigen.
 
 Ein Offer ist advisory, gilt 5 Sekunden und reserviert nichts
-(`reservation: "none"`). `start` prueft CPU, Speicher und Slots vor einem
-neuen tmux-Start unter dem Admission-Lock erneut. Bei verweigerter oder
-unvollstaendiger Messung bleiben Offers leer; die data-sparse Antwort enthaelt
-nur Reason-Codes, keine `/proc`-Inhalte, tmux-Ausgabe, lokalen Pfade oder
-Environment-Text. Sie ist retryable mit 15 Sekunden Wartehinweis.
+(`reservation: "none"`). `start` prueft freie Gesamtslots vor einem neuen
+tmux-Start unter dem Admission-Lock erneut. Ohne belastbare Gesamtzahl bleiben
+Offers leer; die data-sparse Antwort enthaelt nur Reason-Codes, keine
+`/proc`-Inhalte, tmux-Ausgabe, lokalen Pfade oder Environment-Texte. Sie ist
+retryable mit 15 Sekunden Wartehinweis.
 
-Default-Grenzen fuer einen neuen Start:
+Temporäre Grenzen fuer einen neuen Start:
 
-- Last pro CPU hoechstens `0.85`
-- verfuegbarer Speicher mindestens `20 %` und `1024 MiB`
-- hoechstens `6` laufende verwaltete tmux-Agentinnen
-- `required_slots` liegt zwischen 1 und 6
+- Ressourcendruck-Grenzen bleiben mit ihren bisherigen Werten konfiguriert und aktiv: CPU, Load, I/O-Wait und RAM können Spawn fail-closed blockieren.
+- die konfigurierte Ollama-Zweiergrenze bleibt erhalten und wird vor der globalen Zehnergrenze durchgesetzt
+- hoechstens `10` Bienen insgesamt; laufende Masterjet-Sessions sowie aktive und unbestaetigte native Subagentinnen zaehlen zusammen
+- ab `10` Bienen wird jede weitere Biene hart abgewiesen
+- `required_slots` liegt zwischen 1 und 10
+
+Verweigerte Admission-Antworten enthalten neben stabilen `reason_codes` eine
+strukturierte `errors`-Tabelle. Jeder Eintrag liefert `code`, `title`,
+`explanation`, `rule` und `action`; Rohmetriken oder lokale Zustandsdaten werden
+nicht aufgenommen.
+
+| Code | Bedeutung |
+|---|---|
+| `running_agent_limit` | Globale Zehnergrenze bereits erreicht. |
+| `insufficient_slots` | Anfrage passt nicht vollstaendig in verbleibende Gesamtslots. |
+| `session_metrics_unavailable` | Masterjet kann Gesamtzahl nicht belastbar bestimmen. |
+| `policy_invalid` | Konfigurierte Werte oder Enforcement-Flags sind ungueltig. |
+| `cpu_metrics_unavailable` | CPU-Evidenz fehlt; relevant, wenn Druck-Enforcement aktiv ist. |
+| `memory_metrics_unavailable` | Speicherevidenz fehlt; relevant, wenn Druck-Enforcement aktiv ist. |
+| `cpu_pressure_high` | Aktive CPU-Grenze ueberschritten. |
+| `io_pressure_high` | Aktive I/O-Wait-Grenze ueberschritten. |
+| `memory_pressure_high` | Aktive Speichergrenze unterschritten. |
+| `ollama_concurrency_limit` | Konfigurierte aktive Ollama-Zweiergrenze erreicht. |
+| `ollama_simple_task_only` | Aufgabe verletzt Ollama-Capability-Gate. |
 
 `CODEX_MASTER_SPAWN_PRIORITY` ist einzige Spawn-Environment-Konfiguration.
 Sie ist eine kommagetrennte Prioritaetsliste (Default `mcp_host`), wird nur als
@@ -448,10 +569,12 @@ Ein sauberer tmux-Zustand ohne Server oder Sessions zaehlt als null laufende
 Agentinnen. Messfehler, `/proc`-Fehler und alle anderen tmux-Fehler fail-closed;
 ihre oeffentlichen Fehler bleiben begrenzt und redigiert.
 
-Native Subagentinnen sind davon getrennt: deren Steuerung ist Assignment-
-Prompt-Policy (inklusive frischem Ressourcencheck vor weiterem Spawn). Sie ist
-nicht technisch erzwungen. Der Masterjet kann eine native Codex-Delegation
-nicht intercepten. `developer_vm` darf erst offerable werden, wenn alle
+Native Subagentinnen melden Starts und Stops an den Masterjet. Aktive und
+unbestaetigte Eintraege zaehlen deshalb in jede folgende Slotentscheidung ein.
+Die Assignment-Prompt-Policy verlangt den frischen Gesamtcheck vor jedem
+weiteren Spawn. Ein Modell, das diesen MCP-Pfad umgeht, kann der Masterjet ohne
+Codex-eigenen Pre-Spawn-Hook weiterhin nicht technisch intercepten.
+`developer_vm` darf erst offerable werden, wenn alle
 folgenden Voraussetzungen erfuellt sind:
 
 - real reachability/health probe against the actual VM
@@ -622,6 +745,10 @@ argv. Finite refresh intervals outside the allowed range are clamped to
 one summary, at most six managed rows, and the separately bounded Native-Bienen
 submenu.
 
+Only the Koenigin may restart or reload Masterjet, install it, or synchronize
+the plugin cache. Other roles may inspect and verify state and recommend these
+actions to the Koenigin, but must not execute them.
+
 Install MCP/plugin and applet with the repository-owned installers:
 
 ```sh
@@ -631,12 +758,23 @@ Install MCP/plugin and applet with the repository-owned installers:
 ./scripts/codex-master-cinnamon-applet verify
 ```
 
-`codex-master-mcp install` synchronizes the regular `hooks/hooks.json` and
-`hooks/native_bee_event.py` files into the personal plugin cache. It does not
+The complete CLI reference is the repository manpage
+[`codex-master-mcp(1)`](man/man1/codex-master-mcp.1). Build deterministic
+compressed output without installing it, or render the source directly:
+
+```sh
+./scripts/codex-master-manpage build --output-dir /tmp/codex-master-man
+groff -man -Tutf8 man/man1/codex-master-mcp.1
+```
+
+`codex-master-mcp install` synchronizes the plugin, including the regular
+`hooks/hooks.json`, `hooks/native_spawn_admission.py`, and
+`hooks/native_bee_event.py` files, into the personal plugin cache. It does not
 and must not alter Codex hook-trust state. After installation, open a new Codex
-session, run `/hooks`, inspect the four `codex-master` lifecycle hook
-definitions, and explicitly trust them. Until that manual step succeeds, do
-not claim that Native-Bienen hooks are active.
+session, run `/hooks`, inspect the five `codex-master` definitions, and
+explicitly trust them: one blocking `PreToolUse` admission hook plus four
+lifecycle hooks. Until that manual step succeeds, do not claim that native
+spawn admission or Native-Bienen lifecycle coverage is active.
 
 Rollback the active applet tree with:
 
@@ -775,6 +913,15 @@ failed. Verify the installed files and CLI first; do not interpret ordinary
   watchdog flags
 - parses only the aggregate `systemd-analyze security` exposure score and
   level; raw analyzer output and local unit paths are not returned
+
+`goddess report run` processes all eligible UTC report buckets in chronological
+order, backfills up to 24 hours, and retries buckets that were not finalized.
+For hourly operation, enable the hardened optional user timer:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now codex-master-goddess-report.timer
+```
 
 `timeout-policy`
 - reports that `agent_claim` retries forever by default for busy fremde Bienen,
@@ -938,9 +1085,10 @@ outside the active raw-log policy before touching state or paths. Use `tail`
 only when an explicit, capped, ANSI-stripped, redacted excerpt is needed. Failed
 starts remove their prepared raw-log file before returning an error.
 
-Model policy: managed Agentinnen run on `gpt-5.4-mini` by default. Read-only
-Exploriererin assignments keep that model. Arbeitsbiene write assignments are
-marked for `gpt-5.3-codex-spark` in the structured assignment and audit metadata.
+Model policy is resolved once through the central class/lifecycle/model/effort
+resolver documented above. Start and assignment responses expose the effective
+selection, fallback state, and reason codes; assignment audit metadata records
+the effective model without storing prompts or responses.
 
 Agentinnen may start their own native Subagentinnen only when the assignment
 uses `--allow-subagents`. Without that flag, the generated assignment explicitly

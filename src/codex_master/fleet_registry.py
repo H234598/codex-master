@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from uuid import UUID
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -98,6 +99,112 @@ class FleetSeries:
 
 
 @dataclass(frozen=True, slots=True)
+class LegacyFleetSeriesMember:
+    migration_identity: str
+    ordinal: int
+    account_id: str | None
+    enabled: bool
+    model_override: str | None = None
+    skill_profile_override: str | None = None
+    task_profile_override: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FleetMigrationSeries:
+    prefix: str
+    display_name: str
+    runner: RunnerKind
+    provider: Provider
+    model: str
+    enabled: bool
+    skill_profile: str
+    task_profile: str
+    members: tuple[LegacyFleetSeriesMember, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FleetMigrationSnapshot:
+    source_schema_version: int
+    generation: int
+    accounts: tuple[FleetAccount, ...]
+    series: tuple[FleetMigrationSeries, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FleetAccountV2:
+    account_id: str
+    label: str
+    provider: Provider
+    auth_kind: AuthKind
+    secret_state: SecretState
+    limit_state: LimitState
+    enabled: bool
+    reset_at_utc: str | None
+    last_probe_at_utc: str | None
+    limit_reason: str | None
+    billing_group: str | None = None
+    credential_binding_id: str | None = None
+
+    def __repr__(self) -> str:
+        return "FleetAccountV2(<redacted>)"
+
+    def __str__(self) -> str:
+        return repr(self)
+
+
+@dataclass(frozen=True, slots=True)
+class FleetSeriesMember:
+    member_id: str
+    ordinal: int
+    account_id: str | None
+    enabled: bool
+    model_override: str | None = None
+    skill_profile_override: str | None = None
+    task_profile_override: str | None = None
+
+    def __repr__(self) -> str:
+        return "FleetSeriesMember(<redacted>)"
+
+    def __str__(self) -> str:
+        return repr(self)
+
+
+@dataclass(frozen=True, slots=True)
+class FleetSeriesV2:
+    prefix: str
+    display_name: str
+    runner: RunnerKind
+    provider: Provider
+    model: str
+    enabled: bool
+    skill_profile: str
+    task_profile: str
+    members: tuple[FleetSeriesMember, ...]
+
+    @property
+    def count(self) -> int:
+        return len(self.members)
+
+
+@dataclass(frozen=True, slots=True)
+class FleetSnapshotV2:
+    schema_version: int
+    generation: int
+    accounts: tuple[FleetAccountV2, ...]
+    series: tuple[FleetSeriesV2, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "accounts", tuple(self.accounts))
+        object.__setattr__(self, "series", tuple(self.series))
+
+    def __repr__(self) -> str:
+        return "FleetSnapshotV2(<redacted>)"
+
+    def __str__(self) -> str:
+        return repr(self)
+
+
+@dataclass(frozen=True, slots=True)
 class FleetSnapshot:
     schema_version: int
     generation: int
@@ -154,10 +261,19 @@ _ROOT_FIELDS = frozenset({"schema_version", "generation", "accounts", "series"})
 _ACCOUNT_FIELDS = frozenset({
     "account_id", "label", "provider", "auth_kind", "secret_state", "limit_state",
     "enabled", "reset_at_utc", "last_probe_at_utc", "limit_reason", "billing_group",
+    "credential_binding_id",
 })
 _SERIES_FIELDS = frozenset({
     "prefix", "display_name", "count", "runner", "provider", "model", "account_id", "enabled",
     "skill_profile", "task_profile",
+})
+_V2_SERIES_FIELDS = frozenset({
+    "prefix", "display_name", "runner", "provider", "model", "enabled",
+    "skill_profile", "task_profile", "members",
+})
+_MEMBER_FIELDS = frozenset({
+    "member_id", "ordinal", "account_id", "enabled", "model_override",
+    "skill_profile_override", "task_profile_override",
 })
 
 
@@ -218,10 +334,10 @@ def _optional_reason(value: object, code: str) -> str | None:
     return text
 
 
-def _account(value: object) -> FleetAccount:
+def _account(value: object, *, v2: bool = False) -> FleetAccount | FleetAccountV2:
     code = "invalid_account"
     raw = _mapping(value, code)
-    if set(raw) - _ACCOUNT_FIELDS:
+    if set(raw) - _ACCOUNT_FIELDS or (not v2 and "credential_binding_id" in raw):
         _fail(code)
     required = {"account_id", "label", "provider", "auth_kind", "enabled"}
     if not required.issubset(raw):
@@ -243,12 +359,23 @@ def _account(value: object) -> FleetAccount:
         billing_group = _text(billing_group, minimum=1, maximum=64, code=code)
         if not _ACCOUNT_ID_RE.fullmatch(billing_group):
             _fail(code)
+    credential_binding_id = raw.get("credential_binding_id")
+    if credential_binding_id is not None:
+        credential_binding_id = _text(credential_binding_id, minimum=1, maximum=200, code=code)
+    if v2:
+        return FleetAccountV2(
+            account_id, _text(raw["label"], minimum=1, maximum=120, code=code), provider, auth_kind,
+            secret_state, _enum(LimitState, raw.get("limit_state", "unknown"), code),
+            _boolean(raw["enabled"], code), _time(raw.get("reset_at_utc"), code),
+            _time(raw.get("last_probe_at_utc"), code), _optional_reason(raw.get("limit_reason"), code),
+            billing_group, credential_binding_id,
+        )
     return FleetAccount(
         account_id, _text(raw["label"], minimum=1, maximum=120, code=code), provider, auth_kind,
         secret_state, _enum(LimitState, raw.get("limit_state", "unknown"), code),
         _boolean(raw["enabled"], code), _time(raw.get("reset_at_utc"), code),
         _time(raw.get("last_probe_at_utc"), code), _optional_reason(raw.get("limit_reason"), code),
-        billing_group,
+        billing_group
     )
 
 
@@ -286,7 +413,72 @@ def _series(value: object) -> FleetSeries:
     )
 
 
-def normalize_fleet_document(raw: object) -> FleetSnapshot:
+def _optional_override(value: object, code: str) -> str | None:
+    if value is None:
+        return None
+    return _text(value, minimum=1, maximum=200, code=code)
+
+
+def _member(value: object) -> FleetSeriesMember:
+    code = "invalid_member"
+    raw = _mapping(value, code)
+    if set(raw) - _MEMBER_FIELDS or not {"member_id", "ordinal", "account_id", "enabled"}.issubset(raw):
+        _fail(code)
+    member_id = raw["member_id"]
+    if not isinstance(member_id, str):
+        _fail(code)
+    try:
+        parsed = UUID(member_id)
+    except (ValueError, AttributeError):
+        _fail(code)
+    if parsed.version != 4 or str(parsed) != member_id:
+        _fail(code)
+    ordinal = raw["ordinal"]
+    if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 1:
+        _fail(code)
+    account_id = raw["account_id"]
+    if account_id is not None:
+        account_id = _text(account_id, minimum=1, maximum=64, code=code)
+        if not _ACCOUNT_ID_RE.fullmatch(account_id):
+            _fail(code)
+    return FleetSeriesMember(
+        member_id, ordinal, account_id, _boolean(raw["enabled"], code),
+        _optional_override(raw.get("model_override"), code),
+        _optional_override(raw.get("skill_profile_override"), code),
+        _optional_override(raw.get("task_profile_override"), code),
+    )
+
+
+def _series_v2(value: object) -> FleetSeriesV2:
+    code = "invalid_series"
+    raw = _mapping(value, code)
+    required = {"prefix", "display_name", "runner", "provider", "model", "enabled", "members"}
+    if set(raw) - _V2_SERIES_FIELDS or not required.issubset(raw):
+        _fail(code)
+    prefix = _text(raw["prefix"], minimum=1, maximum=16, code=code)
+    if not re.fullmatch(r"[a-z](?:[a-z0-9_-]*[-_][a-z0-9_-]*)?", prefix):
+        _fail(code)
+    provider = _enum(Provider, raw["provider"], code)
+    runner = _enum(RunnerKind, raw["runner"], code)
+    if runner is not _PROVIDER_RULES[provider][0]:
+        _fail(code)
+    if provider is Provider.GEMINI_API and prefix != "g":
+        _fail(code)
+    if prefix == "g" and provider is not Provider.GEMINI_API:
+        _fail(code)
+    members_raw = raw["members"]
+    if not isinstance(members_raw, list) or not members_raw or len(members_raw) > MAX_SERIES_COUNT:
+        _fail(code)
+    members = tuple(sorted((_member(item) for item in members_raw), key=lambda member: member.ordinal))
+    return FleetSeriesV2(
+        prefix, _text(raw["display_name"], minimum=1, maximum=120, code=code), runner, provider,
+        _text(raw["model"], minimum=1, maximum=200, code=code), _boolean(raw["enabled"], code),
+        _text(raw.get("skill_profile", "generic"), minimum=1, maximum=64, code=code),
+        _text(raw.get("task_profile", "standard"), minimum=1, maximum=64, code=code), members,
+    )
+
+
+def normalize_fleet_document(raw: object) -> FleetSnapshot | FleetSnapshotV2:
     try:
         encoded = json.dumps(raw, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         encoded_bytes = encoded.encode("utf-8")
@@ -295,7 +487,7 @@ def normalize_fleet_document(raw: object) -> FleetSnapshot:
     if len(encoded_bytes) > MAX_DOCUMENT_BYTES:
         _fail("invalid_document")
     document = _mapping(raw, "invalid_document")
-    if set(document) != _ROOT_FIELDS or document.get("schema_version") != 1:
+    if set(document) != _ROOT_FIELDS or document.get("schema_version") not in (1, 2):
         _fail("invalid_document")
     generation = document.get("generation")
     if (
@@ -310,8 +502,9 @@ def normalize_fleet_document(raw: object) -> FleetSnapshot:
         _fail("invalid_document")
     if len(accounts_raw) > MAX_ACCOUNTS or len(series_raw) > MAX_SERIES:
         _fail("invalid_document")
-    accounts = tuple(sorted((_account(item) for item in accounts_raw), key=lambda item: item.account_id))
-    series = tuple(sorted((_series(item) for item in series_raw), key=lambda item: item.prefix))
+    is_v2 = document.get("schema_version") == 2
+    accounts = tuple(sorted((_account(item, v2=is_v2) for item in accounts_raw), key=lambda item: item.account_id))
+    series = tuple(sorted(((_series_v2(item) if is_v2 else _series(item)) for item in series_raw), key=lambda item: item.prefix))
     if len({item.account_id for item in accounts}) != len(accounts):
         _fail("invalid_account")
     if len({item.prefix for item in series}) != len(series):
@@ -321,15 +514,69 @@ def normalize_fleet_document(raw: object) -> FleetSnapshot:
     if sum(item.count for item in series) > MAX_AGENTS:
         _fail("invalid_document")
     accounts_by_id = {item.account_id: item for item in accounts}
+    all_member_ids: set[str] = set()
     for item in series:
-        if item.account_id is not None:
+        if is_v2:
+            member_ids = [member.member_id for member in item.members]
+            if (len(set(member_ids)) != len(member_ids) or all_member_ids.intersection(member_ids)
+                    or [m.ordinal for m in item.members] != list(range(1, item.count + 1))):
+                _fail("invalid_member")
+            all_member_ids.update(member_ids)
+            for member in item.members:
+                account = accounts_by_id.get(member.account_id) if member.account_id is not None else None
+                requires_account = _PROVIDER_RULES[item.provider][2]
+                if (requires_account and (member.account_id is None or account is None)) or (
+                        account is not None and account.provider is not item.provider):
+                    _fail("invalid_member")
+                if member.enabled and (not item.enabled or (account is not None and not account.enabled)):
+                    _fail("invalid_member")
+        elif item.account_id is not None:
             account = accounts_by_id.get(item.account_id)
             if account is None or account.provider is not item.provider:
                 _fail("invalid_series")
+    if is_v2:
+        bindings = [account.credential_binding_id for account in accounts
+                    if account.provider is Provider.GEMINI_API and account.enabled and account.credential_binding_id]
+        if len(bindings) != len(set(bindings)):
+            _fail("duplicate_credential_binding")
+        return FleetSnapshotV2(2, generation, accounts, series)
     return FleetSnapshot(1, generation, accounts, series)
 
 
-def fleet_document(snapshot: FleetSnapshot) -> dict[str, object]:
+def fleet_document(snapshot: FleetSnapshot | FleetSnapshotV2 | FleetMigrationSnapshot) -> dict[str, object]:
+    if isinstance(snapshot, FleetMigrationSnapshot):
+        _fail("final_member_id_required")
+    if isinstance(snapshot, FleetSnapshotV2):
+        for series in snapshot.series:
+            for member in series.members:
+                if not _is_canonical_uuid4(member.member_id):
+                    _fail("final_member_id_required")
+        return {
+            "schema_version": 2, "generation": snapshot.generation,
+            "accounts": [
+                {"account_id": item.account_id, "label": item.label, "provider": item.provider.value,
+                 "auth_kind": item.auth_kind.value, "secret_state": item.secret_state.value,
+                 "limit_state": item.limit_state.value, "enabled": item.enabled,
+                 "reset_at_utc": item.reset_at_utc, "last_probe_at_utc": item.last_probe_at_utc,
+                 "limit_reason": item.limit_reason, "billing_group": item.billing_group,
+                 "credential_binding_id": item.credential_binding_id}
+                for item in snapshot.accounts
+            ],
+            "series": [
+                {"prefix": item.prefix, "display_name": item.display_name, "runner": item.runner.value,
+                 "provider": item.provider.value, "model": item.model, "enabled": item.enabled,
+                 "skill_profile": item.skill_profile, "task_profile": item.task_profile,
+                 "members": [
+                     {"member_id": member.member_id, "ordinal": member.ordinal,
+                      "account_id": member.account_id, "enabled": member.enabled,
+                      "model_override": member.model_override,
+                      "skill_profile_override": member.skill_profile_override,
+                      "task_profile_override": member.task_profile_override}
+                     for member in item.members
+                 ]}
+                for item in snapshot.series
+            ],
+        }
     return {
         "schema_version": snapshot.schema_version,
         "generation": snapshot.generation,
@@ -355,7 +602,17 @@ def fleet_document(snapshot: FleetSnapshot) -> dict[str, object]:
     }
 
 
-def build_inventory(snapshot: FleetSnapshot, pool_root: Path) -> InventorySnapshot:
+def _is_canonical_uuid4(member_id: object) -> bool:
+    if not isinstance(member_id, str):
+        return False
+    try:
+        parsed = UUID(member_id)
+    except (ValueError, AttributeError):
+        return False
+    return parsed.version == 4 and str(parsed) == member_id
+
+
+def build_inventory(snapshot: FleetSnapshot | FleetSnapshotV2, pool_root: Path) -> InventorySnapshot:
     accounts = {item.account_id: item for item in snapshot.accounts}
     agents: dict[str, AgentDescriptor] = {}
     by_series: dict[str, tuple[str, ...]] = {}
@@ -364,26 +621,56 @@ def build_inventory(snapshot: FleetSnapshot, pool_root: Path) -> InventorySnapsh
     root = Path(pool_root)
     for item in snapshot.series:
         ids: list[str] = []
-        account = accounts.get(item.account_id) if item.account_id is not None else None
-        enabled = item.enabled and (account is None or account.enabled)
-        for ordinal in range(1, item.count + 1):
+        if isinstance(item, FleetSeriesV2):
+            members = item.members
+            series_account = None
+        else:
+            members = tuple(range(1, item.count + 1))
+            series_account = item.account_id
+        account = accounts.get(series_account) if series_account is not None else None
+        for member_or_ordinal in members:
+            ordinal = member_or_ordinal.ordinal if isinstance(member_or_ordinal, FleetSeriesMember) else member_or_ordinal
+            member_account = member_or_ordinal.account_id if isinstance(member_or_ordinal, FleetSeriesMember) else series_account
+            member_enabled = member_or_ordinal.enabled if isinstance(member_or_ordinal, FleetSeriesMember) else True
+            account = accounts.get(member_account) if member_account is not None else None
             agent_id = f"{item.prefix}{ordinal}"
             ids.append(agent_id)
             agent_ids.append(agent_id)
             positions[agent_id] = len(agent_ids) - 1
             executable = "gemini" if item.runner is RunnerKind.GEMINI_CLI else "codex"
+            model = member_or_ordinal.model_override or item.model if isinstance(member_or_ordinal, FleetSeriesMember) else item.model
+            skill = member_or_ordinal.skill_profile_override or item.skill_profile if isinstance(member_or_ordinal, FleetSeriesMember) else item.skill_profile
+            task = member_or_ordinal.task_profile_override or item.task_profile if isinstance(member_or_ordinal, FleetSeriesMember) else item.task_profile
+            enabled = item.enabled and member_enabled and (account is None or account.enabled)
             agents[agent_id] = AgentDescriptor(
                 agent_id, item.prefix, ordinal, f"{item.display_name} {ordinal}", item.runner,
-                item.provider, item.model, item.account_id, root / agent_id,
+                item.provider, model, member_account, root / agent_id,
                 f"codex_agent_{agent_id}_mcp", enabled, root / agent_id / executable,
-                item.skill_profile, item.task_profile,
+                skill, task,
             )
         by_series[f"{item.prefix}-series"] = tuple(ids)
     return InventorySnapshot(tuple(agent_ids), MappingProxyType(agents), MappingProxyType(by_series),
                              MappingProxyType(positions), tuple(item.prefix for item in snapshot.series))
 
 
-def public_fleet_snapshot(snapshot: FleetSnapshot) -> dict[str, object]:
+def public_fleet_snapshot(snapshot: FleetSnapshot | FleetSnapshotV2) -> dict[str, object]:
+    if isinstance(snapshot, FleetSnapshotV2):
+        return {
+            "generation": snapshot.generation, "account_count": len(snapshot.accounts),
+            "series_count": len(snapshot.series), "agent_count": sum(item.count for item in snapshot.series),
+            "accounts": [
+                {"label": item.label, "provider": item.provider.value, "auth_kind": item.auth_kind.value,
+                 "secret_state": item.secret_state.value, "limit_state": item.limit_state.value,
+                 "enabled": item.enabled}
+                for item in snapshot.accounts
+            ],
+            "series": [
+                {"prefix": item.prefix, "display_name": item.display_name, "count": item.count,
+                 "runner": item.runner.value, "provider": item.provider.value, "model": item.model,
+                 "enabled": item.enabled}
+                for item in snapshot.series
+            ],
+        }
     return {
         "generation": snapshot.generation, "account_count": len(snapshot.accounts),
         "series_count": len(snapshot.series), "agent_count": sum(item.count for item in snapshot.series),
@@ -402,24 +689,48 @@ def public_fleet_snapshot(snapshot: FleetSnapshot) -> dict[str, object]:
     }
 
 
-def _generation(snapshot: FleetSnapshot, expected_generation: int) -> None:
+def expand_v1_for_migration(snapshot: FleetSnapshot) -> FleetMigrationSnapshot:
+    if not isinstance(snapshot, FleetSnapshot) or snapshot.schema_version != 1:
+        _fail("invalid_document")
+    series = tuple(
+        FleetMigrationSeries(
+            item.prefix, item.display_name, item.runner, item.provider, item.model, item.enabled,
+            item.skill_profile, item.task_profile,
+            tuple(LegacyFleetSeriesMember(f"v1:{item.prefix}:{ordinal}", ordinal, item.account_id, True)
+                  for ordinal in range(1, item.count + 1)),
+        )
+        for item in snapshot.series
+    )
+    return FleetMigrationSnapshot(1, snapshot.generation, snapshot.accounts, series)
+
+
+def _generation(snapshot: FleetSnapshot | FleetSnapshotV2, expected_generation: int) -> None:
     if (not isinstance(expected_generation, int) or isinstance(expected_generation, bool)
             or snapshot.generation != expected_generation):
         _fail("generation_conflict")
 
 
-def _next(snapshot: FleetSnapshot, *, accounts: Iterable[FleetAccount] | None = None,
-          series: Iterable[FleetSeries] | None = None) -> FleetSnapshot:
+def _next(snapshot: FleetSnapshot | FleetSnapshotV2, *,
+          accounts: Iterable[FleetAccount] | Iterable[FleetAccountV2] | None = None,
+          series: Iterable[FleetSeries] | Iterable[FleetSeriesV2] | None = None) -> FleetSnapshot | FleetSnapshotV2:
     if snapshot.generation >= MAX_GENERATION:
         _fail("invalid_document")
-    candidate = FleetSnapshot(snapshot.schema_version, snapshot.generation + 1,
-                              tuple(snapshot.accounts if accounts is None else accounts),
-                              tuple(snapshot.series if series is None else series))
+    candidate_type = FleetSnapshotV2 if isinstance(snapshot, FleetSnapshotV2) else FleetSnapshot
+    candidate = candidate_type(snapshot.schema_version, snapshot.generation + 1,
+                               tuple(snapshot.accounts if accounts is None else accounts),
+                               tuple(snapshot.series if series is None else series))
     return normalize_fleet_document(fleet_document(candidate))
 
 
-def plan_account_upsert(snapshot: FleetSnapshot, account: FleetAccount, *, expected_generation: int) -> FleetSnapshot:
+def plan_account_upsert(
+    snapshot: FleetSnapshot | FleetSnapshotV2,
+    account: FleetAccount | FleetAccountV2,
+    *,
+    expected_generation: int,
+) -> FleetSnapshot | FleetSnapshotV2:
     _generation(snapshot, expected_generation)
+    if isinstance(snapshot, FleetSnapshotV2) is not isinstance(account, FleetAccountV2):
+        _fail("invalid_account")
     accounts = [item for item in snapshot.accounts if item.account_id != account.account_id] + [account]
     return _next(snapshot, accounts=accounts)
 

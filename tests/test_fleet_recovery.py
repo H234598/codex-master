@@ -6,6 +6,7 @@ from pathlib import Path
 import hashlib
 import json
 import os
+from types import MappingProxyType
 
 import pytest
 from unittest.mock import patch
@@ -18,6 +19,11 @@ from codex_master.fleet_recovery import (
     FileIdentity,
     FleetRecoveryValidationError,
     FleetRecoveryJournal,
+    GMigrationRecoveryError,
+    GMigrationAlias,
+    GMigrationHomeIdentity,
+    GMigrationJournal,
+    GMigrationPhase,
     MutationKind,
     RecoveryAction,
     RecoveryPlan,
@@ -33,7 +39,11 @@ from codex_master.fleet_recovery import (
     plan_reconciliation,
     recovery_document,
     advance_recovery_phase,
+    g_migration_alias_view,
+    g_migration_journal_document,
+    normalize_g_migration_journal,
 )
+from codex_master.fleet_migration_materialization import MemberIdAllocation
 from codex_master.fleet_registry import AgentDescriptor, FleetSnapshot, Provider, RunnerKind
 from codex_master.server import AgentError, FleetPaths
 
@@ -256,6 +266,120 @@ def test_reconciliation_matrix_is_complete(kind, state, action) -> None:
     plan = plan_reconciliation(journal, {"d1": authoritative})
     assert plan.actions == (RecoveryAction(action, 0, "d1", state),)
     assert plan.has_third is (state is DescriptorState.THIRD)
+
+
+def test_intent_without_identity_only_verifies_unchanged_public_state() -> None:
+    entry = replace(
+        sample_entry(MutationKind.CREATED),
+        old_descriptor_fingerprint="4" * 64,
+        phase=EntryPhase.INTENT,
+        source_identity=None,
+        target_identity=None,
+    )
+    plan = plan_reconciliation(sample_journal(entry), {"d1": "4" * 64})
+
+    assert plan.actions == (
+        RecoveryAction(RecoveryActionKind.VERIFY_UNCHANGED, 0, "d1", DescriptorState.OLD),
+    )
+
+
+G_DIGEST_A = "sha256:" + "a" * 64
+G_DIGEST_B = "sha256:" + "b" * 64
+G_DIGEST_C = "sha256:" + "c" * 64
+G_DIGEST_D = "sha256:" + "d" * 64
+G_DIGEST_E = "sha256:" + "e" * 64
+G_MEMBER_ID = "11111111-1111-4111-8111-111111111111"
+G_MIGRATION_ID = "f" * 32
+
+
+def sample_g_journal() -> GMigrationJournal:
+    return GMigrationJournal(
+        schema_version=1,
+        migration_id=G_MIGRATION_ID,
+        manifest_version=1,
+        expected_registry_generation=218,
+        source_projection_digest=G_DIGEST_A,
+        source_snapshot_digest=G_DIGEST_B,
+        plan_digest=G_DIGEST_C,
+        candidate_digest=G_DIGEST_D,
+        binding_evidence_digest=G_DIGEST_E,
+        allocations=(MemberIdAllocation("v1:m:1", G_MEMBER_ID),),
+        source_ids=("g1", "m1"),
+        home_identities=(
+            GMigrationHomeIdentity(
+                "m1",
+                FileIdentity(1, 2, 0o40700, 1000, 1000, 1),
+                "rollback-m1",
+            ),
+        ),
+        aliases=(
+            GMigrationAlias("m1", "g2", G_MEMBER_ID, 219, G_MIGRATION_ID),
+        ),
+        phase=GMigrationPhase.PREPARED,
+        authoritative_generation=None,
+        blocking_error_codes=(),
+    )
+
+
+def test_g_journal_is_closed_frozen_sorted_and_redacted() -> None:
+    journal = sample_g_journal()
+    assert normalize_g_migration_journal(g_migration_journal_document(journal)) == journal
+    aliases = g_migration_alias_view(journal)
+    assert type(aliases) is MappingProxyType
+    with pytest.raises(TypeError):
+        aliases["other"] = "g3"  # type: ignore[index]
+    raw = g_migration_journal_document(journal)
+    raw["binding"] = "marker-binding"
+    with pytest.raises(GMigrationRecoveryError, match="migration_journal_invalid"):
+        normalize_g_migration_journal(raw)
+    assert "marker-binding" not in str(journal)
+    assert G_MEMBER_ID not in repr(journal)
+
+
+def test_g_journal_repr_and_str_redact_every_private_value() -> None:
+    journal = sample_g_journal()
+    public = f"{journal!r}\n{journal!s}"
+    for private_value in (
+        G_MIGRATION_ID,
+        G_DIGEST_A,
+        G_DIGEST_B,
+        G_DIGEST_C,
+        G_DIGEST_D,
+        G_DIGEST_E,
+        "g1",
+        "m1",
+        "g2",
+        "v1:m:1",
+        "rollback-m1",
+        G_MEMBER_ID,
+        "prepared",
+    ):
+        assert private_value not in public
+    assert normalize_g_migration_journal(g_migration_journal_document(journal)) == journal
+
+
+def test_g_alias_view_rejects_duplicate_cycle_and_wrong_generation() -> None:
+    journal = sample_g_journal()
+    invalid = (
+        replace(
+            journal,
+            aliases=journal.aliases + (journal.aliases[0],),
+        ),
+        replace(
+            journal,
+            aliases=(
+                journal.aliases[0],
+                GMigrationAlias("g2", "m1", G_MEMBER_ID, 219, G_MIGRATION_ID),
+            ),
+        ),
+        replace(
+            journal,
+            aliases=(replace(journal.aliases[0], expected_generation=218),),
+        ),
+    )
+    for candidate in invalid:
+        with pytest.raises(GMigrationRecoveryError, match="migration_journal_invalid"):
+            g_migration_alias_view(candidate)
 
 
 def test_descriptor_fingerprint_returns_hash_not_private_path() -> None:

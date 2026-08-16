@@ -1,11 +1,17 @@
 from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
+import traceback
 
 import pytest
 
-from codex_master.hive.config import load_agent_class_catalog, load_hive_config
-from codex_master.hive.runtime import HiveRuntimeError, build_hive_runtime
+from codex_master.hive.config import load_agent_class_catalog, load_agent_class_catalog_snapshot, load_hive_config
+from codex_master.hive.events import HiveEventStore
+from codex_master.hive.runtime import (
+    HiveRuntimeError,
+    _compose_hive_runtime_from_catalog_snapshot,
+    build_hive_runtime,
+)
 from codex_master.hive.repositories import RepositoryRegistry
 from codex_master.server import AgentError, build_server_admission_runtime
 
@@ -29,6 +35,77 @@ def config_bundle():
     classes = load_agent_class_catalog(ROOT / "tests/fixtures/hive/classes-valid.json")
     config = load_hive_config(ROOT / "tests/fixtures/hive/hive-enforced-valid.json", classes)
     return classes, config
+
+
+def snapshot_bundle(tmp_path: Path):
+    catalog = tmp_path / "classes.json"
+    catalog.write_bytes((ROOT / "tests/fixtures/hive/classes-valid.json").read_bytes())
+    snapshot = load_agent_class_catalog_snapshot(catalog)
+    config = load_hive_config(ROOT / "tests/fixtures/hive/hive-enforced-valid.json", snapshot.classes)
+    return snapshot, config
+
+
+def test_snapshot_composer_pins_digest_and_reuses_immutable_classes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    snapshot, config = snapshot_bundle(tmp_path)
+    monkeypatch.setattr(Path, "read_bytes", lambda _: (_ for _ in ()).throw(AssertionError("composer_read")))
+    runtime = _compose_hive_runtime_from_catalog_snapshot(
+        config,
+        snapshot,
+        repository_roots={"repo-one": repo(tmp_path)},
+        state_root=tmp_path / "state",
+        expected_catalog_digest=snapshot.digest,
+        materialize_principals=True,
+        now=lambda: NOW,
+    )
+    assert runtime.catalog_digest == snapshot.digest
+    assert runtime.classes is snapshot.classes
+    assert isinstance(runtime.events, HiveEventStore)
+
+
+def test_snapshot_composer_rejects_digest_mismatch_type_length_and_case(tmp_path: Path) -> None:
+    snapshot, config = snapshot_bundle(tmp_path)
+    drifted_path = tmp_path / "classes-drifted.json"
+    drifted_path.write_bytes((ROOT / "tests/fixtures/hive/classes-valid.json").read_bytes() + b"\n")
+    drifted = load_agent_class_catalog_snapshot(drifted_path)
+    with pytest.raises(HiveRuntimeError, match="catalog_digest_mismatch"):
+        _compose_hive_runtime_from_catalog_snapshot(
+            config,
+            drifted,
+            repository_roots={},
+            state_root=tmp_path / "state",
+            expected_catalog_digest=snapshot.digest,
+        )
+    for invalid in (
+        b"sha256:" + b"a" * 64,
+        object(),
+        "sha256:" + "a" * 63,
+        "SHA256:" + "a" * 64,
+        "sha256:" + "A" * 64,
+    ):
+        with pytest.raises(HiveRuntimeError, match="catalog_digest_mismatch"):
+            _compose_hive_runtime_from_catalog_snapshot(
+                config,
+                snapshot,
+                repository_roots={},
+                state_root=tmp_path / "state",
+                expected_catalog_digest=invalid,
+            )
+
+
+def test_snapshot_composer_rejects_invalid_snapshot_without_public_secret(tmp_path: Path) -> None:
+    marker = "catalog-payload-class-member-principal-repo-home-session-journal-path-secret"
+
+    with pytest.raises(HiveRuntimeError) as raised:
+        _compose_hive_runtime_from_catalog_snapshot(
+            marker,
+            marker,
+            repository_roots={},
+            state_root=tmp_path / "state",
+        )
+
+    assert str(raised.value) == "invalid_catalog_snapshot"
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert marker not in rendered
 
 
 def test_runtime_materializes_and_reloads_exact_authoritative_principal_set(tmp_path: Path) -> None:

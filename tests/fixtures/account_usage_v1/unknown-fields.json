@@ -1,0 +1,31 @@
+{
+  "accounts": [
+    {
+      "account_id": "zeta",
+      "display_label": "safe-label",
+      "freshness": {
+        "captured_at": "2026-08-15T11:59:00Z",
+        "stale": false,
+        "harmless_extra": 7
+      },
+      "status": "ok",
+      "nested_extra": {
+        "note": "safe"
+      }
+    },
+    {
+      "account_id": "alpha",
+      "display_label": "safe-label",
+      "freshness": {
+        "captured_at": "2026-08-15T11:58:00Z",
+        "stale": false
+      },
+      "status": "partial"
+    }
+  ],
+  "harmless_root_extra": {
+    "note": "safe"
+  },
+  "generated_at": "2026-08-15T12:00:00Z",
+  "schema_version": 1
+}

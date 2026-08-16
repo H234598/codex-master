@@ -1,9 +1,13 @@
+import io
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from codex_master.admission import (
     DEFAULT_RESERVATION_TTL_SECONDS,
+    MAX_ADMISSION_STATE_BYTES,
     MAX_RESERVATION_TTL_SECONDS,
     AdmissionError,
     AdmissionPriority,
@@ -150,6 +154,17 @@ def test_file_store_persists_revisions_and_rejects_corrupt_or_symlink_state(tmp_
     state_path.symlink_to(symlink_target)
     with pytest.raises(AdmissionError, match="invalid_admission_state_file"):
         first.get(reserved.admission_id)
+
+
+def test_file_store_bounds_state_read_after_metadata_check(tmp_path) -> None:
+    state_path = tmp_path / "admissions.json"
+    lock_path = tmp_path / "admission.lock"
+    state_path.write_text("{}", encoding="utf-8")
+    store = FileAdmissionStore(state_path, lock_path)
+
+    with patch.object(Path, "open", return_value=io.BytesIO(b"x" * (MAX_ADMISSION_STATE_BYTES + 1))):
+        with pytest.raises(AdmissionError, match="admission_state_too_large"):
+            store.get("missing")
 
 
 def test_file_store_persists_every_lifecycle_transition_across_instances(tmp_path) -> None:

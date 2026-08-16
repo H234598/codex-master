@@ -1,1 +1,45 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["schema_version","classes"],"properties":{"schema_version":{"const":1},"classes":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["class_id","role_kind","worker_kind","scope_kind","authority_profile","identity_lifetime","memory_lifetime","home_policy","session_policy","write_mode","capabilities","delegation_targets","max_delegation_depth"],"properties":{"class_id":{"type":"string"},"role_kind":{"type":"string"},"worker_kind":{"type":"string"},"scope_kind":{"type":"string"},"authority_profile":{"type":"string"},"identity_lifetime":{"type":"string"},"memory_lifetime":{"type":"string"},"home_policy":{"type":"string"},"session_policy":{"type":"string"},"write_mode":{"type":"string"},"capabilities":{"type":"array","items":{"type":"string"}},"delegation_targets":{"type":"array","items":{"type":"string"}},"max_delegation_depth":{"type":"integer","minimum":0}}}}}}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "classes"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "classes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "class_id", "role_kind", "worker_kind", "scope_kind", "authority_profile",
+          "identity_lifetime", "memory_lifetime", "home_policy", "session_policy", "write_mode",
+          "capabilities", "delegation_targets", "max_delegation_depth", "public_lifecycle",
+          "allowed_lifecycles", "allowed_model_families", "min_reasoning", "max_reasoning",
+          "introduces_to_user"
+        ],
+        "properties": {
+          "class_id": {"type": "string"},
+          "role_kind": {"type": "string"},
+          "worker_kind": {"type": "string"},
+          "scope_kind": {"type": "string"},
+          "authority_profile": {"type": "string"},
+          "identity_lifetime": {"type": "string"},
+          "memory_lifetime": {"type": "string"},
+          "home_policy": {"type": "string"},
+          "session_policy": {"type": "string"},
+          "write_mode": {"type": "string"},
+          "capabilities": {"type": "array", "items": {"type": "string"}},
+          "delegation_targets": {"type": "array", "items": {"type": "string"}},
+          "max_delegation_depth": {"type": "integer", "minimum": 0},
+          "public_lifecycle": {"enum": ["ephemeral", "binding", "persistent"]},
+          "allowed_lifecycles": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["ephemeral", "binding", "persistent"]}},
+          "allowed_model_families": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
+          "allowed_model_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+          "min_reasoning": {"enum": ["low", "medium", "high", "xhigh", "max"]},
+          "max_reasoning": {"enum": ["low", "medium", "high", "xhigh", "max"]},
+          "introduces_to_user": {"type": "boolean"}
+        }
+      }
+    }
+  }
+}

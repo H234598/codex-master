@@ -1,19 +1,26 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import hmac
 import json
 import re
+import secrets
+import stat
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace as dataclass_replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import ContextManager
+from types import MappingProxyType
+from typing import ContextManager, Mapping, TypeVar
 
 from .fleet_registry import (
     FleetAccount,
+    FleetAccountV2,
     FleetSeries,
     FleetSnapshot,
+    FleetSnapshotV2,
     InventorySnapshot,
     LimitState,
     Provider,
@@ -35,12 +42,51 @@ MAX_RATE_LIMIT_BYTES = 256 * 1024
 MAX_USAGE_BYTES = 1024 * 1024
 MAX_EVENT_BYTES = 512 * 1024
 MAX_SECRET_BYTES = 16 * 1024
+_CREDENTIAL_BINDING_SALT_BYTES = 32
+_CREDENTIAL_BINDING_DOMAIN = b"codex-master:gemini-credential-binding:v1\0"
 GEMINI_MIN_REQUEST_INTERVAL_SECONDS = 60
+GEMINI_TIER1_LOCAL_REQUEST_INTERVAL_SECONDS = 4
+GEMINI_TIER1_SPEND_RATE_LIMIT_USD_PER_10_MINUTES = 10.0
+GEMINI_TIER1_BILLING_CAP_USD_PER_MONTH = 250.0
+GEMINI_QUOTA_SNAPSHOT_SOURCE = "user_supplied_ai_studio_snapshots_2026-08-11"
+# The dashboard exports show different tiers for projects in the same local
+# account group. Keep this project-scoped and do not infer Tier 1 from the
+# account number alone.
+GEMINI_PROJECT_BILLING_TIERS: dict[str, str] = {
+    "the-hive-1": "tier1",
+    "the-hive-2": "tier1",
+    "the-hive-3": "tier0",
+    "the-hive-4": "tier0",
+    "the-hive-6": "tier0",
+    "the-hive-10": "tier0",
+}
+GEMINI_QUOTA_SNAPSHOTS: dict[str, dict[str, dict[str, int]]] = {
+    "tier0": {
+        "gemini-3.1-flash-lite": {"rpm": 15, "tpm": 250_000, "rpd": 500},
+        "gemini-3-flash": {"rpm": 5, "tpm": 250_000, "rpd": 20},
+        "gemini-3.5-flash": {"rpm": 5, "tpm": 250_000, "rpd": 20},
+    },
+    "tier1": {
+        "gemini-3.1-flash-lite": {"rpm": 4_000, "tpm": 4_000_000, "rpd": 150_000},
+        "gemini-3-flash": {"rpm": 1_000, "tpm": 2_000_000, "rpd": 10_000},
+        "gemini-3.5-flash": {"rpm": 1_000, "tpm": 2_000_000, "rpd": 10_000},
+    },
+}
+# Only projects with a Rate Limit export get concrete RPM/TPM/RPD values.
+# H3 and H10 have a visible free-tier label in Usage exports, but no concrete
+# Rate Limit table in the supplied files, so their limits remain unknown.
+GEMINI_PROJECT_QUOTA_SNAPSHOTS: dict[str, dict[str, dict[str, int]]] = {
+    "the-hive-1": GEMINI_QUOTA_SNAPSHOTS["tier1"],
+    "the-hive-2": GEMINI_QUOTA_SNAPSHOTS["tier1"],
+    "the-hive-4": GEMINI_QUOTA_SNAPSHOTS["tier0"],
+    "the-hive-6": GEMINI_QUOTA_SNAPSHOTS["tier0"],
+}
 GEMINI_REQUEST_LEASE_SECONDS = 120 * 60 + 60
 GEMINI_INITIAL_429_COOLDOWN_SECONDS = 15 * 60
 GEMINI_MAX_429_COOLDOWN_SECONDS = 24 * 60 * 60
 _ACCOUNT_ID_RE = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 _LIMIT_REASON_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+_T = TypeVar("_T")
 
 
 class FleetConflictError(ValueError):
@@ -143,7 +189,7 @@ class FleetService:
         self._io.ensure_dir(self._paths.root)
         self._io.ensure_dir(self._paths.secrets)
 
-    def _load_registry(self) -> FleetSnapshot:
+    def _load_registry(self) -> FleetSnapshot | FleetSnapshotV2:
         self._ensure_layout()
         text = self._io.read_text(
             self._paths.registry,
@@ -158,7 +204,7 @@ class FleetService:
             raise ValueError("invalid_fleet_registry") from exc
         return normalize_fleet_document(raw)
 
-    def _write_registry(self, snapshot: FleetSnapshot) -> FleetSnapshot:
+    def _write_registry(self, snapshot: FleetSnapshot | FleetSnapshotV2) -> FleetSnapshot | FleetSnapshotV2:
         document = fleet_document(snapshot)
         text = json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
         self._io.replace_text(self._paths.registry, text)
@@ -384,7 +430,79 @@ class FleetService:
             return f"the-hive-account-{((number - 1) // 10) + 1}"
         return account_id
 
-    def project_limit_identity(self, account_id: str) -> dict[str, object]:
+    @staticmethod
+    def _normalize_gemini_model(model: str | None) -> str | None:
+        if not isinstance(model, str):
+            return None
+        normalized = model.strip().lower().split("/")[-1]
+        if normalized in {"gemini-3.1-flash-lite", "gemini-3-flash", "gemini-3.5-flash"}:
+            return normalized
+        return None
+
+    @classmethod
+    def gemini_quota_limits(cls, tier: str, model: str | None) -> dict[str, int] | None:
+        """Return model-specific limits from the supplied AI Studio snapshots."""
+
+        if not isinstance(tier, str):
+            return None
+        model_key = cls._normalize_gemini_model(model)
+        limits = GEMINI_QUOTA_SNAPSHOTS.get(tier, {}).get(model_key or "")
+        return dict(limits) if limits is not None else None
+
+    @classmethod
+    def gemini_quota_profile(
+        cls,
+        account_id: str,
+        *,
+        model: str | None = None,
+    ) -> dict[str, object]:
+        """Return billing metadata and model limits without guessing."""
+
+        billing_group = cls.gemini_billing_group(account_id)
+        tier = GEMINI_PROJECT_BILLING_TIERS.get(account_id, "unknown")
+        tier1 = tier == "tier1"
+        model_key = cls._normalize_gemini_model(model)
+        project_limits = GEMINI_PROJECT_QUOTA_SNAPSHOTS.get(account_id, {})
+        model_limits = project_limits.get(model_key or "")
+        limits_by_model = {
+            name: dict(values)
+            for name, values in project_limits.items()
+        }
+        return {
+            "billing_group": billing_group,
+            "billing_tier": tier,
+            "billing_tier_source": (
+                GEMINI_QUOTA_SNAPSHOT_SOURCE if tier != "unknown" else "not_confirmed"
+            ),
+            "provider_quota_source": (
+                GEMINI_QUOTA_SNAPSHOT_SOURCE if model_limits is not None else "ai_studio_dashboard"
+            ),
+            "quota_snapshot_source": GEMINI_QUOTA_SNAPSHOT_SOURCE if limits_by_model else None,
+            "quota_model": model_key,
+            "limits_by_model": limits_by_model,
+            "rpm_limit": model_limits.get("rpm") if model_limits is not None else None,
+            "tpm_limit": model_limits.get("tpm") if model_limits is not None else None,
+            "rpd_limit": model_limits.get("rpd") if model_limits is not None else None,
+            "spend_rate_limit_usd_per_10_minutes": (
+                GEMINI_TIER1_SPEND_RATE_LIMIT_USD_PER_10_MINUTES if tier1 else None
+            ),
+            "billing_cap_usd_per_month": (
+                GEMINI_TIER1_BILLING_CAP_USD_PER_MONTH if tier1 else None
+            ),
+            "local_request_interval_seconds": (
+                GEMINI_TIER1_LOCAL_REQUEST_INTERVAL_SECONDS if tier1
+                else GEMINI_MIN_REQUEST_INTERVAL_SECONDS
+            ),
+            "quota_scope": "project",
+            "billing_scope": "billing_account",
+        }
+
+    def project_limit_identity(
+        self,
+        account_id: str,
+        *,
+        model: str | None = None,
+    ) -> dict[str, object]:
         """Expose the quota scope explicitly.
 
         Gemini RPM/TPM/RPD counters are per project.  Billing tier and spend
@@ -399,11 +517,13 @@ class FleetService:
             if account is not None and account.billing_group
             else self.gemini_billing_group(account_id)
         )
+        quota = self.gemini_quota_profile(account_id, model=model)
         return {
             "project_id": account_id,
-            "billing_group": billing_group,
             "rpm_tpm_rpd_scope": "project",
             "spend_and_tier_scope": "billing_account",
+            **quota,
+            "billing_group": billing_group,
         }
 
     def record_gemini_usage(
@@ -481,21 +601,90 @@ class FleetService:
             except (TypeError, ValueError, AttributeError):
                 probe_state = "invalid"
         identity = self.project_limit_identity(account_id)
+        observed = {
+            "rpm": len(recent_minute),
+            # Google defines TPM as input tokens per minute.  Output tokens
+            # remain visible separately and are not folded into TPM.
+            "tpm": sum(int(event.get("input_tokens", 0)) for event in recent_minute),
+            "rpd": len(recent_day),
+        }
+        model_evaluations: dict[str, dict[str, object]] = {}
+        model_names = sorted({
+            str(event.get("model"))
+            for event in recent_day
+            if isinstance(event.get("model"), str) and event.get("model")
+        })
+        for model in model_names:
+            model_minute = [event for event in recent_minute if event.get("model") == model]
+            model_day = [event for event in recent_day if event.get("model") == model]
+            model_observed = {
+                "rpm": len(model_minute),
+                "tpm": sum(int(event.get("input_tokens", 0)) for event in model_minute),
+                "rpd": len(model_day),
+            }
+            model_profile = self.gemini_quota_profile(account_id, model=model)
+            model_limits = {
+                "rpm": model_profile.get("rpm_limit"),
+                "tpm": model_profile.get("tpm_limit"),
+                "rpd": model_profile.get("rpd_limit"),
+            }
+            utilization: dict[str, float | None] = {}
+            for metric, value in model_observed.items():
+                limit = model_limits[metric]
+                if isinstance(limit, (int, float)) and not isinstance(limit, bool) and limit > 0:
+                    utilization[metric] = round(float(value) / float(limit) * 100, 2)
+                else:
+                    utilization[metric] = None
+            model_evaluations[model] = {
+                "model": model,
+                "observed": model_observed,
+                "limits": model_limits,
+                "utilization_percent": utilization,
+                "state": (
+                    "limits_unknown_dashboard_required"
+                    if any(value is None for value in model_limits.values())
+                    else "within_limits"
+                ),
+                "limits_source": model_profile["provider_quota_source"],
+            }
+        if len(model_evaluations) == 1:
+            quota_evaluation: dict[str, object] = next(iter(model_evaluations.values()))
+            quota_evaluation["scope"] = identity["quota_scope"]
+        elif model_evaluations:
+            quota_evaluation = {
+                "state": "mixed_models",
+                "scope": identity["quota_scope"],
+                "limits_source": identity["provider_quota_source"],
+                "models": model_evaluations,
+            }
+        else:
+            quota_evaluation = {
+                "state": "model_required",
+                "scope": identity["quota_scope"],
+                "limits_source": identity["provider_quota_source"],
+                "limits_by_model": identity["limits_by_model"],
+            }
         return {
             "account_id": account_id,
             **identity,
             "probe_state": probe_state,
             "probe_age_seconds": probe_age,
             "rpm_observed": len(recent_minute),
-            # Google defines TPM as input tokens per minute.  Output tokens
-            # remain visible separately and are not folded into TPM.
-            "tpm_observed": sum(int(event.get("input_tokens", 0)) for event in recent_minute),
+            "tpm_observed": observed["tpm"],
             "output_tokens_per_minute_observed": sum(int(event.get("output_tokens", 0)) for event in recent_minute),
             "rpd_observed": len(recent_day),
             "input_tokens_24h": sum(int(event.get("input_tokens", 0)) for event in recent_day),
             "output_tokens_24h": sum(int(event.get("output_tokens", 0)) for event in recent_day),
             "last_request_at_utc": events[-1].get("at_utc") if events else None,
             "event_count_24h": len(recent_day),
+            "quota_evaluation": quota_evaluation,
+            "spend_evaluation": {
+                "state": "billing_export_required",
+                "scope": identity["billing_scope"],
+                "limit_usd_per_10_minutes": identity["spend_rate_limit_usd_per_10_minutes"],
+                "billing_cap_usd_per_month": identity["billing_cap_usd_per_month"],
+                "observed_spend_usd": None,
+            },
             "raw_output": "not_returned",
         }
 
@@ -514,7 +703,7 @@ class FleetService:
             "stale_or_unknown_accounts": stale,
             "state": "ready" if not stale else "probe_deferred_until_invocation",
             "probe_policy": "probe_once_when_invocation_admission_sees_stale_or_unknown",
-            "limits_source": "observed_request_and_token_counters; provider_quota_caps_not_available_locally",
+            "limits_source": "observed_project_counters; RPM/TPM/RPD caps must be supplied by the AI Studio dashboard",
             "recent_events": self.gemini_event_status(),
             "raw_output": "not_returned",
         }
@@ -630,6 +819,7 @@ class FleetService:
         with self._io.lock():
             now = self._rate_now()
             entries = self._load_rate_limits()
+            quota = self.gemini_quota_profile(account_id)
             entry = entries.get(account_id)
             if entry is not None:
                 in_flight = entry.get("in_flight")
@@ -648,7 +838,7 @@ class FleetService:
             previous_429 = entry.get("consecutive_429", 0) if entry else 0
             entries[account_id] = {
                 "next_allowed_at_utc": self._rate_text(
-                    now + timedelta(seconds=GEMINI_MIN_REQUEST_INTERVAL_SECONDS)
+                    now + timedelta(seconds=int(quota["local_request_interval_seconds"]))
                 ),
                 "cooldown_until_utc": previous_cooldown if isinstance(previous_cooldown, str) else None,
                 "in_flight": {"reservation_id": reservation_id, "expires_at_utc": self._rate_text(expires)},
@@ -663,7 +853,12 @@ class FleetService:
         now = self._rate_now()
         entry = self._load_rate_limits().get(account_id)
         if entry is None:
-            return {"allowed": True, "reason": "ready", "retry_after_seconds": 0}
+            return {
+                "allowed": True,
+                "reason": "ready",
+                "retry_after_seconds": 0,
+                **self.gemini_quota_profile(account_id),
+            }
         in_flight = entry.get("in_flight")
         in_flight_until = in_flight.get("expires_at_utc") if isinstance(in_flight, dict) else None
         retry_after = self._retry_after(
@@ -676,6 +871,7 @@ class FleetService:
             "allowed": retry_after == 0,
             "reason": "ready" if retry_after == 0 else "gemini_local_rate_limit",
             "retry_after_seconds": retry_after,
+            **self.gemini_quota_profile(account_id),
         }
 
     def release_gemini_request(
@@ -737,9 +933,9 @@ class FleetService:
 
     def _overlay_limits(
         self,
-        snapshot: FleetSnapshot,
+        snapshot: FleetSnapshot | FleetSnapshotV2,
         entries: dict[str, dict[str, str | None]],
-    ) -> FleetSnapshot:
+    ) -> FleetSnapshot | FleetSnapshotV2:
         now = self._io.utc_now()
         active_entries: dict[str, dict[str, str | None]] = {}
         expired_ids: set[str] = set()
@@ -773,7 +969,7 @@ class FleetService:
         )
 
     @staticmethod
-    def _check_generation(snapshot: FleetSnapshot, expected_generation: int) -> None:
+    def _check_generation(snapshot: FleetSnapshot | FleetSnapshotV2, expected_generation: int) -> None:
         if (
             isinstance(expected_generation, bool)
             or not isinstance(expected_generation, int)
@@ -781,7 +977,10 @@ class FleetService:
         ):
             raise FleetConflictError("generation_conflict")
 
-    def load(self) -> FleetSnapshot:
+    def registry_snapshot(self) -> FleetSnapshot | FleetSnapshotV2:
+        return self._load_registry()
+
+    def load(self) -> FleetSnapshot | FleetSnapshotV2:
         return self._overlay_limits(self._load_registry(), self._load_limits())
 
     def public_snapshot(self) -> dict[str, object]:
@@ -789,10 +988,10 @@ class FleetService:
 
     def commit_snapshot(
         self,
-        snapshot: FleetSnapshot,
+        snapshot: FleetSnapshot | FleetSnapshotV2,
         *,
         expected_generation: int,
-    ) -> FleetSnapshot:
+    ) -> FleetSnapshot | FleetSnapshotV2:
         candidate = normalize_fleet_document(fleet_document(snapshot))
         with self._io.lock():
             current = self._load_registry()
@@ -800,6 +999,155 @@ class FleetService:
             if candidate.generation != current.generation + 1:
                 raise FleetConflictError("generation_conflict")
             return self._write_registry(candidate)
+
+    @staticmethod
+    def _credential_binding_salt_metadata(path: Path) -> tuple[int, ...] | None:
+        try:
+            current = path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise FleetSecretError("credential_binding_unavailable") from None
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or getattr(current, "st_nlink", 1) != 1
+            or stat.S_IMODE(current.st_mode) != 0o600
+        ):
+            raise FleetSecretError("credential_binding_unavailable")
+        return (
+            current.st_dev,
+            current.st_ino,
+            current.st_mode,
+            current.st_nlink,
+            current.st_size,
+            current.st_mtime_ns,
+            current.st_ctime_ns,
+        )
+
+    def _credential_binding_salt_locked(self, *, allow_create: bool = True) -> bytes:
+        path = self._paths.secrets / ".credential-binding-salt"
+        try:
+            current = self._load_registry()
+            has_existing_binding = isinstance(current, FleetSnapshotV2) and any(
+                isinstance(account, FleetAccountV2)
+                and account.provider is Provider.GEMINI_API
+                and account.credential_binding_id is not None
+                for account in current.accounts
+            )
+            before = self._credential_binding_salt_metadata(path)
+            salt = self._io.read_bytes(
+                path,
+                _CREDENTIAL_BINDING_SALT_BYTES,
+                "credential_binding_salt_read_failed",
+            )
+            after = self._credential_binding_salt_metadata(path)
+            if salt is None:
+                if before is not None or after is not None or has_existing_binding or not allow_create:
+                    raise FleetSecretError("credential_binding_unavailable")
+                salt = secrets.token_bytes(_CREDENTIAL_BINDING_SALT_BYTES)
+                self._io.replace_bytes(path, salt, 0o600)
+                created = self._credential_binding_salt_metadata(path)
+                salt = self._io.read_bytes(
+                    path,
+                    _CREDENTIAL_BINDING_SALT_BYTES,
+                    "credential_binding_salt_read_failed",
+                )
+                verified = self._credential_binding_salt_metadata(path)
+                if created is None or verified != created:
+                    raise FleetSecretError("credential_binding_unavailable")
+            elif (
+                before is None
+                or after is None
+                or before != after
+            ):
+                raise FleetSecretError("credential_binding_unavailable")
+        except FleetSecretError:
+            raise
+        except Exception:
+            raise FleetSecretError("credential_binding_unavailable") from None
+        if salt is None or len(salt) != _CREDENTIAL_BINDING_SALT_BYTES:
+            raise FleetSecretError("credential_binding_unavailable")
+        return salt
+
+    def _credential_binding_id_locked(
+        self,
+        secret_bytes: bytes,
+        *,
+        allow_create_salt: bool = True,
+    ) -> str:
+        if not isinstance(secret_bytes, bytes):
+            raise FleetSecretError("credential_binding_unavailable")
+        digest = hmac.new(
+            self._credential_binding_salt_locked(allow_create=allow_create_salt),
+            _CREDENTIAL_BINDING_DOMAIN + secret_bytes,
+            hashlib.sha256,
+        ).hexdigest()
+        return f"hmac-sha256:{digest}"
+
+    def _with_g_migration_binding_evidence(
+        self,
+        account_ids: tuple[str, ...],
+        *,
+        expected_generation: int,
+        callback: Callable[[FleetSnapshot, Mapping[str, str]], _T],
+    ) -> _T:
+        if (
+            type(account_ids) is not tuple
+            or not account_ids
+            or any(
+                type(account_id) is not str
+                or _ACCOUNT_ID_RE.fullmatch(account_id) is None
+                for account_id in account_ids
+            )
+            or len(set(account_ids)) != len(account_ids)
+            or not callable(callback)
+        ):
+            raise FleetSecretError("credential_binding_unknown")
+
+        with self._io.lock():
+            try:
+                current = self._load_registry()
+                if type(current) is not FleetSnapshot:
+                    raise FleetSecretError("credential_binding_unknown")
+                self._check_generation(current, expected_generation)
+                accounts = {account.account_id: account for account in current.accounts}
+                selected = []
+                for account_id in account_ids:
+                    account = accounts.get(account_id)
+                    if (
+                        type(account) is not FleetAccount
+                        or account.provider is not Provider.GEMINI_API
+                        or account.secret_state is not SecretState.CONFIGURED
+                    ):
+                        raise FleetSecretError("credential_binding_unknown")
+                    selected.append(account)
+
+                self._credential_binding_salt_locked(allow_create=False)
+                bindings: dict[str, str] = {}
+                for account in selected:
+                    secret_path = self._paths.secrets / f"{account.account_id}.secret"
+                    before = self._credential_binding_salt_metadata(secret_path)
+                    secret_bytes = self._io.read_bytes(
+                        secret_path,
+                        MAX_SECRET_BYTES,
+                        "credential_binding_unknown",
+                    )
+                    after = self._credential_binding_salt_metadata(secret_path)
+                    if (
+                        before is None
+                        or after is None
+                        or before != after
+                        or type(secret_bytes) is not bytes
+                        or not 1 <= len(secret_bytes) <= MAX_SECRET_BYTES
+                    ):
+                        raise FleetSecretError("credential_binding_unknown")
+                    bindings[account.account_id] = self._credential_binding_id_locked(
+                        secret_bytes,
+                        allow_create_salt=False,
+                    )
+            except Exception:
+                raise FleetSecretError("credential_binding_unknown") from None
+            return callback(current, MappingProxyType(bindings))
 
     def set_secret(
         self,
@@ -841,6 +1189,13 @@ class FleetService:
             except Exception:
                 raise FleetSecretError("secret_write_failed") from None
             try:
+                binding_id = (
+                    self._credential_binding_id_locked(encoded)
+                    if isinstance(current, FleetSnapshotV2)
+                    and isinstance(account, FleetAccountV2)
+                    and account.provider is Provider.GEMINI_API
+                    else None
+                )
                 updated_account = dataclass_replace(
                     account,
                     secret_state=SecretState.CONFIGURED,
@@ -848,6 +1203,7 @@ class FleetService:
                     reset_at_utc=None,
                     last_probe_at_utc=None,
                     limit_reason=None,
+                    **({"credential_binding_id": binding_id} if binding_id is not None else {}),
                 )
                 updated = plan_account_upsert(
                     current,
@@ -1231,7 +1587,7 @@ class FleetService:
 
     def _account_decision(
         self,
-        snapshot: FleetSnapshot,
+        snapshot: FleetSnapshot | FleetSnapshotV2,
         *,
         account_id: str | None,
         provider: object,
@@ -1246,6 +1602,13 @@ class FleetService:
             reason = "account_provider_mismatch"
         elif account is None or not account.enabled or account.limit_state is LimitState.DISABLED:
             reason = "account_disabled"
+        elif (
+            provider is Provider.GEMINI_API
+            and isinstance(account, FleetAccountV2)
+            and account.secret_state is SecretState.CONFIGURED
+            and account.credential_binding_id is None
+        ):
+            reason = "credential_binding_unknown"
         elif account.secret_state is SecretState.MISSING:
             reason = "secret_missing"
         elif account.secret_state is SecretState.INVALID:

@@ -10,12 +10,14 @@ provider, start a process, or mutate a repository.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
+import hmac
 from pathlib import Path
 
 from codex_master.hive.authority import AuthorityContext, AuthorityEngine
-from codex_master.hive.config import AgentClassProfile, HiveConfig
+from codex_master.hive.config import AgentClassCatalogSnapshot, AgentClassProfile, HiveConfig, _is_catalog_digest
+from codex_master.hive.events import HiveEventStore
 from codex_master.hive.principals import Principal, PrincipalRegistry
 from codex_master.hive.repositories import RepositoryBinding, RepositoryRegistry
 from codex_master.hive.state import HiveStateStore
@@ -35,6 +37,8 @@ class HiveRuntime:
     principals: PrincipalRegistry
     repositories: RepositoryRegistry
     authority: AuthorityEngine
+    events: HiveEventStore
+    catalog_digest: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.config, HiveConfig) or not isinstance(self.classes, Mapping):
@@ -42,6 +46,10 @@ class HiveRuntime:
         if not isinstance(self.state, HiveStateStore) or not isinstance(self.principals, PrincipalRegistry):
             raise HiveRuntimeError("invalid_hive_runtime")
         if not isinstance(self.repositories, RepositoryRegistry) or not isinstance(self.authority, AuthorityEngine):
+            raise HiveRuntimeError("invalid_hive_runtime")
+        if not isinstance(self.events, HiveEventStore):
+            raise HiveRuntimeError("invalid_hive_runtime")
+        if self.catalog_digest is not None and not _is_catalog_digest(self.catalog_digest):
             raise HiveRuntimeError("invalid_hive_runtime")
 
     def public_status(self) -> dict[str, object]:
@@ -106,7 +114,34 @@ def build_hive_runtime(
         state=state,
         now=now,
     )
-    return HiveRuntime(config, dict(classes), state, principals, repositories, authority)
+    return HiveRuntime(config, dict(classes), state, principals, repositories, authority, HiveEventStore(state))
+
+
+def _compose_hive_runtime_from_catalog_snapshot(
+    config: HiveConfig,
+    snapshot: AgentClassCatalogSnapshot,
+    *,
+    repository_roots: Mapping[str, Path],
+    state_root: Path,
+    expected_catalog_digest: str | None = None,
+    materialize_principals: bool = False,
+    now: Callable[[], datetime] | None = None,
+) -> HiveRuntime:
+    if not isinstance(snapshot, AgentClassCatalogSnapshot):
+        raise HiveRuntimeError("invalid_catalog_snapshot")
+    if expected_catalog_digest is not None and not _is_catalog_digest(expected_catalog_digest):
+        raise HiveRuntimeError("catalog_digest_mismatch")
+    if expected_catalog_digest is not None and not hmac.compare_digest(snapshot.digest, expected_catalog_digest):
+        raise HiveRuntimeError("catalog_digest_mismatch")
+    runtime = build_hive_runtime(
+        config,
+        snapshot.classes,
+        repository_roots=repository_roots,
+        state_root=state_root,
+        materialize_principals=materialize_principals,
+        now=now,
+    )
+    return replace(runtime, classes=snapshot.classes, catalog_digest=snapshot.digest)
 
 
 def _build_repositories(config: HiveConfig, roots: Mapping[str, Path]) -> RepositoryRegistry:

@@ -289,6 +289,7 @@ def plan_global_request(
     repository_queens: Mapping[str, str] | None = None,
     user_gates: tuple[str, ...] = (),
     mode: str = "shadow",
+    now: Callable[[], datetime] | None = None,
 ) -> GlobalRequestPlan:
     """Plan independent repository dispatches without creating runtime state."""
 
@@ -332,6 +333,17 @@ def plan_global_request(
     planning_reason = "unknown_repository" if unknown else ("user_gate_required" if missing_gate else "ready")
     digest = _saga_request_digest(actor_principal_id, objective, repositories, priority, tuple(success_criteria), tuple(constraints))
     request_id = f"request-{digest[:24]}"
+    if now is not None and not callable(now):
+        raise HiveDispatchError("invalid_planning_clock")
+    clock = now if now is not None else lambda: datetime.now(timezone.utc)
+    try:
+        sample = clock()
+    except Exception:
+        raise HiveDispatchError("invalid_request_timestamp") from None
+    try:
+        created_at_utc = _time(sample, "request_timestamp")
+    except Exception:
+        raise HiveDispatchError("invalid_request_timestamp") from None
     request = GlobalRequest(
         request_id,
         objective,
@@ -343,7 +355,7 @@ def plan_global_request(
         resolved,
         priority,
         tuple(sorted(normalized_gates)),
-        datetime.now(timezone.utc),
+        created_at_utc,
         state="planned" if planning_reason == "ready" else "blocked",
     )
     dispatches = tuple(

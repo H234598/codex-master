@@ -52,7 +52,7 @@ def plan(name: str = "one"):
         resource=ResourceBinding(f"agent-{name}", f"account-{name}", "standard", "gpt-primary", 1),
         lease_context=LeaseBinding("available"),
         priority=AdmissionPriority("DP1", "selection"),
-        now=NOW,
+        now=datetime.now(timezone.utc),
     )
 
 

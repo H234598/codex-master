@@ -143,6 +143,8 @@ class HiveMessage:
         _id(self.message_id, "message")
         _id(self.correlation_id, "correlation")
         _optional_id(self.causation_id, "causation")
+        if self.causation_id == self.message_id:
+            raise HiveMessageError("message_self_causation")
         if self.message_type not in MESSAGE_TYPES:
             raise HiveMessageError("unknown_message_type")
         if not isinstance(self.sender, PrincipalReference) or not isinstance(self.recipient, PrincipalReference):

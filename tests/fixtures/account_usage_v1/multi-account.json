@@ -1,0 +1,30 @@
+{
+  "accounts": [
+    {
+      "account_id": "zeta",
+      "freshness": {
+        "captured_at": "2026-08-15T11:59:00Z",
+        "stale": false
+      },
+      "status": "ok"
+    },
+    {
+      "account_id": "alpha",
+      "freshness": {
+        "captured_at": "2026-08-15T11:58:00Z",
+        "stale": false
+      },
+      "status": "login_required"
+    },
+    {
+      "account_id": "foreign",
+      "freshness": {
+        "captured_at": "2026-08-15T11:57:00Z",
+        "stale": false
+      },
+      "status": "error"
+    }
+  ],
+  "generated_at": "2026-08-15T12:00:00Z",
+  "schema_version": 1
+}

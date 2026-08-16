@@ -10,6 +10,7 @@ import re
 from threading import RLock
 from pathlib import PurePosixPath
 
+from codex_master.hive.capabilities import ROOT_EXECUTIVE_CLASSES
 from codex_master.hive.state import HiveStateError, HiveStateStore
 from codex_master.hive.types import HiveValidationError, validate_identifier, validate_utc_datetime
 
@@ -21,8 +22,10 @@ _MAX_LIST_LIMIT = 256
 _ROLE_RULES = {
     "gottbiene": (None, "global", False),
     "godbee": (None, "global", False),
-    "koenigin": ({"gottbiene", "godbee"}, "repository", True),
-    "queen": ({"gottbiene", "godbee"}, "repository", True),
+    "goettin": (None, "global", False),
+    "goddess": (None, "global", False),
+    "koenigin": (ROOT_EXECUTIVE_CLASSES, "repository", True),
+    "queen": (ROOT_EXECUTIVE_CLASSES, "repository", True),
     "teamleiterin": ({"koenigin", "queen"}, "repository", True),
     "teamlead": ({"koenigin", "queen"}, "repository", True),
     "spezialistin": ({"teamleiterin", "teamlead"}, "repository", True),
@@ -249,6 +252,32 @@ class PrincipalRegistry:
     def public_bindings(self) -> tuple[dict[str, object], ...]:
         with self._transaction():
             return tuple(binding.public() for binding in self._bindings.values())
+
+    def has_active_execution_binding(self, principal_id: str, *, now: datetime) -> bool:
+        try:
+            normalized_now = validate_utc_datetime(now)
+        except Exception:
+            raise PrincipalError("invalid_binding_timestamp") from None
+        with self._transaction():
+            try:
+                validate_identifier(principal_id, field="principal")
+                principal = self._principals[principal_id]
+            except (HiveValidationError, KeyError):
+                raise PrincipalError("principal_not_found") from None
+            if principal.state != "active":
+                return False
+            for binding in self._bindings.values():
+                if binding.state != "active" or binding.principal_id != principal_id:
+                    continue
+                try:
+                    expires_at = validate_utc_datetime(
+                        datetime.fromisoformat(binding.expires_at_utc.replace("Z", "+00:00"))
+                    )
+                except Exception:
+                    continue
+                if expires_at > normalized_now:
+                    return True
+            return False
 
     def _validate_parent(self, principal: Principal) -> None:
         rule = _ROLE_RULES.get(principal.class_id)

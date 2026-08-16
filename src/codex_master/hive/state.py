@@ -139,6 +139,50 @@ class HiveStateStore:
                 raise HiveStateError("state_oversize")
             self._atomic_replace(path, candidate)
 
+    def read_bounded_jsonl(
+        self,
+        relative: PurePosixPath,
+        *,
+        max_records: int,
+        max_bytes: int,
+    ) -> tuple[dict[str, object], ...]:
+        self._validate_jsonl_limits(max_records, max_bytes)
+        with self._lock():
+            return self.read_bounded_jsonl_locked(
+                relative,
+                max_records=max_records,
+                max_bytes=max_bytes,
+            )
+
+    def read_bounded_jsonl_locked(
+        self,
+        relative: PurePosixPath,
+        *,
+        max_records: int,
+        max_bytes: int,
+    ) -> tuple[dict[str, object], ...]:
+        """Read bounded JSONL while the caller already owns :meth:`locked`."""
+
+        self._validate_jsonl_limits(max_records, max_bytes)
+        path = self._path(relative)
+        if not self._exists(path):
+            return ()
+        raw = self._read_bytes(path, max_bytes)
+        records: list[dict[str, object]] = []
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+                raise HiveStateError("invalid_state_jsonl") from exc
+            if not isinstance(payload, Mapping):
+                raise HiveStateError("invalid_state_jsonl")
+            records.append(dict(payload))
+            if len(records) > max_records:
+                raise HiveStateError("state_jsonl_full")
+        return tuple(records)
+
     def _path(self, relative: PurePosixPath) -> Path:
         relative = _validate_relative(relative)
         path = self._root.joinpath(*relative.parts)
@@ -156,6 +200,12 @@ class HiveStateStore:
     def _validate_limit(max_bytes: int) -> None:
         if isinstance(max_bytes, bool) or not 1 <= max_bytes <= MAX_HIVE_STATE_BYTES:
             raise HiveStateError("invalid_state_limit")
+
+    @classmethod
+    def _validate_jsonl_limits(cls, max_records: int, max_bytes: int) -> None:
+        if isinstance(max_records, bool) or not 1 <= max_records <= MAX_HIVE_JSONL_RECORDS:
+            raise HiveStateError("invalid_state_limit")
+        cls._validate_limit(max_bytes)
 
     @staticmethod
     def _encode(payload: Mapping[str, object]) -> bytes:

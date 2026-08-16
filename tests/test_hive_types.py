@@ -14,7 +14,7 @@ from codex_master.hive.types import (
 
 def test_enum_values_are_explicit_and_stable() -> None:
     assert [item.value for item in DispatchPriority] == ["DP0", "DP1", "DP2", "DP3"]
-    assert [item.value for item in TaskComplexity] == ["simple", "complex", "unknown"]
+    assert [item.value for item in TaskComplexity] == ["simple", "medium", "complex", "unknown"]
 
 
 @pytest.mark.parametrize("value", ["", "A1", "bad space", "../escape", "a/child", "a" * 129])

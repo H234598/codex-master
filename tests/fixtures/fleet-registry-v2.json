@@ -1,0 +1,66 @@
+{
+  "schema_version": 2,
+  "generation": 5,
+  "accounts": [
+    {
+      "account_id": "gemini-project-1",
+      "label": "Gemini Project 1",
+      "provider": "gemini_api",
+      "auth_kind": "api_key",
+      "secret_state": "configured",
+      "limit_state": "ready",
+      "enabled": true,
+      "reset_at_utc": null,
+      "last_probe_at_utc": null,
+      "limit_reason": null,
+      "billing_group": null,
+      "credential_binding_id": "binding-one"
+    },
+    {
+      "account_id": "gemini-project-2",
+      "label": "Gemini Project 2",
+      "provider": "gemini_api",
+      "auth_kind": "api_key",
+      "secret_state": "configured",
+      "limit_state": "ready",
+      "enabled": true,
+      "reset_at_utc": null,
+      "last_probe_at_utc": null,
+      "limit_reason": null,
+      "billing_group": null,
+      "credential_binding_id": "binding-two"
+    }
+  ],
+  "series": [
+    {
+      "prefix": "g",
+      "display_name": "G-Serie",
+      "runner": "gemini_cli",
+      "provider": "gemini_api",
+      "model": "gemini-3-flash-preview",
+      "enabled": true,
+      "skill_profile": "generic",
+      "task_profile": "standard",
+      "members": [
+        {
+          "member_id": "11111111-1111-4111-8111-111111111111",
+          "ordinal": 1,
+          "account_id": "gemini-project-1",
+          "enabled": true,
+          "model_override": null,
+          "skill_profile_override": null,
+          "task_profile_override": null
+        },
+        {
+          "member_id": "22222222-2222-4222-8222-222222222222",
+          "ordinal": 2,
+          "account_id": "gemini-project-2",
+          "enabled": true,
+          "model_override": null,
+          "skill_profile_override": null,
+          "task_profile_override": null
+        }
+      ]
+    }
+  ]
+}

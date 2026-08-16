@@ -97,6 +97,26 @@ def test_authorize_is_deny_by_default_and_checks_scope_and_repo(tmp_path: Path) 
     ).reason_code == "scope_denied"
 
 
+def test_global_goettin_request_remains_scope_denied(tmp_path: Path) -> None:
+    state = HiveStateStore(tmp_path / "hive")
+    principals = PrincipalRegistry(state)
+    principals.create(Principal("goettin-main", "goettin", None, "goddess", "global", None, "active", DIGEST, 1))
+    authority = AuthorityEngine(
+        AuthorityContext(principals, RepositoryRegistry(()), {"goddess": frozenset({"goddess.report.auto"})}),
+        state=state,
+        now=lambda: NOW,
+    )
+    decision = authority.authorize(
+        AuthorityRequest("goettin-main", "goddess.report.auto", None, None, None, ("report",), ("report",))
+    )
+    assert (decision.allowed, decision.reason_code, decision.grant_id) == (False, "scope_denied", None)
+
+
+def test_authority_context_three_argument_construction_remains_compatible(tmp_path: Path) -> None:
+    current = engine(tmp_path).context
+    assert AuthorityContext(current.principals, current.repositories, current.capabilities) == current
+
+
 def test_grant_requires_parent_capability_subset_and_scope(tmp_path: Path) -> None:
     authority = engine(tmp_path)
     created = grant(authority)

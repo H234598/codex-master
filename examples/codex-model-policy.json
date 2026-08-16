@@ -1,7 +1,9 @@
 {
   "schema_version": 1,
   "models": [
-    {"model_id":"gpt-primary","aliases":["primary"],"role":"primary","provider":"openai","capabilities":["tools","complex_task_eligible"],"budget_key":"standard"},
-    {"model_id":"gpt-spark","aliases":["spark"],"role":"secondary_simple","provider":"openai","capabilities":["tools","simple_task_eligible"],"budget_key":"spark"}
+    {"model_id":"gpt-5.3-codex-spark","aliases":["spark"],"role":"secondary_simple","provider":"openai","capabilities":["tools","simple_task_eligible","write"],"budget_key":"spark","family":"spark","rank":10,"reasoning_levels":["low","medium","high"],"default_reasoning":"low","cost_tier":"low","spawn_behavior":"manual"},
+    {"model_id":"gpt-5.6-luna","aliases":["luna"],"role":"primary","provider":"openai","capabilities":["tools","complex_task_eligible","read","write"],"budget_key":"luna","family":"luna","rank":20,"reasoning_levels":["low","medium","high","xhigh"],"default_reasoning":"medium","cost_tier":"standard","spawn_behavior":"manual"},
+    {"model_id":"gpt-5.6-terra","aliases":["terra"],"role":"primary","provider":"openai","capabilities":["tools","complex_task_eligible","read","write"],"budget_key":"terra","family":"terra","rank":30,"reasoning_levels":["high","xhigh"],"default_reasoning":"high","cost_tier":"standard","spawn_behavior":"manual"},
+    {"model_id":"gpt-5.6-sol","aliases":["sol"],"role":"primary","provider":"openai","capabilities":["tools","complex_task_eligible","read","write","leadership"],"budget_key":"sol","family":"sol","rank":40,"reasoning_levels":["xhigh","max"],"default_reasoning":"xhigh","cost_tier":"standard","spawn_behavior":"manual"}
   ]
 }

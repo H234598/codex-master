@@ -8,6 +8,7 @@ from datetime import datetime
 import hashlib
 import json
 import re
+from types import MappingProxyType
 
 from codex_master.hive.principals import Principal
 from codex_master.hive.types import HiveValidationError, validate_identifier, validate_utc_datetime
@@ -82,11 +83,16 @@ class DecisionRecord:
             raise DecisionError("invalid_decision_status")
         if not isinstance(self.options, tuple) or len(self.options) > 64:
             raise DecisionError("invalid_decision_options")
+        frozen_options: list[Mapping[str, object]] = []
         for option in self.options:
             if not isinstance(option, Mapping) or set(option) - {"option_id", "summary"}:
                 raise DecisionError("invalid_decision_option")
-            _id(option.get("option_id"), "option")
-            _text(option.get("summary"), "option_summary", 1024)
+            option_id = _id(option.get("option_id"), "option")
+            summary = _text(option.get("summary"), "option_summary", 1024)
+            frozen_options.append(
+                MappingProxyType({"option_id": option_id, "summary": summary})
+            )
+        object.__setattr__(self, "options", tuple(frozen_options))
         if self.selected_option_id is not None:
             _id(self.selected_option_id, "selected_option")
             if self.selected_option_id not in {option["option_id"] for option in self.options}:
@@ -171,28 +177,66 @@ def record_decision(record: DecisionRecord, *, actor: Principal) -> DecisionReco
 
 def supersede_decision(decision_id: str, replacement: DecisionRecord, *, actor: Principal) -> DecisionRecord:
     _id(decision_id, "decision")
-    if not isinstance(replacement, DecisionRecord) or replacement.supersedes != decision_id:
+    if (
+        not isinstance(replacement, DecisionRecord)
+        or replacement.supersedes != decision_id
+        or replacement.decision_id == decision_id
+        or replacement.previous_record_hash is None
+    ):
         raise DecisionError("supersede_reference_mismatch")
     return record_decision(replacement, actor=actor)
+
+
+def _verify_decision_chain_values(
+    records: object,
+) -> tuple[tuple[DecisionRecord, ...], str | None]:
+    try:
+        values = tuple(records)
+    except TypeError:
+        return (), "duplicate_or_invalid_record"
+
+    seen: set[str] = set()
+    earlier_ids: set[str] = set()
+    previous: str | None = None
+    for record in values:
+        if not isinstance(record, DecisionRecord) or record.decision_id in seen:
+            return values, "duplicate_or_invalid_record"
+        expected = "sha256:" + hashlib.sha256(
+            (record.previous_record_hash or "genesis").encode("utf-8")
+            + b"\0"
+            + _canonical_for_hash(record)
+        ).hexdigest()
+        if record.previous_record_hash != previous or record.record_hash != expected:
+            return values, "decision_chain_mismatch"
+        if (
+            record.supersedes is not None
+            and (
+                record.supersedes == record.decision_id
+                or record.supersedes not in earlier_ids
+            )
+        ):
+            return values, "decision_chain_mismatch"
+        seen.add(record.decision_id)
+        earlier_ids.add(record.decision_id)
+        previous = record.record_hash
+    return values, None
 
 
 def verify_decision_chain(records: Iterable[DecisionRecord] = ()) -> Mapping[str, object]:
     """Verify record hashes, links, and supersede references without exposing content."""
 
-    values = tuple(records)
-    seen: set[str] = set()
-    previous: str | None = None
-    for record in values:
-        if not isinstance(record, DecisionRecord) or record.decision_id in seen:
-            return {"valid": False, "record_count": len(values), "reason_code": "duplicate_or_invalid_record"}
-        seen.add(record.decision_id)
-        expected = "sha256:" + hashlib.sha256(
-            (record.previous_record_hash or "genesis").encode("utf-8") + b"\0" + _canonical_for_hash(record)
-        ).hexdigest()
-        if record.previous_record_hash != previous or record.record_hash != expected:
-            return {"valid": False, "record_count": len(values), "reason_code": "decision_chain_mismatch"}
-        previous = record.record_hash
-    return {"valid": True, "record_count": len(values), "reason_code": "decision_chain_verified"}
+    values, reason_code = _verify_decision_chain_values(records)
+    if reason_code is not None:
+        return {
+            "valid": False,
+            "record_count": len(values),
+            "reason_code": reason_code,
+        }
+    return {
+        "valid": True,
+        "record_count": len(values),
+        "reason_code": "decision_chain_verified",
+    }
 
 
 __all__ = ["DecisionError", "DecisionRecord", "record_decision", "supersede_decision", "verify_decision_chain"]

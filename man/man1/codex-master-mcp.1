@@ -1,0 +1,301 @@
+.TH "CODEX-MASTER-MCP" "1" "2026-08-14" "codex-master 0.10.5" "User Commands"
+.SH NAME
+codex-master-mcp \- control the local Codex Agentinnen fleet and expose its MCP server
+.SH SYNOPSIS
+.B codex-master-mcp
+.RI [ options ]
+.I command
+.RI [ command-options ]
+.PP
+.B python3 -m codex_master.server
+.RI [ options ]
+.I command
+.RI [ command-options ]
+.SH DESCRIPTION
+.B codex-master-mcp
+is the command-line and MCP entry point for the local codex-master fleet.
+It manages sleeping Codex Agentinnen, assignments, leases, account-aware model
+selection, registry-backed provider series, and read-only Hive control-plane
+diagnostics.
+.PP
+The repository wrapper at
+.B bin/codex-master-mcp
+sets
+.B PYTHONPATH
+to the repository's
+.B src
+directory and executes the Python module.  A package installation exposes the
+same entry point through the
+.B codex-master-mcp
+console script.
+.PP
+Run
+.B codex-master-mcp COMMAND --help
+for command-specific arguments.  Commands that mutate sessions, homes,
+registries, plugin state, or external providers require explicit authority and
+their own safety gates.
+.SH SECURITY MODEL
+Public command and MCP responses are data-sparse.  Raw prompts, raw model
+responses, secrets, authentication files, absolute private paths, and
+unbounded logs must not be returned.
+.PP
+Agent selection and lifecycle operations fail closed when authority, account
+availability, resource counts, scope, lease ownership, or required runtime
+state cannot be established.  A spawn offer is advisory, short-lived, and does
+not reserve capacity.  Starting an Agentin performs admission again under the
+runtime lock.
+.PP
+Only the authorized Queen may restart or reload Masterjet, install it, or
+synchronize its plugin cache.  Other callers may inspect status and provide a
+verified recommendation, but must not perform those lifecycle actions.
+.SH AGENT SELECTION
+Start and assignment commands share the central class, lifecycle, model, and
+reasoning resolver.  Explicit requests are accepted only inside class,
+lifecycle, capability, availability, cost, and reasoning bounds.  A rejected
+request returns the effective fallback and reason codes.
+.PP
+The first selection round should use the MCP tool
+.B agent_selection_options
+for the concrete target Agentin.  Its response contains only currently allowed
+classes, lifecycles, models, reasoning levels, and valid tuples.  The response
+generation may be supplied as
+.B known_generation
+on the next read-only query.
+.PP
+The accepted lifecycle spellings include
+.BR ephemeral ,
+.BR invocation ,
+.BR binding ,
+and
+.BR persistent .
+.B invocation
+is an input alias for
+.BR ephemeral .
+.SH COMMANDS
+.SS Agent lifecycle
+.TP
+.B start
+Start selected Agentinnen through the shared resolver and admission path.
+.TP
+.B spawn-offers
+Return short-lived resource-aware spawn offers without reserving capacity.
+.TP
+.B status
+Return structured, data-sparse status for selected Agentinnen.
+.TP
+.B wait
+Wait briefly for activity, stop, or a classified limit.
+.TP
+.B watchdog
+Run a bounded watchdog check for selected Agentinnen.
+.TP
+.B usage-watchdog
+Inspect usage state without returning raw provider output.
+.TP
+.B send
+Send bounded input to a leased Agentin.
+.TP
+.B interrupt
+Interrupt a leased Agentin.
+.TP
+.B stop
+Stop selected Agentinnen through guarded lifecycle handling.
+.TP
+.B lease-status
+Inspect lease ownership and expiry.
+.TP
+.B claim
+Claim an Agentin lease when policy permits it.
+.TP
+.B release
+Release an owned Agentin lease.
+.TP
+.B tail
+Return a bounded, redacted activity excerpt.
+.SS Assignment and capability inspection
+.TP
+.B assign
+Create an assignment with explicit role, scope, lifecycle, model, and reasoning
+inputs.
+.TP
+.BR assign-readonly , " " assign-live-data , " " assign-write
+Create role-specific assignments with stricter predefined write policies.
+.TP
+.BR assignments , " " last-assignment , " " assignment-report
+List assignment metadata or return a bounded report.
+.TP
+.BR report-request , " " worktree-create , " " worktree-status
+Request a report or manage an assignment-scoped worktree under the applicable
+authority checks.
+.TP
+.BR skills , " " skill-match , " " capabilities , " " scope-check
+Inspect bounded skill, capability, and scope metadata.
+.TP
+.B routing-decision
+Inspect the account-aware route selected for an Agentin and role.
+.SS Selection policy
+.TP
+.BR selector-policy , " " selection-policy-status
+Inspect selector and account-aware selection policy state.
+.TP
+.BR selector-preview , " " selection-preview
+Preview selection without reserving or starting an Agentin.
+.TP
+.B selection-status
+Show read-only Selection service status.
+.SS Fleet and recovery
+.TP
+.B fleet
+Manage the versioned fleet registry, accounts, provider models, series, Gemini
+plans, Ollama diagnostics, and related read-only or guarded mutation commands.
+Use
+.B codex-master-mcp fleet --help
+for its subcommands.
+.TP
+.BR fleet-recovery-status , " " fleet-recovery-retry
+Inspect recovery journal state or retry an eligible recovery action.
+.TP
+.B pool
+Validate, install, inspect, copy authentication into, or destroy a managed
+Agentinnen pool.  Destructive subcommands require their explicit confirmation
+and target checks.
+.SS Integration and diagnostics
+.TP
+.BR integration-status , " " commit-ready-check
+Inspect integration evidence without committing or publishing changes.
+.TP
+.BR app-bridge-status , " " plugin-status , " " namespace-status
+Inspect application bridge, plugin, and namespace state.
+.TP
+.BR release-status , " " watchdog-status , " " timeout-policy
+Inspect release, supervisor, and timeout policy state.
+.TP
+.BR control-center , " " control-center-launch
+Inspect or launch the local control-center surface when available.
+.TP
+.BR applet-status , " " applet-action
+Inspect or operate the Cinnamon adapter under its bounded interface.
+.TP
+.B doctor
+Run structured diagnostics without exposing raw output.
+.TP
+.B tools
+Print the MCP tool catalog as JSON.
+.SS Hive control plane
+.TP
+.B hive
+Validate or inspect the Hive control plane.  DP and SP scheduling remain
+separate and mutation stays gated.
+.TP
+.B reset-anchor-run
+Plan a passive reset anchor without executing it unless the command's explicit
+gate permits execution.
+.SS Installation
+.TP
+.B install
+Install the MCP/plugin integration.  This mutates local registration and plugin
+state and is reserved for the authorized Queen under current policy.
+.TP
+.B uninstall
+Remove the installed MCP integration through the guarded uninstall path.
+.SH MANPAGE BUILD AND INSTALL
+Build deterministic compressed output without installing it:
+.PP
+.nf
+\&./scripts/codex-master-manpage build --output-dir /tmp/codex-master-man
+.fi
+.PP
+Install to the default user prefix
+.BR ~/.local :
+.PP
+.nf
+\&./scripts/codex-master-manpage install
+.fi
+.PP
+Verify the installed regular file, mode, and content:
+.PP
+.nf
+\&./scripts/codex-master-manpage verify
+.fi
+.PP
+For isolated packaging or tests, pass an absolute
+.B --prefix
+to
+.B install
+and
+.BR verify .
+The resulting file is
+.BR PREFIX/share/man/man1/codex-master-mcp.1.gz .
+The installer refuses symlinks in its managed target path.
+.SH OPTIONS
+.TP
+.BR -h , " " --help
+Show top-level help.  Place
+.B --help
+after a command to inspect that command's arguments.
+.SH EXIT STATUS
+.TP
+.B 0
+Command completed successfully.
+.TP
+.B non-zero
+Validation, authority, availability, safety, runtime, or command execution
+failed.  Mutating commands must leave denied operations unapplied.
+.SH ENVIRONMENT
+.TP
+.B HOME
+Provides the default user-local prefix and runtime home locations.
+.TP
+.B PYTHONPATH
+The repository wrapper prepends the repository's
+.B src
+directory before running the Python module.
+.SH FILES
+.TP
+.B man/man1/codex-master-mcp.1
+Canonical repository source for this manual page.
+.TP
+.B ~/.local/share/man/man1/codex-master-mcp.1.gz
+Default user-local installed manual page.
+.TP
+.B codex-agent-classes.json
+Versioned Agentinnen class policy catalog.
+.TP
+.B codex-model-policy.json
+Versioned model and reasoning policy catalog.
+.TP
+.B codex-fleet-registry.json
+Versioned fleet series and account-reference registry.  Secrets are stored
+separately.
+.SH EXAMPLES
+Inspect top-level commands:
+.PP
+.nf
+codex-master-mcp --help
+.fi
+.PP
+Request one advisory spawn offer:
+.PP
+.nf
+codex-master-mcp spawn-offers --required-slots 1
+.fi
+.PP
+Inspect plugin state without changing it:
+.PP
+.nf
+codex-master-mcp plugin-status
+.fi
+.PP
+Render the repository manpage locally:
+.PP
+.nf
+groff -man -Tutf8 man/man1/codex-master-mcp.1
+.fi
+.SH SEE ALSO
+.BR codex (1),
+.BR tmux (1),
+.BR groff (1),
+.BR gzip (1)
+.SH BUGS
+Report defects through the codex-master project issue tracker.  Do not include
+authentication files, provider secrets, raw prompts, or raw model output.

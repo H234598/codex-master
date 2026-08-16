@@ -21,12 +21,18 @@ const DEFAULT_TRACKED_AGENTS_TEXT = "a1,b1";
 const DEFAULT_REFRESH_ON_OPEN = true;
 const DEFAULT_BACKGROUND_REFRESH = false;
 const DEFAULT_REFRESH_INTERVAL_SECONDS = 60;
+const DEFAULT_OVERVIEW_INTERVAL_SECONDS = 30;
+const DEFAULT_OVERVIEW_SESSION_NO_ACTIVE_ONLY = false;
+const DEFAULT_OVERVIEW_COMPACT = true;
+const DEFAULT_OVERVIEW_DETAIL = true;
 const DEFAULT_TERMINAL_COMMAND = "ghostty";
 const DEFAULT_PANEL_ICON = "hive-01-core";
 const DEFAULT_SETTINGS_ICON = "hive-02-queen-crown";
 const DEFAULT_PANEL_DISPLAY = "icon-text";
 const MIN_REFRESH_INTERVAL_SECONDS = 15;
 const MAX_REFRESH_INTERVAL_SECONDS = 3600;
+const MIN_OVERVIEW_INTERVAL_SECONDS = 15;
+const MAX_OVERVIEW_INTERVAL_SECONDS = 3600;
 const MAX_TRACKED_AGENTS = 6;
 const MAX_NATIVE_BEES = 6;
 const MAX_TRACKED_AGENTS_SETTING_CHARS = 128;
@@ -45,6 +51,11 @@ const APPLET_ICON_NAMES = new Set([
 ]);
 const APPLET_PANEL_DISPLAY_MODES = new Set(["icon", "text", "icon-text"]);
 const APPLET_STATUS_COMMAND = "applet-status";
+const APPLET_OVERVIEW_COMMAND = "overview";
+const APPLET_OVERVIEW_FORMAT = "json";
+const APPLET_OVERVIEW_MAX_ARRAY_LENGTH = 64;
+const APPLET_OVERVIEW_MAX_STRING_LENGTH = 128;
+const APPLET_OVERVIEW_MAX_WARNING_LENGTH = 64;
 const APPLET_ACTION_COMMAND = "applet-action";
 const APPLET_STATUS_SCHEMA_VERSION = 2;
 const MAX_ENVIRONMENT_KEYS = 256;
@@ -124,6 +135,8 @@ const APPLET_ALLOWED_ENV_VARS = new Set([
     "XAUTHORITY",
     "DBUS_SESSION_BUS_ADDRESS",
     "XDG_RUNTIME_DIR",
+    "CODEX_USAGE_INTEGRATION_STATE_HOME",
+    "XDG_STATE_HOME",
     "XDG_CURRENT_DESKTOP",
     "XDG_SESSION_DESKTOP",
     "XDG_SESSION_TYPE",
@@ -156,6 +169,14 @@ FlottenmanagementApplet.prototype = {
         this._statusActiveState = null;
         this._statusViewState = "initializing";
         this._backgroundRefreshSource = 0;
+        this._overviewSource = 0;
+        this._overviewInFlight = false;
+        this._overviewGeneration = 0;
+        this._overviewActiveGeneration = 0;
+        this._overviewLastGood = null;
+        this._overviewActiveState = null;
+        this._overviewViewState = "initializing";
+        this._overviewRefreshStarted = false;
         this._launcherInFlight = false;
         this._actionInFlight = false;
         this._armedAction = null;
@@ -167,6 +188,10 @@ FlottenmanagementApplet.prototype = {
         this.refreshOnOpenSetting = DEFAULT_REFRESH_ON_OPEN;
         this.backgroundRefreshSetting = DEFAULT_BACKGROUND_REFRESH;
         this.refreshIntervalSecondsSetting = DEFAULT_REFRESH_INTERVAL_SECONDS;
+        this.overviewIntervalSecondsSetting = DEFAULT_OVERVIEW_INTERVAL_SECONDS;
+        this.overviewSessionNoActiveOnlySetting = DEFAULT_OVERVIEW_SESSION_NO_ACTIVE_ONLY;
+        this.overviewCompactSetting = DEFAULT_OVERVIEW_COMPACT;
+        this.overviewDetailSetting = DEFAULT_OVERVIEW_DETAIL;
         this.terminalCommandSetting = DEFAULT_TERMINAL_COMMAND;
         this.panelIconSetting = DEFAULT_PANEL_ICON;
         this.settingsIconSetting = DEFAULT_SETTINGS_ICON;
@@ -174,6 +199,10 @@ FlottenmanagementApplet.prototype = {
         this.refreshOnOpen = DEFAULT_REFRESH_ON_OPEN;
         this.backgroundRefresh = DEFAULT_BACKGROUND_REFRESH;
         this.refreshIntervalSeconds = DEFAULT_REFRESH_INTERVAL_SECONDS;
+        this.overviewIntervalSeconds = DEFAULT_OVERVIEW_INTERVAL_SECONDS;
+        this.overviewSessionNoActiveOnly = DEFAULT_OVERVIEW_SESSION_NO_ACTIVE_ONLY;
+        this.overviewCompact = DEFAULT_OVERVIEW_COMPACT;
+        this.overviewDetail = DEFAULT_OVERVIEW_DETAIL;
         this.terminalCommand = DEFAULT_TERMINAL_COMMAND;
         this.panelIcon = DEFAULT_PANEL_ICON;
         this.settingsIcon = DEFAULT_SETTINGS_ICON;
@@ -184,6 +213,8 @@ FlottenmanagementApplet.prototype = {
         this.settings = null;
         this._settingsCleanupPending = null;
         this._statusSummaryItem = null;
+        this._overviewSummaryItem = null;
+        this._overviewDetailItem = null;
         this._settingsMenuItem = null;
         this._statusRowItems = [];
         this._nativeSubmenuItem = null;
@@ -279,6 +310,11 @@ FlottenmanagementApplet.prototype = {
             this._nativeSubmenuItem.menu.addMenuItem(rowItem);
         }
 
+        this._overviewSummaryItem = new PopupMenu.PopupMenuItem("Übersicht: nicht verfügbar", { reactive: false });
+        this._overviewDetailItem = new PopupMenu.PopupMenuItem("Übersicht Details: —", { reactive: false });
+        this.menu.addMenuItem(this._overviewSummaryItem);
+        this.menu.addMenuItem(this._overviewDetailItem);
+
         this._initializeSettings(instance_id);
         this._applySettings();
     },
@@ -301,6 +337,10 @@ FlottenmanagementApplet.prototype = {
             bind("refresh-on-open", "refreshOnOpenSetting");
             bind("background-refresh", "backgroundRefreshSetting");
             bind("refresh-interval-seconds", "refreshIntervalSecondsSetting");
+            bind("overview-interval-seconds", "overviewIntervalSecondsSetting");
+            bind("overview-session-no-active-only", "overviewSessionNoActiveOnlySetting");
+            bind("overview-compact", "overviewCompactSetting");
+            bind("overview-detail", "overviewDetailSetting");
             bind("terminal-command", "terminalCommandSetting");
             bind("panel-icon", "panelIconSetting");
             bind("settings-icon", "settingsIconSetting");
@@ -425,6 +465,36 @@ FlottenmanagementApplet.prototype = {
                 Math.max(MIN_REFRESH_INTERVAL_SECONDS, Math.trunc(this.refreshIntervalSecondsSetting))
             );
         }
+        if (
+            typeof this.overviewIntervalSecondsSetting !== "number"
+            || !Number.isFinite(this.overviewIntervalSecondsSetting)
+            || !Number.isInteger(this.overviewIntervalSecondsSetting)
+            || this.overviewIntervalSecondsSetting < MIN_OVERVIEW_INTERVAL_SECONDS
+            || this.overviewIntervalSecondsSetting > MAX_OVERVIEW_INTERVAL_SECONDS
+        ) {
+            this.overviewIntervalSeconds = DEFAULT_OVERVIEW_INTERVAL_SECONDS;
+            valid = false;
+        } else {
+            this.overviewIntervalSeconds = this.overviewIntervalSecondsSetting;
+        }
+        if (typeof this.overviewSessionNoActiveOnlySetting !== "boolean") {
+            this.overviewSessionNoActiveOnly = DEFAULT_OVERVIEW_SESSION_NO_ACTIVE_ONLY;
+            valid = false;
+        } else {
+            this.overviewSessionNoActiveOnly = this.overviewSessionNoActiveOnlySetting;
+        }
+        if (typeof this.overviewCompactSetting !== "boolean") {
+            this.overviewCompact = DEFAULT_OVERVIEW_COMPACT;
+            valid = false;
+        } else {
+            this.overviewCompact = this.overviewCompactSetting;
+        }
+        if (typeof this.overviewDetailSetting !== "boolean") {
+            this.overviewDetail = DEFAULT_OVERVIEW_DETAIL;
+            valid = false;
+        } else {
+            this.overviewDetail = this.overviewDetailSetting;
+        }
         const terminalCommand = this._normalizeTerminalCommand(this.terminalCommandSetting);
         if (!terminalCommand) {
             this.terminalCommand = DEFAULT_TERMINAL_COMMAND;
@@ -466,7 +536,9 @@ FlottenmanagementApplet.prototype = {
             if (this._statusInFlight) this._statusPendingRefresh = true;
         }
         this._restartBackgroundRefresh();
+        this._restartOverviewRefresh();
         this._renderStatusSafely();
+        this._renderOverviewSafely();
     },
 
     _onSettingsChanged() {
@@ -505,6 +577,42 @@ FlottenmanagementApplet.prototype = {
             this._backgroundRefreshSource = backgroundRefreshSource;
         } catch (error) {
             this._backgroundRefreshSource = 0;
+            this._settingsValid = false;
+            this._logCleanupError(error);
+        }
+    },
+
+    _restartOverviewRefresh() {
+        if (this._overviewSource) {
+            try {
+                GLib.source_remove(this._overviewSource);
+            } catch (error) {
+                this._settingsValid = false;
+                this._logCleanupError(error);
+            }
+            this._overviewSource = 0;
+        }
+        if (this._overviewInFlight) this._cancelOverviewRefresh();
+        if (this._removed || !this._settingsValid || !this._overviewRefreshStarted) return;
+        try {
+            const overviewTimerCallback = () => {
+                if (this._removed || !this._settingsValid) {
+                    this._overviewSource = 0;
+                    return GLib.SOURCE_REMOVE;
+                }
+                this._refreshOverview();
+                return GLib.SOURCE_CONTINUE;
+            };
+            overviewTimerCallback.__codexOverviewTimer = true;
+            const source = GLib.timeout_add_seconds(
+                GLib.PRIORITY_DEFAULT,
+                this.overviewIntervalSeconds,
+                overviewTimerCallback
+            );
+            if (!Number.isSafeInteger(source) || source <= 0) throw new Error("Invalid overview timeout source id");
+            this._overviewSource = source;
+        } catch (error) {
+            this._overviewSource = 0;
             this._settingsValid = false;
             this._logCleanupError(error);
         }
@@ -668,16 +776,97 @@ FlottenmanagementApplet.prototype = {
         this._startStatusRefresh();
     },
 
+    _overviewArgv() {
+        const home = GLib.get_home_dir ? GLib.get_home_dir() : null;
+        if (typeof home !== "string" || !home.startsWith("/") || home.includes("\u0000")) {
+            throw new Error("Overview home unavailable");
+        }
+        const argv = [
+            home + "/.local/bin/codex-master-mcp",
+            "fleet",
+            APPLET_OVERVIEW_COMMAND,
+            "--format",
+            APPLET_OVERVIEW_FORMAT,
+        ];
+        if (this.overviewSessionNoActiveOnly) argv.push("--no-active-only");
+        return argv;
+    },
+
+    _refreshOverview() {
+        if (this._removed || !this._settingsValid || this._overviewInFlight) return;
+        this._overviewRefreshStarted = true;
+        this._startStatusRefresh({ kind: "overview" });
+    },
+
+    _cancelOverviewRefresh() {
+        let clean = true;
+        this._overviewGeneration += 1;
+        this._overviewActiveGeneration = 0;
+        const state = this._overviewActiveState;
+        if (!state) {
+            this._overviewInFlight = false;
+            return true;
+        }
+        state.finalizing = true;
+        state.discardOutput = true;
+        this._clearStatusBuffers(state);
+        if (state.timeoutSource) {
+            try {
+                GLib.source_remove(state.timeoutSource);
+                state.timeoutSource = 0;
+            } catch (error) {
+                this._logCleanupError(error);
+                clean = false;
+            }
+        }
+        if (state.cancellable && !state.cancellableCancelled) {
+            try {
+                state.cancellable.cancel();
+                state.cancellableCancelled = true;
+            } catch (error) {
+                this._logCleanupError(error);
+                clean = false;
+            }
+        }
+        if (state.exitWaitCancellable && !state.exitWaitCancellableCancelled) {
+            try {
+                state.exitWaitCancellable.cancel();
+                state.exitWaitCancellableCancelled = true;
+            } catch (error) {
+                this._logCleanupError(error);
+                clean = false;
+            }
+        }
+        if (!state.forceExitCalled && state.process && typeof state.process.force_exit === "function") {
+            try {
+                state.process.force_exit();
+                state.forceExitCalled = true;
+            } catch (error) {
+                this._logCleanupError(error);
+                clean = false;
+            }
+        }
+        if (clean) this._overviewActiveState = null;
+        this._overviewInFlight = !clean;
+        return clean;
+    },
+
     _startStatusRefresh(request = null) {
         if (this._removed) return;
-        const commandKind = request && request.kind === "launcher" ? "launcher" : request ? "action" : "status";
+        const commandKind = request && request.kind === "launcher"
+            ? "launcher"
+            : request && request.kind === "overview"
+                ? "overview"
+                : request ? "action" : "status";
         const actionRequest = commandKind === "action" ? request : null;
+        const overviewRequest = commandKind === "overview";
 
-        const generation = ++this._statusGeneration;
+        const generation = overviewRequest ? ++this._overviewGeneration : ++this._statusGeneration;
         let process;
         try {
             const argv = commandKind === "launcher"
                 ? this._controlCenterArgv()
+                : overviewRequest ? this._overviewArgv()
                 : actionRequest ? this._appletActionArgv(actionRequest) : this._trackedStatusArgv();
             const launcher = Gio.SubprocessLauncher.new(
                 Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
@@ -685,6 +874,12 @@ FlottenmanagementApplet.prototype = {
             this._sanitizeLauncherEnvironment(launcher);
             process = launcher.spawnv(argv);
         } catch (_error) {
+            if (overviewRequest) {
+                this._overviewInFlight = false;
+                this._markOverviewFailed();
+                this._restartOverviewRefresh();
+                return;
+            }
             this._statusInFlight = false;
             this._actionInFlight = false;
             if (commandKind === "action") {
@@ -707,6 +902,7 @@ FlottenmanagementApplet.prototype = {
         const state = {
             generation,
             commandKind,
+            overviewRequest,
             actionRequest,
             process,
             cancellable,
@@ -733,16 +929,24 @@ FlottenmanagementApplet.prototype = {
             stderrLimitExceeded: false,
         };
 
-        this._activeStatusProcess = process;
-        this._statusActiveState = state;
-        this._statusActiveGeneration = generation;
-        this._statusInFlight = true;
-        this._actionInFlight = commandKind === "action";
-        this._launcherInFlight = commandKind === "launcher";
-        if (commandKind === "status") {
-            this._statusViewState = this._statusLastGood ? "refreshing" : "initializing";
+        if (overviewRequest) {
+            this._overviewActiveState = state;
+            this._overviewActiveGeneration = generation;
+            this._overviewInFlight = true;
+            this._overviewViewState = this._overviewLastGood ? "refreshing" : "initializing";
+            this._renderOverviewSafely();
+        } else {
+            this._activeStatusProcess = process;
+            this._statusActiveState = state;
+            this._statusActiveGeneration = generation;
+            this._statusInFlight = true;
+            this._actionInFlight = commandKind === "action";
+            this._launcherInFlight = commandKind === "launcher";
+            if (commandKind === "status") {
+                this._statusViewState = this._statusLastGood ? "refreshing" : "initializing";
+            }
+            this._renderStatusSafely();
         }
-        this._renderStatusSafely();
 
         const requestForceExit = (stateArg) => {
             if (stateArg.forceExitCalled || !stateArg.process) return true;
@@ -773,7 +977,8 @@ FlottenmanagementApplet.prototype = {
             requestCancel(stateArg);
             stateArg.discardOutput = true;
             this._clearStatusBuffers(stateArg);
-            if (stateArg.commandKind === "status") this._markRefreshFailed();
+            if (stateArg.commandKind === "overview") this._markOverviewFailed();
+            else if (stateArg.commandKind === "status") this._markRefreshFailed();
         };
 
         const attemptFinalize = (stateArg) => {
@@ -1024,7 +1229,9 @@ FlottenmanagementApplet.prototype = {
                 state,
                 "stdout",
                 stdoutStream,
-                commandKind === "status" ? APPLET_STDOUT_LIMIT_BYTES : APPLET_STDERR_LIMIT_BYTES
+                commandKind === "status" || commandKind === "overview"
+                    ? APPLET_STDOUT_LIMIT_BYTES
+                    : APPLET_STDERR_LIMIT_BYTES
             );
         }
         if (!state.stderrDone) {
@@ -1078,6 +1285,10 @@ FlottenmanagementApplet.prototype = {
     },
 
     _finalizeStatusProcess(state) {
+        if (state.commandKind === "overview") {
+            this._finalizeOverviewProcess(state);
+            return;
+        }
         const generation = state.generation;
         if (generation !== this._statusActiveGeneration) return;
 
@@ -1149,11 +1360,42 @@ FlottenmanagementApplet.prototype = {
             GLib.source_remove(state.timeoutSource);
             state.timeoutSource = 0;
         }
-
         if (this._statusPendingRefresh) {
             this._statusPendingRefresh = false;
             this._startStatusRefresh();
         }
+    },
+
+    _finalizeOverviewProcess(state) {
+        const generation = state.generation;
+        if (generation !== this._overviewActiveGeneration) return;
+
+        this._overviewInFlight = false;
+        this._overviewActiveGeneration = 0;
+        this._overviewActiveState = null;
+
+        let applied = false;
+        if (!state.timedOut && !state.waitFailed && !state.streamFailed && !state.stdoutLimitExceeded && !state.stderrLimitExceeded) {
+            const payload = state.process ? this._collectProcessPayload(state) : null;
+            let processSuccessful = false;
+            try {
+                processSuccessful = state.process && state.process.get_successful();
+            } catch (_error) {
+                processSuccessful = false;
+            }
+            if (processSuccessful && payload) applied = this._maybeApplyOverviewPayload(payload);
+        }
+        this._clearStatusBuffers(state);
+        if (!applied) this._markOverviewFailed();
+        if (state.timeoutSource) {
+            try {
+                GLib.source_remove(state.timeoutSource);
+            } catch (error) {
+                this._logCleanupError(error);
+            }
+            state.timeoutSource = 0;
+        }
+        if (!this._removed) this._restartOverviewRefresh();
     },
 
     _collectProcessPayload(state) {
@@ -1439,6 +1681,208 @@ FlottenmanagementApplet.prototype = {
             this._logCleanupError(error);
             return false;
         }
+    },
+
+    _overviewHasExactFields(value, fields) {
+        if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+        const keys = Object.keys(value);
+        return keys.length === fields.length && fields.every((field) => Object.prototype.hasOwnProperty.call(value, field));
+    },
+
+    _overviewString(value, maximum = APPLET_OVERVIEW_MAX_STRING_LENGTH) {
+        return typeof value === "string"
+            && value.length > 0
+            && value.length <= maximum
+            && !/[\u0000-\u001f\u007f]/.test(value);
+    },
+
+    _overviewOptionalString(value) {
+        return value === null || this._overviewString(value);
+    },
+
+    _overviewAccountId(value) {
+        return typeof value === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(value);
+    },
+
+    _overviewAgentId(value) {
+        return typeof value === "string" && /^(?:[abc](?:[1-9]|[1-9][0-9]|100))$/.test(value);
+    },
+
+    _overviewPercent(value) {
+        return value === null || (
+            typeof value === "number"
+            && Number.isFinite(value)
+            && value >= 0
+            && value <= 100
+        );
+    },
+
+    _overviewUtc(value) {
+        if (value === null) return true;
+        if (!this._overviewString(value, 40)) return false;
+        const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|\+00:00)$/.exec(value);
+        if (!match) return false;
+        const year = Number(match[1]);
+        const month = Number(match[2]);
+        const day = Number(match[3]);
+        const hour = Number(match[4]);
+        const minute = Number(match[5]);
+        const second = Number(match[6]);
+        const candidate = new Date(0);
+        candidate.setUTCFullYear(year, month - 1, day);
+        candidate.setUTCHours(hour, minute, second, 0);
+        return Number.isFinite(candidate.valueOf())
+            && candidate.getUTCFullYear() === year
+            && candidate.getUTCMonth() === month - 1
+            && candidate.getUTCDate() === day
+            && candidate.getUTCHours() === hour
+            && candidate.getUTCMinutes() === minute
+            && candidate.getUTCSeconds() === second;
+    },
+
+    _isValidOverviewPayload(payload) {
+        try {
+            if (!this._overviewHasExactFields(payload, [
+                "generation", "created_at", "integration_freshness", "series", "agents", "account_limits", "warnings",
+            ])) return false;
+            if (!Number.isSafeInteger(payload.generation) || payload.generation < 0) return false;
+            if (typeof payload.created_at !== "string" || !this._overviewUtc(payload.created_at)) return false;
+            if (!["fresh", "stale", "unavailable", "registry_only"].includes(payload.integration_freshness)) return false;
+            if (!Array.isArray(payload.series) || payload.series.length > APPLET_OVERVIEW_MAX_ARRAY_LENGTH) return false;
+            if (!Array.isArray(payload.agents) || payload.agents.length > APPLET_OVERVIEW_MAX_ARRAY_LENGTH) return false;
+            if (!Array.isArray(payload.account_limits) || payload.account_limits.length > APPLET_OVERVIEW_MAX_ARRAY_LENGTH) return false;
+            if (!Array.isArray(payload.warnings) || payload.warnings.length > APPLET_OVERVIEW_MAX_ARRAY_LENGTH) return false;
+            if (payload.warnings.some((warning) => !this._overviewString(warning, APPLET_OVERVIEW_MAX_WARNING_LENGTH))) return false;
+
+            const seriesIds = new Set();
+            const seriesAgentIds = new Set();
+            for (const row of payload.series) {
+                if (!this._overviewHasExactFields(row, [
+                    "prefix", "display_name", "provider", "runner", "model", "active_count", "total_count", "agent_ids",
+                ])) return false;
+                if (!this._overviewString(row.prefix, 16) || seriesIds.has(row.prefix)) return false;
+                if (!this._overviewString(row.display_name) || !this._overviewString(row.provider)
+                    || !this._overviewString(row.runner) || !this._overviewString(row.model)) return false;
+                if (!Number.isSafeInteger(row.active_count) || row.active_count < 0
+                    || !Number.isSafeInteger(row.total_count) || row.total_count < row.active_count) return false;
+                if (!Array.isArray(row.agent_ids) || row.agent_ids.length > APPLET_OVERVIEW_MAX_ARRAY_LENGTH) return false;
+                const rowIds = new Set();
+                for (const agentId of row.agent_ids) {
+                    if (!this._overviewAgentId(agentId) || rowIds.has(agentId) || seriesAgentIds.has(agentId)) return false;
+                    rowIds.add(agentId);
+                    seriesAgentIds.add(agentId);
+                }
+                if (row.active_count > row.agent_ids.length || row.total_count !== row.agent_ids.length) return false;
+                seriesIds.add(row.prefix);
+            }
+
+            const agentIds = new Set();
+            const usageFreshnesses = [];
+            for (const row of payload.agents) {
+                if (!this._overviewHasExactFields(row, [
+                    "agent_id", "series_display", "provider", "runner", "model", "account_id", "account_label", "state",
+                    "principal_role", "dispatch_id", "limit_short_remaining_percent", "limit_short_reset_at",
+                    "limit_week_remaining_percent", "limit_week_reset_at", "cost_last_hour_percentage_points", "usage_freshness",
+                ])) return false;
+                if (!this._overviewAgentId(row.agent_id)
+                    || !seriesAgentIds.has(row.agent_id)
+                    || agentIds.has(row.agent_id)) return false;
+                if (!this._overviewString(row.series_display) || !this._overviewString(row.provider)
+                    || !this._overviewString(row.runner) || !this._overviewString(row.model)) return false;
+                if ((row.account_id !== null && !this._overviewAccountId(row.account_id)) || !this._overviewOptionalString(row.account_label)
+                    || !["running", "idle", "stopped", "unknown"].includes(row.state)
+                    || !this._overviewOptionalString(row.principal_role) || !this._overviewOptionalString(row.dispatch_id)
+                    || !this._overviewPercent(row.limit_short_remaining_percent)
+                    || !this._overviewUtc(row.limit_short_reset_at)
+                    || !this._overviewPercent(row.limit_week_remaining_percent)
+                    || !this._overviewUtc(row.limit_week_reset_at)
+                    || !this._overviewPercent(row.cost_last_hour_percentage_points)
+                    || !["fresh", "stale", "unavailable"].includes(row.usage_freshness)) return false;
+                agentIds.add(row.agent_id);
+                usageFreshnesses.push(row.usage_freshness);
+            }
+
+            const accountIds = new Set();
+            for (const row of payload.account_limits) {
+                if (!this._overviewHasExactFields(row, [
+                    "account_id", "account_label", "provider", "short_remaining_percent", "short_reset_at",
+                    "week_remaining_percent", "week_reset_at", "cost_last_hour_percentage_points", "usage_freshness",
+                ])) return false;
+                if (!this._overviewAccountId(row.account_id) || accountIds.has(row.account_id)
+                    || !this._overviewString(row.account_label) || !this._overviewString(row.provider)
+                    || !this._overviewPercent(row.short_remaining_percent) || !this._overviewUtc(row.short_reset_at)
+                    || !this._overviewPercent(row.week_remaining_percent) || !this._overviewUtc(row.week_reset_at)
+                    || !this._overviewPercent(row.cost_last_hour_percentage_points)
+                    || !["fresh", "stale", "unavailable"].includes(row.usage_freshness)) return false;
+                accountIds.add(row.account_id);
+                usageFreshnesses.push(row.usage_freshness);
+            }
+            const expectedFreshness = payload.integration_freshness === "fresh"
+                ? "fresh"
+                : payload.integration_freshness === "stale" ? "stale" : "unavailable";
+            if (usageFreshnesses.some((value) => value !== expectedFreshness)) return false;
+            if (expectedFreshness === "fresh" || expectedFreshness === "stale") {
+                if (payload.warnings.length !== 0) return false;
+            } else if (payload.warnings.length !== 1 || payload.warnings[0] !== "usage_unavailable") {
+                return false;
+            }
+            return true;
+        } catch (_error) {
+            return false;
+        }
+    },
+
+    _maybeApplyOverviewPayload(payload) {
+        if (!this._isValidOverviewPayload(payload)) return false;
+        this._overviewLastGood = payload;
+        this._overviewViewState = "ready";
+        return this._renderOverviewSafely();
+    },
+
+    _markOverviewFailed() {
+        if (this._removed) return;
+        this._overviewViewState = "unavailable";
+        this._renderOverviewSafely();
+    },
+
+    _renderOverviewSafely() {
+        try {
+            this._renderOverview();
+            return true;
+        } catch (error) {
+            this._logCleanupError(error);
+            return false;
+        }
+    },
+
+    _renderOverview() {
+        if (this._removed) return;
+        if (this._overviewViewState !== "ready" || !this._overviewLastGood) {
+            this._setMenuItemText(this._overviewSummaryItem, "Übersicht: nicht verfügbar");
+            this._setMenuItemText(this._overviewDetailItem, "Übersicht Details: —");
+            return;
+        }
+        const payload = this._overviewLastGood;
+        const freshness = payload.integration_freshness === "fresh"
+            ? "frisch"
+            : payload.integration_freshness === "stale" ? "veraltet" : "nicht verfügbar";
+        const accountText = payload.account_limits.length === 0
+            ? "Konten: —"
+            : payload.account_limits.map((row) => (
+                `${row.account_id} short=${row.short_remaining_percent === null ? "—" : `${row.short_remaining_percent.toFixed(1)}%`}`
+                + ` week=${row.week_remaining_percent === null ? "—" : `${row.week_remaining_percent.toFixed(1)}%`}`
+                + ` cost=${row.cost_last_hour_percentage_points === null ? "—" : `${row.cost_last_hour_percentage_points.toFixed(1)}%`}`
+            )).join(" · ");
+        const summary = this.overviewCompact
+            ? `Übersicht: ${freshness} · ${accountText}`
+            : `Übersicht: ${freshness} · Serien ${payload.series.length} · Agenten ${payload.agents.length}`;
+        this._setMenuItemText(this._overviewSummaryItem, summary);
+        const detail = this.overviewDetail
+            ? payload.agents.length === 0
+                ? "Übersicht Details: —"
+                : `Übersicht Details: ${payload.agents.map((row) => `${row.agent_id} → ${row.account_id || "—"} · ${row.state}`).join(" · ")}`
+            : "Übersicht Details: —";
+        this._setMenuItemText(this._overviewDetailItem, detail);
     },
 
     _renderStatus() {
@@ -1807,6 +2251,25 @@ FlottenmanagementApplet.prototype = {
         return success;
     },
 
+    _cleanupOverviewResources() {
+        let success = true;
+        if (this._overviewSource) {
+            try {
+                GLib.source_remove(this._overviewSource);
+                this._overviewSource = 0;
+            } catch (error) {
+                this._logCleanupError(error);
+                success = false;
+            }
+        }
+        if (!this._cancelOverviewRefresh()) success = false;
+        if (success) {
+            this._overviewLastGood = null;
+            this._overviewViewState = "unavailable";
+        }
+        return success;
+    },
+
     _cleanupSettings() {
         const settings = this.settings || this._settingsCleanupPending;
         if (!settings) return true;
@@ -1828,7 +2291,10 @@ FlottenmanagementApplet.prototype = {
             if (this.menu.actor && typeof this.menu.actor.is_finalized === "function" && this.menu.actor.is_finalized()) return;
             const wasOpen = this.menu.isOpen === true;
             this.menu.toggle();
-            if (!wasOpen && this.menu.isOpen === true && this.refreshOnOpen) this._refreshStatus();
+            if (!wasOpen && this.menu.isOpen === true) {
+                if (this.refreshOnOpen) this._refreshStatus();
+                this._refreshOverview();
+            }
         } catch (error) {
             this._logCleanupError(error);
         }
@@ -1839,6 +2305,7 @@ FlottenmanagementApplet.prototype = {
         this._removed = true;
         for (let attempt = 0; attempt < 2 && !this._cleanupComplete; attempt += 1) {
             const statusClean = this._cleanupStatusResources();
+            const overviewClean = this._cleanupOverviewResources();
             const settingsClean = this._cleanupSettings();
             const signalsClean = this._disconnectTrackedSignals();
             const appletMenuClean = this._cleanupMenuResource("menu", "menuManager");
@@ -1846,6 +2313,8 @@ FlottenmanagementApplet.prototype = {
             if (appletMenuClean) {
                 this._statusSummaryItem = null;
                 this._statusRowItems = [];
+                this._overviewSummaryItem = null;
+                this._overviewDetailItem = null;
                 this._nativeSubmenuItem = null;
                 this._nativeBeeRowItems = [];
                 this._quickControlSubmenuItem = null;
@@ -1857,7 +2326,7 @@ FlottenmanagementApplet.prototype = {
                 this._startActionBinding = null;
                 this._stopActionBindings = [];
             }
-            this._cleanupComplete = statusClean && settingsClean && signalsClean && appletMenuClean && contextMenuClean;
+            this._cleanupComplete = statusClean && overviewClean && settingsClean && signalsClean && appletMenuClean && contextMenuClean;
         }
     },
 };

@@ -1,5 +1,6 @@
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
@@ -92,3 +93,21 @@ def test_duplicate_repository_ids_are_rejected(tmp_path: Path) -> None:
     )
     with pytest.raises(RepositoryError, match="duplicate_repository_id"):
         RepositoryRegistry([binding, binding])
+
+
+def test_git_rejects_oversized_output_before_process_finishes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    marker = tmp_path / "finished"
+    fake_git = tmp_path / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        f"{sys.executable} -c \"import os, pathlib, sys, time; "
+        f"sys.stdout.write('x' * {65536 + 1}); sys.stdout.flush(); "
+        "time.sleep(0.3); pathlib.Path(os.environ['GIT_MARKER']).touch()\"\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("GIT_MARKER", str(marker))
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    assert RepositoryRegistry._git(tmp_path, "rev-parse", "--show-toplevel") is None
+    assert not marker.exists()
