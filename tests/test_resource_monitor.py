@@ -1316,6 +1316,8 @@ def test_resource_monitor_unit_has_exact_hardening_allowlist_including_keyring_c
         "PrivateDevices": "yes",
         "PrivatePIDs": "yes",
         "ProtectHome": "tmpfs",
+        "Restart": "on-failure",
+        "RestartSec": "5s",
         "KeyringMode": "private",
         "ProtectSystem": "strict",
         "ProtectControlGroups": "yes",
@@ -1865,6 +1867,7 @@ def test_thermal_breach_is_derived_from_current_input_and_appears_in_snapshot() 
 
     assert snapshot.thermal_state == "ready"
     assert snapshot.reason_codes == ("cgroup_preflight_failed", "temperature_pressure_high")
+    assert snapshot.bottleneck == "thermal"
 
 
 def test_kernel_parsers_accept_standard_extra_lines_but_reject_duplicate_or_malformed_target_lines() -> None:
@@ -2059,9 +2062,88 @@ def test_thermal_states_and_ten_one_hz_samples_build_one_complete_generation() -
         )
 
 
-def test_monitor_snapshot_accepts_bounded_scheduler_jitter_but_rejects_large_gap() -> None:
+def test_collect_sample_uses_regular_iteration_start_despite_variable_sensor_latency() -> None:
+    class MutableCadence:
+        def __init__(self) -> None:
+            self.now = NOW
+            self.monotonic_ns = 10_000_000_000
+
+        @property
+        def clocks(self) -> ResourceClocks:
+            return ResourceClocks(
+                now_utc=lambda: self.now,
+                monotonic_ns=lambda: self.monotonic_ns,
+            )
+
+        def set_start(self, index: int) -> None:
+            self.now = NOW + timedelta(seconds=index)
+            self.monotonic_ns = 10_000_000_000 + index * 1_000_000_000
+
+    class LatencyBackend(FakeResourceBackend):
+        def __init__(self, kernel: dict[Path, bytes], cadence: MutableCadence, latency_ms: int) -> None:
+            super().__init__(kernel, sensor_document())
+            self.cadence = cadence
+            self.latency_ms = latency_ms
+
+        def run_sensors_json(self, **kwargs: object) -> bytes:
+            self.cadence.now += timedelta(milliseconds=self.latency_ms)
+            self.cadence.monotonic_ns += self.latency_ms * 1_000_000
+            return super().run_sensors_json(**kwargs)
+
     paths = resource_paths()
-    offsets_ms = (0, 25, -20, 30, -15, 20, -10, 15, -5, 0)
+    cadence = MutableCadence()
+    latencies_ms = (250, 0, 300, 10, 275, 25, 350, 5, 225, 50)
+    samples: list[ResourceSampleV1] = []
+    for index, latency_ms in enumerate(latencies_ms):
+        cadence.set_start(index)
+        kernel = resource_kernel_document(paths)
+        kernel[paths.stat] = (
+            f"cpu {100 + index} 0 100 {700 + index} 50 0 0 0 0 0\n"
+            f"cpu0 {100 + index} 0 100 {700 + index} 50 0 0 0 0 0\n"
+        ).encode("ascii")
+        samples.append(
+            collect_resource_sample(
+                LatencyBackend(kernel, cadence, latency_ms),
+                paths,
+                clocks=cadence.clocks,
+                candidates=[ThermalCandidate("coretemp-isa-0000", "ISA adapter", "Package id 0")],
+                completed_sample_count=index + 1,
+            )
+        )
+
+    snapshot = build_monitor_snapshot(samples, prior_generation=0, clocks=cadence.clocks)
+
+    assert snapshot.generation == 1
+    assert [sample.observed_at_utc for sample in samples] == [
+        NOW + timedelta(seconds=index) for index in range(10)
+    ]
+    assert [sample.observed_monotonic_ns for sample in samples] == [
+        10_000_000_000 + index * 1_000_000_000 for index in range(10)
+    ]
+
+
+@pytest.mark.parametrize(
+    "clocks",
+    (
+        ResourceClocks(now_utc=lambda: object(), monotonic_ns=lambda: 10_000_000_000),
+        ResourceClocks(now_utc=lambda: NOW, monotonic_ns=lambda: False),
+    ),
+)
+def test_collect_sample_start_clock_errors_remain_fail_closed(clocks: ResourceClocks) -> None:
+    paths = resource_paths()
+    with pytest.raises(ResourceSnapshotError, match="^resource_monitor_unavailable$"):
+        collect_resource_sample(
+            FakeResourceBackend(resource_kernel_document(paths), sensor_document()),
+            paths,
+            clocks=clocks,
+            candidates=[ThermalCandidate("coretemp-isa-0000", "ISA adapter", "Package id 0")],
+            completed_sample_count=10,
+        )
+
+
+def test_monitor_snapshot_accepts_exact_jitter_limit_but_rejects_one_microsecond_more() -> None:
+    paths = resource_paths()
+    offsets_ms = (0, 0, 0, 0, 0, 100, 0, 0, 0, 0)
     samples: list[ResourceSampleV1] = []
     for index, offset_ms in enumerate(offsets_ms):
         kernel = resource_kernel_document(paths)
@@ -2096,8 +2178,8 @@ def test_monitor_snapshot_accepts_bounded_scheduler_jitter_but_rejects_large_gap
     delayed = list(samples)
     delayed[5] = replace(
         delayed[5],
-        observed_monotonic_ns=delayed[5].observed_monotonic_ns + 250_000_000,
-        observed_at_utc=delayed[5].observed_at_utc + timedelta(milliseconds=250),
+        observed_monotonic_ns=delayed[5].observed_monotonic_ns + 1_000,
+        observed_at_utc=delayed[5].observed_at_utc + timedelta(microseconds=1),
     )
     with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
         build_monitor_snapshot(

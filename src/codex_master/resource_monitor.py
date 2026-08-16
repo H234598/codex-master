@@ -1464,6 +1464,11 @@ def collect_resource_sample(
         _invalid()
     if type(completed_sample_count) is not int or not 1 <= completed_sample_count <= _MAX_SAMPLE_BUCKETS:
         _invalid()
+    try:
+        observed_at_utc = _require_utc_datetime(clocks.now_utc())
+        observed_monotonic_ns = _require_positive_int(clocks.monotonic_ns())
+    except (ResourceSnapshotError, Exception):
+        _monitor_unavailable()
     load1 = _parse_loadavg(_read_kernel_bytes(backend, paths.loadavg, maximum=_KERNEL_INPUT_MAX_BYTES))
     total_kib, available_kib = _parse_meminfo(
         _read_kernel_bytes(backend, paths.meminfo, maximum=_KERNEL_INPUT_MAX_BYTES)
@@ -1502,11 +1507,6 @@ def collect_resource_sample(
             thermal_state = "warming_up"
         else:
             thermal_state = "ready" if policy is not None else "no_valid_sensors"
-    try:
-        observed_at_utc = _require_utc_datetime(clocks.now_utc())
-        observed_monotonic_ns = _require_positive_int(clocks.monotonic_ns())
-    except (ResourceSnapshotError, Exception):
-        _monitor_unavailable()
     return ResourceSampleV1(
         boot_id=boot_id,
         observed_at_utc=observed_at_utc,
@@ -1703,8 +1703,7 @@ def build_monitor_snapshot(
         if any(sample.thermal_pressure_high for sample in samples):
             reasons_list.append("temperature_pressure_high")
             gate_state = "blocked"
-            if bottleneck == "unknown":
-                bottleneck = "thermal"
+            bottleneck = "thermal"
     reasons = tuple(reasons_list) if reasons_list else ("resource_ready",)
     return ResourceSnapshotV1(
         schema_version=_SCHEMA_VERSION,
