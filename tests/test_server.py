@@ -3072,6 +3072,100 @@ class ServerHelpersTest(unittest.TestCase):
             self.assertFalse(result["allowed"])
             self.assertEqual(result["reason_codes"], ["memory_metrics_unavailable"])
 
+    def test_declared_memory_reasons_never_override_local_memavailable(self) -> None:
+        policy = spawn_resource_policy()
+        cases = (
+            (7 * 1024, ["memory_pressure_high"], []),
+            (8192, ["memory_pressure_high", "memory_metrics_unavailable"], []),
+            (None, ["memory_pressure_high"], ["memory_metrics_unavailable"]),
+            (7 * 1024 - 1, ["memory_pressure_high"], ["memory_pressure_high"]),
+            (8192, ["memory_pressure_high", "temperature_monitor_unavailable"], ["temperature_monitor_unavailable"]),
+        )
+        for memory_mib, declared, expected in cases:
+            snapshot = {
+                "ok": True,
+                "load_per_cpu": 0.25,
+                "cpu_busy_percent": 25.0,
+                "io_wait_percent": 0.0,
+                "available_memory_mib": memory_mib,
+                "reason_codes": declared,
+            }
+
+            with self.subTest(memory_mib=memory_mib, declared=declared):
+                self.assertEqual(
+                    server_module._resource_pressure_reason_codes(snapshot, policy),
+                    expected,
+                )
+
+    def test_g5_blocked_declared_memory_reasons_never_override_local_memavailable(self) -> None:
+        policy = spawn_resource_policy()
+        cases = (
+            (7 * 1024, ["memory_pressure_high"], []),
+            (8192, ["memory_pressure_high", "memory_metrics_unavailable"], []),
+            (None, ["memory_pressure_high"], ["memory_metrics_unavailable"]),
+            (7 * 1024 - 1, ["memory_pressure_high"], ["memory_pressure_high"]),
+            (7 * 1024 - 1, ["temperature_monitor_unavailable"], ["temperature_monitor_unavailable"]),
+            (
+                7 * 1024 - 1,
+                ["memory_pressure_high", "temperature_monitor_unavailable"],
+                ["memory_pressure_high", "temperature_monitor_unavailable"],
+            ),
+            (
+                7 * 1024 - 1,
+                [
+                    "memory_pressure_high",
+                    "temperature_monitor_unavailable",
+                    "temperature_monitor_unavailable",
+                ],
+                ["memory_pressure_high", "temperature_monitor_unavailable"],
+            ),
+            (
+                None,
+                ["memory_pressure_high", "temperature_monitor_unavailable"],
+                ["memory_metrics_unavailable", "temperature_monitor_unavailable"],
+            ),
+            (8192, ["memory_pressure_high", "temperature_monitor_unavailable"], ["temperature_monitor_unavailable"]),
+        )
+        for memory_mib, declared, expected in cases:
+            snapshot = {
+                "_g5_facts": True,
+                "ok": False,
+                "load_per_cpu": 0.25,
+                "cpu_busy_percent": 25.0,
+                "io_wait_percent": 0.0,
+                "io_psi_percent": 0.0,
+                "available_memory_mib": memory_mib,
+                "reason_codes": declared,
+            }
+
+            with self.subTest(memory_mib=memory_mib, declared=declared):
+                self.assertEqual(
+                    server_module._resource_pressure_reason_codes(snapshot, policy),
+                    expected,
+                )
+
+    def test_g5_blocked_requires_valid_declared_reason_codes(self) -> None:
+        policy = spawn_resource_policy()
+        cases = (
+            (None, ["resource_snapshot_invalid"]),
+            ("memory_pressure_high", ["resource_snapshot_invalid"]),
+            (["unknown_reason"], ["resource_snapshot_invalid"]),
+            ([], []),
+        )
+        for declared, expected in cases:
+            snapshot = {
+                "_g5_facts": True,
+                "ok": False,
+                "available_memory_mib": 8192,
+                "reason_codes": declared,
+            }
+
+            with self.subTest(declared=declared):
+                self.assertEqual(
+                    server_module._resource_pressure_reason_codes(snapshot, policy),
+                    expected,
+                )
+
     def test_spawn_admission_rejects_invalid_policy_and_keeps_output_data_sparse(self) -> None:
         with patch(
             "codex_master.server.system_resource_snapshot",

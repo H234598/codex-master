@@ -5577,21 +5577,36 @@ def _resource_pressure_reason_codes(snapshot: Mapping[str, Any], policy: Mapping
     ]
     if not isinstance(snapshot, Mapping) or not isinstance(policy, Mapping):
         return fallback
-    if snapshot.get("_g5_facts") is True and snapshot.get("ok") is False:
-        declared = snapshot.get("reason_codes")
-        if isinstance(declared, list) and all(
-            isinstance(item, str) and item in RESOURCE_REASON_CODES for item in declared
-        ):
-            return list(dict.fromkeys(declared))
-        return ["resource_snapshot_invalid"]
     declared = snapshot.get("reason_codes")
+    g5_blocked = snapshot.get("_g5_facts") is True and snapshot.get("ok") is False
+    if g5_blocked and declared is None:
+        return ["resource_snapshot_invalid"]
     if declared is not None and (
         not isinstance(declared, list)
         or any(not isinstance(item, str) or item not in RESOURCE_REASON_CODES for item in declared)
     ):
-        return fallback
+        return ["resource_snapshot_invalid"] if g5_blocked else fallback
+    had_declared = bool(declared)
+    had_declared_memory_reason = (
+        isinstance(declared, list)
+        and any(
+            reason in {"memory_metrics_unavailable", "memory_pressure_high"}
+            for reason in declared
+        )
+    )
+    if declared is not None:
+        declared = [
+            reason
+            for reason in declared
+            if reason not in {"memory_metrics_unavailable", "memory_pressure_high"}
+        ]
+    if g5_blocked:
+        if not had_declared:
+            return []
+        if not had_declared_memory_reason:
+            return list(dict.fromkeys(declared))
     snapshot_ok = snapshot.get("ok")
-    if not isinstance(snapshot_ok, bool) or (snapshot_ok is False and not declared):
+    if not isinstance(snapshot_ok, bool) or (snapshot_ok is False and not declared and not had_declared):
         return fallback
     reasons: list[str] = []
     load_per_cpu = snapshot.get("load_per_cpu")
