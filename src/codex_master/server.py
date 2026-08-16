@@ -5587,6 +5587,13 @@ def _resource_pressure_reason_codes(snapshot: Mapping[str, Any], policy: Mapping
     ):
         return ["resource_snapshot_invalid"] if g5_blocked else fallback
     had_declared = bool(declared)
+    had_declared_memory_reason = (
+        isinstance(declared, list)
+        and any(
+            reason in {"memory_metrics_unavailable", "memory_pressure_high"}
+            for reason in declared
+        )
+    )
     if declared is not None:
         declared = [
             reason
@@ -5594,10 +5601,10 @@ def _resource_pressure_reason_codes(snapshot: Mapping[str, Any], policy: Mapping
             if reason not in {"memory_metrics_unavailable", "memory_pressure_high"}
         ]
     if g5_blocked:
-        if declared:
-            return list(dict.fromkeys(declared))
         if not had_declared:
             return []
+        if not had_declared_memory_reason:
+            return list(dict.fromkeys(declared))
     snapshot_ok = snapshot.get("ok")
     if not isinstance(snapshot_ok, bool) or (snapshot_ok is False and not declared and not had_declared):
         return fallback

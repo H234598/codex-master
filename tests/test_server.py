@@ -3104,6 +3104,17 @@ class ServerHelpersTest(unittest.TestCase):
             (8192, ["memory_pressure_high", "memory_metrics_unavailable"], []),
             (None, ["memory_pressure_high"], ["memory_metrics_unavailable"]),
             (7 * 1024 - 1, ["memory_pressure_high"], ["memory_pressure_high"]),
+            (7 * 1024 - 1, ["temperature_monitor_unavailable"], ["temperature_monitor_unavailable"]),
+            (
+                7 * 1024 - 1,
+                ["memory_pressure_high", "temperature_monitor_unavailable"],
+                ["memory_pressure_high", "temperature_monitor_unavailable"],
+            ),
+            (
+                None,
+                ["memory_pressure_high", "temperature_monitor_unavailable"],
+                ["memory_metrics_unavailable", "temperature_monitor_unavailable"],
+            ),
             (8192, ["memory_pressure_high", "temperature_monitor_unavailable"], ["temperature_monitor_unavailable"]),
         )
         for memory_mib, declared, expected in cases:
