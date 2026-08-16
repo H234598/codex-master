@@ -1392,29 +1392,34 @@ def _discovered_thermal_measurement(
 ) -> tuple[ThermalPolicyV1 | None, bool]:
     thresholds: dict[str, float] = {}
     pressure = False
-    normalized_thermal_chips: set[str] = set()
+    validated_chips: list[tuple[str, str, list[tuple[str, object]]]] = []
+    normalized_chips: set[str] = set()
+    label_count = 0
     for chip, payload in sensor_document.items():
         if not isinstance(chip, str) or not isinstance(payload, Mapping) or len(payload) > 256:
             _thermal_unavailable()
+        adapter = payload.get("Adapter")
+        if not isinstance(adapter, str):
+            _thermal_unavailable()
+        normalized_chip = _normalize_sensor_component(chip)
+        normalized_adapter = _normalize_sensor_component(adapter)
+        if normalized_chip in normalized_chips:
+            _thermal_unavailable()
+        normalized_chips.add(normalized_chip)
+        labels = [(label, reading) for label, reading in payload.items() if label != "Adapter"]
+        label_count += len(labels)
+        if label_count > 256 or any(not isinstance(label, str) for label, _reading in labels):
+            _thermal_unavailable()
+        validated_chips.append((normalized_chip, normalized_adapter, labels))
+
+    for normalized_chip, normalized_adapter, labels in validated_chips:
         discovered: list[tuple[str, tuple[float, float | None, float | None]]] = []
-        for label, reading in payload.items():
-            if label == "Adapter":
-                continue
-            if not isinstance(label, str):
-                _thermal_unavailable()
+        for label, reading in labels:
             parsed = _thermal_reading(reading, ignore_unusable_raw_threshold=True)
             if parsed is not None:
                 discovered.append((label, parsed))
         if not discovered:
             continue
-        adapter = payload.get("Adapter")
-        if not isinstance(adapter, str):
-            _thermal_unavailable()
-        normalized_chip = _normalize_sensor_component(chip)
-        if normalized_chip in normalized_thermal_chips:
-            _thermal_unavailable()
-        normalized_thermal_chips.add(normalized_chip)
-        normalized_adapter = _normalize_sensor_component(adapter)
         normalized_labels: set[str] = set()
         for label, (current, maximum, critical) in discovered:
             normalized_label = _normalize_sensor_component(label)
@@ -1551,7 +1556,7 @@ def run_resource_monitor(
                 paths,
                 clocks=clocks,
                 candidates=None,
-                completed_sample_count=len(samples) + 1,
+                completed_sample_count=min(len(samples) + 1, _MAX_SAMPLE_BUCKETS),
             )
         except ResourceSnapshotError:
             samples.clear()

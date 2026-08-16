@@ -913,6 +913,62 @@ def test_monitor_publishes_only_complete_generation_and_never_claims_healthy_whe
     assert snapshot.reason_codes == ("temperature_monitor_unavailable",)
 
 
+def test_monitor_long_run_caps_completed_count_and_keeps_publishing_fresh_generations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class MonitorStopped(RuntimeError):
+        pass
+
+    now = NOW
+    monotonic_ns = 10_000_000_000
+    completed_counts: list[int] = []
+    policy = ThermalPolicyV1(
+        schema_version=1,
+        sensor_thresholds={"chip:adapter:package": 80.0},
+    )
+
+    def collect(*_args: object, **kwargs: object) -> ResourceSampleV1:
+        completed_count = int(kwargs["completed_sample_count"])
+        completed_counts.append(completed_count)
+        index = len(completed_counts) - 1
+        return ResourceSampleV1(
+            boot_id=BOOT_ID,
+            observed_at_utc=now,
+            observed_monotonic_ns=monotonic_ns,
+            current={"cpu": 10.0, "io": 1.0, "memory": 20.0},
+            available_memory_mib=8192,
+            load1=1.0,
+            available_memory_percent=80.0,
+            cpu_counters=CpuCountersV1(1, 1_000 + index * 10, 200 + index * 2, 50 + index),
+            cgroup_state="unavailable",
+            thermal_state="warming_up" if completed_count < 10 else "ready",
+            thermal_policy=policy,
+        )
+
+    def sleep(seconds: float) -> None:
+        nonlocal now, monotonic_ns
+        now += timedelta(seconds=seconds)
+        monotonic_ns += int(seconds * 1_000_000_000)
+        if len(completed_counts) == 65:
+            raise MonitorStopped
+
+    monkeypatch.setattr(resource_monitor_module, "collect_resource_sample", collect)
+    store = HiveStateStore(tmp_path / "state")
+    with pytest.raises(MonitorStopped):
+        resource_monitor_module.run_resource_monitor(
+            store,
+            backend=object(),
+            clocks=ResourceClocks(now_utc=lambda: now, monotonic_ns=lambda: monotonic_ns),
+            sleep=sleep,
+        )
+
+    assert completed_counts == [*range(1, 61), *([60] * 5)]
+    snapshot = read_resource_snapshot(store, now_utc=now, expected_boot_id=BOOT_ID)
+    assert snapshot.generation == 56
+    assert snapshot.observed_at_utc == NOW + timedelta(seconds=64)
+
+
 def test_monitor_real_collection_path_discovers_host_shape_and_uses_deadline_cadence(
     tmp_path: Path,
 ) -> None:
@@ -1258,6 +1314,8 @@ def test_resource_monitor_unit_has_exact_hardening_allowlist_including_keyring_c
         "NoNewPrivileges": "yes",
         "PrivateTmp": "yes",
         "PrivateDevices": "yes",
+        "PrivatePIDs": "yes",
+        "ProtectHome": "tmpfs",
         "KeyringMode": "private",
         "ProtectSystem": "strict",
         "ProtectControlGroups": "yes",
@@ -1277,6 +1335,7 @@ def test_resource_monitor_unit_has_exact_hardening_allowlist_including_keyring_c
         "UMask": "0077",
     }
     assert {key: directives.get(key) for key in expected} == expected
+    assert "ProtectProc" not in directives
 
 
 def test_resource_monitor_unit_checks_readonly_and_readwrite_paths_separately() -> None:
@@ -1284,8 +1343,6 @@ def test_resource_monitor_unit_checks_readonly_and_readwrite_paths_separately() 
     assert service.is_file()
     directives = _resource_monitor_unit_directives(service.read_text(encoding="utf-8"))
     assert directives["ReadOnlyPaths"].split() == [
-        "%h/.local/bin/codex-master-resource-monitor",
-        "%h/.local/state/codex-master-mcp/hive",
         "/usr/bin/python3",
         "/usr/bin/sensors",
         "/proc/loadavg",
@@ -1297,6 +1354,13 @@ def test_resource_monitor_unit_checks_readonly_and_readwrite_paths_separately() 
         "/proc/sys/kernel/random/boot_id",
     ]
     assert all(not path.startswith("/sys") for path in directives["ReadOnlyPaths"].split())
+    assert directives["BindReadOnlyPaths"].split() == [
+        "%h/codex-master/bin/codex-master-resource-monitor:%h/.local/bin/codex-master-resource-monitor:norbind",
+        "%h/codex-master/src:%h/.local/src:norbind",
+        "%h/codex-master/codex-agent-classes.json:%h/.local/codex-agent-classes.json:norbind",
+        "%h/codex-master/codex-hive.json:%h/.local/codex-hive.json:norbind",
+        "%h/.local/state/codex-master-mcp/hive:%h/.local/state/codex-master-mcp/hive:norbind",
+    ]
     assert directives["ReadWritePaths"].split() == [
         "%h/.local/state/codex-master-mcp/hive/resources",
         "%h/.local/state/codex-master-mcp/hive/.hive-state.lock",
@@ -1325,10 +1389,30 @@ def test_resource_monitor_unit_uses_absolute_exec_and_never_enables_or_starts_it
     assert "runtime-root" not in entrypoint_text
 
 
-def test_resource_monitor_entrypoint_imports_src_layout_from_foreign_cwd_without_pythonpath(
+def test_resource_monitor_entrypoint_loads_real_server_from_foreign_cwd_in_isolated_mode_without_starting_monitor(
     tmp_path: Path,
 ) -> None:
     entrypoint = Path(__file__).resolve().parents[1] / "bin" / "codex-master-resource-monitor"
+    probe = (
+        "import runpy, sys\n"
+        f"namespace = runpy.run_path({str(entrypoint)!r}, run_name='resource_monitor_import_probe')\n"
+        "target = namespace['_load_run_resource_monitor']()\n"
+        "assert target.__module__ == 'codex_master.server'\n"
+        "assert sys.modules['codex_master.server'].run_resource_monitor is target\n"
+    )
+    imported = subprocess.run(
+        ["/usr/bin/python3", "-I", "-c", probe],
+        cwd=tmp_path,
+        env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert imported.returncode == 0
+    assert imported.stdout == ""
+    assert imported.stderr == ""
+
     completed = subprocess.run(
         ["/usr/bin/python3", "-I", str(entrypoint), "unexpected-argument"],
         cwd=tmp_path,
@@ -1347,6 +1431,8 @@ def test_documentation_marks_unit_delivered_but_not_installed_or_active() -> Non
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
     assert "codex-master-resource-monitor.service is delivered but not installed or active" in readme
     assert "No installer, MCP tool, or standard test enables or starts this unit" in readme
+    assert "ProtectHome=tmpfs and PrivatePIDs=yes hide unrelated Home and process data" in readme
+    assert "BindReadOnlyPaths exposes only the installed monitor layout" in readme
 
 
 def test_snapshot_stale_persistence_is_unavailable_without_cross_document_atomicity_claim(tmp_path: Path) -> None:
@@ -1536,6 +1622,90 @@ def test_product_thermal_discovery_reports_no_valid_sensors_for_strict_nontherma
 
     assert sample.thermal_state == "no_valid_sensors"
     assert sample.thermal_policy is None
+
+
+@pytest.mark.parametrize("adapter", ("missing", None, 1))
+@pytest.mark.parametrize(
+    "labels",
+    (
+        {},
+        {"fan1": {"fan1_input": 1800.0}},
+        {"Package": {"temp1_input": 70.0, "temp1_max": 80.0}},
+    ),
+    ids=("empty", "nonthermal", "thermal"),
+)
+def test_product_thermal_discovery_rejects_missing_null_or_numeric_adapter_before_filtering(
+    adapter: object,
+    labels: dict[str, object],
+) -> None:
+    paths = resource_paths()
+    chip = dict(labels)
+    if adapter != "missing":
+        chip["Adapter"] = adapter
+    document = json.dumps({"chip": chip}).encode("utf-8")
+
+    sample = collect_resource_sample(
+        FakeResourceBackend(resource_kernel_document(paths), document),
+        paths,
+        clocks=resource_clocks(),
+        candidates=None,
+        completed_sample_count=10,
+    )
+
+    assert sample.thermal_state == "monitor_unavailable"
+    assert sample.thermal_policy is None
+
+
+@pytest.mark.parametrize("label_count", (256, 257))
+def test_product_thermal_discovery_enforces_global_label_limit_before_parsing(
+    label_count: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = resource_paths()
+    first_count = label_count // 2
+    per_chip_counts = (first_count, label_count - first_count)
+    document: dict[str, object] = {}
+    label_index = 0
+    for chip_index, chip_count in enumerate(per_chip_counts):
+        payload: dict[str, object] = {"Adapter": f"adapter {chip_index}"}
+        for _ in range(chip_count):
+            payload[f"Sensor {label_index}"] = {
+                "temp1_input": 70.0,
+                "temp1_max": 80.0,
+            }
+            label_index += 1
+        document[f"chip-{chip_index}"] = payload
+
+    original = resource_monitor_module._thermal_reading
+    parsed_readings = 0
+
+    def count_readings(*args: object, **kwargs: object) -> object:
+        nonlocal parsed_readings
+        parsed_readings += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(resource_monitor_module, "_thermal_reading", count_readings)
+    sample = collect_resource_sample(
+        FakeResourceBackend(
+            resource_kernel_document(paths),
+            json.dumps(document, sort_keys=True).encode("utf-8"),
+        ),
+        paths,
+        clocks=resource_clocks(),
+        candidates=None,
+        completed_sample_count=10,
+    )
+
+    if label_count == 256:
+        assert sample.thermal_state == "ready"
+        assert sample.thermal_policy is not None
+        assert len(sample.thermal_policy.sensor_thresholds) == 256
+        assert parsed_readings == 256
+    else:
+        assert sample.thermal_state == "monitor_unavailable"
+        assert sample.thermal_policy is None
+        assert parsed_readings == 0
+
 
 def test_product_thermal_discovery_uses_none_sentinel_for_host_shape_and_preserves_explicit_candidates() -> None:
     paths = resource_paths()

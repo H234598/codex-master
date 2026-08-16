@@ -16,6 +16,8 @@ one-Hz generations under its fixed `resources` subtree. No installer, MCP tool, 
 private `resources` directory and existing Hive lock before activation. Installation
 and activation remain a separate operator action after external review; this delivery
 makes no H2 claim.
+ProtectHome=tmpfs and PrivatePIDs=yes hide unrelated Home and process data.
+BindReadOnlyPaths exposes only the installed monitor layout, fixed catalogs, and central Hive state; D8 keeps write access limited to `resources` and the existing lock.
 
 - `/home/teladi/.codex-agents/a1` through `/home/teladi/.codex-agents/a100`
 - `/home/teladi/.codex-agents/b1` through `/home/teladi/.codex-agents/b100`
