@@ -789,6 +789,40 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["allowed"])
         self.assertEqual(result["available_slots"], 8)
 
+    def test_monitor_entrypoint_receives_only_centrally_composed_hive_state_store_without_root_or_environment_api(
+        self,
+    ) -> None:
+        self.assertTrue(hasattr(server_module, "run_resource_monitor"))
+        self.assertTrue(hasattr(server_module, "run_resource_monitor_loop"))
+        with tempfile.TemporaryDirectory() as directory:
+            state = HiveStateStore(Path(directory))
+            runtime = server_module.ResourceGateRuntime(
+                state=state,
+                expected_boot_id="123e4567-e89b-12d3-a456-426614174000",
+                now_utc=lambda: datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+                monotonic_ns=lambda: 0,
+                cgroup_profile=None,
+                cgroup_adapter=None,
+            )
+            with patch.object(
+                server_module,
+                "_compose_resource_gate_runtime",
+                return_value=runtime,
+            ) as compose, patch.object(server_module, "run_resource_monitor_loop") as monitor:
+                self.assertIsNone(server_module.run_resource_monitor())
+
+            compose.assert_called_once_with()
+            monitor.assert_called_once_with(state)
+
+            with patch.object(
+                server_module,
+                "_compose_resource_gate_runtime",
+                return_value=None,
+            ), patch.object(server_module, "run_resource_monitor_loop") as unavailable_monitor:
+                with self.assertRaisesRegex(AgentError, "^resource_monitor_unavailable$"):
+                    server_module.run_resource_monitor()
+            unavailable_monitor.assert_not_called()
+
     def test_g5_offer_reads_one_injected_fresh_facts_snapshot(self) -> None:
         class FakeCgroupAdapter:
             def inspect_preflight(self) -> CgroupPreflightV1:

@@ -1,0 +1,27 @@
+#!/usr/bin/python3
+"""Run the centrally composed resource monitor without accepting roots."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+repository_source = Path(__file__).resolve().parents[1] / "src"
+if repository_source.is_dir():
+    sys.path.insert(0, str(repository_source))
+
+
+def main() -> int:
+    if len(sys.argv) != 1:
+        return 64
+    try:
+        from codex_master.server import run_resource_monitor
+
+        run_resource_monitor()
+    except Exception:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

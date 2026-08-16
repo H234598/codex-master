@@ -9,6 +9,14 @@ Versioned local Wiki sources start at [docs/wiki/Home.md](docs/wiki/Home.md).
 They remain canonical in this repository; no GitHub Wiki publication is implied.
 Fleet-Overview, G-Serie and Goddess-Reporting contract: [docs/operations/goddess-reporting.md](docs/operations/goddess-reporting.md).
 
+The codex-master-resource-monitor.service is delivered but not installed or active.
+It runs the argument-free `%h/.local/bin/codex-master-resource-monitor` entrypoint,
+which receives only the centrally composed Hive state store and publishes complete
+one-Hz generations under its fixed `resources` subtree. No installer, MCP tool, or standard test enables or starts this unit. A later H4 installer must initialize the
+private `resources` directory and existing Hive lock before activation. Installation
+and activation remain a separate operator action after external review; this delivery
+makes no H2 claim.
+
 - `/home/teladi/.codex-agents/a1` through `/home/teladi/.codex-agents/a100`
 - `/home/teladi/.codex-agents/b1` through `/home/teladi/.codex-agents/b100`
 - `/home/teladi/.codex-agents/c1` through `/home/teladi/.codex-agents/c100`

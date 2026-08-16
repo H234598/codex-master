@@ -1,0 +1,30 @@
+[Unit]
+Description=Codex Master Resource Monitor
+Documentation=man:systemd.service(5)
+
+[Service]
+Type=exec
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+KeyringMode=private
+ProtectSystem=strict
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+IPAddressDeny=any
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+UMask=0077
+ReadOnlyPaths=%h/.local/bin/codex-master-resource-monitor %h/.local/state/codex-master-mcp/hive /usr/bin/python3 /usr/bin/sensors /proc/loadavg /proc/meminfo /proc/stat /proc/pressure/cpu /proc/pressure/io /proc/pressure/memory /proc/sys/kernel/random/boot_id
+ReadWritePaths=%h/.local/state/codex-master-mcp/hive/resources %h/.local/state/codex-master-mcp/hive/.hive-state.lock
+ExecStart=%h/.local/bin/codex-master-resource-monitor

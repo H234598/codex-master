@@ -11,7 +11,7 @@ import stat
 import subprocess
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -40,10 +40,35 @@ _SENSORS_STDOUT_MAX_BYTES = 512 * 1024
 _SENSORS_STDERR_MAX_BYTES = 16 * 1024
 _SENSORS_TIMEOUT_SECONDS = 1.0
 _ONE_SECOND_NS = 1_000_000_000
+_SAMPLE_INTERVAL_JITTER_NS = 100_000_000
+_SAMPLE_INTERVAL_JITTER = timedelta(milliseconds=100)
 _MAX_SAMPLE_BUCKETS = 60
 _MIN_COMPLETE_SAMPLES = 10
 _MAX_AVAILABLE_MEMORY_MIB = ((1 << 63) - 1) // 1024
 _DECIMAL = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
+_THERMAL_FIELD = re.compile(r"^temp([1-9][0-9]*)_([a-z][a-z0-9_]*)$")
+_THERMAL_FIELD_SUFFIXES = frozenset(
+    (
+        "alarm",
+        "beep",
+        "crit",
+        "crit_alarm",
+        "crit_hyst",
+        "emergency",
+        "emergency_hyst",
+        "fault",
+        "high",
+        "hyst",
+        "input",
+        "lcrit",
+        "low",
+        "max",
+        "max_hyst",
+        "min",
+        "offset",
+        "type",
+    )
+)
 _RESOURCE_SNAPSHOT_PATH = PurePosixPath("resources/resource-snapshot-v1.json")
 _THERMAL_POLICY_PATH = PurePosixPath("resources/thermal-policy-v1.json")
 _THERMAL_POLICY_FIELDS = frozenset(("schema_version", "sensor_thresholds"))
@@ -189,6 +214,7 @@ class ResourceSampleV1:
     cgroup_state: Literal["unavailable"]
     thermal_state: Literal["warming_up", "no_valid_sensors", "ready", "monitor_unavailable"]
     thermal_policy: ThermalPolicyV1 | None
+    thermal_pressure_high: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "boot_id", _require_canonical_boot_id(self.boot_id))
@@ -209,6 +235,8 @@ class ResourceSampleV1:
         object.__setattr__(self, "cgroup_state", "unavailable")
         object.__setattr__(self, "thermal_state", _require_thermal_state(self.thermal_state))
         if self.thermal_policy is not None and not isinstance(self.thermal_policy, ThermalPolicyV1):
+            _invalid()
+        if type(self.thermal_pressure_high) is not bool:
             _invalid()
 
 
@@ -970,6 +998,20 @@ def write_resource_snapshot(state: HiveStateStore, snapshot: ResourceSnapshotV1)
         _invalid()
 
 
+def _stored_resource_generation(state: HiveStateStore) -> tuple[str | None, int]:
+    try:
+        raw = state.read_private_bytes(_RESOURCE_SNAPSHOT_PATH, max_bytes=_RESOURCE_DOCUMENT_MAX_BYTES)
+    except HiveStateError as exc:
+        if str(exc) == "state_not_found":
+            return None, 0
+        _monitor_unavailable()
+    try:
+        snapshot = _snapshot_from_stored_document(_decode_resource_document(raw))
+        return snapshot.boot_id, snapshot.generation
+    except ResourceSnapshotError:
+        _monitor_unavailable()
+
+
 def read_thermal_policy(state: HiveStateStore) -> ThermalPolicyV1 | None:
     """Read the independent normalized thermal policy, if one was derived."""
 
@@ -1142,11 +1184,12 @@ def _parse_psi(raw: bytes, *, require_full: bool) -> float:
         lines = raw.decode("ascii").splitlines()
     except UnicodeDecodeError:
         _monitor_unavailable()
-    expected = {"some", "full"} if require_full else {"some"}
+    allowed = {"some", "full"}
+    required = allowed if require_full else {"some"}
     parsed: dict[str, float] = {}
     for line in lines:
         fields = line.split()
-        if len(fields) != 5 or fields[0] not in expected or fields[0] in parsed:
+        if len(fields) != 5 or fields[0] not in allowed or fields[0] in parsed:
             _monitor_unavailable()
         values: dict[str, str] = {}
         for field in fields[1:]:
@@ -1161,7 +1204,7 @@ def _parse_psi(raw: bytes, *, require_full: bool) -> float:
         if not values["total"].isdigit() or int(values["total"]) > (1 << 63) - 1:
             _monitor_unavailable()
         parsed[fields[0]] = _strict_decimal(values["avg10"])
-    if set(parsed) != expected:
+    if not required.issubset(parsed):
         _monitor_unavailable()
     return parsed["some"]
 
@@ -1220,13 +1263,77 @@ def _sensor_number(value: object) -> float:
     return float(value)
 
 
-def resolve_thermal_policy(
-    sensor_document: Mapping[str, object], *, configured_candidates: Sequence[ThermalCandidate]
-) -> ThermalPolicyV1 | None:
-    """Derive only normalized thresholds from one strict current sensor document."""
-
-    if not isinstance(sensor_document, Mapping) or len(sensor_document) > 256:
+def _sensor_metadata_number(value: object) -> None:
+    if type(value) not in {int, float} or not math.isfinite(value) or not -1_000_000 <= value <= 1_000_000:
         _thermal_unavailable()
+
+
+def _thermal_reading(
+    reading: object,
+    *,
+    require_raw_threshold: bool = True,
+    ignore_unusable_raw_threshold: bool = False,
+) -> tuple[float, float | None, float | None] | None:
+    if not isinstance(reading, Mapping) or len(reading) > 32:
+        _thermal_unavailable()
+    fields: dict[str, object] = {}
+    stems: set[str] = set()
+    extras: set[str] = set()
+    for key, value in reading.items():
+        if not isinstance(key, str):
+            _thermal_unavailable()
+        if key in {"show_in_panel", "user_formula"}:
+            extras.add(key)
+            continue
+        match = _THERMAL_FIELD.fullmatch(key)
+        if match is None:
+            if key.startswith("temp"):
+                _thermal_unavailable()
+            extras.add(key)
+            continue
+        stem, suffix = match.groups()
+        if suffix not in _THERMAL_FIELD_SUFFIXES or suffix in fields:
+            _thermal_unavailable()
+        stems.add(stem)
+        fields[suffix] = value
+    if not fields:
+        return None
+    if len(stems) != 1 or extras - {"show_in_panel", "user_formula"}:
+        _thermal_unavailable()
+    if "input" not in fields:
+        _thermal_unavailable()
+    unusable_raw_threshold = False
+    for suffix, value in fields.items():
+        if suffix == "input":
+            _sensor_number(value)
+        elif suffix in {"max", "crit"}:
+            if type(value) not in {int, float} or not math.isfinite(value):
+                _thermal_unavailable()
+            if not 0 < value <= 200:
+                if ignore_unusable_raw_threshold:
+                    unusable_raw_threshold = True
+                else:
+                    _sensor_number(value)
+        else:
+            _sensor_metadata_number(value)
+    if "show_in_panel" in reading and reading["show_in_panel"] is not True:
+        _thermal_unavailable()
+    if "user_formula" in reading and reading["user_formula"] != "":
+        _thermal_unavailable()
+    if unusable_raw_threshold:
+        return None
+    if require_raw_threshold and not ({"max", "crit"} & fields.keys()):
+        return None
+    return (
+        _sensor_number(fields["input"]),
+        _sensor_number(fields["max"]) if "max" in fields else None,
+        _sensor_number(fields["crit"]) if "crit" in fields else None,
+    )
+
+
+def _configured_thermal_measurement(
+    sensor_document: Mapping[str, object], *, configured_candidates: Sequence[ThermalCandidate]
+) -> tuple[ThermalPolicyV1 | None, bool]:
     candidates = tuple(configured_candidates)
     if len(candidates) > 256 or any(not isinstance(candidate, ThermalCandidate) for candidate in candidates):
         _thermal_unavailable()
@@ -1252,6 +1359,7 @@ def resolve_thermal_policy(
         if any((chip, _normalize_sensor_component(label)) not in known_labels for label in labels):
             _thermal_unavailable()
     thresholds: dict[str, float] = {}
+    pressure = False
     for candidate in candidates:
         chip = chips.get(candidate.chip)
         if chip is None:
@@ -1264,27 +1372,77 @@ def resolve_thermal_policy(
             _thermal_unavailable()
         if not matching:
             continue
-        reading = matching[0]
-        allowed = {"temp1_input", "temp1_high", "temp1_max", "temp1_crit", "show_in_panel", "user_formula"}
-        if set(reading) - allowed or "temp1_input" not in reading:
+        parsed = _thermal_reading(matching[0], require_raw_threshold=candidate.high is None)
+        if parsed is None:
             _thermal_unavailable()
-        _sensor_number(reading["temp1_input"])
-        if "show_in_panel" in reading and reading["show_in_panel"] is not True:
-            _thermal_unavailable()
-        if "user_formula" in reading and reading["user_formula"] != "":
-            _thermal_unavailable()
-        if candidate.high is not None:
-            threshold = candidate.high
-        elif "temp1_max" in reading:
-            threshold = _sensor_number(reading["temp1_max"])
-        elif "temp1_crit" in reading:
-            threshold = _sensor_number(reading["temp1_crit"]) * 0.9
-        else:
-            _thermal_unavailable()
-        thresholds[candidate.sensor_id] = _require_temperature(threshold)
+        current, maximum, critical = parsed
+        threshold = candidate.high
+        if threshold is None:
+            threshold = maximum if maximum is not None else critical * 0.9  # type: ignore[operator]
+        threshold = _require_temperature(threshold)
+        thresholds[candidate.sensor_id] = threshold
+        pressure = pressure or current >= threshold
     if not thresholds:
-        return None
-    return ThermalPolicyV1(schema_version=_SCHEMA_VERSION, sensor_thresholds=thresholds)
+        return None, False
+    return ThermalPolicyV1(schema_version=_SCHEMA_VERSION, sensor_thresholds=thresholds), pressure
+
+
+def _discovered_thermal_measurement(
+    sensor_document: Mapping[str, object],
+) -> tuple[ThermalPolicyV1 | None, bool]:
+    thresholds: dict[str, float] = {}
+    pressure = False
+    normalized_thermal_chips: set[str] = set()
+    for chip, payload in sensor_document.items():
+        if not isinstance(chip, str) or not isinstance(payload, Mapping) or len(payload) > 256:
+            _thermal_unavailable()
+        discovered: list[tuple[str, tuple[float, float | None, float | None]]] = []
+        for label, reading in payload.items():
+            if label == "Adapter":
+                continue
+            if not isinstance(label, str):
+                _thermal_unavailable()
+            parsed = _thermal_reading(reading, ignore_unusable_raw_threshold=True)
+            if parsed is not None:
+                discovered.append((label, parsed))
+        if not discovered:
+            continue
+        adapter = payload.get("Adapter")
+        if not isinstance(adapter, str):
+            _thermal_unavailable()
+        normalized_chip = _normalize_sensor_component(chip)
+        if normalized_chip in normalized_thermal_chips:
+            _thermal_unavailable()
+        normalized_thermal_chips.add(normalized_chip)
+        normalized_adapter = _normalize_sensor_component(adapter)
+        normalized_labels: set[str] = set()
+        for label, (current, maximum, critical) in discovered:
+            normalized_label = _normalize_sensor_component(label)
+            if normalized_label in normalized_labels:
+                _thermal_unavailable()
+            normalized_labels.add(normalized_label)
+            sensor_id = f"{normalized_chip}:{normalized_adapter}:{normalized_label}"
+            if sensor_id in thresholds:
+                _thermal_unavailable()
+            threshold = maximum if maximum is not None else critical * 0.9  # type: ignore[operator]
+            threshold = _require_temperature(threshold)
+            thresholds[sensor_id] = threshold
+            pressure = pressure or current >= threshold
+    if not thresholds:
+        return None, False
+    return ThermalPolicyV1(schema_version=_SCHEMA_VERSION, sensor_thresholds=thresholds), pressure
+
+
+def resolve_thermal_policy(
+    sensor_document: Mapping[str, object], *, configured_candidates: Sequence[ThermalCandidate]
+) -> ThermalPolicyV1 | None:
+    """Resolve the compatibility API for an explicit candidate sequence."""
+
+    if not isinstance(sensor_document, Mapping) or len(sensor_document) > 256:
+        _thermal_unavailable()
+    return _configured_thermal_measurement(
+        sensor_document, configured_candidates=configured_candidates
+    )[0]
 
 
 def collect_resource_sample(
@@ -1292,14 +1450,14 @@ def collect_resource_sample(
     paths: ResourceInputPaths,
     *,
     clocks: ResourceClocks,
-    candidates: Sequence[ThermalCandidate],
+    candidates: Sequence[ThermalCandidate] | None,
     completed_sample_count: int,
 ) -> ResourceSampleV1:
     """Read one complete bounded sample through injected inputs only."""
 
     if not isinstance(paths, ResourceInputPaths) or not isinstance(clocks, ResourceClocks):
         _invalid()
-    if type(completed_sample_count) is not int or not 0 <= completed_sample_count <= _MAX_SAMPLE_BUCKETS:
+    if type(completed_sample_count) is not int or not 1 <= completed_sample_count <= _MAX_SAMPLE_BUCKETS:
         _invalid()
     load1 = _parse_loadavg(_read_kernel_bytes(backend, paths.loadavg, maximum=_KERNEL_INPUT_MAX_BYTES))
     total_kib, available_kib = _parse_meminfo(
@@ -1314,6 +1472,7 @@ def collect_resource_sample(
     boot_id = _parse_boot_id(_read_kernel_bytes(backend, paths.boot_id, maximum=_BOOT_ID_MAX_BYTES))
     available_memory_percent = available_kib / total_kib * 100.0
     memory = (total_kib - available_kib) * 100.0 / total_kib
+    thermal_pressure_high = False
     try:
         sensor_raw = backend.run_sensors_json(
             argv=("/usr/bin/sensors", "-j"),
@@ -1323,11 +1482,17 @@ def collect_resource_sample(
             max_stdout_bytes=_SENSORS_STDOUT_MAX_BYTES,
             max_stderr_bytes=_SENSORS_STDERR_MAX_BYTES,
         )
+        sensor_document = _decode_sensor_document(sensor_raw)
+        if candidates is None:
+            policy, thermal_pressure_high = _discovered_thermal_measurement(sensor_document)
+        else:
+            policy, thermal_pressure_high = _configured_thermal_measurement(
+                sensor_document, configured_candidates=candidates
+            )
     except Exception:
         thermal_state: Literal["warming_up", "no_valid_sensors", "ready", "monitor_unavailable"] = "monitor_unavailable"
         policy = None
     else:
-        policy = resolve_thermal_policy(_decode_sensor_document(sensor_raw), configured_candidates=candidates)
         if completed_sample_count < _MIN_COMPLETE_SAMPLES:
             thermal_state = "warming_up"
         else:
@@ -1349,7 +1514,94 @@ def collect_resource_sample(
         cgroup_state="unavailable",
         thermal_state=thermal_state,
         thermal_policy=policy,
+        thermal_pressure_high=thermal_pressure_high,
     )
+
+
+def run_resource_monitor(
+    state: HiveStateStore,
+    *,
+    backend: ResourceInputBackend | None = None,
+    clocks: ResourceClocks | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Continuously publish complete one-Hz generations through one authorized store."""
+
+    store = _require_state(state)
+    if clocks is None:
+        clocks = ResourceClocks(
+            now_utc=lambda: datetime.now(timezone.utc),
+            monotonic_ns=time.monotonic_ns,
+        )
+    if not isinstance(clocks, ResourceClocks) or not callable(sleep):
+        _invalid()
+    if backend is None:
+        backend = HostResourceInputBackend(monotonic_seconds=time.monotonic)
+
+    generation_boot_id, prior_generation = _stored_resource_generation(store)
+    samples: list[ResourceSampleV1] = []
+    published_thermal_policy: ThermalPolicyV1 | None = None
+    paths = ResourceInputPaths()
+    next_deadline_ns = _require_positive_int(clocks.monotonic_ns()) + _ONE_SECOND_NS
+    while True:
+        sample: ResourceSampleV1 | None = None
+        try:
+            sample = collect_resource_sample(
+                backend,
+                paths,
+                clocks=clocks,
+                candidates=None,
+                completed_sample_count=len(samples) + 1,
+            )
+        except ResourceSnapshotError:
+            samples.clear()
+        try:
+            now_monotonic_ns = _require_positive_int(clocks.monotonic_ns())
+        except (ResourceSnapshotError, Exception):
+            _monitor_unavailable()
+        if now_monotonic_ns > next_deadline_ns:
+            samples.clear()
+            next_deadline_ns = now_monotonic_ns + 2 * _ONE_SECOND_NS
+            sleep(1.0)
+            continue
+        if sample is not None:
+            if generation_boot_id != sample.boot_id:
+                generation_boot_id = sample.boot_id
+                prior_generation = 0
+                samples.clear()
+            if samples and sample.thermal_policy != samples[0].thermal_policy:
+                samples = [
+                    replace(
+                        sample,
+                        thermal_state=(
+                            "monitor_unavailable"
+                            if sample.thermal_state == "monitor_unavailable"
+                            else "warming_up"
+                        ),
+                    )
+                ]
+            else:
+                samples.append(sample)
+            if len(samples) > _MAX_SAMPLE_BUCKETS:
+                del samples[:-_MAX_SAMPLE_BUCKETS]
+            if len(samples) >= _MIN_COMPLETE_SAMPLES:
+                try:
+                    snapshot = build_monitor_snapshot(
+                        samples,
+                        prior_generation=prior_generation,
+                        clocks=clocks,
+                    )
+                    snapshot_policy = samples[-1].thermal_policy
+                    if snapshot_policy is not None and snapshot_policy != published_thermal_policy:
+                        write_thermal_policy(store, snapshot_policy)
+                    write_resource_snapshot(store, snapshot)
+                except ResourceSnapshotError:
+                    samples.clear()
+                else:
+                    prior_generation = snapshot.generation
+                    published_thermal_policy = snapshot_policy
+        sleep(max(0.0, (next_deadline_ns - now_monotonic_ns) / _ONE_SECOND_NS))
+        next_deadline_ns += _ONE_SECOND_NS
 
 
 def _mean(samples: Sequence[ResourceSampleV1], dimension: str) -> float:
@@ -1394,11 +1646,15 @@ def build_monitor_snapshot(
     if len(samples) > _MAX_SAMPLE_BUCKETS or any(not isinstance(sample, ResourceSampleV1) for sample in samples):
         _invalid()
     first = samples[0]
+    if any(sample.thermal_policy != first.thermal_policy for sample in samples[1:]):
+        _thermal_unavailable()
     for previous, current in zip(samples, samples[1:]):
+        monotonic_interval = current.observed_monotonic_ns - previous.observed_monotonic_ns
+        utc_interval = current.observed_at_utc - previous.observed_at_utc
         if (
             current.boot_id != first.boot_id
-            or current.observed_monotonic_ns - previous.observed_monotonic_ns != _ONE_SECOND_NS
-            or current.observed_at_utc - previous.observed_at_utc != timedelta(seconds=1)
+            or abs(monotonic_interval - _ONE_SECOND_NS) > _SAMPLE_INTERVAL_JITTER_NS
+            or abs(utc_interval - timedelta(seconds=1)) > _SAMPLE_INTERVAL_JITTER
         ):
             _invalid()
     latest = samples[-1]
@@ -1425,17 +1681,26 @@ def build_monitor_snapshot(
     }
     pressure = {dimension: int(round(latest.current[dimension])) for dimension in _DIMENSIONS}
     headroom = {dimension: 100 - pressure[dimension] for dimension in _DIMENSIONS}
-    reasons: tuple[str, ...] = ("resource_ready",)
+    reasons_list: list[str] = []
     gate_state: Literal["ready", "blocked"] = "ready"
     bottleneck: Literal["cpu", "io", "memory", "thermal", "cgroup", "unknown"] = "unknown"
-    if latest.thermal_state in {"warming_up", "monitor_unavailable"}:
-        reasons = ("temperature_monitor_unavailable",)
+    if latest.thermal_state == "warming_up" or any(
+        sample.thermal_state == "monitor_unavailable" for sample in samples
+    ):
+        reasons_list.append("temperature_monitor_unavailable")
         gate_state = "blocked"
         bottleneck = "thermal"
-    elif latest.cgroup_state != "ready":
-        reasons = ("cgroup_preflight_failed",)
-        gate_state = "blocked"
-        bottleneck = "cgroup"
+    else:
+        if latest.cgroup_state != "ready":
+            reasons_list.append("cgroup_preflight_failed")
+            gate_state = "blocked"
+            bottleneck = "cgroup"
+        if any(sample.thermal_pressure_high for sample in samples):
+            reasons_list.append("temperature_pressure_high")
+            gate_state = "blocked"
+            if bottleneck == "unknown":
+                bottleneck = "thermal"
+    reasons = tuple(reasons_list) if reasons_list else ("resource_ready",)
     return ResourceSnapshotV1(
         schema_version=_SCHEMA_VERSION,
         boot_id=latest.boot_id,
