@@ -1313,7 +1313,7 @@ def _thermal_reading(
                 if ignore_unusable_raw_threshold:
                     unusable_raw_threshold = True
                 else:
-                    _sensor_number(value)
+                    _thermal_unavailable()
         else:
             _sensor_metadata_number(value)
     if "show_in_panel" in reading and reading["show_in_panel"] is not True:

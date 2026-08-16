@@ -1756,6 +1756,29 @@ def test_explicit_candidate_high_accepts_same_stem_input_without_raw_max_or_crit
     )
 
 
+@pytest.mark.parametrize("threshold_suffix", ("max", "crit"))
+def test_configured_raw_zero_threshold_fails_as_temperature_monitor_unavailable(
+    threshold_suffix: str,
+) -> None:
+    document = {
+        "coretemp-isa-0000": {
+            "Adapter": "ISA adapter",
+            "Package id 0": {
+                "temp2_input": 70.0,
+                f"temp2_{threshold_suffix}": 0.0,
+            },
+        }
+    }
+
+    with pytest.raises(ResourceSnapshotError, match="^temperature_monitor_unavailable$"):
+        resolve_thermal_policy(
+            document,
+            configured_candidates=[
+                ThermalCandidate("coretemp-isa-0000", "ISA adapter", "Package id 0")
+            ],
+        )
+
+
 @pytest.mark.parametrize(
     "reading",
     (
