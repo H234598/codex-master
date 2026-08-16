@@ -70,6 +70,7 @@ _SNAPSHOT_FIELDS = frozenset(
         "cgroup_state",
         "thermal_state",
         "available_memory_mib",
+        "legacy_pressure",
     )
 )
 
@@ -158,12 +159,32 @@ class ThermalCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class CpuCountersV1:
+    """Private one-read CPU counter evidence for legacy delta gates."""
+
+    logical_cpu_count: int
+    total_ticks: int
+    busy_ticks: int
+    io_wait_ticks: int
+
+    def __post_init__(self) -> None:
+        values = (self.logical_cpu_count, self.total_ticks, self.busy_ticks, self.io_wait_ticks)
+        if any(type(value) is not int or value < 0 or value > (1 << 63) - 1 for value in values):
+            _invalid()
+        if self.logical_cpu_count == 0 or self.total_ticks == 0 or self.busy_ticks + self.io_wait_ticks > self.total_ticks:
+            _invalid()
+
+
+@dataclass(frozen=True, slots=True)
 class ResourceSampleV1:
     boot_id: str
     observed_at_utc: datetime
     observed_monotonic_ns: int
     current: Mapping[str, float]
     available_memory_mib: int
+    load1: float
+    available_memory_percent: float
+    cpu_counters: CpuCountersV1
     cgroup_state: Literal["unavailable"]
     thermal_state: Literal["warming_up", "no_valid_sensors", "ready", "monitor_unavailable"]
     thermal_policy: ThermalPolicyV1 | None
@@ -174,6 +195,14 @@ class ResourceSampleV1:
         object.__setattr__(self, "observed_monotonic_ns", _require_positive_int(self.observed_monotonic_ns))
         object.__setattr__(self, "current", _require_metric_mapping(self.current))
         object.__setattr__(self, "available_memory_mib", _require_available_memory_mib(self.available_memory_mib))
+        object.__setattr__(self, "load1", _require_legacy_pressure_float(self.load1))
+        object.__setattr__(
+            self,
+            "available_memory_percent",
+            _require_legacy_pressure_float(self.available_memory_percent, maximum=100.0),
+        )
+        if not isinstance(self.cpu_counters, CpuCountersV1):
+            _invalid()
         if self.cgroup_state != "unavailable":
             _invalid()
         object.__setattr__(self, "cgroup_state", "unavailable")
@@ -328,6 +357,34 @@ class TrendAssessmentV1:
 
 
 @dataclass(frozen=True, slots=True)
+class LegacyPressureV1:
+    """Private legacy admission evidence from one validated monitor generation."""
+
+    load_per_cpu: float
+    cpu_busy_percent: float
+    io_wait_percent: float
+    available_memory_percent: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "load_per_cpu", _require_legacy_pressure_float(self.load_per_cpu))
+        object.__setattr__(
+            self,
+            "cpu_busy_percent",
+            _require_legacy_pressure_float(self.cpu_busy_percent, maximum=100.0),
+        )
+        object.__setattr__(
+            self,
+            "io_wait_percent",
+            _require_legacy_pressure_float(self.io_wait_percent, maximum=100.0),
+        )
+        object.__setattr__(
+            self,
+            "available_memory_percent",
+            _require_legacy_pressure_float(self.available_memory_percent, maximum=100.0),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ResourceSnapshotV1:
     schema_version: int
     boot_id: str
@@ -339,6 +396,7 @@ class ResourceSnapshotV1:
     reason_codes: tuple[str, ...]
     current: Mapping[str, float]
     available_memory_mib: int
+    legacy_pressure: LegacyPressureV1
     mean_1m: Mapping[str, float]
     mean_10m: Mapping[str, float]
     peak_10m: Mapping[str, float]
@@ -364,6 +422,8 @@ class ResourceSnapshotV1:
         object.__setattr__(self, "reason_codes", _require_identifiers(self.reason_codes, pattern=_IDENTIFIER, maximum=16))
         object.__setattr__(self, "current", _require_metric_mapping(self.current))
         object.__setattr__(self, "available_memory_mib", _require_available_memory_mib(self.available_memory_mib))
+        if not isinstance(self.legacy_pressure, LegacyPressureV1):
+            _invalid()
         object.__setattr__(self, "mean_1m", _require_metric_mapping(self.mean_1m))
         object.__setattr__(self, "mean_10m", _require_metric_mapping(self.mean_10m))
         object.__setattr__(self, "peak_10m", _require_metric_mapping(self.peak_10m))
@@ -388,6 +448,7 @@ class ResourceGateFacts:
     reason_codes: tuple[str, ...]
     current: Mapping[str, float]
     available_memory_mib: int
+    legacy_pressure: LegacyPressureV1
     normalized_pressure: Mapping[str, int]
     normalized_headroom: Mapping[str, int]
     bottleneck: str
@@ -402,6 +463,8 @@ class ResourceGateFacts:
         object.__setattr__(self, "reason_codes", _require_identifiers(self.reason_codes, pattern=_IDENTIFIER, maximum=16))
         object.__setattr__(self, "current", _require_metric_mapping(self.current))
         object.__setattr__(self, "available_memory_mib", _require_available_memory_mib(self.available_memory_mib))
+        if not isinstance(self.legacy_pressure, LegacyPressureV1):
+            _invalid()
         object.__setattr__(self, "normalized_pressure", _require_percentage_mapping(self.normalized_pressure))
         object.__setattr__(self, "normalized_headroom", _require_percentage_mapping(self.normalized_headroom))
         object.__setattr__(self, "bottleneck", _require_bottleneck(self.bottleneck))
@@ -618,6 +681,14 @@ def _require_gate_state(value: object) -> Literal["ready", "blocked"]:
     return value  # type: ignore[return-value]
 
 
+def _require_legacy_pressure_float(value: object, *, maximum: float | None = None) -> float:
+    if type(value) is not float or not math.isfinite(value) or value < 0:
+        _invalid()
+    if maximum is not None and value > maximum:
+        _invalid()
+    return value
+
+
 def _require_bottleneck(value: object) -> Literal["cpu", "io", "memory", "thermal", "cgroup", "unknown"]:
     if not isinstance(value, str) or value not in _BOTTLENECKS:
         _invalid()
@@ -634,6 +705,22 @@ def _require_thermal_state(value: object) -> Literal["warming_up", "no_valid_sen
     if not isinstance(value, str) or value not in _THERMAL_STATES:
         _invalid()
     return value  # type: ignore[return-value]
+
+
+def _require_legacy_pressure(value: object) -> LegacyPressureV1:
+    if not isinstance(value, Mapping) or set(value) != {
+        "load_per_cpu",
+        "cpu_busy_percent",
+        "io_wait_percent",
+        "available_memory_percent",
+    }:
+        _invalid()
+    return LegacyPressureV1(
+        load_per_cpu=value["load_per_cpu"],  # type: ignore[arg-type]
+        cpu_busy_percent=value["cpu_busy_percent"],  # type: ignore[arg-type]
+        io_wait_percent=value["io_wait_percent"],  # type: ignore[arg-type]
+        available_memory_percent=value["available_memory_percent"],  # type: ignore[arg-type]
+    )
 
 
 def parse_snapshot_document(
@@ -659,6 +746,7 @@ def parse_snapshot_document(
         reason_codes=payload["reason_codes"],
         current=payload["current"],
         available_memory_mib=payload["available_memory_mib"],
+        legacy_pressure=_require_legacy_pressure(payload["legacy_pressure"]),
         mean_1m=payload["mean_1m"],
         mean_10m=payload["mean_10m"],
         peak_10m=payload["peak_10m"],
@@ -758,6 +846,7 @@ def _snapshot_from_stored_document(payload: Mapping[str, object]) -> ResourceSna
         reason_codes=payload["reason_codes"],
         current=payload["current"],
         available_memory_mib=payload["available_memory_mib"],
+        legacy_pressure=_require_legacy_pressure(payload["legacy_pressure"]),
         mean_1m=payload["mean_1m"],
         mean_10m=payload["mean_10m"],
         peak_10m=payload["peak_10m"],
@@ -796,6 +885,12 @@ def _snapshot_document(snapshot: ResourceSnapshotV1) -> Mapping[str, object]:
         "reason_codes": list(snapshot.reason_codes),
         "current": dict(snapshot.current),
         "available_memory_mib": snapshot.available_memory_mib,
+        "legacy_pressure": {
+            "load_per_cpu": snapshot.legacy_pressure.load_per_cpu,
+            "cpu_busy_percent": snapshot.legacy_pressure.cpu_busy_percent,
+            "io_wait_percent": snapshot.legacy_pressure.io_wait_percent,
+            "available_memory_percent": snapshot.legacy_pressure.available_memory_percent,
+        },
         "mean_1m": dict(snapshot.mean_1m),
         "mean_10m": dict(snapshot.mean_10m),
         "peak_10m": dict(snapshot.peak_10m),
@@ -925,14 +1020,15 @@ def _strict_decimal(value: object, *, maximum: float = 100.0) -> float:
     return parsed
 
 
-def _parse_loadavg(raw: bytes) -> None:
+def _parse_loadavg(raw: bytes) -> float:
     try:
         fields = raw.decode("ascii").split()
     except UnicodeDecodeError:
         _monitor_unavailable()
     if len(fields) != 5:
         _monitor_unavailable()
-    for value in fields[:3]:
+    load1 = _strict_decimal(fields[0], maximum=1_000_000.0)
+    for value in fields[1:3]:
         _strict_decimal(value, maximum=1_000_000.0)
     try:
         runnable, total = fields[3].split("/", 1)
@@ -942,6 +1038,7 @@ def _parse_loadavg(raw: bytes) -> None:
             _monitor_unavailable()
     except ValueError:
         _monitor_unavailable()
+    return load1
 
 
 def _parse_meminfo(raw: bytes) -> tuple[int, int]:
@@ -964,38 +1061,69 @@ def _parse_meminfo(raw: bytes) -> tuple[int, int]:
             if key in parsed or len(fields) != 3 or fields[2] != "kB":
                 _monitor_unavailable()
             parsed[key] = value
-    if set(parsed) != {"MemTotal:", "MemAvailable:"} or parsed["MemAvailable:"] > parsed["MemTotal:"]:
+    if (
+        set(parsed) != {"MemTotal:", "MemAvailable:"}
+        or parsed["MemTotal:"] <= 0
+        or parsed["MemAvailable:"] > parsed["MemTotal:"]
+    ):
         _monitor_unavailable()
     return parsed["MemTotal:"], parsed["MemAvailable:"]
 
 
-def _parse_cpu_stat(raw: bytes) -> float:
+def _parse_cpu_stat(raw: bytes) -> tuple[CpuCountersV1, float]:
     try:
         lines = raw.decode("ascii").splitlines()
     except UnicodeDecodeError:
         _monitor_unavailable()
     aggregate: list[int] | None = None
+    logical_cpus: set[int] = set()
     for line in lines:
         fields = line.split()
         if not fields:
             _monitor_unavailable()
         if fields[0] == "cpu":
-            if aggregate is not None or len(fields) < 6 or any(not field.isdigit() for field in fields[1:]):
+            if aggregate is not None or len(fields) < 9 or any(not field.isdigit() for field in fields[1:]):
                 _monitor_unavailable()
-            aggregate = [int(field) for field in fields[1:]]
+            try:
+                aggregate = [int(field) for field in fields[1:]]
+            except ValueError:
+                _monitor_unavailable()
         elif re.fullmatch(r"cpu[0-9]+", fields[0]):
-            if len(fields) < 6 or any(not field.isdigit() for field in fields[1:]):
+            if len(fields) < 9 or any(not field.isdigit() for field in fields[1:]):
                 _monitor_unavailable()
-    if aggregate is None:
+            try:
+                counters = [int(field) for field in fields[1:]]
+                index = int(fields[0][3:])
+            except ValueError:
+                _monitor_unavailable()
+            if any(counter > (1 << 63) - 1 for counter in counters):
+                _monitor_unavailable()
+            if fields[0] != f"cpu{index}" or index in logical_cpus:
+                _monitor_unavailable()
+            logical_cpus.add(index)
+    if aggregate is None or not logical_cpus or logical_cpus != set(range(len(logical_cpus))):
         _monitor_unavailable()
     values = aggregate
     if any(value > (1 << 63) - 1 for value in values):
         _monitor_unavailable()
-    total = sum(values)
-    if total <= 0:
+    total = sum(values[:8])
+    idle = values[3]
+    io_wait = values[4]
+    busy = total - idle - io_wait
+    if total <= 0 or total > (1 << 63) - 1 or busy < 0:
         _monitor_unavailable()
-    idle = values[3] + values[4]
-    return (total - idle) * 100.0 / total
+    public_total = sum(values)
+    if public_total <= 0:
+        _monitor_unavailable()
+    return (
+        CpuCountersV1(
+            logical_cpu_count=len(logical_cpus),
+            total_ticks=total,
+            busy_ticks=busy,
+            io_wait_ticks=io_wait,
+        ),
+        (public_total - idle - io_wait) * 100.0 / public_total,
+    )
 
 
 def _parse_psi(raw: bytes, *, require_full: bool) -> float:
@@ -1143,15 +1271,18 @@ def collect_resource_sample(
         _invalid()
     if type(completed_sample_count) is not int or not 0 <= completed_sample_count <= _MAX_SAMPLE_BUCKETS:
         _invalid()
-    _parse_loadavg(_read_kernel_bytes(backend, paths.loadavg, maximum=_KERNEL_INPUT_MAX_BYTES))
+    load1 = _parse_loadavg(_read_kernel_bytes(backend, paths.loadavg, maximum=_KERNEL_INPUT_MAX_BYTES))
     total_kib, available_kib = _parse_meminfo(
         _read_kernel_bytes(backend, paths.meminfo, maximum=_KERNEL_INPUT_MAX_BYTES)
     )
-    cpu = _parse_cpu_stat(_read_kernel_bytes(backend, paths.stat, maximum=_KERNEL_INPUT_MAX_BYTES))
+    cpu_counters, current_cpu = _parse_cpu_stat(
+        _read_kernel_bytes(backend, paths.stat, maximum=_KERNEL_INPUT_MAX_BYTES)
+    )
     _parse_psi(_read_kernel_bytes(backend, paths.psi_cpu, maximum=_PSI_INPUT_MAX_BYTES), require_full=False)
     io = _parse_psi(_read_kernel_bytes(backend, paths.psi_io, maximum=_PSI_INPUT_MAX_BYTES), require_full=True)
     _parse_psi(_read_kernel_bytes(backend, paths.psi_memory, maximum=_PSI_INPUT_MAX_BYTES), require_full=True)
     boot_id = _parse_boot_id(_read_kernel_bytes(backend, paths.boot_id, maximum=_BOOT_ID_MAX_BYTES))
+    available_memory_percent = available_kib / total_kib * 100.0
     memory = (total_kib - available_kib) * 100.0 / total_kib
     try:
         sensor_raw = backend.run_sensors_json(
@@ -1180,8 +1311,11 @@ def collect_resource_sample(
         boot_id=boot_id,
         observed_at_utc=observed_at_utc,
         observed_monotonic_ns=observed_monotonic_ns,
-        current={"cpu": cpu, "io": io, "memory": memory},
+        current={"cpu": current_cpu, "io": io, "memory": memory},
         available_memory_mib=available_kib // 1024,
+        load1=load1,
+        available_memory_percent=available_memory_percent,
+        cpu_counters=cpu_counters,
         cgroup_state="unavailable",
         thermal_state=thermal_state,
         thermal_policy=policy,
@@ -1190,6 +1324,31 @@ def collect_resource_sample(
 
 def _mean(samples: Sequence[ResourceSampleV1], dimension: str) -> float:
     return sum(sample.current[dimension] for sample in samples) / len(samples)
+
+
+def _legacy_pressure_from_samples(
+    previous: ResourceSampleV1, latest: ResourceSampleV1
+) -> LegacyPressureV1:
+    prior = previous.cpu_counters
+    current = latest.cpu_counters
+    if prior.logical_cpu_count != current.logical_cpu_count:
+        _monitor_unavailable()
+    total_delta = current.total_ticks - prior.total_ticks
+    busy_delta = current.busy_ticks - prior.busy_ticks
+    io_wait_delta = current.io_wait_ticks - prior.io_wait_ticks
+    if (
+        total_delta <= 0
+        or busy_delta < 0
+        or io_wait_delta < 0
+        or busy_delta + io_wait_delta > total_delta
+    ):
+        _monitor_unavailable()
+    return LegacyPressureV1(
+        load_per_cpu=latest.load1 / current.logical_cpu_count,
+        cpu_busy_percent=busy_delta * 100.0 / total_delta,
+        io_wait_percent=io_wait_delta * 100.0 / total_delta,
+        available_memory_percent=latest.available_memory_percent,
+    )
 
 
 def build_monitor_snapshot(
@@ -1224,6 +1383,7 @@ def build_monitor_snapshot(
         or now_monotonic_ns < latest.observed_monotonic_ns
     ):
         _monitor_unavailable()
+    legacy_pressure = _legacy_pressure_from_samples(samples[-2], latest)
     means = {dimension: _mean(samples, dimension) for dimension in _DIMENSIONS}
     peaks = {dimension: max(sample.current[dimension] for sample in samples) for dimension in _DIMENSIONS}
     assessments = {dimension: classify_trend([round(sample.current[dimension]) for sample in samples]) for dimension in _DIMENSIONS}
@@ -1257,6 +1417,7 @@ def build_monitor_snapshot(
         reason_codes=reasons,
         current=latest.current,
         available_memory_mib=latest.available_memory_mib,
+        legacy_pressure=legacy_pressure,
         mean_1m=means,
         mean_10m=means,
         peak_10m=peaks,
@@ -1281,6 +1442,7 @@ def build_resource_gate_facts(snapshot: ResourceSnapshotV1) -> ResourceGateFacts
         reason_codes=snapshot.reason_codes,
         current=snapshot.current,
         available_memory_mib=snapshot.available_memory_mib,
+        legacy_pressure=snapshot.legacy_pressure,
         normalized_pressure=snapshot.normalized_pressure,
         normalized_headroom=snapshot.normalized_headroom,
         bottleneck=snapshot.bottleneck,
