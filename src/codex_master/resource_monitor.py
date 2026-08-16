@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import selectors
+import stat
+import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Literal
+from typing import Callable, Literal, Protocol
 from uuid import UUID
 
 from codex_master.hive.state import HiveStateError, HiveStateStore
@@ -28,6 +32,16 @@ _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _PROFILE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 _SENSOR_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_:-]{0,127}$")
 _RESOURCE_DOCUMENT_MAX_BYTES = 64 * 1024
+_KERNEL_INPUT_MAX_BYTES = 64 * 1024
+_PSI_INPUT_MAX_BYTES = 4 * 1024
+_BOOT_ID_MAX_BYTES = 128
+_SENSORS_STDOUT_MAX_BYTES = 512 * 1024
+_SENSORS_STDERR_MAX_BYTES = 16 * 1024
+_SENSORS_TIMEOUT_SECONDS = 1.0
+_ONE_SECOND_NS = 1_000_000_000
+_MAX_SAMPLE_BUCKETS = 60
+_MIN_COMPLETE_SAMPLES = 10
+_DECIMAL = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 _RESOURCE_SNAPSHOT_PATH = PurePosixPath("resources/resource-snapshot-v1.json")
 _THERMAL_POLICY_PATH = PurePosixPath("resources/thermal-policy-v1.json")
 _THERMAL_POLICY_FIELDS = frozenset(("schema_version", "sensor_thresholds"))
@@ -60,6 +74,216 @@ _SNAPSHOT_FIELDS = frozenset(
 
 class ResourceSnapshotError(ValueError):
     """A data-sparse resource snapshot validation error."""
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceInputPaths:
+    """Fixed kernel input allowlist; callers cannot select host paths."""
+
+    loadavg: Path = Path("/proc/loadavg")
+    meminfo: Path = Path("/proc/meminfo")
+    stat: Path = Path("/proc/stat")
+    psi_cpu: Path = Path("/proc/pressure/cpu")
+    psi_io: Path = Path("/proc/pressure/io")
+    psi_memory: Path = Path("/proc/pressure/memory")
+    boot_id: Path = Path("/proc/sys/kernel/random/boot_id")
+
+    def __post_init__(self) -> None:
+        expected = (
+            Path("/proc/loadavg"),
+            Path("/proc/meminfo"),
+            Path("/proc/stat"),
+            Path("/proc/pressure/cpu"),
+            Path("/proc/pressure/io"),
+            Path("/proc/pressure/memory"),
+            Path("/proc/sys/kernel/random/boot_id"),
+        )
+        values = (
+            self.loadavg,
+            self.meminfo,
+            self.stat,
+            self.psi_cpu,
+            self.psi_io,
+            self.psi_memory,
+            self.boot_id,
+        )
+        if values != expected:
+            _invalid()
+
+
+class ResourceInputBackend(Protocol):
+    def read_private_kernel_bytes(self, path: Path, *, max_bytes: int) -> bytes: ...
+
+    def run_sensors_json(
+        self,
+        *,
+        argv: tuple[str, str],
+        environment: Mapping[str, str],
+        stdin_closed: bool,
+        timeout_seconds: float,
+        max_stdout_bytes: int,
+        max_stderr_bytes: int,
+    ) -> bytes: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceClocks:
+    now_utc: Callable[[], datetime]
+    monotonic_ns: Callable[[], int]
+
+    def __post_init__(self) -> None:
+        if not callable(self.now_utc) or not callable(self.monotonic_ns):
+            _invalid()
+
+
+@dataclass(frozen=True, slots=True)
+class ThermalCandidate:
+    chip: str
+    adapter: str
+    label: str
+    high: float | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "chip", _normalize_sensor_component(self.chip))
+        object.__setattr__(self, "adapter", _normalize_sensor_component(self.adapter))
+        object.__setattr__(self, "label", _normalize_sensor_component(self.label))
+        if self.high is not None:
+            object.__setattr__(self, "high", _require_temperature(self.high))
+
+    @property
+    def sensor_id(self) -> str:
+        return f"{self.chip}:{self.adapter}:{self.label}"
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceSampleV1:
+    boot_id: str
+    observed_at_utc: datetime
+    observed_monotonic_ns: int
+    current: Mapping[str, float]
+    cgroup_state: Literal["unavailable"]
+    thermal_state: Literal["warming_up", "no_valid_sensors", "ready", "monitor_unavailable"]
+    thermal_policy: ThermalPolicyV1 | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "boot_id", _require_canonical_boot_id(self.boot_id))
+        object.__setattr__(self, "observed_at_utc", _require_utc_datetime(self.observed_at_utc))
+        object.__setattr__(self, "observed_monotonic_ns", _require_positive_int(self.observed_monotonic_ns))
+        object.__setattr__(self, "current", _require_metric_mapping(self.current))
+        if self.cgroup_state != "unavailable":
+            _invalid()
+        object.__setattr__(self, "cgroup_state", "unavailable")
+        object.__setattr__(self, "thermal_state", _require_thermal_state(self.thermal_state))
+        if self.thermal_policy is not None and not isinstance(self.thermal_policy, ThermalPolicyV1):
+            _invalid()
+
+
+class HostResourceInputBackend:
+    """Production adapter for the fixed allowlist; normal tests inject fakes."""
+
+    _allowed_kernel_paths = frozenset(
+        {
+            Path("/proc/loadavg"),
+            Path("/proc/meminfo"),
+            Path("/proc/stat"),
+            Path("/proc/pressure/cpu"),
+            Path("/proc/pressure/io"),
+            Path("/proc/pressure/memory"),
+            Path("/proc/sys/kernel/random/boot_id"),
+        }
+    )
+
+    def __init__(self, *, monotonic_seconds: Callable[[], float]) -> None:
+        if not callable(monotonic_seconds):
+            _invalid()
+        self._monotonic_seconds = monotonic_seconds
+
+    def read_private_kernel_bytes(self, path: Path, *, max_bytes: int) -> bytes:
+        if path not in self._allowed_kernel_paths or type(max_bytes) is not int or max_bytes <= 0:
+            _monitor_unavailable()
+        parent = path.parent
+        try:
+            parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            before = os.fstat(parent_fd)
+            file_fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            try:
+                file_stat = os.fstat(file_fd)
+                if not stat.S_ISREG(file_stat.st_mode):
+                    _monitor_unavailable()
+                data = os.read(file_fd, max_bytes + 1)
+            finally:
+                os.close(file_fd)
+            after = os.fstat(parent_fd)
+        except (OSError, ValueError):
+            _monitor_unavailable()
+        finally:
+            try:
+                os.close(parent_fd)
+            except (OSError, UnboundLocalError):
+                pass
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) or len(data) > max_bytes:
+            _monitor_unavailable()
+        return data
+
+    def run_sensors_json(
+        self,
+        *,
+        argv: tuple[str, str],
+        environment: Mapping[str, str],
+        stdin_closed: bool,
+        timeout_seconds: float,
+        max_stdout_bytes: int,
+        max_stderr_bytes: int,
+    ) -> bytes:
+        if (
+            argv != ("/usr/bin/sensors", "-j")
+            or dict(environment) != {"LC_ALL": "C", "LANG": "C", "PATH": "/usr/bin:/bin"}
+            or stdin_closed is not True
+            or timeout_seconds != _SENSORS_TIMEOUT_SECONDS
+            or max_stdout_bytes != _SENSORS_STDOUT_MAX_BYTES
+            or max_stderr_bytes != _SENSORS_STDERR_MAX_BYTES
+        ):
+            _thermal_unavailable()
+        try:
+            process = subprocess.Popen(
+                argv,
+                close_fds=True,
+                env=dict(environment),
+                stdin=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+            )
+            if process.stdout is None or process.stderr is None:
+                _thermal_unavailable()
+            buffers = {process.stdout: bytearray(), process.stderr: bytearray()}
+            limits = {process.stdout: max_stdout_bytes, process.stderr: max_stderr_bytes}
+            deadline = self._monotonic_seconds() + timeout_seconds
+            with selectors.DefaultSelector() as selector:
+                for stream in buffers:
+                    selector.register(stream, selectors.EVENT_READ)
+                while selector.get_map():
+                    remaining = deadline - self._monotonic_seconds()
+                    if not math.isfinite(remaining) or remaining <= 0:
+                        _thermal_unavailable()
+                    for key, _mask in selector.select(remaining):
+                        stream = key.fileobj
+                        chunk = os.read(stream.fileno(), 8192)
+                        if not chunk:
+                            selector.unregister(stream)
+                            continue
+                        buffers[stream].extend(chunk)
+                        if len(buffers[stream]) > limits[stream]:
+                            _thermal_unavailable()
+            remaining = deadline - self._monotonic_seconds()
+            if not math.isfinite(remaining) or remaining <= 0 or process.wait(timeout=remaining) != 0:
+                _thermal_unavailable()
+        except (OSError, subprocess.SubprocessError, ValueError):
+            _thermal_unavailable()
+        finally:
+            if "process" in locals() and process.poll() is None:
+                process.kill()
+                process.wait()
+        return bytes(buffers[process.stdout])
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,6 +456,14 @@ def _invalid() -> None:
     raise ResourceSnapshotError("resource_snapshot_invalid")
 
 
+def _monitor_unavailable() -> None:
+    raise ResourceSnapshotError("resource_monitor_unavailable")
+
+
+def _thermal_unavailable() -> None:
+    raise ResourceSnapshotError("temperature_monitor_unavailable")
+
+
 def _require_positive_int(value: object) -> int:
     if type(value) is not int or value <= 0:
         _invalid()
@@ -248,6 +480,21 @@ def _require_bounded_number(value: object) -> float:
     if type(value) not in {int, float} or not math.isfinite(value) or not 0 <= value <= 100:
         _invalid()
     return float(value)
+
+
+def _require_temperature(value: object) -> float:
+    if type(value) not in {int, float} or not math.isfinite(value) or not 0 < value <= 200:
+        _invalid()
+    return float(value)
+
+
+def _normalize_sensor_component(value: object) -> str:
+    if not isinstance(value, str) or len(value) > 128:
+        _invalid()
+    normalized = re.sub(r"[^a-z0-9_-]+", "_", value.strip().lower()).strip("_")
+    if not normalized or not _SENSOR_IDENTIFIER.fullmatch(normalized):
+        _invalid()
+    return normalized
 
 
 def _require_metric_mapping(value: object) -> Mapping[str, float]:
@@ -637,6 +884,373 @@ def write_thermal_policy(state: HiveStateStore, policy: ThermalPolicyV1) -> None
             store.replace_private_bytes(_THERMAL_POLICY_PATH, raw)
     except HiveStateError:
         _invalid()
+
+
+def _read_kernel_bytes(backend: ResourceInputBackend, path: Path, *, maximum: int) -> bytes:
+    try:
+        raw = backend.read_private_kernel_bytes(path, max_bytes=maximum)
+    except Exception:
+        _monitor_unavailable()
+    if type(raw) is not bytes or len(raw) > maximum:
+        _monitor_unavailable()
+    return raw
+
+
+def _strict_decimal(value: object, *, maximum: float = 100.0) -> float:
+    if not isinstance(value, str) or not _DECIMAL.fullmatch(value):
+        _monitor_unavailable()
+    try:
+        parsed = float(value)
+    except ValueError:
+        _monitor_unavailable()
+    if not math.isfinite(parsed) or not 0 <= parsed <= maximum:
+        _monitor_unavailable()
+    return parsed
+
+
+def _parse_loadavg(raw: bytes) -> None:
+    try:
+        fields = raw.decode("ascii").split()
+    except UnicodeDecodeError:
+        _monitor_unavailable()
+    if len(fields) != 5:
+        _monitor_unavailable()
+    for value in fields[:3]:
+        _strict_decimal(value, maximum=1_000_000.0)
+    try:
+        runnable, total = fields[3].split("/", 1)
+        if type(int(runnable)) is not int or type(int(total)) is not int or int(total) <= 0 or int(runnable) < 0:
+            _monitor_unavailable()
+        if int(fields[4]) < 0:
+            _monitor_unavailable()
+    except ValueError:
+        _monitor_unavailable()
+
+
+def _parse_meminfo(raw: bytes) -> tuple[int, int]:
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        _monitor_unavailable()
+    parsed: dict[str, int] = {}
+    for line in lines:
+        fields = line.split()
+        if len(fields) not in {2, 3} or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_()]*:", fields[0]):
+            _monitor_unavailable()
+        key = fields[0]
+        if not fields[1].isdigit() or (len(fields) == 3 and fields[2] != "kB"):
+            _monitor_unavailable()
+        value = int(fields[1])
+        if value < 0 or value > (1 << 63) - 1:
+            _monitor_unavailable()
+        if key in {"MemTotal:", "MemAvailable:"}:
+            if key in parsed or len(fields) != 3 or fields[2] != "kB":
+                _monitor_unavailable()
+            parsed[key] = value
+    if set(parsed) != {"MemTotal:", "MemAvailable:"} or parsed["MemAvailable:"] > parsed["MemTotal:"]:
+        _monitor_unavailable()
+    return parsed["MemTotal:"], parsed["MemAvailable:"]
+
+
+def _parse_cpu_stat(raw: bytes) -> float:
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        _monitor_unavailable()
+    aggregate: list[int] | None = None
+    for line in lines:
+        fields = line.split()
+        if not fields:
+            _monitor_unavailable()
+        if fields[0] == "cpu":
+            if aggregate is not None or len(fields) < 6 or any(not field.isdigit() for field in fields[1:]):
+                _monitor_unavailable()
+            aggregate = [int(field) for field in fields[1:]]
+        elif re.fullmatch(r"cpu[0-9]+", fields[0]):
+            if len(fields) < 6 or any(not field.isdigit() for field in fields[1:]):
+                _monitor_unavailable()
+    if aggregate is None:
+        _monitor_unavailable()
+    values = aggregate
+    if any(value > (1 << 63) - 1 for value in values):
+        _monitor_unavailable()
+    total = sum(values)
+    if total <= 0:
+        _monitor_unavailable()
+    idle = values[3] + values[4]
+    return (total - idle) * 100.0 / total
+
+
+def _parse_psi(raw: bytes, *, require_full: bool) -> float:
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        _monitor_unavailable()
+    expected = {"some", "full"} if require_full else {"some"}
+    parsed: dict[str, float] = {}
+    for line in lines:
+        fields = line.split()
+        if len(fields) != 5 or fields[0] not in expected or fields[0] in parsed:
+            _monitor_unavailable()
+        values: dict[str, str] = {}
+        for field in fields[1:]:
+            key, separator, value = field.partition("=")
+            if separator != "=" or key in values:
+                _monitor_unavailable()
+            values[key] = value
+        if set(values) != {"avg10", "avg60", "avg300", "total"}:
+            _monitor_unavailable()
+        for key in ("avg10", "avg60", "avg300"):
+            _strict_decimal(values[key])
+        if not values["total"].isdigit() or int(values["total"]) > (1 << 63) - 1:
+            _monitor_unavailable()
+        parsed[fields[0]] = _strict_decimal(values["avg10"])
+    if set(parsed) != expected:
+        _monitor_unavailable()
+    return parsed["some"]
+
+
+def _parse_boot_id(raw: bytes) -> str:
+    if len(raw) > _BOOT_ID_MAX_BYTES:
+        _monitor_unavailable()
+    try:
+        decoded = raw.decode("ascii")
+    except UnicodeDecodeError:
+        _monitor_unavailable()
+    if not decoded.endswith("\n") or decoded.count("\n") != 1:
+        _monitor_unavailable()
+    try:
+        return _require_canonical_boot_id(decoded[:-1])
+    except ResourceSnapshotError:
+        _monitor_unavailable()
+
+
+def _decode_sensor_document(raw: object) -> Mapping[str, object]:
+    if type(raw) is not bytes or len(raw) > _SENSORS_STDOUT_MAX_BYTES:
+        _thermal_unavailable()
+    try:
+        decoded = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_pairs, parse_constant=_reject_json_constant
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError, ResourceSnapshotError):
+        _thermal_unavailable()
+    if not isinstance(decoded, Mapping) or len(decoded) > 256:
+        _thermal_unavailable()
+    return decoded
+
+
+def _sensor_number(value: object) -> float:
+    if type(value) not in {int, float} or not math.isfinite(value) or not 0 <= value <= 200:
+        _thermal_unavailable()
+    return float(value)
+
+
+def resolve_thermal_policy(
+    sensor_document: Mapping[str, object], *, configured_candidates: Sequence[ThermalCandidate]
+) -> ThermalPolicyV1 | None:
+    """Derive only normalized thresholds from one strict current sensor document."""
+
+    if not isinstance(sensor_document, Mapping) or len(sensor_document) > 256:
+        _thermal_unavailable()
+    candidates = tuple(configured_candidates)
+    if len(candidates) > 256 or any(not isinstance(candidate, ThermalCandidate) for candidate in candidates):
+        _thermal_unavailable()
+    by_id = {candidate.sensor_id: candidate for candidate in candidates}
+    if len(by_id) != len(candidates):
+        _thermal_unavailable()
+    chips: dict[str, tuple[str, Mapping[str, object]]] = {}
+    for chip, payload in sensor_document.items():
+        normalized_chip = _normalize_sensor_component(chip)
+        if normalized_chip in chips or not isinstance(payload, Mapping):
+            _thermal_unavailable()
+        adapter = payload.get("Adapter")
+        if not isinstance(adapter, str):
+            _thermal_unavailable()
+        labels = {key: value for key, value in payload.items() if key != "Adapter"}
+        if not labels or any(not isinstance(key, str) or not isinstance(value, Mapping) for key, value in labels.items()):
+            _thermal_unavailable()
+        chips[normalized_chip] = (_normalize_sensor_component(adapter), labels)
+    known_labels = {(candidate.chip, candidate.label) for candidate in candidates}
+    if set(chips) - {candidate.chip for candidate in candidates}:
+        _thermal_unavailable()
+    for chip, (_adapter, labels) in chips.items():
+        if any((chip, _normalize_sensor_component(label)) not in known_labels for label in labels):
+            _thermal_unavailable()
+    thresholds: dict[str, float] = {}
+    for candidate in candidates:
+        chip = chips.get(candidate.chip)
+        if chip is None:
+            continue
+        adapter, labels = chip
+        if adapter != candidate.adapter:
+            _thermal_unavailable()
+        matching = [value for label, value in labels.items() if _normalize_sensor_component(label) == candidate.label]
+        if len(matching) > 1:
+            _thermal_unavailable()
+        if not matching:
+            continue
+        reading = matching[0]
+        allowed = {"temp1_input", "temp1_high", "temp1_max", "temp1_crit", "show_in_panel", "user_formula"}
+        if set(reading) - allowed or "temp1_input" not in reading:
+            _thermal_unavailable()
+        _sensor_number(reading["temp1_input"])
+        if "show_in_panel" in reading and reading["show_in_panel"] is not True:
+            _thermal_unavailable()
+        if "user_formula" in reading and reading["user_formula"] != "":
+            _thermal_unavailable()
+        if candidate.high is not None:
+            threshold = candidate.high
+        elif "temp1_max" in reading:
+            threshold = _sensor_number(reading["temp1_max"])
+        elif "temp1_crit" in reading:
+            threshold = _sensor_number(reading["temp1_crit"]) * 0.9
+        else:
+            _thermal_unavailable()
+        thresholds[candidate.sensor_id] = _require_temperature(threshold)
+    if not thresholds:
+        return None
+    return ThermalPolicyV1(schema_version=_SCHEMA_VERSION, sensor_thresholds=thresholds)
+
+
+def collect_resource_sample(
+    backend: ResourceInputBackend,
+    paths: ResourceInputPaths,
+    *,
+    clocks: ResourceClocks,
+    candidates: Sequence[ThermalCandidate],
+    completed_sample_count: int,
+) -> ResourceSampleV1:
+    """Read one complete bounded sample through injected inputs only."""
+
+    if not isinstance(paths, ResourceInputPaths) or not isinstance(clocks, ResourceClocks):
+        _invalid()
+    if type(completed_sample_count) is not int or not 0 <= completed_sample_count <= _MAX_SAMPLE_BUCKETS:
+        _invalid()
+    _parse_loadavg(_read_kernel_bytes(backend, paths.loadavg, maximum=_KERNEL_INPUT_MAX_BYTES))
+    total_kib, available_kib = _parse_meminfo(
+        _read_kernel_bytes(backend, paths.meminfo, maximum=_KERNEL_INPUT_MAX_BYTES)
+    )
+    cpu = _parse_cpu_stat(_read_kernel_bytes(backend, paths.stat, maximum=_KERNEL_INPUT_MAX_BYTES))
+    _parse_psi(_read_kernel_bytes(backend, paths.psi_cpu, maximum=_PSI_INPUT_MAX_BYTES), require_full=False)
+    io = _parse_psi(_read_kernel_bytes(backend, paths.psi_io, maximum=_PSI_INPUT_MAX_BYTES), require_full=True)
+    _parse_psi(_read_kernel_bytes(backend, paths.psi_memory, maximum=_PSI_INPUT_MAX_BYTES), require_full=True)
+    boot_id = _parse_boot_id(_read_kernel_bytes(backend, paths.boot_id, maximum=_BOOT_ID_MAX_BYTES))
+    memory = (total_kib - available_kib) * 100.0 / total_kib
+    try:
+        sensor_raw = backend.run_sensors_json(
+            argv=("/usr/bin/sensors", "-j"),
+            environment={"LC_ALL": "C", "LANG": "C", "PATH": "/usr/bin:/bin"},
+            stdin_closed=True,
+            timeout_seconds=_SENSORS_TIMEOUT_SECONDS,
+            max_stdout_bytes=_SENSORS_STDOUT_MAX_BYTES,
+            max_stderr_bytes=_SENSORS_STDERR_MAX_BYTES,
+        )
+    except Exception:
+        thermal_state: Literal["warming_up", "no_valid_sensors", "ready", "monitor_unavailable"] = "monitor_unavailable"
+        policy = None
+    else:
+        policy = resolve_thermal_policy(_decode_sensor_document(sensor_raw), configured_candidates=candidates)
+        if completed_sample_count < _MIN_COMPLETE_SAMPLES:
+            thermal_state = "warming_up"
+        else:
+            thermal_state = "ready" if policy is not None else "no_valid_sensors"
+    try:
+        observed_at_utc = _require_utc_datetime(clocks.now_utc())
+        observed_monotonic_ns = _require_positive_int(clocks.monotonic_ns())
+    except (ResourceSnapshotError, Exception):
+        _monitor_unavailable()
+    return ResourceSampleV1(
+        boot_id=boot_id,
+        observed_at_utc=observed_at_utc,
+        observed_monotonic_ns=observed_monotonic_ns,
+        current={"cpu": cpu, "io": io, "memory": memory},
+        cgroup_state="unavailable",
+        thermal_state=thermal_state,
+        thermal_policy=policy,
+    )
+
+
+def _mean(samples: Sequence[ResourceSampleV1], dimension: str) -> float:
+    return sum(sample.current[dimension] for sample in samples) / len(samples)
+
+
+def build_monitor_snapshot(
+    samples: Sequence[ResourceSampleV1], *, prior_generation: int, clocks: ResourceClocks
+) -> ResourceSnapshotV1:
+    """Build one generation only from a complete, bounded one-Hz sample window."""
+
+    if not isinstance(clocks, ResourceClocks) or type(prior_generation) is not int or prior_generation < 0:
+        _invalid()
+    samples = tuple(samples)
+    if len(samples) < _MIN_COMPLETE_SAMPLES:
+        _thermal_unavailable()
+    if len(samples) > _MAX_SAMPLE_BUCKETS or any(not isinstance(sample, ResourceSampleV1) for sample in samples):
+        _invalid()
+    first = samples[0]
+    for previous, current in zip(samples, samples[1:]):
+        if (
+            current.boot_id != first.boot_id
+            or current.observed_monotonic_ns - previous.observed_monotonic_ns != _ONE_SECOND_NS
+            or current.observed_at_utc - previous.observed_at_utc != timedelta(seconds=1)
+        ):
+            _invalid()
+    latest = samples[-1]
+    try:
+        now_utc = _require_utc_datetime(clocks.now_utc())
+        now_monotonic_ns = _require_positive_int(clocks.monotonic_ns())
+    except (ResourceSnapshotError, Exception):
+        _monitor_unavailable()
+    if (
+        latest.observed_at_utc > now_utc
+        or now_utc - latest.observed_at_utc > _FRESHNESS_MAX_AGE
+        or now_monotonic_ns < latest.observed_monotonic_ns
+    ):
+        _monitor_unavailable()
+    means = {dimension: _mean(samples, dimension) for dimension in _DIMENSIONS}
+    peaks = {dimension: max(sample.current[dimension] for sample in samples) for dimension in _DIMENSIONS}
+    assessments = {dimension: classify_trend([round(sample.current[dimension]) for sample in samples]) for dimension in _DIMENSIONS}
+    confidence: Literal["high", "low"] = "high" if all(
+        assessment.confidence == "high" for assessment in assessments.values()
+    ) else "low"
+    trend = {
+        dimension: assessments[dimension].trend if confidence == "high" else None for dimension in _DIMENSIONS
+    }
+    pressure = {dimension: int(round(latest.current[dimension])) for dimension in _DIMENSIONS}
+    headroom = {dimension: 100 - pressure[dimension] for dimension in _DIMENSIONS}
+    reasons: tuple[str, ...] = ("resource_ready",)
+    gate_state: Literal["ready", "blocked"] = "ready"
+    bottleneck: Literal["cpu", "io", "memory", "thermal", "cgroup", "unknown"] = "unknown"
+    if latest.thermal_state in {"warming_up", "monitor_unavailable"}:
+        reasons = ("temperature_monitor_unavailable",)
+        gate_state = "blocked"
+        bottleneck = "thermal"
+    elif latest.cgroup_state != "ready":
+        reasons = ("cgroup_preflight_failed",)
+        gate_state = "blocked"
+        bottleneck = "cgroup"
+    return ResourceSnapshotV1(
+        schema_version=_SCHEMA_VERSION,
+        boot_id=latest.boot_id,
+        generation=prior_generation + 1,
+        observed_at_utc=latest.observed_at_utc,
+        observed_monotonic_ns=latest.observed_monotonic_ns,
+        freshness="fresh",
+        gate_state=gate_state,
+        reason_codes=reasons,
+        current=latest.current,
+        mean_1m=means,
+        mean_10m=means,
+        peak_10m=peaks,
+        normalized_pressure=pressure,
+        normalized_headroom=headroom,
+        trend=trend,
+        bottleneck=bottleneck,
+        preferred_profiles=("balanced",),
+        avoid_profiles=(),
+        confidence=confidence,
+        cgroup_state=latest.cgroup_state,
+        thermal_state=latest.thermal_state,
+    )
 
 
 def build_resource_gate_facts(snapshot: ResourceSnapshotV1) -> ResourceGateFacts:
