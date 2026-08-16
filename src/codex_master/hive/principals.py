@@ -279,6 +279,45 @@ class PrincipalRegistry:
                     return True
             return False
 
+    def get_active_execution_binding(
+        self,
+        binding_id: str,
+        principal_id: str,
+        repo_id: str | None,
+        *,
+        now: datetime,
+    ) -> ExecutionBinding:
+        try:
+            validate_identifier(binding_id, field="binding")
+            validate_identifier(principal_id, field="principal")
+            if repo_id is not None:
+                validate_identifier(repo_id, field="repo")
+            normalized_now = validate_utc_datetime(now)
+        except HiveValidationError:
+            raise PrincipalError("invalid_execution_binding_lookup") from None
+        with self._transaction():
+            try:
+                binding = self._bindings[binding_id]
+            except KeyError:
+                raise PrincipalError("execution_binding_not_found") from None
+            if binding.state != "active":
+                raise PrincipalError("execution_binding_inactive")
+            if binding.principal_id != principal_id or binding.repo_id != repo_id:
+                raise PrincipalError("execution_binding_mismatch")
+            try:
+                principal = self._principals[binding.principal_id]
+            except KeyError:
+                raise PrincipalError("execution_binding_invalid") from None
+            if principal.state != "active":
+                raise PrincipalError("execution_binding_inactive")
+            try:
+                expires_at = validate_utc_datetime(datetime.fromisoformat(binding.expires_at_utc.replace("Z", "+00:00")))
+            except (HiveValidationError, ValueError):
+                raise PrincipalError("execution_binding_invalid") from None
+            if expires_at <= normalized_now:
+                raise PrincipalError("execution_binding_expired")
+            return binding
+
     def _validate_parent(self, principal: Principal) -> None:
         rule = _ROLE_RULES.get(principal.class_id)
         if rule is None:

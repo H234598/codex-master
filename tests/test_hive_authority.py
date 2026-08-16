@@ -97,6 +97,40 @@ def test_authorize_is_deny_by_default_and_checks_scope_and_repo(tmp_path: Path) 
     ).reason_code == "scope_denied"
 
 
+def test_read_only_request_allows_empty_write_paths_but_keeps_scope_required(tmp_path: Path) -> None:
+    existing = engine(tmp_path)
+    authority = AuthorityEngine(
+        AuthorityContext(
+            existing.context.principals,
+            existing.context.repositories,
+            {"profile": frozenset({"hive.resource.trend.read"})},
+        )
+    )
+    read_only = AuthorityRequest(
+        "lead-one",
+        "hive.resource.trend.read",
+        "repo-one",
+        None,
+        None,
+        (".codex-master/resource-status",),
+        (),
+    )
+
+    assert authority.authorize(read_only).public() == {
+        "allowed": True,
+        "reason_code": "authorized",
+        "grant_id": None,
+    }
+    assert authority.authorize(
+        AuthorityRequest("lead-one", "hive.resource.other.read", "repo-one", None, None, ("src",), ())
+    ).reason_code == "capability_denied"
+    assert authority.authorize(
+        AuthorityRequest("lead-one", "hive.resource.trend.read", "other-repo", None, None, ("src",), ())
+    ).reason_code == "repository_mismatch"
+    with pytest.raises(AuthorityError, match="invalid_scope"):
+        AuthorityRequest("lead-one", "hive.resource.trend.read", "repo-one", None, None, (), ())
+
+
 def test_global_goettin_request_remains_scope_denied(tmp_path: Path) -> None:
     state = HiveStateStore(tmp_path / "hive")
     principals = PrincipalRegistry(state)
