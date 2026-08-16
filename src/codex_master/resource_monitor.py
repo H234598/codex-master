@@ -1,0 +1,443 @@
+"""Pure, immutable resource snapshot models and projections."""
+
+from __future__ import annotations
+
+import math
+import re
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from types import MappingProxyType
+from typing import Literal
+from uuid import UUID
+
+
+_SCHEMA_VERSION = 1
+_FRESHNESS_MAX_AGE = timedelta(seconds=3)
+_DIMENSIONS = frozenset(("cpu", "io", "memory"))
+_TRENDS = frozenset(("rising", "stable", "falling"))
+_BOTTLENECKS = frozenset(("cpu", "io", "memory", "thermal", "cgroup", "unknown"))
+_THERMAL_STATES = frozenset(("warming_up", "no_valid_sensors", "ready", "monitor_unavailable"))
+_CGROUP_STATES = frozenset(("ready", "unavailable", "preflight_failed"))
+_GATE_STATES = frozenset(("ready", "blocked"))
+_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_PROFILE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+_SNAPSHOT_FIELDS = frozenset(
+    (
+        "schema_version",
+        "boot_id",
+        "generation",
+        "observed_at_utc",
+        "observed_monotonic_ns",
+        "freshness",
+        "gate_state",
+        "reason_codes",
+        "current",
+        "mean_1m",
+        "mean_10m",
+        "peak_10m",
+        "normalized_pressure",
+        "normalized_headroom",
+        "trend",
+        "bottleneck",
+        "preferred_profiles",
+        "avoid_profiles",
+        "confidence",
+        "cgroup_state",
+        "thermal_state",
+    )
+)
+
+
+class ResourceSnapshotError(ValueError):
+    """A data-sparse resource snapshot validation error."""
+
+
+@dataclass(frozen=True, slots=True)
+class TrendAssessmentV1:
+    trend: Literal["rising", "stable", "falling"] | None
+    confidence: Literal["high", "low"]
+
+    def __post_init__(self) -> None:
+        confidence = _require_confidence(self.confidence)
+        if confidence == "high" and (
+            not isinstance(self.trend, str) or self.trend not in _TRENDS
+        ):
+            _invalid()
+        if confidence == "low" and self.trend is not None:
+            _invalid()
+        object.__setattr__(self, "confidence", confidence)
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceSnapshotV1:
+    schema_version: int
+    boot_id: str
+    generation: int
+    observed_at_utc: datetime
+    observed_monotonic_ns: int
+    freshness: Literal["fresh"]
+    gate_state: Literal["ready", "blocked"]
+    reason_codes: tuple[str, ...]
+    current: Mapping[str, float]
+    mean_1m: Mapping[str, float]
+    mean_10m: Mapping[str, float]
+    peak_10m: Mapping[str, float]
+    normalized_pressure: Mapping[str, int]
+    normalized_headroom: Mapping[str, int]
+    trend: Mapping[str, Literal["rising", "stable", "falling"] | None]
+    bottleneck: Literal["cpu", "io", "memory", "thermal", "cgroup", "unknown"]
+    preferred_profiles: tuple[str, ...]
+    avoid_profiles: tuple[str, ...]
+    confidence: Literal["high", "low"]
+    cgroup_state: Literal["ready", "unavailable", "preflight_failed"]
+    thermal_state: Literal["warming_up", "no_valid_sensors", "ready", "monitor_unavailable"]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "schema_version", _require_schema_version(self.schema_version))
+        object.__setattr__(self, "boot_id", _require_canonical_boot_id(self.boot_id))
+        object.__setattr__(self, "generation", _require_positive_int(self.generation))
+        object.__setattr__(self, "observed_at_utc", _require_utc_datetime(self.observed_at_utc))
+        object.__setattr__(self, "observed_monotonic_ns", _require_positive_int(self.observed_monotonic_ns))
+        if self.freshness != "fresh":
+            _invalid()
+        object.__setattr__(self, "gate_state", _require_gate_state(self.gate_state))
+        object.__setattr__(self, "reason_codes", _require_identifiers(self.reason_codes, pattern=_IDENTIFIER, maximum=16))
+        object.__setattr__(self, "current", _require_metric_mapping(self.current))
+        object.__setattr__(self, "mean_1m", _require_metric_mapping(self.mean_1m))
+        object.__setattr__(self, "mean_10m", _require_metric_mapping(self.mean_10m))
+        object.__setattr__(self, "peak_10m", _require_metric_mapping(self.peak_10m))
+        object.__setattr__(self, "normalized_pressure", _require_percentage_mapping(self.normalized_pressure))
+        object.__setattr__(self, "normalized_headroom", _require_percentage_mapping(self.normalized_headroom))
+        confidence = _require_confidence(self.confidence)
+        object.__setattr__(self, "trend", _require_snapshot_trend_mapping(self.trend, confidence))
+        object.__setattr__(self, "confidence", confidence)
+        object.__setattr__(self, "bottleneck", _require_bottleneck(self.bottleneck))
+        object.__setattr__(self, "preferred_profiles", _require_identifiers(self.preferred_profiles, pattern=_PROFILE, maximum=8))
+        object.__setattr__(self, "avoid_profiles", _require_identifiers(self.avoid_profiles, pattern=_PROFILE, maximum=8))
+        object.__setattr__(self, "cgroup_state", _require_cgroup_state(self.cgroup_state))
+        object.__setattr__(self, "thermal_state", _require_thermal_state(self.thermal_state))
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceGateFacts:
+    generation: int
+    observed_at_utc: datetime
+    observed_monotonic_ns: int
+    gate_state: str
+    reason_codes: tuple[str, ...]
+    current: Mapping[str, float]
+    normalized_pressure: Mapping[str, int]
+    normalized_headroom: Mapping[str, int]
+    bottleneck: str
+    cgroup_state: str
+    thermal_state: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "generation", _require_positive_int(self.generation))
+        object.__setattr__(self, "observed_at_utc", _require_utc_datetime(self.observed_at_utc))
+        object.__setattr__(self, "observed_monotonic_ns", _require_positive_int(self.observed_monotonic_ns))
+        object.__setattr__(self, "gate_state", _require_gate_state(self.gate_state))
+        object.__setattr__(self, "reason_codes", _require_identifiers(self.reason_codes, pattern=_IDENTIFIER, maximum=16))
+        object.__setattr__(self, "current", _require_metric_mapping(self.current))
+        object.__setattr__(self, "normalized_pressure", _require_percentage_mapping(self.normalized_pressure))
+        object.__setattr__(self, "normalized_headroom", _require_percentage_mapping(self.normalized_headroom))
+        object.__setattr__(self, "bottleneck", _require_bottleneck(self.bottleneck))
+        object.__setattr__(self, "cgroup_state", _require_cgroup_state(self.cgroup_state))
+        object.__setattr__(self, "thermal_state", _require_thermal_state(self.thermal_state))
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceOperatorStatus:
+    schema_version: int
+    generation: int
+    state: str
+    bottleneck: str
+    current: Mapping[str, float]
+    mean_1m: Mapping[str, float]
+    mean_10m: Mapping[str, float]
+    peak_10m: Mapping[str, float]
+    trend: Mapping[str, Literal["rising", "stable", "falling"]]
+    confidence: Literal["high", "low"]
+    preferred_profiles: tuple[str, ...]
+    avoid_profiles: tuple[str, ...]
+    reason_codes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "schema_version", _require_schema_version(self.schema_version))
+        object.__setattr__(self, "generation", _require_positive_int(self.generation))
+        object.__setattr__(self, "state", _require_gate_state(self.state))
+        object.__setattr__(self, "bottleneck", _require_bottleneck(self.bottleneck))
+        object.__setattr__(self, "current", _require_metric_mapping(self.current))
+        object.__setattr__(self, "mean_1m", _require_metric_mapping(self.mean_1m))
+        object.__setattr__(self, "mean_10m", _require_metric_mapping(self.mean_10m))
+        object.__setattr__(self, "peak_10m", _require_metric_mapping(self.peak_10m))
+        confidence = _require_confidence(self.confidence)
+        object.__setattr__(self, "trend", _require_operator_trend_mapping(self.trend, confidence))
+        object.__setattr__(self, "confidence", confidence)
+        object.__setattr__(self, "preferred_profiles", _require_identifiers(self.preferred_profiles, pattern=_PROFILE, maximum=8))
+        object.__setattr__(self, "avoid_profiles", _require_identifiers(self.avoid_profiles, pattern=_PROFILE, maximum=8))
+        object.__setattr__(self, "reason_codes", _require_identifiers(self.reason_codes, pattern=_IDENTIFIER, maximum=16))
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceSchedulerSnapshot:
+    schema_version: int
+    generation: int
+    confidence: Literal["high", "low"]
+    normalized_pressure: Mapping[str, int]
+    preferred_profiles: tuple[str, ...]
+    avoid_profiles: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "schema_version", _require_schema_version(self.schema_version))
+        object.__setattr__(self, "generation", _require_positive_int(self.generation))
+        object.__setattr__(self, "confidence", _require_confidence(self.confidence))
+        object.__setattr__(self, "normalized_pressure", _require_percentage_mapping(self.normalized_pressure))
+        object.__setattr__(self, "preferred_profiles", _require_identifiers(self.preferred_profiles, pattern=_PROFILE, maximum=8))
+        object.__setattr__(self, "avoid_profiles", _require_identifiers(self.avoid_profiles, pattern=_PROFILE, maximum=8))
+
+
+def _invalid() -> None:
+    raise ResourceSnapshotError("resource_snapshot_invalid")
+
+
+def _require_positive_int(value: object) -> int:
+    if type(value) is not int or value <= 0:
+        _invalid()
+    return value
+
+
+def _require_utc_datetime(value: object) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() != timedelta():
+        _invalid()
+    return value.astimezone(timezone.utc)
+
+
+def _require_bounded_number(value: object) -> float:
+    if type(value) not in {int, float} or not math.isfinite(value) or not 0 <= value <= 100:
+        _invalid()
+    return float(value)
+
+
+def _require_metric_mapping(value: object) -> Mapping[str, float]:
+    if not isinstance(value, Mapping) or set(value) != _DIMENSIONS:
+        _invalid()
+    return MappingProxyType({dimension: _require_bounded_number(value[dimension]) for dimension in _DIMENSIONS})
+
+
+def _require_percentage_mapping(value: object) -> Mapping[str, int]:
+    if not isinstance(value, Mapping) or set(value) != _DIMENSIONS:
+        _invalid()
+    normalized: dict[str, int] = {}
+    for dimension in _DIMENSIONS:
+        item = value[dimension]
+        if type(item) is not int or not 0 <= item <= 100:
+            _invalid()
+        normalized[dimension] = item
+    return MappingProxyType(normalized)
+
+
+def _require_schema_version(value: object) -> int:
+    if type(value) is not int or value != _SCHEMA_VERSION:
+        _invalid()
+    return value
+
+
+def _require_confidence(value: object) -> Literal["high", "low"]:
+    if not isinstance(value, str) or value not in {"high", "low"}:
+        _invalid()
+    return value  # type: ignore[return-value]
+
+
+def _require_snapshot_trend_mapping(
+    value: object, confidence: Literal["high", "low"]
+) -> Mapping[str, Literal["rising", "stable", "falling"] | None]:
+    if not isinstance(value, Mapping) or set(value) != _DIMENSIONS:
+        _invalid()
+    normalized: dict[str, Literal["rising", "stable", "falling"] | None] = {}
+    for dimension in _DIMENSIONS:
+        item = value[dimension]
+        if confidence == "low":
+            if item is not None:
+                _invalid()
+        elif not isinstance(item, str) or item not in _TRENDS:
+            _invalid()
+        normalized[dimension] = item  # type: ignore[assignment]
+    return MappingProxyType(normalized)
+
+
+def _require_operator_trend_mapping(
+    value: object, confidence: Literal["high", "low"]
+) -> Mapping[str, Literal["rising", "stable", "falling"]]:
+    if confidence == "low":
+        if not isinstance(value, Mapping) or value:
+            _invalid()
+        return MappingProxyType({})
+    if not isinstance(value, Mapping) or set(value) != _DIMENSIONS:
+        _invalid()
+    normalized: dict[str, Literal["rising", "stable", "falling"]] = {}
+    for dimension in _DIMENSIONS:
+        item = value[dimension]
+        if not isinstance(item, str) or item not in _TRENDS:
+            _invalid()
+        normalized[dimension] = item  # type: ignore[assignment]
+    return MappingProxyType(normalized)
+
+
+def _require_identifiers(value: object, *, pattern: re.Pattern[str], maximum: int) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)) or len(value) > maximum:
+        _invalid()
+    if any(not isinstance(item, str) or not pattern.fullmatch(item) for item in value):
+        _invalid()
+    normalized = tuple(value)
+    if len(set(normalized)) != len(normalized):
+        _invalid()
+    return normalized
+
+
+def _parse_utc(value: object) -> datetime:
+    if not isinstance(value, str):
+        _invalid()
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        _invalid()
+    return _require_utc_datetime(parsed)
+
+
+def _require_canonical_boot_id(value: object, expected_boot_id: str | None = None) -> str:
+    if not isinstance(value, str) or (expected_boot_id is not None and not isinstance(expected_boot_id, str)):
+        _invalid()
+    try:
+        if str(UUID(value)) != value:
+            _invalid()
+        if expected_boot_id is not None and str(UUID(expected_boot_id)) != expected_boot_id:
+            _invalid()
+    except ValueError:
+        _invalid()
+    if expected_boot_id is not None and value != expected_boot_id:
+        _invalid()
+    return value
+
+
+def _require_gate_state(value: object) -> Literal["ready", "blocked"]:
+    if not isinstance(value, str) or value not in _GATE_STATES:
+        _invalid()
+    return value  # type: ignore[return-value]
+
+
+def _require_bottleneck(value: object) -> Literal["cpu", "io", "memory", "thermal", "cgroup", "unknown"]:
+    if not isinstance(value, str) or value not in _BOTTLENECKS:
+        _invalid()
+    return value  # type: ignore[return-value]
+
+
+def _require_cgroup_state(value: object) -> Literal["ready", "unavailable", "preflight_failed"]:
+    if not isinstance(value, str) or value not in _CGROUP_STATES:
+        _invalid()
+    return value  # type: ignore[return-value]
+
+
+def _require_thermal_state(value: object) -> Literal["warming_up", "no_valid_sensors", "ready", "monitor_unavailable"]:
+    if not isinstance(value, str) or value not in _THERMAL_STATES:
+        _invalid()
+    return value  # type: ignore[return-value]
+
+
+def parse_snapshot_document(
+    payload: Mapping[str, object], *, now_utc: datetime, expected_boot_id: str
+) -> ResourceSnapshotV1:
+    """Validate one already-decoded, fresh resource snapshot document."""
+
+    if not isinstance(payload, Mapping) or set(payload) != _SNAPSHOT_FIELDS:
+        _invalid()
+    now_utc = _require_utc_datetime(now_utc)
+    observed_at_utc = _parse_utc(payload["observed_at_utc"])
+    if observed_at_utc > now_utc or now_utc - observed_at_utc > _FRESHNESS_MAX_AGE:
+        _invalid()
+
+    return ResourceSnapshotV1(
+        schema_version=payload["schema_version"],
+        boot_id=_require_canonical_boot_id(payload["boot_id"], expected_boot_id),
+        generation=payload["generation"],
+        observed_at_utc=observed_at_utc,
+        observed_monotonic_ns=payload["observed_monotonic_ns"],
+        freshness=payload["freshness"],
+        gate_state=payload["gate_state"],
+        reason_codes=payload["reason_codes"],
+        current=payload["current"],
+        mean_1m=payload["mean_1m"],
+        mean_10m=payload["mean_10m"],
+        peak_10m=payload["peak_10m"],
+        normalized_pressure=payload["normalized_pressure"],
+        normalized_headroom=payload["normalized_headroom"],
+        trend=payload["trend"],
+        bottleneck=payload["bottleneck"],
+        preferred_profiles=payload["preferred_profiles"],
+        avoid_profiles=payload["avoid_profiles"],
+        confidence=payload["confidence"],
+        cgroup_state=payload["cgroup_state"],
+        thermal_state=payload["thermal_state"],
+    )
+
+
+def build_resource_gate_facts(snapshot: ResourceSnapshotV1) -> ResourceGateFacts:
+    return ResourceGateFacts(
+        generation=snapshot.generation,
+        observed_at_utc=snapshot.observed_at_utc,
+        observed_monotonic_ns=snapshot.observed_monotonic_ns,
+        gate_state=snapshot.gate_state,
+        reason_codes=snapshot.reason_codes,
+        current=snapshot.current,
+        normalized_pressure=snapshot.normalized_pressure,
+        normalized_headroom=snapshot.normalized_headroom,
+        bottleneck=snapshot.bottleneck,
+        cgroup_state=snapshot.cgroup_state,
+        thermal_state=snapshot.thermal_state,
+    )
+
+
+def build_resource_operator_status(snapshot: ResourceSnapshotV1) -> ResourceOperatorStatus:
+    return ResourceOperatorStatus(
+        schema_version=snapshot.schema_version,
+        generation=snapshot.generation,
+        state=snapshot.gate_state,
+        bottleneck=snapshot.bottleneck,
+        current=snapshot.current,
+        mean_1m=snapshot.mean_1m,
+        mean_10m=snapshot.mean_10m,
+        peak_10m=snapshot.peak_10m,
+        trend=snapshot.trend if snapshot.confidence == "high" else {},
+        confidence=snapshot.confidence,
+        preferred_profiles=snapshot.preferred_profiles,
+        avoid_profiles=snapshot.avoid_profiles,
+        reason_codes=snapshot.reason_codes,
+    )
+
+
+def build_resource_scheduler_snapshot(snapshot: ResourceSnapshotV1) -> ResourceSchedulerSnapshot:
+    return ResourceSchedulerSnapshot(
+        schema_version=snapshot.schema_version,
+        generation=snapshot.generation,
+        confidence=snapshot.confidence,
+        normalized_pressure=snapshot.normalized_pressure,
+        preferred_profiles=snapshot.preferred_profiles,
+        avoid_profiles=snapshot.avoid_profiles,
+    )
+
+
+def classify_trend(buckets: Sequence[int]) -> TrendAssessmentV1:
+    """Classify bounded percentage buckets without guessing at low confidence."""
+
+    if any(type(value) is not int or not 0 <= value <= 100 for value in buckets):
+        raise ResourceSnapshotError("resource_snapshot_invalid")
+    if len(buckets) < 10:
+        return TrendAssessmentV1(trend=None, confidence="low")
+    previous = sum(buckets[-10:-2]) / 8
+    recent = sum(buckets[-2:]) / 2
+    if recent - previous >= 5:
+        return TrendAssessmentV1(trend="rising", confidence="high")
+    if recent - previous <= -5:
+        return TrendAssessmentV1(trend="falling", confidence="high")
+    return TrendAssessmentV1(trend="stable", confidence="high")
