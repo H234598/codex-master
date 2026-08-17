@@ -4,6 +4,7 @@ import functools
 import hashlib
 import io
 import json
+import multiprocessing
 import re
 import shutil
 import stat
@@ -4223,7 +4224,7 @@ class ServerHelpersTest(unittest.TestCase):
             path = managed / "config.toml"
             path.write_text("expected = true\n", encoding="utf-8")
             (outside / path.name).write_text("forged = true\n", encoding="utf-8")
-            real_open = server_module.open_directory_no_follow_matching
+            real_open = server_module.open_directory_chain_no_follow_matching
             swapped = False
 
             def swap_before_open(candidate: Path, *args: Any, **kwargs: Any) -> int:
@@ -35140,6 +35141,1163 @@ def test_usage_loader_exception_becomes_canonical_unavailable_and_render_success
     assert marker not in result
     loader.assert_called_once()
     renderer.assert_called_once_with(enriched_overview, format="compact")
+
+
+class ResourceMonitorLifecycleTest(unittest.TestCase):
+    service_name = "codex-master-resource-monitor.service"
+    slice_name = "codex-master.slice"
+
+    def _systemctl_fake(
+        self,
+        calls: list[list[str]],
+        states: dict[str, dict[str, str]],
+        *,
+        failures: dict[str, list[tuple[int, str, str]]] | None = None,
+    ):
+        pending_failures = {key: list(value) for key, value in (failures or {}).items()}
+
+        def fake(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+            calls.append(list(command))
+            if command[:3] != ["systemctl", "--user", "show"]:
+                operation = " ".join(command[2:])
+                queued = pending_failures.get(operation)
+                if queued:
+                    returncode, stdout, stderr = queued.pop(0)
+                    return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+                if command[2:] == ["enable", "--now", self.service_name]:
+                    states[self.service_name]["UnitFileState"] = "enabled"
+                    states[self.service_name]["ActiveState"] = "active"
+                    states[self.service_name]["SubState"] = "running"
+                elif command[2:] == ["disable", self.service_name]:
+                    states[self.service_name]["UnitFileState"] = "disabled"
+                elif command[2:] == ["stop", self.service_name]:
+                    states[self.service_name]["ActiveState"] = "inactive"
+                    states[self.service_name]["SubState"] = "dead"
+                elif command[2:] == ["start", self.service_name]:
+                    states[self.service_name]["ActiveState"] = "active"
+                    states[self.service_name]["SubState"] = "running"
+                elif command[2:] != ["daemon-reload"]:
+                    raise AssertionError(f"unexpected systemctl command: {command!r}")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            unit = command[3]
+            properties = states.get(unit, {})
+            output = "".join(f"{key}={value}\n" for key, value in properties.items())
+            return subprocess.CompletedProcess(command, 0, output, "")
+
+        return fake
+
+    def _states(self, *, service_state: str = "inactive", service_enabled: str = "disabled") -> dict[str, dict[str, str]]:
+        return {
+            self.service_name: {
+                "LoadState": "loaded",
+                "ActiveState": service_state,
+                "SubState": "running" if service_state == "active" else "dead",
+                "UnitFileState": service_enabled,
+                "FragmentPath": "",
+                "ControlGroup": "",
+                "MainPID": "0",
+            },
+            self.slice_name: {
+                "LoadState": "loaded",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "UnitFileState": "static",
+                "FragmentPath": "",
+                "ControlGroup": "",
+                "TasksCurrent": "0",
+            },
+        }
+
+    def _valid_resource_status(self) -> ResourceOperatorStatus:
+        metrics = {"cpu": 10.0, "io": 20.0, "memory": 30.0}
+        return ResourceOperatorStatus(
+            schema_version=1,
+            generation=7,
+            state="ready",
+            bottleneck="cpu",
+            current=metrics,
+            mean_1m=metrics,
+            mean_10m=metrics,
+            peak_10m=metrics,
+            trend={"cpu": "stable", "io": "stable", "memory": "stable"},
+            confidence="high",
+            preferred_profiles=("balanced",),
+            avoid_profiles=(),
+            reason_codes=("resource_ready",),
+        )
+
+    def test_install_resource_monitor_materializes_units_atomically_and_enables_monitor(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            calls: list[list[str]] = []
+            states = self._states()
+            with patch.object(server_module, "run_command", side_effect=self._systemctl_fake(calls, states)):
+                result = server_module.install_resource_monitor(
+                    root=source_root,
+                    systemd_user_dir=target,
+                )
+
+            self.assertTrue(result["ok"])
+            for name in (self.service_name, self.slice_name):
+                self.assertEqual(
+                    (target / name).read_bytes(),
+                    (source_root / "systemd" / "user" / name).read_bytes(),
+                )
+            operations = [call[2:] for call in calls if call[:2] == ["systemctl", "--user"]]
+            mutation_operations = [operation for operation in operations if operation and operation[0] != "show"]
+            self.assertEqual(
+                mutation_operations,
+                [["daemon-reload"], ["enable", "--now", self.service_name]],
+            )
+
+    def test_install_resource_monitor_is_idempotent_when_units_match(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            for name in (self.service_name, self.slice_name):
+                (target / name).write_bytes((source_root / "systemd" / "user" / name).read_bytes())
+            calls: list[list[str]] = []
+            states = self._states(service_state="active", service_enabled="enabled")
+            fake = self._systemctl_fake(calls, states)
+            with patch.object(server_module, "run_command", side_effect=fake):
+                first = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target)
+                second = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target)
+
+            self.assertTrue(first["ok"])
+            self.assertTrue(second["ok"])
+            self.assertEqual(states[self.service_name]["UnitFileState"], "enabled")
+            self.assertEqual(states[self.service_name]["ActiveState"], "active")
+            self.assertEqual(
+                [call[2:] for call in calls if call[:2] == ["systemctl", "--user"] and call[2:] and call[2] != "show"],
+                [["daemon-reload"], ["enable", "--now", self.service_name], ["daemon-reload"], ["enable", "--now", self.service_name]],
+            )
+
+    def test_install_resource_monitor_refuses_symlinked_parent_or_target(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            real_parent = root / "real-parent"
+            real_parent.mkdir()
+            linked_parent = root / "linked-parent"
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+            target_linked_parent = linked_parent / "user"
+            with patch.object(server_module, "run_command", side_effect=AssertionError("systemctl must not run")):
+                with self.assertRaises(AgentError):
+                    server_module.install_resource_monitor(root=source_root, systemd_user_dir=target_linked_parent)
+
+            target = root / "user"
+            target.mkdir()
+            outside = root / "outside"
+            outside.write_bytes(b"outside")
+            (target / self.service_name).symlink_to(outside)
+            with patch.object(server_module, "run_command", side_effect=AssertionError("systemctl must not run")):
+                with self.assertRaises(AgentError):
+                    server_module.install_resource_monitor(root=source_root, systemd_user_dir=target)
+
+    def test_install_resource_monitor_rejects_world_writable_target_directory(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            target.chmod(0o777)
+            with patch.object(server_module, "run_command", side_effect=AssertionError("systemctl must not run")):
+                with self.assertRaises(AgentError):
+                    server_module.install_resource_monitor(root=source_root, systemd_user_dir=target)
+            self.assertEqual(list(target.iterdir()), [])
+
+    def test_install_resource_monitor_serializes_separate_processes(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            target = root / "systemd-user"
+            target.mkdir()
+            target.chmod(0o700)
+            lock_root = root / "state"
+            lock_dir = lock_root / "locks"
+            process_context = multiprocessing.get_context("fork")
+            entered_systemctl = process_context.Event()
+            calls: list[list[str]] = []
+            states = self._states()
+            real_fake = self._systemctl_fake(calls, states)
+
+            def fake(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+                entered_systemctl.set()
+                return real_fake(command, **kwargs)
+
+            with patch.object(server_module, "STATE_ROOT", lock_root), patch.object(
+                server_module, "LOCK_DIR", lock_dir
+            ), patch.object(server_module, "run_command", side_effect=fake):
+                with server_module.install_lock():
+                    child = process_context.Process(
+                        target=server_module.install_resource_monitor,
+                        kwargs={"root": source_root, "systemd_user_dir": target},
+                    )
+                    child.start()
+                    self.assertFalse(entered_systemctl.wait(0.3))
+                child.join(5)
+
+            self.assertEqual(child.exitcode, 0)
+            self.assertTrue(entered_systemctl.is_set())
+
+    def test_install_resource_monitor_never_disables_preexisting_enabled_runtime_service(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            target.chmod(0o700)
+            calls: list[list[str]] = []
+            states = self._states(service_enabled="enabled-runtime")
+            failures = {f"enable --now {self.service_name}": [(1, "", "enable failed /tmp/private")]}
+            with patch.object(server_module, "run_command", side_effect=self._systemctl_fake(calls, states, failures=failures)):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target, force=True)
+
+            self.assertFalse(result["ok"])
+            self.assertNotIn(["disable", self.service_name], [call[2:] for call in calls])
+
+    def test_install_resource_monitor_never_stops_preexisting_active_service(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            target.chmod(0o700)
+            calls: list[list[str]] = []
+            states = self._states(service_state="active", service_enabled="enabled")
+            failures = {f"enable --now {self.service_name}": [(1, "", "enable failed /tmp/private")]}
+            with patch.object(server_module, "run_command", side_effect=self._systemctl_fake(calls, states, failures=failures)):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target, force=True)
+
+            self.assertFalse(result["ok"])
+            self.assertNotIn(["stop", self.service_name], [call[2:] for call in calls])
+
+    def test_install_resource_monitor_fails_closed_on_unknown_service_state(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            target.chmod(0o700)
+            calls: list[list[str]] = []
+            states = self._states(service_enabled="masked")
+            with patch.object(server_module, "run_command", side_effect=self._systemctl_fake(calls, states)):
+                with self.assertRaises(AgentError):
+                    server_module.install_resource_monitor(root=source_root, systemd_user_dir=target)
+
+            self.assertEqual(list(target.iterdir()), [])
+            self.assertEqual(
+                [call[2:] for call in calls if call[:2] == ["systemctl", "--user"] and call[2:] and call[2] != "show"],
+                [],
+            )
+
+    def test_native_hook_coverage_status_rejects_v2_active_entry_without_session_id(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            registry = Path(tmpdir) / "native-agents.json"
+            registry.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "agents": [],
+                        "sessions": [{"activity_state": "active", "updated_at": 100.0}],
+                        "reservations": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry.chmod(0o600)
+            with patch.object(server_module, "NATIVE_AGENT_REGISTRY_FILE", registry):
+                result = server_module.native_hook_coverage_status(root=source_root, now=100.0)
+
+        self.assertFalse(result["fresh_native_coverage"])
+        self.assertEqual(result["action"], "manual_hook_trust_or_new_session_required")
+
+    def test_native_hook_coverage_status_rejects_partial_v2_registry(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            registry = Path(tmpdir) / "native-agents.json"
+            registry.write_text(json.dumps({"schema_version": 2, "agents": []}), encoding="utf-8")
+            registry.chmod(0o600)
+            with patch.object(server_module, "NATIVE_AGENT_REGISTRY_FILE", registry):
+                result = server_module.native_hook_coverage_status(root=source_root, now=100.0)
+
+        self.assertFalse(result["fresh_native_coverage"])
+        self.assertEqual(result["coverage_state"], "stale")
+
+    def test_native_hook_coverage_status_accepts_real_normalized_fresh_v2_registry(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            registry = Path(tmpdir) / "native-agents.json"
+            payload = server_module._native_agent_registry_payload()
+            payload["sessions"] = [{"session_id": "session-1", "activity_state": "active", "updated_at": 100.0}]
+            normalized = server_module._native_agent_normalize_registry(payload)
+            self.assertEqual(normalized, payload)
+            registry.write_text(json.dumps(normalized), encoding="utf-8")
+            registry.chmod(0o600)
+            with patch.object(server_module, "NATIVE_AGENT_REGISTRY_FILE", registry):
+                result = server_module.native_hook_coverage_status(root=source_root, now=100.0)
+
+        self.assertTrue(result["fresh_native_coverage"])
+        self.assertEqual(result["coverage_state"], "fresh_v2")
+        self.assertNotIn("action", result)
+
+    def test_install_resource_monitor_cli_returns_nonzero_on_failed_install(self) -> None:
+        failed = {"ok": False, "primary_error": {"code": "safe_failure"}, "raw_output": "not_returned"}
+        with patch.object(server_module, "install_resource_monitor", return_value=failed), patch.object(
+            server_module, "print_json", return_value=99
+        ) as printer:
+            result = server_module.main_cli(["install-resource-monitor"])
+
+        self.assertEqual(result, 1)
+        printer.assert_called_once_with(failed)
+
+    def test_install_resource_monitor_cli_returns_zero_on_success(self) -> None:
+        success = {"ok": True, "raw_output": "not_returned"}
+        with patch.object(server_module, "install_resource_monitor", return_value=success), patch.object(
+            server_module, "print_json", return_value=99
+        ) as printer:
+            result = server_module.main_cli(["install-resource-monitor"])
+
+        self.assertEqual(result, 0)
+        printer.assert_called_once_with(success)
+
+    def test_install_resource_monitor_force_replaces_regular_stale_units_atomically(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            for name in (self.service_name, self.slice_name):
+                path = target / name
+                path.write_text("stale-unit\n", encoding="utf-8")
+                path.chmod(0o640)
+            calls: list[list[str]] = []
+            states = self._states()
+            with patch.object(server_module, "run_command", side_effect=self._systemctl_fake(calls, states)):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target, force=True)
+
+            self.assertTrue(result["ok"])
+            for name in (self.service_name, self.slice_name):
+                source = source_root / "systemd" / "user" / name
+                self.assertEqual((target / name).read_bytes(), source.read_bytes())
+                self.assertEqual(stat.S_IMODE((target / name).stat().st_mode), stat.S_IMODE(source.stat().st_mode))
+            self.assertEqual(sorted(target.iterdir()), sorted([target / self.service_name, target / self.slice_name]))
+
+    def test_install_resource_monitor_rolls_back_when_daemon_reload_fails(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            before: dict[str, tuple[bytes, int]] = {}
+            for name in (self.service_name, self.slice_name):
+                path = target / name
+                path.write_text(f"old-{name}\n", encoding="utf-8")
+                path.chmod(0o640)
+                before[name] = (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+            calls: list[list[str]] = []
+            states = self._states()
+            failures = {"daemon-reload": [(1, "", "reload secret /tmp/private")]}
+            with patch.object(server_module, "run_command", side_effect=self._systemctl_fake(calls, states, failures=failures)):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target, force=True)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["primary_error"]["code"], "daemon_reload_failed")
+            self.assertNotIn("/tmp/private", json.dumps(result))
+            for name, (content, mode) in before.items():
+                self.assertEqual((target / name).read_bytes(), content)
+                self.assertEqual(stat.S_IMODE((target / name).stat().st_mode), mode)
+            self.assertEqual(states[self.service_name]["UnitFileState"], "disabled")
+            self.assertEqual(states[self.service_name]["ActiveState"], "inactive")
+            self.assertEqual(sum(call[2:] == ["daemon-reload"] for call in calls), 2)
+
+    def test_install_resource_monitor_rolls_back_when_enable_now_fails(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            before: dict[str, tuple[bytes, int]] = {}
+            for name in (self.service_name, self.slice_name):
+                path = target / name
+                path.write_text(f"old-{name}\n", encoding="utf-8")
+                path.chmod(0o640)
+                before[name] = (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+            calls: list[list[str]] = []
+            states = self._states(service_state="active", service_enabled="enabled")
+            failures = {f"enable --now {self.service_name}": [(1, "", "enable secret /tmp/private")]}
+            with patch.object(server_module, "run_command", side_effect=self._systemctl_fake(calls, states, failures=failures)):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target, force=True)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["primary_error"]["code"], "enable_now_failed")
+            self.assertNotIn("/tmp/private", json.dumps(result))
+            for name, (content, mode) in before.items():
+                self.assertEqual((target / name).read_bytes(), content)
+                self.assertEqual(stat.S_IMODE((target / name).stat().st_mode), mode)
+            self.assertEqual(states[self.service_name]["UnitFileState"], "enabled")
+            self.assertEqual(states[self.service_name]["ActiveState"], "active")
+            self.assertEqual(sum(call[2:] == ["daemon-reload"] for call in calls), 2)
+
+    def test_install_resource_monitor_reports_primary_and_rollback_failure(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            for name in (self.service_name, self.slice_name):
+                (target / name).write_text("old\n", encoding="utf-8")
+            calls: list[list[str]] = []
+            states = self._states()
+            failures = {
+                "daemon-reload": [
+                    (1, "", "primary secret /tmp/primary"),
+                    (1, "", "rollback secret /tmp/rollback"),
+                ]
+            }
+            with patch.object(server_module, "run_command", side_effect=self._systemctl_fake(calls, states, failures=failures)):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target, force=True)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["primary_error"]["code"], "daemon_reload_failed")
+            self.assertEqual(result["rollback_error"]["code"], "rollback_daemon_reload_failed")
+            self.assertNotIn("secret", json.dumps(result))
+            self.assertNotIn(str(target), json.dumps(result))
+
+    def test_resource_monitor_status_distinguishes_missing_unit_from_inactive_empty_slice(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            calls: list[list[str]] = []
+            states = self._states()
+            with patch.object(server_module, "run_command", side_effect=self._systemctl_fake(calls, states)):
+                result = server_module.resource_monitor_status(root=source_root, systemd_user_dir=target)
+                states[self.service_name].update(
+                    {"LoadState": "loaded", "FragmentPath": "/run/systemd/generator.late/generated.service"}
+                )
+                synthetic = server_module.resource_monitor_status(root=source_root, systemd_user_dir=target)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["checks"]["monitor_unit"]["state"], "missing")
+        self.assertEqual(result["checks"]["slice_runtime"]["state"], "inactive_unmaterialized")
+        self.assertFalse(result["checks"]["slice_runtime"]["real_fragment"])
+        self.assertEqual(result["checks"]["slice_runtime"]["blocker"], "fragment_not_materialized")
+        self.assertFalse(synthetic["checks"]["monitor_unit"]["materialized"])
+        self.assertEqual(synthetic["checks"]["monitor_unit"]["fragment_state"], "synthetic")
+        self.assertEqual(synthetic["checks"]["monitor_unit"]["blocker"], "synthetic_fragment")
+
+    def test_resource_monitor_status_reports_ready_anchor_and_fresh_snapshot(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            for name in (self.service_name, self.slice_name):
+                (target / name).write_bytes((source_root / "systemd" / "user" / name).read_bytes())
+            states = self._states(service_state="active", service_enabled="enabled")
+            states[self.service_name].update(
+                {
+                    "FragmentPath": str(target / self.service_name),
+                    "ControlGroup": "/user.slice/codex-master.slice/codex-master-resource-monitor.service",
+                    "MainPID": "42",
+                }
+            )
+            states[self.slice_name].update(
+                {
+                    "ActiveState": "active",
+                    "SubState": "active",
+                    "FragmentPath": str(target / self.slice_name),
+                    "ControlGroup": "/user.slice/codex-master.slice",
+                    "TasksCurrent": "1",
+                }
+            )
+            calls: list[list[str]] = []
+            with patch.object(server_module, "run_command", side_effect=self._systemctl_fake(calls, states)), patch.object(
+                server_module, "_read_resource_operator_status", return_value=self._valid_resource_status()
+            ), patch.object(server_module, "native_hook_coverage_status", return_value={
+                "manifest_installed": True,
+                "fresh_native_coverage": True,
+                "coverage_state": "fresh_v2",
+                "ok": True,
+            }):
+                result = server_module.resource_monitor_status(root=source_root, systemd_user_dir=target)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["checks"]["slice_runtime"]["real_fragment"])
+        self.assertTrue(result["checks"]["slice_runtime"]["monitor_child"])
+        self.assertTrue(result["checks"]["snapshot"]["fresh"])
+        self.assertTrue(result["hook"]["fresh_native_coverage"])
+        self.assertNotIn("action", result)
+        payload = json.dumps(result, sort_keys=True)
+        self.assertNotIn(str(target), payload)
+        self.assertNotIn("available_memory_mib", payload)
+
+    def test_doctor_requires_manual_hook_trust_or_new_session_without_fresh_native_coverage(self) -> None:
+        with patch.object(server_module, "native_hook_coverage_status", return_value={
+            "manifest_installed": True,
+            "fresh_native_coverage": False,
+            "coverage_state": "stale",
+            "action": "manual_hook_trust_or_new_session_required",
+            "ok": False,
+        }, create=True):
+            result = server_module.doctor()
+
+        check = next(item for item in result["checks"] if item["name"] == "native_hook_coverage")
+        self.assertTrue(check["manifest_installed"])
+        self.assertFalse(check["fresh_native_coverage"])
+        self.assertEqual(check["action"], "manual_hook_trust_or_new_session_required")
+
+    def test_doctor_accepts_fresh_v2_native_session_coverage(self) -> None:
+        with patch.object(server_module, "native_hook_coverage_status", return_value={
+            "manifest_installed": True,
+            "fresh_native_coverage": True,
+            "coverage_state": "fresh_v2",
+            "ok": True,
+        }, create=True):
+            result = server_module.doctor()
+
+        check = next(item for item in result["checks"] if item["name"] == "native_hook_coverage")
+        self.assertTrue(check["manifest_installed"])
+        self.assertTrue(check["fresh_native_coverage"])
+        self.assertNotIn("action", check)
+
+    def test_install_resource_monitor_rolls_back_when_parent_rebound_before_daemon_reload(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            chain = root / "chain"
+            target = chain / "user"
+            target.mkdir(parents=True)
+            target.chmod(0o700)
+            rebound = root / "rebound"
+            original_open = server_module.open_directory_chain_no_follow_matching
+            opened = False
+
+            def open_then_rebind(path: Path, expected: os.stat_result, **kwargs: Any) -> int:
+                nonlocal opened
+                fd = original_open(path, expected, **kwargs)
+                if path == target and not opened:
+                    opened = True
+                    chain.rename(rebound)
+                    (chain / "user").mkdir(parents=True)
+                    (chain / "user").chmod(0o700)
+                return fd
+
+            calls: list[list[str]] = []
+            states = self._states()
+            with patch.object(server_module, "open_directory_chain_no_follow_matching", side_effect=open_then_rebind), patch.object(
+                server_module, "run_command", side_effect=self._systemctl_fake(calls, states)
+            ):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["primary_error"]["code"], "target_parent_rebound")
+            self.assertFalse(any(call[2:] == ["enable", "--now", self.service_name] for call in calls))
+            self.assertTrue((rebound / "user").is_dir())
+            self.assertEqual(list((rebound / "user").iterdir()), [])
+            self.assertEqual(list((chain / "user").iterdir()), [])
+
+    def test_install_resource_monitor_revalidates_unit_identities_before_daemon_reload(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            target.chmod(0o700)
+            service = target / self.service_name
+            service.write_text("original\n", encoding="utf-8")
+            service.chmod(0o640)
+            calls: list[list[str]] = []
+            states = self._states()
+            real_reopen = server_module._resource_monitor_reopen_directory
+            reopen_count = 0
+
+            def reopen_then_swap(path: Path, expected: tuple[int, int]) -> None:
+                nonlocal reopen_count
+                real_reopen(path, expected)
+                reopen_count += 1
+                if reopen_count == 1:
+                    service.write_text("foreign\n", encoding="utf-8")
+                    service.chmod(0o640)
+
+            with patch.object(server_module, "_resource_monitor_reopen_directory", side_effect=reopen_then_swap), patch.object(
+                server_module, "run_command", side_effect=self._systemctl_fake(calls, states)
+            ):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target, force=True)
+
+            self.assertFalse(result["ok"])
+            self.assertNotIn("/tmp", json.dumps(result))
+            operations = [call[2:] for call in calls if call[:2] == ["systemctl", "--user"]]
+            self.assertEqual([operation for operation in operations if operation[0] != "show"], [])
+            self.assertEqual(service.read_text(encoding="utf-8"), "original\n")
+            self.assertIn("manual_recovery", json.dumps(result))
+
+    def test_install_resource_monitor_revalidates_unit_identities_before_enable_now(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            target.chmod(0o700)
+            service = target / self.service_name
+            service.write_text("original\n", encoding="utf-8")
+            service.chmod(0o640)
+            calls: list[list[str]] = []
+            states = self._states()
+            real_reopen = server_module._resource_monitor_reopen_directory
+            reopen_count = 0
+
+            def reopen_then_swap(path: Path, expected: tuple[int, int]) -> None:
+                nonlocal reopen_count
+                reopen_count += 1
+                if reopen_count == 2:
+                    service.write_text("foreign\n", encoding="utf-8")
+                    service.chmod(0o640)
+                real_reopen(path, expected)
+
+            with patch.object(server_module, "_resource_monitor_reopen_directory", side_effect=reopen_then_swap), patch.object(
+                server_module, "run_command", side_effect=self._systemctl_fake(calls, states)
+            ):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target, force=True)
+
+            self.assertFalse(result["ok"])
+            operations = [call[2:] for call in calls if call[:2] == ["systemctl", "--user"]]
+            self.assertEqual([operation for operation in operations if operation[0] != "show"], [["daemon-reload"]])
+            self.assertEqual(service.read_text(encoding="utf-8"), "original\n")
+            self.assertIn("manual_recovery", json.dumps(result))
+
+    def test_install_resource_monitor_skips_rollback_reload_after_parent_rebound_before_enable(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            chain = root / "chain"
+            target = chain / "user"
+            target.mkdir(parents=True)
+            target.chmod(0o700)
+            rebound = root / "rebound"
+            calls: list[list[str]] = []
+            states = self._states()
+            real_reopen = server_module._resource_monitor_reopen_directory
+            reopen_count = 0
+
+            def reopen_then_rebind(path: Path, expected: tuple[int, int]) -> None:
+                nonlocal reopen_count
+                reopen_count += 1
+                if reopen_count == 2:
+                    chain.rename(rebound)
+                    (chain / "user").mkdir(parents=True)
+                    (chain / "user").chmod(0o700)
+                real_reopen(path, expected)
+
+            with patch.object(server_module, "_resource_monitor_reopen_directory", side_effect=reopen_then_rebind), patch.object(
+                server_module, "run_command", side_effect=self._systemctl_fake(calls, states)
+            ):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target)
+
+            self.assertFalse(result["ok"])
+            operations = [call[2:] for call in calls if call[:2] == ["systemctl", "--user"]]
+            self.assertEqual([operation for operation in operations if operation[0] != "show"], [["daemon-reload"]])
+            self.assertEqual(states[self.service_name]["ActiveState"], "inactive")
+            self.assertEqual(states[self.service_name]["UnitFileState"], "disabled")
+
+    def test_install_resource_monitor_rejects_sticky_world_writable_final_directory(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            shared = root / "shared"
+            target = shared / "user"
+            target.mkdir(parents=True)
+            shared.chmod(0o1777)
+            target.chmod(0o1777)
+            with patch.object(server_module, "run_command", side_effect=AssertionError("systemctl must not run")):
+                with self.assertRaises(AgentError):
+                    server_module.install_resource_monitor(root=source_root, systemd_user_dir=target)
+            self.assertEqual(stat.S_IMODE(shared.stat().st_mode), 0o1777)
+            self.assertEqual(list(target.iterdir()), [])
+
+    def test_install_resource_monitor_allows_sticky_shared_ancestor_with_repeated_final_basename(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            shared = root / "user"
+            target = shared / "nested" / "user"
+            target.mkdir(parents=True)
+            shared.chmod(0o1777)
+            (shared / "nested").chmod(0o700)
+            target.chmod(0o700)
+            calls: list[list[str]] = []
+            states = self._states()
+            with patch.object(server_module, "run_command", side_effect=self._systemctl_fake(calls, states)):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(stat.S_IMODE(shared.stat().st_mode), 0o1777)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o700)
+
+    def test_resource_monitor_transaction_preserves_swapped_name_during_exact_cleanup(self) -> None:
+        for case in ("backup", "restore", "installed", "stage"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmpdir:
+                directory = Path(tmpdir) / "user"
+                directory.mkdir()
+                directory.chmod(0o700)
+                name = f"{case}.unit"
+                target = directory / name
+                target.write_bytes(b"expected\n")
+                target.chmod(0o640)
+                expected = server_module._resource_monitor_stat_identity(target.stat())
+                directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                real_rename = server_module.os.rename
+                swapped = False
+
+                def rename_then_occupy(source: str, destination: str, **kwargs: Any) -> None:
+                    nonlocal swapped
+                    real_rename(source, destination, **kwargs)
+                    if source == name and not swapped:
+                        swapped = True
+                        target.write_bytes(b"foreign\n")
+                        target.chmod(0o640)
+
+                try:
+                    with patch.object(server_module.os, "rename", side_effect=rename_then_occupy):
+                        errors = server_module._resource_monitor_remove_exact_identity(
+                            directory_fd,
+                            name,
+                            expected,
+                            journal={"name": name, "cleanup_kind": case},
+                        )
+                finally:
+                    os.close(directory_fd)
+
+                self.assertEqual(errors, [])
+                self.assertEqual(target.read_bytes(), b"foreign\n")
+                self.assertEqual(list(directory.iterdir()), [target])
+
+    def test_install_resource_monitor_aborts_external_ops_when_lockfile_rebound(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            target = root / "systemd-user"
+            target.mkdir()
+            target.chmod(0o700)
+            lock_root = root / "state"
+            lock_dir = lock_root / "locks"
+            lock_path = lock_dir / "install.lock"
+            calls: list[list[str]] = []
+            states = self._states()
+            armed = False
+            rebound = False
+            real_stat = server_module.os.stat
+
+            def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+                nonlocal armed
+                if command[:3] == ["systemctl", "--user", "show"] and command[3] == self.service_name:
+                    armed = True
+                return self._systemctl_fake(calls, states)(command, **kwargs)
+
+            def stat_then_rebind(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+                nonlocal rebound
+                if armed and not rebound and Path(path) == lock_path:
+                    lock_path.unlink()
+                    lock_path.write_bytes(b"foreign-lock\n")
+                    lock_path.chmod(0o600)
+                    rebound = True
+                return real_stat(path, *args, **kwargs)
+
+            with patch.object(server_module, "STATE_ROOT", lock_root), patch.object(
+                server_module, "LOCK_DIR", lock_dir
+            ), patch.object(server_module, "run_command", side_effect=fake_run), patch.object(
+                server_module.os, "stat", side_effect=stat_then_rebind
+            ):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target)
+
+            self.assertFalse(result["ok"])
+            operations = [call[2:] for call in calls if call[:2] == ["systemctl", "--user"]]
+            self.assertEqual([operation for operation in operations if operation[0] != "show"], [])
+            self.assertTrue(rebound)
+
+    def test_install_resource_monitor_unit_transaction_preserves_target_swapped_at_displacement_seam(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            target.chmod(0o700)
+            service = target / self.service_name
+            service.write_text("original\n", encoding="utf-8")
+            service.chmod(0o640)
+            real_rename = server_module.os.rename
+            swapped = False
+
+            def rename_then_swap(source: str, destination: str, **kwargs: Any) -> None:
+                nonlocal swapped
+                real_rename(source, destination, **kwargs)
+                if source == self.service_name and not swapped:
+                    swapped = True
+                    service.write_text("foreign\n", encoding="utf-8")
+                    service.chmod(0o640)
+
+            calls: list[list[str]] = []
+            states = self._states()
+            with patch.object(server_module.os, "rename", side_effect=rename_then_swap), patch.object(
+                server_module, "run_command", side_effect=self._systemctl_fake(calls, states)
+            ):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target, force=True)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(service.read_text(encoding="utf-8"), "foreign\n")
+            self.assertIn("manual_recovery", json.dumps(result))
+            self.assertFalse(any(call[2:] == ["enable", "--now", self.service_name] for call in calls))
+
+    def test_install_resource_monitor_unit_transaction_preserves_target_appearing_before_staged_link(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            target.chmod(0o700)
+            service = target / self.service_name
+            real_link = server_module.os.link
+            appeared = False
+
+            def link_after_foreign(source: str, destination: str, **kwargs: Any) -> None:
+                nonlocal appeared
+                if destination == self.service_name and not appeared:
+                    appeared = True
+                    service.write_text("foreign\n", encoding="utf-8")
+                    service.chmod(0o640)
+                real_link(source, destination, **kwargs)
+
+            calls: list[list[str]] = []
+            states = self._states()
+            with patch.object(server_module.os, "link", side_effect=link_after_foreign), patch.object(
+                server_module, "run_command", side_effect=self._systemctl_fake(calls, states)
+            ):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(service.read_text(encoding="utf-8"), "foreign\n")
+            self.assertIn("manual_recovery", json.dumps(result))
+
+    def test_install_resource_monitor_unit_transaction_preserves_target_appearing_during_rollback(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            target.chmod(0o700)
+            service = target / self.service_name
+            service.write_text("original\n", encoding="utf-8")
+            service.chmod(0o640)
+            calls: list[list[str]] = []
+            states = self._states()
+            failures = {"daemon-reload": [(1, "", "primary /tmp/private"), (0, "", "")]}
+            real_rename = server_module.os.rename
+            appeared = False
+            rename_count = 0
+
+            def rename_during_rollback(source: str, destination: str, **kwargs: Any) -> None:
+                nonlocal appeared, rename_count
+                rename_count += 1
+                real_rename(source, destination, **kwargs)
+                if source == self.service_name and rename_count == 6 and not appeared:
+                    appeared = True
+                    service.write_text("foreign\n", encoding="utf-8")
+                    service.chmod(0o640)
+
+            with patch.object(server_module.os, "rename", side_effect=rename_during_rollback), patch.object(
+                server_module, "run_command", side_effect=self._systemctl_fake(calls, states, failures=failures)
+            ):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target, force=True)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(service.read_text(encoding="utf-8"), "foreign\n")
+            self.assertIn("manual_recovery", json.dumps(result))
+
+    def test_install_resource_monitor_restores_first_unit_when_second_transaction_fails(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            target.chmod(0o700)
+            before: dict[str, tuple[bytes, int, int]] = {}
+            for name in (self.service_name, self.slice_name):
+                path = target / name
+                path.write_text(f"old-{name}\n", encoding="utf-8")
+                path.chmod(0o640)
+                original = path.stat()
+                before[name] = (path.read_bytes(), stat.S_IMODE(original.st_mode), original.st_ino)
+            real_rename = server_module.os.rename
+            rename_count = 0
+
+            def fail_second_displacement(source: str, destination: str, **kwargs: Any) -> None:
+                nonlocal rename_count
+                rename_count += 1
+                if rename_count == 2:
+                    raise OSError("second displacement /tmp/private")
+                real_rename(source, destination, **kwargs)
+
+            calls: list[list[str]] = []
+            states = self._states()
+            with patch.object(server_module.os, "rename", side_effect=fail_second_displacement), patch.object(
+                server_module, "run_command", side_effect=self._systemctl_fake(calls, states)
+            ):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target, force=True)
+
+            self.assertFalse(result["ok"])
+            for name, (content, mode, inode) in before.items():
+                current = (target / name).stat()
+                self.assertEqual((target / name).read_bytes(), content)
+                self.assertEqual(stat.S_IMODE(current.st_mode), mode)
+                self.assertEqual(current.st_ino, inode)
+            self.assertFalse(any(call[2:] == ["enable", "--now", self.service_name] for call in calls))
+            self.assertEqual(list(target.glob(".*")), [])
+
+    def test_install_resource_monitor_journals_original_move_before_fsync(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            target.chmod(0o700)
+            for name in (self.service_name, self.slice_name):
+                (target / name).write_text("old\n", encoding="utf-8")
+            events: list[str] = []
+            calls: list[list[str]] = []
+            states = self._states()
+
+            def mark(_journal: dict[str, Any], field: str, value: Any = True) -> None:
+                _journal[field] = value
+                if field == "original_moved":
+                    events.append("original_moved")
+
+            def directory_fsync(_directory_fd: int) -> None:
+                events.append("directory_fsync")
+
+            with patch.object(server_module, "_resource_monitor_journal_mark", side_effect=mark, create=True), patch.object(
+                server_module, "_resource_monitor_fsync_directory", side_effect=directory_fsync, create=True
+            ), patch.object(server_module, "run_command", side_effect=self._systemctl_fake(calls, states)):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target, force=True)
+
+            self.assertTrue(result["ok"])
+            mark_index = events.index("original_moved")
+            self.assertTrue(any(index > mark_index and event == "directory_fsync" for index, event in enumerate(events)))
+
+    def test_install_resource_monitor_journals_staged_link_before_fsync(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            target.chmod(0o700)
+            events: list[str] = []
+            calls: list[list[str]] = []
+            states = self._states()
+
+            def mark(_journal: dict[str, Any], field: str, value: Any = True) -> None:
+                _journal[field] = value
+                if field == "staged_linked":
+                    events.append("staged_linked")
+
+            def directory_fsync(_directory_fd: int) -> None:
+                events.append("directory_fsync")
+
+            with patch.object(server_module, "_resource_monitor_journal_mark", side_effect=mark, create=True), patch.object(
+                server_module, "_resource_monitor_fsync_directory", side_effect=directory_fsync, create=True
+            ), patch.object(server_module, "run_command", side_effect=self._systemctl_fake(calls, states)):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target)
+
+            self.assertTrue(result["ok"])
+            mark_index = events.index("staged_linked")
+            self.assertTrue(any(index > mark_index and event == "directory_fsync" for index, event in enumerate(events)))
+
+    def test_install_resource_monitor_rolls_back_identical_content_from_journal(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            target.chmod(0o700)
+            source = source_root / "systemd" / "user" / self.service_name
+            service = target / self.service_name
+            service.write_bytes(source.read_bytes())
+            service.chmod(0o640)
+            original_stat = service.stat()
+            calls: list[list[str]] = []
+            states = self._states()
+            failures = {"daemon-reload": [(1, "", "primary /tmp/private"), (0, "", "")]}
+            with patch.object(server_module, "run_command", side_effect=self._systemctl_fake(calls, states, failures=failures)):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target, force=True)
+
+            self.assertFalse(result["ok"])
+            restored = service.stat()
+            self.assertEqual(restored.st_ino, original_stat.st_ino)
+            self.assertEqual(stat.S_IMODE(restored.st_mode), 0o640)
+
+    def test_install_resource_monitor_rejects_source_changed_during_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "repo"
+            source_dir = root / "systemd" / "user"
+            source_dir.mkdir(parents=True)
+            repo_root = Path(__file__).resolve().parents[1]
+            for name in (self.service_name, self.slice_name):
+                shutil.copy2(repo_root / "systemd" / "user" / name, source_dir / name)
+            target = Path(tmpdir) / "systemd-user"
+            target.mkdir()
+            target.chmod(0o700)
+            source_service = source_dir / self.service_name
+            real_read = server_module.os.read
+            changed = False
+
+            def read_then_change(fd: int, size: int) -> bytes:
+                nonlocal changed
+                data = real_read(fd, size)
+                if not changed and Path(os.readlink(f"/proc/self/fd/{fd}")).name == self.service_name:
+                    changed = True
+                    source_service.write_bytes(source_service.read_bytes() + b"changed\n")
+                return data
+
+            with patch.object(server_module.os, "read", side_effect=read_then_change), patch.object(
+                server_module, "run_command", side_effect=AssertionError("systemctl must not run")
+            ):
+                with self.assertRaises(AgentError):
+                    server_module.install_resource_monitor(root=root, systemd_user_dir=target)
+            self.assertEqual(list(target.iterdir()), [])
+
+    def test_install_resource_monitor_creates_missing_user_systemd_directory_safely(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir) / "home"
+            base.mkdir()
+            base.chmod(0o700)
+            target = base / ".config" / "systemd" / "user"
+            calls: list[list[str]] = []
+            states = self._states()
+            with patch.object(server_module, "run_command", side_effect=self._systemctl_fake(calls, states)):
+                result = server_module.install_resource_monitor(root=source_root, systemd_user_dir=target)
+
+            self.assertTrue(result["ok"])
+            for directory in (base / ".config", base / ".config" / "systemd", target):
+                self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
+
+    def test_install_resource_monitor_rejects_unsafe_existing_config_ancestor(self) -> None:
+        source_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir) / "home"
+            config = base / ".config"
+            config.mkdir(parents=True)
+            base.chmod(0o700)
+            config.chmod(0o777)
+            target = config / "systemd" / "user"
+            with patch.object(server_module, "run_command", side_effect=AssertionError("systemctl must not run")):
+                with self.assertRaises(AgentError):
+                    server_module.install_resource_monitor(root=source_root, systemd_user_dir=target)
+            self.assertFalse((config / "systemd").exists())
+
+    def test_restore_resource_monitor_unit_file_state_exactly(self) -> None:
+        cases = (
+            ("not-found", "enabled", [["disable", self.service_name]]),
+            ("not-found", "enabled-runtime", [["disable", "--runtime", self.service_name]]),
+            ("not-found", "disabled", []),
+            ("not-found", "not-found", []),
+            ("disabled", "enabled", [["disable", self.service_name]]),
+            ("disabled", "enabled-runtime", [["disable", "--runtime", self.service_name]]),
+            ("disabled", "disabled", []),
+            ("disabled", "not-found", []),
+        )
+        for initial, current, expected in cases:
+            with self.subTest(initial=initial, current=current):
+                operations: list[list[str]] = []
+                with patch.object(
+                    server_module,
+                    "_resource_monitor_systemctl_show",
+                    return_value={
+                        "ok": True,
+                        "returncode": 0,
+                        "properties": {
+                            "LoadState": "not-found" if current == "not-found" else "loaded",
+                            "UnitFileState": "" if current == "not-found" else current,
+                            "ActiveState": "inactive",
+                        },
+                    },
+                ), patch.object(
+                    server_module,
+                    "_resource_monitor_systemctl",
+                    side_effect=lambda operation: operations.append(operation) or subprocess.CompletedProcess(operation, 0, "", ""),
+                ):
+                    errors = server_module._resource_monitor_restore_service_state(
+                        {"unit_file_state": initial, "active_state": "inactive"}
+                    )
+                self.assertEqual(operations, expected)
+                self.assertEqual(errors, [])
+
+    def test_restore_resource_monitor_active_state_independently(self) -> None:
+        cases = (
+            ("active", "inactive", [["start", self.service_name]]),
+            ("inactive", "active", [["stop", self.service_name]]),
+            ("active", "active", []),
+            ("inactive", "inactive", []),
+        )
+        for initial, current, expected in cases:
+            with self.subTest(initial=initial, current=current):
+                operations: list[list[str]] = []
+                with patch.object(
+                    server_module,
+                    "_resource_monitor_systemctl_show",
+                    return_value={
+                        "ok": True,
+                        "returncode": 0,
+                        "properties": {
+                            "LoadState": "loaded",
+                            "UnitFileState": "disabled",
+                            "ActiveState": current,
+                        },
+                    },
+                ), patch.object(
+                    server_module,
+                    "_resource_monitor_systemctl",
+                    side_effect=lambda operation: operations.append(operation) or subprocess.CompletedProcess(operation, 0, "", ""),
+                ):
+                    errors = server_module._resource_monitor_restore_service_state(
+                        {"unit_file_state": "disabled", "active_state": initial}
+                    )
+                self.assertEqual(operations, expected)
+                self.assertEqual(errors, [])
+
+    def test_restore_enabled_runtime_uses_runtime_flag(self) -> None:
+        operations: list[list[str]] = []
+        with patch.object(
+            server_module,
+            "_resource_monitor_systemctl_show",
+            return_value={
+                "ok": True,
+                "returncode": 0,
+                "properties": {"LoadState": "loaded", "UnitFileState": "disabled", "ActiveState": "inactive"},
+            },
+        ), patch.object(
+            server_module,
+            "_resource_monitor_systemctl",
+            side_effect=lambda operation: operations.append(operation) or subprocess.CompletedProcess(operation, 0, "", ""),
+        ):
+            errors = server_module._resource_monitor_restore_service_state(
+                {"unit_file_state": "enabled-runtime", "active_state": "inactive"}
+            )
+        self.assertEqual(operations, [["enable", "--runtime", self.service_name]])
+        self.assertEqual(errors, [])
+
+    def test_restore_enabled_runtime_from_persistent_continues_after_disable_failure(self) -> None:
+        operations: list[list[str]] = []
+
+        def systemctl(operation: list[str]) -> subprocess.CompletedProcess[str]:
+            operations.append(operation)
+            return subprocess.CompletedProcess(operation, 1 if operation == ["disable", self.service_name] else 0, "", "")
+
+        with patch.object(
+            server_module,
+            "_resource_monitor_systemctl_show",
+            return_value={
+                "ok": True,
+                "returncode": 0,
+                "properties": {"LoadState": "loaded", "UnitFileState": "enabled", "ActiveState": "inactive"},
+            },
+        ), patch.object(server_module, "_resource_monitor_systemctl", side_effect=systemctl):
+            errors = server_module._resource_monitor_restore_service_state(
+                {"unit_file_state": "enabled-runtime", "active_state": "inactive"}
+            )
+
+        self.assertEqual(
+            operations,
+            [["disable", self.service_name], ["enable", "--runtime", self.service_name]],
+        )
+        self.assertEqual(errors[0]["code"], "resource_monitor_rollback_state_failed")
 
 if __name__ == "__main__":
     unittest.main()

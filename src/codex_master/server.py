@@ -656,8 +656,13 @@ CODEX_USAGE_SPARK_HEALTH_STATES = {"healthy", "failed"}
 CODEX_USAGE_DECISIONS = {"spark", "main", "credits", "blocked", "unchanged"}
 WATCHDOG_SERVICE_NAME = "codex-master-watchdog.service"
 WATCHDOG_TIMER_NAME = "codex-master-watchdog.timer"
+RESOURCE_MONITOR_SERVICE_NAME = "codex-master-resource-monitor.service"
+RESOURCE_MONITOR_SLICE_NAME = "codex-master.slice"
+RESOURCE_MONITOR_UNIT_NAMES = (RESOURCE_MONITOR_SERVICE_NAME, RESOURCE_MONITOR_SLICE_NAME)
 MAX_SYSTEMD_UNIT_BYTES = 64 * 1024
 MAX_SYSTEMD_SECURITY_OUTPUT_BYTES = 64 * 1024
+RESOURCE_MONITOR_SYSTEMCTL_TIMEOUT_SECONDS = 15.0
+RESOURCE_MONITOR_HOOK_ACTION = "manual_hook_trust_or_new_session_required"
 WATCHDOG_REQUIRED_HARDENING_DIRECTIVES = (
     "CapabilityBoundingSet=",
     "KeyringMode=private",
@@ -4626,7 +4631,7 @@ def install_lock() -> Any:
         except OSError as exc:
             raise AgentError("could not acquire install lock") from exc
         try:
-            yield
+            yield fh
         finally:
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
@@ -16558,6 +16563,1252 @@ def safe_unit_text(path: Path, status: dict[str, Any]) -> tuple[str, bool]:
         return "", False
 
 
+def _resource_monitor_unit_path(root: Path, name: str) -> Path:
+    if name not in RESOURCE_MONITOR_UNIT_NAMES:
+        raise AgentError("resource_monitor_unit_invalid")
+    return root / "systemd" / "user" / name
+
+
+def _resource_monitor_stat_identity(current: os.stat_result) -> dict[str, int]:
+    return {
+        "dev": int(current.st_dev),
+        "ino": int(current.st_ino),
+        "mode": int(current.st_mode),
+        "size": int(current.st_size),
+        "mtime_ns": int(current.st_mtime_ns),
+    }
+
+
+def _resource_monitor_stat_matches_identity(
+    current: os.stat_result,
+    expected: Mapping[str, Any],
+) -> bool:
+    return _resource_monitor_stat_identity(current) == {
+        "dev": int(expected.get("dev", -1)),
+        "ino": int(expected.get("ino", -1)),
+        "mode": int(expected.get("mode", -1)),
+        "size": int(expected.get("size", -1)),
+        "mtime_ns": int(expected.get("mtime_ns", -1)),
+    }
+
+
+def _resource_monitor_validate_directory_stat(current: os.stat_result, *, final: bool = False) -> None:
+    if not stat_module.S_ISDIR(current.st_mode) or stat_module.S_ISLNK(current.st_mode):
+        raise AgentError("resource_monitor_systemd_directory_untrusted")
+    current_uid = os.getuid() if hasattr(os, "getuid") else -1
+    if final and current.st_uid != current_uid:
+        raise AgentError("resource_monitor_systemd_directory_untrusted")
+    sticky_shared = bool(current.st_mode & 0o002 and current.st_mode & stat_module.S_ISVTX)
+    if current.st_uid not in {0, current_uid} or (current.st_mode & 0o022 and (final or not sticky_shared)):
+        raise AgentError("resource_monitor_systemd_directory_untrusted")
+
+
+def _resource_monitor_open_directory(path: Path) -> int:
+    if not isinstance(path, Path) or not path.is_absolute():
+        raise AgentError("resource_monitor_systemd_directory_untrusted")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = -1
+    try:
+        directory_fd = os.open(path.anchor, flags)
+        components = path.parts[1:]
+        for index, part in enumerate(components):
+            created = False
+            try:
+                current = os.stat(part, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                os.mkdir(part, 0o700, dir_fd=directory_fd)
+                current = os.stat(part, dir_fd=directory_fd, follow_symlinks=False)
+                created = True
+                if not stat_module.S_ISDIR(current.st_mode):
+                    raise AgentError("resource_monitor_systemd_directory_untrusted")
+            _resource_monitor_validate_directory_stat(current, final=index == len(components) - 1)
+            child_fd = os.open(part, flags, dir_fd=directory_fd)
+            opened = os.fstat(child_fd)
+            if opened.st_dev != current.st_dev or opened.st_ino != current.st_ino:
+                os.close(child_fd)
+                raise AgentError("resource_monitor_systemd_directory_changed")
+            if created:
+                os.fchmod(child_fd, 0o700)
+            os.close(directory_fd)
+            directory_fd = child_fd
+        final_stat = os.fstat(directory_fd)
+        _resource_monitor_validate_directory_stat(final_stat, final=True)
+        chained_fd = open_directory_chain_no_follow_matching(
+            path,
+            final_stat,
+            error_text="resource_monitor_systemd_directory_untrusted",
+            changed_text="resource_monitor_systemd_directory_changed",
+        )
+        chained_stat = os.fstat(chained_fd)
+        if chained_stat.st_dev != final_stat.st_dev or chained_stat.st_ino != final_stat.st_ino:
+            os.close(chained_fd)
+            raise AgentError("resource_monitor_systemd_directory_changed")
+        os.close(directory_fd)
+        return chained_fd
+    except AgentError:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        raise
+    except (FileNotFoundError, OSError) as exc:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        raise AgentError("resource_monitor_systemd_directory_untrusted") from exc
+
+
+def _resource_monitor_reopen_directory(path: Path, expected: tuple[int, int]) -> None:
+    try:
+        current = path.lstat()
+        fd = open_directory_chain_no_follow_matching(
+            path,
+            current,
+            error_text="target_parent_rebound",
+            changed_text="target_parent_rebound",
+        )
+    except (AgentError, OSError) as exc:
+        raise AgentError("target_parent_rebound") from exc
+    try:
+        opened = os.fstat(fd)
+        _resource_monitor_validate_directory_stat(opened, final=True)
+        if (opened.st_dev, opened.st_ino) != expected:
+            raise AgentError("target_parent_rebound")
+    finally:
+        os.close(fd)
+
+
+def _resource_monitor_read_regular_at_fd(
+    directory_fd: int,
+    name: str,
+    *,
+    missing_ok: bool,
+) -> tuple[bytes | None, os.stat_result | None]:
+    try:
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if missing_ok:
+            return None, None
+        raise AgentError("resource_monitor_unit_invalid") from None
+    except OSError as exc:
+        raise AgentError("resource_monitor_unit_unreadable") from exc
+    if (
+        not stat_module.S_ISREG(before.st_mode)
+        or getattr(before, "st_nlink", 1) != 1
+        or before.st_size > MAX_SYSTEMD_UNIT_BYTES
+    ):
+        raise AgentError("resource_monitor_unit_must_be_regular")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = -1
+    try:
+        fd = os.open(name, flags, dir_fd=directory_fd)
+        opened = os.fstat(fd)
+        if not _resource_monitor_stat_matches_identity(opened, _resource_monitor_stat_identity(before)):
+            raise AgentError("resource_monitor_unit_changed")
+        raw = bytearray()
+        while len(raw) <= MAX_SYSTEMD_UNIT_BYTES:
+            chunk = os.read(fd, min(8192, MAX_SYSTEMD_UNIT_BYTES + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        after = os.fstat(fd)
+        if not _resource_monitor_stat_matches_identity(after, _resource_monitor_stat_identity(before)):
+            raise AgentError("resource_monitor_unit_changed")
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError("resource_monitor_unit_unreadable") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) > MAX_SYSTEMD_UNIT_BYTES:
+        raise AgentError("resource_monitor_unit_too_large")
+    return bytes(raw), after
+
+
+def _resource_monitor_read_source(path: Path) -> tuple[bytes, os.stat_result]:
+    try:
+        parent_stat = path.parent.lstat()
+    except OSError as exc:
+        raise AgentError("resource_monitor_source_invalid") from exc
+    if not directory_chain_is_real_no_symlink(path.parent):
+        raise AgentError("resource_monitor_source_invalid")
+    parent_fd = open_directory_no_follow_matching(
+        path.parent,
+        parent_stat,
+        error_text="resource_monitor_source_invalid",
+        changed_text="resource_monitor_source_changed",
+    )
+    try:
+        raw, current = _resource_monitor_read_regular_at_fd(parent_fd, path.name, missing_ok=False)
+    finally:
+        os.close(parent_fd)
+    assert raw is not None and current is not None
+    return raw, current
+
+
+def _resource_monitor_read_sources(root: Path) -> dict[str, dict[str, Any]]:
+    sources: dict[str, dict[str, Any]] = {}
+    for name in RESOURCE_MONITOR_UNIT_NAMES:
+        raw, current = _resource_monitor_read_source(_resource_monitor_unit_path(root, name))
+        sources[name] = {"bytes": raw, "mode": stat_module.S_IMODE(current.st_mode), "stat": current}
+    return sources
+
+
+def _resource_monitor_temp_bytes(
+    directory_fd: int,
+    name: str,
+    data: bytes,
+    mode: int,
+) -> tuple[str, os.stat_result]:
+    temp_name = f".{name}.{uuid.uuid4().hex}.stage"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = -1
+    created = False
+    keep = False
+    try:
+        fd = os.open(temp_name, flags, 0o600, dir_fd=directory_fd)
+        created = True
+        os.fchmod(fd, mode)
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view) :]
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        current = os.stat(temp_name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat_module.S_ISREG(current.st_mode)
+            or getattr(current, "st_nlink", 1) != 1
+            or current.st_size != len(data)
+        ):
+            raise AgentError("resource_monitor_unit_stage_failed")
+        keep = True
+        return temp_name, current
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError("resource_monitor_unit_stage_failed") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if created and not keep:
+            with contextlib.suppress(OSError):
+                os.unlink(temp_name, dir_fd=directory_fd)
+
+
+def _resource_monitor_fsync_directory(directory_fd: int) -> None:
+    os.fsync(directory_fd)
+
+
+def _resource_monitor_journal_mark(journal: dict[str, Any], field: str, value: Any = True) -> None:
+    journal[field] = value
+
+
+def _resource_monitor_snapshot_targets(directory_fd: int) -> dict[str, os.stat_result | None]:
+    snapshots: dict[str, os.stat_result | None] = {}
+    for name in RESOURCE_MONITOR_UNIT_NAMES:
+        try:
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            snapshots[name] = None
+            continue
+        except OSError as exc:
+            raise AgentError("resource_monitor_unit_unreadable") from exc
+        if (
+            not stat_module.S_ISREG(current.st_mode)
+            or getattr(current, "st_nlink", 1) != 1
+            or current.st_size > MAX_SYSTEMD_UNIT_BYTES
+        ):
+            raise AgentError("resource_monitor_unit_must_be_regular")
+        snapshots[name] = current
+    return snapshots
+
+
+def _resource_monitor_new_journal(
+    name: str,
+    original: os.stat_result | None,
+    staged_name: str,
+    staged: os.stat_result,
+) -> dict[str, Any]:
+    token = uuid.uuid4().hex
+    return {
+        "name": name,
+        "original_present": original is not None,
+        "original_identity": None if original is None else _resource_monitor_stat_identity(original),
+        "backup_name": f".{name}.{token}.backup" if original is not None else None,
+        "backup_identity": None,
+        "original_moved": False,
+        "staged_name": staged_name,
+        "staged_identity": _resource_monitor_stat_identity(staged),
+        "staged_linked": False,
+        "staged_durable": False,
+        "link_durable": False,
+        "stage_cleaned": False,
+        "installed_identity": None,
+        "cleanup_name": f".{name}.{token}.cleanup",
+        "installed_moved": False,
+        "cleanup_done": False,
+        "cleanup_quarantine_name": None,
+        "cleanup_moved": False,
+        "cleanup_removed": False,
+        "cleanup_restored": False,
+        "restored": False,
+        "manual_recovery": False,
+    }
+
+
+def _resource_monitor_name_must_be_absent(directory_fd: int, name: str) -> None:
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise AgentError("resource_monitor_transaction_name_unreadable") from exc
+    raise AgentError("resource_monitor_transaction_name_collision")
+
+
+def _resource_monitor_error_append(journal: dict[str, Any], code: str) -> None:
+    journal["manual_recovery"] = True
+    journal.setdefault("errors", []).append(_resource_monitor_error(code))
+
+
+def _resource_monitor_remove_exact_identity(
+    directory_fd: int,
+    name: str,
+    expected: Mapping[str, Any],
+    *,
+    journal: dict[str, Any] | None = None,
+    missing_ok: bool = True,
+) -> list[dict[str, Any]]:
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return [] if missing_ok else [_resource_monitor_error("resource_monitor_exact_cleanup_failed")]
+    except OSError:
+        return [_resource_monitor_error("resource_monitor_exact_cleanup_failed")]
+    if (
+        not stat_module.S_ISREG(current.st_mode)
+        or not _resource_monitor_stat_matches_identity(current, expected)
+    ):
+        if journal is not None:
+            _resource_monitor_error_append(journal, "manual_recovery_required")
+        return [_resource_monitor_error("manual_recovery_required")]
+
+    quarantine_name = ""
+    quarantine_fd = -1
+    quarantine_created = False
+    moved = False
+    removed = False
+    for _ in range(8):
+        candidate = f".{name}.{uuid.uuid4().hex}.quarantine"
+        try:
+            os.mkdir(candidate, 0o700, dir_fd=directory_fd)
+            quarantine_name = candidate
+            quarantine_created = True
+            break
+        except FileExistsError:
+            continue
+        except OSError:
+            return [_resource_monitor_error("resource_monitor_exact_cleanup_failed")]
+    if not quarantine_created:
+        return [_resource_monitor_error("resource_monitor_exact_cleanup_failed")]
+
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        quarantine_fd = os.open(quarantine_name, flags, dir_fd=directory_fd)
+        quarantine_stat = os.fstat(quarantine_fd)
+        if not stat_module.S_ISDIR(quarantine_stat.st_mode) or stat_module.S_IMODE(quarantine_stat.st_mode) & 0o077:
+            return [_resource_monitor_error("resource_monitor_exact_cleanup_failed")]
+        os.rename(
+            name,
+            "object",
+            src_dir_fd=directory_fd,
+            dst_dir_fd=quarantine_fd,
+        )
+        moved = True
+        if journal is not None:
+            journal["cleanup_quarantine_name"] = quarantine_name
+            _resource_monitor_journal_mark(journal, "cleanup_moved", True)
+        moved_stat = os.stat("object", dir_fd=quarantine_fd, follow_symlinks=False)
+        moved_identity = _resource_monitor_stat_identity(moved_stat)
+        if (
+            stat_module.S_ISREG(moved_stat.st_mode)
+            and _resource_monitor_stat_matches_identity(moved_stat, expected)
+        ):
+            os.unlink("object", dir_fd=quarantine_fd)
+            os.fsync(quarantine_fd)
+            os.close(quarantine_fd)
+            quarantine_fd = -1
+            os.rmdir(quarantine_name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+            removed = True
+            if journal is not None:
+                _resource_monitor_journal_mark(journal, "cleanup_removed", True)
+            return []
+
+        try:
+            os.link(
+                "object",
+                name,
+                src_dir_fd=quarantine_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            if journal is not None:
+                _resource_monitor_error_append(journal, "manual_recovery_required")
+            return [_resource_monitor_error("manual_recovery_required")]
+        restored = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if not _resource_monitor_stat_matches_identity(restored, moved_identity):
+            if journal is not None:
+                _resource_monitor_error_append(journal, "manual_recovery_required")
+            return [_resource_monitor_error("manual_recovery_required")]
+        moved_again = os.stat("object", dir_fd=quarantine_fd, follow_symlinks=False)
+        if not _resource_monitor_stat_matches_identity(moved_again, moved_identity):
+            if journal is not None:
+                _resource_monitor_error_append(journal, "manual_recovery_required")
+            return [_resource_monitor_error("manual_recovery_required")]
+        os.unlink("object", dir_fd=quarantine_fd)
+        os.fsync(quarantine_fd)
+        os.close(quarantine_fd)
+        quarantine_fd = -1
+        os.rmdir(quarantine_name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+        removed = True
+        if journal is not None:
+            _resource_monitor_journal_mark(journal, "cleanup_restored", True)
+        return [_resource_monitor_error("manual_recovery_required")]
+    except (AgentError, OSError):
+        return [_resource_monitor_error("resource_monitor_exact_cleanup_failed")]
+    finally:
+        if quarantine_fd >= 0:
+            os.close(quarantine_fd)
+        if quarantine_created and not moved and not removed:
+            with contextlib.suppress(OSError):
+                os.rmdir(quarantine_name, dir_fd=directory_fd)
+
+
+def _resource_monitor_restore_backup_no_overwrite(
+    directory_fd: int,
+    journal: dict[str, Any],
+) -> list[dict[str, Any]]:
+    backup_name = journal.get("backup_name")
+    if not backup_name:
+        return []
+    errors: list[dict[str, Any]] = []
+    original_identity = journal.get("original_identity")
+    try:
+        backup = os.stat(backup_name, dir_fd=directory_fd, follow_symlinks=False)
+        if not isinstance(original_identity, Mapping) or not _resource_monitor_stat_matches_identity(
+            backup, original_identity
+        ):
+            _resource_monitor_error_append(journal, "manual_recovery_required")
+            return [_resource_monitor_error("manual_recovery_required")]
+        try:
+            os.link(
+                backup_name,
+                journal["name"],
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            _resource_monitor_error_append(journal, "manual_recovery_required")
+            return [_resource_monitor_error("manual_recovery_required")]
+        restored = os.stat(journal["name"], dir_fd=directory_fd, follow_symlinks=False)
+        if not _resource_monitor_stat_matches_identity(restored, original_identity):
+            _resource_monitor_error_append(journal, "manual_recovery_required")
+            return [_resource_monitor_error("manual_recovery_required")]
+        journal["cleanup_kind"] = "restore"
+        cleanup_errors = _resource_monitor_remove_exact_identity(
+            directory_fd,
+            backup_name,
+            original_identity,
+            journal=journal,
+            missing_ok=False,
+        )
+        if cleanup_errors:
+            return cleanup_errors
+        _resource_monitor_journal_mark(journal, "restored")
+        return errors
+    except (AgentError, OSError):
+        errors.append(_resource_monitor_error("resource_monitor_backup_restore_failed"))
+        return errors
+
+
+def _resource_monitor_displace_original(
+    directory_fd: int,
+    journal: dict[str, Any],
+) -> None:
+    if not journal["original_present"]:
+        return
+    backup_name = journal["backup_name"]
+    _resource_monitor_name_must_be_absent(directory_fd, backup_name)
+    os.rename(
+        journal["name"],
+        backup_name,
+        src_dir_fd=directory_fd,
+        dst_dir_fd=directory_fd,
+    )
+    _resource_monitor_journal_mark(journal, "backup_exists", True)
+    backup = os.stat(backup_name, dir_fd=directory_fd, follow_symlinks=False)
+    journal["backup_identity"] = _resource_monitor_stat_identity(backup)
+    if not _resource_monitor_stat_matches_identity(backup, journal["original_identity"]):
+        errors = _resource_monitor_restore_backup_no_overwrite(directory_fd, journal)
+        if errors:
+            journal.setdefault("errors", []).extend(errors)
+        raise AgentError("resource_monitor_target_changed")
+    _resource_monitor_journal_mark(journal, "original_moved")
+    _resource_monitor_fsync_directory(directory_fd)
+
+
+def _resource_monitor_link_staged(
+    directory_fd: int,
+    journal: dict[str, Any],
+) -> None:
+    try:
+        os.link(
+            journal["staged_name"],
+            journal["name"],
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except FileExistsError as exc:
+        _resource_monitor_error_append(journal, "manual_recovery_required")
+        raise AgentError("resource_monitor_target_changed") from exc
+    installed = os.stat(journal["name"], dir_fd=directory_fd, follow_symlinks=False)
+    if not _resource_monitor_stat_matches_identity(installed, journal["staged_identity"]):
+        _resource_monitor_error_append(journal, "manual_recovery_required")
+        raise AgentError("resource_monitor_target_changed")
+    journal["installed_identity"] = _resource_monitor_stat_identity(installed)
+    _resource_monitor_journal_mark(journal, "staged_linked")
+    _resource_monitor_fsync_directory(directory_fd)
+    _resource_monitor_journal_mark(journal, "link_durable")
+    stage = os.stat(journal["staged_name"], dir_fd=directory_fd, follow_symlinks=False)
+    if not _resource_monitor_stat_matches_identity(stage, journal["staged_identity"]):
+        _resource_monitor_error_append(journal, "manual_recovery_required")
+        raise AgentError("resource_monitor_target_changed")
+    journal["cleanup_kind"] = "stage"
+    cleanup_errors = _resource_monitor_remove_exact_identity(
+        directory_fd,
+        journal["staged_name"],
+        journal["staged_identity"],
+        journal=journal,
+        missing_ok=False,
+    )
+    if cleanup_errors:
+        journal.setdefault("errors", []).extend(cleanup_errors)
+        raise AgentError("resource_monitor_target_changed")
+    _resource_monitor_journal_mark(journal, "stage_cleaned")
+
+
+def _resource_monitor_mutate_unit(directory_fd: int, journal: dict[str, Any]) -> None:
+    _resource_monitor_displace_original(directory_fd, journal)
+    _resource_monitor_link_staged(directory_fd, journal)
+
+
+def _resource_monitor_remove_installed(
+    directory_fd: int,
+    journal: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not journal.get("staged_linked") or not journal.get("installed_identity"):
+        return []
+    cleanup_name = journal["cleanup_name"]
+    errors: list[dict[str, Any]] = []
+    try:
+        _resource_monitor_name_must_be_absent(directory_fd, cleanup_name)
+        os.rename(
+            journal["name"],
+            cleanup_name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        _resource_monitor_journal_mark(journal, "installed_moved")
+        moved = os.stat(cleanup_name, dir_fd=directory_fd, follow_symlinks=False)
+        if not _resource_monitor_stat_matches_identity(moved, journal["installed_identity"]):
+            _resource_monitor_error_append(journal, "manual_recovery_required")
+            return _resource_monitor_remove_exact_identity(
+                directory_fd,
+                cleanup_name,
+                journal["installed_identity"],
+                journal=journal,
+                missing_ok=False,
+            )
+        journal["cleanup_kind"] = "installed"
+        cleanup_errors = _resource_monitor_remove_exact_identity(
+            directory_fd,
+            cleanup_name,
+            journal["installed_identity"],
+            journal=journal,
+            missing_ok=False,
+        )
+        if cleanup_errors:
+            return cleanup_errors
+        _resource_monitor_journal_mark(journal, "cleanup_done")
+        _resource_monitor_fsync_directory(directory_fd)
+    except FileNotFoundError:
+        return []
+    except (AgentError, OSError):
+        errors.append(_resource_monitor_error("resource_monitor_installed_cleanup_failed"))
+    return errors
+
+
+def _resource_monitor_cleanup_stage(
+    directory_fd: int,
+    journal: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if journal.get("stage_cleaned"):
+        return []
+    try:
+        stage = os.stat(journal["staged_name"], dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        _resource_monitor_journal_mark(journal, "stage_cleaned")
+        return []
+    except OSError:
+        return [_resource_monitor_error("resource_monitor_temp_cleanup_failed")]
+    if not _resource_monitor_stat_matches_identity(stage, journal["staged_identity"]):
+        _resource_monitor_error_append(journal, "manual_recovery_required")
+        return [_resource_monitor_error("manual_recovery_required")]
+    journal["cleanup_kind"] = "stage"
+    errors = _resource_monitor_remove_exact_identity(
+        directory_fd,
+        journal["staged_name"],
+        journal["staged_identity"],
+        journal=journal,
+        missing_ok=False,
+    )
+    if errors:
+        return errors
+    _resource_monitor_journal_mark(journal, "stage_cleaned")
+    return []
+
+
+def _resource_monitor_rollback_unit(
+    directory_fd: int,
+    journal: dict[str, Any],
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    errors.extend(_resource_monitor_cleanup_stage(directory_fd, journal))
+    errors.extend(_resource_monitor_remove_installed(directory_fd, journal))
+    if journal.get("backup_exists") or journal.get("original_moved"):
+        errors.extend(_resource_monitor_restore_backup_no_overwrite(directory_fd, journal))
+    errors.extend(journal.get("errors", []))
+    return errors
+
+
+def _resource_monitor_commit_backups(
+    directory_fd: int,
+    journals: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    errors: list[dict[str, Any]] = []
+    changed = False
+    for journal in journals:
+        backup_name = journal.get("backup_name")
+        if not backup_name:
+            continue
+        try:
+            backup = os.stat(backup_name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            errors.append(_resource_monitor_error("resource_monitor_backup_cleanup_failed"))
+            continue
+        if not _resource_monitor_stat_matches_identity(backup, journal.get("original_identity", {})):
+            errors.append(_resource_monitor_error("manual_recovery_required"))
+            continue
+        journal["cleanup_kind"] = "backup"
+        cleanup_errors = _resource_monitor_remove_exact_identity(
+            directory_fd,
+            backup_name,
+            journal.get("original_identity", {}),
+            journal=journal,
+            missing_ok=False,
+        )
+        if cleanup_errors:
+            errors.extend(cleanup_errors)
+        else:
+            journal["backup_cleaned"] = True
+            changed = True
+    if changed:
+        try:
+            _resource_monitor_fsync_directory(directory_fd)
+        except OSError:
+            errors.append(_resource_monitor_error("resource_monitor_backup_cleanup_failed"))
+    return errors
+
+
+def _resource_monitor_systemctl_show(unit: str) -> dict[str, Any]:
+    properties = (
+        "LoadState",
+        "ActiveState",
+        "SubState",
+        "UnitFileState",
+        "FragmentPath",
+        "ControlGroup",
+        "TasksCurrent",
+        "MainPID",
+    )
+    cp = run_command(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            unit,
+            "--no-pager",
+            *(argument for prop in properties for argument in ("--property", prop)),
+        ],
+        timeout=RESOURCE_MONITOR_SYSTEMCTL_TIMEOUT_SECONDS,
+    )
+    parsed = parse_systemctl_show(cp.stdout)
+    return {
+        "ok": cp.returncode == 0,
+        "returncode": cp.returncode,
+        "properties": {prop: parsed.get(prop, "") for prop in properties},
+    }
+
+
+def _resource_monitor_systemctl(operation: list[str]) -> subprocess.CompletedProcess[str]:
+    return run_command(
+        ["systemctl", "--user", *operation],
+        timeout=RESOURCE_MONITOR_SYSTEMCTL_TIMEOUT_SECONDS,
+    )
+
+
+def _resource_monitor_canonical_surface_check(
+    *,
+    target_dir: Path,
+    target_identity: tuple[int, int],
+    directory_fd: int,
+    lock_fd: int,
+    lock_path: Path,
+    journals: list[dict[str, Any]],
+) -> None:
+    try:
+        pinned = os.fstat(directory_fd)
+    except OSError as exc:
+        raise AgentError("target_parent_rebound") from exc
+    _resource_monitor_validate_directory_stat(pinned, final=True)
+    if (pinned.st_dev, pinned.st_ino) != target_identity:
+        raise AgentError("target_parent_rebound")
+    _resource_monitor_reopen_directory(target_dir, target_identity)
+
+    try:
+        lock_stat = os.fstat(lock_fd)
+        canonical_lock = os.stat(lock_path, follow_symlinks=False)
+    except OSError as exc:
+        raise AgentError("install_lock_rebound") from exc
+    if (
+        not stat_module.S_ISREG(lock_stat.st_mode)
+        or not stat_module.S_ISREG(canonical_lock.st_mode)
+        or getattr(lock_stat, "st_nlink", 1) != 1
+        or getattr(canonical_lock, "st_nlink", 1) != 1
+        or (lock_stat.st_dev, lock_stat.st_ino) != (canonical_lock.st_dev, canonical_lock.st_ino)
+    ):
+        raise AgentError("install_lock_rebound")
+
+    for journal in journals:
+        name = journal.get("name")
+        installed_identity = journal.get("installed_identity")
+        if (
+            name not in RESOURCE_MONITOR_UNIT_NAMES
+            or not journal.get("staged_linked")
+            or not isinstance(installed_identity, Mapping)
+        ):
+            _resource_monitor_error_append(journal, "manual_recovery_required")
+            raise AgentError("resource_monitor_unit_identity_mismatch")
+        try:
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as exc:
+            _resource_monitor_error_append(journal, "manual_recovery_required")
+            raise AgentError("resource_monitor_unit_identity_mismatch") from exc
+        if (
+            not stat_module.S_ISREG(current.st_mode)
+            or getattr(current, "st_nlink", 1) != 1
+            or not _resource_monitor_stat_matches_identity(current, installed_identity)
+        ):
+            _resource_monitor_error_append(journal, "manual_recovery_required")
+            raise AgentError("resource_monitor_unit_identity_mismatch")
+
+
+def _resource_monitor_error(code: str, returncode: int | None = None) -> dict[str, Any]:
+    error: dict[str, Any] = {"code": code}
+    if returncode is not None:
+        error["returncode"] = int(returncode)
+    return error
+
+
+_RESOURCE_MONITOR_SUPPORTED_UNIT_FILE_STATES = frozenset({"not-found", "enabled", "enabled-runtime", "disabled"})
+_RESOURCE_MONITOR_SUPPORTED_ACTIVE_STATES = frozenset({"active", "inactive"})
+
+
+def _resource_monitor_previous_state(show: Mapping[str, Any]) -> dict[str, Any]:
+    properties = show.get("properties") if isinstance(show, Mapping) else None
+    if not isinstance(properties, Mapping):
+        properties = {}
+    load_state = properties.get("LoadState")
+    raw_unit_file_state = properties.get("UnitFileState")
+    active_state = properties.get("ActiveState")
+    if not show.get("ok", True) and load_state != "not-found":
+        raise AgentError("resource_monitor_service_state_unknown")
+    if active_state not in _RESOURCE_MONITOR_SUPPORTED_ACTIVE_STATES:
+        raise AgentError("resource_monitor_service_state_unknown")
+    if load_state == "not-found" and raw_unit_file_state in {"", None} and active_state == "inactive":
+        unit_file_state = "not-found"
+    elif load_state != "not-found" and raw_unit_file_state in {"enabled", "enabled-runtime", "disabled"}:
+        unit_file_state = raw_unit_file_state
+    else:
+        raise AgentError("resource_monitor_service_state_unknown")
+    return {
+        "load_state": load_state,
+        "unit_file_state": unit_file_state,
+        "active_state": active_state,
+        "enabled": unit_file_state in {"enabled", "enabled-runtime"},
+        "active": active_state == "active",
+    }
+
+
+def _resource_monitor_restore_service_state(previous: Mapping[str, Any]) -> list[dict[str, Any]]:
+    previous_unit_file_state = previous.get("unit_file_state")
+    previous_active_state = previous.get("active_state")
+    if (
+        previous_unit_file_state not in _RESOURCE_MONITOR_SUPPORTED_UNIT_FILE_STATES
+        or previous_active_state not in _RESOURCE_MONITOR_SUPPORTED_ACTIVE_STATES
+    ):
+        raise AgentError("rollback_service_state_unknown")
+    try:
+        current = _resource_monitor_previous_state(
+            _resource_monitor_systemctl_show(RESOURCE_MONITOR_SERVICE_NAME)
+        )
+    except AgentError as exc:
+        if str(exc) == "resource_monitor_service_state_unknown":
+            return [_resource_monitor_error("rollback_service_state_unknown")]
+        raise
+
+    errors: list[dict[str, Any]] = []
+
+    def run(operation: list[str]) -> None:
+        try:
+            result = _resource_monitor_systemctl(operation)
+            if result.returncode != 0:
+                errors.append(_resource_monitor_error("resource_monitor_rollback_state_failed", result.returncode))
+        except Exception:
+            errors.append(_resource_monitor_error("resource_monitor_rollback_state_failed"))
+
+    current_unit_file_state = current["unit_file_state"]
+    if previous_unit_file_state in {"not-found", "disabled"}:
+        if current_unit_file_state == "enabled":
+            run(["disable", RESOURCE_MONITOR_SERVICE_NAME])
+        elif current_unit_file_state == "enabled-runtime":
+            run(["disable", "--runtime", RESOURCE_MONITOR_SERVICE_NAME])
+    elif previous_unit_file_state == "enabled":
+        if current_unit_file_state in {"enabled-runtime", "disabled", "not-found"}:
+            run(["enable", RESOURCE_MONITOR_SERVICE_NAME])
+    elif previous_unit_file_state == "enabled-runtime":
+        if current_unit_file_state in {"disabled", "not-found"}:
+            run(["enable", "--runtime", RESOURCE_MONITOR_SERVICE_NAME])
+        elif current_unit_file_state == "enabled":
+            run(["disable", RESOURCE_MONITOR_SERVICE_NAME])
+            run(["enable", "--runtime", RESOURCE_MONITOR_SERVICE_NAME])
+
+    if previous_active_state == "active" and current["active_state"] == "inactive":
+        run(["start", RESOURCE_MONITOR_SERVICE_NAME])
+    elif previous_active_state == "inactive" and current["active_state"] == "active":
+        run(["stop", RESOURCE_MONITOR_SERVICE_NAME])
+    return errors
+
+
+def _resource_monitor_rollback_result(
+    primary_error: dict[str, Any],
+    *,
+    directory_fd: int,
+    journals: list[dict[str, Any]],
+    activation_attempted: bool,
+    previous_service_state: Mapping[str, Any],
+    preexisting_rollback_errors: list[dict[str, Any]] | None = None,
+    rollback_reload_allowed: bool = True,
+    external_ops_allowed: bool = True,
+) -> dict[str, Any]:
+    rollback_errors: list[dict[str, Any]] = list(preexisting_rollback_errors or [])
+    for journal in reversed(journals):
+        try:
+            rollback_errors.extend(_resource_monitor_rollback_unit(directory_fd, journal))
+        except Exception:
+            rollback_errors.append(_resource_monitor_error("resource_monitor_rollback_unit_failed"))
+    if rollback_reload_allowed and external_ops_allowed:
+        try:
+            reload_result = _resource_monitor_systemctl(["daemon-reload"])
+            if reload_result.returncode != 0:
+                rollback_errors.append(
+                    _resource_monitor_error("rollback_daemon_reload_failed", reload_result.returncode)
+                )
+        except Exception:
+            rollback_errors.append(_resource_monitor_error("rollback_daemon_reload_failed"))
+    if activation_attempted and external_ops_allowed:
+        try:
+            rollback_errors.extend(_resource_monitor_restore_service_state(previous_service_state))
+        except AgentError as exc:
+            rollback_errors.append(_resource_monitor_error(str(exc)))
+        except Exception:
+            rollback_errors.append(_resource_monitor_error("resource_monitor_rollback_state_failed"))
+    rollback_error: dict[str, Any] | None = None
+    if rollback_errors:
+        if len(rollback_errors) == 1:
+            rollback_error = rollback_errors[0]
+        else:
+            rollback_error = {"code": "rollback_failed", "errors": rollback_errors}
+    return {
+        "ok": False,
+        "status": "rollback_failed" if rollback_error else "rolled_back",
+        "primary_error": primary_error,
+        "rollback_error": rollback_error,
+        "raw_output": "not_returned",
+    }
+
+
+def install_resource_monitor(
+    *,
+    root: Path | None = None,
+    systemd_user_dir: Path | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    root = root or repo_root()
+    target_dir = systemd_user_dir or (Path.home() / ".config" / "systemd" / "user")
+    with install_lock() as lock_handle:
+        sources = _resource_monitor_read_sources(root)
+        directory_fd = -1
+        snapshots: dict[str, os.stat_result | None] = {}
+        journals: list[dict[str, Any]] = []
+        activation_attempted = False
+        previous_service_state: dict[str, Any] = {}
+        rollback_reload_allowed = True
+        external_ops_allowed = True
+        mutation_started = False
+        preexisting_rollback_errors: list[dict[str, Any]] = []
+        lock_path = (LOCK_DIR / "install.lock").absolute()
+        try:
+            directory_fd = _resource_monitor_open_directory(target_dir)
+            opened_target = os.fstat(directory_fd)
+            target_identity = (opened_target.st_dev, opened_target.st_ino)
+            snapshots = _resource_monitor_snapshot_targets(directory_fd)
+            if not force:
+                for name, source in sources.items():
+                    if snapshots[name] is None:
+                        continue
+                    target_bytes, target_stat = _resource_monitor_read_regular_at_fd(
+                        directory_fd,
+                        name,
+                        missing_ok=False,
+                    )
+                    if target_bytes != source["bytes"] or stat_module.S_IMODE(target_stat.st_mode) != source["mode"]:
+                        raise AgentError("resource_monitor_target_stale_use_force")
+            service_show = _resource_monitor_systemctl_show(RESOURCE_MONITOR_SERVICE_NAME)
+            slice_show = _resource_monitor_systemctl_show(RESOURCE_MONITOR_SLICE_NAME)
+            for show in (service_show, slice_show):
+                if not show["ok"] and show["returncode"] not in {1}:
+                    raise AgentError("resource_monitor_systemctl_unavailable")
+            previous_service_state = _resource_monitor_previous_state(service_show)
+            for name, source in sources.items():
+                staged_name, staged_stat = _resource_monitor_temp_bytes(
+                    directory_fd,
+                    name,
+                    source["bytes"],
+                    source["mode"],
+                )
+                journals.append(_resource_monitor_new_journal(name, snapshots[name], staged_name, staged_stat))
+            _resource_monitor_fsync_directory(directory_fd)
+            for journal in journals:
+                _resource_monitor_journal_mark(journal, "staged_durable")
+            for journal in journals:
+                mutation_started = True
+                _resource_monitor_mutate_unit(directory_fd, journal)
+
+            try:
+                _resource_monitor_canonical_surface_check(
+                    target_dir=target_dir,
+                    target_identity=target_identity,
+                    directory_fd=directory_fd,
+                    lock_fd=lock_handle.fileno(),
+                    lock_path=lock_path,
+                    journals=journals,
+                )
+            except AgentError as exc:
+                external_ops_allowed = False
+                rollback_reload_allowed = False
+                preexisting_rollback_errors.append(_resource_monitor_error("manual_recovery_required"))
+                raise _ResourceMonitorPrimaryFailure(_resource_monitor_error(str(exc))) from exc
+
+            reload_result = _resource_monitor_systemctl(["daemon-reload"])
+            if reload_result.returncode != 0:
+                raise _ResourceMonitorPrimaryFailure(
+                    _resource_monitor_error("daemon_reload_failed", reload_result.returncode)
+                )
+            try:
+                _resource_monitor_canonical_surface_check(
+                    target_dir=target_dir,
+                    target_identity=target_identity,
+                    directory_fd=directory_fd,
+                    lock_fd=lock_handle.fileno(),
+                    lock_path=lock_path,
+                    journals=journals,
+                )
+            except AgentError as exc:
+                external_ops_allowed = False
+                rollback_reload_allowed = False
+                preexisting_rollback_errors.append(_resource_monitor_error("manual_recovery_required"))
+                raise _ResourceMonitorPrimaryFailure(_resource_monitor_error(str(exc))) from exc
+            activation_attempted = True
+            enable_result = _resource_monitor_systemctl(
+                ["enable", "--now", RESOURCE_MONITOR_SERVICE_NAME]
+            )
+            if enable_result.returncode != 0:
+                raise _ResourceMonitorPrimaryFailure(
+                    _resource_monitor_error("enable_now_failed", enable_result.returncode)
+                )
+            backup_cleanup_errors = _resource_monitor_commit_backups(directory_fd, journals)
+            if backup_cleanup_errors:
+                return {
+                    "ok": False,
+                    "status": "manual_recovery_required",
+                    "primary_error": _resource_monitor_error("resource_monitor_backup_cleanup_failed"),
+                    "rollback_error": {"code": "manual_recovery_required", "errors": backup_cleanup_errors},
+                    "raw_output": "not_returned",
+                }
+            return {
+                "ok": True,
+                "service": RESOURCE_MONITOR_SERVICE_NAME,
+                "units_materialized": True,
+                "enabled": True,
+                "active": True,
+                "raw_output": "not_returned",
+            }
+        except _ResourceMonitorPrimaryFailure as primary:
+            return _resource_monitor_rollback_result(
+                primary.error,
+                directory_fd=directory_fd,
+                journals=journals,
+                activation_attempted=activation_attempted,
+                previous_service_state=previous_service_state,
+                preexisting_rollback_errors=preexisting_rollback_errors,
+                rollback_reload_allowed=rollback_reload_allowed,
+                external_ops_allowed=external_ops_allowed,
+            )
+        except Exception as exc:
+            if directory_fd < 0:
+                raise
+            if not journals:
+                raise
+            rollback_reload_allowed = rollback_reload_allowed and mutation_started
+            return _resource_monitor_rollback_result(
+                _resource_monitor_error(
+                    str(exc) if isinstance(exc, AgentError) else "resource_monitor_install_failed"
+                ),
+                directory_fd=directory_fd,
+                journals=journals,
+                activation_attempted=activation_attempted,
+                previous_service_state=previous_service_state,
+                preexisting_rollback_errors=preexisting_rollback_errors,
+                rollback_reload_allowed=rollback_reload_allowed,
+                external_ops_allowed=external_ops_allowed,
+            )
+        finally:
+            if directory_fd >= 0:
+                os.close(directory_fd)
+
+
+class _ResourceMonitorPrimaryFailure(Exception):
+    def __init__(self, error: dict[str, Any]):
+        self.error = error
+
+
+def native_hook_coverage_status(*, root: Path | None = None, now: float | None = None) -> dict[str, Any]:
+    root = root or repo_root()
+    manifest_state = repo_file_status(root / "hooks" / "hooks.json")
+    manifest_installed = bool(manifest_state.get("regular_file")) and not bool(manifest_state.get("symlink"))
+    coverage_state = "missing"
+    current_time = time.time() if now is None else float(now)
+    try:
+        raw = read_private_regular_text(
+            NATIVE_AGENT_REGISTRY_FILE,
+            MAX_NATIVE_AGENT_REGISTRY_BYTES,
+            "native hook coverage unavailable",
+        )
+        payload = json.loads(raw)
+        normalized = _native_agent_normalize_registry(payload) if isinstance(payload, dict) else None
+        sessions = payload.get("sessions") if isinstance(payload, dict) else None
+        canonical = (
+            isinstance(normalized, dict)
+            and isinstance(payload, dict)
+            and json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            == json.dumps(normalized, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        )
+        fresh = (
+            canonical
+            and payload.get("schema_version") == 2
+            and isinstance(payload.get("agents"), list)
+            and isinstance(sessions, list)
+            and isinstance(payload.get("reservations"), list)
+            and any(
+                isinstance(session, dict)
+                and _validate_native_agent_identifier(session.get("session_id"), NATIVE_AGENT_ID_RE)
+                and session.get("activity_state") == "active"
+                and isinstance(session.get("updated_at"), (int, float))
+                and 0 <= current_time - float(session["updated_at"]) <= NATIVE_AGENT_RETENTION_SECONDS
+                for session in sessions
+            )
+        )
+        coverage_state = "fresh_v2" if fresh else "stale"
+    except (AgentError, TypeError, ValueError, json.JSONDecodeError):
+        coverage_state = "missing"
+    result: dict[str, Any] = {
+        "manifest_installed": manifest_installed,
+        "manifest_state": "installed" if manifest_installed else "missing_or_invalid",
+        "fresh_native_coverage": coverage_state == "fresh_v2",
+        "coverage_state": coverage_state,
+        "ok": manifest_installed and coverage_state == "fresh_v2",
+        "raw_output": "not_returned",
+    }
+    if not result["fresh_native_coverage"]:
+        result["action"] = RESOURCE_MONITOR_HOOK_ACTION
+    return result
+
+
+def _resource_monitor_unit_status(
+    source: Path,
+    target: Path,
+) -> dict[str, Any]:
+    source_state = repo_file_status(source)
+    target_state = repo_file_status(target)
+    result: dict[str, Any] = {
+        "state": "missing",
+        "materialized": False,
+        "source_regular": bool(source_state.get("regular_file")) and not bool(source_state.get("symlink")),
+        "target_regular": bool(target_state.get("regular_file")) and not bool(target_state.get("symlink")),
+    }
+    if target_state.get("exists") and not result["target_regular"]:
+        result["state"] = "invalid"
+        return result
+    if not target_state.get("exists"):
+        return result
+    if not result["source_regular"]:
+        result["state"] = "source_invalid"
+        return result
+    try:
+        source_bytes, source_stat = _resource_monitor_read_source(source)
+        target_bytes, target_stat = _resource_monitor_read_source(target)
+    except AgentError:
+        result["state"] = "unreadable"
+        return result
+    result["state"] = (
+        "materialized"
+        if source_bytes == target_bytes and stat_module.S_IMODE(source_stat.st_mode) == stat_module.S_IMODE(target_stat.st_mode)
+        else "stale"
+    )
+    result["materialized"] = result["state"] == "materialized"
+    return result
+
+
+def _resource_monitor_fragment_state(fragment: str, target: Path) -> str:
+    if not fragment:
+        return "missing"
+    try:
+        return "real" if Path(fragment).absolute() == target.absolute() else "synthetic"
+    except (OSError, RuntimeError):
+        return "synthetic"
+
+
+def resource_monitor_status(
+    *,
+    root: Path | None = None,
+    systemd_user_dir: Path | None = None,
+) -> dict[str, Any]:
+    root = root or repo_root()
+    target_dir = systemd_user_dir or (Path.home() / ".config" / "systemd" / "user")
+    checks: dict[str, Any] = {}
+    for name in RESOURCE_MONITOR_UNIT_NAMES:
+        source = _resource_monitor_unit_path(root, name)
+        target = target_dir / name
+        checks["monitor_unit" if name == RESOURCE_MONITOR_SERVICE_NAME else "slice_unit"] = _resource_monitor_unit_status(
+            source,
+            target,
+        )
+    service = _resource_monitor_systemctl_show(RESOURCE_MONITOR_SERVICE_NAME)
+    slice_status = _resource_monitor_systemctl_show(RESOURCE_MONITOR_SLICE_NAME)
+    service_props = service["properties"]
+    slice_props = slice_status["properties"]
+    monitor_fragment = _resource_monitor_fragment_state(
+        service_props.get("FragmentPath", ""),
+        target_dir / RESOURCE_MONITOR_SERVICE_NAME,
+    )
+    slice_fragment = _resource_monitor_fragment_state(
+        slice_props.get("FragmentPath", ""),
+        target_dir / RESOURCE_MONITOR_SLICE_NAME,
+    )
+    monitor_child = bool(
+        service_props.get("ControlGroup")
+        and slice_props.get("ControlGroup")
+        and service_props["ControlGroup"].startswith(slice_props["ControlGroup"] + "/")
+    )
+    tasks_current = slice_props.get("TasksCurrent", "")
+    slice_empty = tasks_current in {"", "0"} and not monitor_child
+    checks["monitor_unit"].update(
+        {
+            "loaded": service_props.get("LoadState") == "loaded",
+            "active": service_props.get("ActiveState") == "active",
+            "fragment_state": monitor_fragment,
+            "materialized": checks["monitor_unit"]["materialized"] and monitor_fragment == "real",
+        }
+    )
+    if monitor_fragment != "real":
+        checks["monitor_unit"]["blocker"] = (
+            "synthetic_fragment" if monitor_fragment == "synthetic" else "fragment_not_materialized"
+        )
+    slice_materialized = checks["slice_unit"]["materialized"] and slice_fragment == "real"
+    checks["slice_runtime"] = {
+        "state": "inactive_empty_normal"
+        if slice_props.get("ActiveState") == "inactive" and slice_empty and slice_materialized
+        else "inactive_unmaterialized"
+        if slice_props.get("ActiveState") == "inactive" and slice_empty
+        else "active_anchor"
+        if slice_props.get("ActiveState") == "active"
+        else "unavailable",
+        "real_fragment": slice_fragment == "real",
+        "monitor_child": monitor_child,
+        "empty": slice_empty,
+    }
+    if slice_fragment != "real":
+        checks["slice_runtime"]["blocker"] = (
+            "synthetic_fragment" if slice_fragment == "synthetic" else "fragment_not_materialized"
+        )
+    snapshot: dict[str, Any] = {"valid": False, "fresh": False}
+    try:
+        operator_status = _read_resource_operator_status()
+        snapshot = {
+            "valid": isinstance(operator_status, ResourceOperatorStatus),
+            "fresh": isinstance(operator_status, ResourceOperatorStatus),
+            "generation": operator_status.generation if isinstance(operator_status, ResourceOperatorStatus) else None,
+        }
+    except Exception:
+        pass
+    checks["snapshot"] = snapshot
+    hook = native_hook_coverage_status(root=root)
+    result: dict[str, Any] = {
+        "ok": bool(
+            checks["monitor_unit"]["materialized"]
+            and checks["monitor_unit"]["loaded"]
+            and checks["monitor_unit"]["active"]
+            and checks["slice_unit"]["materialized"]
+            and checks["slice_runtime"]["real_fragment"]
+            and checks["slice_runtime"]["monitor_child"]
+            and checks["snapshot"]["fresh"]
+        ),
+        "checks": checks,
+        "hook": hook,
+        "raw_output": "not_returned",
+    }
+    if hook.get("action"):
+        result["action"] = hook["action"]
+    return result
+
+
 def watchdog_unit_file_status(root: Path | None = None, systemd_user_dir: Path | None = None) -> dict[str, Any]:
     root = root or repo_root()
     installed_dir = systemd_user_dir or (Path.home() / ".config" / "systemd" / "user")
@@ -17058,6 +18309,7 @@ def doctor() -> dict[str, Any]:
         "raw_output": "not_returned",
     })
     checks.append({"name": "raw_log_retention_configured", "ok": True, **raw_log_retention_status()})
+    checks.append({"name": "native_hook_coverage", **native_hook_coverage_status()})
     return {"ok": all(check["ok"] for check in checks), "checks": checks, "raw_output": "not_returned"}
 
 
@@ -27300,6 +28552,29 @@ def _resource_status_cli(argv: list[str]) -> int:
         return 1
 
 
+def _resource_monitor_install_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="codex-master-mcp install-resource-monitor")
+    parser.add_argument("--force", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        result = install_resource_monitor(force=args.force)
+        print_json(result)
+        return 0 if result.get("ok") else 1
+    except Exception as exc:
+        print_json(public_error_payload(exc))
+        return 1
+
+
+def _resource_monitor_status_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="codex-master-mcp resource-monitor-status")
+    parser.parse_args(argv)
+    try:
+        return print_json(resource_monitor_status())
+    except Exception:
+        print_json({"error": "resource_monitor_status_unavailable"})
+        return 1
+
+
 def _goddess_report_state() -> ReporterStateStore:
     return ReporterStateStore(GODDESS_REPORT_STATE_FILE)
 
@@ -27682,6 +28957,10 @@ def main_cli(argv: list[str]) -> int:
         return _goddess_report_cli(argv[2:])
     if argv[:1] == ["resource-status"]:
         return _resource_status_cli(argv[1:])
+    if argv[:1] == ["install-resource-monitor"]:
+        return _resource_monitor_install_cli(argv[1:])
+    if argv[:1] == ["resource-monitor-status"]:
+        return _resource_monitor_status_cli(argv[1:])
 
     global _FLEET_STARTUP_ERROR
     previous_inventory = swap_agent_inventory(None)

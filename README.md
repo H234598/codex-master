@@ -9,13 +9,75 @@ Versioned local Wiki sources start at [docs/wiki/Home.md](docs/wiki/Home.md).
 They remain canonical in this repository; no GitHub Wiki publication is implied.
 Fleet-Overview, G-Serie and Goddess-Reporting contract: [docs/operations/goddess-reporting.md](docs/operations/goddess-reporting.md).
 
-The codex-master-resource-monitor.service is delivered but not installed or active.
-It runs the argument-free `%h/.local/bin/codex-master-resource-monitor` entrypoint,
-which receives only the centrally composed Hive state store and publishes complete
-one-Hz generations under its fixed `resources` subtree. No installer, MCP tool, or standard test enables or starts this unit. A later H4 installer must initialize the
-private `resources` directory and existing Hive lock before activation. Installation
-and activation remain a separate operator action after external review; this delivery
-makes no H2 claim.
+## Resource monitor H4 operator lifecycle
+
+`codex-master-resource-monitor.service` runs the argument-free
+`%h/.local/bin/codex-master-resource-monitor` entrypoint. It receives only the
+centrally composed Hive state store and publishes complete one-Hz generations
+under its fixed `resources` subtree. H4 lifecycle is separate from main install.
+
+By default, codex-master-resource-monitor.service is delivered but not installed or active. No installer, MCP tool, or standard test enables or starts this unit implicitly; only these explicit
+operator commands do so:
+
+```sh
+./bin/codex-master-mcp install-resource-monitor --force
+./bin/codex-master-mcp resource-monitor-status
+```
+
+Installer validates both bounded regular repository units and both target units
+before mutation. One cooperative process lock (`install_lock()`/`flock`) spans
+source validation, staging, the transaction, daemon reload, activation, and
+rollback. It serializes cooperative installer processes; same-UID/root or
+User-Systemd namespace manipulation outside this boundary is not an adversarial
+mutex threat covered by H4.
+Source reads use no-follow FDs with identity/type/size/mode/mtime checks before
+and after bounded reads. Target directory chain is safely created only for the
+missing suffix, then pinned by FD plus `(dev, ino)`; unsafe ancestors, symlinks,
+or group/world-writable existing directories fail closed. Shared sticky
+ancestors are allowed; final `~/.config/systemd/user` must be user-owned and
+non-group/world-writable.
+
+Both units are staged and validated before the first mutation. Existing units
+move FD-relatively to unique inspected backups. Staged units install with
+no-replace `link`; `EEXIST` preserves the foreign target. Per-unit journals
+record original/staged identities, durability, moves, restores, and cleanup.
+Rollback removes only the journaled installed identity, restores backups
+no-overwrite, preserves foreign files/backups, and reports manual recovery when
+needed. No bytes or modes are inferred during rollback.
+
+After both unit mutations are durable, installer reopens the original target
+path no-follow and revalidates the pinned `(dev, ino)`, held canonical lock
+identity, and both journaled installed unit identities before daemon-reload and
+again before `enable --now`. Any mismatch disallows the next external operation,
+including rollback reload/state guesses; file rollback uses only the pinned FD.
+Parent rebound means no primary reload and rollback through the original FD.
+Daemon reload runs before enable/start, and only
+`codex-master-resource-monitor.service` is enabled/started; the slice is never
+separately enabled/started.
+
+This is not atomic pair replacement. Each operation is atomic per file/name, but
+a crash between the two renames can leave a mixed pair. The process journal is
+in memory and is lost on crash. Recovery then uses only filesystem evidence,
+unit/systemd status, `resource-monitor-status`, and manual inspection/recovery.
+Status detects mixed or foreign state and the operator must recover manually.
+Rollback independently attempts both units, temp/backup cleanup, daemon-reload,
+UnitFileState restoration, and ActiveState restoration. Unknown state causes no
+guess. Initial `not-found` is valid only with inactive `LoadState=not-found`;
+otherwise UnitFileState must be `disabled`, `enabled`, or `enabled-runtime`, and
+ActiveState must be active/inactive. State restoration uses exact persistent vs
+runtime flags and never skips ActiveState recovery after UnitFileState failure.
+Public errors contain codes/return codes only, never paths or raw output.
+
+Manifest presence is not hook trust. Missing, malformed, noncanonical, or stale
+V2 native coverage reports `manual_hook_trust_or_new_session_required`; only a
+new regular Codex session after explicit user `/hooks` trust creates fresh V2
+coverage. No command automates trust or edits synthetic native state.
+
+An inactive childless `codex-master.slice` is expected only with a real
+`FragmentPath` and materialized unit. Missing or synthetic `FragmentPath` is a
+blocker, not installed status. Ready status requires real fragments for both
+units, active monitor child, and fresh valid snapshot. Live spawn is offered
+only when `resource-monitor-status` is green. Main `install` behavior is unchanged.
 ProtectHome=tmpfs and PrivatePIDs=yes hide unrelated Home and process data.
 BindReadOnlyPaths exposes only the installed monitor layout, fixed catalogs, and central Hive state; D8 keeps write access limited to `resources` and the existing lock.
 
