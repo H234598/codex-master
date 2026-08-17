@@ -21,10 +21,15 @@ from typing import Any
 from unittest.mock import Mock, patch
 
 import codex_master.server as server_module
+import codex_master.resource_cgroup as resource_cgroup
 from codex_master import __version__
 from codex_master.hive.types import TaskComplexity
 from codex_master.hive.state import HiveStateStore
-from codex_master.resource_cgroup import CgroupPreflightV1, CgroupProfileV1, PreparedAgentScope
+from codex_master.resource_cgroup import (
+    CgroupPreflightError,
+    CgroupProfileV1,
+    PreparedAgentScope,
+)
 from codex_master.resource_monitor import LegacyPressureV1, ResourceGateFacts, ResourceOperatorStatus
 from codex_master.selection.task_classification import TaskClassificationRequest, TaskClassifier
 from codex_master.usage_snapshot import UsageSnapshot
@@ -221,6 +226,262 @@ def fake_g5_start_scope_for_test(session: str) -> tuple[Any, PreparedAgentScope]
             challenge="a" * 64,
         ),
     )
+
+
+class PreflightSystemdRunner:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+
+    def run(
+        self,
+        argv: tuple[str, ...],
+        *,
+        timeout_seconds: float,
+        max_stdout_bytes: int,
+        max_stderr_bytes: int,
+    ) -> resource_cgroup.CommandResultV1:
+        assert timeout_seconds > 0
+        assert max_stdout_bytes > 0
+        assert max_stderr_bytes > 0
+        self.calls.append(argv)
+        assert argv == (
+            "/usr/bin/systemctl",
+            "--user",
+            "--no-pager",
+            "show",
+            "codex-master.slice",
+            "--property=ControlGroup",
+        )
+        return resource_cgroup.CommandResultV1(
+            returncode=0,
+            stdout=b"ControlGroup=/user.slice/codex-master.slice\n",
+            stderr=b"",
+        )
+
+    def start_held(
+        self,
+        argv: tuple[str, ...],
+        *,
+        timeout_seconds: float,
+        max_stdout_bytes: int,
+        max_stderr_bytes: int,
+    ) -> Any:
+        raise AssertionError("scope mutation is outside this test")
+
+
+class HeldScopeProcess:
+    def __init__(self) -> None:
+        self.releases: list[bytes] = []
+
+    def read_stdout(self, *, max_bytes: int, timeout_seconds: float) -> bytes:
+        assert max_bytes == 65
+        assert timeout_seconds > 0
+        return b"c" * 64 + b"\n"
+
+    def release_once(self, payload: bytes, *, timeout_seconds: float) -> None:
+        assert timeout_seconds > 0
+        self.releases.append(payload)
+
+    def finish(
+        self, *, timeout_seconds: float, max_stdout_bytes: int, max_stderr_bytes: int
+    ) -> resource_cgroup.CommandResultV1:
+        assert timeout_seconds > 0
+        assert max_stdout_bytes > 0
+        assert max_stderr_bytes > 0
+        return resource_cgroup.CommandResultV1(returncode=0, stdout=b"", stderr=b"")
+
+    def terminate(self) -> None:
+        return None
+
+
+class ScopeSystemdRunner:
+    def __init__(self, cgroup_root: Path) -> None:
+        self.cgroup_root = cgroup_root
+        self.calls: list[tuple[str, ...]] = []
+        self.started: list[tuple[str, ...]] = []
+        self.stopped: list[str] = []
+        self.unit_name = ""
+        self.gate = HeldScopeProcess()
+
+    @staticmethod
+    def _result(
+        returncode: int, *, stdout: bytes = b"", stderr: bytes = b""
+    ) -> resource_cgroup.CommandResultV1:
+        return resource_cgroup.CommandResultV1(
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+
+    def run(
+        self,
+        argv: tuple[str, ...],
+        *,
+        timeout_seconds: float,
+        max_stdout_bytes: int,
+        max_stderr_bytes: int,
+    ) -> resource_cgroup.CommandResultV1:
+        assert timeout_seconds > 0
+        assert max_stdout_bytes > 0
+        assert max_stderr_bytes > 0
+        self.calls.append(argv)
+        if argv[0] == "/usr/bin/systemctl" and argv[3:5] == (
+            "show",
+            "codex-master.slice",
+        ):
+            return self._result(
+                0,
+                stdout=b"ControlGroup=/user.slice/codex-master.slice\n",
+            )
+        if argv[0] == "/usr/bin/systemctl" and "--property=Id" in argv:
+            return self._result(4)
+        if argv[0] == "/usr/bin/systemctl" and argv[3] == "show":
+            return self._result(
+                0,
+                stdout=(
+                    f"ControlGroup=/user.slice/codex-master.slice/{self.unit_name}\n"
+                    "MainPID=4241\n"
+                    "DelegateControllers=cpu cpuset memory pids io\n"
+                ).encode(),
+            )
+        if argv[0] == "/usr/bin/systemctl" and argv[3] == "stop":
+            self.stopped.append(argv[4])
+            return self._result(0)
+        if argv[0] == "/usr/bin/tmux":
+            return self._result(0, stdout=b"4242\n")
+        raise AssertionError(f"unexpected command {argv!r}")
+
+    def start_held(
+        self,
+        argv: tuple[str, ...],
+        *,
+        timeout_seconds: float,
+        max_stdout_bytes: int,
+        max_stderr_bytes: int,
+    ) -> HeldScopeProcess:
+        assert timeout_seconds > 0
+        assert max_stdout_bytes == 65
+        assert max_stderr_bytes > 0
+        self.started.append(argv)
+        self.unit_name = next(
+            argument.split("=", 1)[1] for argument in argv if argument.startswith("--unit=")
+        )
+        scope_root = self.cgroup_root / "user.slice" / "codex-master.slice" / self.unit_name
+        scope_root.mkdir()
+        documents = {
+            "cpuset.cpus.effective": b"4-11\n",
+            "cpu.max": b"750000 100000\n",
+            "memory.high": f"{9 * 1024**3}\n".encode(),
+            "memory.max": f"{12 * 1024**3}\n".encode(),
+            "memory.swap.max": f"{8 * 1024**3}\n".encode(),
+            "io.weight": b"50\n",
+            "cgroup.procs": b"4241\n4242\n4243\n",
+        }
+        for name, payload in documents.items():
+            (scope_root / name).write_bytes(payload)
+        return self.gate
+
+
+def regular_systemd_adapter_for_test(
+    directory: Path,
+    *,
+    runner: Any | None = None,
+    controllers: bytes = b"cpu cpuset memory pids io\n",
+    subtree_controllers: bytes = b"cpu cpuset memory pids io\n",
+) -> tuple[resource_cgroup.SystemdUserCgroupAdapter, Any]:
+    cgroup_root = write_cgroup_preflight_facts_for_test(
+        directory,
+        controllers=controllers,
+        subtree_controllers=subtree_controllers,
+    )
+    runner = runner or PreflightSystemdRunner()
+    with patch.object(resource_cgroup, "CGROUP_ROOT", cgroup_root):
+        adapter = resource_cgroup.SystemdUserCgroupAdapter(runner=runner)
+    return adapter, runner
+
+
+def write_cgroup_preflight_facts_for_test(
+    directory: Path,
+    *,
+    controllers: bytes = b"cpu cpuset memory pids io\n",
+    subtree_controllers: bytes = b"cpu cpuset memory pids io\n",
+    parent_cpuset: bytes = b"0-11\n",
+) -> Path:
+    cgroup_root = directory / "cgroup"
+    slice_root = cgroup_root / "user.slice" / "codex-master.slice"
+    slice_root.mkdir(parents=True)
+    (slice_root / "cgroup.controllers").write_bytes(controllers)
+    (slice_root / "cgroup.subtree_control").write_bytes(subtree_controllers)
+    (slice_root / "cpuset.cpus.effective").write_bytes(parent_cpuset)
+    return cgroup_root
+
+
+def write_provider_cpu_topology_for_test(
+    directory: Path,
+    *,
+    present: bytes = b"0-11\n",
+) -> Path:
+    cpu_root = directory / "cpu"
+    (cpu_root / "present").parent.mkdir(parents=True)
+    (cpu_root / "present").write_bytes(present)
+    for cpu in range(12):
+        topology_root = cpu_root / f"cpu{cpu}" / "topology"
+        topology_root.mkdir(parents=True)
+        (topology_root / "physical_package_id").write_bytes(b"0\n")
+        (topology_root / "core_id").write_bytes(f"{cpu}\n".encode())
+        (topology_root / "core_type").write_bytes(
+            b"efficiency\n" if cpu >= 4 else b"performance\n"
+        )
+    return cpu_root
+
+
+@contextlib.contextmanager
+def approved_provider_facts_for_test(
+    directory: Path,
+    *,
+    runner: Any | None = None,
+    present: bytes = b"0-11\n",
+    controllers: bytes = b"cpu cpuset memory pids io\n",
+    subtree_controllers: bytes = b"cpu cpuset memory pids io\n",
+    parent_cpuset: bytes = b"0-11\n",
+) -> Any:
+    cgroup_root = write_cgroup_preflight_facts_for_test(
+        directory,
+        controllers=controllers,
+        subtree_controllers=subtree_controllers,
+        parent_cpuset=parent_cpuset,
+    )
+    cpu_root = write_provider_cpu_topology_for_test(directory, present=present)
+    runner = runner or PreflightSystemdRunner()
+
+    def sysconf(name: str) -> int:
+        if name == "SC_PAGE_SIZE":
+            return 4096
+        if name == "SC_PHYS_PAGES":
+            return 4_194_304
+        raise AssertionError(f"unexpected sysconf fact {name!r}")
+
+    with patch.object(resource_cgroup, "CGROUP_ROOT", cgroup_root), patch.object(
+        resource_cgroup, "CPU_TOPOLOGY_ROOT", cpu_root
+    ), patch.object(
+        resource_cgroup, "CPU_PRESENT_PATH", cpu_root / "present"
+    ), patch.object(
+        resource_cgroup, "_SubprocessSystemdUserRunner", return_value=runner
+    ), patch.object(resource_cgroup.os, "sysconf", side_effect=sysconf):
+        yield runner
+
+
+def approved_cgroup_runtime_for_test(
+    directory: Path,
+    *,
+    runner: Any | None = None,
+) -> tuple[Any, resource_cgroup.SystemdUserCgroupAdapter, Any]:
+    with approved_provider_facts_for_test(directory, runner=runner) as runner:
+        approved = resource_cgroup.build_approved_cgroup_runtime(
+            runner=runner,
+            mem_total_bytes=16 * 1024**3,
+        )
+    return approved, approved.adapter, runner
 
 
 def complex_task_profile():
@@ -823,17 +1084,234 @@ class ServerHelpersTest(unittest.TestCase):
                     server_module.run_resource_monitor()
             unavailable_monitor.assert_not_called()
 
-    def test_g5_offer_reads_one_injected_fresh_facts_snapshot(self) -> None:
-        class FakeCgroupAdapter:
-            def inspect_preflight(self) -> CgroupPreflightV1:
-                return CgroupPreflightV1(
-                    unified_v2=True,
-                    controllers=frozenset({"cpu", "cpuset", "memory", "pids", "io"}),
-                    subtree_controllers=frozenset({"cpu", "cpuset", "memory", "pids", "io"}),
-                    parent_effective_cpuset=(0, 1),
-                    io_physical_isolation_proven=False,
-                )
+    def test_compose_resource_gate_runtime_consumes_final_provider_snapshot(self) -> None:
+        snapshots: list[resource_cgroup.ApprovedCgroupRuntimeV1] = []
 
+        def build_snapshot() -> resource_cgroup.ApprovedCgroupRuntimeV1:
+            snapshot = resource_cgroup.build_approved_cgroup_runtime()
+            snapshots.append(snapshot)
+            return snapshot
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = HiveStateStore(root)
+            with approved_provider_facts_for_test(root) as runner, patch.object(
+                server_module,
+                "build_current_hive_runtime",
+                return_value=SimpleNamespace(state=state),
+            ), patch.object(
+                server_module,
+                "read_current_resource_boot_id",
+                return_value="123e4567-e89b-12d3-a456-426614174000",
+            ), patch.object(
+                server_module,
+                "build_approved_cgroup_runtime",
+                side_effect=build_snapshot,
+            ) as provider:
+                runtime = server_module._compose_resource_gate_runtime()
+
+        snapshot = snapshots[0]
+        assert runtime is not None
+        assert runtime.cgroup_profile is snapshot.profile
+        assert runtime.cgroup_adapter is snapshot.adapter
+        assert runtime.h2_ready is True
+        assert type(runtime.cgroup_adapter) is resource_cgroup.SystemdUserCgroupAdapter
+        assert runtime.cgroup_profile.cpuset_cpus == tuple(range(4, 12))
+        assert len(runner.calls) == 1
+        provider.assert_called_once_with()
+        assert not hasattr(resource_cgroup, "_require_attested_approved_cgroup_runtime")
+
+    def test_compose_resource_gate_runtime_rejects_non_plan_cpuset_snapshot(self) -> None:
+        snapshot = {
+            "ok": True,
+            "_g5_facts": True,
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
+            "io_psi_percent": 0.0,
+            "available_memory_percent": 50.0,
+            "available_memory_mib": 8192,
+            "running_agents": 0,
+            "reason_codes": [],
+        }
+        provider_errors: list[str] = []
+
+        def build_invalid_snapshot() -> resource_cgroup.ApprovedCgroupRuntimeV1:
+            try:
+                return resource_cgroup.build_approved_cgroup_runtime()
+            except CgroupPreflightError as exc:
+                provider_errors.append(str(exc))
+                raise
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = HiveStateStore(root)
+            with approved_provider_facts_for_test(
+                root,
+                present=b"0-3,5-11\n",
+                parent_cpuset=b"0-3,5-11\n",
+            ) as runner, patch.object(
+                server_module,
+                "build_current_hive_runtime",
+                return_value=SimpleNamespace(state=state),
+            ), patch.object(
+                server_module,
+                "read_current_resource_boot_id",
+                return_value="123e4567-e89b-12d3-a456-426614174000",
+            ), patch.object(
+                server_module,
+                "build_approved_cgroup_runtime",
+                side_effect=build_invalid_snapshot,
+            ) as provider:
+                runtime = server_module._compose_resource_gate_runtime()
+
+            assert runtime is not None
+            assert runtime.cgroup_profile is None
+            assert runtime.cgroup_adapter is None
+            assert runtime.h2_ready is False
+            with server_module._resource_gate_runtime_scope(runtime), patch.object(
+                server_module, "system_resource_snapshot", return_value=snapshot
+            ), patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0):
+                result = spawn_admission_decision()
+
+        assert provider_errors == ["cgroup_preflight_failed"]
+        assert len(runner.calls) == 0
+        provider.assert_called_once_with()
+        assert result["allowed"] is False
+        assert result["reason_codes"] == ["cgroup_preflight_failed"]
+
+    def test_compose_resource_gate_runtime_fails_closed_without_required_controller_delegation(self) -> None:
+        snapshot = {
+            "ok": True,
+            "_g5_facts": True,
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
+            "io_psi_percent": 0.0,
+            "available_memory_percent": 50.0,
+            "available_memory_mib": 8192,
+            "running_agents": 0,
+            "reason_codes": [],
+        }
+        provider_errors: list[str] = []
+        delegated = frozenset({"cpu", "cpuset", "memory", "pids"})
+
+        def build_with_missing_io_delegation() -> resource_cgroup.ApprovedCgroupRuntimeV1:
+            try:
+                return resource_cgroup.build_approved_cgroup_runtime()
+            except CgroupPreflightError as exc:
+                provider_errors.append(str(exc))
+                raise
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = HiveStateStore(root)
+            with approved_provider_facts_for_test(
+                root,
+                subtree_controllers=b"cpu cpuset memory pids\n",
+            ) as runner, patch.object(
+                server_module,
+                "build_current_hive_runtime",
+                return_value=SimpleNamespace(state=state),
+            ), patch.object(
+                server_module,
+                "read_current_resource_boot_id",
+                return_value="123e4567-e89b-12d3-a456-426614174000",
+            ), patch.object(
+                server_module,
+                "build_approved_cgroup_runtime",
+                side_effect=build_with_missing_io_delegation,
+            ) as provider:
+                runtime = server_module._compose_resource_gate_runtime()
+
+            assert runtime is not None
+            assert runtime.cgroup_profile is None
+            assert runtime.cgroup_adapter is None
+            assert runtime.h2_ready is False
+            with server_module._resource_gate_runtime_scope(runtime), patch.object(
+                server_module, "system_resource_snapshot", return_value=snapshot
+            ), patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0):
+                result = spawn_admission_decision()
+
+        assert resource_cgroup.REQUIRED_CONTROLLERS - delegated == frozenset({"io"})
+        assert provider_errors == ["cgroup_preflight_failed"]
+        assert len(runner.calls) == 1
+        provider.assert_called_once_with()
+        assert result["allowed"] is False
+        assert result["reason_codes"] == ["cgroup_preflight_failed"]
+
+    def test_spawn_admission_accepts_fresh_hive_snapshot_with_verified_typed_runtime(self) -> None:
+        facts = ResourceGateFacts(
+            generation=7,
+            observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+            observed_monotonic_ns=1,
+            gate_state="ready",
+            reason_codes=(),
+            current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
+            available_memory_mib=8192,
+            legacy_pressure=LegacyPressureV1(0.25, 25.0, 0.0, 50.0),
+            normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
+            normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
+            bottleneck="unknown",
+            cgroup_state="unavailable",
+            thermal_state="ready",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = HiveStateStore(root)
+            approved, adapter, runner = approved_cgroup_runtime_for_test(root)
+            with patch.object(
+                server_module,
+                "build_current_hive_runtime",
+                return_value=SimpleNamespace(state=state),
+            ), patch.object(
+                server_module,
+                "read_current_resource_boot_id",
+                return_value="123e4567-e89b-12d3-a456-426614174000",
+            ), patch.object(
+                server_module,
+                "build_approved_cgroup_runtime",
+                create=True,
+                return_value=approved,
+            ), patch.object(
+                server_module,
+                "read_resource_gate_facts",
+                return_value=facts,
+            ) as read_facts, patch.object(
+                server_module, "_total_running_agent_count", return_value=0
+            ), patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0):
+                result = spawn_admission_decision()
+
+        assert result["allowed"] is True
+        assert result["reason_codes"] == []
+        assert isinstance(adapter, resource_cgroup.SystemdUserCgroupAdapter)
+        assert len(runner.calls) == 2
+        read_facts.assert_called_once()
+
+    def test_spawn_admission_rejects_observer_snapshot_without_verified_typed_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = HiveStateStore(Path(directory))
+            with patch.object(
+                server_module,
+                "build_current_hive_runtime",
+                return_value=SimpleNamespace(state=state),
+            ), patch.object(
+                server_module,
+                "read_current_resource_boot_id",
+                return_value="123e4567-e89b-12d3-a456-426614174000",
+            ), patch.object(
+                server_module,
+                "build_approved_cgroup_runtime",
+                create=True,
+                return_value=None,
+            ) as provider:
+                result = spawn_admission_decision()
+
+        assert result["allowed"] is False
+        assert result["reason_codes"] == ["session_metrics_unavailable", "resource_snapshot_invalid"]
+        provider.assert_called_once_with()
+
+    def test_g5_offer_reads_one_injected_fresh_facts_snapshot(self) -> None:
         facts = ResourceGateFacts(
             generation=7,
             observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
@@ -864,13 +1342,15 @@ class ServerHelpersTest(unittest.TestCase):
             io_weight=50,
         )
         with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter, _runner = regular_systemd_adapter_for_test(root)
             runtime = server_module.ResourceGateRuntime(
-                state=HiveStateStore(Path(directory)),
+                state=HiveStateStore(root),
                 expected_boot_id="123e4567-e89b-12d3-a456-426614174000",
                 now_utc=lambda: datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
                 monotonic_ns=lambda: 0,
                 cgroup_profile=profile,
-                cgroup_adapter=FakeCgroupAdapter(),
+                cgroup_adapter=adapter,
                 h2_ready=True,
             )
             with patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0), server_module._resource_gate_runtime_scope(runtime), patch(
@@ -978,6 +1458,9 @@ class ServerHelpersTest(unittest.TestCase):
             ), patch(
                 "codex_master.server.read_resource_gate_facts", return_value=facts
             ) as read_facts, patch(
+                "codex_master.server.build_approved_cgroup_runtime",
+                side_effect=CgroupPreflightError("cgroup_preflight_failed"),
+            ), patch(
                 "codex_master.server._total_running_agent_count", return_value=1
             ), patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0):
                 result = agent_spawn_offers()
@@ -1019,6 +1502,9 @@ class ServerHelpersTest(unittest.TestCase):
             ), patch(
                 "codex_master.server.read_resource_gate_facts", return_value=facts
             ) as read_facts, patch(
+                "codex_master.server.build_approved_cgroup_runtime",
+                side_effect=CgroupPreflightError("cgroup_preflight_failed"),
+            ), patch(
                 "codex_master.server._total_running_agent_count", return_value=1
             ), patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0):
                 result = spawn_admission_decision()
@@ -1073,6 +1559,9 @@ class ServerHelpersTest(unittest.TestCase):
             ), patch(
                 "codex_master.server.read_resource_gate_facts", return_value=facts
             ) as read_facts, patch(
+                "codex_master.server.build_approved_cgroup_runtime",
+                side_effect=CgroupPreflightError("cgroup_preflight_failed"),
+            ), patch(
                 "codex_master.server.current_agent_inventory", return_value=inventory
             ), patch(
                 "codex_master.server.effective_observation_inventory", return_value=(inventory, True)
@@ -1228,6 +1717,9 @@ class ServerHelpersTest(unittest.TestCase):
             ), patch(
                 "codex_master.server.read_resource_gate_facts", return_value=facts
             ) as read_facts, patch(
+                "codex_master.server.build_approved_cgroup_runtime",
+                side_effect=CgroupPreflightError("cgroup_preflight_failed"),
+            ), patch(
                 "codex_master.server._total_running_agent_count", return_value=0
             ), patch(
                 "codex_master.server.require_fleet_recovery_ready"
@@ -1780,19 +2272,14 @@ class ServerHelpersTest(unittest.TestCase):
             memory_high_bytes=8 * 1024**3, memory_max_bytes=9 * 1024**3,
             memory_swap_max_bytes=8 * 1024**3, io_weight=50,
         )
-        preflight = CgroupPreflightV1(
-            unified_v2=True,
-            controllers=frozenset({"cpu", "cpuset", "memory", "pids", "io"}),
-            subtree_controllers=frozenset({"cpu", "cpuset", "memory", "pids", "io"}),
-            parent_effective_cpuset=(0,), io_physical_isolation_proven=False,
-        )
-        adapter = SimpleNamespace(inspect_preflight=lambda: preflight)
         previous = server_module._SPAWN_WARMUP_UNTIL_NS
         try:
             server_module._SPAWN_WARMUP_UNTIL_NS = 115_000_000_000
             with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                adapter, _runner = regular_systemd_adapter_for_test(root)
                 runtime = server_module.ResourceGateRuntime(
-                    state=HiveStateStore(Path(directory)),
+                    state=HiveStateStore(root),
                     expected_boot_id="123e4567-e89b-12d3-a456-426614174000",
                     now_utc=lambda: datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
                     monotonic_ns=lambda: 100_000_000_000,
@@ -1824,46 +2311,6 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(allowed["allowed"])
 
     def test_g5_replacement_reads_fresh_facts_once_then_confirms_scope_before_warmup(self) -> None:
-        class FakeCgroupAdapter:
-            def __init__(self) -> None:
-                self.events: list[str] = []
-                self.socket_name: str | None = None
-
-            def inspect_preflight(self) -> CgroupPreflightV1:
-                self.events.append("preflight")
-                return CgroupPreflightV1(
-                    unified_v2=True,
-                    controllers=frozenset({"cpu", "cpuset", "memory", "pids", "io"}),
-                    subtree_controllers=frozenset({"cpu", "cpuset", "memory", "pids", "io"}),
-                    parent_effective_cpuset=(0,),
-                    io_physical_isolation_proven=False,
-                )
-
-            def start_held_scope(self, *, profile: CgroupProfileV1, socket_name: str, session_name: str) -> PreparedAgentScope:
-                self.events.append("scope")
-                self.socket_name = socket_name
-                return PreparedAgentScope(
-                    unit_name="g5-test.scope",
-                    socket_name=socket_name,
-                    session_name=session_name,
-                    control_group="/user.slice/g5-test.scope",
-                    gate_pid=1,
-                    challenge="a" * 64,
-                )
-
-            def verify_scope(self, scope: PreparedAgentScope, profile: CgroupProfileV1) -> None:
-                self.events.append("scope_verified")
-
-            def release_scope(self, scope: PreparedAgentScope) -> int:
-                self.events.append("released")
-                return 2
-
-            def verify_tmux_membership_and_inheritance(self, scope: PreparedAgentScope, tmux_pid: int) -> None:
-                self.events.append("inheritance")
-
-            def cleanup_new_scope(self, scope: PreparedAgentScope) -> None:
-                self.events.append("cleanup")
-
         facts = ResourceGateFacts(
             generation=7,
             observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
@@ -1879,12 +2326,6 @@ class ServerHelpersTest(unittest.TestCase):
             cgroup_state="unavailable",
             thermal_state="ready",
         )
-        profile = CgroupProfileV1(
-            cpuset_cpus=(0,), cpu_quota_percent=750, cpu_weight=50,
-            memory_high_bytes=8 * 1024**3, memory_max_bytes=9 * 1024**3,
-            memory_swap_max_bytes=8 * 1024**3, io_weight=50,
-        )
-        adapter = FakeCgroupAdapter()
         process_summary = {
             "process_count": 0, "external_process_count": 0, "managed_process_count": 0,
             "external_processes": [], "external_processes_truncated": False, "raw_output": "not_returned",
@@ -1925,17 +2366,57 @@ class ServerHelpersTest(unittest.TestCase):
                 runner = root / "codex"
                 runner.write_text("#!/bin/sh\n", encoding="utf-8")
                 runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
-                state = root / "state"
-                runtime = server_module.ResourceGateRuntime(
-                    state=HiveStateStore(root / "hive-state"),
-                    expected_boot_id="123e4567-e89b-12d3-a456-426614174000",
-                    now_utc=lambda: datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
-                    monotonic_ns=lambda: 100_000_000_000,
-                    cgroup_profile=profile,
-                    cgroup_adapter=adapter,
-                    h2_ready=True,
+                scope_runner = ScopeSystemdRunner(root / "cgroup")
+                approved, adapter, scope_runner = approved_cgroup_runtime_for_test(
+                    root,
+                    runner=scope_runner,
                 )
-                with server_module._resource_gate_runtime_scope(runtime), patch.dict(
+                proc_root = root / "proc"
+                children = proc_root / "4242" / "task" / "4242" / "children"
+                children.parent.mkdir(parents=True)
+                children.write_bytes(b"4243\n")
+                state = root / "state"
+                hive_state = HiveStateStore(root / "hive-state")
+
+                provider = Mock(return_value=approved)
+
+                @contextlib.contextmanager
+                def product_resource_dependencies() -> Any:
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(
+                            patch.object(
+                                server_module,
+                                "build_current_hive_runtime",
+                                return_value=SimpleNamespace(state=hive_state),
+                            )
+                        )
+                        stack.enter_context(
+                            patch.object(
+                                server_module,
+                                "read_current_resource_boot_id",
+                                return_value="123e4567-e89b-12d3-a456-426614174000",
+                            )
+                        )
+                        stack.enter_context(
+                            patch.object(
+                                server_module,
+                                "build_approved_cgroup_runtime",
+                                provider,
+                            )
+                        )
+                        stack.enter_context(
+                            patch.object(
+                                server_module.time,
+                                "monotonic_ns",
+                                return_value=100_000_000_000,
+                            )
+                        )
+                        stack.enter_context(
+                            patch.object(resource_cgroup, "PROC_ROOT", proc_root)
+                        )
+                        yield
+
+                with patch.dict(
                     "codex_master.server.AGENTS",
                     {"a": {"label": "A", "runner": runner, "home": root, "session": "g5session"}},
                     clear=False,
@@ -1950,7 +2431,9 @@ class ServerHelpersTest(unittest.TestCase):
                 ), patch(
                     "codex_master.server.require_managed_replacement_reservation",
                     return_value={"allowed": True, "reservation_id": "r", "managed_session": "g5session"},
-                ), patch("codex_master.server.read_resource_gate_facts", return_value=facts) as read_facts, patch(
+                ), product_resource_dependencies(), patch(
+                    "codex_master.server.read_resource_gate_facts", return_value=facts
+                ) as read_facts, patch(
                     "codex_master.server.agent_base_args", return_value=[]
                 ), patch(
                     "codex_master.server.spawn_admission_lock", side_effect=tracked_spawn_lock
@@ -1966,13 +2449,19 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "started")
         self.assertEqual(read_facts.call_count, 1)
-        self.assertEqual(adapter.events, ["preflight", "preflight", "scope", "scope_verified", "released", "inheritance"])
+        provider.assert_called_once_with()
+        self.assertIs(approved.adapter, adapter)
+        self.assertIs(type(adapter), resource_cgroup.SystemdUserCgroupAdapter)
+        self.assertEqual(len(scope_runner.started), 1)
+        self.assertEqual(scope_runner.gate.releases, [b"c" * 64 + b"\n"])
+        self.assertEqual(len(adapter._owned), 1)
         self.assertEqual(warmup_until, 115_000_000_000)
+        scope_socket = scope_runner.started[0][-2]
         self.assertEqual(
             [
                 call.args[0][2]
                 for call in run_tmux.call_args_list
-                if call.args[0][:2] == ["-L", adapter.socket_name]
+                if call.args[0][:2] == ["-L", scope_socket]
             ],
             ["send-keys", "pipe-pane"],
         )

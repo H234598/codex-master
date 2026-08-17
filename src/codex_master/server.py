@@ -91,10 +91,15 @@ from codex_master.usage_snapshot import (
 )
 from codex_master.hive.state import HiveStateStore
 from codex_master.resource_cgroup import (
+    APPROVED_CPUSET,
+    ApprovedCgroupRuntimeV1,
+    build_approved_cgroup_runtime,
     CgroupPreflightError,
+    CgroupPreflightV1,
     CgroupProfileV1,
-    CgroupSystemAdapter,
     PreparedAgentScope,
+    REQUIRED_CONTROLLERS,
+    SystemdUserCgroupAdapter,
     require_cgroup_preflight,
     start_verified_scope,
 )
@@ -917,7 +922,7 @@ class ResourceGateRuntime:
     now_utc: Callable[[], _dt.datetime]
     monotonic_ns: Callable[[], int]
     cgroup_profile: CgroupProfileV1 | None
-    cgroup_adapter: CgroupSystemAdapter | None
+    cgroup_adapter: SystemdUserCgroupAdapter | None
     h2_ready: bool = False
 
 
@@ -951,14 +956,46 @@ def _compose_resource_gate_runtime() -> ResourceGateRuntime | None:
         expected_boot_id = read_current_resource_boot_id()
     except Exception:
         return None
+
+    cgroup_profile = None
+    cgroup_adapter = None
+    h2_ready = False
+    try:
+        snapshot = build_approved_cgroup_runtime()
+    except Exception:
+        pass
+    else:
+        if type(snapshot) is ApprovedCgroupRuntimeV1:
+            profile = snapshot.profile
+            adapter = snapshot.adapter
+            preflight = snapshot.preflight
+        else:
+            profile = None
+            adapter = None
+            preflight = None
+        if (
+            type(profile) is CgroupProfileV1
+            and type(adapter) is SystemdUserCgroupAdapter
+            and type(preflight) is CgroupPreflightV1
+            and profile.cpuset_cpus == APPROVED_CPUSET
+            and preflight.unified_v2 is True
+            and REQUIRED_CONTROLLERS.issubset(preflight.controllers)
+            and REQUIRED_CONTROLLERS.issubset(preflight.subtree_controllers)
+            and set(APPROVED_CPUSET).issubset(preflight.parent_effective_cpuset)
+            and set(profile.cpuset_cpus).issubset(preflight.parent_effective_cpuset)
+            and preflight.io_physical_isolation_proven is False
+        ):
+            cgroup_profile = profile
+            cgroup_adapter = adapter
+            h2_ready = True
     return ResourceGateRuntime(
         state=state,
         expected_boot_id=expected_boot_id,
         now_utc=lambda: _dt.datetime.now(_dt.timezone.utc),
         monotonic_ns=time.monotonic_ns,
-        cgroup_profile=None,
-        cgroup_adapter=None,
-        h2_ready=False,
+        cgroup_profile=cgroup_profile,
+        cgroup_adapter=cgroup_adapter,
+        h2_ready=h2_ready,
     )
 
 
@@ -5908,17 +5945,17 @@ def _resource_pressure_reason_codes(snapshot: Mapping[str, Any], policy: Mapping
     return list(dict.fromkeys(reasons))
 
 
-def _typed_g5_cgroup_runtime() -> tuple[CgroupProfileV1, CgroupSystemAdapter] | None:
+def _typed_g5_cgroup_runtime() -> tuple[CgroupProfileV1, SystemdUserCgroupAdapter] | None:
     runtime = _RESOURCE_GATE_RUNTIME.get()
+    adapter = None if runtime is None else runtime.cgroup_adapter
     if (
         runtime is None
         or runtime.h2_ready is not True
-        or not isinstance(runtime.cgroup_profile, CgroupProfileV1)
-        or runtime.cgroup_adapter is None
-        or not callable(getattr(runtime.cgroup_adapter, "inspect_preflight", None))
+        or type(runtime.cgroup_profile) is not CgroupProfileV1
+        or type(adapter) is not SystemdUserCgroupAdapter
     ):
         return None
-    return runtime.cgroup_profile, runtime.cgroup_adapter
+    return runtime.cgroup_profile, adapter
 
 
 def _g5_warmup_active() -> bool:

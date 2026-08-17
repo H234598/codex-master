@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import inspect
 import os
 import runpy
 import stat
@@ -144,6 +145,59 @@ def _topology_documents(*, present: bytes = b"0-11\n", malformed: bool = False) 
     return documents
 
 
+def _write_topology_documents(root: Path, documents: dict[Path, bytes]) -> None:
+    source_root = Path("/sys/devices/system/cpu")
+    for source, payload in documents.items():
+        target = root / source.relative_to(source_root)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+
+
+def _approved_provider_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    runner: _FakeSystemdRunner | None = None,
+    present: bytes = b"0-11\n",
+    controllers: bytes = b"cpu cpuset memory pids io\n",
+    subtree_controllers: bytes = b"cpu cpuset memory pids io\n",
+    parent_cpuset: bytes = b"0-11\n",
+) -> _FakeSystemdRunner:
+    cpu_root = tmp_path / "cpu"
+    _write_topology_documents(cpu_root, _topology_documents(present=present))
+    cgroup_root = tmp_path / "cgroup"
+    slice_root = cgroup_root / "user.slice" / "codex-master.slice"
+    slice_root.mkdir(parents=True)
+    (slice_root / "cgroup.controllers").write_bytes(controllers)
+    (slice_root / "cgroup.subtree_control").write_bytes(subtree_controllers)
+    (slice_root / "cpuset.cpus.effective").write_bytes(parent_cpuset)
+    monkeypatch.setattr(resource_cgroup, "CPU_TOPOLOGY_ROOT", cpu_root)
+    monkeypatch.setattr(resource_cgroup, "CPU_PRESENT_PATH", cpu_root / "present")
+    monkeypatch.setattr(resource_cgroup, "CGROUP_ROOT", cgroup_root)
+    return runner or _FakeSystemdRunner()
+
+
+def _write_tmux_children_fact(tmp_path: Path, *, tmux_pid: int = 4242) -> Path:
+    proc_root = tmp_path / "proc"
+    children = proc_root / str(tmux_pid) / "task" / str(tmux_pid) / "children"
+    children.parent.mkdir(parents=True)
+    children.write_bytes(b"4243\n")
+    return proc_root
+
+
+def _provide_user_bus_socket_fact(monkeypatch: pytest.MonkeyPatch) -> None:
+    bus = Path("/run/user") / str(os.getuid()) / "bus"
+    real_lstat = os.lstat
+    socket_metadata = os.stat_result((stat.S_IFSOCK | 0o600, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+
+    def lstat(path: os.PathLike[str] | str) -> os.stat_result:
+        if Path(path) == bus:
+            return socket_metadata
+        return real_lstat(path)
+
+    monkeypatch.setattr(resource_cgroup.os, "lstat", lstat)
+
+
 def _nonhybrid_topology_documents() -> dict[Path, bytes]:
     documents = _topology_documents()
     for cpu in range(12):
@@ -170,6 +224,137 @@ def test_resource_cgroup_is_the_only_sys_cpu_topology_cpuset_and_cgroup_parser_o
 
     assert topology.efficiency_cpus == tuple(range(4, 12))
     assert all(event.split(":", 1)[-1].startswith("/sys/devices/system/cpu/") for event in adapter.events)
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    (
+        "inspect_preflight",
+        "start_held_scope",
+        "verify_scope",
+        "release_scope",
+        "verify_tmux_membership_and_inheritance",
+        "cleanup_new_scope",
+    ),
+)
+def test_systemd_user_cgroup_adapter_disallows_instance_method_shadowing(
+    method_name: str,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = _approved_provider_runner(monkeypatch, tmp_path)
+    adapter = resource_cgroup.SystemdUserCgroupAdapter(runner=runner)
+    descriptor = getattr(resource_cgroup.SystemdUserCgroupAdapter, method_name)
+
+    assert not hasattr(adapter, "__dict__")
+    with pytest.raises(AttributeError):
+        setattr(adapter, method_name, lambda *args, **kwargs: None)
+    assert getattr(resource_cgroup.SystemdUserCgroupAdapter, method_name) is descriptor
+    assert getattr(adapter, method_name).__func__ is descriptor
+
+
+def test_systemd_user_cgroup_adapter_binds_runner_and_root_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = _approved_provider_runner(monkeypatch, tmp_path)
+    adapter = resource_cgroup.SystemdUserCgroupAdapter(runner=runner)
+    bound_root = adapter._cgroup_root
+
+    assert adapter._runner is runner
+    assert bound_root.path == tmp_path / "cgroup"
+    with pytest.raises(AttributeError):
+        adapter._runner = _FakeSystemdRunner()
+    with pytest.raises(AttributeError):
+        adapter._cgroup_root = bound_root
+    assert adapter._runner is runner
+    assert adapter._cgroup_root is bound_root
+
+
+def test_approved_runtime_provider_constructs_exact_adapter_internally(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = _approved_provider_runner(monkeypatch, tmp_path)
+
+    result = resource_cgroup.build_approved_cgroup_runtime(
+        runner=runner,
+        mem_total_bytes=16 * GIB,
+    )
+
+    assert result.profile.cpuset_cpus == tuple(range(4, 12))
+    assert result.profile.cpuset_expression == "4-11"
+    assert type(result.adapter) is resource_cgroup.SystemdUserCgroupAdapter
+    assert result.adapter._runner is runner
+    parameters = inspect.signature(resource_cgroup.build_approved_cgroup_runtime).parameters
+    assert "adapter" not in parameters
+    assert "adapter_factory" not in parameters
+
+
+def test_approved_runtime_provider_returns_final_immutable_snapshot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = _approved_provider_runner(monkeypatch, tmp_path)
+
+    result = resource_cgroup.build_approved_cgroup_runtime(
+        runner=runner,
+        mem_total_bytes=16 * GIB,
+    )
+
+    assert result.profile.cpuset_cpus == tuple(range(4, 12))
+    assert type(result.adapter) is resource_cgroup.SystemdUserCgroupAdapter
+    assert result.adapter._runner is runner
+    assert result.preflight == _preflight()
+    assert not hasattr(result, "__dict__")
+    assignments = (
+        (result, "profile", result.profile),
+        (result, "adapter", result.adapter),
+        (result, "preflight", result.preflight),
+        (result.profile, "cpuset_cpus", (0, 1)),
+        (result.profile, "cpu_quota_percent", 1),
+        (result.profile, "cpu_weight", 1),
+        (result.profile, "memory_high_bytes", 1),
+        (result.profile, "memory_max_bytes", 2),
+        (result.profile, "memory_swap_max_bytes", 0),
+        (result.profile, "io_weight", 1),
+        (result.preflight, "unified_v2", False),
+        (result.preflight, "controllers", frozenset()),
+        (result.preflight, "subtree_controllers", frozenset()),
+        (result.preflight, "parent_effective_cpuset", (0, 1)),
+        (result.preflight, "io_physical_isolation_proven", True),
+    )
+    for target, field_name, replacement in assignments:
+        with pytest.raises(AttributeError):
+            setattr(target, field_name, replacement)
+
+
+def test_approved_runtime_provider_rejects_topology_missing_approved_cpu(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = _approved_provider_runner(
+        monkeypatch,
+        tmp_path,
+        present=b"0-3,5-11\n",
+    )
+
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        resource_cgroup.build_approved_cgroup_runtime(
+            runner=runner,
+            mem_total_bytes=16 * GIB,
+        )
+
+
+def test_approved_runtime_provider_rejects_parent_mask_missing_approved_cpu(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = _approved_provider_runner(
+        monkeypatch,
+        tmp_path,
+        parent_cpuset=b"0-10\n",
+    )
+
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        resource_cgroup.build_approved_cgroup_runtime(
+            runner=runner,
+            mem_total_bytes=16 * GIB,
+        )
 
 
 def test_topology_uses_nonhybrid_route_only_when_every_core_type_leaf_is_cleanly_missing() -> None:
@@ -727,7 +912,7 @@ def test_systemd_adapter_uses_fixed_argv_internal_unit_and_one_internal_gate_rel
 ) -> None:
     runner = _FakeSystemdRunner()
     adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
-    monkeypatch.setattr(adapter, "_read_tmux_children", lambda _pid: (4243,))
+    monkeypatch.setattr(resource_cgroup, "PROC_ROOT", _write_tmux_children_fact(tmp_path))
 
     scope = start_verified_scope(
         adapter,
@@ -789,7 +974,7 @@ def test_systemd_adapter_binds_preflight_and_new_scope_to_codex_master_slice(
 ) -> None:
     runner = _FakeSystemdRunner()
     adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
-    monkeypatch.setattr(adapter, "_read_tmux_children", lambda _pid: (4243,))
+    monkeypatch.setattr(resource_cgroup, "PROC_ROOT", _write_tmux_children_fact(tmp_path))
 
     start_verified_scope(
         adapter,
@@ -885,7 +1070,7 @@ def test_systemd_adapter_allows_parent_controller_supersets(
         slice_controllers=b"cpu cpuset memory pids io hugetlb\n",
         slice_subtree=b"cpu cpuset memory pids io hugetlb\n",
     )
-    monkeypatch.setattr(adapter, "_read_tmux_children", lambda _pid: (4243,))
+    monkeypatch.setattr(resource_cgroup, "PROC_ROOT", _write_tmux_children_fact(tmp_path))
 
     scope = start_verified_scope(
         adapter,
@@ -931,9 +1116,9 @@ def test_systemd_adapter_rejects_duplicate_target_slice_controller_evidence_befo
 def test_integration_precondition_classifier_skips_only_clean_absence_and_fails_readback(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    _provide_user_bus_socket_fact(monkeypatch)
     missing_runner = _FakeSystemdRunner(target_slice_missing=True)
     missing_adapter = _systemd_adapter(monkeypatch, tmp_path / "missing", missing_runner)
-    monkeypatch.setattr(missing_adapter, "_user_bus_socket_present", lambda: True)
     assert missing_adapter.integration_precondition_reason() == "requires_target_slice"
 
     no_delegation = _FakeSystemdRunner()
@@ -943,7 +1128,6 @@ def test_integration_precondition_classifier_skips_only_clean_absence_and_fails_
         no_delegation,
         slice_controllers=b"cpu cpuset memory pids\n",
     )
-    monkeypatch.setattr(absent_adapter, "_user_bus_socket_present", lambda: True)
     assert absent_adapter.integration_precondition_reason() == "requires_delegated_controllers"
 
     malformed_runner = _FakeSystemdRunner()
@@ -953,7 +1137,6 @@ def test_integration_precondition_classifier_skips_only_clean_absence_and_fails_
         malformed_runner,
         slice_subtree=b"cpu cpuset memory pids io io\n",
     )
-    monkeypatch.setattr(malformed_adapter, "_user_bus_socket_present", lambda: True)
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
         malformed_adapter.integration_precondition_reason()
 
@@ -963,7 +1146,7 @@ def test_empty_target_slice_control_group_is_missing_only_for_integration_classi
 ) -> None:
     runner = _FakeSystemdRunner(target_slice_stdout=b"ControlGroup=\n")
     adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
-    monkeypatch.setattr(adapter, "_user_bus_socket_present", lambda: True)
+    _provide_user_bus_socket_fact(monkeypatch)
 
     assert adapter.integration_precondition_reason() == "requires_target_slice"
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
@@ -983,7 +1166,7 @@ def test_integration_precondition_rejects_malformed_target_slice_output(
 ) -> None:
     runner = _FakeSystemdRunner(target_slice_stdout=stdout)
     adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
-    monkeypatch.setattr(adapter, "_user_bus_socket_present", lambda: True)
+    _provide_user_bus_socket_fact(monkeypatch)
 
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
         adapter.integration_precondition_reason()

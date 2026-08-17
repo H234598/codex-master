@@ -40,6 +40,7 @@ _TMUX_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _CGROUP_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}$")
 
 CpuSet = tuple[int, ...]
+APPROVED_CPUSET: CpuSet = tuple(range(4, 12))
 
 
 class CgroupPreflightError(ValueError):
@@ -621,10 +622,18 @@ class _SubprocessSystemdUserRunner:
 class SystemdUserCgroupAdapter:
     """Concrete, held-scope adapter; G5 alone may inject it into admission."""
 
+    __slots__ = ("_runner", "_cgroup_root", "_owned")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise AttributeError("SystemdUserCgroupAdapter bindings are immutable")
+
     def __init__(self, *, runner: SystemdUserCommandRunner | None = None) -> None:
-        self._runner = runner or _SubprocessSystemdUserRunner()
-        self._cgroup_root = _bind_directory(CGROUP_ROOT)
-        self._owned: dict[str, _OwnedScope] = {}
+        bound_runner = _SubprocessSystemdUserRunner() if runner is None else runner
+        bound_root = _bind_directory(CGROUP_ROOT)
+        object.__setattr__(self, "_runner", bound_runner)
+        object.__setattr__(self, "_cgroup_root", bound_root)
+        object.__setattr__(self, "_owned", {})
 
     def _run(self, argv: tuple[str, ...]) -> CommandResultV1:
         try:
@@ -1230,6 +1239,57 @@ def derive_cgroup_profile(
         memory_max_bytes=mem_total_bytes - 4 * GIB,
         memory_swap_max_bytes=8 * GIB,
         io_weight=50,
+    )
+
+
+def _read_host_memory_total_bytes() -> int:
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        page_count = os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, OSError, TypeError, ValueError):
+        _fail()
+    if (
+        type(page_size) is not int
+        or type(page_count) is not int
+        or page_size <= 0
+        or page_count <= 0
+    ):
+        _fail()
+    return page_size * page_count
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovedCgroupRuntimeV1:
+    profile: CgroupProfileV1
+    adapter: SystemdUserCgroupAdapter
+    preflight: CgroupPreflightV1
+
+
+def build_approved_cgroup_runtime(
+    *,
+    runner: SystemdUserCommandRunner | None = None,
+    mem_total_bytes: int | None = None,
+) -> ApprovedCgroupRuntimeV1:
+    """Build one validated profile and adapter from the approved host plan."""
+
+    approved = _canonical_cpu_set(APPROVED_CPUSET)
+    adapter = SystemdUserCgroupAdapter(runner=runner)
+    if type(adapter) is not SystemdUserCgroupAdapter:
+        _fail()
+    topology = parse_cpu_topology(adapter)
+    memory_total = _read_host_memory_total_bytes() if mem_total_bytes is None else mem_total_bytes
+    profile = derive_cgroup_profile(
+        topology,
+        approved_cpuset=approved,
+        mem_total_bytes=memory_total,
+    )
+    preflight = require_cgroup_preflight(adapter, profile)
+    if type(preflight) is not CgroupPreflightV1:
+        _fail()
+    return ApprovedCgroupRuntimeV1(
+        profile=profile,
+        adapter=adapter,
+        preflight=preflight,
     )
 
 
