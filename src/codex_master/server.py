@@ -396,6 +396,7 @@ MAX_SELECTION_PREVIEW_EXCLUSIONS = 64
 MAX_ASSIGNMENT_TEXT = 12000
 MAX_SEND_TEXT = 12000
 MAX_TASK_TEXT = 4000
+MAX_HEADLESS_CONTEXT_CHARS = 4000
 MAX_TEXT_FIELD = 1000
 MAX_ASSIGNMENT_LIST_ITEMS = 50
 MAX_AGENTIN_NAME = 80
@@ -9211,10 +9212,10 @@ def _ensure_gemini_headless_retry_policy(home: Path) -> None:
         document["general"] = general
     if not isinstance(general, dict):
         raise AgentError("headless_settings_invalid")
-    if general.get("maxAttempts") == 2 and general.get("retryFetchErrors") is False:
+    if general.get("maxAttempts") == 1 and general.get("retryFetchErrors") is False:
         _refresh_gemini_fleet_marker(home, settings_text)
         return
-    general["maxAttempts"] = 2
+    general["maxAttempts"] = 1
     general["retryFetchErrors"] = False
     settings_text = json.dumps(document, indent=2, sort_keys=True) + "\n"
     replace_private_text(settings_path, settings_text)
@@ -9484,9 +9485,8 @@ def cancel_headless_job(agent: str, force: bool = False) -> dict[str, Any]:
 
 
 def _start_headless_agent_unlocked(agent: str) -> dict[str, Any]:
-    descriptor = _headless_descriptor(agent)
-    if descriptor is None:
-        raise AgentError("headless_runner_unavailable")
+    requested_agent = canonical_agent_id(agent)
+    agent, descriptor, structured_gate, routing_gate = _resolve_gemini_headless_route(requested_agent)
     status = status_agent(agent, initialize_state=False)
     identity = status.get("identity_guard")
     if isinstance(identity, Mapping) and identity.get("ok") is not True:
@@ -9494,15 +9494,31 @@ def _start_headless_agent_unlocked(agent: str) -> dict[str, Any]:
     gate = _headless_admission_gate(agent)
     if not gate.allowed:
         raise AgentError(gate.reason)
+    if structured_gate.get("action") != "allow":
+        return {
+            "agent": agent,
+            "requested_agent": requested_agent,
+            "selected_agent": agent,
+            "status": "deferred" if structured_gate.get("action") == "defer_until" else "failed",
+            "backend": "headless_job",
+            "model": descriptor.model,
+            "gate": structured_gate,
+            "routing_gate": routing_gate,
+            "raw_output": "not_returned",
+        }
     marker = _headless_marker(agent)
     current = HEADLESS_JOBS.status(agent)
     if current.get("status") in {"running", "cancelling"}:
         return {
             "agent": agent,
+            "requested_agent": requested_agent,
+            "selected_agent": agent,
             "status": "already_running",
             "backend": "headless_job",
             "job": current,
             "account_gate": _headless_public_gate(agent),
+            "gate": structured_gate,
+            "routing_gate": routing_gate,
             "raw_output": "not_returned",
         }
     marker = {
@@ -9517,11 +9533,15 @@ def _start_headless_agent_unlocked(agent: str) -> dict[str, Any]:
     _write_headless_marker(agent, marker)
     return {
         "agent": agent,
+        "requested_agent": requested_agent,
+        "selected_agent": agent,
         "status": "ready",
         "backend": "headless_job",
         "model": descriptor.model,
         "lease": agent_lease_status(agent),
         "account_gate": _headless_public_gate(agent),
+        "gate": structured_gate,
+        "routing_gate": routing_gate,
         "raw_output": "not_returned",
     }
 
@@ -9535,62 +9555,138 @@ def _run_headless_process(
     role: str = "arbeitsbiene",
     assignment_id: str | None = None,
     release_lease_on_completion: bool = True,
+    reservation: object | None = None,
+    structured_gate: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    descriptor = _headless_descriptor(agent)
-    if descriptor is None:
-        raise AgentError("headless_runner_unavailable")
-    prompt = bounded_text(prompt, field="prompt", max_chars=MAX_ASSIGNMENT_TEXT, required=True) or ""
-    _validate_headless_timeout(timeout_seconds)
-    role = role.strip().lower()
-    if role not in {"exploriererin", "arbeitsbiene"}:
-        raise AgentError("role must be 'exploriererin' or 'arbeitsbiene'")
-    if lease.get("state") != "held" or lease.get("held_by_this_server") is not True:
-        raise AgentError("headless_lease_not_held")
-    marker = _headless_marker(agent)
-    if marker.get("state") not in {"ready", "running"}:
-        raise AgentError("headless_slot_not_ready")
     service = current_fleet_service()
-    status = status_agent(agent, initialize_state=False)
-    identity = status.get("identity_guard")
-    if isinstance(identity, Mapping) and identity.get("ok") is not True:
-        raise AgentError("headless_identity_unverified")
-    gate = _headless_admission_gate(agent)
-    if not gate.allowed or gate.account_id is None:
-        raise AgentError(gate.reason)
-    fresh_snapshot = service.load()
-    fresh_inventory = build_inventory(fresh_snapshot, AGENT_POOL_ROOT)
-    fresh_descriptor = fresh_inventory.agents.get(agent)
-    if (
-        fresh_descriptor is None
-        or fresh_descriptor.runner is not descriptor.runner
-        or fresh_descriptor.provider is not descriptor.provider
-        or fresh_descriptor.model != descriptor.model
-        or fresh_descriptor.account_id != descriptor.account_id
-    ):
-        raise AgentError("headless_binding_changed")
-    executable = _headless_executable(descriptor)
-    _ensure_gemini_headless_retry_policy(descriptor.home)
-    plan = build_runner_plan(descriptor, executable)
-    child_env = dict(os.environ)
-    for name in plan.unset_env | {"CODEX_HOME"}:
-        child_env.pop(name, None)
-    child_env.update(plan.env)
-    if plan.secret_env_name is None:
-        raise AgentError("headless_secret_binding_missing")
-    argv = list(plan.argv)
-    argv.append("--approval-mode=plan" if role == "exploriererin" else "--approval-mode=auto_edit")
-    assignment_id = assignment_id or f"{now_id()}-{agent}"
+    try:
+        descriptor = _headless_descriptor(agent)
+        if descriptor is None:
+            raise AgentError("headless_runner_unavailable")
+        prompt = bounded_text(prompt, field="prompt", max_chars=MAX_ASSIGNMENT_TEXT, required=True) or ""
+        _validate_headless_timeout(timeout_seconds)
+        role = role.strip().lower()
+        if role not in {"exploriererin", "arbeitsbiene"}:
+            raise AgentError("role must be 'exploriererin' or 'arbeitsbiene'")
+        if lease.get("state") != "held" or lease.get("held_by_this_server") is not True:
+            raise AgentError("headless_lease_not_held")
+        marker = _headless_marker(agent)
+        if marker.get("state") not in {"ready", "running"}:
+            raise AgentError("headless_slot_not_ready")
+    except Exception:
+        if reservation is not None:
+            with contextlib.suppress(Exception):
+                service.release_gemini_request(reservation, outcome="provider_error")
+        if release_lease_on_completion:
+            with contextlib.suppress(Exception):
+                release_agent(agent, force=True)
+        raise
+    structured_gate = (
+        _gemini_headless_gate(agent)
+        if structured_gate is None
+        else dict(structured_gate)
+    )
+    if structured_gate.get("action") != "allow":
+        account_id = structured_gate.get("account_id")
+        gate_code = structured_gate.get("diagnostic_code")
+        with contextlib.suppress(Exception):
+            if isinstance(account_id, str) and isinstance(gate_code, str):
+                service.record_gemini_usage(
+                    account_id,
+                    model=descriptor.model,
+                    status="failed",
+                    gate_action=str(structured_gate.get("action")),
+                    gate_code=gate_code,
+                    next_reset_at_utc=structured_gate.get("defer_until"),
+                )
+                service.record_gemini_event(
+                    event_type="headless_gate",
+                    agent_id=agent,
+                    account_id=account_id,
+                    assignment_id=assignment_id,
+                    status="deferred" if structured_gate.get("action") == "defer_until" else "failed",
+                    reason=gate_code,
+                    model=descriptor.model,
+                    gate_action=str(structured_gate.get("action")),
+                    gate_code=gate_code,
+                    next_reset_at_utc=structured_gate.get("defer_until"),
+                )
+        if reservation is not None:
+            with contextlib.suppress(Exception):
+                service.release_gemini_request(reservation, outcome="provider_error")
+        if release_lease_on_completion:
+            with contextlib.suppress(Exception):
+                release_agent(agent, force=True)
+        return {
+            "agent": agent,
+            "assignment_id": assignment_id,
+            "status": "deferred" if structured_gate.get("action") == "defer_until" else "failed",
+            "model": descriptor.model,
+            "response": "",
+            "gate": structured_gate,
+            "raw_output": "not_returned",
+        }
+    gate_action = structured_gate.get("action")
+    gate_code = structured_gate.get("diagnostic_code")
+    if not isinstance(gate_action, str) or not isinstance(gate_code, str):
+        if reservation is not None:
+            with contextlib.suppress(Exception):
+                service.release_gemini_request(reservation, outcome="provider_error")
+        if release_lease_on_completion:
+            with contextlib.suppress(Exception):
+                release_agent(agent, force=True)
+        raise AgentError("headless_gate_invalid")
+    try:
+        status = status_agent(agent, initialize_state=False)
+        identity = status.get("identity_guard")
+        if isinstance(identity, Mapping) and identity.get("ok") is not True:
+            raise AgentError("headless_identity_unverified")
+        gate = _headless_admission_gate(agent)
+        if not gate.allowed or gate.account_id is None:
+            raise AgentError(gate.reason)
+        if structured_gate.get("account_id") != gate.account_id:
+            raise AgentError("headless_gate_binding_changed")
+        fresh_snapshot = service.load()
+        fresh_inventory = build_inventory(fresh_snapshot, AGENT_POOL_ROOT)
+        fresh_descriptor = fresh_inventory.agents.get(agent)
+        if (
+            fresh_descriptor is None
+            or fresh_descriptor.runner is not descriptor.runner
+            or fresh_descriptor.provider is not descriptor.provider
+            or fresh_descriptor.model != descriptor.model
+            or fresh_descriptor.account_id != descriptor.account_id
+        ):
+            raise AgentError("headless_binding_changed")
+        executable = _headless_executable(descriptor)
+        _ensure_gemini_headless_retry_policy(descriptor.home)
+        plan = build_runner_plan(descriptor, executable)
+        child_env = dict(os.environ)
+        for name in plan.unset_env | {"CODEX_HOME"}:
+            child_env.pop(name, None)
+        child_env.update(plan.env)
+        if plan.secret_env_name is None:
+            raise AgentError("headless_secret_binding_missing")
+        argv = list(plan.argv)
+        argv.append("--approval-mode=plan" if role == "exploriererin" else "--approval-mode=auto_edit")
+        assignment_id = assignment_id or f"{now_id()}-{agent}"
+    except Exception:
+        if reservation is not None:
+            with contextlib.suppress(Exception):
+                service.release_gemini_request(reservation, outcome="provider_error")
+        if release_lease_on_completion:
+            with contextlib.suppress(Exception):
+                release_agent(agent, force=True)
+        raise
     process: object | None = None
     job: HeadlessJob | None = None
     result: HeadlessProcessResult | None = None
     parsed = None
     popen_env: dict[str, str] | None = None
-    reservation = None
     rate_outcome = "provider_error"
     rate_reset_at_utc: str | None = None
     secret = ""
     try:
-        if gate.account_id is not None:
+        if reservation is None and gate.account_id is not None:
             reservation = service.reserve_gemini_request(gate.account_id)
         secret = service.read_secret(gate.account_id, expected_generation=gate.generation)
         child_env[plan.secret_env_name] = secret
@@ -9602,6 +9698,7 @@ def _run_headless_process(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=popen_env,
+                cwd=descriptor.home,
                 shell=False,
                 start_new_session=True,
             )
@@ -9686,6 +9783,10 @@ def _run_headless_process(
                 input_tokens=parsed.input_tokens,
                 output_tokens=parsed.output_tokens,
                 status=usage_status,
+                tool_call_count=parsed.tool_call_count,
+                gate_action=gate_action,
+                gate_code=gate_code,
+                next_reset_at_utc=rate_reset_at_utc,
             )
         with contextlib.suppress(Exception):
             service.record_gemini_event(
@@ -9698,6 +9799,10 @@ def _run_headless_process(
                 model=parsed.model or descriptor.model,
                 input_tokens=parsed.input_tokens,
                 output_tokens=parsed.output_tokens,
+                tool_call_count=parsed.tool_call_count,
+                gate_action=gate_action,
+                gate_code=gate_code,
+                next_reset_at_utc=rate_reset_at_utc,
             )
         response = parsed.response if terminal == "completed" else ""
         if terminal == "completed":
@@ -9708,6 +9813,7 @@ def _run_headless_process(
             "status": terminal,
             "model": parsed.model or descriptor.model,
             "response": response,
+            "gate": structured_gate,
             "session_id": parsed.session_id,
             "input_tokens": parsed.input_tokens,
             "output_tokens": parsed.output_tokens,
@@ -9728,6 +9834,9 @@ def _run_headless_process(
                 gate.account_id,
                 model=descriptor.model,
                 status=usage_status,
+                gate_action=gate_action,
+                gate_code=gate_code,
+                next_reset_at_utc=rate_reset_at_utc,
             )
         with contextlib.suppress(Exception):
             service.record_gemini_event(
@@ -9736,8 +9845,15 @@ def _run_headless_process(
                 account_id=gate.account_id,
                 assignment_id=assignment_id,
                 status=usage_status,
-                reason=(str(exc) if isinstance(exc, (AgentError, FleetRateLimitError, FleetSecretError)) else type(exc).__name__.lower()),
+                reason=(
+                    exc.reason if isinstance(exc, FleetRateLimitError)
+                    else "secret_missing" if isinstance(exc, FleetSecretError)
+                    else "runner_failed"
+                ),
                 model=descriptor.model,
+                gate_action=gate_action,
+                gate_code=gate_code,
+                next_reset_at_utc=rate_reset_at_utc,
             )
         raise
     finally:
@@ -9806,6 +9922,43 @@ def _headless_route_candidates(agent: str, skill: str | None, required_skills: l
     return [canonical_agent_id(agent)]
 
 
+def _gemini_headless_gate(agent: str) -> dict[str, Any]:
+    """Return FleetService's redacted, pre-process Gemini gate decision."""
+
+    return current_fleet_service().gemini_headless_gate(agent).public()
+
+
+def _resolve_gemini_headless_route(
+    requested_agent: str,
+) -> tuple[str, AgentDescriptor, dict[str, Any], dict[str, Any] | None]:
+    """Resolve one explicit Gemini target without crossing provider boundaries."""
+
+    requested_agent = canonical_agent_id(requested_agent)
+    descriptor = _headless_descriptor(requested_agent)
+    if descriptor is None:
+        raise AgentError("headless_runner_unavailable")
+    gate = _gemini_headless_gate(requested_agent)
+    if gate.get("action") not in {"rotate_account", "rotate_model"}:
+        return requested_agent, descriptor, gate, None
+    target = gate.get("target_agent_id")
+    if not isinstance(target, str):
+        raise AgentError("headless_rotation_target_invalid")
+    try:
+        target = canonical_agent_id(target)
+    except AgentError as exc:
+        raise AgentError("headless_rotation_target_invalid") from exc
+    target_descriptor = _headless_descriptor(target)
+    if (
+        descriptor.provider is not Provider.GEMINI_API
+        or descriptor.runner is not RunnerKind.GEMINI_CLI
+        or target_descriptor is None
+        or target_descriptor.provider is not Provider.GEMINI_API
+        or target_descriptor.runner is not RunnerKind.GEMINI_CLI
+    ):
+        raise AgentError("headless_rotation_target_invalid")
+    return target, target_descriptor, _gemini_headless_gate(target), gate
+
+
 def _assign_headless_agent(
     agent: str,
     *,
@@ -9832,7 +9985,7 @@ def _assign_headless_agent(
     del operation, allow_unauthenticated
     requested_agent = canonical_agent_id(agent)
     agent = requested_agent
-    descriptor = _headless_descriptor(agent)
+    descriptor = _headless_descriptor(requested_agent)
     if descriptor is None:
         raise AgentError("headless_runner_unavailable")
     _validate_headless_timeout(timeout_seconds)
@@ -9851,6 +10004,8 @@ def _assign_headless_agent(
     write_paths = as_string_list(write_paths, field="write_paths", max_chars=MAX_PATH_TEXT)
     context = as_string_list(context, field="context")
     forbidden = as_string_list(forbidden, field="forbidden")
+    if len(task) + sum(len(item) for item in context) > MAX_HEADLESS_CONTEXT_CHARS:
+        raise AgentError("headless_context_budget_exceeded")
     live_data_topic = bounded_text(
         live_data_topic, field="live_data_topic", max_chars=MAX_LIVE_DATA_TOPIC,
     ) if live_data_topic is not None else None
@@ -9860,6 +10015,7 @@ def _assign_headless_agent(
         raise AgentError("arbeitsbiene assignments require at least one explicit write path")
     if role == "arbeitsbiene":
         raise HeadlessWriteScopeError()
+    agent, descriptor, gate, routing_gate = _resolve_gemini_headless_route(requested_agent)
     matches = skill_matches(agent, skill) if skill else []
     missing_skills = [item for item in required_skills if not skill_matches(agent, item)]
     if missing_skills and not allow_missing_skill:
@@ -9875,50 +10031,73 @@ def _assign_headless_agent(
     )
     if len(prompt) > MAX_ASSIGNMENT_TEXT:
         raise AgentError(f"assignment prompt exceeds {MAX_ASSIGNMENT_TEXT} characters")
-    with agent_lifecycle_lock(agent):
-        claim = _claim_agent_unlocked(agent)
-        lease = claim["lease"]
-        release_on_completion = claim["status"] in {"claimed", "claimed_expired"}
-        assignment_id = f"{now_id()}-{agent}"
-        try:
-            record_assignment({
-                "assignment_id": assignment_id,
-                "created_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-                "agent": agent,
-                "role": role,
-                "name": name or default_agentin_name(agent),
-                "model": descriptor.model,
-                "group_id": group_id,
-                "job_id": job_id,
-                "skill": {"requested": skill, "available": bool(matches) if skill else None,
-                          "match_count": len(matches)},
-                "scope": redact_list(scope),
-                "write_paths": redact_list(write_paths),
-                "context_count": len(context),
-                "forbidden_count": len(forbidden),
-                "write_policy": "read_only" if role == "exploriererin" else "explicit_paths_only",
-                "allow_subagents": allow_subagents,
-                "requires_search": requires_search,
-                "live_data": {"required": requires_search, "topic_state": "set" if live_data_topic else "task",
-                              "raw_output": "not_returned"},
-                "lease": lease,
-                "submitted": enter,
-                "prompt_chars": len(prompt),
-                "prompt_output": "not_returned",
-                "response_output": "not_returned",
-            })
-            marker = _headless_marker(agent)
-            marker.update({"state": "ready", "assignment_id": assignment_id})
-            _write_headless_marker(agent, marker)
-        except Exception:
-            if release_on_completion:
-                release_start_lease_if_safe(agent, lease, True)
-            raise
+    if gate.get("action") != "allow":
+        return {
+            "agent": agent,
+            "requested_agent": requested_agent,
+            "selected_agent": agent,
+            "status": "deferred" if gate.get("action") == "defer_until" else "failed",
+            "model": descriptor.model,
+            "gate": gate,
+            "routing_gate": routing_gate,
+            "raw_output": "not_returned",
+        }
+    account_id = gate.get("account_id")
+    if not isinstance(account_id, str) or account_id != getattr(descriptor, "account_id", None):
+        raise AgentError("headless_gate_binding_changed")
+    service = current_fleet_service()
+    reservation = service.reserve_gemini_request(account_id)
+    try:
+        with agent_lifecycle_lock(agent):
+            claim = _claim_agent_unlocked(agent)
+            lease = claim["lease"]
+            release_on_completion = claim["status"] in {"claimed", "claimed_expired"}
+            assignment_id = f"{now_id()}-{agent}"
+            try:
+                record_assignment({
+                    "assignment_id": assignment_id,
+                    "created_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                    "agent": agent,
+                    "role": role,
+                    "name": name or default_agentin_name(agent),
+                    "model": descriptor.model,
+                    "group_id": group_id,
+                    "job_id": job_id,
+                    "skill": {"requested": skill, "available": bool(matches) if skill else None,
+                              "match_count": len(matches)},
+                    "scope": redact_list(scope),
+                    "write_paths": redact_list(write_paths),
+                    "context_count": len(context),
+                    "forbidden_count": len(forbidden),
+                    "write_policy": "read_only" if role == "exploriererin" else "explicit_paths_only",
+                    "allow_subagents": allow_subagents,
+                    "requires_search": requires_search,
+                    "live_data": {"required": requires_search, "topic_state": "set" if live_data_topic else "task",
+                                  "raw_output": "not_returned"},
+                    "lease": lease,
+                    "submitted": enter,
+                    "prompt_chars": len(prompt),
+                    "prompt_output": "not_returned",
+                    "response_output": "not_returned",
+                })
+                marker = _headless_marker(agent)
+                marker.update({"state": "ready", "assignment_id": assignment_id})
+                _write_headless_marker(agent, marker)
+            except Exception:
+                if release_on_completion:
+                    release_start_lease_if_safe(agent, lease, True)
+                raise
+    except Exception:
+        with contextlib.suppress(Exception):
+            service.release_gemini_request(reservation, outcome="provider_error")
+        raise
     try:
         result = _run_headless_process(
             agent, prompt, lease, timeout_seconds,
             role=role, assignment_id=assignment_id,
             release_lease_on_completion=release_on_completion,
+            reservation=reservation,
+            structured_gate=gate,
         )
     except FleetRateLimitError as exc:
         result = {
@@ -9933,7 +10112,10 @@ def _assign_headless_agent(
     result.update({
         "role": role,
         "requested_agent": requested_agent,
+        "selected_agent": agent,
         "routed_from": requested_agent if requested_agent != agent else None,
+        "gate": result.get("gate", gate),
+        "routing_gate": routing_gate,
         "name": name or default_agentin_name(agent),
         "scope_count": len(scope),
         "write_path_count": len(write_paths),
@@ -19165,7 +19347,7 @@ def fleet_minimal_config(agent: AgentDescriptor) -> tuple[str, str]:
                 "defaultApprovalMode": "default",
                 "enableAutoUpdate": False,
                 "enableAutoUpdateNotification": False,
-                "maxAttempts": 2,
+                "maxAttempts": 1,
                 "retryFetchErrors": False,
             },
             "privacy": {"usageStatisticsEnabled": False},

@@ -527,7 +527,7 @@ def _gemini_probe_settings(home: Path) -> None:
         "general": {
             "enableAutoUpdate": False,
             "enableAutoUpdateNotification": False,
-            "maxAttempts": 2,
+            "maxAttempts": 1,
             "retryFetchErrors": False,
         },
         "privacy": {"usageStatisticsEnabled": False},

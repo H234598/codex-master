@@ -5680,7 +5680,7 @@ class ServerHelpersTest(unittest.TestCase):
                         "defaultApprovalMode": "default",
                         "enableAutoUpdate": False,
                         "enableAutoUpdateNotification": False,
-                        "maxAttempts": 2,
+                        "maxAttempts": 1,
                         "retryFetchErrors": False,
                     },
                     "privacy": {"usageStatisticsEnabled": False},

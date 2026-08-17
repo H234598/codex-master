@@ -158,7 +158,7 @@ def test_gemini_provider_probe_is_stdin_only_bounded_and_isolated(
     assert "--approval-mode=plan" in argv
     assert "gemini-3.1-flash-lite" in argv
     settings = json.loads(captured["settings"])  # type: ignore[arg-type]
-    assert settings["general"]["maxAttempts"] == 2
+    assert settings["general"]["maxAttempts"] == 1
     assert settings["general"]["retryFetchErrors"] is False
     env = captured["env"]
     assert isinstance(env, dict)

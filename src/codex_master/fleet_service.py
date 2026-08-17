@@ -34,6 +34,14 @@ from .fleet_registry import (
     public_fleet_snapshot,
 )
 from .fleet_runners import ProbeResult
+from .selection import (
+    FairnessLedger,
+    ModelRole,
+    SelectionCandidate,
+    SelectionPolicy,
+    TaskKind,
+    preview_selection,
+)
 
 
 MAX_REGISTRY_BYTES = 1024 * 1024
@@ -88,6 +96,116 @@ _ACCOUNT_ID_RE = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 _LIMIT_REASON_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _T = TypeVar("_T")
 
+GEMINI_GATE_DIAGNOSTICS: Mapping[str, Mapping[str, object]] = MappingProxyType({
+    "gemini_ready": MappingProxyType({
+        "severity": "info", "retryable": False, "action": "allow",
+        "reason": "Gemini request admitted.",
+    }),
+    "gemini_local_rate_limited": MappingProxyType({
+        "severity": "warning", "retryable": True, "action": "defer_until",
+        "reason": "Gemini local request rate limit active.",
+    }),
+    "gemini_rpm_exhausted": MappingProxyType({
+        "severity": "warning", "retryable": True, "action": "defer_until",
+        "reason": "Known Gemini requests-per-minute limit reached.",
+    }),
+    "gemini_tpm_exhausted": MappingProxyType({
+        "severity": "warning", "retryable": True, "action": "defer_until",
+        "reason": "Known Gemini input-tokens-per-minute limit reached.",
+    }),
+    "gemini_rpd_exhausted": MappingProxyType({
+        "severity": "warning", "retryable": True, "action": "defer_until",
+        "reason": "Known Gemini requests-per-day limit reached.",
+    }),
+    "gemini_account_limited": MappingProxyType({
+        "severity": "warning", "retryable": True, "action": "defer_until",
+        "reason": "Gemini account has an active provider limit.",
+    }),
+    "gemini_account_disabled": MappingProxyType({
+        "severity": "error", "retryable": False, "action": "reject",
+        "reason": "Gemini account is disabled.",
+    }),
+    "gemini_secret_missing": MappingProxyType({
+        "severity": "error", "retryable": False, "action": "reject",
+        "reason": "Gemini account credential is missing.",
+    }),
+    "gemini_auth_invalid": MappingProxyType({
+        "severity": "error", "retryable": False, "action": "reject",
+        "reason": "Gemini account authentication is invalid.",
+    }),
+    "gemini_provider_unavailable": MappingProxyType({
+        "severity": "warning", "retryable": True, "action": "reject",
+        "reason": "Gemini provider is unavailable.",
+    }),
+    "gemini_model_unavailable": MappingProxyType({
+        "severity": "error", "retryable": False, "action": "reject",
+        "reason": "Gemini model is unavailable.",
+    }),
+    "gemini_account_limit_unknown": MappingProxyType({
+        "severity": "warning", "retryable": True, "action": "reject",
+        "reason": "Gemini account limit state is unknown.",
+    }),
+    "gemini_credential_unverified": MappingProxyType({
+        "severity": "error", "retryable": False, "action": "reject",
+        "reason": "Gemini account credential cannot be verified.",
+    }),
+    "gemini_probe_stale": MappingProxyType({
+        "severity": "warning", "retryable": True, "action": "reject",
+        "reason": "Gemini account probe is stale.",
+    }),
+    "gemini_account_unavailable": MappingProxyType({
+        "severity": "error", "retryable": False, "action": "reject",
+        "reason": "Gemini account is unavailable.",
+    }),
+    "gemini_limits_unknown": MappingProxyType({
+        "severity": "warning", "retryable": False, "action": "allow",
+        "reason": "Gemini dashboard limits are unknown; only observed counters are available.",
+    }),
+    "gemini_gate_unknown": MappingProxyType({
+        "severity": "error", "retryable": False, "action": "reject",
+        "reason": "Gemini gate state is unknown.",
+    }),
+})
+_GEMINI_LEGACY_GATE_CODES = MappingProxyType({
+    "ready": "gemini_ready",
+    "limit_active": "gemini_account_limited",
+    "probe_stale": "gemini_probe_stale",
+    "gemini_local_rate_limit": "gemini_local_rate_limited",
+    "account_disabled": "gemini_account_disabled",
+    "account_provider_mismatch": "gemini_account_unavailable",
+    "credential_binding_unknown": "gemini_credential_unverified",
+    "secret_missing": "gemini_secret_missing",
+    "auth_invalid": "gemini_auth_invalid",
+    "provider_unavailable": "gemini_provider_unavailable",
+    "model_unavailable": "gemini_model_unavailable",
+    "limit_unknown": "gemini_account_limit_unknown",
+})
+_GEMINI_EVENT_REASON_CODES = frozenset({
+    *GEMINI_GATE_DIAGNOSTICS,
+    "account_limited",
+    "auth_invalid",
+    "model_unavailable",
+    "provider_unavailable",
+    "runner_failed",
+    "secret_missing",
+    "limit_active",
+    "ready",
+})
+
+
+def map_gemini_gate_code(code: str) -> str:
+    """Map historical gate reasons to one stable, public diagnostic code."""
+
+    if not isinstance(code, str):
+        return "gemini_gate_unknown"
+    return _GEMINI_LEGACY_GATE_CODES.get(code, code if code in GEMINI_GATE_DIAGNOSTICS else "gemini_gate_unknown")
+
+
+def _redacted_gemini_event_reason(reason: str | None) -> str | None:
+    if reason is None:
+        return None
+    return reason if reason in _GEMINI_EVENT_REASON_CODES else "runner_failed"
+
 
 class FleetConflictError(ValueError):
     pass
@@ -117,6 +235,36 @@ class AccountGateDecision:
     reason: str
     account_id: str | None
     generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class GeminiGateDecision:
+    action: str
+    diagnostic_code: str
+    reason: str
+    severity: str
+    retryable: bool
+    account_id: str | None
+    model: str | None
+    defer_until: str | None = None
+    target_agent_id: str | None = None
+    openai_fallback_reason: str | None = None
+
+    def public(self) -> dict[str, object]:
+        return {
+            "action": self.action,
+            "diagnostic_code": self.diagnostic_code,
+            "reason": self.reason,
+            "severity": self.severity,
+            "retryable": self.retryable,
+            "account_id": self.account_id,
+            "model": self.model,
+            "defer_until": self.defer_until,
+            "next_reset_at_utc": self.defer_until,
+            "target_agent_id": self.target_agent_id,
+            "openai_fallback_reason": self.openai_fallback_reason,
+            "raw_output": "not_returned",
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,19 +536,34 @@ class FleetService:
                     model = event.get("model")
                     if not isinstance(model, str) or not 1 <= len(model) <= 200:
                         raise ValueError("invalid_gemini_usage")
-                    for key in ("input_tokens", "output_tokens"):
+                    for key in ("input_tokens", "output_tokens", "tool_call_count"):
                         value = event.get(key, 0)
                         if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2**63 - 1:
                             raise ValueError("invalid_gemini_usage")
                     status = event.get("status")
                     if not isinstance(status, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", status):
                         raise ValueError("invalid_gemini_usage")
+                    gate_action = event.get("gate_action")
+                    if gate_action is not None and gate_action not in {
+                        "allow", "defer_until", "rotate_account", "rotate_model", "reject",
+                    }:
+                        raise ValueError("invalid_gemini_usage")
+                    gate_code = event.get("gate_code")
+                    if gate_code is not None and gate_code not in GEMINI_GATE_DIAGNOSTICS:
+                        raise ValueError("invalid_gemini_usage")
+                    reset_at = event.get("next_reset_at_utc")
+                    if reset_at is not None and self._parse_time(reset_at) is None:
+                        raise ValueError("invalid_gemini_usage")
                     clean.append({
                         "at_utc": timestamp,
                         "model": model,
                         "input_tokens": event.get("input_tokens", 0),
                         "output_tokens": event.get("output_tokens", 0),
+                        "tool_call_count": event.get("tool_call_count", 0),
                         "status": status,
+                        "gate_action": gate_action,
+                        "gate_code": gate_code,
+                        "next_reset_at_utc": reset_at,
                     })
                 result[account_id] = clean[-2000:]
             return result
@@ -533,7 +696,11 @@ class FleetService:
         model: str,
         input_tokens: int | None = None,
         output_tokens: int | None = None,
+        tool_call_count: int | None = None,
         status: str = "completed",
+        gate_action: str | None = None,
+        gate_code: str | None = None,
+        next_reset_at_utc: str | None = None,
     ) -> dict[str, object]:
         if not isinstance(account_id, str) or not _ACCOUNT_ID_RE.fullmatch(account_id):
             raise ValueError("invalid_account")
@@ -543,10 +710,20 @@ class FleetService:
             raise ValueError("invalid_gemini_usage")
         input_value = 0 if input_tokens is None else input_tokens
         output_value = 0 if output_tokens is None else output_tokens
+        tool_call_value = 0 if tool_call_count is None else tool_call_count
         if (
             isinstance(input_value, bool) or not isinstance(input_value, int) or input_value < 0
             or isinstance(output_value, bool) or not isinstance(output_value, int) or output_value < 0
+            or isinstance(tool_call_value, bool) or not isinstance(tool_call_value, int) or tool_call_value < 0
         ):
+            raise ValueError("invalid_gemini_usage")
+        if gate_action is not None and gate_action not in {
+            "allow", "defer_until", "rotate_account", "rotate_model", "reject",
+        }:
+            raise ValueError("invalid_gemini_usage")
+        if gate_code is not None and gate_code not in GEMINI_GATE_DIAGNOSTICS:
+            raise ValueError("invalid_gemini_usage")
+        if next_reset_at_utc is not None and self._parse_time(next_reset_at_utc) is None:
             raise ValueError("invalid_gemini_usage")
         with self._io.lock():
             now = self._rate_now()
@@ -565,14 +742,18 @@ class FleetService:
                 "model": model,
                 "input_tokens": input_value,
                 "output_tokens": output_value,
+                "tool_call_count": tool_call_value,
                 "status": status,
+                "gate_action": gate_action,
+                "gate_code": gate_code,
+                "next_reset_at_utc": next_reset_at_utc,
             }
             events.append(event)
             entries[account_id] = events[-2000:]
             self._write_usage(entries)
         return self.gemini_usage_status(account_id)
 
-    def gemini_usage_status(self, account_id: str) -> dict[str, object]:
+    def gemini_usage_status(self, account_id: str, *, model: str | None = None) -> dict[str, object]:
         snapshot = self.load()
         now = self._rate_now()
         events = self._load_usage().get(account_id, [])
@@ -586,9 +767,9 @@ class FleetService:
             if at.tzinfo is None:
                 continue
             age = (now - at.astimezone(timezone.utc)).total_seconds()
-            if 0 <= age <= 60:
+            if 0 <= age < 60:
                 recent_minute.append(event)
-            if 0 <= age <= 86400:
+            if 0 <= age < 86400:
                 recent_day.append(event)
         account = next((item for item in snapshot.accounts if item.account_id == account_id), None)
         probe_age = None
@@ -609,11 +790,14 @@ class FleetService:
             "rpd": len(recent_day),
         }
         model_evaluations: dict[str, dict[str, object]] = {}
-        model_names = sorted({
+        model_names = {
             str(event.get("model"))
             for event in recent_day
             if isinstance(event.get("model"), str) and event.get("model")
-        })
+        }
+        if isinstance(model, str) and model:
+            model_names.add(model)
+        model_names = sorted(model_names)
         for model in model_names:
             model_minute = [event for event in recent_minute if event.get("model") == model]
             model_day = [event for event in recent_day if event.get("model") == model]
@@ -621,6 +805,7 @@ class FleetService:
                 "rpm": len(model_minute),
                 "tpm": sum(int(event.get("input_tokens", 0)) for event in model_minute),
                 "rpd": len(model_day),
+                "tool_call_count": sum(int(event.get("tool_call_count", 0)) for event in model_day),
             }
             model_profile = self.gemini_quota_profile(account_id, model=model)
             model_limits = {
@@ -628,8 +813,21 @@ class FleetService:
                 "tpm": model_profile.get("tpm_limit"),
                 "rpd": model_profile.get("rpd_limit"),
             }
+            resets_at_utc = {
+                "rpm": self._quota_window_reset(
+                    model_minute, seconds=60, limit=model_limits["rpm"], metric="rpm",
+                ),
+                "tpm": self._quota_window_reset(
+                    model_minute, seconds=60, limit=model_limits["tpm"], metric="tpm",
+                ),
+                "rpd": self._quota_window_reset(
+                    model_day, seconds=86400, limit=model_limits["rpd"], metric="rpd",
+                ),
+            }
             utilization: dict[str, float | None] = {}
             for metric, value in model_observed.items():
+                if metric == "tool_call_count":
+                    continue
                 limit = model_limits[metric]
                 if isinstance(limit, (int, float)) and not isinstance(limit, bool) and limit > 0:
                     utilization[metric] = round(float(value) / float(limit) * 100, 2)
@@ -639,6 +837,7 @@ class FleetService:
                 "model": model,
                 "observed": model_observed,
                 "limits": model_limits,
+                "resets_at_utc": resets_at_utc,
                 "utilization_percent": utilization,
                 "state": (
                     "limits_unknown_dashboard_required"
@@ -647,7 +846,10 @@ class FleetService:
                 ),
                 "limits_source": model_profile["provider_quota_source"],
             }
-        if len(model_evaluations) == 1:
+        if model is not None and model in model_evaluations:
+            quota_evaluation = model_evaluations[model]
+            quota_evaluation["scope"] = identity["quota_scope"]
+        elif len(model_evaluations) == 1:
             quota_evaluation: dict[str, object] = next(iter(model_evaluations.values()))
             quota_evaluation["scope"] = identity["quota_scope"]
         elif model_evaluations:
@@ -672,11 +874,21 @@ class FleetService:
             "rpm_observed": len(recent_minute),
             "tpm_observed": observed["tpm"],
             "output_tokens_per_minute_observed": sum(int(event.get("output_tokens", 0)) for event in recent_minute),
+            "tool_call_count_24h": sum(int(event.get("tool_call_count", 0)) for event in recent_day),
             "rpd_observed": len(recent_day),
             "input_tokens_24h": sum(int(event.get("input_tokens", 0)) for event in recent_day),
             "output_tokens_24h": sum(int(event.get("output_tokens", 0)) for event in recent_day),
             "last_request_at_utc": events[-1].get("at_utc") if events else None,
             "event_count_24h": len(recent_day),
+            "last_gate": (
+                {
+                    "action": events[-1].get("gate_action"),
+                    "code": events[-1].get("gate_code"),
+                }
+                if events and events[-1].get("gate_action") is not None and events[-1].get("gate_code") is not None
+                else None
+            ),
+            "next_known_reset_at_utc": events[-1].get("next_reset_at_utc") if events else None,
             "quota_evaluation": quota_evaluation,
             "spend_evaluation": {
                 "state": "billing_export_required",
@@ -738,6 +950,10 @@ class FleetService:
         model: str | None = None,
         input_tokens: int | None = None,
         output_tokens: int | None = None,
+        tool_call_count: int | None = None,
+        gate_action: str | None = None,
+        gate_code: str | None = None,
+        next_reset_at_utc: str | None = None,
     ) -> dict[str, object]:
         """Append a bounded, redacted Gemini event for master/dispatcher status."""
 
@@ -749,10 +965,14 @@ class FleetService:
             "account_id": account_id,
             "assignment_id": assignment_id,
             "status": status,
-            "reason": reason,
+            "reason": _redacted_gemini_event_reason(reason),
             "model": model,
             "input_tokens": input_tokens or 0,
             "output_tokens": output_tokens or 0,
+            "tool_call_count": tool_call_count or 0,
+            "gate_action": gate_action,
+            "gate_code": gate_code,
+            "next_reset_at_utc": next_reset_at_utc,
         }
         for key in ("event_type", "status"):
             value = values[key]
@@ -762,10 +982,18 @@ class FleetService:
             value = values[key]
             if value is not None and (not isinstance(value, str) or not 1 <= len(value) <= 300):
                 raise ValueError("invalid_gemini_event")
-        for key in ("input_tokens", "output_tokens"):
+        for key in ("input_tokens", "output_tokens", "tool_call_count"):
             value = values[key]
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2**63 - 1:
                 raise ValueError("invalid_gemini_event")
+        if gate_action is not None and gate_action not in {
+            "allow", "defer_until", "rotate_account", "rotate_model", "reject",
+        }:
+            raise ValueError("invalid_gemini_event")
+        if gate_code is not None and gate_code not in GEMINI_GATE_DIAGNOSTICS:
+            raise ValueError("invalid_gemini_event")
+        if next_reset_at_utc is not None and self._parse_time(next_reset_at_utc) is None:
+            raise ValueError("invalid_gemini_event")
         with self._io.lock():
             try:
                 existing = self._io.read_text(self._paths.events, MAX_EVENT_BYTES, "could_not_read_gemini_events") or ""
@@ -795,6 +1023,35 @@ class FleetService:
     def _rate_text(value: datetime) -> str:
         return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
+    @classmethod
+    def _quota_window_reset(
+        cls,
+        events: list[dict[str, object]],
+        *,
+        seconds: int,
+        limit: object,
+        metric: str,
+    ) -> str | None:
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            return None
+        observations: list[tuple[datetime, int]] = []
+        for event in events:
+            try:
+                at = datetime.fromisoformat(str(event["at_utc"]).replace("Z", "+00:00"))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if at.tzinfo is not None:
+                weight = int(event.get("input_tokens", 0)) if metric == "tpm" else 1
+                observations.append((at.astimezone(timezone.utc), weight))
+        observed = sum(weight for _at, weight in observations)
+        if observed < limit:
+            return None
+        for at, weight in sorted(observations):
+            observed -= weight
+            if observed < limit:
+                return cls._rate_text(at + timedelta(seconds=seconds))
+        return None
+
     @staticmethod
     def _retry_after(now: datetime, *values: str | None) -> int:
         deadlines: list[datetime] = []
@@ -810,6 +1067,20 @@ class FleetService:
         if not deadlines:
             return 0
         return max(1, int(max((item - now).total_seconds() for item in deadlines) + 0.999))
+
+    @staticmethod
+    def _latest_deadline(now: datetime, *values: str | None) -> str | None:
+        deadlines: list[datetime] = []
+        for value in values:
+            if value is None:
+                continue
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if parsed.tzinfo is not None and parsed.astimezone(timezone.utc) > now:
+                deadlines.append(parsed.astimezone(timezone.utc))
+        return FleetService._rate_text(max(deadlines)) if deadlines else None
 
     def reserve_gemini_request(self, account_id: str) -> GeminiRequestReservation:
         if self._read_only:
@@ -867,12 +1138,151 @@ class FleetService:
             entry.get("cooldown_until_utc") if isinstance(entry.get("cooldown_until_utc"), str) else None,
             in_flight_until if isinstance(in_flight_until, str) else None,
         )
+        defer_until = self._latest_deadline(
+            now,
+            entry.get("next_allowed_at_utc") if isinstance(entry.get("next_allowed_at_utc"), str) else None,
+            entry.get("cooldown_until_utc") if isinstance(entry.get("cooldown_until_utc"), str) else None,
+            in_flight_until if isinstance(in_flight_until, str) else None,
+        )
         return {
             "allowed": retry_after == 0,
             "reason": "ready" if retry_after == 0 else "gemini_local_rate_limit",
             "retry_after_seconds": retry_after,
+            "defer_until": defer_until,
             **self.gemini_quota_profile(account_id),
         }
+
+    @staticmethod
+    def _gate_decision(
+        action: str,
+        code: str,
+        *,
+        account_id: str | None,
+        model: str | None,
+        defer_until: str | None = None,
+        target_agent_id: str | None = None,
+        openai_fallback_reason: str | None = None,
+    ) -> GeminiGateDecision:
+        code = map_gemini_gate_code(code)
+        diagnostic = GEMINI_GATE_DIAGNOSTICS[code]
+        return GeminiGateDecision(
+            action,
+            code,
+            str(diagnostic["reason"]),
+            str(diagnostic["severity"]),
+            bool(diagnostic["retryable"]),
+            account_id,
+            model,
+            defer_until,
+            target_agent_id,
+            openai_fallback_reason,
+        )
+
+    def _gemini_agent_gate_code(
+        self,
+        agent: object,
+        *,
+        snapshot: FleetSnapshot | FleetSnapshotV2,
+        inventory: InventorySnapshot,
+    ) -> tuple[str, str | None]:
+        agent_id = getattr(agent, "agent_id", None)
+        account_id = getattr(agent, "account_id", None)
+        model = getattr(agent, "model", None)
+        if not isinstance(agent_id, str) or not isinstance(account_id, str) or not isinstance(model, str):
+            return "gemini_gate_unknown", None
+        account_gate = self.account_gate(agent_id, snapshot=snapshot, inventory=inventory)
+        if not account_gate.allowed:
+            account = next((item for item in snapshot.accounts if item.account_id == account_id), None)
+            reset_at = account.reset_at_utc if account is not None else None
+            return map_gemini_gate_code(account_gate.reason), reset_at
+        rate = self.gemini_rate_status(account_id)
+        if rate["allowed"] is not True:
+            return "gemini_local_rate_limited", rate.get("defer_until") if isinstance(rate.get("defer_until"), str) else None
+        usage = self.gemini_usage_status(account_id, model=model)
+        evaluation = usage.get("quota_evaluation")
+        if not isinstance(evaluation, Mapping):
+            return "gemini_limits_unknown", None
+        observed = evaluation.get("observed")
+        limits = evaluation.get("limits")
+        resets = evaluation.get("resets_at_utc")
+        if not isinstance(observed, Mapping) or not isinstance(limits, Mapping):
+            return "gemini_limits_unknown", None
+        for metric, code in (("rpm", "gemini_rpm_exhausted"), ("tpm", "gemini_tpm_exhausted"), ("rpd", "gemini_rpd_exhausted")):
+            value = observed.get(metric)
+            limit = limits.get(metric)
+            if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+                if isinstance(value, int) and not isinstance(value, bool) and value >= limit:
+                    reset_at = resets.get(metric) if isinstance(resets, Mapping) else None
+                    return code, reset_at if isinstance(reset_at, str) else None
+            else:
+                return "gemini_limits_unknown", None
+        return "gemini_ready", None
+
+    def gemini_headless_gate(self, agent_id: str) -> GeminiGateDecision:
+        """Decide one Gemini headless start before secret or process access."""
+
+        snapshot = self.load()
+        inventory = build_inventory(snapshot, self._pool_root)
+        agent = inventory.agents.get(agent_id)
+        if agent is None or agent.provider is not Provider.GEMINI_API:
+            return self._gate_decision("reject", "gemini_account_unavailable", account_id=None, model=None)
+        code, defer_until = self._gemini_agent_gate_code(agent, snapshot=snapshot, inventory=inventory)
+        if code in {"gemini_ready", "gemini_limits_unknown"}:
+            return self._gate_decision("allow", code, account_id=agent.account_id, model=agent.model)
+
+        ready_candidates: dict[str, object] = {}
+        selection_candidates: list[SelectionCandidate] = []
+        for candidate in inventory.agents.values():
+            if candidate.agent_id == agent.agent_id or candidate.provider is not Provider.GEMINI_API or not candidate.enabled:
+                continue
+            candidate_code, _candidate_reset = self._gemini_agent_gate_code(
+                candidate, snapshot=snapshot, inventory=inventory,
+            )
+            if candidate_code not in {"gemini_ready", "gemini_limits_unknown"}:
+                continue
+            ready_candidates[candidate.agent_id] = candidate
+            selection_candidates.append(SelectionCandidate(
+                agent_id=candidate.agent_id,
+                account_key=candidate.account_id or candidate.agent_id,
+                model_id=candidate.model,
+                task_kind=TaskKind.COMPLEX,
+                model_role=ModelRole.PRIMARY,
+                rotation_distance=0 if candidate.account_id == agent.account_id else 1,
+            ))
+        rotation = preview_selection(
+            selection_candidates,
+            policy=SelectionPolicy(sp3=True),
+            now=self._rate_now(),
+            ledger=FairnessLedger({}),
+        )
+        if rotation.selected is not None:
+            candidate = ready_candidates[rotation.selected.agent_id]
+            action = "rotate_model" if candidate.account_id == agent.account_id else "rotate_account"
+            return self._gate_decision(
+                action,
+                code,
+                account_id=agent.account_id,
+                model=agent.model,
+                target_agent_id=candidate.agent_id,
+            )
+
+        fallback_available = any(
+            candidate.provider in {Provider.OPENAI_API, Provider.OPENAI_CHATGPT}
+            and self.account_gate(candidate.agent_id, snapshot=snapshot, inventory=inventory).allowed
+            for candidate in inventory.agents.values()
+        )
+        action = "defer_until" if defer_until is not None else "reject"
+        return self._gate_decision(
+            action,
+            code,
+            account_id=agent.account_id,
+            model=agent.model,
+            defer_until=defer_until,
+            openai_fallback_reason=(
+                "Gemini rotation exhausted; eligible OpenAI fallback may be selected."
+                if fallback_available else None
+            ),
+        )
 
     def release_gemini_request(
         self,
