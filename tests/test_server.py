@@ -5708,6 +5708,7 @@ class ServerHelpersTest(unittest.TestCase):
                     self.assertEqual(config["approval_policy"], "never")
                     self.assertEqual(config["sandbox_mode"], "danger-full-access")
                     self.assertEqual(config.get("model_provider"), model_provider)
+                    self.assertEqual(config["tui"], {"animations": False})
                     self.assertEqual(next(iter(config["projects"].values())), {"trust_level": "trusted"})
                     if provider is Provider.OLLAMA_LOCAL:
                         self.assertEqual(
@@ -5730,6 +5731,29 @@ class ServerHelpersTest(unittest.TestCase):
                         )
                     else:
                         self.assertNotIn("model_providers", config)
+
+            q_name, q_text = server_module.fleet_minimal_config(
+                AgentDescriptor(
+                    "q1", "q", 1, "Q 1", RunnerKind.CODEX_CLI,
+                    Provider.OPENAI_CHATGPT, "gpt-5.6-terra", None,
+                    root / "q1", "session-q1", True,
+                    skill_profile="teamleiterin",
+                )
+            )
+            q_config = tomllib.loads(q_text)
+            self.assertEqual(q_name, "config.toml")
+            self.assertEqual(
+                q_config["mcp_servers"][server_module.MCP_SERVER_NAME],
+                {
+                    "command": str(server_module.DEFAULT_INSTALL_PATH),
+                    "startup_timeout_sec": server_module.RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
+                },
+            )
+
+    def test_pool_minimal_config_disables_tui_animations(self) -> None:
+        config = tomllib.loads(server_module.pool_minimal_config(Path("/tmp/agent")))
+
+        self.assertEqual(config["tui"], {"animations": False})
 
     def test_fleet_gemini_materialization_is_recursive_private_and_exact(self) -> None:
         from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
@@ -24857,8 +24881,14 @@ class ServerHelpersTest(unittest.TestCase):
             registry.write_text(
                 json.dumps(
                     {
-                        "schema_version": 1,
-                        "principals": [server_module.teamleader_principal_digest(codex_home)],
+                        "schema_version": 2,
+                        "principals": [
+                            {
+                                "digest": server_module.teamleader_principal_digest(codex_home),
+                                "class": "koenigin",
+                                "agent_id": None,
+                            }
+                        ],
                     }
                 )
                 + "\n",

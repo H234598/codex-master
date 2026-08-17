@@ -453,9 +453,58 @@ MAX_PLUGIN_CACHE_RETAINED_VERSIONS = 5
 MAX_SELECTOR_POLICY_BYTES = 4096
 MAX_TEAMLEADER_REGISTRY_BYTES = 16 * 1024
 MAX_TEAMLEADER_PRINCIPALS = 64
-TEAMLEADER_REGISTRY_SCHEMA_VERSION = 1
+TEAMLEADER_REGISTRY_SCHEMA_VERSION = 2
 TEAMLEADER_PRINCIPAL_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_TEAMLEADER_ANCESTORS = 32
+HIVE_PRINCIPAL_CLASSES = frozenset({"koenigin", "teamleiterin"})
+TEAMLEADER_TOOL_NAMES = frozenset(
+    {
+        "agent_spawn_offers",
+        "agent_start",
+        "agent_status",
+        "agent_lease_status",
+        "agent_claim",
+        "agent_release",
+        "agent_wait",
+        "agent_send",
+        "agent_interrupt",
+        "agent_stop",
+        "agent_safe_tail",
+        "agent_skills",
+        "agent_skill_match",
+        "agent_capabilities",
+        "agent_scope_check",
+        "agent_selection_options",
+        "agent_routing_decision",
+        "agent_assign",
+        "agent_assign_readonly",
+        "agent_assign_live_data",
+        "agent_assign_write",
+        "agent_assignments",
+        "agent_last_assignment_status",
+        "agent_report_request",
+        "agent_assignment_report",
+        "agent_selector_preview",
+        "agent_selection_preview",
+        "worktree_create_for_agent",
+        "worktree_status",
+        "integration_status",
+        "commit_ready_check",
+        "master_namespace_status",
+        "master_watchdog_status",
+        "master_timeout_policy",
+        "agent_doctor",
+        "fleet_overview",
+        "fleet_status_compact",
+        "hive_status",
+        "hive_dispatch_status",
+        "hive_queue_status",
+        "hive_decisions",
+        "hive_authority_check",
+        "hive_admission_status",
+        "agent_selection_status",
+    }
+)
 MAX_PAGED_OFFSET = 10_000_000
 PLUGIN_CACHE_ALLOWED_FILES = (
     ".app.json", ".mcp.json", "README.md", "codex-agent-pool.json", "codex-agent-classes.json",
@@ -2095,7 +2144,7 @@ def teamleader_principal_digest(codex_home: Path) -> str:
     return hashlib.sha256(material).hexdigest()
 
 
-def _decode_teamleader_registry(text: str) -> set[str]:
+def _decode_hive_principal_registry(text: str) -> dict[str, dict[str, str | None]]:
     try:
         payload = json.loads(text)
     except (json.JSONDecodeError, RecursionError) as exc:
@@ -2103,23 +2152,54 @@ def _decode_teamleader_registry(text: str) -> set[str]:
     if not isinstance(payload, dict) or set(payload) != {"schema_version", "principals"}:
         raise AgentError("teamleader registry is unavailable")
     principals = payload.get("principals")
-    if payload.get("schema_version") != TEAMLEADER_REGISTRY_SCHEMA_VERSION or not isinstance(principals, list):
+    if not isinstance(principals, list) or len(principals) > MAX_TEAMLEADER_PRINCIPALS:
         raise AgentError("teamleader registry is unavailable")
-    if len(principals) > MAX_TEAMLEADER_PRINCIPALS:
+
+    if payload.get("schema_version") == 1:
+        if any(not isinstance(item, str) or not TEAMLEADER_PRINCIPAL_RE.fullmatch(item) for item in principals):
+            raise AgentError("teamleader registry is unavailable")
+        if len(set(principals)) != len(principals):
+            raise AgentError("teamleader registry is unavailable")
+        return {
+            digest: {"class": "legacy", "agent_id": None}
+            for digest in principals
+        }
+
+    if payload.get("schema_version") != TEAMLEADER_REGISTRY_SCHEMA_VERSION:
         raise AgentError("teamleader registry is unavailable")
-    if any(not isinstance(item, str) or not TEAMLEADER_PRINCIPAL_RE.fullmatch(item) for item in principals):
-        raise AgentError("teamleader registry is unavailable")
-    if len(set(principals)) != len(principals):
-        raise AgentError("teamleader registry is unavailable")
-    return set(principals)
+    decoded: dict[str, dict[str, str | None]] = {}
+    for item in principals:
+        if not isinstance(item, dict) or set(item) != {"digest", "class", "agent_id"}:
+            raise AgentError("teamleader registry is unavailable")
+        digest = item.get("digest")
+        principal_class = item.get("class")
+        agent_id = item.get("agent_id")
+        if (
+            not isinstance(digest, str)
+            or not TEAMLEADER_PRINCIPAL_RE.fullmatch(digest)
+            or principal_class not in HIVE_PRINCIPAL_CLASSES
+            or digest in decoded
+        ):
+            raise AgentError("teamleader registry is unavailable")
+        if principal_class == "koenigin":
+            if agent_id is not None:
+                raise AgentError("teamleader registry is unavailable")
+        elif not isinstance(agent_id, str) or re.fullmatch(r"q[1-9][0-9]*", agent_id) is None:
+            raise AgentError("teamleader registry is unavailable")
+        decoded[digest] = {"class": principal_class, "agent_id": agent_id}
+    return decoded
 
 
-def _read_teamleader_principals_strict(*, missing_ok: bool) -> set[str]:
+def _decode_teamleader_registry(text: str) -> set[str]:
+    return set(_decode_hive_principal_registry(text))
+
+
+def _read_hive_principals_strict(*, missing_ok: bool) -> dict[str, dict[str, str | None]]:
     try:
         registry_stat = TEAMLEADER_REGISTRY_FILE.lstat()
     except FileNotFoundError:
         if missing_ok:
-            return set()
+            return {}
         raise AgentError("teamleader registry is unavailable")
     except OSError as exc:
         raise AgentError("teamleader registry is unavailable") from exc
@@ -2137,14 +2217,55 @@ def _read_teamleader_principals_strict(*, missing_ok: bool) -> set[str]:
         MAX_TEAMLEADER_REGISTRY_BYTES,
         "teamleader registry is unavailable",
     )
-    return _decode_teamleader_registry(text)
+    return _decode_hive_principal_registry(text)
+
+
+def _read_teamleader_principals_strict(*, missing_ok: bool) -> set[str]:
+    return set(_read_hive_principals_strict(missing_ok=missing_ok))
+
+
+def read_hive_principals() -> dict[str, dict[str, str | None]]:
+    try:
+        return _read_hive_principals_strict(missing_ok=True)
+    except AgentError:
+        return {}
 
 
 def read_teamleader_principals() -> set[str]:
-    try:
-        return _read_teamleader_principals_strict(missing_ok=True)
-    except AgentError:
-        return set()
+    return set(read_hive_principals())
+
+
+def _write_hive_principals(principals: Mapping[str, Mapping[str, str | None]]) -> None:
+    document = {
+        "schema_version": TEAMLEADER_REGISTRY_SCHEMA_VERSION,
+        "principals": [
+            {
+                "digest": digest,
+                "class": record["class"],
+                "agent_id": record["agent_id"],
+            }
+            for digest, record in sorted(principals.items())
+        ],
+    }
+    encoded = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(encoded) > MAX_TEAMLEADER_REGISTRY_BYTES:
+        raise AgentError("teamleader registry capacity reached")
+    ensure_private_dir(STATE_ROOT)
+    replace_private_bytes(TEAMLEADER_REGISTRY_FILE, encoded, mode=0o600)
+
+
+def _migrate_legacy_principals(
+    principals: Mapping[str, Mapping[str, str | None]],
+) -> dict[str, dict[str, str | None]]:
+    migrated = {
+        digest: {"class": record["class"], "agent_id": record["agent_id"]}
+        for digest, record in principals.items()
+        if record.get("class") in HIVE_PRINCIPAL_CLASSES
+    }
+    default_digest = teamleader_principal_digest(Path.home() / ".codex")
+    if principals.get(default_digest, {}).get("class") == "legacy":
+        migrated[default_digest] = {"class": "koenigin", "agent_id": None}
+    return migrated
 
 
 def enroll_current_teamleader() -> dict[str, Any]:
@@ -2162,25 +2283,69 @@ def enroll_current_teamleader() -> dict[str, Any]:
         or not directory_chain_is_real_no_symlink(codex_home)
     ):
         raise AgentError("teamleader CODEX_HOME is unavailable")
-    principals = _read_teamleader_principals_strict(missing_ok=True)
+    loaded_principals = _read_hive_principals_strict(missing_ok=True)
+    legacy_present = any(record.get("class") == "legacy" for record in loaded_principals.values())
+    principals = _migrate_legacy_principals(loaded_principals)
     digest = teamleader_principal_digest(codex_home)
-    changed = digest not in principals
+    expected = {"class": "koenigin", "agent_id": None}
+    changed = legacy_present or principals.get(digest) != expected
     if changed:
         if len(principals) >= MAX_TEAMLEADER_PRINCIPALS:
             raise AgentError("teamleader registry capacity reached")
-        principals.add(digest)
-        document = {
-            "schema_version": TEAMLEADER_REGISTRY_SCHEMA_VERSION,
-            "principals": sorted(principals),
-        }
-        encoded = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-        ensure_private_dir(STATE_ROOT)
-        replace_private_bytes(TEAMLEADER_REGISTRY_FILE, encoded, mode=0o600)
+        principals[digest] = expected
+        _write_hive_principals(principals)
     return {
         "authorized": True,
-        "role": "teamleader",
+        "role": "koenigin",
+        "principal_class": "koenigin",
         "changed": changed,
         "visible_tool_count": len(TOOLS),
+        "raw_output": "not_returned",
+    }
+
+
+def enroll_managed_principal(agent: str, principal_class: str) -> dict[str, Any]:
+    if principal_class != "teamleiterin":
+        raise AgentError("managed principal class is unsupported")
+    inventory = current_agent_inventory()
+    descriptor = inventory.agents.get(agent)
+    if (
+        descriptor is None
+        or descriptor.agent_id != agent
+        or descriptor.series_prefix != "q"
+        or descriptor.skill_profile != "teamleiterin"
+    ):
+        raise AgentError("managed teamleader identity is unavailable")
+    codex_home = normalized_compare_path(descriptor.home)
+    try:
+        home_stat = codex_home.lstat()
+    except OSError as exc:
+        raise AgentError("managed teamleader CODEX_HOME is unavailable") from exc
+    if (
+        not stat_module.S_ISDIR(home_stat.st_mode)
+        or stat_module.S_ISLNK(home_stat.st_mode)
+        or home_stat.st_uid != os.geteuid()
+        or stat_module.S_IMODE(home_stat.st_mode) != 0o700
+        or not directory_chain_is_real_no_symlink(codex_home)
+    ):
+        raise AgentError("managed teamleader CODEX_HOME is unavailable")
+    loaded_principals = _read_hive_principals_strict(missing_ok=True)
+    legacy_present = any(record.get("class") == "legacy" for record in loaded_principals.values())
+    principals = _migrate_legacy_principals(loaded_principals)
+    digest = teamleader_principal_digest(codex_home)
+    expected = {"class": principal_class, "agent_id": agent}
+    changed = legacy_present or principals.get(digest) != expected
+    if changed:
+        if digest not in principals and len(principals) >= MAX_TEAMLEADER_PRINCIPALS:
+            raise AgentError("teamleader registry capacity reached")
+        principals[digest] = expected
+        _write_hive_principals(principals)
+    return {
+        "authorized": True,
+        "role": principal_class,
+        "principal_class": principal_class,
+        "changed": changed,
+        "visible_tool_count": len(TEAMLEADER_TOOL_NAMES),
         "raw_output": "not_returned",
     }
 
@@ -2188,19 +2353,15 @@ def enroll_current_teamleader() -> dict[str, Any]:
 def revoke_current_teamleader() -> dict[str, Any]:
     assert_install_context_allows_master_registration()
     digest = teamleader_principal_digest(active_codex_home_path())
-    principals = _read_teamleader_principals_strict(missing_ok=True)
+    principals = _read_hive_principals_strict(missing_ok=True)
     changed = digest in principals
     if changed:
-        principals.remove(digest)
-        document = {
-            "schema_version": TEAMLEADER_REGISTRY_SCHEMA_VERSION,
-            "principals": sorted(principals),
-        }
-        encoded = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-        replace_private_bytes(TEAMLEADER_REGISTRY_FILE, encoded, mode=0o600)
+        principals.pop(digest)
+        _write_hive_principals(principals)
     return {
         "authorized": False,
         "role": "non_teamleader",
+        "principal_class": None,
         "changed": changed,
         "visible_tool_count": 0,
         "raw_output": "not_returned",
@@ -2249,15 +2410,32 @@ def managed_home_in_process_ancestry(
 
 def master_tool_access_status() -> dict[str, Any]:
     context = codex_home_context()
-    authorized = False
+    principal_class: str | None = None
     ancestry_managed = managed_home_in_process_ancestry()
-    if context["home_kind"] != "managed_agent_home" and ancestry_managed is False:
-        digest = teamleader_principal_digest(active_codex_home_path())
-        authorized = digest in read_teamleader_principals()
+    digest = teamleader_principal_digest(active_codex_home_path())
+    record = read_hive_principals().get(digest)
+    if record is not None:
+        if context["home_kind"] == "managed_agent_home":
+            matched_agent = context.get("matched_agent")
+            if (
+                record.get("class") == "teamleiterin"
+                and isinstance(matched_agent, str)
+                and record.get("agent_id") == matched_agent
+            ):
+                principal_class = "teamleiterin"
+        elif (
+            ancestry_managed is False
+            and record.get("class") == "koenigin"
+            and record.get("agent_id") is None
+        ):
+            principal_class = "koenigin"
+    authorized = principal_class is not None
+    visible_tool_count = len(allowed_tool_names_for_principal_class(principal_class)) if authorized else 0
     return {
         "authorized": authorized,
-        "role": "teamleader" if authorized else "non_teamleader",
-        "visible_tool_count": len(TOOLS) if authorized else 0,
+        "role": principal_class or "non_teamleader",
+        "principal_class": principal_class,
+        "visible_tool_count": visible_tool_count,
         "raw_output": "not_returned",
     }
 
@@ -2274,9 +2452,29 @@ def verified_principal_class(status: Mapping[str, Any]) -> str:
 
     if status.get("authorized") is not True:
         raise AgentError("verified principal is required")
-    if status.get("role") == "teamleader":
+    principal_class = status.get("principal_class")
+    if principal_class in HIVE_PRINCIPAL_CLASSES:
+        return str(principal_class)
+    if status.get("role") in {"teamleader", "teamleiterin"}:
         return "teamleiterin"
+    if status.get("role") == "koenigin":
+        return "koenigin"
     raise AgentError("verified principal role is unsupported")
+
+
+def allowed_tool_names_for_principal_class(principal_class: str | None) -> frozenset[str]:
+    if principal_class == "koenigin":
+        return frozenset(tool["name"] for tool in TOOLS)
+    if principal_class == "teamleiterin":
+        return TEAMLEADER_TOOL_NAMES
+    return frozenset()
+
+
+def require_principal_tool_access(name: str, status: Mapping[str, Any]) -> str:
+    principal_class = verified_principal_class(status)
+    if name not in allowed_tool_names_for_principal_class(principal_class):
+        raise AgentError(f"tool {name} is not allowed for {principal_class}")
+    return principal_class
 
 
 def normalize_agent_selector_text(agent: str) -> str:
@@ -8741,6 +8939,13 @@ def _start_agent_unlocked(
     g5_scope: PreparedAgentScope | None = None
     ensure_state()
     cfg = agent_config(agent)
+    descriptor = current_agent_inventory().agents.get(agent)
+    if (
+        agent_class == "teamleiterin"
+        and descriptor is not None
+        and descriptor.series_prefix == "q"
+    ):
+        enroll_managed_principal(agent, "teamleiterin")
     runner = cfg["runner"]
     session = cfg["session"]
     try:
@@ -18990,8 +19195,20 @@ def fleet_minimal_config(agent: AgentDescriptor) -> tuple[str, str]:
         )
     elif agent.provider is Provider.HUGGINGFACE_INFERENCE:
         lines.append('model_provider = "huggingface"')
+    if agent.series_prefix == "q" and agent.skill_profile == "teamleiterin":
+        lines.extend(
+            [
+                "",
+                f"[mcp_servers.{MCP_SERVER_NAME}]",
+                f"command = {json.dumps(str(DEFAULT_INSTALL_PATH))}",
+                f"startup_timeout_sec = {RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS}",
+            ]
+        )
     lines.extend(
         [
+            "",
+            "[tui]",
+            "animations = false",
             "",
             f"[projects.{json.dumps(str(agent.home))}]",
             'trust_level = "trusted"',
@@ -23215,6 +23432,9 @@ def pool_minimal_config(home: Path) -> str:
             'approval_policy = "never"',
             'sandbox_mode = "danger-full-access"',
             "",
+            "[tui]",
+            "animations = false",
+            "",
             f"[projects.{project_key}]",
             'trust_level = "trusted"',
             "",
@@ -26216,17 +26436,20 @@ def call_validated_tool(
 
 def call_teamleader_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     status = require_teamleader_tool_access()
+    principal_class = require_principal_tool_access(name, status)
     return call_validated_tool(
         name,
         args,
-        principal_class=verified_principal_class(status),
+        principal_class=principal_class,
     )
 
 
 def teamleader_tool_catalog() -> list[dict[str, Any]]:
-    require_teamleader_tool_access()
+    status = require_teamleader_tool_access()
+    allowed_names = allowed_tool_names_for_principal_class(verified_principal_class(status))
+    allowed_tools = [tool for tool in TOOLS if tool["name"] in allowed_names]
     try:
-        encoded = json.dumps(TOOLS, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        encoded = json.dumps(allowed_tools, ensure_ascii=True, separators=(",", ":")).encode("ascii")
     except (TypeError, ValueError, RecursionError, UnicodeError) as exc:
         raise AgentError("teamleader tool catalog is invalid") from exc
     if len(encoded) > MAX_TOOL_CATALOG_BYTES:
@@ -26355,12 +26578,16 @@ def handle_rpc(msg: dict[str, Any], *, enforce_master_role: bool = False) -> dic
             principal_class = None
             if enforce_master_role:
                 status = require_teamleader_tool_access()
-                principal_class = verified_principal_class(status)
             params = msg.get("params", {})
             if params is None:
                 params = {}
             if not isinstance(params, dict):
                 raise AgentError("tools/call params must be an object")
+            if enforce_master_role:
+                requested_name = params.get("name")
+                if not isinstance(requested_name, str):
+                    raise AgentError("tools/call requires a known tool name")
+                principal_class = require_principal_tool_access(requested_name, status)
             name, args = validate_tool_call(params.get("name"), params.get("arguments", {}))
             payload = (
                 call_tool(name, args, principal_class=principal_class)

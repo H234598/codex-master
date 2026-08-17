@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from codex_master import server
@@ -34,11 +35,42 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
 
                 self.assertTrue(enrolled["authorized"])
                 self.assertTrue(status["authorized"])
+                self.assertEqual(enrolled["role"], "koenigin")
+                self.assertEqual(status["principal_class"], "koenigin")
                 registry = server.TEAMLEADER_REGISTRY_FILE
                 self.assertEqual(stat.S_IMODE(registry.stat().st_mode), 0o600)
                 stored = registry.read_text(encoding="utf-8")
                 self.assertNotIn(str(codex_home), stored)
                 self.assertNotIn(str(home), stored)
+
+    def test_legacy_registry_migration_keeps_only_current_default_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            codex_home = home / ".codex"
+            codex_home.mkdir(parents=True)
+            current = server.teamleader_principal_digest(codex_home)
+            foreign = "f" * 64
+            state_patch, lock_patch, registry_patch = self._paths(root)
+            with state_patch, lock_patch, registry_patch, patch.dict(
+                os.environ, {"HOME": str(home)}, clear=False
+            ):
+                os.environ.pop("CODEX_HOME", None)
+                server.ensure_private_dir(server.STATE_ROOT)
+                server.TEAMLEADER_REGISTRY_FILE.write_text(
+                    json.dumps({"schema_version": 1, "principals": [current, foreign]}),
+                    encoding="utf-8",
+                )
+                server.TEAMLEADER_REGISTRY_FILE.chmod(0o600)
+
+                server.enroll_current_teamleader()
+                payload = json.loads(server.TEAMLEADER_REGISTRY_FILE.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(
+            payload["principals"],
+            [{"agent_id": None, "class": "koenigin", "digest": current}],
+        )
 
     def test_managed_agent_home_is_denied_even_if_digest_is_registered(self) -> None:
         managed_home = server.AGENTS["a1"]["home"]
@@ -51,6 +83,74 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
         self.assertFalse(status["authorized"])
         self.assertEqual(status["role"], "non_teamleader")
         self.assertEqual(status["visible_tool_count"], 0)
+
+    def test_class_bound_managed_teamleader_is_authorized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            managed_home = Path(tmp) / "q1"
+            managed_home.mkdir()
+            digest = server.teamleader_principal_digest(managed_home)
+            record = {"class": "teamleiterin", "agent_id": "q1"}
+            with patch.dict(os.environ, {"CODEX_HOME": str(managed_home)}, clear=False), patch(
+                "codex_master.server.codex_home_context",
+                return_value={"home_kind": "managed_agent_home", "matched_agent": "q1"},
+            ), patch(
+                "codex_master.server.read_hive_principals",
+                return_value={digest: record},
+            ), patch(
+                "codex_master.server.managed_home_in_process_ancestry",
+                return_value=True,
+            ):
+                status = server.master_tool_access_status()
+
+        self.assertTrue(status["authorized"])
+        self.assertEqual(status["role"], "teamleiterin")
+        self.assertEqual(status["principal_class"], "teamleiterin")
+        self.assertGreater(status["visible_tool_count"], 0)
+        self.assertLess(status["visible_tool_count"], len(server.TOOLS))
+
+    def test_queen_can_enroll_exact_managed_q_teamleader_without_storing_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            managed_home = root / "q1"
+            managed_home.mkdir(mode=0o700)
+            descriptor = SimpleNamespace(
+                agent_id="q1",
+                home=managed_home,
+                series_prefix="q",
+                skill_profile="teamleiterin",
+            )
+            state_patch, lock_patch, registry_patch = self._paths(root)
+            with state_patch, lock_patch, registry_patch, patch(
+                "codex_master.server.current_agent_inventory",
+                return_value=SimpleNamespace(agents={"q1": descriptor}),
+            ):
+                result = server.enroll_managed_principal("q1", "teamleiterin")
+                stored = server.TEAMLEADER_REGISTRY_FILE.read_text(encoding="utf-8")
+
+            self.assertTrue(result["authorized"])
+            self.assertEqual(result["principal_class"], "teamleiterin")
+            self.assertNotIn(str(managed_home), stored)
+            self.assertIn('"class":"teamleiterin"', stored)
+            self.assertIn('"agent_id":"q1"', stored)
+
+    def test_managed_worker_cannot_reuse_teamleader_attestation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            managed_home = Path(tmp) / "d1"
+            managed_home.mkdir()
+            digest = server.teamleader_principal_digest(managed_home)
+            with patch.dict(os.environ, {"CODEX_HOME": str(managed_home)}, clear=False), patch(
+                "codex_master.server.codex_home_context",
+                return_value={"home_kind": "managed_agent_home", "matched_agent": "d1"},
+            ), patch(
+                "codex_master.server.read_hive_principals",
+                return_value={digest: {"class": "teamleiterin", "agent_id": "q1"}},
+            ), patch(
+                "codex_master.server.managed_home_in_process_ancestry",
+                return_value=True,
+            ):
+                status = server.master_tool_access_status()
+
+        self.assertFalse(status["authorized"])
 
     def test_managed_ancestor_blocks_forged_main_home_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -94,8 +194,13 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
         self.assertIn("teamleader", called["result"]["content"][0]["text"])
         dispatch.assert_not_called()
 
-    def test_authorized_rpc_sees_exact_runtime_catalog(self) -> None:
-        allowed = {"authorized": True, "role": "teamleader", "visible_tool_count": len(server.TOOLS)}
+    def test_authorized_queen_rpc_sees_exact_runtime_catalog(self) -> None:
+        allowed = {
+            "authorized": True,
+            "role": "koenigin",
+            "principal_class": "koenigin",
+            "visible_tool_count": len(server.TOOLS),
+        }
         with patch("codex_master.server.master_tool_access_status", return_value=allowed):
             listed = server.handle_rpc(
                 {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
@@ -103,6 +208,53 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
             )
 
         self.assertEqual(listed["result"]["tools"], server.TOOLS)
+
+    def test_teamleader_rpc_catalog_hides_admin_and_credential_tools(self) -> None:
+        allowed = {
+            "authorized": True,
+            "role": "teamleiterin",
+            "principal_class": "teamleiterin",
+            "visible_tool_count": 1,
+        }
+        with patch("codex_master.server.master_tool_access_status", return_value=allowed):
+            listed = server.handle_rpc(
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                enforce_master_role=True,
+            )
+
+        names = {tool["name"] for tool in listed["result"]["tools"]}
+        self.assertIn("agent_assign_write", names)
+        self.assertIn("agent_selection_options", names)
+        self.assertNotIn("fleet_account_set_secret", names)
+        self.assertNotIn("fleet_series_delete", names)
+        self.assertNotIn("agent_pool_destroy_pool", names)
+
+    def test_teamleader_cached_admin_call_is_rejected_before_dispatch(self) -> None:
+        allowed = {
+            "authorized": True,
+            "role": "teamleiterin",
+            "principal_class": "teamleiterin",
+            "visible_tool_count": 1,
+        }
+        with patch("codex_master.server.master_tool_access_status", return_value=allowed), patch(
+            "codex_master.server.call_tool"
+        ) as dispatch:
+            called = server.handle_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "fleet_account_delete",
+                        "arguments": {"account_id": "x", "expected_generation": 1},
+                    },
+                },
+                enforce_master_role=True,
+            )
+
+        self.assertTrue(called["result"]["isError"])
+        self.assertIn("not allowed", called["result"]["content"][0]["text"])
+        dispatch.assert_not_called()
 
     def test_internal_teamleader_dispatch_rechecks_role_before_validation(self) -> None:
         with patch("codex_master.server.require_teamleader_tool_access", side_effect=server.AgentError("denied")), patch(
@@ -113,7 +265,12 @@ class TeamleaderAuthorizationTest(unittest.TestCase):
         dispatch.assert_not_called()
 
     def test_authorized_catalog_is_detached_from_runtime_definition(self) -> None:
-        with patch("codex_master.server.require_teamleader_tool_access"):
+        allowed = {
+            "authorized": True,
+            "role": "teamleiterin",
+            "principal_class": "teamleiterin",
+        }
+        with patch("codex_master.server.require_teamleader_tool_access", return_value=allowed):
             catalog = server.teamleader_tool_catalog()
         catalog[0]["name"] = "changed"
         self.assertNotEqual(server.TOOLS[0]["name"], "changed")
