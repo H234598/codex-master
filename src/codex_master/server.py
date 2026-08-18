@@ -4834,22 +4834,33 @@ def _native_agent_normalize_registry(payload: dict[str, Any]) -> dict[str, Any]:
             created_at = _normalize_native_agent_timestamp(candidate.get("created_at"))
             parent_session_id = candidate.get("parent_session_id")
             managed_session = candidate.get("managed_session")
+            agent = candidate.get("agent")
+            assignment_id = candidate.get("assignment_id")
             if (
                 not _validate_native_agent_identifier(reservation_id, NATIVE_AGENT_ID_RE)
-                or kind not in {"native_spawn", "managed_replacement"}
+                or kind not in {"native_spawn", "managed_replacement", "headless_inflight"}
                 or created_at is None
-                or now - created_at > NATIVE_AGENT_RESERVATION_TTL_SECONDS
             ):
+                continue
+            if kind in {"native_spawn", "managed_replacement"} and now - created_at > NATIVE_AGENT_RESERVATION_TTL_SECONDS:
                 continue
             row = {"reservation_id": reservation_id, "kind": kind, "created_at": created_at}
             if kind == "native_spawn":
                 if not _validate_native_agent_identifier(parent_session_id, NATIVE_AGENT_ID_RE):
                     continue
                 row["parent_session_id"] = parent_session_id
-            elif not _validate_native_agent_identifier(managed_session, NATIVE_AGENT_ID_RE):
-                continue
-            else:
+            elif kind == "managed_replacement":
+                if not _validate_native_agent_identifier(managed_session, NATIVE_AGENT_ID_RE):
+                    continue
                 row["managed_session"] = managed_session
+            elif kind == "headless_inflight":
+                if (
+                    not _validate_native_agent_identifier(agent, NATIVE_AGENT_ID_RE)
+                    or not _validate_native_agent_identifier(assignment_id, NATIVE_AGENT_ID_RE)
+                ):
+                    continue
+                row["agent"] = agent
+                row["assignment_id"] = assignment_id
             reservations.append(row)
     return {
         "schema_version": 2,
@@ -4885,9 +4896,12 @@ def _read_native_agent_registry() -> tuple[dict[str, Any], str]:
             and isinstance(loaded.get("reservations"), list)
             and all(
                 isinstance(row, dict)
-                and row.get("kind") in {"native_spawn", "managed_replacement"}
+                and row.get("kind") in {"native_spawn", "managed_replacement", "headless_inflight"}
                 and isinstance(row.get("created_at"), (int, float))
-                and time.time() - row["created_at"] > NATIVE_AGENT_RESERVATION_TTL_SECONDS
+                and (
+                    row.get("kind") == "headless_inflight"
+                    or time.time() - row["created_at"] > NATIVE_AGENT_RESERVATION_TTL_SECONDS
+                )
                 for row in loaded["reservations"]
             )
         )
@@ -5485,12 +5499,18 @@ def _fresh_native_reservation_count(
                 1
                 for row in registry.get("reservations", [])
                 if isinstance(row, dict)
-                and (
-                    row.get("kind") == "native_spawn"
-                    or (row.get("kind") == "managed_replacement" and row.get("managed_session") not in managed_ids)
-                )
                 and isinstance(row.get("created_at"), (int, float))
-                and 0 <= timestamp - row["created_at"] <= NATIVE_AGENT_RESERVATION_TTL_SECONDS
+                and (
+                    row.get("kind") == "headless_inflight"
+                    or (
+                        row.get("kind") in {"native_spawn", "managed_replacement"}
+                        and (
+                            row.get("kind") == "native_spawn"
+                            or row.get("managed_session") not in managed_ids
+                        )
+                        and 0 <= timestamp - row["created_at"] <= NATIVE_AGENT_RESERVATION_TTL_SECONDS
+                    )
+                )
             )
     except (AgentError, OSError, TypeError, ValueError):
         return None
@@ -5575,6 +5595,71 @@ def reserve_managed_replacement(managed_session: Any) -> dict[str, Any]:
             reservations.append(reservation)
             _write_native_agent_registry(registry)
             return {"allowed": True, "reservation_id": reservation["reservation_id"]}
+
+
+def reserve_headless_inflight(agent: Any, assignment_id: Any) -> dict[str, Any] | None:
+    if not _validate_native_agent_identifier(agent, NATIVE_AGENT_ID_RE) or not _validate_native_agent_identifier(
+        assignment_id, NATIVE_AGENT_ID_RE
+    ):
+        return None
+    timestamp = time.time()
+    with spawn_admission_lock():
+        with native_agent_registry_lock():
+            registry, state = _read_native_agent_registry()
+            if state != "ready":
+                return None
+            reservations = registry.setdefault("reservations", [])
+            for row in reservations:
+                if (
+                    isinstance(row, dict)
+                    and row.get("kind") == "headless_inflight"
+                    and row.get("agent") == agent
+                    and row.get("assignment_id") == assignment_id
+                ):
+                    return {
+                        "kind": "headless_inflight",
+                        "reservation_id": row["reservation_id"],
+                        "agent": row["agent"],
+                        "assignment_id": row["assignment_id"],
+                        "created_at": row["created_at"],
+                    }
+            reservation_id = uuid.uuid4().hex
+            reservation = {
+                "kind": "headless_inflight",
+                "reservation_id": reservation_id,
+                "agent": agent,
+                "assignment_id": assignment_id,
+                "created_at": timestamp,
+            }
+            reservations.append(reservation)
+            _write_native_agent_registry(registry)
+            return reservation
+
+
+def release_headless_inflight(reservation_id: Any, agent: Any, assignment_id: Any) -> dict[str, Any] | None:
+    if not _validate_native_agent_identifier(reservation_id, NATIVE_AGENT_ID_RE) or not _validate_native_agent_identifier(
+        agent, NATIVE_AGENT_ID_RE
+    ) or not _validate_native_agent_identifier(assignment_id, NATIVE_AGENT_ID_RE):
+        return None
+    with spawn_admission_lock():
+        with native_agent_registry_lock():
+            registry, state = _read_native_agent_registry()
+            if state != "ready":
+                return None
+            reservations = registry.setdefault("reservations", [])
+            for index, row in enumerate(reservations):
+                if (
+                    isinstance(row, dict)
+                    and row.get("kind") == "headless_inflight"
+                    and row.get("reservation_id") == reservation_id
+                    and row.get("agent") == agent
+                    and row.get("assignment_id") == assignment_id
+                ):
+                    removed = dict(row)
+                    reservations.pop(index)
+                    _write_native_agent_registry(registry)
+                    return removed
+    return None
 
 
 def require_managed_replacement_reservation(
@@ -9376,7 +9461,6 @@ def _headless_admission_gate(
     probed_accounts: set[str] | None = None,
 ) -> Any:
     """Return a usable gate, probing one stale project only when needed."""
-
     service = current_fleet_service()
     try:
         gate = service.account_gate(agent, inventory=inventory)
@@ -9569,12 +9653,22 @@ def cancel_headless_job(agent: str, force: bool = False) -> dict[str, Any]:
                     "backend": "headless_job",
                     "raw_output": "not_returned",
                 }
-            marker.update({"state": "cancelled" if recovery == "stopped" else "failed"})
+            is_recovered = recovery in {"stopped", "already_gone"}
+            if is_recovered:
+                released: dict[str, Any] | None = None
+                reservation_id = marker.get("headless_inflight_reservation_id")
+                assignment_id = marker.get("assignment_id")
+                if isinstance(reservation_id, str) and isinstance(assignment_id, str):
+                    with contextlib.suppress(Exception):
+                        released = release_headless_inflight(reservation_id, agent, assignment_id)
+                    if isinstance(released, dict):
+                        marker.pop("headless_inflight_reservation_id", None)
+            marker.update({"state": "cancelled" if is_recovered else "failed"})
             marker.pop("process", None)
             _write_headless_marker(agent, marker)
             result = {
                 "agent": agent,
-                "status": "cancelled" if recovery == "stopped" else "not_running",
+                "status": "cancelled" if is_recovered else "not_running",
                 "running": False,
                 "recovery": recovery,
                 "raw_output": "not_returned",
@@ -9654,9 +9748,52 @@ def _run_headless_process(
     assignment_id: str | None = None,
     release_lease_on_completion: bool = True,
     reservation: object | None = None,
+    headless_inflight_reservation: object | None = None,
     structured_gate: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    service = current_fleet_service()
+    headless_inflight_reservation_id = (
+        headless_inflight_reservation.get("reservation_id")
+        if isinstance(headless_inflight_reservation, Mapping)
+        else None
+    )
+    release_bound_headless_inflight_called = False
+    terminal: str | None = None
+
+    def release_bound_headless_inflight() -> None:
+        nonlocal release_bound_headless_inflight_called
+        if release_bound_headless_inflight_called:
+            return
+        if not isinstance(headless_inflight_reservation_id, str):
+            return
+        release_bound_headless_inflight_called = True
+        released: dict[str, Any] | None = None
+        marker: dict[str, Any] | None = None
+        with contextlib.suppress(Exception):
+            marker_value = _headless_marker(agent)
+            if isinstance(marker_value, dict):
+                marker = marker_value
+        with contextlib.suppress(Exception):
+            released = release_headless_inflight(
+                headless_inflight_reservation_id,
+                agent,
+                assignment_id,
+            )
+        if (
+            isinstance(released, dict)
+            and marker is not None
+            and isinstance(marker.get("assignment_id"), str)
+            and marker.get("assignment_id") == assignment_id
+            and marker.get("headless_inflight_reservation_id") == headless_inflight_reservation_id
+        ):
+            marker.pop("headless_inflight_reservation_id", None)
+            with contextlib.suppress(Exception):
+                _write_headless_marker(agent, marker)
+
+    try:
+        service = current_fleet_service()
+    except Exception:
+        release_bound_headless_inflight()
+        raise
     try:
         descriptor = _headless_descriptor(agent)
         if descriptor is None:
@@ -9672,6 +9809,7 @@ def _run_headless_process(
         if marker.get("state") not in {"ready", "running"}:
             raise AgentError("headless_slot_not_ready")
     except Exception:
+        release_bound_headless_inflight()
         if reservation is not None:
             with contextlib.suppress(Exception):
                 service.release_gemini_request(reservation, outcome="provider_error")
@@ -9712,6 +9850,7 @@ def _run_headless_process(
         if reservation is not None:
             with contextlib.suppress(Exception):
                 service.release_gemini_request(reservation, outcome="provider_error")
+        release_bound_headless_inflight()
         if release_lease_on_completion:
             with contextlib.suppress(Exception):
                 release_agent(agent, force=True)
@@ -9727,6 +9866,7 @@ def _run_headless_process(
     gate_action = structured_gate.get("action")
     gate_code = structured_gate.get("diagnostic_code")
     if not isinstance(gate_action, str) or not isinstance(gate_code, str):
+        release_bound_headless_inflight()
         if reservation is not None:
             with contextlib.suppress(Exception):
                 service.release_gemini_request(reservation, outcome="provider_error")
@@ -9768,6 +9908,7 @@ def _run_headless_process(
         argv.append("--approval-mode=plan" if role == "exploriererin" else "--approval-mode=auto_edit")
         assignment_id = assignment_id or f"{now_id()}-{agent}"
     except Exception:
+        release_bound_headless_inflight()
         if reservation is not None:
             with contextlib.suppress(Exception):
                 service.release_gemini_request(reservation, outcome="provider_error")
@@ -9784,38 +9925,42 @@ def _run_headless_process(
     rate_reset_at_utc: str | None = None
     secret = ""
     try:
-        if reservation is None and gate.account_id is not None:
-            reservation = service.reserve_gemini_request(gate.account_id)
-        secret = service.read_secret(gate.account_id, expected_generation=gate.generation)
-        child_env[plan.secret_env_name] = secret
         try:
-            popen_env = dict(child_env)
-            process = subprocess.Popen(
-                tuple(argv),
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=popen_env,
-                cwd=descriptor.home,
-                shell=False,
-                start_new_session=True,
-            )
-        except (OSError, ValueError) as exc:
-            raise AgentError("headless_start_failed") from exc
+            if reservation is None and gate.account_id is not None:
+                reservation = service.reserve_gemini_request(gate.account_id)
+            secret = service.read_secret(gate.account_id, expected_generation=gate.generation)
+            child_env[plan.secret_env_name] = secret
+            try:
+                popen_env = dict(child_env)
+                process = subprocess.Popen(
+                    tuple(argv),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=popen_env,
+                    cwd=descriptor.home,
+                    shell=False,
+                    start_new_session=True,
+                )
+            except (OSError, ValueError) as exc:
+                raise AgentError("headless_start_failed") from exc
+        except Exception:
+            release_bound_headless_inflight()
+            raise
         job = HeadlessJob(agent, assignment_id, process, time.monotonic(), gate.generation)
         HEADLESS_JOBS.register(job)
-        _write_headless_marker(
-            agent,
-            {
-                "agent": agent,
-                "backend": "headless_job",
-                "state": "running",
-                "assignment_id": assignment_id,
-                "generation": gate.generation,
-                "process": _headless_job_identity(process, descriptor.home),
-                "started_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-            },
-        )
+        running_marker = {
+            "agent": agent,
+            "backend": "headless_job",
+            "state": "running",
+            "assignment_id": assignment_id,
+            "generation": gate.generation,
+            "process": _headless_job_identity(process, descriptor.home),
+            "started_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        }
+        if isinstance(headless_inflight_reservation_id, str):
+            running_marker["headless_inflight_reservation_id"] = headless_inflight_reservation_id
+        _write_headless_marker(agent, running_marker)
         child_env.pop(plan.secret_env_name, None)
         popen_env.clear()
         popen_env = None
@@ -9831,14 +9976,22 @@ def _run_headless_process(
         try:
             parsed = parse_gemini_jsonl(result.stdout.decode("utf-8").splitlines())
         except (FleetRunnerError, UnicodeDecodeError) as exc:
-            _write_headless_marker(agent, {
-                "agent": agent,
-                "backend": "headless_job",
-                "state": "failed",
-                "assignment_id": assignment_id,
-                "generation": gate.generation,
-                "error": "invalid_headless_output",
-            })
+            _write_headless_marker(
+                agent,
+                {
+                    "agent": agent,
+                    "backend": "headless_job",
+                    "state": "failed",
+                    "assignment_id": assignment_id,
+                    "generation": gate.generation,
+                    "error": "invalid_headless_output",
+                    **(
+                        {"headless_inflight_reservation_id": headless_inflight_reservation_id}
+                        if isinstance(headless_inflight_reservation_id, str)
+                        else {}
+                    ),
+                },
+            )
             raise AgentError("invalid_headless_output") from exc
         if parsed.error is not None and parsed.error.kind == "account_limited":
             rate_outcome = "rate_limited"
@@ -9864,7 +10017,7 @@ def _run_headless_process(
             if parsed.error is not None and parsed.error.kind == "account_limited"
             else terminal
         )
-        _write_headless_marker(agent, {
+        terminal_marker = {
             "agent": agent,
             "backend": "headless_job",
             "state": terminal,
@@ -9873,7 +10026,10 @@ def _run_headless_process(
             "returncode": result.returncode,
             "stdout_truncated": result.stdout_truncated,
             "stderr_truncated": result.stderr_truncated,
-        })
+        }
+        if isinstance(headless_inflight_reservation_id, str):
+            terminal_marker["headless_inflight_reservation_id"] = headless_inflight_reservation_id
+        _write_headless_marker(agent, terminal_marker)
         with contextlib.suppress(Exception):
             service.record_gemini_usage(
                 gate.account_id,
@@ -9927,6 +10083,8 @@ def _run_headless_process(
         }
     except Exception as exc:
         usage_status = "rate_limited" if isinstance(exc, FleetRateLimitError) else "failed"
+        if isinstance(exc, FleetRateLimitError):
+            release_bound_headless_inflight()
         with contextlib.suppress(Exception):
             service.record_gemini_usage(
                 gate.account_id,
@@ -9969,7 +10127,9 @@ def _run_headless_process(
                 )
         if job is not None and result is not None:
             HEADLESS_JOBS.finish(job, result)
+            release_bound_headless_inflight()
         if job is not None and result is None:
+            process_returncode: int | None = None
             with contextlib.suppress(Exception):
                 HEADLESS_JOBS.request_cancel(agent, force=True)
             if process is not None:
@@ -9977,22 +10137,37 @@ def _run_headless_process(
                 if callable(wait):
                     with contextlib.suppress(Exception):
                         try:
-                            wait(timeout=5)
+                            process_returncode = wait(timeout=5)
                         except TypeError:
-                            wait()
-            if job is not None:
-                returncode = getattr(process, "returncode", None)
-                if not isinstance(returncode, int) or isinstance(returncode, bool):
+                            with contextlib.suppress(Exception):
+                                process_returncode = wait()
+                if not isinstance(process_returncode, int) or isinstance(process_returncode, bool):
                     poll = getattr(process, "poll", None)
-                    returncode = poll() if callable(poll) else 1
-                if not isinstance(returncode, int) or isinstance(returncode, bool):
-                    returncode = 1
-                HEADLESS_JOBS.finish(
-                    job,
-                    HeadlessProcessResult(
-                        returncode, b"", b"", False, False, False, True,
-                    ),
-                )
+                    if callable(poll):
+                        with contextlib.suppress(Exception):
+                            process_returncode = poll()
+                if isinstance(process_returncode, int) and not isinstance(process_returncode, bool):
+                    terminal = "completed" if process_returncode == 0 else "failed"
+                    HEADLESS_JOBS.finish(
+                        job,
+                        HeadlessProcessResult(
+                            process_returncode, b"", b"", False, False, False, True,
+                        ),
+                    )
+                    _write_headless_marker(agent, {
+                        "agent": agent,
+                        "backend": "headless_job",
+                        "state": terminal,
+                        "assignment_id": assignment_id,
+                        "generation": gate.generation,
+                        "returncode": process_returncode,
+                        "stdout_truncated": False,
+                        "stderr_truncated": False,
+                        **({
+                            "headless_inflight_reservation_id": headless_inflight_reservation_id
+                        } if isinstance(headless_inflight_reservation_id, str) else {}),
+                    })
+                    release_bound_headless_inflight()
         if release_lease_on_completion:
             with contextlib.suppress(Exception):
                 current_lease = agent_lease_status(agent)
@@ -10143,58 +10318,80 @@ def _assign_headless_agent(
     account_id = gate.get("account_id")
     if not isinstance(account_id, str) or account_id != getattr(descriptor, "account_id", None):
         raise AgentError("headless_gate_binding_changed")
-    service = current_fleet_service()
-    reservation = service.reserve_gemini_request(account_id)
+    assignment_id = f"{now_id()}-{agent}"
+    with spawn_admission_lock():
+        require_spawn_capacity(1, agent=agent, task=task, role=role)
+        headless_inflight_reservation = reserve_headless_inflight(agent, assignment_id)
+        if headless_inflight_reservation is None:
+            raise AgentCapacityError(
+                "capacity unavailable",
+                {
+                    "error_code": "spawn_capacity_unavailable",
+                    "retryable": True,
+                    "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS,
+                    "reason_codes": ["session_metrics_unavailable"],
+                    "errors": spawn_error_details(["session_metrics_unavailable"]),
+                },
+            )
+    headless_inflight_reservation_id = (
+        headless_inflight_reservation.get("reservation_id")
+        if isinstance(headless_inflight_reservation, Mapping)
+        else None
+    )
+
+    def release_headless_inflight_claim() -> None:
+        if not isinstance(headless_inflight_reservation_id, str):
+            return
+        with contextlib.suppress(Exception):
+            release_headless_inflight(headless_inflight_reservation_id, agent, assignment_id)
+
+    release_on_completion = False
     try:
         with agent_lifecycle_lock(agent):
             claim = _claim_agent_unlocked(agent)
             lease = claim["lease"]
             release_on_completion = claim["status"] in {"claimed", "claimed_expired"}
-            assignment_id = f"{now_id()}-{agent}"
-            try:
-                record_assignment({
-                    "assignment_id": assignment_id,
-                    "created_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-                    "agent": agent,
-                    "role": role,
-                    "name": name or default_agentin_name(agent),
-                    "model": descriptor.model,
-                    "group_id": group_id,
-                    "job_id": job_id,
-                    "skill": {"requested": skill, "available": bool(matches) if skill else None,
-                              "match_count": len(matches)},
-                    "scope": redact_list(scope),
-                    "write_paths": redact_list(write_paths),
-                    "context_count": len(context),
-                    "forbidden_count": len(forbidden),
-                    "write_policy": "read_only" if role == "exploriererin" else "explicit_paths_only",
-                    "allow_subagents": allow_subagents,
-                    "requires_search": requires_search,
-                    "live_data": {"required": requires_search, "topic_state": "set" if live_data_topic else "task",
-                                  "raw_output": "not_returned"},
-                    "lease": lease,
-                    "submitted": enter,
-                    "prompt_chars": len(prompt),
-                    "prompt_output": "not_returned",
-                    "response_output": "not_returned",
-                })
-                marker = _headless_marker(agent)
-                marker.update({"state": "ready", "assignment_id": assignment_id})
-                _write_headless_marker(agent, marker)
-            except Exception:
-                if release_on_completion:
-                    release_start_lease_if_safe(agent, lease, True)
-                raise
+            record_assignment({
+                "assignment_id": assignment_id,
+                "created_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                "agent": agent,
+                "role": role,
+                "name": name or default_agentin_name(agent),
+                "model": descriptor.model,
+                "group_id": group_id,
+                "job_id": job_id,
+                "skill": {"requested": skill, "available": bool(matches) if skill else None,
+                          "match_count": len(matches)},
+                "scope": redact_list(scope),
+                "write_paths": redact_list(write_paths),
+                "context_count": len(context),
+                "forbidden_count": len(forbidden),
+                "write_policy": "read_only" if role == "exploriererin" else "explicit_paths_only",
+                "allow_subagents": allow_subagents,
+                "requires_search": requires_search,
+                "live_data": {"required": requires_search, "topic_state": "set" if live_data_topic else "task",
+                              "raw_output": "not_returned"},
+                "lease": lease,
+                "submitted": enter,
+                "prompt_chars": len(prompt),
+                "prompt_output": "not_returned",
+                "response_output": "not_returned",
+            })
+            marker = _headless_marker(agent)
+            marker.update({"state": "ready", "assignment_id": assignment_id})
+            _write_headless_marker(agent, marker)
     except Exception:
-        with contextlib.suppress(Exception):
-            service.release_gemini_request(reservation, outcome="provider_error")
+        release_headless_inflight_claim()
+        if release_on_completion:
+            with contextlib.suppress(Exception):
+                release_start_lease_if_safe(agent, lease, True)
         raise
     try:
         result = _run_headless_process(
             agent, prompt, lease, timeout_seconds,
             role=role, assignment_id=assignment_id,
+            headless_inflight_reservation=headless_inflight_reservation,
             release_lease_on_completion=release_on_completion,
-            reservation=reservation,
             structured_gate=gate,
         )
     except FleetRateLimitError as exc:
@@ -10453,7 +10650,7 @@ def _stop_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]:
                 "raw_output": "not_returned",
             }
         marker = _headless_marker(agent)
-        if marker.get("state") == "running":
+        if marker.get("state") in {"running", "cancelling"}:
             if not force:
                 return {
                     "agent": agent,
@@ -10471,6 +10668,15 @@ def _stop_agent_unlocked(agent: str, force: bool = False) -> dict[str, Any]:
                     "lease": agent_lease_status(agent),
                     "raw_output": "not_returned",
                 }
+            if recovery in {"stopped", "already_gone"}:
+                released: dict[str, Any] | None = None
+                reservation_id = marker.get("headless_inflight_reservation_id")
+                assignment_id = marker.get("assignment_id")
+                if isinstance(reservation_id, str) and isinstance(assignment_id, str):
+                    with contextlib.suppress(Exception):
+                        released = release_headless_inflight(reservation_id, agent, assignment_id)
+                    if isinstance(released, dict):
+                        marker.pop("headless_inflight_reservation_id", None)
         marker.update({"state": "disabled", "assignment_id": marker.get("assignment_id")})
         _write_headless_marker(agent, marker)
         current_lease = agent_lease_status(agent)

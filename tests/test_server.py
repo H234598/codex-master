@@ -1466,6 +1466,54 @@ class ServerHelpersTest(unittest.TestCase):
         assert result["allowed"] is True
         assert result["reason_codes"] == []
 
+    def test_p1w1_resource_admission_uses_resource_evidence_with_known_observation(self) -> None:
+        snapshot = {
+            "ok": False,
+            "_g5_facts": True,
+            "load_per_cpu": 2.25,
+            "cpu_busy_percent": 99.0,
+            "io_wait_percent": 99.0,
+            "available_memory_percent": 1.0,
+            "available_memory_mib": 256,
+            "running_agents": 0,
+            "reason_codes": ["cpu_pressure_high"],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            approved, adapter, _runner = approved_cgroup_runtime_for_test(Path(directory))
+            with patch.object(
+                server_module,
+                "_typed_g5_cgroup_runtime",
+                return_value=(approved.profile, adapter),
+            ):
+                result = server_module._resource_admission_decision(snapshot=snapshot)
+
+        assert result["allowed"] is False
+        assert result["reason_codes"] == ["cpu_pressure_high"]
+
+    def test_p1w1_cgroup_preflight_reason_is_not_shadowed_by_observation(self) -> None:
+        snapshot = {
+            "ok": False,
+            "_g5_facts": True,
+            "load_per_cpu": 2.25,
+            "cpu_busy_percent": 99.0,
+            "io_wait_percent": 99.0,
+            "available_memory_percent": 1.0,
+            "available_memory_mib": 256,
+            "running_agents": 0,
+            "reason_codes": ["cpu_pressure_high"],
+        }
+
+        with patch.object(
+            server_module,
+            "_typed_g5_cgroup_runtime",
+            return_value=None,
+        ):
+            result = server_module._resource_admission_decision(snapshot=snapshot)
+
+        assert result["allowed"] is False
+        assert result["reason_codes"] == ["cgroup_preflight_failed"]
+
     def test_spawn_admission_reports_session_and_resource_failures_independently(self) -> None:
         snapshots = {
             "valid": {
@@ -3657,11 +3705,21 @@ class ServerHelpersTest(unittest.TestCase):
             "bridge_state": "degraded",
             "counts": {"active": 0, "unconfirmed": 0, "overflow": 0},
         }
+        system_resource_snapshot = Mock(
+            return_value={
+                "ok": False,
+                "_g5_facts": True,
+                "running_agents": None,
+                "reason_codes": ["session_metrics_unavailable"],
+            }
+        )
         with patch(
             "codex_master.server._managed_tmux_session_ids",
             return_value=frozenset({"q1", "q2", "q3", "q4"}),
         ), patch(
             "codex_master.server.native_agent_status", return_value=native
+        ), patch(
+            "codex_master.server.system_resource_snapshot", new=system_resource_snapshot
         ), patch("codex_master.server.os.cpu_count", return_value=4), patch(
             "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
         ), patch("codex_master.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
@@ -3675,15 +3733,16 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(
             result["errors"],
             [
-                {
-                    "code": "session_metrics_unavailable",
-                    "title": "Gesamtzahl nicht bestimmbar",
-                    "explanation": "Laufende und unbestaetigte Bienen konnten nicht verlaesslich gezaehlt werden.",
-                    "rule": "Ohne belastbare Gesamtzahl wird kein Spawn zugelassen.",
-                    "action": "Tmux- und Native-Agent-Registry pruefen, dann erneut versuchen.",
-                }
-            ],
+            {
+                "code": "session_metrics_unavailable",
+                "title": "Gesamtzahl nicht bestimmbar",
+                "explanation": "Laufende und unbestaetigte Bienen konnten nicht verlaesslich gezaehlt werden.",
+                "rule": "Ohne belastbare Gesamtzahl wird kein Spawn zugelassen.",
+                "action": "Tmux- und Native-Agent-Registry pruefen, dann erneut versuchen.",
+            }
+        ],
         )
+        system_resource_snapshot.assert_called_once_with()
 
     def test_system_resource_snapshot_counts_only_managed_tmux_sessions_without_host_metric_fallback(self) -> None:
         meminfo = "MemTotal:       16384 kB\nMemAvailable:    8192 kB\n"
@@ -35173,6 +35232,162 @@ class NativeAgentRegistryTest(unittest.TestCase):
                 server_module.record_native_agent_event({"hook_event_name": "SubagentStart", "session_id": "019fc541-a1e2-7a63-a4bf-b307fcb78457", "agent_id": "019fc541-a1e2-7a63-a4bf-b307fcb78458", "agent_type": "worker"}, now=1_000.0)
                 result = server_module.native_agent_status(now=1_001.0)
             self.assertEqual(result["counts"]["active"], 1)
+
+    def test_headless_inflight_reservation_round_trips_canonically(self) -> None:
+        agent = "019fc541-a1e2-7a63-a4bf-b307fcb78457"
+        assignment_id = "019fc541-a1e2-7a63-a4bf-b307fcb78458"
+        reservation_id = "019fc541-a1e2-7a63-a4bf-b307fcb78459"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "state"
+            record_path = root / "native-agents.json"
+            lock_path = root / "locks" / "native.lock"
+            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "codex_master.server.time.time", return_value=1_000.0
+            ), patch("codex_master.server.uuid.uuid4", return_value=SimpleNamespace(hex=reservation_id)):
+                server_module._write_native_agent_registry(
+                    {"schema_version": 2, "agents": [], "sessions": [], "reservations": []}
+                )
+                first = server_module.reserve_headless_inflight(agent, assignment_id)
+                second = server_module.reserve_headless_inflight(agent, assignment_id)
+                self.assertEqual(first, second)
+                self.assertEqual(
+                    json.loads(record_path.read_text(encoding="utf-8")),
+                    {
+                        "schema_version": 2,
+                        "agents": [],
+                        "sessions": [],
+                        "reservations": [
+                            {
+                                "kind": "headless_inflight",
+                                "reservation_id": reservation_id,
+                                "agent": agent,
+                                "assignment_id": assignment_id,
+                                "created_at": 1_000.0,
+                            }
+                        ],
+                    },
+                )
+
+    def test_headless_inflight_release_is_bound_and_idempotent(self) -> None:
+        agent = "019fc541-a1e2-7a63-a4bf-b307fcb78457"
+        assignment_id = "019fc541-a1e2-7a63-a4bf-b307fcb78458"
+        reservation_id = "019fc541-a1e2-7a63-a4bf-b307fcb78459"
+        other_agent = "019fc541-a1e2-7a63-a4bf-b307fcb78460"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "state"
+            record_path = root / "native-agents.json"
+            lock_path = root / "locks" / "native.lock"
+            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "codex_master.server.time.time", return_value=1_000.0
+            ):
+                server_module._write_native_agent_registry(
+                    {
+                        "schema_version": 2,
+                        "agents": [],
+                        "sessions": [],
+                        "reservations": [
+                            {
+                                "reservation_id": reservation_id,
+                                "kind": "headless_inflight",
+                                "created_at": 1_000.0,
+                                "agent": agent,
+                                "assignment_id": assignment_id,
+                            },
+                        ],
+                    }
+                )
+                self.assertIsNone(
+                    server_module.release_headless_inflight(
+                        reservation_id,
+                        other_agent,
+                        assignment_id,
+                    )
+                )
+                first = server_module.release_headless_inflight(reservation_id, agent, assignment_id)
+                second = server_module.release_headless_inflight(reservation_id, agent, assignment_id)
+            stored = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(first["reservation_id"], reservation_id)
+        self.assertEqual(first["kind"], "headless_inflight")
+        self.assertIsNone(second)
+        self.assertEqual(stored["reservations"], [])
+
+    def test_headless_inflight_same_assignment_is_parallel_safe(self) -> None:
+        agent = "019fc541-a1e2-7a63-a4bf-b307fcb78457"
+        assignment_id = "019fc541-a1e2-7a63-a4bf-b307fcb78458"
+        start = threading.Barrier(2)
+        results: list[dict[str, Any]] = []
+        errors: list[BaseException] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "state"
+            record_path = root / "native-agents.json"
+            lock_path = root / "locks" / "native.lock"
+            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "codex_master.server.time.time", return_value=1_000.0
+            ):
+                server_module._write_native_agent_registry({"schema_version": 2, "agents": [], "sessions": [], "reservations": []})
+
+                def worker() -> None:
+                    try:
+                        start.wait(2)
+                        results.append(server_module.reserve_headless_inflight(agent, assignment_id))
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                first = threading.Thread(target=worker)
+                second = threading.Thread(target=worker)
+                first.start()
+                second.start()
+                first.join(2)
+                second.join(2)
+                self.assertEqual(errors, [])
+                self.assertEqual(len(results), 2)
+                self.assertEqual(results[0], results[1])
+                registry, _ = server_module._read_native_agent_registry()
+        self.assertEqual(len(registry["reservations"]), 1)
+        self.assertEqual(registry["reservations"][0], results[0])
+
+    def test_p1w1_persistent_headless_inflight_is_visible_in_total_observation(self) -> None:
+        agent = "019fc541-a1e2-7a63-a4bf-b307fcb78457"
+        assignment_id = "019fc541-a1e2-7a63-a4bf-b307fcb78458"
+        reservation_id = "019fc541-a1e2-7a63-a4bf-b307fcb78459"
+        now = 1_000.0 + server_module.NATIVE_AGENT_RESERVATION_TTL_SECONDS + 1
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "state"
+            record_path = root / "native-agents.json"
+            lock_path = root / "locks" / "native.lock"
+            with patch("codex_master.server.STATE_ROOT", root), patch("codex_master.server.LOCK_DIR", root / "locks"), patch(
+                "codex_master.server.NATIVE_AGENT_REGISTRY_FILE", record_path
+            ), patch("codex_master.server.NATIVE_AGENT_REGISTRY_LOCK_FILE", lock_path), patch(
+                "codex_master.server.time.time", return_value=now
+            ), patch(
+                "codex_master.server.native_agent_status",
+                return_value={"bridge_state": "ready", "counts": {"active": 1, "unconfirmed": 1, "overflow": 0}},
+            ):
+                server_module._write_native_agent_registry(
+                    {
+                        "schema_version": 2,
+                        "agents": [],
+                        "sessions": [],
+                        "reservations": [
+                            {
+                                "reservation_id": reservation_id,
+                                "kind": "headless_inflight",
+                                "created_at": 1_000.0,
+                                "agent": agent,
+                                "assignment_id": assignment_id,
+                            }
+                        ],
+                    }
+                )
+                total = server_module._total_running_agent_count(managed_ids=frozenset({"q1", "q2", "q3"}))
+
+        assert total == 6
 
     def test_spawn_admission_lock_is_reentrant_in_same_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, patch("codex_master.server.STATE_ROOT", Path(tmpdir) / "state"), patch(
