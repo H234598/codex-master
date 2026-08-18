@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -33,11 +34,13 @@ MAX_COMMAND_STDERR_BYTES = 1024
 COMMAND_TIMEOUT_SECONDS = 5.0
 _GATE_CHALLENGE_BYTES = 32
 _GATE_OUTPUT_BYTES = (_GATE_CHALLENGE_BYTES * 2) + 1
+_UNSET_TARGET_SLICE_CONTROL_GROUP = object()
 _CPU_SET_PART = re.compile(r"(?:0|[1-9][0-9]*)(?:-(?:[1-9][0-9]*))?")
 _UNIT_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]{0,127}$")
 _CHALLENGE = re.compile(r"^[a-f0-9]{64}$")
 _TMUX_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _CGROUP_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}$")
+_PSI_DECIMAL = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$")
 
 CpuSet = tuple[int, ...]
 APPROVED_CPUSET: CpuSet = tuple(range(4, 12))
@@ -242,6 +245,26 @@ class CgroupSystemAdapter(Protocol):
     def verify_tmux_membership_and_inheritance(self, scope: PreparedAgentScope, tmux_pid: int) -> None: ...
 
     def cleanup_new_scope(self, scope: PreparedAgentScope) -> None: ...
+
+    def read_hive_io_pressure(self) -> CgroupIoPressureEvidenceV1 | None: ...
+
+    def clear_target_slice_control_group_cache(self) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class CgroupIoPressureEvidenceV1:
+    some_avg10: float
+    full_avg10: float
+    full_avg60: float
+
+    def __post_init__(self) -> None:
+        for value in (self.some_avg10, self.full_avg10, self.full_avg60):
+            if type(value) is bool or not isinstance(value, (float, int)) or not math.isfinite(
+                value
+            ):
+                _fail()
+            if value < 0.0 or value > 100.0:
+                _fail()
 
 
 @dataclass(frozen=True, slots=True)
@@ -622,7 +645,7 @@ class _SubprocessSystemdUserRunner:
 class SystemdUserCgroupAdapter:
     """Concrete, held-scope adapter; G5 alone may inject it into admission."""
 
-    __slots__ = ("_runner", "_cgroup_root", "_owned")
+    __slots__ = ("_runner", "_cgroup_root", "_owned", "_target_slice_control_group_path")
 
     def __setattr__(self, name: str, value: object) -> None:
         del name, value
@@ -634,6 +657,7 @@ class SystemdUserCgroupAdapter:
         object.__setattr__(self, "_runner", bound_runner)
         object.__setattr__(self, "_cgroup_root", bound_root)
         object.__setattr__(self, "_owned", {})
+        object.__setattr__(self, "_target_slice_control_group_path", _UNSET_TARGET_SLICE_CONTROL_GROUP)
 
     def _run(self, argv: tuple[str, ...]) -> CommandResultV1:
         try:
@@ -730,6 +754,13 @@ class SystemdUserCgroupAdapter:
         return present, parents
 
     def _target_slice_control_group(self, *, allow_missing: bool = False) -> str | None:
+        cached = self._target_slice_control_group_path
+        if cached is not _UNSET_TARGET_SLICE_CONTROL_GROUP:
+            if cached is None:
+                if allow_missing:
+                    return None
+                _fail()
+            return cached
         result = self._run(
             (
                 SYSTEMCTL_PATH,
@@ -741,6 +772,7 @@ class SystemdUserCgroupAdapter:
             )
         )
         if result.returncode == 4 and allow_missing:
+            object.__setattr__(self, "_target_slice_control_group_path", None)
             return None
         if result.returncode != 0 or result.stderr:
             _fail()
@@ -750,9 +782,12 @@ class SystemdUserCgroupAdapter:
             _fail()
         if value == "":
             if allow_missing:
+                object.__setattr__(self, "_target_slice_control_group_path", None)
                 return None
             _fail()
-        return _canonical_control_group(value)
+        control_group = _canonical_control_group(value)
+        object.__setattr__(self, "_target_slice_control_group_path", control_group)
+        return control_group
 
     def _target_slice_evidence(self, *, allow_missing: bool = False) -> tuple[str, frozenset[str], frozenset[str], CpuSet] | None:
         control_group = self._target_slice_control_group(allow_missing=allow_missing)
@@ -764,6 +799,30 @@ class SystemdUserCgroupAdapter:
             _parse_controller_set(self._read_cgroup_file(control_group, "cgroup.subtree_control")),
             _parse_cpu_set(_read_single_line(self._read_cgroup_file(control_group, "cpuset.cpus.effective"))),
         )
+
+    def clear_target_slice_control_group_cache(self) -> None:
+        object.__setattr__(
+            self,
+            "_target_slice_control_group_path",
+            _UNSET_TARGET_SLICE_CONTROL_GROUP,
+        )
+
+    def bind_target_slice_control_group(self) -> str:
+        """Re-bind the dynamic target cgroup once for this typed flow."""
+
+        self.clear_target_slice_control_group_cache()
+        return self._target_slice_control_group()
+
+    def read_hive_io_pressure(self) -> CgroupIoPressureEvidenceV1 | None:
+        try:
+            control_group = self._target_slice_control_group()
+            raw = self._read_cgroup_file(control_group, "io.pressure")
+        except Exception:
+            return None
+        try:
+            return _parse_cgroup_pressure(raw)
+        except Exception:
+            return None
 
     def inspect_preflight(self) -> CgroupPreflightV1:
         evidence = self._target_slice_evidence()
@@ -1141,6 +1200,63 @@ def _read_optional_cpu_topology_text(
     return text[:-1]
 
 
+def _parse_cgroup_pressure(raw: bytes) -> CgroupIoPressureEvidenceV1:
+    if type(raw) is not bytes or not 1 <= len(raw) <= MAX_CGROUP_READ_BYTES:
+        _fail()
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        _fail()
+    if len(lines) != 2:
+        _fail()
+    some: dict[str, float] | None = None
+    full: dict[str, float] | None = None
+    seen: set[str] = set()
+    for line in lines:
+        fields = line.split()
+        if len(fields) != 5 or fields[0] not in {"some", "full"} or fields[0] in seen:
+            _fail()
+        seen.add(fields[0])
+        values: dict[str, str] = {}
+        for field in fields[1:]:
+            key, separator, value = field.partition("=")
+            if separator != "=" or key in values:
+                _fail()
+            values[key] = value
+        if set(values) != {"avg10", "avg60", "avg300", "total"}:
+            _fail()
+        for key in ("avg10", "avg60", "avg300"):
+            if not _PSI_DECIMAL.fullmatch(values[key]):
+                _fail()
+        if not values["total"].isdigit() or int(values["total"]) > (1 << 63) - 1:
+            _fail()
+        parsed_line = {
+            "avg10": float(values["avg10"]),
+            "avg60": float(values["avg60"]),
+            "avg300": float(values["avg300"]),
+        }
+        if not all(math.isfinite(value) for value in parsed_line.values()):
+            _fail()
+        if fields[0] == "some":
+            some = parsed_line
+        else:
+            full = parsed_line
+    if some is None or full is None:
+        _fail()
+    return CgroupIoPressureEvidenceV1(
+        some_avg10=some["avg10"],
+        full_avg10=full["avg10"],
+        full_avg60=full["avg60"],
+    )
+
+
+def read_hive_io_pressure(*, adapter: CgroupSystemAdapter) -> CgroupIoPressureEvidenceV1 | None:
+    try:
+        return adapter.read_hive_io_pressure()
+    except Exception:
+        return None
+
+
 def _parse_decimal(value: str) -> int:
     if not value or not value.isascii() or not value.isdecimal() or (len(value) > 1 and value[0] == "0"):
         _fail()
@@ -1276,6 +1392,7 @@ def build_approved_cgroup_runtime(
     adapter = SystemdUserCgroupAdapter(runner=runner)
     if type(adapter) is not SystemdUserCgroupAdapter:
         _fail()
+    adapter.bind_target_slice_control_group()
     topology = parse_cpu_topology(adapter)
     memory_total = _read_host_memory_total_bytes() if mem_total_bytes is None else mem_total_bytes
     profile = derive_cgroup_profile(

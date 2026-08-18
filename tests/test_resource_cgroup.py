@@ -16,8 +16,10 @@ from codex_master.resource_cgroup import (
     CgroupPreflightError,
     CgroupPreflightV1,
     CgroupProfileV1,
+    CgroupIoPressureEvidenceV1,
     CpuTopologyV1,
     PreparedAgentScope,
+    read_hive_io_pressure,
     derive_cgroup_profile,
     parse_cpu_topology,
     require_cgroup_preflight,
@@ -104,6 +106,17 @@ class FakeCgroupAdapter:
     def cleanup_new_scope(self, scope: PreparedAgentScope) -> None:
         self.events.append("cleanup")
         self.cleaned.append(scope)
+
+    def read_hive_io_pressure(self) -> CgroupIoPressureEvidenceV1 | None:
+        try:
+            return resource_cgroup._parse_cgroup_pressure(
+                self.read_bounded_cgroup_bytes(
+                    Path("/sys/fs/cgroup/user.slice/codex-master.slice/io.pressure"),
+                    max_bytes=4096,
+                )
+            )
+        except Exception:
+            return None
 
 
 def _preflight(
@@ -494,6 +507,77 @@ def test_topology_rejects_malformed_oversize_and_inconsistent_cpu_records() -> N
     for adapter in (malformed, oversized, FakeCgroupAdapter(documents=inconsistent)):
         with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
             parse_cpu_topology(adapter)
+
+
+def test_read_hive_io_pressure_reads_valid_pressure_payload() -> None:
+    adapter = FakeCgroupAdapter(
+        documents={
+            Path("/sys/fs/cgroup/user.slice/codex-master.slice/io.pressure"): (
+                b"some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+                b"full avg10=1.23 avg60=2.34 avg300=3.45 total=4\n"
+            )
+        }
+    )
+
+    assert read_hive_io_pressure(adapter=adapter) == CgroupIoPressureEvidenceV1(
+        some_avg10=0.0,
+        full_avg10=1.23,
+        full_avg60=2.34,
+    )
+
+
+def test_read_hive_io_pressure_rejects_malformed_pressure_payload() -> None:
+    payloads = (
+        b"some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        b"some avg10=invalid avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        b"some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=invalid\n",
+    )
+    for payload in payloads:
+        adapter = FakeCgroupAdapter(
+            documents={Path("/sys/fs/cgroup/user.slice/codex-master.slice/io.pressure"): payload}
+        )
+        assert read_hive_io_pressure(adapter=adapter) is None
+
+
+def test_read_hive_io_pressure_uses_control_group_from_target_slice_systemd_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    target_control_group = "/user.slice/user-1000.slice/user@1000.service/codex.slice/codex-master.slice"
+    payload = (
+        b"some avg10=12.34 avg60=11.11 avg300=10.00 total=7\n"
+        b"full avg10=34.56 avg60=7.89 avg300=6.78 total=8\n"
+    )
+    runner = _FakeSystemdRunner(target_slice_control_group=target_control_group)
+    adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
+    pressure_file = tmp_path / "cgroup" / target_control_group.lstrip("/") / "io.pressure"
+    pressure_file.parent.mkdir(parents=True)
+    pressure_file.write_bytes(payload)
+
+    assert adapter.read_hive_io_pressure() == CgroupIoPressureEvidenceV1(
+        some_avg10=12.34,
+        full_avg10=34.56,
+        full_avg60=7.89,
+    )
+
+
+@pytest.mark.parametrize(
+    "some_avg10,full_avg10,full_avg60",
+    (
+        (float("nan"), 0.0, 0.0),
+        (0.0, -1.0, 0.0),
+        (0.0, 0.0, 101.0),
+        (True, 0.0, 0.0),
+        (0.0, False, 0.0),
+        (0.0, 0.0, True),
+    ),
+)
+def test_hive_io_pressure_evidence_rejects_invalid_pressure_values(
+    some_avg10: float, full_avg10: float, full_avg60: float
+) -> None:
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        CgroupIoPressureEvidenceV1(
+            some_avg10=some_avg10,
+            full_avg10=full_avg10,
+            full_avg60=full_avg60,
+        )
 
 
 def test_profile_rejects_unapproved_empty_duplicate_hybrid_or_outside_parent_cpu_set() -> None:

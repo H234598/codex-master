@@ -29,6 +29,7 @@ from codex_master.hive.state import HiveStateStore
 from codex_master.resource_cgroup import (
     CgroupPreflightError,
     CgroupProfileV1,
+    CgroupIoPressureEvidenceV1,
     PreparedAgentScope,
 )
 from codex_master.resource_monitor import LegacyPressureV1, ResourceGateFacts, ResourceOperatorStatus
@@ -270,6 +271,48 @@ class PreflightSystemdRunner:
         raise AssertionError("scope mutation is outside this test")
 
 
+class RebindingSystemdRunner(PreflightSystemdRunner):
+    def __init__(
+        self,
+        *,
+        control_slice_sequence: tuple[str, ...],
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._control_slice_sequence = list(control_slice_sequence)
+        self.control_slice_reads: list[str] = []
+
+    def run(
+        self,
+        argv: tuple[str, ...],
+        *,
+        timeout_seconds: float,
+        max_stdout_bytes: int,
+        max_stderr_bytes: int,
+    ) -> resource_cgroup.CommandResultV1:
+        if (
+            argv[0] == "/usr/bin/systemctl"
+            and argv[3] == "show"
+            and argv[4] == "codex-master.slice"
+            and "--property=ControlGroup" in argv
+        ):
+            assert self._control_slice_sequence
+            control_slice = self._control_slice_sequence.pop(0)
+            self.calls.append(argv)
+            self.control_slice_reads.append(control_slice)
+            return resource_cgroup.CommandResultV1(
+                returncode=0,
+                stdout=f"ControlGroup={control_slice}\n".encode(),
+                stderr=b"",
+            )
+        return super().run(
+            argv,
+            timeout_seconds=timeout_seconds,
+            max_stdout_bytes=max_stdout_bytes,
+            max_stderr_bytes=max_stderr_bytes,
+        )
+
+
 class HeldScopeProcess:
     def __init__(self) -> None:
         self.releases: list[bytes] = []
@@ -407,6 +450,10 @@ def write_cgroup_preflight_facts_for_test(
     controllers: bytes = b"cpu cpuset memory pids io\n",
     subtree_controllers: bytes = b"cpu cpuset memory pids io\n",
     parent_cpuset: bytes = b"0-11\n",
+    io_pressure: bytes = (
+        b"some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+        b"full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
+    ),
 ) -> Path:
     cgroup_root = directory / "cgroup"
     slice_root = cgroup_root / "user.slice" / "codex-master.slice"
@@ -414,6 +461,7 @@ def write_cgroup_preflight_facts_for_test(
     (slice_root / "cgroup.controllers").write_bytes(controllers)
     (slice_root / "cgroup.subtree_control").write_bytes(subtree_controllers)
     (slice_root / "cpuset.cpus.effective").write_bytes(parent_cpuset)
+    (slice_root / "io.pressure").write_bytes(io_pressure)
     return cgroup_root
 
 
@@ -513,6 +561,11 @@ ADMITTED_SPAWN_DECISION = {
     "reason_codes": [],
     "raw_output": "not_returned",
 }
+LOW_HIVE_IO_PRESSURE = CgroupIoPressureEvidenceV1(
+    some_avg10=0.0,
+    full_avg10=0.0,
+    full_avg60=0.0,
+)
 
 
 def create_test_q_series(pool: Path, executable: Path):
@@ -1129,7 +1182,7 @@ class ServerHelpersTest(unittest.TestCase):
             "load_per_cpu": 0.25,
             "cpu_busy_percent": 25.0,
             "io_wait_percent": 0.0,
-            "io_psi_percent": 0.0,
+            "io_psi_percent": LOW_HIVE_IO_PRESSURE,
             "available_memory_percent": 50.0,
             "available_memory_mib": 8192,
             "running_agents": 0,
@@ -1176,7 +1229,7 @@ class ServerHelpersTest(unittest.TestCase):
                 result = spawn_admission_decision()
 
         assert provider_errors == ["cgroup_preflight_failed"]
-        assert len(runner.calls) == 0
+        assert len(runner.calls) == 1
         provider.assert_called_once_with()
         assert result["allowed"] is False
         assert result["reason_codes"] == ["cgroup_preflight_failed"]
@@ -1188,7 +1241,7 @@ class ServerHelpersTest(unittest.TestCase):
             "load_per_cpu": 0.25,
             "cpu_busy_percent": 25.0,
             "io_wait_percent": 0.0,
-            "io_psi_percent": 0.0,
+            "io_psi_percent": LOW_HIVE_IO_PRESSURE,
             "available_memory_percent": 50.0,
             "available_memory_mib": 8192,
             "running_agents": 0,
@@ -1289,6 +1342,86 @@ class ServerHelpersTest(unittest.TestCase):
         assert len(runner.calls) == 2
         read_facts.assert_called_once()
 
+    def test_spawn_admission_binds_and_prefers_dynamic_control_group_in_flow(self) -> None:
+        first_slice = "/user.slice/codex-master.slice"
+        second_slice = "/user.slice/user-1000.slice/user@1000.service/codex.slice/codex-master.slice"
+        facts = ResourceGateFacts(
+            generation=7,
+            observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+            observed_monotonic_ns=1,
+            gate_state="ready",
+            reason_codes=(),
+            current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
+            available_memory_mib=8192,
+            legacy_pressure=LegacyPressureV1(0.25, 25.0, 0.0, 50.0),
+            normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
+            normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
+            bottleneck="unknown",
+            cgroup_state="unavailable",
+            thermal_state="ready",
+        )
+        runner = RebindingSystemdRunner(
+            control_slice_sequence=(first_slice, second_slice),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = HiveStateStore(root / "hive")
+            cgroup_root = root / "cgroup"
+            control_a = cgroup_root / first_slice.lstrip("/")
+            control_b = cgroup_root / second_slice.lstrip("/")
+            with approved_provider_facts_for_test(root, runner=runner) as _patched_runner:
+                approved = resource_cgroup.build_approved_cgroup_runtime(
+                    runner=runner,
+                    mem_total_bytes=16 * 1024**3,
+                )
+            for slice_root in (control_a, control_b):
+                slice_root.mkdir(parents=True, exist_ok=True)
+                (slice_root / "cgroup.controllers").write_text(
+                    "cpu cpuset memory pids io\n", encoding="utf-8"
+                )
+                (slice_root / "cgroup.subtree_control").write_text(
+                    "cpu cpuset memory pids io\n", encoding="utf-8"
+                )
+                (slice_root / "cpuset.cpus.effective").write_text(
+                    "0-11\n", encoding="utf-8"
+                )
+                if slice_root == control_a:
+                    (slice_root / "io.pressure").write_bytes(
+                        b"some avg10=99.00 avg60=99.00 avg300=99.00 total=1\n"
+                        b"full avg10=99.00 avg60=99.00 avg300=99.00 total=1\n"
+                    )
+                else:
+                    (slice_root / "io.pressure").write_bytes(
+                        b"some avg10=0.00 avg60=0.00 avg300=0.00 total=1\n"
+                        b"full avg10=0.00 avg60=0.00 avg300=0.00 total=1\n"
+                    )
+            with patch.object(
+                server_module,
+                "build_current_hive_runtime",
+                return_value=SimpleNamespace(state=state),
+            ), patch.object(
+                server_module,
+                "read_current_resource_boot_id",
+                return_value="123e4567-e89b-12d3-a456-426614174000",
+            ), patch.object(
+                server_module,
+                "build_approved_cgroup_runtime",
+                return_value=approved,
+            ), patch.object(
+                server_module,
+                "read_resource_gate_facts",
+                return_value=facts,
+            ) as read_facts, patch.object(
+                server_module, "_total_running_agent_count", return_value=0
+            ), patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0):
+                result = spawn_admission_decision()
+
+        assert result["allowed"] is True
+        assert result["reason_codes"] == []
+        assert runner.control_slice_reads == [first_slice, second_slice]
+        assert len(runner.calls) == 2
+        read_facts.assert_called_once()
+
     def test_spawn_admission_does_not_report_resource_snapshot_invalid_for_fresh_valid_composed_runtime(self) -> None:
         facts = ResourceGateFacts(
             generation=7,
@@ -1341,7 +1474,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "load_per_cpu": 0.25,
                 "cpu_busy_percent": 25.0,
                 "io_wait_percent": 0.0,
-                "io_psi_percent": 0.0,
+                "io_psi_percent": LOW_HIVE_IO_PRESSURE,
                 "available_memory_percent": 50.0,
                 "available_memory_mib": 8192,
                 "running_agents": 0,
@@ -1531,6 +1664,197 @@ class ServerHelpersTest(unittest.TestCase):
                 self.assertEqual(result["ok"], expected_ok)
                 self.assertEqual(result["reason_codes"], expected_reasons)
                 self.assertEqual(result["raw_output"], "not_returned")
+
+    def test_resource_gate_snapshot_prefers_hive_io_pressure_over_host_wait_metrics(self) -> None:
+        def facts(*, gate_state: str, io_wait_percent: float) -> ResourceGateFacts:
+            return ResourceGateFacts(
+                generation=7,
+                observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+                observed_monotonic_ns=1,
+                gate_state=gate_state,
+                reason_codes=(),
+                current={"cpu": 25.0, "io": 99.0, "memory": 50.0},
+                available_memory_mib=8192,
+                legacy_pressure=LegacyPressureV1(
+                    load_per_cpu=0.25,
+                    cpu_busy_percent=25.0,
+                    io_wait_percent=io_wait_percent,
+                    available_memory_percent=50.0,
+                ),
+                normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
+                normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
+                bottleneck="unknown",
+                cgroup_state="unavailable",
+                thermal_state="ready",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            adapter, _runner = regular_systemd_adapter_for_test(Path(directory))
+            runtime = server_module.ResourceGateRuntime(
+                state=HiveStateStore(Path(directory)),
+                expected_boot_id="123e4567-e89b-12d3-a456-426614174000",
+                now_utc=lambda: datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+                monotonic_ns=lambda: 0,
+                cgroup_profile=None,
+                cgroup_adapter=adapter,
+            )
+            with server_module._resource_gate_runtime_scope(runtime), patch.object(
+                server_module,
+                "read_resource_gate_facts",
+                return_value=facts(gate_state="ready", io_wait_percent=99.001),
+            ):
+                snapshot = server_module._resource_gate_snapshot(running_agents_override=2)
+
+        self.assertEqual(snapshot["io_wait_percent"], 99.001)
+        self.assertEqual(snapshot["io_psi_percent"], LOW_HIVE_IO_PRESSURE)
+        self.assertEqual(server_module._resource_pressure_reason_codes(snapshot, spawn_resource_policy()), [])
+
+    def test_resource_gate_snapshot_accepts_invalid_host_io_wait_when_hive_evidence_is_valid(self) -> None:
+        def facts() -> ResourceGateFacts:
+            data = ResourceGateFacts(
+                generation=7,
+                observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+                observed_monotonic_ns=1,
+                gate_state="ready",
+                reason_codes=(),
+                current={"cpu": 25.0, "io": 99.0, "memory": 50.0},
+                available_memory_mib=8192,
+                legacy_pressure=LegacyPressureV1(
+                    load_per_cpu=0.25,
+                    cpu_busy_percent=25.0,
+                    io_wait_percent=99.001,
+                    available_memory_percent=50.0,
+                ),
+                normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
+                normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
+                bottleneck="unknown",
+                cgroup_state="unavailable",
+                thermal_state="ready",
+            )
+            object.__setattr__(data.legacy_pressure, "io_wait_percent", float("nan"))
+            return data
+
+        with tempfile.TemporaryDirectory() as directory:
+            adapter, _runner = regular_systemd_adapter_for_test(Path(directory))
+            runtime = server_module.ResourceGateRuntime(
+                state=HiveStateStore(Path(directory)),
+                expected_boot_id="123e4567-e89b-12d3-a456-426614174000",
+                now_utc=lambda: datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+                monotonic_ns=lambda: 0,
+                cgroup_profile=None,
+                cgroup_adapter=adapter,
+            )
+            with server_module._resource_gate_runtime_scope(runtime), patch.object(
+                server_module,
+                "read_resource_gate_facts",
+                return_value=facts(),
+            ):
+                snapshot = server_module._resource_gate_snapshot(running_agents_override=2)
+
+        self.assertTrue(snapshot["ok"])
+        self.assertEqual(snapshot["io_psi_percent"], LOW_HIVE_IO_PRESSURE)
+        self.assertNotEqual(snapshot["io_wait_percent"], snapshot["io_wait_percent"])
+        self.assertEqual(
+            server_module._resource_pressure_reason_codes(snapshot, spawn_resource_policy()),
+            [],
+        )
+
+    def test_resource_gate_snapshot_fail_closed_without_hive_io_pressure_evidence(self) -> None:
+        def facts() -> ResourceGateFacts:
+            return ResourceGateFacts(
+                generation=7,
+                observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+                observed_monotonic_ns=1,
+                gate_state="ready",
+                reason_codes=(),
+                current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
+                available_memory_mib=8192,
+                legacy_pressure=LegacyPressureV1(
+                    load_per_cpu=0.25,
+                    cpu_busy_percent=25.0,
+                    io_wait_percent=0.0,
+                    available_memory_percent=50.0,
+                ),
+                normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
+                normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
+                bottleneck="unknown",
+                cgroup_state="unavailable",
+                thermal_state="ready",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            adapter, _runner = regular_systemd_adapter_for_test(Path(directory))
+            runtime = server_module.ResourceGateRuntime(
+                state=HiveStateStore(Path(directory)),
+                expected_boot_id="123e4567-e89b-12d3-a456-426614174000",
+                now_utc=lambda: datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+                monotonic_ns=lambda: 0,
+                cgroup_profile=None,
+                cgroup_adapter=adapter,
+            )
+            with patch.object(
+                server_module, "read_hive_io_pressure", return_value=None
+            ), server_module._resource_gate_runtime_scope(runtime), patch.object(
+                server_module,
+                "read_resource_gate_facts",
+                return_value=facts(),
+            ):
+                snapshot = server_module._resource_gate_snapshot(running_agents_override=2)
+
+        self.assertEqual(snapshot["io_psi_percent"], None)
+        self.assertEqual(
+            server_module._resource_pressure_reason_codes(snapshot, spawn_resource_policy()),
+            ["resource_monitor_unavailable"],
+        )
+
+    def test_resource_pressure_reason_codes_blocks_on_exact_hive_io_thresholds(self) -> None:
+        policy = spawn_resource_policy()
+        for evidence in (
+            CgroupIoPressureEvidenceV1(some_avg10=95.0, full_avg10=0.0, full_avg60=0.0),
+            CgroupIoPressureEvidenceV1(some_avg10=0.0, full_avg10=85.0, full_avg60=0.0),
+            CgroupIoPressureEvidenceV1(some_avg10=0.0, full_avg10=0.0, full_avg60=80.0),
+        ):
+            snapshot = {
+                "ok": True,
+                "_g5_facts": True,
+                "load_per_cpu": 0.25,
+                "cpu_busy_percent": 25.0,
+                "io_wait_percent": 99.001,
+                "io_psi_percent": evidence,
+                "available_memory_percent": 50.0,
+                "available_memory_mib": 8192,
+                "reason_codes": [],
+            }
+            with self.subTest(evidence=evidence):
+                self.assertEqual(
+                    server_module._resource_pressure_reason_codes(snapshot, policy),
+                    ["io_pressure_high"],
+                )
+
+    def test_resource_pressure_reason_codes_blocks_when_full_pressures_are_high_but_some_is_low(
+        self,
+    ) -> None:
+        policy = spawn_resource_policy()
+        snapshot = {
+            "ok": True,
+            "_g5_facts": True,
+            "load_per_cpu": 0.25,
+            "cpu_busy_percent": 25.0,
+            "io_wait_percent": 0.0,
+            "io_psi_percent": CgroupIoPressureEvidenceV1(
+                some_avg10=1.0,
+                full_avg10=10.0,
+                full_avg60=80.1,
+            ),
+            "available_memory_percent": 50.0,
+            "available_memory_mib": 8192,
+            "reason_codes": [],
+        }
+
+        self.assertEqual(
+            server_module._resource_pressure_reason_codes(snapshot, policy),
+            ["io_pressure_high"],
+        )
 
     def test_g5_product_composer_reads_one_authorized_hive_state_facts_snapshot_for_offer(self) -> None:
         facts = ResourceGateFacts(
@@ -1853,7 +2177,7 @@ class ServerHelpersTest(unittest.TestCase):
             "load_per_cpu": 0.25,
             "cpu_busy_percent": 25.0,
             "io_wait_percent": 0.0,
-            "io_psi_percent": 0.0,
+            "io_psi_percent": LOW_HIVE_IO_PRESSURE,
             "available_memory_percent": 50.0,
             "available_memory_mib": 8192,
             "running_agents": 1,
@@ -1877,7 +2201,7 @@ class ServerHelpersTest(unittest.TestCase):
             "load_per_cpu": 0.25,
             "cpu_busy_percent": 25.0,
             "io_wait_percent": 0.0,
-            "io_psi_percent": 0.0,
+            "io_psi_percent": LOW_HIVE_IO_PRESSURE,
             "available_memory_percent": 50.0,
             "available_memory_mib": 1024,
             "running_agents": 9,
@@ -1906,7 +2230,7 @@ class ServerHelpersTest(unittest.TestCase):
             "load_per_cpu": 0.25,
             "cpu_busy_percent": 25.0,
             "io_wait_percent": 0.0,
-            "io_psi_percent": 0.0,
+            "io_psi_percent": LOW_HIVE_IO_PRESSURE,
             "available_memory_percent": 50.0,
             "available_memory_mib": 1024,
             "running_agents": 10,
@@ -2370,7 +2694,7 @@ class ServerHelpersTest(unittest.TestCase):
             "load_per_cpu": 0.25,
             "cpu_busy_percent": 25.0,
             "io_wait_percent": 0.0,
-            "io_psi_percent": 0.0,
+            "io_psi_percent": LOW_HIVE_IO_PRESSURE,
             "available_memory_percent": 50.0,
             "available_memory_mib": 8192,
             "running_agents": 1,
@@ -3270,7 +3594,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "load_per_cpu": 0.25,
                 "cpu_busy_percent": 25.0,
                 "io_wait_percent": 0.0,
-                "io_psi_percent": 0.0,
+                "io_psi_percent": LOW_HIVE_IO_PRESSURE,
                 "available_memory_percent": 60.0,
                 "available_memory_mib": 8192,
                 "running_agents": 10,
@@ -3775,7 +4099,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "load_per_cpu": 0.25,
                 "cpu_busy_percent": 25.0,
                 "io_wait_percent": 0.0,
-                "io_psi_percent": 0.0,
+                "io_psi_percent": LOW_HIVE_IO_PRESSURE,
                 "available_memory_mib": memory_mib,
                 "reason_codes": declared,
             }

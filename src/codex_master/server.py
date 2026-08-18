@@ -97,8 +97,10 @@ from codex_master.resource_cgroup import (
     CgroupPreflightError,
     CgroupPreflightV1,
     CgroupProfileV1,
+    CgroupIoPressureEvidenceV1,
     PreparedAgentScope,
     REQUIRED_CONTROLLERS,
+    read_hive_io_pressure,
     SystemdUserCgroupAdapter,
     require_cgroup_preflight,
     start_verified_scope,
@@ -420,6 +422,9 @@ RESOURCE_MAX_CPU_BUSY_PERCENT = 90.0
 RESOURCE_MAX_IO_WAIT_PERCENT = 50.0
 RESOURCE_MIN_AVAILABLE_MEMORY_MIB = 7 * 1024
 RESOURCE_MAX_RUNNING_AGENTS = 10
+HIVE_IO_PRESSURE_SOME_AVG10_LIMIT = 95.0
+HIVE_IO_PRESSURE_FULL_AVG10_LIMIT = 85.0
+HIVE_IO_PRESSURE_FULL_AVG60_LIMIT = 80.0
 RESOURCE_PRESSURE_LIMITS_ENABLED = True
 OLLAMA_MAX_CONCURRENT_AGENTS = 2
 OLLAMA_CONCURRENCY_LIMIT_ENABLED = True
@@ -935,6 +940,9 @@ _RESOURCE_GATE_RUNTIME: contextvars.ContextVar[ResourceGateRuntime | None] = con
     "codex_master_resource_gate_runtime",
     default=None,
 )
+_RESOURCE_GATE_RUNTIME_TYPED_G5: contextvars.ContextVar[
+    tuple[CgroupProfileV1, SystemdUserCgroupAdapter] | bool | None
+] = contextvars.ContextVar("codex_master_resource_gate_typed_g5", default=None)
 
 
 @contextlib.contextmanager
@@ -1015,8 +1023,24 @@ def _resource_gate_composer_scope() -> Iterator[None]:
     if runtime is None:
         yield
         return
-    with _resource_gate_runtime_scope(runtime):
-        yield
+    flow_runtime: tuple[CgroupProfileV1, SystemdUserCgroupAdapter] | bool | None = None
+    if (
+        runtime.h2_ready is True
+        and type(runtime.cgroup_profile) is CgroupProfileV1
+        and type(runtime.cgroup_adapter) is SystemdUserCgroupAdapter
+    ):
+        try:
+            runtime.cgroup_adapter.bind_target_slice_control_group()
+            require_cgroup_preflight(runtime.cgroup_adapter, runtime.cgroup_profile)
+            flow_runtime = (runtime.cgroup_profile, runtime.cgroup_adapter)
+        except Exception:
+            flow_runtime = False
+    flow_token = _RESOURCE_GATE_RUNTIME_TYPED_G5.set(flow_runtime)
+    try:
+        with _resource_gate_runtime_scope(runtime):
+            yield
+    finally:
+        _RESOURCE_GATE_RUNTIME_TYPED_G5.reset(flow_token)
 
 
 def _call_with_resource_gate_composer(callback: Any) -> Any:
@@ -5658,6 +5682,7 @@ def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> di
         reasons.append("resource_snapshot_invalid")
         return {
             "ok": False,
+            "_typed_hive_io_pressure": False,
             "_g5_facts": True,
             "running_agents": running_agents,
             "reason_codes": reasons,
@@ -5679,15 +5704,26 @@ def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> di
         if not isinstance(facts, ResourceGateFacts):
             raise ValueError
         legacy = facts.legacy_pressure
-        current = facts.current
-        values = (
-            legacy.load_per_cpu,
-            legacy.cpu_busy_percent,
-            legacy.io_wait_percent,
-            legacy.available_memory_percent,
-            facts.available_memory_mib,
-            current.get("io"),
-        )
+        adapter = runtime.cgroup_adapter
+        typed_hive_io_pressure = type(adapter) is SystemdUserCgroupAdapter
+        io_psi = None
+        if typed_hive_io_pressure:
+            io_psi = read_hive_io_pressure(adapter=adapter)
+        if io_psi is None:
+            values = (
+                legacy.load_per_cpu,
+                legacy.cpu_busy_percent,
+                legacy.io_wait_percent,
+                legacy.available_memory_percent,
+                facts.available_memory_mib,
+            )
+        else:
+            values = (
+                legacy.load_per_cpu,
+                legacy.cpu_busy_percent,
+                legacy.available_memory_percent,
+                facts.available_memory_mib,
+            )
         if any(not _finite_resource_number(value) for value in values):
             raise ValueError
         if facts.gate_state not in {"ready", "blocked"}:
@@ -5696,6 +5732,7 @@ def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> di
         reasons.append("resource_snapshot_invalid")
         return {
             "ok": False,
+            "_typed_hive_io_pressure": False,
             "_g5_facts": True,
             "running_agents": running_agents,
             "reason_codes": list(dict.fromkeys(reasons)),
@@ -5715,11 +5752,12 @@ def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> di
     reasons.extend(declared)
     return {
         "ok": not reasons,
+        "_typed_hive_io_pressure": typed_hive_io_pressure,
         "_g5_facts": True,
         "load_per_cpu": legacy.load_per_cpu,
         "cpu_busy_percent": legacy.cpu_busy_percent,
         "io_wait_percent": legacy.io_wait_percent,
-        "io_psi_percent": current["io"],
+        "io_psi_percent": io_psi,
         "available_memory_percent": legacy.available_memory_percent,
         "available_memory_mib": facts.available_memory_mib,
         "running_agents": running_agents,
@@ -5820,8 +5858,11 @@ def spawn_error_details(
         ),
         "io_pressure_high": (
             "I/O-Druck zu hoch",
-            "I/O-Wait ueberschreitet die konfigurierte aktive Grenze.",
-            f"Aktive Grenze: maximal {RESOURCE_MAX_IO_WAIT_PERCENT:g} Prozent I/O-Wait.",
+            "Hive-IO-PSI uebersteigt die aktive Druckgrenze.",
+            (
+                "Aktive Grenze: some avg10<95.0, full avg10<85.0, "
+                "full avg60<80.0."
+            ),
             "I/O-Last senken oder erneut versuchen.",
         ),
         "memory_pressure_high": (
@@ -5919,10 +5960,14 @@ def _resource_pressure_reason_codes(snapshot: Mapping[str, Any], policy: Mapping
     load_per_cpu = snapshot.get("load_per_cpu")
     cpu_busy_percent = snapshot.get("cpu_busy_percent")
     io_wait_percent = snapshot.get("io_wait_percent")
+    io_psi = snapshot.get("io_psi_percent")
+    has_hive_io_pressure = (
+        snapshot.get("_typed_hive_io_pressure") is True
+        or isinstance(io_psi, CgroupIoPressureEvidenceV1)
+    )
     if (
         not _finite_resource_number(load_per_cpu)
         or not _finite_resource_number(cpu_busy_percent)
-        or not _finite_resource_number(io_wait_percent)
     ):
         reasons.append("cpu_metrics_unavailable")
     else:
@@ -5931,14 +5976,20 @@ def _resource_pressure_reason_codes(snapshot: Mapping[str, Any], policy: Mapping
             or cpu_busy_percent > policy["max_cpu_busy_percent"]
         ):
             reasons.append("cpu_pressure_high")
-        if io_wait_percent > policy["max_io_wait_percent"]:
-            reasons.append("io_pressure_high")
-    io_psi_percent = snapshot.get("io_psi_percent")
-    if snapshot.get("_g5_facts") is True:
-        if not _finite_resource_number(io_psi_percent):
-            reasons.append("resource_monitor_unavailable")
-        elif io_psi_percent > policy["max_io_wait_percent"]:
-            reasons.append("io_pressure_high")
+        if has_hive_io_pressure:
+            if not isinstance(io_psi, CgroupIoPressureEvidenceV1):
+                reasons.append("resource_monitor_unavailable")
+            elif (
+                io_psi.some_avg10 >= HIVE_IO_PRESSURE_SOME_AVG10_LIMIT
+                or io_psi.full_avg10 >= HIVE_IO_PRESSURE_FULL_AVG10_LIMIT
+                or io_psi.full_avg60 >= HIVE_IO_PRESSURE_FULL_AVG60_LIMIT
+            ):
+                reasons.append("io_pressure_high")
+        else:
+            if not _finite_resource_number(io_wait_percent):
+                reasons.append("cpu_metrics_unavailable")
+            elif io_wait_percent > policy["max_io_wait_percent"]:
+                reasons.append("io_pressure_high")
     memory_mib = snapshot.get("available_memory_mib")
     if type(memory_mib) is not int or memory_mib < 0:
         reasons.append("memory_metrics_unavailable")
@@ -5951,6 +6002,18 @@ def _resource_pressure_reason_codes(snapshot: Mapping[str, Any], policy: Mapping
 
 
 def _typed_g5_cgroup_runtime() -> tuple[CgroupProfileV1, SystemdUserCgroupAdapter] | None:
+    flow_runtime = _RESOURCE_GATE_RUNTIME_TYPED_G5.get()
+    if flow_runtime is False:
+        return None
+    if flow_runtime is not None:
+        try:
+            profile, adapter = flow_runtime
+        except ValueError:
+            return None
+        if type(profile) is CgroupProfileV1 and type(adapter) is SystemdUserCgroupAdapter:
+            return profile, adapter
+        return None
+
     runtime = _RESOURCE_GATE_RUNTIME.get()
     adapter = None if runtime is None else runtime.cgroup_adapter
     if (
@@ -6019,11 +6082,7 @@ def _resource_admission_decision(
             ],
         )
     else:
-        pressure_reasons = (
-            _resource_pressure_reason_codes(snapshot, policy)
-            if enforce_pressure and policy["pressure_limits_enabled"]
-            else []
-        )
+        pressure_reasons: list[str] = []
         capacity_reasons: list[str] = []
         running_agents = snapshot.get("running_agents")
         available_slots: int | None = None
@@ -6090,14 +6149,11 @@ def _resource_admission_decision(
             if descriptor.task_profile == "simple_only" and not task_ok:
                 reasons.append("ollama_simple_task_only")
         if enforce_pressure and snapshot.get("_g5_facts") is True and not reasons:
-            cgroup_runtime = _typed_g5_cgroup_runtime()
-            if cgroup_runtime is None:
+            if _typed_g5_cgroup_runtime() is None:
                 reasons.append("cgroup_preflight_failed")
-            else:
-                try:
-                    require_cgroup_preflight(cgroup_runtime[1], cgroup_runtime[0])
-                except CgroupPreflightError:
-                    reasons.append("cgroup_preflight_failed")
+        if enforce_pressure and policy["pressure_limits_enabled"] and "cgroup_preflight_failed" not in reasons:
+            pressure_reasons = _resource_pressure_reason_codes(snapshot, policy)
+            reasons.extend(pressure_reasons)
         if enforce_pressure and snapshot.get("_g5_facts") is True and not reasons and _g5_warmup_active():
             reasons.append("spawn_warmup_active")
 
