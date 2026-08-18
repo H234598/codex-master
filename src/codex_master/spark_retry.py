@@ -330,6 +330,7 @@ def apply_resume_event(
     ):
         if retry_count < _CAPACITY_RETRY_LIMIT:
             retry_count += 1
+        active_window_ms = 0
 
     return ResumeCapsuleV1(
         bee_id=capsule.bee_id,

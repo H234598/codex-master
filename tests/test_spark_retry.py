@@ -260,6 +260,90 @@ def test_active_events_count_and_inactive_events_are_zeroed() -> None:
     assert after_provider.active_window_ms == 500
 
 
+def test_capacity_event_starts_new_activity_epoch_before_retry_reset() -> None:
+    capsule = normalize_resume_capsule(
+        base_capsule_payload()
+        | {"retry_count": 12, "active_window_ms": 299_900}
+    )
+    after_capacity = apply_resume_event(
+        capsule,
+        base_event_payload()
+        | {"event_sequence": 1, "event_type": "capacity", "error_code": "at_capacity"},
+    )
+    after_small_provider = apply_resume_event(
+        after_capacity,
+        base_event_payload()
+        | {"event_sequence": 2, "event_type": "provider", "active_duration_ms": 100},
+    )
+
+    assert after_capacity.retry_count == 13
+    assert after_capacity.active_window_ms == 0
+    assert after_small_provider.retry_count == 13
+    assert after_small_provider.active_window_ms == 100
+
+    after_reset = apply_resume_event(
+        after_small_provider,
+        base_event_payload()
+        | {"event_sequence": 3, "event_type": "provider", "active_duration_ms": 299_900},
+    )
+    assert after_reset.retry_count == 0
+    assert after_reset.active_window_ms == 0
+
+
+def test_noncanonical_capacity_and_inactive_events_do_not_open_new_epoch() -> None:
+    capsule = normalize_resume_capsule(
+        base_capsule_payload() | {"retry_count": 7, "active_window_ms": 200_000}
+    )
+    non_canonical = apply_resume_event(
+        capsule,
+        base_event_payload()
+        | {"event_sequence": 1, "event_type": "capacity", "error_code": "token_lost"},
+    )
+    mismatched = apply_resume_event(
+        non_canonical,
+        base_event_payload()
+        | {
+            "event_sequence": 2,
+            "event_type": "provider",
+            "active_duration_ms": 120_000,
+            "binding": {
+                "bee_id": "bee-other",
+                "session_id": "session-77",
+                "spark_requirement": "explicit_spark",
+                "model": "gpt-5.3",
+                "provider": "gemini",
+                "effort": "high",
+                "account_binding": "sha256:" + ("ab" * 32),
+            },
+        },
+    )
+    backoff = apply_resume_event(
+        mismatched,
+        base_event_payload()
+        | {"event_sequence": 3, "event_type": "backoff", "active_duration_ms": 120_000},
+    )
+    wait = apply_resume_event(
+        backoff,
+        base_event_payload()
+        | {"event_sequence": 4, "event_type": "wait", "active_duration_ms": 120_000},
+    )
+    poll = apply_resume_event(
+        wait,
+        base_event_payload()
+        | {"event_sequence": 5, "event_type": "poll", "active_duration_ms": 120_000},
+    )
+    liveness = apply_resume_event(
+        poll,
+        base_event_payload()
+        | {"event_sequence": 6, "event_type": "liveness", "active_duration_ms": 120_000},
+    )
+
+    assert backoff.retry_count == 7
+    assert backoff.active_window_ms == 200_000
+    assert wait.active_window_ms == 200_000
+    assert poll.active_window_ms == 200_000
+    assert liveness.active_window_ms == 200_000
+
 def test_active_window_reset_and_capacity_before_and_after_boundary() -> None:
     base = normalize_resume_capsule(base_capsule_payload() | {"retry_count": 12, "active_window_ms": 299_900})
     before_reset = apply_resume_event(
