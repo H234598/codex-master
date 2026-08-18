@@ -1051,7 +1051,10 @@ class FakeProviderResponse:
 def test_gemini_rest_probe_uses_fixed_model_header_key_and_bounded_json() -> None:
     response = FakeProviderResponse(
         GEMINI_PROBE_URL,
-        json.dumps({"candidates": [{"content": {"parts": [{"text": "OK"}]}}]}).encode(),
+        json.dumps({
+            "status": "completed",
+            "steps": [{"type": "model_output", "content": [{"type": "text", "text": "OK"}]}],
+        }).encode(),
     )
     observed: dict[str, object] = {}
 
@@ -1073,6 +1076,12 @@ def test_gemini_rest_probe_uses_fixed_model_header_key_and_bounded_json() -> Non
     assert observed["authorization"] is None
     assert isinstance(observed["body"], bytes)
     assert len(observed["body"]) <= MAX_GEMINI_PROBE_REQUEST_BYTES
+    assert json.loads(observed["body"]) == {
+        "model": GEMINI_DEFAULT_LIGHT_MODEL,
+        "input": "Reply with exactly OK.",
+        "generation_config": {"max_output_tokens": 1},
+        "store": False,
+    }
     assert b"private-gemini-key" not in observed["body"]
     assert observed["timeout"] == 5
     assert response.read_sizes == [MAX_GEMINI_PROBE_RESPONSE_BYTES + 1]
@@ -1119,7 +1128,7 @@ def test_gemini_rest_probe_classifies_structured_and_detailless_429() -> None:
 def test_gemini_rest_probe_rotates_only_to_canonical_25_model() -> None:
     model = "gemini-2.5-flash-lite"
     response = FakeProviderResponse(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        GEMINI_PROBE_URL,
         json.dumps({"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}}).encode(),
         status=429,
     )
@@ -1127,11 +1136,18 @@ def test_gemini_rest_probe_rotates_only_to_canonical_25_model() -> None:
 
     def opener(request: object, *, timeout: int) -> FakeProviderResponse:
         observed["url"] = request.full_url  # type: ignore[attr-defined]
+        observed["body"] = request.data  # type: ignore[attr-defined]
         return response
 
     result = probe_gemini_rest("private-gemini-key", model=model, opener=opener)
 
     assert observed["url"] == response.geturl()
+    assert json.loads(observed["body"]) == {
+        "model": model,
+        "input": "Reply with exactly OK.",
+        "generation_config": {"max_output_tokens": 1},
+        "store": False,
+    }
     assert result.model == model
     assert result.error is not None
     assert result.error.kind == "account_limited"

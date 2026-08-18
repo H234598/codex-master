@@ -35,8 +35,7 @@ MAX_PROVIDER_MODELS = 1000
 PROVIDER_HTTP_TIMEOUT_SECONDS = 5
 GEMINI_PROBE_TIMEOUT_SECONDS = 90
 GEMINI_DEFAULT_LIGHT_MODEL = "gemini-3.1-flash-lite"
-GEMINI_PROBE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models/"
-GEMINI_PROBE_URL = f"{GEMINI_PROBE_BASE_URL}{GEMINI_DEFAULT_LIGHT_MODEL}:generateContent"
+GEMINI_PROBE_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 MAX_GEMINI_MODEL_ID_BYTES = 128
 MAX_GEMINI_MODELS_PAGES = 4
@@ -1024,18 +1023,18 @@ def _gemini_probe_error_payload(status: int, raw: object) -> object:
 def _gemini_probe_response_ready(raw: object) -> bool:
     if not isinstance(raw, Mapping):
         return False
-    candidates = raw.get("candidates")
-    if not isinstance(candidates, list) or not 1 <= len(candidates) <= 8:
+    if raw.get("status") != "completed":
         return False
-    candidate = candidates[0]
-    if not isinstance(candidate, Mapping):
+    steps = raw.get("steps")
+    if not isinstance(steps, list) or not 1 <= len(steps) <= 8:
         return False
-    content = candidate.get("content")
-    if not isinstance(content, Mapping):
-        return False
-    parts = content.get("parts")
-    return isinstance(parts, list) and 1 <= len(parts) <= 8 and all(
-        isinstance(part, Mapping) for part in parts
+    return any(
+        isinstance(step, Mapping)
+        and step.get("type") == "model_output"
+        and isinstance(step.get("content"), list)
+        and 1 <= len(step["content"]) <= 8
+        and all(isinstance(part, Mapping) for part in step["content"])
+        for step in steps
     )
 
 
@@ -1057,7 +1056,6 @@ def probe_gemini_rest(
             False,
             ProviderError("model_unavailable", False, None, None),
         )
-    probe_url = f"{GEMINI_PROBE_BASE_URL}{model}:generateContent"
     if not isinstance(secret, str) or not 1 <= len(secret.encode("utf-8")) <= MAX_PROVIDER_RESPONSE_BYTES:
         return ProbeResult(
             Provider.GEMINI_API,
@@ -1069,8 +1067,10 @@ def probe_gemini_rest(
 
     body = json.dumps(
         {
-            "contents": [{"parts": [{"text": "Reply with exactly OK."}]}],
-            "generationConfig": {"maxOutputTokens": 1},
+            "model": model,
+            "input": "Reply with exactly OK.",
+            "generation_config": {"max_output_tokens": 1},
+            "store": False,
         },
         separators=(",", ":"),
         sort_keys=True,
@@ -1085,7 +1085,7 @@ def probe_gemini_rest(
         )
 
     request = Request(
-        probe_url,
+        GEMINI_PROBE_URL,
         data=body,
         headers={
             "Accept": "application/json",
@@ -1110,7 +1110,7 @@ def probe_gemini_rest(
             try:
                 raw = _provider_json_body(
                     response,
-                    probe_url,
+                    GEMINI_PROBE_URL,
                     max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES,
                 )
             except _RedirectRejected:
@@ -1123,14 +1123,14 @@ def probe_gemini_rest(
                 "",
             )
             return ProbeResult(Provider.GEMINI_API, False, model, False, error)
-        raw = _provider_json_body(response, probe_url, max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES)
+        raw = _provider_json_body(response, GEMINI_PROBE_URL, max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES)
         if not _gemini_probe_response_ready(raw):
             raise FleetRunnerError("provider_response_invalid")
         return ProbeResult(Provider.GEMINI_API, True, model, True, None)
     except HTTPError as exc:
         response = exc
         try:
-            raw = _provider_json_body(exc, probe_url, max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES)
+            raw = _provider_json_body(exc, GEMINI_PROBE_URL, max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES)
         except FleetRunnerError:
             raw = {}
         error = classify_provider_error(
