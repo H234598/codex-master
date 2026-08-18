@@ -752,6 +752,76 @@ def test_probe_model_scope_without_retry_or_accountwide_scopes_fail_closed(
     assert service._load_limits().get("shared", {}).get("reset_at_utc") == "2026-08-03T12:03:00Z"
 
 
+def test_detail_poor_429_binds_account_limit_to_existing_rate_cooldown(tmp_path: Path, monkeypatch) -> None:
+    service, _ = _service(tmp_path, _configured_snapshot())
+    reservation = service.reserve_gemini_request("shared")
+    monkeypatch.setattr(service, "reserve_gemini_request", lambda _account_id: reservation)
+
+    assert service.gemini_rate_status("shared").get("defer_until") == "2026-08-03T14:01:00Z"
+
+    result = service.probe_account(
+        "shared",
+        lambda account: ProbeResult(account.provider, False, "gemini-3.1-flash", False,
+                                   ProviderError("account_limited", True, 429, None)),
+        expected_generation=2,
+    )
+
+    assert result["reason"] == "limit_active"
+    assert service.account_gate("d1").reason == "limit_active"
+    assert service._load_limits()["shared"] == {
+        "reset_at_utc": "2026-08-03T12:15:00Z",
+        "reason": "provider_429",
+    }
+    assert service.gemini_rate_status("shared").get("defer_until") == "2026-08-03T12:15:00Z"
+
+    service._io = replace(service._io, utc_now=lambda: datetime(2026, 8, 3, 12, 16, tzinfo=timezone.utc))
+    assert service.account_gate("d1").reason == "limit_unknown"
+
+
+@pytest.mark.parametrize(
+    ("inject_invalid_local_deadline", "raise_status"),
+    [
+        (False, False),
+        (True, False),
+        (False, True),
+    ],
+)
+def test_detail_poor_429_without_valid_rate_deadline_remains_unbounded_limited(
+    tmp_path: Path,
+    monkeypatch,
+    inject_invalid_local_deadline: bool,
+    raise_status: bool,
+) -> None:
+    service, _ = _service(tmp_path, _configured_snapshot())
+    if raise_status:
+        def _raise_status(_account_id: str) -> dict[str, object]:
+            raise RuntimeError("status-unavailable")
+    elif inject_invalid_local_deadline:
+        status = {"defer_until": "not-a-time", "allowed": False, "reason": "gemini_local_rate_limit"}
+    else:
+        status = {}
+    if raise_status:
+        monkeypatch.setattr(service, "gemini_rate_status", _raise_status)
+    else:
+        monkeypatch.setattr(
+            service,
+            "gemini_rate_status",
+            lambda _account_id: status,
+        )
+
+    result = service.probe_account(
+        "shared",
+        lambda account: ProbeResult(account.provider, False, "gemini-3.1-flash", False,
+                                   ProviderError("account_limited", True, 429, None)),
+        expected_generation=2,
+    )
+
+    assert result["reason"] == "limit_active"
+    assert service._load_limits()["shared"]["reset_at_utc"] is None
+    service._io = replace(service._io, utc_now=lambda: datetime(2026, 8, 3, 13, 0, tzinfo=timezone.utc))
+    assert service.account_gate("d1").reason == "limit_active"
+
+
 def test_legacy_usage_events_missing_quota_fields_normalize_to_none(
     tmp_path: Path,
 ) -> None:

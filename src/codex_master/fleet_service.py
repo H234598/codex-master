@@ -2059,7 +2059,41 @@ class FleetService:
                 reason = "provider_unavailable"
 
             if reason == "limit_active":
-                reset_at_utc = result.error.reset_at_utc if isinstance(result, ProbeResult) and result.error else None
+                if (
+                    isinstance(result, ProbeResult)
+                    and result.error is not None
+                ):
+                    reset_at_utc = result.error.reset_at_utc
+                else:
+                    reset_at_utc = None
+                if isinstance(reset_at_utc, str):
+                    try:
+                        parsed = datetime.fromisoformat(reset_at_utc.replace("Z", "+00:00"))
+                    except ValueError:
+                        parsed = None
+                    else:
+                        if parsed.tzinfo is None:
+                            parsed = None
+                else:
+                    parsed = None
+                if parsed is None or parsed <= self._rate_now():
+                    try:
+                        rate_status = self.gemini_rate_status(account.account_id)
+                    except Exception:
+                        rate_status = {}
+                    defer_until = rate_status.get("defer_until") if isinstance(rate_status, Mapping) else None
+                    if isinstance(defer_until, str):
+                        try:
+                            parsed = datetime.fromisoformat(defer_until.replace("Z", "+00:00"))
+                        except ValueError:
+                            parsed = None
+                        else:
+                            if parsed.tzinfo is not None and parsed > self._rate_now():
+                                reset_at_utc = self._rate_text(parsed.astimezone(timezone.utc))
+                            else:
+                                reset_at_utc = None
+                    else:
+                        reset_at_utc = None
                 stored = self._mark_limited_locked(
                     account_id,
                     reset_at_utc=reset_at_utc,
