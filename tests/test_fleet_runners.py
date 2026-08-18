@@ -18,6 +18,8 @@ from codex_master.fleet_runners import (
     OLLAMA_MODELS_URL,
     build_runner_plan,
     classify_provider_error,
+    ProviderError,
+    ProviderErrorQuotaObservation,
     model_is_agentic,
     parse_gemini_jsonl,
     probe_gemini_cli,
@@ -355,6 +357,194 @@ def test_provider_error_classifier_uses_only_structured_confirmations(
 ) -> None:
     error = classify_provider_error(Provider.OPENAI_API, payload, "private stderr")
     assert (error.kind, error.retryable) == (kind, retryable)
+
+
+def test_provider_error_records_quota_retry_scope_model_and_clamps_duration() -> None:
+    model_payload = {
+        "error": {
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+                {
+                    "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                    "violations": [
+                        {
+                            "quotaDimensions": {
+                                "model": "gemini",
+                                "region": "us-central1",
+                                "feature": "batch",
+                            },
+                        },
+                    ],
+                },
+                {
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "1.1s",
+                },
+            ],
+        },
+    }
+    bounded_payload = {
+        "error": {
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+                {
+                    "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                    "violations": [
+                        {
+                            "quotaDimensions": {"model": "gemini"},
+                        },
+                    ],
+                },
+                {
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "3600.1s",
+                },
+            ],
+        },
+    }
+    error = classify_provider_error(Provider.GEMINI_API, model_payload, "")
+    bounded_error = classify_provider_error(Provider.GEMINI_API, bounded_payload, "")
+
+    assert error.kind == "account_limited"
+    assert error.status_code == 429
+    assert error.reset_at_utc is None
+    assert error.quota_observation is not None
+    assert error.quota_observation.scope == "model"
+    assert error.quota_observation.retry_after_seconds == 2
+    assert "retryDelay" not in repr(error.quota_observation)
+    assert "gemini" not in repr(error.quota_observation)
+    assert "us-central1" not in repr(error.quota_observation)
+    assert "batch" not in repr(error.quota_observation)
+    assert error.quota_observation == ProviderErrorQuotaObservation("model", 2)
+    assert bounded_error.kind == "account_limited"
+    assert bounded_error.status_code == 429
+    assert bounded_error.quota_observation is not None
+    assert bounded_error.quota_observation.scope == "model"
+    assert bounded_error.quota_observation.retry_after_seconds == 3600
+    assert "retryDelay" not in repr(bounded_error.quota_observation)
+    assert "3600.1" not in repr(bounded_error.quota_observation)
+
+
+def test_provider_error_records_scope_account_unknown_and_sanitizes_retry_info() -> None:
+    account_payload = {
+        "error": {
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+                {
+                    "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                    "violations": [
+                        {
+                            "quotaDimensions": {},
+                        },
+                    ],
+                },
+                {
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "0s",
+                },
+            ],
+        },
+    }
+    unknown_payload = {
+        "error": {
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+                {
+                    "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                    "violations": [{"quotaDimensions": {"region": "us"}}],
+                },
+                {
+                    "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                    "violations": [{"quotaDimensions": {"model": "gemini"}}],
+                },
+                {
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "1.5s",
+                },
+                {
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "2.5s",
+                },
+            ],
+        },
+    }
+    malformed_retry_payload = {
+        "error": {
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+                {
+                    "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                    "violations": [{"quotaDimensions": {"model": "gemini"}}],
+                },
+                {
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "not-a-duration",
+                },
+            ],
+        },
+    }
+    overlong_retry_payload = {
+        "error": {
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+                {
+                    "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                    "violations": [{"quotaDimensions": {}}],
+                },
+                {
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "9" * 500 + "s",
+                },
+            ],
+        },
+    }
+    missing_payload = {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "details": [{"foo": 1}]}}
+
+    account_error = classify_provider_error(Provider.GEMINI_API, account_payload, "")
+    unknown_error = classify_provider_error(Provider.GEMINI_API, unknown_payload, "")
+    malformed_retry_error = classify_provider_error(Provider.GEMINI_API, malformed_retry_payload, "")
+    overlong_retry_error = classify_provider_error(Provider.GEMINI_API, overlong_retry_payload, "")
+    missing_payload_error = classify_provider_error(Provider.GEMINI_API, missing_payload, "")
+
+    assert account_error.kind == "account_limited"
+    assert account_error.status_code == 429
+    assert account_error.quota_observation is not None
+    assert account_error.quota_observation.scope == "account"
+    assert account_error.quota_observation.retry_after_seconds is None
+    assert unknown_error.quota_observation is not None
+    assert unknown_error.quota_observation.scope == "unknown"
+    assert unknown_error.quota_observation.retry_after_seconds is None
+    assert malformed_retry_error.quota_observation is not None
+    assert malformed_retry_error.quota_observation.scope == "model"
+    assert malformed_retry_error.quota_observation.retry_after_seconds is None
+    assert overlong_retry_error.quota_observation is not None
+    assert overlong_retry_error.quota_observation.scope == "account"
+    assert overlong_retry_error.quota_observation.retry_after_seconds is None
+    assert missing_payload_error.quota_observation is not None
+    assert missing_payload_error.quota_observation.scope == "unknown"
+    assert missing_payload_error.quota_observation.retry_after_seconds is None
+
+
+def test_provider_error_non_429_keeps_quota_observation_none_and_old_constructors() -> None:
+    not_429 = classify_provider_error(
+        Provider.GEMINI_API, {"code": 503, "status": "UNAVAILABLE", "details": []}, "",
+    )
+    no_http_429 = classify_provider_error(
+        Provider.GEMINI_API, {"status": "RESOURCE_EXHAUSTED", "details": []}, "",
+    )
+    legacy = ProviderError("account_limited", True, 429, None)
+
+    assert not_429.kind == "provider_unavailable"
+    assert not_429.quota_observation is None
+    assert no_http_429.kind == "account_limited"
+    assert no_http_429.quota_observation is None
+    assert legacy == ProviderError("account_limited", True, 429, None)
 
 
 def test_provider_error_keeps_only_valid_structured_reset_time() -> None:

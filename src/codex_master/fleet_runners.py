@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal
+from typing import Final, Literal
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 from unicodedata import category
@@ -41,6 +41,12 @@ _SECRET_ENV_NAMES = frozenset({
     "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "GOOGLE_GENAI_USE_VERTEXAI", "HF_TOKEN",
 })
 _RFC3339_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\Z")
+_QUOTA_FAILURE_TYPE: Final = "type.googleapis.com/google.rpc.QuotaFailure"
+_RETRY_INFO_TYPE: Final = "type.googleapis.com/google.rpc.RetryInfo"
+_QUOTA_SCOPE_ACCOUNT: Final = "account"
+_QUOTA_SCOPE_MODEL: Final = "model"
+_QUOTA_SCOPE_UNKNOWN: Final = "unknown"
+_MAX_RETRY_AFTER_SECONDS: Final = 3600
 
 
 class FleetRunnerError(ValueError):
@@ -70,6 +76,12 @@ class _RejectRedirectHandler(HTTPRedirectHandler):
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderErrorQuotaObservation:
+    scope: Literal["model", "account", "unknown"]
+    retry_after_seconds: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderError:
     kind: Literal[
         "account_limited", "auth_invalid", "secret_missing", "provider_unavailable", "model_unavailable",
@@ -78,6 +90,7 @@ class ProviderError:
     retryable: bool
     status_code: int | None
     reset_at_utc: str | None
+    quota_observation: ProviderErrorQuotaObservation | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +212,108 @@ def _valid_time(value: object) -> str | None:
     return value
 
 
+def _parse_retry_delay_seconds(value: object) -> int | None:
+    if not isinstance(value, str):
+        return None
+    if len(value) > 64:
+        return None
+    match = re.fullmatch(r"(\d+)(?:\.(\d{1,9}))?s", value)
+    if match is None:
+        return None
+    integer_seconds = int(match.group(1))
+    if integer_seconds == 0 and match.group(2) is None:
+        return None
+    fractional = match.group(2)
+    if fractional is None or fractional == "":
+        seconds = integer_seconds
+    else:
+        if int(fractional) == 0:
+            seconds = integer_seconds
+        else:
+            seconds = integer_seconds + 1
+    if seconds <= 0:
+        return None
+    if seconds > _MAX_RETRY_AFTER_SECONDS:
+        return _MAX_RETRY_AFTER_SECONDS
+    return seconds
+
+
+def _collect_quota_scope(details: list[object]) -> tuple[bool, Literal["model", "account", "unknown"] | None]:
+    derived_scopes: set[Literal["model", "account", "unknown"]] = set()
+    quota_failure_seen = False
+    for item in details:
+        detail = _mapping(item)
+        if detail is None or detail.get("@type") != _QUOTA_FAILURE_TYPE:
+            continue
+        quota_failure_seen = True
+        violations = detail.get("violations")
+        if not isinstance(violations, list):
+            return True, _QUOTA_SCOPE_UNKNOWN
+        if len(violations) == 0:
+            return True, _QUOTA_SCOPE_UNKNOWN
+        for raw_violation in violations:
+            violation = _mapping(raw_violation)
+            if violation is None:
+                return True, _QUOTA_SCOPE_UNKNOWN
+            dimensions = violation.get("quotaDimensions")
+            dimensions_mapping = _mapping(dimensions)
+            if dimensions is None:
+                return True, _QUOTA_SCOPE_UNKNOWN
+            if dimensions_mapping is None:
+                return True, _QUOTA_SCOPE_UNKNOWN
+            dimensions = dimensions_mapping
+            if not dimensions:
+                derived_scopes.add(_QUOTA_SCOPE_ACCOUNT)
+                continue
+            if any(not isinstance(key, str) for key in dimensions.keys()):
+                return True, _QUOTA_SCOPE_UNKNOWN
+            if any(not isinstance(value, str) or not value for value in dimensions.values()):
+                return True, _QUOTA_SCOPE_UNKNOWN
+            if _QUOTA_SCOPE_MODEL in dimensions:
+                derived_scopes.add(_QUOTA_SCOPE_MODEL)
+                continue
+            return True, _QUOTA_SCOPE_UNKNOWN
+
+    if not quota_failure_seen:
+        return False, None
+    if len(derived_scopes) == 0:
+        return True, _QUOTA_SCOPE_UNKNOWN
+    if len(derived_scopes) > 1:
+        return True, _QUOTA_SCOPE_UNKNOWN
+    return True, next(iter(derived_scopes))
+
+
+def _collect_retry_seconds(details: list[object]) -> int | None:
+    observed: int | None = None
+    for item in details:
+        detail = _mapping(item)
+        if detail is None or detail.get("@type") != _RETRY_INFO_TYPE:
+            continue
+        retry_seconds = _parse_retry_delay_seconds(detail.get("retryDelay"))
+        if retry_seconds is None:
+            return None
+        if observed is None:
+            observed = retry_seconds
+        elif observed != retry_seconds:
+            return None
+    return observed
+
+
+def _quota_observation(payload: Mapping[str, object]) -> ProviderErrorQuotaObservation | None:
+    details = payload.get("details")
+    if not isinstance(details, list):
+        return ProviderErrorQuotaObservation(_QUOTA_SCOPE_UNKNOWN, None)
+
+    has_quota_scope, scope = _collect_quota_scope(details)
+    retry_after_seconds = _collect_retry_seconds(details)
+    if not has_quota_scope:
+        return ProviderErrorQuotaObservation(_QUOTA_SCOPE_UNKNOWN, None)
+    if scope is None:
+        return ProviderErrorQuotaObservation(_QUOTA_SCOPE_UNKNOWN, retry_after_seconds)
+
+    return ProviderErrorQuotaObservation(scope, retry_after_seconds)
+
+
 def classify_provider_error(provider: Provider, payload: object, stderr: str) -> ProviderError:
     del provider, stderr
     raw = _mapping(payload)
@@ -210,20 +325,23 @@ def classify_provider_error(provider: Provider, payload: object, stderr: str) ->
     status = details.get("status")
     status_name = status if isinstance(status, str) else ""
     reset_at_utc = _valid_time(details.get("reset_at_utc"))
+    quota_observation = None
+    if status_code == 429:
+        quota_observation = _quota_observation(details)
     if (status_code == 429 or status_name in {"RESOURCE_EXHAUSTED", "BUDGET_EXHAUSTED",
                                                "ADMINISTRATIVE_QUOTA_LOCKED"}
             or details.get("budget_exhausted") is True
             or details.get("administrative_quota_lock") is True):
-        return ProviderError("account_limited", True, status_code, reset_at_utc)
+        return ProviderError("account_limited", True, status_code, reset_at_utc, quota_observation)
     if status_code in {401, 403} or status_name in {"UNAUTHENTICATED", "PERMISSION_DENIED"}:
-        return ProviderError("auth_invalid", False, status_code, reset_at_utc)
+        return ProviderError("auth_invalid", False, status_code, reset_at_utc, None)
     if (status_code is not None and 500 <= status_code <= 599
             or status_name in {"UNAVAILABLE", "TRANSPORT_UNAVAILABLE"}
             or details.get("transport_error") is True):
-        return ProviderError("provider_unavailable", True, status_code, reset_at_utc)
+        return ProviderError("provider_unavailable", True, status_code, reset_at_utc, None)
     if status_name in {"MODEL_NOT_FOUND", "MODEL_UNAVAILABLE"} or details.get("model_not_found") is True:
-        return ProviderError("model_unavailable", False, status_code, reset_at_utc)
-    return ProviderError("runner_failed", False, status_code, reset_at_utc)
+        return ProviderError("model_unavailable", False, status_code, reset_at_utc, None)
+    return ProviderError("runner_failed", False, status_code, reset_at_utc, None)
 
 
 def _usage(value: object) -> int | None:
