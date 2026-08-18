@@ -456,6 +456,36 @@ def test_account_tool_catalog_has_no_secret_default_or_private_fields() -> None:
     assert provider_schema["properties"]["provider"]["enum"] == [
         "ollama_local", "huggingface_inference",
     ]
+    probe_schema = by_name["fleet_account_probe"]["inputSchema"]
+    assert probe_schema["required"] == ["account_id", "expected_generation"]
+    assert probe_schema["properties"]["model"] == {"type": "string", "maxLength": 64}
+
+
+def test_fleet_account_probe_cli_threads_optional_model(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_call(name: str, args: dict[str, object]) -> dict[str, object]:
+        captured["name"] = name
+        captured["args"] = args
+        return {"raw_output": "not_returned"}
+
+    monkeypatch.setattr(server, "call_validated_tool", fake_call)
+    assert server.main_cli([
+        "fleet", "account", "probe", "--account-id", "gemini-ready",
+        "--expected-generation", "3", "--model", "gemini-2.5-flash-lite",
+    ]) == 0
+    capsys.readouterr()
+    assert captured == {
+        "name": "fleet_account_probe",
+        "args": {
+            "account_id": "gemini-ready",
+            "model": "gemini-2.5-flash-lite",
+            "expected_generation": 3,
+        },
+    }
 
 
 def test_fleet_cli_namespace_exposes_read_only_account_listing(
@@ -620,30 +650,37 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
     probe_account = Mock(wraps=service.probe_account)
     monkeypatch.setattr(service, "probe_account", probe_account)
     monkeypatch.setattr(server, "current_fleet_service", lambda: service)
+    explicit_model = "gemini-2.5-flash-lite"
 
-    def fake_probe(secret: str) -> ProbeResult:
+    def fake_probe(secret: str, *, model: str | None = None) -> ProbeResult:
         captured["secret"] = secret
+        captured["model"] = model
         return ProbeResult(
             Provider.GEMINI_API,
             True,
-            server.GEMINI_DEFAULT_LIGHT_MODEL,
+            explicit_model,
             True,
             None,
         )
 
     monkeypatch.setattr(server, "probe_gemini_rest", fake_probe)
-    result = server.fleet_account_probe(account_id="gemini-ready", expected_generation=3)
+    result = server.fleet_account_probe(
+        account_id="gemini-ready",
+        expected_generation=3,
+        model=explicit_model,
+    )
 
     assert result == {
         "probed": True,
         "generation": 4,
         "ready": True,
         "reason": "ready",
-        "model": server.GEMINI_DEFAULT_LIGHT_MODEL,
+        "model": explicit_model,
         "raw_output": "not_returned",
     }
     assert captured["secret"] == GEMINI_READY_CREDENTIAL
-    assert probe_account.call_args.kwargs["model"] == server.GEMINI_DEFAULT_LIGHT_MODEL
+    assert captured["model"] == explicit_model
+    assert probe_account.call_args.kwargs["model"] == explicit_model
     assert GEMINI_READY_CREDENTIAL not in json.dumps(result)
 
 
@@ -807,7 +844,7 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
     )
     monkeypatch.setattr(server.shutil, "which", lambda _name: pytest.fail("CLI lookup is not part of account probe"))
 
-    def fake_probe(secret: str) -> ProbeResult:
+    def fake_probe(secret: str, *, model: str | None = None) -> ProbeResult:
         if not expected_ready:
             return ProbeResult(
                 Provider.GEMINI_API,
@@ -1067,6 +1104,26 @@ def test_fleet_mutation_dispatch_requires_expected_generation(
                 "provider": "gemini_api",
                 "auth_kind": "api_key",
                 "enabled": True,
+            },
+        )
+
+
+def test_fleet_account_probe_dispatch_rejects_non_string_model_before_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        server,
+        "require_fleet_recovery_ready",
+        lambda _operation: pytest.fail("invalid model reached recovery gate"),
+    )
+
+    with pytest.raises(server.AgentError, match="gemini_model_invalid"):
+        server.call_tool(
+            "fleet_account_probe",
+            {
+                "account_id": "gemini-ready",
+                "model": {"not": "a model"},
+                "expected_generation": 3,
             },
         )
 

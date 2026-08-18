@@ -1111,6 +1111,46 @@ def test_gemini_rest_probe_classifies_structured_and_detailless_429() -> None:
     assert result.error.quota_observation == ProviderErrorQuotaObservation("unknown", None)
 
 
+def test_gemini_rest_probe_rotates_only_to_canonical_25_model() -> None:
+    model = "gemini-2.5-flash-lite"
+    response = FakeProviderResponse(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        json.dumps({"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}}).encode(),
+        status=429,
+    )
+    observed: dict[str, object] = {}
+
+    def opener(request: object, *, timeout: int) -> FakeProviderResponse:
+        observed["url"] = request.full_url  # type: ignore[attr-defined]
+        return response
+
+    result = probe_gemini_rest("private-gemini-key", model=model, opener=opener)
+
+    assert observed["url"] == response.geturl()
+    assert result.model == model
+    assert result.error is not None
+    assert result.error.kind == "account_limited"
+
+
+@pytest.mark.parametrize("model", [
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent",
+    "gemini-2.5-flash-lite/extra",
+    "gemini-2.5-flash-lite?x=1",
+    "GEMINI-2.5-FLASH-LITE",
+    " gemini-2.5-flash-lite",
+])
+def test_gemini_rest_probe_rejects_noncanonical_model_without_opener(model: str) -> None:
+    result = probe_gemini_rest(
+        "private-gemini-key",
+        model=model,
+        opener=lambda *_args, **_kwargs: pytest.fail("invalid model reached opener"),
+    )
+
+    assert result.model is None
+    assert result.error is not None
+    assert result.error.kind == "model_unavailable"
+
+
 def test_gemini_rest_probe_rejects_redirects() -> None:
     redirected = FakeProviderResponse("https://example.invalid/redirect", b"{}", status=429)
     result = probe_gemini_rest("private-gemini-key", opener=lambda *_args, **_kwargs: redirected)

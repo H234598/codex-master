@@ -34,10 +34,12 @@ MAX_PROVIDER_MODELS = 1000
 PROVIDER_HTTP_TIMEOUT_SECONDS = 5
 GEMINI_PROBE_TIMEOUT_SECONDS = 90
 GEMINI_DEFAULT_LIGHT_MODEL = "gemini-3.1-flash-lite"
-GEMINI_PROBE_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_DEFAULT_LIGHT_MODEL}:generateContent"
-)
+GEMINI_PROBE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models/"
+GEMINI_PROBE_URL = f"{GEMINI_PROBE_BASE_URL}{GEMINI_DEFAULT_LIGHT_MODEL}:generateContent"
+GEMINI_PROBE_MODELS: Final[frozenset[str]] = frozenset({
+    GEMINI_DEFAULT_LIGHT_MODEL,
+    "gemini-2.5-flash-lite",
+})
 MAX_GEMINI_PROBE_REQUEST_BYTES = 4096
 MAX_GEMINI_PROBE_RESPONSE_BYTES = 64 * 1024
 OLLAMA_MODELS_URL = "http://127.0.0.1:11434/api/tags"
@@ -155,6 +157,13 @@ class FleetRunnerError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+def validate_gemini_probe_model(model: object | None) -> str:
+    candidate = GEMINI_DEFAULT_LIGHT_MODEL if model is None else model
+    if not isinstance(candidate, str) or candidate not in GEMINI_PROBE_MODELS:
+        raise FleetRunnerError("gemini_model_invalid")
+    return candidate
 
 
 @dataclass(frozen=True, slots=True)
@@ -841,11 +850,22 @@ def _gemini_probe_response_ready(raw: object) -> bool:
 def probe_gemini_rest(
     secret: str,
     *,
+    model: str | None = None,
     opener: Callable[..., object] | None = None,
 ) -> ProbeResult:
     """Run one bounded Gemini REST readiness probe using a header-only key."""
 
-    model = GEMINI_DEFAULT_LIGHT_MODEL
+    try:
+        model = validate_gemini_probe_model(model)
+    except FleetRunnerError:
+        return ProbeResult(
+            Provider.GEMINI_API,
+            False,
+            None,
+            False,
+            ProviderError("model_unavailable", False, None, None),
+        )
+    probe_url = f"{GEMINI_PROBE_BASE_URL}{model}:generateContent"
     if not isinstance(secret, str) or not 1 <= len(secret.encode("utf-8")) <= MAX_PROVIDER_RESPONSE_BYTES:
         return ProbeResult(
             Provider.GEMINI_API,
@@ -873,7 +893,7 @@ def probe_gemini_rest(
         )
 
     request = Request(
-        GEMINI_PROBE_URL,
+        probe_url,
         data=body,
         headers={
             "Accept": "application/json",
@@ -898,7 +918,7 @@ def probe_gemini_rest(
             try:
                 raw = _provider_json_body(
                     response,
-                    GEMINI_PROBE_URL,
+                    probe_url,
                     max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES,
                 )
             except _RedirectRejected:
@@ -911,14 +931,14 @@ def probe_gemini_rest(
                 "",
             )
             return ProbeResult(Provider.GEMINI_API, False, model, False, error)
-        raw = _provider_json_body(response, GEMINI_PROBE_URL, max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES)
+        raw = _provider_json_body(response, probe_url, max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES)
         if not _gemini_probe_response_ready(raw):
             raise FleetRunnerError("provider_response_invalid")
         return ProbeResult(Provider.GEMINI_API, True, model, True, None)
     except HTTPError as exc:
         response = exc
         try:
-            raw = _provider_json_body(exc, GEMINI_PROBE_URL, max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES)
+            raw = _provider_json_body(exc, probe_url, max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES)
         except FleetRunnerError:
             raw = {}
         error = classify_provider_error(

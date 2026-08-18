@@ -624,6 +624,43 @@ def test_model_scoped_rate_requests_block_only_matching_model(tmp_path: Path) ->
     assert "gemini-3-flash" in account_entry["models"]
 
 
+def test_25_flash_lite_rate_state_is_model_bound_with_unknown_dashboard_limits(tmp_path: Path) -> None:
+    service, paths = _service(tmp_path, _configured_snapshot())
+    model = "gemini-2.5-flash-lite"
+
+    profile = service.gemini_quota_profile("the-hive-1", model=model)
+    assert profile["quota_model"] == model
+    assert profile["provider_quota_source"] == "ai_studio_dashboard"
+    assert profile["rpm_limit"] is None
+    assert profile["tpm_limit"] is None
+    assert profile["rpd_limit"] is None
+
+    error = ProviderError(
+        "account_limited",
+        True,
+        429,
+        "2026-08-03T12:10:00Z",
+        quota_observation=ProviderErrorQuotaObservation("model", 120),
+    )
+    result = service.probe_account(
+        "shared",
+        lambda account: ProbeResult(account.provider, False, model, False, error),
+        model=model,
+        expected_generation=2,
+    )
+
+    assert result["model"] == model
+    rate_limits = json.loads(paths.rate_limits.read_text(encoding="utf-8"))["accounts"]["shared"]
+    assert rate_limits["cooldown_until_utc"] is None
+    assert rate_limits["consecutive_429"] == 0
+    assert rate_limits["models"][model]["in_flight"] is None
+    assert rate_limits["models"][model]["cooldown_until_utc"] is None
+    usage_event = service._load_usage()["shared"][-1]
+    assert usage_event["model"] == model
+    assert usage_event["quota_scope"] == "model"
+    assert service.gemini_rate_status("shared", model=model)["quota_model"] == model
+
+
 def test_model_scoped_gemini_rate_limits_migrate_v1_to_v2(tmp_path: Path) -> None:
     service, paths = _service(tmp_path, _configured_snapshot())
     paths.rate_limits.write_text(

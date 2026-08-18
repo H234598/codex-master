@@ -712,7 +712,9 @@ class FleetService:
         if not isinstance(model, str):
             return None
         normalized = model.strip().lower().split("/")[-1]
-        if normalized in {"gemini-3.1-flash-lite", "gemini-3-flash", "gemini-3.5-flash"}:
+        if normalized in {
+            "gemini-2.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3-flash", "gemini-3.5-flash",
+        }:
             return normalized
         return None
 
@@ -917,7 +919,7 @@ class FleetService:
                 probe_state = "fresh" if self._probe_is_fresh(account.last_probe_at_utc) else "stale"
             except (TypeError, ValueError, AttributeError):
                 probe_state = "invalid"
-        identity = self.project_limit_identity(account_id)
+        identity = self.project_limit_identity(account_id, model=model)
         observed = {
             "rpm": len(recent_minute),
             # Google defines TPM as input tokens per minute.  Output tokens
@@ -1287,7 +1289,7 @@ class FleetService:
         with self._io.lock():
             now = self._rate_now()
             entries = self._load_rate_limits()
-            quota = self.gemini_quota_profile(account_id)
+            quota = self.gemini_quota_profile(account_id, model=model_key)
             entry = entries.get(account_id)
             if entry is None:
                 now_text = self._rate_text(now)
@@ -1369,7 +1371,7 @@ class FleetService:
                 "allowed": True,
                 "reason": "ready",
                 "retry_after_seconds": 0,
-                **self.gemini_quota_profile(account_id),
+                **self.gemini_quota_profile(account_id, model=model_key),
             }
         rates: list[str | None] = [
             entry.get("next_allowed_at_utc") if isinstance(entry.get("next_allowed_at_utc"), str) else None,
@@ -1407,7 +1409,7 @@ class FleetService:
             "reason": "ready" if retry_after == 0 else "gemini_local_rate_limit",
             "retry_after_seconds": retry_after,
             "defer_until": defer_until,
-            **self.gemini_quota_profile(account_id),
+            **self.gemini_quota_profile(account_id, model=model_key),
         }
 
     @staticmethod
@@ -2411,7 +2413,10 @@ class FleetService:
                     parsed = None
                 if parsed is None or parsed <= self._rate_now():
                     try:
-                        rate_status = self.gemini_rate_status(account.account_id)
+                        rate_status = self.gemini_rate_status(
+                            account.account_id,
+                            model=result.model if isinstance(result, ProbeResult) else None,
+                        )
                     except Exception:
                         rate_status = {}
                     defer_until = rate_status.get("defer_until") if isinstance(rate_status, Mapping) else None

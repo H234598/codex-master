@@ -178,7 +178,7 @@ from codex_master.fleet_service import (
     MAX_EVENT_BYTES,
 )
 from codex_master.fleet_runners import (
-    GEMINI_DEFAULT_LIGHT_MODEL,
+    GEMINI_DEFAULT_LIGHT_MODEL,  # noqa: F401 - retained as the public server constant
     FleetRunnerError,
     ProbeResult,
     ProviderError,
@@ -188,6 +188,7 @@ from codex_master.fleet_runners import (
     parse_gemini_jsonl,
     probe_gemini_rest,
     probe_provider_models,
+    validate_gemini_probe_model,
 )
 from codex_master.selection import (
     AdmissionMode,
@@ -20539,6 +20540,7 @@ def call_tool(
     if name == "fleet_account_probe":
         return fleet_account_probe(
             account_id=str(args.get("account_id", "")),
+            model=args.get("model"),
             expected_generation=required_generation(args),
         )
     if name == "fleet_account_delete":
@@ -28031,7 +28033,8 @@ TOOLS: list[dict[str, Any]] = [
         "name": "fleet_account_probe",
         "description": "Run a bounded account capability probe and persist only the redacted readiness state; provider credentials and raw responses never leave private memory.",
         "inputSchema": {"type": "object", "required": ["account_id", "expected_generation"], "properties": {
-            "account_id": text_schema(64), "expected_generation": {"type": "integer", "minimum": 0},
+            "account_id": text_schema(64), "model": text_schema(64),
+            "expected_generation": {"type": "integer", "minimum": 0},
         }, "additionalProperties": False},
     },
     {
@@ -29548,6 +29551,7 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_account_probe = account_sub.add_parser("probe")
     p_account_probe.add_argument("--account-id", required=True)
     p_account_probe.add_argument("--expected-generation", type=int, required=True)
+    p_account_probe.add_argument("--model")
     p_account_sync = account_sub.add_parser("sync-env")
     p_account_sync.add_argument("--first-key", type=int, default=1)
     p_account_sync.add_argument("--last-key", type=int, default=MAX_HIVE_API_KEYS)
@@ -29706,6 +29710,7 @@ def _main_cli_impl(argv: list[str]) -> int:
                 if args.fleet_account_command == "probe":
                     return print_json(call_validated_tool("fleet_account_probe", {
                         "account_id": args.account_id,
+                        "model": args.model,
                         "expected_generation": args.expected_generation,
                     }))
                 if args.fleet_account_command == "sync-env":
@@ -31407,6 +31412,7 @@ def fleet_provider_models(*, provider: str, account_id: str | None = None) -> di
 
 def _fleet_account_probe(account: FleetAccount, *, model: str | None = None) -> ProbeResult:
     if account.provider is Provider.GEMINI_API:
+        model = validate_gemini_probe_model(model)
         service = current_fleet_service()
         try:
             generation = service.load().generation
@@ -31428,7 +31434,7 @@ def _fleet_account_probe(account: FleetAccount, *, model: str | None = None) -> 
                 False,
                 ProviderError("auth_invalid", False, None, None),
             )
-        return probe_gemini_rest(secret)
+        return probe_gemini_rest(secret, model=model)
     if account.provider is not Provider.HUGGINGFACE_INFERENCE:
         return ProbeResult(
             account.provider,
@@ -31470,11 +31476,16 @@ def _fleet_account_probe(account: FleetAccount, *, model: str | None = None) -> 
     )
 
 
-def fleet_account_probe(*, account_id: str, expected_generation: int) -> dict[str, Any]:
+def fleet_account_probe(
+    *, account_id: str, expected_generation: int, model: str | None = None,
+) -> dict[str, Any]:
+    try:
+        probe_model = validate_gemini_probe_model(model)
+    except FleetRunnerError:
+        raise AgentError("gemini_model_invalid") from None
     require_fleet_recovery_ready("fleet_limit_mutation")
     with fleet_mutation_lock():
         try:
-            probe_model = GEMINI_DEFAULT_LIGHT_MODEL
             result = current_fleet_service().probe_account(
                 account_id,
                 lambda account: _fleet_account_probe(account, model=probe_model),
