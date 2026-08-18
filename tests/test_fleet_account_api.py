@@ -644,6 +644,8 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
     "expected_observed",
     "provided_output_shape",
     "expected_output_shape",
+    "provided_stdout_shape",
+    "expected_stdout_shape",
     "expected_process",
     "expected_observed_process",
     "expected_ready",
@@ -656,8 +658,10 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
         False,
         "gemini_probe_process_timeout",
         "gemini_probe_process_timeout",
-        "gemini_probe_output_stderr_only",
-        "gemini_probe_output_stderr_only",
+        "gemini_probe_output_stdout_stderr",
+        "gemini_probe_output_stdout_stderr",
+        "gemini_probe_stdout_terminal_jsonl",
+        "gemini_probe_stdout_terminal_jsonl",
         "gemini_probe_timeout_output_unclassified",
         "gemini_probe_timeout_output_unclassified",
         False,
@@ -672,8 +676,26 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
         "gemini_probe_runner_failure",
         None,
         None,
+        None,
+        None,
         "gemini_probe_process_group_unreaped",
         "gemini_probe_process_group_unreaped",
+        False,
+        "provider_unavailable",
+        "failed",
+        None,
+    ),
+    (
+        "provider_unavailable",
+        False,
+        "gemini_probe_process_timeout",
+        "gemini_probe_process_timeout",
+        "gemini_probe_output_stdout_stderr",
+        "gemini_probe_output_stdout_stderr",
+        "mystery_stdout_shape",
+        None,
+        "gemini_probe_timeout_output_unclassified",
+        "gemini_probe_timeout_output_unclassified",
         False,
         "provider_unavailable",
         "failed",
@@ -685,6 +707,8 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
         "mystery_probe_code",
         None,
         "mystery_output_shape",
+        None,
+        "gemini_probe_stdout_terminal_jsonl",
         None,
         "not_a_phase",
         None,
@@ -699,6 +723,8 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
         None,
         None,
         "gemini_probe_output_stdout_terminal",
+        None,
+        "gemini_probe_stdout_terminal_jsonl",
         None,
         "gemini_probe_normal_exit",
         "gemini_probe_normal_exit",
@@ -717,6 +743,8 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
     expected_observed: ProbeDiagnosticCode | None,
     provided_output_shape: str | None,
     expected_output_shape: str | None,
+    provided_stdout_shape: str | None,
+    expected_stdout_shape: str | None,
     expected_process: str,
     expected_observed_process: str | None,
     expected_ready: bool,
@@ -758,6 +786,7 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
                 ),
                 process_phase=expected_process,
                 process_output_shape=provided_output_shape,
+                process_stdout_shape=provided_stdout_shape,
             )
 
         return ProbeResult(
@@ -768,6 +797,7 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
             None,
             process_phase=expected_process,
             process_output_shape=provided_output_shape,
+            process_stdout_shape=provided_stdout_shape,
         )
 
     monkeypatch.setattr(server, "probe_gemini_cli", fake_probe)
@@ -780,6 +810,7 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
         assert "diagnostic_code" not in result
         assert result.get("process_phase") == expected_observed_process
         assert "process_output_shape" not in result
+        assert "process_stdout_shape" not in result
         if model_name is not None:
             assert result.get("model") == model_name
     else:
@@ -791,8 +822,16 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
             assert "process_output_shape" not in result
         else:
             assert result["process_output_shape"] == expected_output_shape
+        if expected_stdout_shape is None:
+            assert "process_stdout_shape" not in result
+        else:
+            assert result["process_stdout_shape"] == expected_stdout_shape
     if expected_output_shape is None:
         assert "process_output_shape" not in result
+    if expected_stdout_shape is None:
+        assert "process_stdout_shape" not in result
+    else:
+        assert result["process_stdout_shape"] == expected_stdout_shape
     events = (server.STATE_ROOT / "fleet" / "events.jsonl").read_text(encoding="utf-8").splitlines()
     assert events, "missing account_probe event"
     event = json.loads(events[-1])
@@ -808,6 +847,10 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
         assert "process_output_shape" not in event
     else:
         assert event.get("process_output_shape") == expected_output_shape
+    if expected_stdout_shape is None:
+        assert "process_stdout_shape" not in event
+    else:
+        assert event.get("process_stdout_shape") == expected_stdout_shape
     if expected_observed_process is None:
         assert "process_phase" not in event
     else:
@@ -825,6 +868,7 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
         diagnostic_code="gemini_probe_runner_failure",
         process_phase="gemini_probe_normal_exit",
         process_output_shape="gemini_probe_output_stdout_terminal",
+        process_stdout_shape="gemini_probe_stdout_terminal_jsonl",
         model="gemini-2.5-flash",
     )
     events = (server.STATE_ROOT / "fleet" / "events.jsonl").read_text(encoding="utf-8").splitlines()
@@ -834,6 +878,7 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
     assert service_event["reason"] == "provider_unavailable"
     assert service_event["diagnostic_code"] == "gemini_probe_runner_failure"
     assert "process_output_shape" not in service_event
+    assert "process_stdout_shape" not in service_event
 
 
 def test_account_delete_requires_disabled_unbound_account_and_removes_secret(

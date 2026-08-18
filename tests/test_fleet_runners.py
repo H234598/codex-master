@@ -222,6 +222,7 @@ def test_gemini_provider_probe_timeout_maps_to_provider_unavailable(
         "expected_code",
         "expected_phase",
         "expected_shape",
+        "expected_stdout_shape",
     ),
     [
         (
@@ -232,6 +233,7 @@ def test_gemini_provider_probe_timeout_maps_to_provider_unavailable(
             "gemini_probe_process_timeout",
             "gemini_probe_timeout_no_output",
             "gemini_probe_output_none",
+            None,
         ),
         (
             "timeout_structured_no_terminal",
@@ -241,6 +243,7 @@ def test_gemini_provider_probe_timeout_maps_to_provider_unavailable(
             "gemini_probe_process_timeout",
             "gemini_probe_timeout_structured_no_terminal",
             "gemini_probe_output_stdout_jsonl_incomplete",
+            "gemini_probe_stdout_jsonl_incomplete",
         ),
         (
             "timeout_stdout_terminal",
@@ -250,6 +253,7 @@ def test_gemini_provider_probe_timeout_maps_to_provider_unavailable(
             "gemini_probe_process_timeout",
             "gemini_probe_timeout_output_unclassified",
             "gemini_probe_output_stdout_terminal",
+            "gemini_probe_stdout_terminal_jsonl",
         ),
         (
             "timeout_stdout_unclassified",
@@ -259,6 +263,7 @@ def test_gemini_provider_probe_timeout_maps_to_provider_unavailable(
             "gemini_probe_process_timeout",
             "gemini_probe_timeout_output_unclassified",
             "gemini_probe_output_stdout_unclassified",
+            "gemini_probe_stdout_unclassified",
         ),
         (
             "timeout_stderr_only",
@@ -268,6 +273,7 @@ def test_gemini_provider_probe_timeout_maps_to_provider_unavailable(
             "gemini_probe_process_timeout",
             "gemini_probe_timeout_output_unclassified",
             "gemini_probe_output_stderr_only",
+            None,
         ),
         (
             "timeout_stdout_and_stderr",
@@ -277,6 +283,17 @@ def test_gemini_provider_probe_timeout_maps_to_provider_unavailable(
             "gemini_probe_process_timeout",
             "gemini_probe_timeout_output_unclassified",
             "gemini_probe_output_stdout_stderr",
+            "gemini_probe_stdout_terminal_jsonl",
+        ),
+        (
+            "timeout_open_reader",
+            False,
+            "provider_unavailable",
+            True,
+            "gemini_probe_process_timeout",
+            "gemini_probe_timeout_output_unclassified",
+            "gemini_probe_output_truncated_or_pipe_open",
+            None,
         ),
         (
             "timeout_truncated_or_pipe_open",
@@ -286,6 +303,7 @@ def test_gemini_provider_probe_timeout_maps_to_provider_unavailable(
             "gemini_probe_process_timeout",
             "gemini_probe_timeout_structured_no_terminal",
             "gemini_probe_output_truncated_or_pipe_open",
+            None,
         ),
         (
             "terminal_structured_error",
@@ -294,6 +312,7 @@ def test_gemini_provider_probe_timeout_maps_to_provider_unavailable(
             True,
             "gemini_probe_structured_response",
             "gemini_probe_normal_exit",
+            None,
             None,
         ),
         (
@@ -304,6 +323,7 @@ def test_gemini_provider_probe_timeout_maps_to_provider_unavailable(
             None,
             "gemini_probe_normal_exit",
             None,
+            None,
         ),
         (
             "headless_unreaped",
@@ -312,6 +332,7 @@ def test_gemini_provider_probe_timeout_maps_to_provider_unavailable(
             False,
             "gemini_probe_runner_failure",
             "gemini_probe_process_group_unreaped",
+            None,
             None,
         ),
         (
@@ -322,6 +343,7 @@ def test_gemini_provider_probe_timeout_maps_to_provider_unavailable(
             None,
             "gemini_probe_normal_exit",
             None,
+            None,
         ),
         (
             "preflight_runner_error",
@@ -330,6 +352,7 @@ def test_gemini_provider_probe_timeout_maps_to_provider_unavailable(
             False,
             "gemini_probe_runner_failure",
             "gemini_probe_runner_not_started_or_failed",
+            None,
             None,
         ),
     ],
@@ -344,6 +367,7 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
     expected_code: str | None,
     expected_phase: str | None,
     expected_shape: str | None,
+    expected_stdout_shape: str | None,
 ) -> None:
     executable = tmp_path / "gemini"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -448,12 +472,37 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
     elif prepare in {"timeout_stderr_only", "timeout_stdout_and_stderr"}:
         timeout_result = HeadlessProcessResult(
             returncode=0,
-            stdout=b"" if prepare == "timeout_stderr_only" else b'{"type":"init"}\n',
-            stderr=b"timeout stderr\n",
+            stdout=(
+                b""
+                if prepare == "timeout_stderr_only"
+                else (
+                    b'{"type":"init","model":"gemini-2.5-flash"}\n'
+                    b'{"type":"result"}\n'
+                )
+            ),
+                stderr=b"timeout stderr\n",
+                stdout_truncated=False,
+                stderr_truncated=False,
+                timed_out=True,
+                cancelled=False,
+            )
+
+        def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
+            return timeout_result
+        monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+    elif prepare == "timeout_open_reader":
+        timeout_result = HeadlessProcessResult(
+            returncode=0,
+            stdout=(
+                b'{"type":"init","model":"gemini-2.5-flash"}\n'
+                b'{"type":"result"}\n'
+            ),
+            stderr=b"",
             stdout_truncated=False,
             stderr_truncated=False,
             timed_out=True,
             cancelled=False,
+            readers_alive=True,
         )
 
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
@@ -489,6 +538,7 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
         assert result.error.retryable is expected_retryable
         assert result.error.diagnostic_code == expected_code
     assert result.process_output_shape == expected_shape
+    assert result.process_stdout_shape == expected_stdout_shape
 
 
 @pytest.mark.parametrize(("stdout", "expected_code", "expected_kind", "expected_retryable"), [

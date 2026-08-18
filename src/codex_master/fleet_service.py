@@ -36,11 +36,13 @@ from .fleet_registry import (
 from .fleet_runners import (
     ProbeDiagnosticCode,
     ProbeOutputShape,
+    ProbeStdoutShape,
     ProbeProcessPhase,
     ProviderErrorQuotaObservation,
     ProbeResult,
     normalize_gemini_probe_diagnostic_code,
     normalize_gemini_probe_output_shape,
+    normalize_gemini_probe_stdout_shape,
     normalize_gemini_probe_process_phase,
 )
 from .selection import (
@@ -1036,6 +1038,7 @@ class FleetService:
         diagnostic_code: ProbeDiagnosticCode | None = None,
         process_phase: ProbeProcessPhase | None = None,
         process_output_shape: ProbeOutputShape | None = None,
+        process_stdout_shape: ProbeStdoutShape | None = None,
     ) -> dict[str, object]:
         """Append a bounded, redacted Gemini event for master/dispatcher status."""
 
@@ -1047,6 +1050,11 @@ class FleetService:
             normalized_diagnostic_code,
             normalized_process_phase,
             process_output_shape,
+        )
+        normalized_process_stdout_shape = FleetService._normalize_probe_stdout_shape_for_timeout(
+            normalized_diagnostic_code,
+            normalized_process_phase,
+            process_stdout_shape,
         )
         values = {
             "event_type": event_type,
@@ -1069,6 +1077,8 @@ class FleetService:
             values["process_phase"] = normalized_process_phase
         if normalized_process_output_shape is not None:
             values["process_output_shape"] = normalized_process_output_shape
+        if normalized_process_stdout_shape is not None:
+            values["process_stdout_shape"] = normalized_process_stdout_shape
         for key in ("event_type", "status"):
             value = values[key]
             if not isinstance(value, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value):
@@ -1899,6 +1909,7 @@ class FleetService:
         diagnostic_code: ProbeDiagnosticCode | None = None,
         process_phase: ProbeProcessPhase | None = None,
         process_output_shape: ProbeOutputShape | None = None,
+        process_stdout_shape: ProbeStdoutShape | None = None,
         model: str | None = None,
     ) -> dict[str, object]:
         status: dict[str, object] = {
@@ -1918,8 +1929,15 @@ class FleetService:
             normalized_process_phase,
             process_output_shape,
         )
+        normalized_process_stdout_shape = FleetService._normalize_probe_stdout_shape_for_timeout(
+            normalized_diagnostic_code,
+            normalized_process_phase,
+            process_stdout_shape,
+        )
         if normalized_process_output_shape is not None:
             status["process_output_shape"] = normalized_process_output_shape
+        if normalized_process_stdout_shape is not None:
+            status["process_stdout_shape"] = normalized_process_stdout_shape
         if isinstance(model, str) and model:
             status["model"] = model
         return status
@@ -1945,6 +1963,28 @@ class FleetService:
         ):
             return None
         return normalized_process_output_shape
+
+    @staticmethod
+    def _normalize_probe_stdout_shape_for_timeout(
+        diagnostic_code: ProbeDiagnosticCode | None,
+        process_phase: ProbeProcessPhase | None,
+        process_stdout_shape: ProbeStdoutShape | None,
+    ) -> ProbeStdoutShape | None:
+        normalized_diagnostic_code = normalize_gemini_probe_diagnostic_code(diagnostic_code)
+        normalized_process_phase = normalize_gemini_probe_process_phase(process_phase)
+        normalized_process_stdout_shape = normalize_gemini_probe_stdout_shape(process_stdout_shape)
+        timeout_phases = frozenset({
+            "gemini_probe_timeout_no_output",
+            "gemini_probe_timeout_structured_no_terminal",
+            "gemini_probe_timeout_output_unclassified",
+        })
+        if (
+            normalized_diagnostic_code != "gemini_probe_process_timeout"
+            or normalized_process_phase not in timeout_phases
+            or normalized_process_stdout_shape is None
+        ):
+            return None
+        return normalized_process_stdout_shape
 
 
     @staticmethod
@@ -2141,6 +2181,11 @@ class FleetService:
                 if isinstance(result, ProbeResult)
                 else None
             )
+            process_stdout_shape: ProbeStdoutShape | None = (
+                result.process_stdout_shape
+                if isinstance(result, ProbeResult)
+                else None
+            )
 
             if reason == "limit_active":
                 if isinstance(diagnostic_code, str):
@@ -2192,6 +2237,7 @@ class FleetService:
                     diagnostic_code=diagnostic_code,
                     process_phase=process_phase,
                     process_output_shape=process_output_shape,
+                    process_stdout_shape=process_stdout_shape,
                     model=result.model if isinstance(result, ProbeResult) else None,
                 )
 
@@ -2219,6 +2265,7 @@ class FleetService:
                 diagnostic_code=diagnostic_code,
                 process_phase=process_phase,
                 process_output_shape=process_output_shape,
+                process_stdout_shape=process_stdout_shape,
                 model=result.model if isinstance(result, ProbeResult) else None,
             )
 
