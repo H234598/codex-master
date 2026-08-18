@@ -33,7 +33,12 @@ from .fleet_registry import (
     plan_account_upsert,
     public_fleet_snapshot,
 )
-from .fleet_runners import ProviderErrorQuotaObservation, ProbeResult
+from .fleet_runners import (
+    ProbeProcessPhase,
+    ProviderErrorQuotaObservation,
+    ProbeResult,
+    normalize_gemini_probe_process_phase,
+)
 from .fleet_runners import ProbeDiagnosticCode, normalize_gemini_probe_diagnostic_code
 from .selection import (
     FairnessLedger,
@@ -1026,12 +1031,14 @@ class FleetService:
         gate_code: str | None = None,
         next_reset_at_utc: str | None = None,
         diagnostic_code: ProbeDiagnosticCode | None = None,
+        process_phase: ProbeProcessPhase | None = None,
     ) -> dict[str, object]:
         """Append a bounded, redacted Gemini event for master/dispatcher status."""
 
         if self._read_only:
             return {"recorded": False, "reason": "read_only"}
         normalized_diagnostic_code = normalize_gemini_probe_diagnostic_code(diagnostic_code)
+        normalized_process_phase = normalize_gemini_probe_process_phase(process_phase)
         values = {
             "event_type": event_type,
             "agent_id": agent_id,
@@ -1049,6 +1056,8 @@ class FleetService:
         }
         if normalized_diagnostic_code is not None:
             values["diagnostic_code"] = normalized_diagnostic_code
+        if normalized_process_phase is not None:
+            values["process_phase"] = normalized_process_phase
         for key in ("event_type", "status"):
             value = values[key]
             if not isinstance(value, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value):
@@ -1877,6 +1886,7 @@ class FleetService:
         ready: bool,
         reason: str,
         diagnostic_code: ProbeDiagnosticCode | None = None,
+        process_phase: ProbeProcessPhase | None = None,
         model: str | None = None,
     ) -> dict[str, object]:
         status: dict[str, object] = {
@@ -1885,6 +1895,8 @@ class FleetService:
             "ready": ready,
             "reason": reason,
         }
+        if isinstance(process_phase, str) and normalize_gemini_probe_process_phase(process_phase):
+            status["process_phase"] = process_phase
         if isinstance(diagnostic_code, str) and normalize_gemini_probe_diagnostic_code(diagnostic_code):
             status["diagnostic_code"] = diagnostic_code
         if isinstance(model, str) and model:
@@ -2075,6 +2087,11 @@ class FleetService:
                 )
             else:
                 reason = "provider_unavailable"
+            process_phase: ProbeProcessPhase | None = (
+                result.process_phase
+                if isinstance(result, ProbeResult)
+                else None
+            )
 
             if reason == "limit_active":
                 if isinstance(diagnostic_code, str):
@@ -2124,6 +2141,7 @@ class FleetService:
                     ready=False,
                     reason=reason,
                     diagnostic_code=diagnostic_code,
+                    process_phase=process_phase,
                     model=result.model if isinstance(result, ProbeResult) else None,
                 )
 
@@ -2149,6 +2167,7 @@ class FleetService:
                 ready=reason == "ready",
                 reason=reason,
                 diagnostic_code=diagnostic_code,
+                process_phase=process_phase,
                 model=result.model if isinstance(result, ProbeResult) else None,
             )
 

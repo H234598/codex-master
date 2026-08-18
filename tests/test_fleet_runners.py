@@ -213,29 +213,175 @@ def test_gemini_provider_probe_timeout_maps_to_provider_unavailable(
     assert result.error.diagnostic_code == "gemini_probe_process_timeout"
 
 
-@pytest.mark.parametrize(("prepare", "expected_kind"), [
-    (
-        "headless_job_error",
-        "runner_failed",
-    ),
-    (
-        "preflight_runner_error",
-        "provider_unavailable",
-    ),
-])
+@pytest.mark.parametrize(
+    ("prepare", "expected_ok", "expected_kind", "expected_retryable", "expected_code", "expected_phase"),
+    [
+        (
+            "timeout_no_output",
+            False,
+            "provider_unavailable",
+            True,
+            "gemini_probe_process_timeout",
+            "gemini_probe_timeout_no_output",
+        ),
+        (
+            "timeout_structured_no_terminal",
+            False,
+            "provider_unavailable",
+            True,
+            "gemini_probe_process_timeout",
+            "gemini_probe_timeout_structured_no_terminal",
+        ),
+        (
+            "timeout_stderr_only",
+            False,
+            "provider_unavailable",
+            True,
+            "gemini_probe_process_timeout",
+            "gemini_probe_timeout_output_unclassified",
+        ),
+        (
+            "timeout_stdout_and_stderr",
+            False,
+            "provider_unavailable",
+            True,
+            "gemini_probe_process_timeout",
+            "gemini_probe_timeout_output_unclassified",
+        ),
+        (
+            "terminal_structured_error",
+            False,
+            "provider_unavailable",
+            True,
+            "gemini_probe_structured_response",
+            "gemini_probe_normal_exit",
+        ),
+        (
+            "terminal_result_without_model",
+            False,
+            "model_unavailable",
+            False,
+            None,
+            "gemini_probe_normal_exit",
+        ),
+        (
+            "headless_unreaped",
+            False,
+            "runner_failed",
+            False,
+            "gemini_probe_runner_failure",
+            "gemini_probe_process_group_unreaped",
+        ),
+        (
+            "normal_exit",
+            True,
+            None,
+            None,
+            None,
+            "gemini_probe_normal_exit",
+        ),
+        (
+            "preflight_runner_error",
+            False,
+            "provider_unavailable",
+            False,
+            "gemini_probe_runner_failure",
+            "gemini_probe_runner_not_started_or_failed",
+        ),
+    ],
+)
 def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     prepare: str,
-    expected_kind: str,
+    expected_ok: bool,
+    expected_kind: str | None,
+    expected_retryable: bool | None,
+    expected_code: str | None,
+    expected_phase: str | None,
 ) -> None:
     executable = tmp_path / "gemini"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
     executable.chmod(0o700)
 
-    if prepare == "headless_job_error":
+    if prepare == "headless_unreaped":
         def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
-            raise HeadlessJobError("headless-failed")
+            raise HeadlessJobError("headless_process_unreaped")
+        monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+    elif prepare == "normal_exit":
+        result_process = HeadlessProcessResult(
+            returncode=0,
+            stdout=b'{"type":"init","model":"gemini-2.5-flash"}\n{"type":"result"}\n',
+            stderr=b"",
+            stdout_truncated=False,
+            stderr_truncated=False,
+            timed_out=False,
+            cancelled=False,
+        )
+
+        def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
+            return result_process
+        monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+    elif prepare == "terminal_structured_error":
+        result_process = HeadlessProcessResult(
+            returncode=0,
+            stdout=(
+                b'{"type":"error","error":{"code":503,"status":"UNAVAILABLE","message":"private"}}\n'
+                b'{"type":"result"}\n'
+            ),
+            stderr=b"",
+            stdout_truncated=False,
+            stderr_truncated=False,
+            timed_out=False,
+            cancelled=False,
+        )
+
+        def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
+            return result_process
+        monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+    elif prepare == "terminal_result_without_model":
+        result_process = HeadlessProcessResult(
+            returncode=0,
+            stdout=b'{"type":"result"}\n',
+            stderr=b"",
+            stdout_truncated=False,
+            stderr_truncated=False,
+            timed_out=False,
+            cancelled=False,
+        )
+
+        def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
+            return result_process
+        monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+    elif prepare in {"timeout_no_output", "timeout_structured_no_terminal"}:
+        stdout = b"" if prepare == "timeout_no_output" else b'{"type":"init"}\n'
+        stderr = b""
+        timeout_result = HeadlessProcessResult(
+            returncode=0,
+            stdout=stdout,
+            stderr=stderr,
+            stdout_truncated=False,
+            stderr_truncated=False,
+            timed_out=True,
+            cancelled=False,
+        )
+
+        def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
+            return timeout_result
+        monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+    elif prepare in {"timeout_stderr_only", "timeout_stdout_and_stderr"}:
+        timeout_result = HeadlessProcessResult(
+            returncode=0,
+            stdout=b"" if prepare == "timeout_stderr_only" else b'{"type":"init"}\n',
+            stderr=b"timeout stderr\n",
+            stdout_truncated=False,
+            stderr_truncated=False,
+            timed_out=True,
+            cancelled=False,
+        )
+
+        def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
+            return timeout_result
         monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
     else:
         executable.write_text("not executable", encoding="utf-8")
@@ -243,11 +389,15 @@ def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
 
     result = probe_gemini_cli("private-gemini-secret", executable)
 
-    assert result.ok is False
-    assert result.error is not None
-    assert result.error.kind == expected_kind
-    assert result.error.retryable is False
-    assert result.error.diagnostic_code == "gemini_probe_runner_failure"
+    assert result.ok is expected_ok
+    assert result.process_phase == expected_phase
+    if expected_ok:
+        assert result.error is None
+    else:
+        assert result.error is not None
+        assert result.error.kind == expected_kind
+        assert result.error.retryable is expected_retryable
+        assert result.error.diagnostic_code == expected_code
 
 
 @pytest.mark.parametrize(("stdout", "expected_code", "expected_kind", "expected_retryable"), [

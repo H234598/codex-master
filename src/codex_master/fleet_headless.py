@@ -20,7 +20,9 @@ HEADLESS_POLL_SECONDS = 0.02
 
 
 class HeadlessJobError(RuntimeError):
-    pass
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
 
 
 @dataclass(slots=True)

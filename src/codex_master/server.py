@@ -31530,6 +31530,7 @@ def fleet_account_probe(*, account_id: str, expected_generation: int) -> dict[st
             if account_probe_reason == "provider_unavailable"
             else None
         )
+        account_probe_phase = result.get("process_phase")
         with contextlib.suppress(Exception):
             service = current_fleet_service()
             service.record_gemini_usage(
@@ -31545,6 +31546,7 @@ def fleet_account_probe(*, account_id: str, expected_generation: int) -> dict[st
                 status="completed" if result.get("ready") is True else "failed",
                 reason=account_probe_reason,
                 diagnostic_code=account_probe_diagnostic,
+                process_phase=account_probe_phase,
                 model=str(result.get("model") or "probe"),
             )
         return {**result, "raw_output": "not_returned"}

@@ -637,10 +637,66 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
     assert GEMINI_READY_CREDENTIAL not in json.dumps(result)
 
 
-@pytest.mark.parametrize(("error_kind", "error_retryable", "diagnostic_code", "expected_observed"), [
-    ("provider_unavailable", False, "gemini_probe_process_timeout", "gemini_probe_process_timeout"),
-    ("runner_failed", False, "gemini_probe_runner_failure", "gemini_probe_runner_failure"),
-    ("provider_unavailable", False, "mystery_probe_code", None),
+@pytest.mark.parametrize((
+    "error_kind",
+    "error_retryable",
+    "diagnostic_code",
+    "expected_observed",
+    "expected_process",
+    "expected_observed_process",
+    "expected_ready",
+    "expected_reason",
+    "expected_event_status",
+    "model_name",
+), [
+    (
+        "provider_unavailable",
+        False,
+        "gemini_probe_process_timeout",
+        "gemini_probe_process_timeout",
+        "gemini_probe_timeout_output_unclassified",
+        "gemini_probe_timeout_output_unclassified",
+        False,
+        "provider_unavailable",
+        "failed",
+        None,
+    ),
+    (
+        "runner_failed",
+        False,
+        "gemini_probe_runner_failure",
+        "gemini_probe_runner_failure",
+        "gemini_probe_process_group_unreaped",
+        "gemini_probe_process_group_unreaped",
+        False,
+        "provider_unavailable",
+        "failed",
+        None,
+    ),
+    (
+        "provider_unavailable",
+        False,
+        "mystery_probe_code",
+        None,
+        "not_a_phase",
+        None,
+        False,
+        "provider_unavailable",
+        "failed",
+        None,
+    ),
+    (
+        "provider_unavailable",
+        False,
+        None,
+        None,
+        "gemini_probe_normal_exit",
+        "gemini_probe_normal_exit",
+        True,
+        "ready",
+        "completed",
+        "gemini-2.5-flash",
+    ),
 ])
 def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavailable(
     tmp_path: Path,
@@ -649,6 +705,12 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
     error_retryable: bool,
     diagnostic_code: str,
     expected_observed: ProbeDiagnosticCode | None,
+    expected_process: str,
+    expected_observed_process: str | None,
+    expected_ready: bool,
+    expected_reason: str,
+    expected_event_status: str,
+    model_name: str | None,
 ) -> None:
     monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")
     monkeypatch.setattr(server, "AGENT_POOL_ROOT", tmp_path / "pool")
@@ -669,41 +731,62 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
     monkeypatch.setattr(server, "trusted_gemini_executable", lambda path: path)
 
     def fake_probe(secret: str, executable: Path, **_kwargs: object) -> ProbeResult:
+        if not expected_ready:
+            return ProbeResult(
+                Provider.GEMINI_API,
+                False,
+                None,
+                False,
+                ProviderError(
+                    error_kind,
+                    error_retryable,
+                    None,
+                    None,
+                    diagnostic_code=diagnostic_code,
+                ),
+                process_phase=expected_process,
+            )
+
         return ProbeResult(
             Provider.GEMINI_API,
-            False,
+            True,
+            model_name,
+            True,
             None,
-            False,
-            ProviderError(
-                error_kind,
-                error_retryable,
-                None,
-                None,
-                diagnostic_code=diagnostic_code,
-            ),
+            process_phase=expected_process,
         )
 
     monkeypatch.setattr(server, "probe_gemini_cli", fake_probe)
     result = server.fleet_account_probe(account_id="gemini-ready", expected_generation=3)
 
     assert result["probed"] is True
-    assert result["ready"] is False
-    assert result["reason"] == "provider_unavailable"
+    assert result["ready"] is expected_ready
+    assert result["reason"] == expected_reason
     if expected_observed is None:
         assert "diagnostic_code" not in result
+        assert result.get("process_phase") == expected_observed_process
+        if model_name is not None:
+            assert result.get("model") == model_name
     else:
+        if model_name is not None:
+            assert result.get("model") == model_name
         assert result["diagnostic_code"] == expected_observed
+        assert result.get("process_phase") == expected_observed_process
     events = (server.STATE_ROOT / "fleet" / "events.jsonl").read_text(encoding="utf-8").splitlines()
     assert events, "missing account_probe event"
     event = json.loads(events[-1])
     assert isinstance(event, dict)
     assert event["event_type"] == "account_probe"
-    assert event["status"] == "failed"
-    assert event.get("reason") == "provider_unavailable"
+    assert event["status"] == expected_event_status
+    assert event.get("reason") == expected_reason
     if expected_observed is None:
         assert "diagnostic_code" not in event
     else:
         assert event.get("diagnostic_code") == expected_observed
+    if expected_observed_process is None:
+        assert "process_phase" not in event
+    else:
+        assert event.get("process_phase") == expected_observed_process
     assert GEMINI_READY_CREDENTIAL not in json.dumps(result)
 
 
