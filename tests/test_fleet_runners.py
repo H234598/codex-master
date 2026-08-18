@@ -4,6 +4,7 @@ import io
 import json
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+from urllib.error import URLError
 
 import pytest
 
@@ -1125,6 +1126,80 @@ def test_gemini_rest_probe_classifies_structured_and_detailless_429() -> None:
     assert result.error.quota_observation == ProviderErrorQuotaObservation("unknown", None)
 
 
+@pytest.mark.parametrize(("body", "status", "url", "expected_kind", "expected_code"), [
+    (
+        json.dumps({"error": {"code": 418, "status": "TEAPOT"}}).encode(),
+        418,
+        GEMINI_PROBE_URL,
+        "runner_failed",
+        "gemini_probe_rest_http_unclassified",
+    ),
+    (b"{", 200, GEMINI_PROBE_URL, "provider_unavailable", "gemini_probe_rest_provider_json_invalid"),
+    (
+        b"{}" + b"x" * MAX_GEMINI_PROBE_RESPONSE_BYTES,
+        200,
+        GEMINI_PROBE_URL,
+        "provider_unavailable",
+        "gemini_probe_rest_provider_json_invalid",
+    ),
+    (
+        json.dumps({"status": "in_progress", "steps": []}).encode(),
+        200,
+        GEMINI_PROBE_URL,
+        "provider_unavailable",
+        "gemini_probe_rest_interaction_not_completed",
+    ),
+    (
+        json.dumps({"status": "completed", "steps": "invalid"}).encode(),
+        200,
+        GEMINI_PROBE_URL,
+        "provider_unavailable",
+        "gemini_probe_rest_steps_invalid",
+    ),
+    (
+        json.dumps({"status": "completed", "steps": [{"type": "text"}]}).encode(),
+        200,
+        GEMINI_PROBE_URL,
+        "provider_unavailable",
+        "gemini_probe_rest_model_output_missing",
+    ),
+])
+def test_gemini_rest_probe_returns_redacted_diagnostic_for_each_response_branch(
+    body: bytes,
+    status: int,
+    url: str,
+    expected_kind: str,
+    expected_code: str,
+) -> None:
+    response = FakeProviderResponse(url, body, status=status)
+    result = probe_gemini_rest(
+        "private-gemini-key",
+        opener=lambda *_args, **_kwargs: response,
+    )
+
+    assert result.ok is False
+    assert result.model == GEMINI_DEFAULT_LIGHT_MODEL
+    assert result.error is not None
+    assert result.error.kind == expected_kind
+    assert result.error.diagnostic_code == expected_code
+    assert "private-gemini-key" not in repr(result)
+    assert response.closed is True
+
+
+def test_gemini_rest_probe_maps_transport_to_redacted_diagnostic() -> None:
+    result = probe_gemini_rest(
+        "private-gemini-key",
+        opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(URLError("offline")),
+    )
+
+    assert result.ok is False
+    assert result.model == GEMINI_DEFAULT_LIGHT_MODEL
+    assert result.error is not None
+    assert result.error.kind == "provider_unavailable"
+    assert result.error.diagnostic_code == "gemini_probe_rest_transport"
+    assert "offline" not in repr(result)
+
+
 def test_gemini_rest_probe_rotates_only_to_canonical_25_model() -> None:
     model = "gemini-2.5-flash-lite"
     response = FakeProviderResponse(
@@ -1266,6 +1341,7 @@ def test_gemini_rest_probe_rejects_redirects() -> None:
     assert result.ok is False
     assert result.error is not None
     assert result.error.kind == "provider_unavailable"
+    assert result.error.diagnostic_code == "gemini_probe_rest_redirect_rejected"
     assert redirected.closed is True
 
 

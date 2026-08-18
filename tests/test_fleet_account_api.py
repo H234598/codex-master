@@ -831,6 +831,26 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
     (
         "provider_unavailable",
         False,
+        "gemini_probe_rest_interaction_not_completed",
+        "gemini_probe_rest_interaction_not_completed",
+        "mystery_output_shape",
+        None,
+        "gemini_probe_stdout_terminal_jsonl",
+        None,
+        None,
+        None,
+        None,
+        None,
+        "not_a_phase",
+        None,
+        False,
+        "provider_unavailable",
+        "failed",
+        None,
+    ),
+    (
+        "provider_unavailable",
+        False,
         None,
         None,
         "gemini_probe_output_stdout_terminal",
@@ -959,6 +979,7 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
     assert event["event_type"] == "account_probe"
     assert event["status"] == expected_event_status
     assert event.get("reason") == expected_reason
+    assert GEMINI_READY_CREDENTIAL not in json.dumps(event)
     if expected_observed is None:
         assert "diagnostic_code" not in event
     else:

@@ -74,6 +74,13 @@ ProbeDiagnosticCode = Literal[
     "gemini_probe_process_timeout",
     "gemini_probe_runner_failure",
     "gemini_probe_jsonl_terminal_invalid",
+    "gemini_probe_rest_http_unclassified",
+    "gemini_probe_rest_provider_json_invalid",
+    "gemini_probe_rest_interaction_not_completed",
+    "gemini_probe_rest_steps_invalid",
+    "gemini_probe_rest_model_output_missing",
+    "gemini_probe_rest_redirect_rejected",
+    "gemini_probe_rest_transport",
 ]
 ProbeProcessPhase = Literal[
     "gemini_probe_runner_not_started_or_failed",
@@ -112,6 +119,13 @@ GEMINI_PROBE_DIAGNOSTIC_CODES: Final[frozenset[ProbeDiagnosticCode]] = frozenset
     "gemini_probe_process_timeout",
     "gemini_probe_runner_failure",
     "gemini_probe_jsonl_terminal_invalid",
+    "gemini_probe_rest_http_unclassified",
+    "gemini_probe_rest_provider_json_invalid",
+    "gemini_probe_rest_interaction_not_completed",
+    "gemini_probe_rest_steps_invalid",
+    "gemini_probe_rest_model_output_missing",
+    "gemini_probe_rest_redirect_rejected",
+    "gemini_probe_rest_transport",
 })
 GEMINI_PROBE_PROCESS_PHASES: Final[frozenset[ProbeProcessPhase]] = frozenset({
     "gemini_probe_runner_not_started_or_failed",
@@ -1020,22 +1034,47 @@ def _gemini_probe_error_payload(status: int, raw: object) -> object:
     return payload
 
 
-def _gemini_probe_response_ready(raw: object) -> bool:
+def _gemini_probe_response_diagnostic(raw: object) -> ProbeDiagnosticCode | None:
     if not isinstance(raw, Mapping):
-        return False
+        return "gemini_probe_rest_provider_json_invalid"
     if raw.get("status") != "completed":
-        return False
+        return "gemini_probe_rest_interaction_not_completed"
     steps = raw.get("steps")
     if not isinstance(steps, list) or not 1 <= len(steps) <= 8:
-        return False
-    return any(
-        isinstance(step, Mapping)
-        and step.get("type") == "model_output"
-        and isinstance(step.get("content"), list)
-        and 1 <= len(step["content"]) <= 8
-        and all(isinstance(part, Mapping) for part in step["content"])
-        for step in steps
+        return "gemini_probe_rest_steps_invalid"
+    if any(not isinstance(step, Mapping) for step in steps):
+        return "gemini_probe_rest_steps_invalid"
+    model_outputs = [step for step in steps if step.get("type") == "model_output"]
+    if not model_outputs:
+        return "gemini_probe_rest_model_output_missing"
+    if any(
+        not isinstance(step.get("content"), list)
+        or not 1 <= len(step["content"]) <= 8
+        or any(not isinstance(part, Mapping) for part in step["content"])
+        for step in model_outputs
+    ):
+        return "gemini_probe_rest_steps_invalid"
+    return None
+
+
+def _gemini_probe_error_with_diagnostic(
+    error: ProviderError,
+    diagnostic_code: ProbeDiagnosticCode,
+) -> ProviderError:
+    return ProviderError(
+        error.kind,
+        error.retryable,
+        error.status_code,
+        error.reset_at_utc,
+        error.quota_observation,
+        diagnostic_code,
     )
+
+
+def _gemini_probe_json_diagnostic(error: FleetRunnerError) -> ProbeDiagnosticCode | None:
+    if error.code in {"provider_response_invalid", "provider_response_too_large"}:
+        return "gemini_probe_rest_provider_json_invalid"
+    return None
 
 
 def probe_gemini_rest(
@@ -1107,6 +1146,7 @@ def probe_gemini_rest(
         if not isinstance(status, int):
             raise FleetRunnerError("provider_unavailable")
         if not 200 <= status < 300:
+            diagnostic_code = None
             try:
                 raw = _provider_json_body(
                     response,
@@ -1115,29 +1155,61 @@ def probe_gemini_rest(
                 )
             except _RedirectRejected:
                 raise
-            except FleetRunnerError:
+            except FleetRunnerError as exc:
                 raw = {}
+                diagnostic_code = _gemini_probe_json_diagnostic(exc)
             error = classify_provider_error(
                 Provider.GEMINI_API,
                 _gemini_probe_error_payload(status, raw),
                 "",
             )
+            if diagnostic_code is None and error.kind == "runner_failed":
+                diagnostic_code = "gemini_probe_rest_http_unclassified"
+            if diagnostic_code is not None:
+                error = _gemini_probe_error_with_diagnostic(error, diagnostic_code)
             return ProbeResult(Provider.GEMINI_API, False, model, False, error)
         raw = _provider_json_body(response, GEMINI_PROBE_URL, max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES)
-        if not _gemini_probe_response_ready(raw):
-            raise FleetRunnerError("provider_response_invalid")
+        diagnostic_code = _gemini_probe_response_diagnostic(raw)
+        if diagnostic_code is not None:
+            return ProbeResult(
+                Provider.GEMINI_API,
+                False,
+                model,
+                False,
+                ProviderError("provider_unavailable", True, None, None, diagnostic_code=diagnostic_code),
+            )
         return ProbeResult(Provider.GEMINI_API, True, model, True, None)
     except HTTPError as exc:
         response = exc
+        diagnostic_code = None
         try:
             raw = _provider_json_body(exc, GEMINI_PROBE_URL, max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES)
-        except FleetRunnerError:
+        except _RedirectRejected:
+            return ProbeResult(
+                Provider.GEMINI_API,
+                False,
+                model,
+                False,
+                ProviderError(
+                    "provider_unavailable",
+                    True,
+                    None,
+                    None,
+                    diagnostic_code="gemini_probe_rest_redirect_rejected",
+                ),
+            )
+        except FleetRunnerError as body_error:
             raw = {}
+            diagnostic_code = _gemini_probe_json_diagnostic(body_error)
         error = classify_provider_error(
             Provider.GEMINI_API,
             _gemini_probe_error_payload(exc.code, raw),
             "",
         )
+        if diagnostic_code is None and error.kind == "runner_failed":
+            diagnostic_code = "gemini_probe_rest_http_unclassified"
+        if diagnostic_code is not None:
+            error = _gemini_probe_error_with_diagnostic(error, diagnostic_code)
         return ProbeResult(Provider.GEMINI_API, False, model, False, error)
     except _RedirectRejected:
         return ProbeResult(
@@ -1145,15 +1217,30 @@ def probe_gemini_rest(
             False,
             model,
             False,
-            ProviderError("provider_unavailable", True, None, None),
+            ProviderError(
+                "provider_unavailable",
+                True,
+                None,
+                None,
+                diagnostic_code="gemini_probe_rest_redirect_rejected",
+            ),
         )
-    except FleetRunnerError:
+    except FleetRunnerError as exc:
+        diagnostic_code = _gemini_probe_json_diagnostic(exc)
+        if diagnostic_code is None and exc.code == "provider_unavailable":
+            diagnostic_code = "gemini_probe_rest_transport"
         return ProbeResult(
             Provider.GEMINI_API,
             False,
             model,
             False,
-            ProviderError("provider_unavailable", True, None, None),
+            ProviderError(
+                "provider_unavailable",
+                True,
+                None,
+                None,
+                diagnostic_code=diagnostic_code,
+            ),
         )
     except (OSError, URLError, TimeoutError, ValueError, TypeError):
         return ProbeResult(
@@ -1161,7 +1248,13 @@ def probe_gemini_rest(
             False,
             model,
             False,
-            ProviderError("provider_unavailable", True, None, None),
+            ProviderError(
+                "provider_unavailable",
+                True,
+                None,
+                None,
+                diagnostic_code="gemini_probe_rest_transport",
+            ),
         )
     finally:
         close = getattr(response, "close", None)
