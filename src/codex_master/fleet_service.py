@@ -34,6 +34,7 @@ from .fleet_registry import (
     public_fleet_snapshot,
 )
 from .fleet_runners import ProviderErrorQuotaObservation, ProbeResult
+from .fleet_runners import GEMINI_PROBE_DIAGNOSTIC_CODES, ProbeDiagnosticCode, normalize_gemini_probe_diagnostic_code
 from .selection import (
     FairnessLedger,
     ModelRole,
@@ -188,6 +189,7 @@ _GEMINI_LEGACY_GATE_CODES = MappingProxyType({
 })
 _GEMINI_EVENT_REASON_CODES = frozenset({
     *GEMINI_GATE_DIAGNOSTICS,
+    *GEMINI_PROBE_DIAGNOSTIC_CODES,
     "account_limited",
     "auth_invalid",
     "model_unavailable",
@@ -1871,6 +1873,7 @@ class FleetService:
         *,
         ready: bool,
         reason: str,
+        diagnostic_code: ProbeDiagnosticCode | None = None,
         model: str | None = None,
     ) -> dict[str, object]:
         status: dict[str, object] = {
@@ -1879,6 +1882,8 @@ class FleetService:
             "ready": ready,
             "reason": reason,
         }
+        if isinstance(diagnostic_code, str) and normalize_gemini_probe_diagnostic_code(diagnostic_code):
+            status["diagnostic_code"] = diagnostic_code
         if isinstance(model, str) and model:
             status["model"] = model
         return status
@@ -2024,6 +2029,7 @@ class FleetService:
             )
             if latest_account is None:
                 raise FleetConflictError("generation_conflict")
+            diagnostic_code: ProbeDiagnosticCode | None = None
             if (
                 isinstance(result, ProbeResult)
                 and result.provider is latest_account.provider
@@ -2055,10 +2061,21 @@ class FleetService:
                     and 0 < result.error.quota_observation.retry_after_seconds <= _GEMINI_MAX_USAGE_QUOTA_RETRY_SECONDS
                 ):
                     reason = "ready"
+
+                diagnostic_code = (
+                    result.error.diagnostic_code
+                    if (
+                        isinstance(result, ProbeResult)
+                        and reason == "provider_unavailable"
+                        and result.error is not None
+                    ) else None
+                )
             else:
                 reason = "provider_unavailable"
 
             if reason == "limit_active":
+                if isinstance(diagnostic_code, str):
+                    diagnostic_code = None
                 if (
                     isinstance(result, ProbeResult)
                     and result.error is not None
@@ -2103,6 +2120,7 @@ class FleetService:
                     stored,
                     ready=False,
                     reason=reason,
+                    diagnostic_code=diagnostic_code,
                     model=result.model if isinstance(result, ProbeResult) else None,
                 )
 
@@ -2127,6 +2145,7 @@ class FleetService:
                 stored,
                 ready=reason == "ready",
                 reason=reason,
+                diagnostic_code=diagnostic_code,
                 model=result.model if isinstance(result, ProbeResult) else None,
             )
 

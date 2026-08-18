@@ -47,6 +47,22 @@ _QUOTA_SCOPE_ACCOUNT: Final = "account"
 _QUOTA_SCOPE_MODEL: Final = "model"
 _QUOTA_SCOPE_UNKNOWN: Final = "unknown"
 _MAX_RETRY_AFTER_SECONDS: Final = 3600
+ProbeDiagnosticCode = Literal[
+    "gemini_probe_structured_response",
+    "gemini_probe_process_timeout",
+    "gemini_probe_runner_failure",
+    "gemini_probe_jsonl_terminal_invalid",
+]
+GEMINI_PROBE_DIAGNOSTIC_CODES: Final[frozenset[ProbeDiagnosticCode]] = frozenset({
+    "gemini_probe_structured_response",
+    "gemini_probe_process_timeout",
+    "gemini_probe_runner_failure",
+    "gemini_probe_jsonl_terminal_invalid",
+})
+
+
+def normalize_gemini_probe_diagnostic_code(value: object) -> ProbeDiagnosticCode | None:
+    return value if isinstance(value, str) and value in GEMINI_PROBE_DIAGNOSTIC_CODES else None
 
 
 class FleetRunnerError(ValueError):
@@ -91,6 +107,10 @@ class ProviderError:
     status_code: int | None
     reset_at_utc: str | None
     quota_observation: ProviderErrorQuotaObservation | None = None
+    diagnostic_code: ProbeDiagnosticCode | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "diagnostic_code", normalize_gemini_probe_diagnostic_code(self.diagnostic_code))
 
 
 @dataclass(frozen=True, slots=True)
@@ -698,8 +718,25 @@ def probe_gemini_cli(
         ):
             raise FleetRunnerError("runner_failed")
     except FleetRunnerError as exc:
-        kind = "model_unavailable" if exc.args == ("model_unavailable",) else "provider_unavailable"
-        return ProbeResult(Provider.GEMINI_API, False, None, False, ProviderError(kind, False, None, None))
+        if exc.code == "model_unavailable":
+            kind = "model_unavailable"
+            diagnostic_code: ProbeDiagnosticCode | None = None
+        else:
+            kind = "provider_unavailable"
+            diagnostic_code = "gemini_probe_runner_failure"
+        return ProbeResult(
+            Provider.GEMINI_API,
+            False,
+            None,
+            False,
+            ProviderError(
+                kind,
+                False,
+                None,
+                None,
+                diagnostic_code=diagnostic_code,
+            ),
+        )
     probe_home_path: Path | None = None
     env: dict[str, str] = {}
     result = None
@@ -735,12 +772,24 @@ def probe_gemini_cli(
     except HeadlessJobError:
         return ProbeResult(
             Provider.GEMINI_API, False, None, False,
-            ProviderError("runner_failed", False, None, None),
+            ProviderError(
+                "runner_failed",
+                False,
+                None,
+                None,
+                diagnostic_code="gemini_probe_runner_failure",
+            ),
         )
     except Exception:
         return ProbeResult(
             Provider.GEMINI_API, False, None, False,
-            ProviderError("provider_unavailable", True, None, None),
+            ProviderError(
+                "provider_unavailable",
+                True,
+                None,
+                None,
+                diagnostic_code="gemini_probe_runner_failure",
+            ),
         )
     finally:
         env.pop("GEMINI_API_KEY", None)
@@ -751,21 +800,56 @@ def probe_gemini_cli(
     if result.timed_out:
         return ProbeResult(
             Provider.GEMINI_API, False, None, False,
-            ProviderError("provider_unavailable", True, None, None),
+            ProviderError(
+                "provider_unavailable",
+                True,
+                None,
+                None,
+                diagnostic_code="gemini_probe_process_timeout",
+            ),
         )
     try:
         parsed = parse_gemini_jsonl(result.stdout.decode("utf-8").splitlines())
     except (FleetRunnerError, UnicodeDecodeError):
         return ProbeResult(
             Provider.GEMINI_API, False, None, False,
-            ProviderError("runner_failed", False, None, None),
+            ProviderError(
+                "runner_failed",
+                False,
+                None,
+                None,
+                diagnostic_code="gemini_probe_jsonl_terminal_invalid",
+            ),
         )
     if parsed.error is not None:
-        return ProbeResult(Provider.GEMINI_API, False, parsed.model, False, parsed.error)
+        parsed_error = parsed.error
+        parsed_diagnostic_code: str | None = None
+        if parsed_error.kind in {"provider_unavailable", "runner_failed"}:
+            parsed_diagnostic_code = "gemini_probe_structured_response"
+        return ProbeResult(
+            Provider.GEMINI_API,
+            False,
+            parsed.model,
+            False,
+            ProviderError(
+                parsed_error.kind,
+                parsed_error.retryable,
+                parsed_error.status_code,
+                parsed_error.reset_at_utc,
+                quota_observation=parsed_error.quota_observation,
+                diagnostic_code=parsed_diagnostic_code,
+            ),
+        )
     if result.returncode != 0 or result.stdout_truncated or result.stderr_truncated:
         return ProbeResult(
             Provider.GEMINI_API, False, parsed.model, False,
-            ProviderError("runner_failed", False, None, None),
+            ProviderError(
+                "runner_failed",
+                False,
+                None,
+                None,
+                diagnostic_code="gemini_probe_runner_failure",
+            ),
         )
     if not isinstance(parsed.model, str) or not parsed.model:
         return ProbeResult(

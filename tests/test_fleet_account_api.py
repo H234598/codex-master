@@ -26,7 +26,7 @@ from codex_master.fleet_registry import (
     SecretState,
 )
 from codex_master.fleet_recovery import RecoveryPhase
-from codex_master.fleet_runners import ProbeResult, ProviderModelsResult
+from codex_master.fleet_runners import ProbeDiagnosticCode, ProbeResult, ProviderError, ProviderModelsResult
 
 
 GEMINI_PROJECT_CREDENTIAL = "local-only-secret"
@@ -634,6 +634,77 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
         "raw_output": "not_returned",
     }
     assert captured["secret"] == GEMINI_READY_CREDENTIAL
+    assert GEMINI_READY_CREDENTIAL not in json.dumps(result)
+
+
+@pytest.mark.parametrize(("error_kind", "error_retryable", "diagnostic_code", "expected_observed"), [
+    ("provider_unavailable", False, "gemini_probe_process_timeout", "gemini_probe_process_timeout"),
+    ("runner_failed", False, "gemini_probe_runner_failure", "gemini_probe_runner_failure"),
+    ("provider_unavailable", False, "mystery_probe_code", None),
+])
+def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_kind: str,
+    error_retryable: bool,
+    diagnostic_code: str,
+    expected_observed: ProbeDiagnosticCode | None,
+) -> None:
+    monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(server, "AGENT_POOL_ROOT", tmp_path / "pool")
+    server.fleet_account_upsert(
+        account_id="gemini-ready",
+        label="Gemini ready",
+        provider="gemini_api",
+        auth_kind="api_key",
+        enabled=True,
+        expected_generation=1,
+    )
+    server.fleet_account_set_secret(
+        account_id="gemini-ready",
+        secret=GEMINI_READY_CREDENTIAL,
+        expected_generation=2,
+    )
+    monkeypatch.setattr(server.shutil, "which", lambda _name: "/usr/local/bin/gemini")
+    monkeypatch.setattr(server, "trusted_gemini_executable", lambda path: path)
+
+    def fake_probe(secret: str, executable: Path, **_kwargs: object) -> ProbeResult:
+        return ProbeResult(
+            Provider.GEMINI_API,
+            False,
+            None,
+            False,
+            ProviderError(
+                error_kind,
+                error_retryable,
+                None,
+                None,
+                diagnostic_code=diagnostic_code,
+            ),
+        )
+
+    monkeypatch.setattr(server, "probe_gemini_cli", fake_probe)
+    result = server.fleet_account_probe(account_id="gemini-ready", expected_generation=3)
+
+    assert result["probed"] is True
+    assert result["ready"] is False
+    assert result["reason"] == "provider_unavailable"
+    if expected_observed is None:
+        assert "diagnostic_code" not in result
+    else:
+        assert result["diagnostic_code"] == expected_observed
+    events = (server.STATE_ROOT / "fleet" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert events, "missing account_probe event"
+    event = json.loads(events[-1])
+    assert isinstance(event, dict)
+    assert event["event_type"] == "account_probe"
+    assert event["status"] == "failed"
+    if expected_observed is None:
+        assert event.get("reason") != diagnostic_code
+    else:
+        assert event.get("reason") == expected_observed
+    if expected_observed is None:
+        assert event.get("reason") == "provider_unavailable"
     assert GEMINI_READY_CREDENTIAL not in json.dumps(result)
 
 

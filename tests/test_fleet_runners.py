@@ -210,26 +210,101 @@ def test_gemini_provider_probe_timeout_maps_to_provider_unavailable(
     assert result.error is not None
     assert result.error.kind == "provider_unavailable"
     assert result.error.retryable is True
+    assert result.error.diagnostic_code == "gemini_probe_process_timeout"
 
 
-def test_gemini_provider_probe_headless_job_error_maps_to_runner_failed(
+@pytest.mark.parametrize(("prepare", "expected_kind"), [
+    (
+        "headless_job_error",
+        "runner_failed",
+    ),
+    (
+        "preflight_runner_error",
+        "provider_unavailable",
+    ),
+])
+def test_gemini_provider_probe_headless_job_error_maps_to_runner_failure_code(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    prepare: str,
+    expected_kind: str,
 ) -> None:
     executable = tmp_path / "gemini"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
     executable.chmod(0o700)
 
+    if prepare == "headless_job_error":
+        def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
+            raise HeadlessJobError("headless-failed")
+        monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+    else:
+        executable.write_text("not executable", encoding="utf-8")
+        executable.chmod(0o600)
+
+    result = probe_gemini_cli("private-gemini-secret", executable)
+
+    assert result.ok is False
+    assert result.error is not None
+    assert result.error.kind == expected_kind
+    assert result.error.retryable is False
+    assert result.error.diagnostic_code == "gemini_probe_runner_failure"
+
+
+@pytest.mark.parametrize(("stdout", "expected_code", "expected_kind", "expected_retryable"), [
+    (
+        b'{"type":"error","error":{"code":503,"status":"UNAVAILABLE","message":"private"}}\n'
+        b'{"type":"result"}\n',
+        "gemini_probe_structured_response",
+        "provider_unavailable",
+        True,
+    ),
+    (
+        b'{"type":"init","model":"gemini-2.5-flash"}\n',
+        "gemini_probe_jsonl_terminal_invalid",
+        "runner_failed",
+        False,
+    ),
+    (
+        b"not-json\n",
+        "gemini_probe_jsonl_terminal_invalid",
+        "runner_failed",
+        False,
+    ),
+])
+def test_gemini_provider_probe_reports_structured_and_parser_diagnostic_codes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: bytes,
+    expected_code: str,
+    expected_kind: str,
+    expected_retryable: bool,
+) -> None:
+    executable = tmp_path / "gemini"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o700)
+
+    result_process = HeadlessProcessResult(
+        returncode=0,
+        stdout=stdout,
+        stderr=b"",
+        stdout_truncated=False,
+        stderr_truncated=False,
+        timed_out=False,
+        cancelled=False,
+    )
+
     def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
-        raise HeadlessJobError("headless-failed")
+        return result_process
 
     monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
     result = probe_gemini_cli("private-gemini-secret", executable)
 
     assert result.ok is False
     assert result.error is not None
-    assert result.error.kind == "runner_failed"
-    assert result.error.retryable is False
+    assert result.error.kind == expected_kind
+    assert result.error.retryable is expected_retryable
+    assert result.error.diagnostic_code == expected_code
+    assert "private-gemini-secret" not in repr(result)
 
 
 def test_runner_plan_is_immutable_and_refuses_relative_or_controlled_executable(tmp_path: Path) -> None:

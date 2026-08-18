@@ -183,6 +183,7 @@ from codex_master.fleet_runners import (
     ProviderError,
     ProviderErrorQuotaObservation,
     build_runner_plan,
+    normalize_gemini_probe_diagnostic_code,
     parse_gemini_jsonl,
     probe_gemini_cli,
     probe_provider_models,
@@ -31523,6 +31524,13 @@ def fleet_account_probe(*, account_id: str, expected_generation: int) -> dict[st
         probe_status = "probe" if result.get("ready") is True else (
             "rate_limited" if result.get("reason") == "limit_active" else "failed"
         )
+        account_probe_reason: str | None = result.get("reason") if isinstance(result.get("reason"), str) else None
+        account_probe_diagnostic = (
+            normalize_gemini_probe_diagnostic_code(result.get("diagnostic_code"))
+            if account_probe_reason == "provider_unavailable"
+            else None
+        )
+        event_reason = account_probe_diagnostic if isinstance(account_probe_diagnostic, str) else account_probe_reason
         with contextlib.suppress(Exception):
             service = current_fleet_service()
             service.record_gemini_usage(
@@ -31536,7 +31544,7 @@ def fleet_account_probe(*, account_id: str, expected_generation: int) -> dict[st
                 account_id=account_id,
                 assignment_id=None,
                 status="completed" if result.get("ready") is True else "failed",
-                reason=result.get("reason") if isinstance(result.get("reason"), str) else None,
+                reason=event_reason,
                 model=str(result.get("model") or "probe"),
             )
         return {**result, "raw_output": "not_returned"}
