@@ -34,6 +34,12 @@ MAX_PROVIDER_MODELS = 1000
 PROVIDER_HTTP_TIMEOUT_SECONDS = 5
 GEMINI_PROBE_TIMEOUT_SECONDS = 90
 GEMINI_DEFAULT_LIGHT_MODEL = "gemini-3.1-flash-lite"
+GEMINI_PROBE_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_DEFAULT_LIGHT_MODEL}:generateContent"
+)
+MAX_GEMINI_PROBE_REQUEST_BYTES = 4096
+MAX_GEMINI_PROBE_RESPONSE_BYTES = 64 * 1024
 OLLAMA_MODELS_URL = "http://127.0.0.1:11434/api/tags"
 HUGGINGFACE_MODELS_URL = "https://router.huggingface.co/v1/models"
 _SECRET_ENV_NAMES = frozenset({
@@ -614,7 +620,12 @@ def _provider_model_name(value: object) -> str | None:
     return value
 
 
-def _provider_json_body(response: object, expected_url: str) -> object:
+def _provider_json_body(
+    response: object,
+    expected_url: str,
+    *,
+    max_bytes: int = MAX_PROVIDER_RESPONSE_BYTES,
+) -> object:
     geturl = getattr(response, "geturl", None)
     if callable(geturl) and geturl() != expected_url:
         raise _RedirectRejected("redirect_rejected")
@@ -628,13 +639,13 @@ def _provider_json_body(response: object, expected_url: str) -> object:
                     advertised = int(content_length)
                 except (TypeError, ValueError):
                     raise FleetRunnerError("provider_response_invalid") from None
-                if advertised > MAX_PROVIDER_RESPONSE_BYTES:
+                if advertised > max_bytes:
                     raise FleetRunnerError("provider_response_too_large")
     read = getattr(response, "read", None)
     if not callable(read):
         raise FleetRunnerError("provider_response_invalid")
-    body = read(MAX_PROVIDER_RESPONSE_BYTES + 1)
-    if not isinstance(body, bytes) or len(body) > MAX_PROVIDER_RESPONSE_BYTES:
+    body = read(max_bytes + 1)
+    if not isinstance(body, bytes) or len(body) > max_bytes:
         raise FleetRunnerError("provider_response_too_large")
     try:
         return json.loads(body)
@@ -791,6 +802,159 @@ def probe_huggingface_models(
     except FleetRunnerError as exc:
         return ProviderModelsResult(Provider.HUGGINGFACE_INFERENCE, False, (), exc.code)
     return ProviderModelsResult(Provider.HUGGINGFACE_INFERENCE, True, models, None)
+
+
+def _gemini_probe_error_payload(status: int, raw: object) -> object:
+    """Keep HTTP classification structured without exposing provider details."""
+
+    if not isinstance(raw, Mapping):
+        return {"code": status}
+    payload = dict(raw)
+    nested = payload.get("error")
+    if isinstance(nested, Mapping):
+        error = dict(nested)
+        error.setdefault("code", status)
+        payload["error"] = error
+    else:
+        payload.setdefault("code", status)
+    return payload
+
+
+def _gemini_probe_response_ready(raw: object) -> bool:
+    if not isinstance(raw, Mapping):
+        return False
+    candidates = raw.get("candidates")
+    if not isinstance(candidates, list) or not 1 <= len(candidates) <= 8:
+        return False
+    candidate = candidates[0]
+    if not isinstance(candidate, Mapping):
+        return False
+    content = candidate.get("content")
+    if not isinstance(content, Mapping):
+        return False
+    parts = content.get("parts")
+    return isinstance(parts, list) and 1 <= len(parts) <= 8 and all(
+        isinstance(part, Mapping) for part in parts
+    )
+
+
+def probe_gemini_rest(
+    secret: str,
+    *,
+    opener: Callable[..., object] | None = None,
+) -> ProbeResult:
+    """Run one bounded Gemini REST readiness probe using a header-only key."""
+
+    model = GEMINI_DEFAULT_LIGHT_MODEL
+    if not isinstance(secret, str) or not 1 <= len(secret.encode("utf-8")) <= MAX_PROVIDER_RESPONSE_BYTES:
+        return ProbeResult(
+            Provider.GEMINI_API,
+            False,
+            model,
+            False,
+            ProviderError("auth_invalid", False, None, None),
+        )
+
+    body = json.dumps(
+        {
+            "contents": [{"parts": [{"text": "Reply with exactly OK."}]}],
+            "generationConfig": {"maxOutputTokens": 1},
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    if len(body) > MAX_GEMINI_PROBE_REQUEST_BYTES:
+        return ProbeResult(
+            Provider.GEMINI_API,
+            False,
+            model,
+            False,
+            ProviderError("runner_failed", False, None, None),
+        )
+
+    request = Request(
+        GEMINI_PROBE_URL,
+        data=body,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "x-goog-api-key": secret,
+        },
+        method="POST",
+    )
+    selected_opener = opener
+    if selected_opener is None:
+        selected_opener = build_opener(ProxyHandler({}), _RejectRedirectHandler()).open
+    response: object | None = None
+    try:
+        response = selected_opener(request, timeout=PROVIDER_HTTP_TIMEOUT_SECONDS)
+        status = getattr(response, "status", None)
+        if status is None:
+            getcode = getattr(response, "getcode", None)
+            status = getcode() if callable(getcode) else None
+        if not isinstance(status, int):
+            raise FleetRunnerError("provider_unavailable")
+        if not 200 <= status < 300:
+            try:
+                raw = _provider_json_body(
+                    response,
+                    GEMINI_PROBE_URL,
+                    max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES,
+                )
+            except _RedirectRejected:
+                raise
+            except FleetRunnerError:
+                raw = {}
+            error = classify_provider_error(
+                Provider.GEMINI_API,
+                _gemini_probe_error_payload(status, raw),
+                "",
+            )
+            return ProbeResult(Provider.GEMINI_API, False, model, False, error)
+        raw = _provider_json_body(response, GEMINI_PROBE_URL, max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES)
+        if not _gemini_probe_response_ready(raw):
+            raise FleetRunnerError("provider_response_invalid")
+        return ProbeResult(Provider.GEMINI_API, True, model, True, None)
+    except HTTPError as exc:
+        response = exc
+        try:
+            raw = _provider_json_body(exc, GEMINI_PROBE_URL, max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES)
+        except FleetRunnerError:
+            raw = {}
+        error = classify_provider_error(
+            Provider.GEMINI_API,
+            _gemini_probe_error_payload(exc.code, raw),
+            "",
+        )
+        return ProbeResult(Provider.GEMINI_API, False, model, False, error)
+    except _RedirectRejected:
+        return ProbeResult(
+            Provider.GEMINI_API,
+            False,
+            model,
+            False,
+            ProviderError("provider_unavailable", True, None, None),
+        )
+    except FleetRunnerError:
+        return ProbeResult(
+            Provider.GEMINI_API,
+            False,
+            model,
+            False,
+            ProviderError("provider_unavailable", True, None, None),
+        )
+    except (OSError, URLError, TimeoutError, ValueError, TypeError):
+        return ProbeResult(
+            Provider.GEMINI_API,
+            False,
+            model,
+            False,
+            ProviderError("provider_unavailable", True, None, None),
+        )
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
 
 
 def _gemini_probe_settings(home: Path) -> None:

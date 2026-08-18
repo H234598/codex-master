@@ -614,26 +614,24 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
         secret=GEMINI_READY_CREDENTIAL,
         expected_generation=2,
     )
-    monkeypatch.setattr(server.shutil, "which", lambda _name: "/usr/local/bin/gemini")
-    monkeypatch.setattr(server, "trusted_gemini_executable", lambda path: path)
+    monkeypatch.setattr(server.shutil, "which", lambda _name: pytest.fail("CLI lookup is not part of account probe"))
     captured: dict[str, object] = {}
     service = server.current_fleet_service()
     probe_account = Mock(wraps=service.probe_account)
     monkeypatch.setattr(service, "probe_account", probe_account)
     monkeypatch.setattr(server, "current_fleet_service", lambda: service)
 
-    def fake_probe(secret: str, executable: Path, **_kwargs: object) -> ProbeResult:
+    def fake_probe(secret: str) -> ProbeResult:
         captured["secret"] = secret
-        captured["executable"] = executable
         return ProbeResult(
             Provider.GEMINI_API,
             True,
-            "gemini-3-flash-preview",
+            server.GEMINI_DEFAULT_LIGHT_MODEL,
             True,
             None,
         )
 
-    monkeypatch.setattr(server, "probe_gemini_cli", fake_probe)
+    monkeypatch.setattr(server, "probe_gemini_rest", fake_probe)
     result = server.fleet_account_probe(account_id="gemini-ready", expected_generation=3)
 
     assert result == {
@@ -641,7 +639,7 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
         "generation": 4,
         "ready": True,
         "reason": "ready",
-        "model": "gemini-3-flash-preview",
+        "model": server.GEMINI_DEFAULT_LIGHT_MODEL,
         "raw_output": "not_returned",
     }
     assert captured["secret"] == GEMINI_READY_CREDENTIAL
@@ -807,10 +805,9 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
         secret=GEMINI_READY_CREDENTIAL,
         expected_generation=2,
     )
-    monkeypatch.setattr(server.shutil, "which", lambda _name: "/usr/local/bin/gemini")
-    monkeypatch.setattr(server, "trusted_gemini_executable", lambda path: path)
+    monkeypatch.setattr(server.shutil, "which", lambda _name: pytest.fail("CLI lookup is not part of account probe"))
 
-    def fake_probe(secret: str, executable: Path, **_kwargs: object) -> ProbeResult:
+    def fake_probe(secret: str) -> ProbeResult:
         if not expected_ready:
             return ProbeResult(
                 Provider.GEMINI_API,
@@ -844,7 +841,7 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
             process_stdout_error_seen=provided_stdout_error_seen,
         )
 
-    monkeypatch.setattr(server, "probe_gemini_cli", fake_probe)
+    monkeypatch.setattr(server, "probe_gemini_rest", fake_probe)
     result = server.fleet_account_probe(account_id="gemini-ready", expected_generation=3)
 
     assert result["probed"] is True

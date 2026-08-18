@@ -186,7 +186,7 @@ from codex_master.fleet_runners import (
     build_runner_plan,
     normalize_gemini_probe_diagnostic_code,
     parse_gemini_jsonl,
-    probe_gemini_cli,
+    probe_gemini_rest,
     probe_provider_models,
 )
 from codex_master.selection import (
@@ -31428,26 +31428,7 @@ def _fleet_account_probe(account: FleetAccount, *, model: str | None = None) -> 
                 False,
                 ProviderError("auth_invalid", False, None, None),
             )
-        executable_name = shutil.which("gemini")
-        if not executable_name:
-            return ProbeResult(
-                account.provider,
-                False,
-                None,
-                False,
-                ProviderError("provider_unavailable", True, None, None),
-            )
-        try:
-            executable = trusted_gemini_executable(Path(executable_name).absolute())
-        except AgentError:
-            return ProbeResult(
-                account.provider,
-                False,
-                None,
-                False,
-                ProviderError("provider_unavailable", False, None, None),
-            )
-        return probe_gemini_cli(secret, executable, model=model)
+        return probe_gemini_rest(secret)
     if account.provider is not Provider.HUGGINGFACE_INFERENCE:
         return ProbeResult(
             account.provider,

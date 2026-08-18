@@ -11,6 +11,10 @@ from codex_master.fleet_headless import HeadlessJobError, HeadlessProcessResult
 from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
 from codex_master.fleet_runners import (
     FleetRunnerError,
+    GEMINI_DEFAULT_LIGHT_MODEL,
+    GEMINI_PROBE_URL,
+    MAX_GEMINI_PROBE_REQUEST_BYTES,
+    MAX_GEMINI_PROBE_RESPONSE_BYTES,
     GEMINI_PROBE_TIMEOUT_SECONDS,
     MAX_HEADLESS_TIMEOUT_SECONDS,
     HUGGINGFACE_MODELS_URL,
@@ -22,8 +26,10 @@ from codex_master.fleet_runners import (
     ProviderErrorQuotaObservation,
     model_is_agentic,
     parse_gemini_jsonl,
+    ProbeResult,
     ProbeStdoutEventClass,
     probe_gemini_cli,
+    probe_gemini_rest,
     probe_huggingface_models,
     probe_ollama_models,
 )
@@ -1035,6 +1041,83 @@ class FakeProviderResponse:
 
     def close(self) -> None:
         self.closed = True
+
+
+def test_gemini_rest_probe_uses_fixed_model_header_key_and_bounded_json() -> None:
+    response = FakeProviderResponse(
+        GEMINI_PROBE_URL,
+        json.dumps({"candidates": [{"content": {"parts": [{"text": "OK"}]}}]}).encode(),
+    )
+    observed: dict[str, object] = {}
+
+    def opener(request: object, *, timeout: int) -> FakeProviderResponse:
+        observed["url"] = request.full_url  # type: ignore[attr-defined]
+        observed["method"] = request.get_method()  # type: ignore[attr-defined]
+        observed["key"] = request.get_header("X-goog-api-key")  # type: ignore[attr-defined]
+        observed["authorization"] = request.get_header("Authorization")  # type: ignore[attr-defined]
+        observed["body"] = request.data  # type: ignore[attr-defined]
+        observed["timeout"] = timeout
+        return response
+
+    result = probe_gemini_rest("private-gemini-key", opener=opener)
+
+    assert result == ProbeResult(Provider.GEMINI_API, True, GEMINI_DEFAULT_LIGHT_MODEL, True, None)
+    assert observed["url"] == GEMINI_PROBE_URL
+    assert observed["method"] == "POST"
+    assert observed["key"] == "private-gemini-key"
+    assert observed["authorization"] is None
+    assert isinstance(observed["body"], bytes)
+    assert len(observed["body"]) <= MAX_GEMINI_PROBE_REQUEST_BYTES
+    assert b"private-gemini-key" not in observed["body"]
+    assert observed["timeout"] == 5
+    assert response.read_sizes == [MAX_GEMINI_PROBE_RESPONSE_BYTES + 1]
+    assert response.closed is True
+    assert "private-gemini-key" not in repr(result)
+
+
+def test_gemini_rest_probe_classifies_structured_and_detailless_429() -> None:
+    structured = {
+        "error": {
+            "code": 429,
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+                {
+                    "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                    "violations": [{"quotaDimensions": {"model": GEMINI_DEFAULT_LIGHT_MODEL}}],
+                },
+                {
+                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                    "retryDelay": "7s",
+                },
+            ],
+        },
+    }
+    response = FakeProviderResponse(GEMINI_PROBE_URL, json.dumps(structured).encode(), status=429)
+    result = probe_gemini_rest("private-gemini-key", opener=lambda *_args, **_kwargs: response)
+    assert result.ok is False
+    assert result.model == GEMINI_DEFAULT_LIGHT_MODEL
+    assert result.error is not None
+    assert result.error.quota_observation == ProviderErrorQuotaObservation("model", 7)
+
+    detail_less = FakeProviderResponse(
+        GEMINI_PROBE_URL,
+        json.dumps({"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}}).encode(),
+        status=429,
+    )
+    result = probe_gemini_rest("private-gemini-key", opener=lambda *_args, **_kwargs: detail_less)
+    assert result.ok is False
+    assert result.model == GEMINI_DEFAULT_LIGHT_MODEL
+    assert result.error is not None
+    assert result.error.quota_observation == ProviderErrorQuotaObservation("unknown", None)
+
+
+def test_gemini_rest_probe_rejects_redirects() -> None:
+    redirected = FakeProviderResponse("https://example.invalid/redirect", b"{}", status=429)
+    result = probe_gemini_rest("private-gemini-key", opener=lambda *_args, **_kwargs: redirected)
+    assert result.ok is False
+    assert result.error is not None
+    assert result.error.kind == "provider_unavailable"
+    assert redirected.closed is True
 
 
 def test_ollama_probe_is_loopback_bounded_and_secret_free() -> None:
