@@ -5710,7 +5710,7 @@ def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> di
     ]
     if facts.thermal_state in {"warming_up", "monitor_unavailable"}:
         declared.append("temperature_monitor_unavailable")
-    if facts.gate_state == "blocked" and not declared:
+    if facts.gate_state == "blocked" and not declared and set(facts.reason_codes) != {"cgroup_preflight_failed"}:
         reasons.append("resource_snapshot_invalid")
     reasons.extend(declared)
     return {

@@ -1289,6 +1289,109 @@ class ServerHelpersTest(unittest.TestCase):
         assert len(runner.calls) == 2
         read_facts.assert_called_once()
 
+    def test_spawn_admission_does_not_report_resource_snapshot_invalid_for_fresh_valid_composed_runtime(self) -> None:
+        facts = ResourceGateFacts(
+            generation=7,
+            observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+            observed_monotonic_ns=1,
+            gate_state="blocked",
+            reason_codes=("cgroup_preflight_failed",),
+            current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
+            available_memory_mib=8192,
+            legacy_pressure=LegacyPressureV1(0.25, 25.0, 0.0, 50.0),
+            normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
+            normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
+            bottleneck="cgroup",
+            cgroup_state="unavailable",
+            thermal_state="ready",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = HiveStateStore(root)
+            approved, _adapter, _runner = approved_cgroup_runtime_for_test(root)
+            with patch.object(
+                server_module,
+                "build_current_hive_runtime",
+                return_value=SimpleNamespace(state=state),
+            ), patch.object(
+                server_module,
+                "read_current_resource_boot_id",
+                return_value="123e4567-e89b-12d3-a456-426614174000",
+            ), patch.object(
+                server_module,
+                "build_approved_cgroup_runtime",
+                return_value=approved,
+            ), patch.object(
+                server_module,
+                "read_resource_gate_facts",
+                return_value=facts,
+            ), patch.object(server_module, "_total_running_agent_count", return_value=0), patch.object(
+                server_module, "_SPAWN_WARMUP_UNTIL_NS", 0
+            ):
+                result = spawn_admission_decision()
+
+        assert result["allowed"] is True
+        assert result["reason_codes"] == []
+
+    def test_spawn_admission_reports_session_and_resource_failures_independently(self) -> None:
+        snapshots = {
+            "valid": {
+                "ok": True,
+                "_g5_facts": True,
+                "load_per_cpu": 0.25,
+                "cpu_busy_percent": 25.0,
+                "io_wait_percent": 0.0,
+                "io_psi_percent": 0.0,
+                "available_memory_percent": 50.0,
+                "available_memory_mib": 8192,
+                "running_agents": 0,
+                "reason_codes": [],
+            },
+            "session": {
+                "ok": False,
+                "_g5_facts": True,
+                "running_agents": None,
+                "reason_codes": ["session_metrics_unavailable"],
+            },
+            "resource": {
+                "ok": False,
+                "_g5_facts": True,
+                "running_agents": 0,
+                "reason_codes": ["resource_snapshot_invalid"],
+            },
+            "both": {
+                "ok": False,
+                "_g5_facts": True,
+                "running_agents": None,
+                "reason_codes": ["session_metrics_unavailable", "resource_snapshot_invalid"],
+            },
+        }
+        expected = {
+            "valid": [],
+            "session": ["session_metrics_unavailable"],
+            "resource": ["resource_snapshot_invalid"],
+            "both": ["session_metrics_unavailable", "resource_snapshot_invalid"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            approved, adapter, _runner = approved_cgroup_runtime_for_test(root)
+            runtime = server_module.ResourceGateRuntime(
+                state=HiveStateStore(root),
+                expected_boot_id="123e4567-e89b-12d3-a456-426614174000",
+                now_utc=lambda: datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+                monotonic_ns=lambda: 0,
+                cgroup_profile=approved.profile,
+                cgroup_adapter=adapter,
+                h2_ready=True,
+            )
+            for name, snapshot in snapshots.items():
+                with self.subTest(name=name), server_module._resource_gate_runtime_scope(runtime), patch.object(
+                    server_module, "system_resource_snapshot", return_value=snapshot
+                ), patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0):
+                    result = spawn_admission_decision()
+
+                assert result["reason_codes"] == expected[name]
+
     def test_spawn_admission_rejects_observer_snapshot_without_verified_typed_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = HiveStateStore(Path(directory))
@@ -1406,7 +1509,7 @@ class ServerHelpersTest(unittest.TestCase):
         cases = (
             ("blocked_empty", facts(gate_state="blocked", reason_codes=()), False, ["resource_snapshot_invalid"]),
             ("blocked_unknown", facts(gate_state="blocked", reason_codes=("unknown_reason",)), False, ["resource_snapshot_invalid"]),
-            ("blocked_filtered", facts(gate_state="blocked", reason_codes=("cgroup_preflight_failed",)), False, ["resource_snapshot_invalid"]),
+            ("blocked_filtered", facts(gate_state="blocked", reason_codes=("cgroup_preflight_failed",)), True, []),
             ("blocked_known", facts(gate_state="blocked", reason_codes=("cpu_pressure_high",)), False, ["cpu_pressure_high"]),
             ("ready_unknown", facts(gate_state="ready", reason_codes=("unknown_reason",)), True, []),
         )
@@ -1757,7 +1860,12 @@ class ServerHelpersTest(unittest.TestCase):
             "reason_codes": [],
         }
         with patch("codex_master.server.system_resource_snapshot", return_value=snapshot):
-            result = spawn_admission_decision()
+            with patch.object(
+                server_module,
+                "build_approved_cgroup_runtime",
+                side_effect=CgroupPreflightError("cgroup_preflight_failed"),
+            ):
+                result = spawn_admission_decision()
 
         self.assertFalse(result["allowed"])
         self.assertEqual(result["reason_codes"], ["cgroup_preflight_failed"])
@@ -3154,16 +3262,26 @@ class ServerHelpersTest(unittest.TestCase):
             "codex_master.server.native_agent_status", return_value=native
         ), patch(
             "codex_master.server._fresh_native_reservation_count", return_value=0
-        ), patch("codex_master.server.os.cpu_count", return_value=4), patch(
-            "codex_master.server.os.getloadavg", return_value=(1.0, 1.0, 1.0)
-        ), patch("codex_master.server._recent_cpu_usage", return_value=(25.0, 0.0)), patch(
-            "codex_master.server._resource_meminfo", return_value=(60.0, 8192.0)
+        ), patch(
+            "codex_master.server.system_resource_snapshot",
+            return_value={
+                "ok": True,
+                "_g5_facts": True,
+                "load_per_cpu": 0.25,
+                "cpu_busy_percent": 25.0,
+                "io_wait_percent": 0.0,
+                "io_psi_percent": 0.0,
+                "available_memory_percent": 60.0,
+                "available_memory_mib": 8192,
+                "running_agents": 10,
+                "reason_codes": [],
+            },
         ):
             result = spawn_admission_decision(1)
 
         self.assertFalse(result["allowed"])
         self.assertEqual(result["available_slots"], 0)
-        self.assertEqual(result["reason_codes"], ["running_agent_limit", "resource_snapshot_invalid"])
+        self.assertEqual(result["reason_codes"], ["running_agent_limit"])
         self.assertEqual(
             result["errors"],
             [
@@ -3229,7 +3347,7 @@ class ServerHelpersTest(unittest.TestCase):
 
         self.assertFalse(result["allowed"])
         self.assertIsNone(result["available_slots"])
-        self.assertEqual(result["reason_codes"], ["session_metrics_unavailable", "resource_snapshot_invalid"])
+        self.assertEqual(result["reason_codes"], ["session_metrics_unavailable"])
         self.assertEqual(
             result["errors"],
             [

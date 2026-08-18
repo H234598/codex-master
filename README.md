@@ -848,11 +848,13 @@ groff -man -Tutf8 man/man1/codex-master-mcp.1
 `codex-master-mcp install` synchronizes the plugin, including the regular
 `hooks/hooks.json`, `hooks/native_spawn_admission.py`, and
 `hooks/native_bee_event.py` files, into the personal plugin cache. It does not
-and must not alter Codex hook-trust state. After installation, open a new Codex
-session, run `/hooks`, inspect the five `codex-master` definitions, and
-explicitly trust them: one blocking `PreToolUse` admission hook plus four
-lifecycle hooks. Until that manual step succeeds, do not claim that native
-spawn admission or Native-Bienen lifecycle coverage is active.
+and must not alter Codex hook-trust state. In the current parent Codex session,
+open `/hooks`, inspect the five `codex-master` definitions, and explicitly
+trust them: one blocking `PreToolUse` admission hook plus four lifecycle hooks.
+Then start a completely new parent Codex session in the repository. MCP
+reconnect, status, or agent start does not replace that new session. Until
+that manual step succeeds, do not claim that native spawn admission or
+Native-Bienen lifecycle coverage is active.
 
 Rollback the active applet tree with:
 
