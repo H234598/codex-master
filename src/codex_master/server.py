@@ -28046,10 +28046,10 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "fleet_provider_models",
-        "description": "Probe a fixed Ollama loopback or Hugging Face endpoint and return bounded, capability-gated model metadata; never returns headers, raw output, or secrets.",
+        "description": "Probe one fixed provider endpoint, including Gemini models.list through a configured account, and return bounded capability metadata; never returns headers, raw output, or secrets.",
         "inputSchema": {"type": "object", "required": ["provider"], "properties": {
-            "provider": text_schema(64, enum=["ollama_local", "huggingface_inference"]),
-            "account_id": text_schema(64, description="Optional configured Hugging Face account; never returned."),
+            "provider": text_schema(64, enum=["ollama_local", "huggingface_inference", "gemini_api"]),
+            "account_id": text_schema(64, description="Optional configured Hugging Face or Gemini account; never returned."),
         }, "additionalProperties": False},
     },
     {
@@ -31371,14 +31371,22 @@ def fleet_provider_models(*, provider: str, account_id: str | None = None) -> di
         provider_value = Provider(provider)
     except (TypeError, ValueError):
         raise AgentError("invalid_provider") from None
-    if provider_value not in {Provider.OLLAMA_LOCAL, Provider.HUGGINGFACE_INFERENCE}:
+    if provider_value not in {
+        Provider.OLLAMA_LOCAL, Provider.HUGGINGFACE_INFERENCE, Provider.GEMINI_API,
+    }:
         raise AgentError("unsupported_provider")
 
     service = _readonly_fleet_service()
     snapshot = service.load()
     secret: str | None = None
-    if provider_value is Provider.HUGGINGFACE_INFERENCE:
-        if account_id is not None and not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", account_id):
+    if provider_value in {Provider.HUGGINGFACE_INFERENCE, Provider.GEMINI_API}:
+        if (
+            account_id is not None
+            and (
+                not isinstance(account_id, str)
+                or re.fullmatch(r"[a-z][a-z0-9-]{0,63}", account_id) is None
+            )
+        ):
             raise AgentError("invalid_account")
         accounts = [
             account for account in snapshot.accounts

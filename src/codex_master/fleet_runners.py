@@ -12,6 +12,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Final, Literal
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 from unicodedata import category
 
@@ -36,14 +37,28 @@ GEMINI_PROBE_TIMEOUT_SECONDS = 90
 GEMINI_DEFAULT_LIGHT_MODEL = "gemini-3.1-flash-lite"
 GEMINI_PROBE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models/"
 GEMINI_PROBE_URL = f"{GEMINI_PROBE_BASE_URL}{GEMINI_DEFAULT_LIGHT_MODEL}:generateContent"
-GEMINI_PROBE_MODELS: Final[frozenset[str]] = frozenset({
-    GEMINI_DEFAULT_LIGHT_MODEL,
-    "gemini-2.5-flash-lite",
-})
+GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+MAX_GEMINI_MODEL_ID_BYTES = 128
+MAX_GEMINI_MODELS_PAGES = 4
+MAX_GEMINI_MODELS = 256
+MAX_GEMINI_MODELS_PAGE_SIZE = 100
+MAX_GEMINI_PAGE_TOKEN_BYTES = 512
+MAX_GEMINI_MODELS_RESPONSE_BYTES = 256 * 1024
 MAX_GEMINI_PROBE_REQUEST_BYTES = 4096
 MAX_GEMINI_PROBE_RESPONSE_BYTES = 64 * 1024
 OLLAMA_MODELS_URL = "http://127.0.0.1:11434/api/tags"
 HUGGINGFACE_MODELS_URL = "https://router.huggingface.co/v1/models"
+_GEMINI_MODEL_ID_RE = re.compile(r"gemini-[a-z0-9]+(?:[.-][a-z0-9]+)*\Z")
+_GEMINI_GENERATION_METHODS: Final[frozenset[str]] = frozenset({
+    "batchEmbedContents",
+    "countTokens",
+    "embedContent",
+    "generateAnswer",
+    "generateContent",
+    "predict",
+    "predictLongRunning",
+    "streamGenerateContent",
+})
 _SECRET_ENV_NAMES = frozenset({
     "OPENAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
     "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "GOOGLE_GENAI_USE_VERTEXAI", "HF_TOKEN",
@@ -161,7 +176,16 @@ class FleetRunnerError(ValueError):
 
 def validate_gemini_probe_model(model: object | None) -> str:
     candidate = GEMINI_DEFAULT_LIGHT_MODEL if model is None else model
-    if not isinstance(candidate, str) or candidate not in GEMINI_PROBE_MODELS:
+    if not isinstance(candidate, str):
+        raise FleetRunnerError("gemini_model_invalid")
+    try:
+        valid = (
+            1 <= len(candidate.encode("utf-8")) <= MAX_GEMINI_MODEL_ID_BYTES
+            and _GEMINI_MODEL_ID_RE.fullmatch(candidate) is not None
+        )
+    except UnicodeError:
+        valid = False
+    if not valid:
         raise FleetRunnerError("gemini_model_invalid")
     return candidate
 
@@ -813,6 +837,174 @@ def probe_huggingface_models(
     return ProviderModelsResult(Provider.HUGGINGFACE_INFERENCE, True, models, None)
 
 
+def _gemini_models_page_url(page_token: str | None = None) -> str:
+    params: dict[str, str] = {"pageSize": str(MAX_GEMINI_MODELS_PAGE_SIZE)}
+    if page_token is not None:
+        if not isinstance(page_token, str):
+            raise FleetRunnerError("provider_response_invalid")
+        try:
+            valid = (
+                1 <= len(page_token.encode("utf-8")) <= MAX_GEMINI_PAGE_TOKEN_BYTES
+                and not any(category(character) == "Cc" for character in page_token)
+            )
+        except UnicodeError:
+            valid = False
+        if not valid:
+            raise FleetRunnerError("provider_response_invalid")
+        params["pageToken"] = page_token
+    return f"{GEMINI_MODELS_URL}?{urlencode(params)}"
+
+
+def _gemini_models_http_json(
+    url: str,
+    secret: str,
+    *,
+    opener: Callable[..., object] | None = None,
+) -> object:
+    if not isinstance(secret, str) or not 1 <= len(secret.encode("utf-8")) <= MAX_PROVIDER_RESPONSE_BYTES:
+        raise FleetRunnerError("secret_invalid")
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "x-goog-api-key": secret,
+        },
+        method="GET",
+    )
+    selected_opener = opener
+    if selected_opener is None:
+        selected_opener = build_opener(ProxyHandler({}), _RejectRedirectHandler()).open
+    response: object | None = None
+    try:
+        response = selected_opener(request, timeout=PROVIDER_HTTP_TIMEOUT_SECONDS)
+        status = getattr(response, "status", None)
+        if status is None:
+            getcode = getattr(response, "getcode", None)
+            status = getcode() if callable(getcode) else None
+        if not isinstance(status, int):
+            raise FleetRunnerError("provider_unavailable")
+        if not 200 <= status < 300:
+            if status in {401, 403}:
+                raise FleetRunnerError("auth_invalid")
+            if status == 429:
+                raise FleetRunnerError("account_limited")
+            raise FleetRunnerError("provider_unavailable")
+        return _provider_json_body(response, url, max_bytes=MAX_GEMINI_MODELS_RESPONSE_BYTES)
+    except _RedirectRejected:
+        raise
+    except FleetRunnerError:
+        raise
+    except HTTPError as exc:
+        if exc.code in {401, 403}:
+            raise FleetRunnerError("auth_invalid") from None
+        if exc.code == 429:
+            raise FleetRunnerError("account_limited") from None
+        raise FleetRunnerError("provider_unavailable") from None
+    except (OSError, URLError, TimeoutError, ValueError, TypeError):
+        raise FleetRunnerError("provider_unavailable") from None
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+
+
+def _gemini_models_page(raw: object) -> tuple[list[object], str | None]:
+    if not isinstance(raw, Mapping):
+        raise FleetRunnerError("provider_response_invalid")
+    models = raw.get("models")
+    if not isinstance(models, list):
+        raise FleetRunnerError("provider_response_invalid")
+    if len(models) > MAX_GEMINI_MODELS_PAGE_SIZE:
+        raise FleetRunnerError("provider_model_limit_exceeded")
+    token = raw.get("nextPageToken")
+    if token is not None and not isinstance(token, str):
+        raise FleetRunnerError("provider_response_invalid")
+    if isinstance(token, str) and token == "":
+        token = None
+    if token is not None:
+        _gemini_models_page_url(token)
+    return models, token
+
+
+def _gemini_generation_methods(item: Mapping[str, object]) -> tuple[str, ...]:
+    raw_methods = item.get("supportedGenerationMethods")
+    if not isinstance(raw_methods, list):
+        return ()
+    methods: list[str] = []
+    for method in raw_methods:
+        if isinstance(method, str) and method in _GEMINI_GENERATION_METHODS and method not in methods:
+            methods.append(method)
+    return tuple(methods)
+
+
+def _gemini_model_result(raw_models: Iterable[object]) -> dict[str, dict[str, object]]:
+    models: dict[str, dict[str, object]] = {}
+    for item in raw_models:
+        if not isinstance(item, Mapping):
+            continue
+        raw_name = item.get("name", item.get("id", item.get("model")))
+        if not isinstance(raw_name, str):
+            continue
+        if raw_name.startswith("models/"):
+            raw_name = raw_name[len("models/"):]
+        try:
+            model_id = validate_gemini_probe_model(raw_name)
+        except FleetRunnerError:
+            continue
+        methods = list(_gemini_generation_methods(item))
+        existing = models.get(model_id)
+        if existing is not None:
+            methods = list(existing["supported_generation_methods"]) + [
+                method for method in methods if method not in existing["supported_generation_methods"]
+            ]
+        supports_generate_content = "generateContent" in methods
+        models[model_id] = {
+            "id": model_id,
+            "supported_generation_methods": methods,
+            "supports_generate_content": supports_generate_content,
+            "agentic": supports_generate_content,
+            "readiness_worker": supports_generate_content,
+        }
+        if len(models) > MAX_GEMINI_MODELS:
+            raise FleetRunnerError("provider_model_limit_exceeded")
+    return models
+
+
+def probe_gemini_models(
+    secret: str | None,
+    *,
+    opener: Callable[..., object] | None = None,
+) -> ProviderModelsResult:
+    if secret is None:
+        return ProviderModelsResult(Provider.GEMINI_API, False, (), "secret_missing")
+    try:
+        page_token: str | None = None
+        seen_tokens: set[str] = set()
+        raw_models_all: list[object] = []
+        for _page_number in range(MAX_GEMINI_MODELS_PAGES):
+            raw = _gemini_models_http_json(
+                _gemini_models_page_url(page_token),
+                secret,
+                opener=opener,
+            )
+            raw_models, next_token = _gemini_models_page(raw)
+            raw_models_all.extend(raw_models)
+            if len(raw_models_all) > MAX_GEMINI_MODELS:
+                raise FleetRunnerError("provider_model_limit_exceeded")
+            if next_token is None:
+                break
+            if next_token in seen_tokens:
+                raise FleetRunnerError("provider_response_invalid")
+            seen_tokens.add(next_token)
+            page_token = next_token
+        else:
+            raise FleetRunnerError("provider_model_limit_exceeded")
+        projected = _gemini_model_result(raw_models_all)
+    except FleetRunnerError as exc:
+        return ProviderModelsResult(Provider.GEMINI_API, False, (), exc.code)
+    return ProviderModelsResult(Provider.GEMINI_API, True, tuple(projected.values()), None)
+
+
 def _gemini_probe_error_payload(status: int, raw: object) -> object:
     """Keep HTTP classification structured without exposing provider details."""
 
@@ -1282,4 +1474,6 @@ def probe_provider_models(
         return probe_ollama_models(opener=opener)
     if provider is Provider.HUGGINGFACE_INFERENCE:
         return probe_huggingface_models(secret, opener=opener)
+    if provider is Provider.GEMINI_API:
+        return probe_gemini_models(secret, opener=opener)
     return ProviderModelsResult(provider, False, (), "unsupported_provider")

@@ -454,7 +454,7 @@ def test_account_tool_catalog_has_no_secret_default_or_private_fields() -> None:
     assert secret_schema["additionalProperties"] is False
     provider_schema = by_name["fleet_provider_models"]["inputSchema"]
     assert provider_schema["properties"]["provider"]["enum"] == [
-        "ollama_local", "huggingface_inference",
+        "ollama_local", "huggingface_inference", "gemini_api",
     ]
     probe_schema = by_name["fleet_account_probe"]["inputSchema"]
     assert probe_schema["required"] == ["account_id", "expected_generation"]
@@ -552,6 +552,50 @@ def test_provider_models_requires_configured_hf_account_without_network(
     monkeypatch.setattr(server, "AGENT_POOL_ROOT", tmp_path / "pool")
     with pytest.raises(server.AgentError, match="secret_missing"):
         server.fleet_provider_models(provider="huggingface_inference")
+
+
+def test_gemini_provider_models_uses_configured_account_without_secret_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "STATE_ROOT", tmp_path / "state")
+    monkeypatch.setattr(server, "AGENT_POOL_ROOT", tmp_path / "pool")
+    server.fleet_account_upsert(
+        account_id="gemini-catalog",
+        label="Gemini catalog",
+        provider="gemini_api",
+        auth_kind="api_key",
+        enabled=True,
+        expected_generation=1,
+    )
+    server.fleet_account_set_secret(
+        account_id="gemini-catalog",
+        secret=GEMINI_READY_CREDENTIAL,
+        expected_generation=2,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_probe(provider: Provider, *, secret: str | None = None) -> ProviderModelsResult:
+        captured.update({"provider": provider, "secret": secret})
+        return ProviderModelsResult(
+            provider,
+            True,
+            ({
+                "id": "gemini-2.5-flash-lite",
+                "supported_generation_methods": ["generateContent"],
+                "supports_generate_content": True,
+                "agentic": True,
+                "readiness_worker": True,
+            },),
+            None,
+        )
+
+    monkeypatch.setattr(server, "probe_provider_models", fake_probe)
+    result = server.fleet_provider_models(provider="gemini_api")
+
+    assert result["models"][0]["id"] == "gemini-2.5-flash-lite"
+    assert captured == {"provider": Provider.GEMINI_API, "secret": GEMINI_READY_CREDENTIAL}
+    assert GEMINI_READY_CREDENTIAL not in json.dumps(result)
 
 
 def test_account_probe_persists_only_redacted_readiness_state(

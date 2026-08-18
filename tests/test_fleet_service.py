@@ -661,6 +661,24 @@ def test_25_flash_lite_rate_state_is_model_bound_with_unknown_dashboard_limits(t
     assert service.gemini_rate_status("shared", model=model)["quota_model"] == model
 
 
+def test_future_catalog_model_stays_model_bound_with_unknown_quota(tmp_path: Path) -> None:
+    service, paths = _service(tmp_path, _configured_snapshot())
+    model = "gemini-9.9-future-preview"
+
+    reservation = service.reserve_gemini_request("shared", model=model)
+    status = service.gemini_rate_status("shared", model=model)
+    assert reservation.model == model
+    assert status["quota_model"] == model
+    assert status["rpm_limit"] is None
+    assert status["tpm_limit"] is None
+    assert status["rpd_limit"] is None
+
+    service.release_gemini_request(reservation, outcome="provider_error")
+    rate_state = json.loads(paths.rate_limits.read_text(encoding="utf-8"))["accounts"]["shared"]
+    assert rate_state["in_flight"] is None
+    assert rate_state["models"][model]["in_flight"] is None
+
+
 def test_model_scoped_gemini_rate_limits_migrate_v1_to_v2(tmp_path: Path) -> None:
     service, paths = _service(tmp_path, _configured_snapshot())
     paths.rate_limits.write_text(
@@ -710,7 +728,7 @@ def test_v2_rate_limits_reject_unknown_fields_and_invalid_models(tmp_path: Path)
 
     raw = json.loads(valid_text)
     model_state = raw["accounts"]["shared"]["models"].pop("gemini-3-flash")
-    raw["accounts"]["shared"]["models"]["gemini-3-flash-preview"] = model_state
+    raw["accounts"]["shared"]["models"]["gemini-3-flash:preview"] = model_state
     paths.rate_limits.write_text(json.dumps(raw) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="invalid_gemini_rate_limits"):
         service._load_rate_limits()

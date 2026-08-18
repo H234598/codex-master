@@ -34,6 +34,7 @@ from .fleet_registry import (
     public_fleet_snapshot,
 )
 from .fleet_runners import (
+    FleetRunnerError,
     ProbeDiagnosticCode,
     ProbeOutputShape,
     ProbeStdoutEventClass,
@@ -46,6 +47,7 @@ from .fleet_runners import (
     normalize_gemini_probe_stdout_event_class,
     normalize_gemini_probe_stdout_shape,
     normalize_gemini_probe_process_phase,
+    validate_gemini_probe_model,
 )
 from .selection import (
     FairnessLedger,
@@ -709,14 +711,12 @@ class FleetService:
 
     @staticmethod
     def _normalize_gemini_model(model: str | None) -> str | None:
-        if not isinstance(model, str):
+        if model is None:
             return None
-        normalized = model.strip().lower().split("/")[-1]
-        if normalized in {
-            "gemini-2.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3-flash", "gemini-3.5-flash",
-        }:
-            return normalized
-        return None
+        try:
+            return validate_gemini_probe_model(model)
+        except FleetRunnerError:
+            return None
 
     @classmethod
     def gemini_quota_limits(cls, tier: str, model: str | None) -> dict[str, int] | None:

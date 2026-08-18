@@ -12,6 +12,9 @@ from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
 from codex_master.fleet_runners import (
     FleetRunnerError,
     GEMINI_DEFAULT_LIGHT_MODEL,
+    GEMINI_MODELS_URL,
+    MAX_GEMINI_MODELS_RESPONSE_BYTES,
+    MAX_GEMINI_MODELS_PAGE_SIZE,
     GEMINI_PROBE_URL,
     MAX_GEMINI_PROBE_REQUEST_BYTES,
     MAX_GEMINI_PROBE_RESPONSE_BYTES,
@@ -29,9 +32,11 @@ from codex_master.fleet_runners import (
     ProbeResult,
     ProbeStdoutEventClass,
     probe_gemini_cli,
+    probe_gemini_models,
     probe_gemini_rest,
     probe_huggingface_models,
     probe_ollama_models,
+    validate_gemini_probe_model,
 )
 
 
@@ -1149,6 +1154,94 @@ def test_gemini_rest_probe_rejects_noncanonical_model_without_opener(model: str)
     assert result.model is None
     assert result.error is not None
     assert result.error.kind == "model_unavailable"
+
+
+def test_gemini_models_catalog_is_paged_bounded_and_projects_safe_fields() -> None:
+    secret = "private-gemini-key"
+    future_model = "gemini-9.9-future-preview"
+    first_url = f"{GEMINI_MODELS_URL}?pageSize={MAX_GEMINI_MODELS_PAGE_SIZE}"
+    second_url = f"{first_url}&pageToken=next%2Ftoken"
+    first_response = FakeProviderResponse(
+        first_url,
+        json.dumps({
+            "models": [
+                {
+                    "name": "models/gemini-2.5-flash-lite",
+                    "supportedGenerationMethods": ["countTokens", "generateContent", "privateMethod"],
+                },
+                {
+                    "name": f"models/{future_model}",
+                    "supportedGenerationMethods": ["countTokens"],
+                },
+            ],
+            "nextPageToken": "next/token",
+        }).encode(),
+    )
+    second_response = FakeProviderResponse(
+        second_url,
+        json.dumps({
+            "models": [{
+                "name": "models/gemini-2.5-flash-lite",
+                "supportedGenerationMethods": ["streamGenerateContent"],
+            }],
+        }).encode(),
+    )
+    responses = iter([first_response, second_response])
+    observed: list[dict[str, object]] = []
+
+    def opener(request: object, *, timeout: int) -> FakeProviderResponse:
+        observed.append({
+            "url": request.full_url,  # type: ignore[attr-defined]
+            "key": request.get_header("X-goog-api-key"),  # type: ignore[attr-defined]
+            "authorization": request.get_header("Authorization"),  # type: ignore[attr-defined]
+            "timeout": timeout,
+        })
+        return next(responses)
+
+    result = probe_gemini_models(secret, opener=opener)
+
+    assert result.available is True
+    assert result.models == (
+        {
+            "id": "gemini-2.5-flash-lite",
+            "supported_generation_methods": ["countTokens", "generateContent", "streamGenerateContent"],
+            "supports_generate_content": True,
+            "agentic": True,
+            "readiness_worker": True,
+        },
+        {
+            "id": future_model,
+            "supported_generation_methods": ["countTokens"],
+            "supports_generate_content": False,
+            "agentic": False,
+            "readiness_worker": False,
+        },
+    )
+    assert observed == [
+        {"url": first_url, "key": secret, "authorization": None, "timeout": 5},
+        {"url": second_url, "key": secret, "authorization": None, "timeout": 5},
+    ]
+    assert all(secret not in str(item["url"]) for item in observed)
+    assert all(secret not in str(item) for item in result.models)
+    assert first_response.read_sizes == [MAX_GEMINI_MODELS_RESPONSE_BYTES + 1]
+    assert second_response.read_sizes == [MAX_GEMINI_MODELS_RESPONSE_BYTES + 1]
+
+
+def test_gemini_model_validator_accepts_future_ids_and_rejects_path_injection() -> None:
+    assert validate_gemini_probe_model("gemini-9.9-future-preview") == "gemini-9.9-future-preview"
+    for value in (
+        "",
+        "gemini-2.5-flash-lite/other",
+        "gemini-2.5-flash-lite:generateContent",
+        "gemini-2.5-flash-lite?x=1",
+        "https://example.invalid/gemini-2.5-flash-lite",
+        "GEMINI-2.5-FLASH-LITE",
+        " gemini-2.5-flash-lite",
+        "gemini-2.5-flash-lite\n",
+        "gemini-" + "a" * 128,
+    ):
+        with pytest.raises(FleetRunnerError, match="gemini_model_invalid"):
+            validate_gemini_probe_model(value)
 
 
 def test_gemini_rest_probe_rejects_redirects() -> None:
