@@ -63,6 +63,15 @@ ProbeProcessPhase = Literal[
     "gemini_probe_normal_exit",
     "gemini_probe_exit_output_pipe_open",
 ]
+ProbeOutputShape = Literal[
+    "gemini_probe_output_none",
+    "gemini_probe_output_stderr_only",
+    "gemini_probe_output_stdout_stderr",
+    "gemini_probe_output_stdout_jsonl_incomplete",
+    "gemini_probe_output_stdout_unclassified",
+    "gemini_probe_output_stdout_terminal",
+    "gemini_probe_output_truncated_or_pipe_open",
+]
 GEMINI_PROBE_DIAGNOSTIC_CODES: Final[frozenset[ProbeDiagnosticCode]] = frozenset({
     "gemini_probe_structured_response",
     "gemini_probe_process_timeout",
@@ -79,6 +88,15 @@ GEMINI_PROBE_PROCESS_PHASES: Final[frozenset[ProbeProcessPhase]] = frozenset({
     "gemini_probe_normal_exit",
     "gemini_probe_exit_output_pipe_open",
 })
+GEMINI_PROBE_OUTPUT_SHAPES: Final[frozenset[ProbeOutputShape]] = frozenset({
+    "gemini_probe_output_none",
+    "gemini_probe_output_stderr_only",
+    "gemini_probe_output_stdout_stderr",
+    "gemini_probe_output_stdout_jsonl_incomplete",
+    "gemini_probe_output_stdout_unclassified",
+    "gemini_probe_output_stdout_terminal",
+    "gemini_probe_output_truncated_or_pipe_open",
+})
 
 
 def normalize_gemini_probe_diagnostic_code(value: object) -> ProbeDiagnosticCode | None:
@@ -87,6 +105,10 @@ def normalize_gemini_probe_diagnostic_code(value: object) -> ProbeDiagnosticCode
 
 def normalize_gemini_probe_process_phase(value: object) -> ProbeProcessPhase | None:
     return value if isinstance(value, str) and value in GEMINI_PROBE_PROCESS_PHASES else None
+
+
+def normalize_gemini_probe_output_shape(value: object) -> ProbeOutputShape | None:
+    return value if isinstance(value, str) and value in GEMINI_PROBE_OUTPUT_SHAPES else None
 
 
 class FleetRunnerError(ValueError):
@@ -145,9 +167,11 @@ class ProbeResult:
     supports_tools: bool
     error: ProviderError | None
     process_phase: ProbeProcessPhase | None = None
+    process_output_shape: ProbeOutputShape | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "process_phase", normalize_gemini_probe_process_phase(self.process_phase))
+        object.__setattr__(self, "process_output_shape", normalize_gemini_probe_output_shape(self.process_output_shape))
 
 
 @dataclass(frozen=True, slots=True)
@@ -734,6 +758,7 @@ def probe_gemini_cli(
             ProviderError("auth_invalid", False, None, None),
         )
     process_phase: ProbeProcessPhase | None = None
+    process_output_shape: ProbeOutputShape | None = None
     try:
         command = _safe_executable(executable)
         if not executable.is_file() or not os.access(executable, os.X_OK):
@@ -838,6 +863,28 @@ def probe_gemini_cli(
             registry.finish(job, result)
 
     if result.timed_out:
+        process_output_shape = None
+        if result.readers_alive or result.stdout_truncated or result.stderr_truncated:
+            process_output_shape = "gemini_probe_output_truncated_or_pipe_open"
+        elif result.stdout == b"" and result.stderr == b"":
+            process_output_shape = "gemini_probe_output_none"
+        elif result.stderr == b"" and result.stdout != b"":
+            try:
+                parse_gemini_jsonl(result.stdout.decode("utf-8").splitlines())
+            except FleetRunnerError as exc:
+                if getattr(exc, "code", None) == "gemini_result_missing":
+                    process_output_shape = "gemini_probe_output_stdout_jsonl_incomplete"
+                else:
+                    process_output_shape = "gemini_probe_output_stdout_unclassified"
+            except UnicodeDecodeError:
+                process_output_shape = "gemini_probe_output_stdout_unclassified"
+            else:
+                process_output_shape = "gemini_probe_output_stdout_terminal"
+        elif result.stdout == b"" and result.stderr != b"":
+            process_output_shape = "gemini_probe_output_stderr_only"
+        elif result.stdout != b"" and result.stderr != b"":
+            process_output_shape = "gemini_probe_output_stdout_stderr"
+
         if result.stdout == b"" and result.stderr == b"":
             process_phase = "gemini_probe_timeout_no_output"
         elif result.stderr == b"" and result.stdout != b"":
@@ -852,6 +899,10 @@ def probe_gemini_cli(
                 process_phase = "gemini_probe_timeout_output_unclassified"
             else:
                 process_phase = "gemini_probe_timeout_output_unclassified"
+        elif result.stdout == b"" and result.stderr != b"":
+            process_phase = "gemini_probe_timeout_output_unclassified"
+        elif result.stdout != b"" and result.stderr != b"":
+            process_phase = "gemini_probe_timeout_output_unclassified"
         else:
             process_phase = "gemini_probe_timeout_output_unclassified"
         return ProbeResult(
@@ -864,6 +915,7 @@ def probe_gemini_cli(
                 diagnostic_code="gemini_probe_process_timeout",
             ),
             process_phase=process_phase,
+            process_output_shape=process_output_shape,
         )
 
     if (

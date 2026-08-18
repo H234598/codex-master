@@ -31547,6 +31547,7 @@ def fleet_account_probe(*, account_id: str, expected_generation: int) -> dict[st
                 reason=account_probe_reason,
                 diagnostic_code=account_probe_diagnostic,
                 process_phase=account_probe_phase,
+                process_output_shape=result.get("process_output_shape"),
                 model=str(result.get("model") or "probe"),
             )
         return {**result, "raw_output": "not_returned"}
