@@ -31531,6 +31531,9 @@ def fleet_account_probe(*, account_id: str, expected_generation: int) -> dict[st
             else None
         )
         account_probe_phase = result.get("process_phase")
+        account_probe_stdout_shape = result.get("process_stdout_shape")
+        account_probe_stdout_event_class = result.get("process_stdout_event_class")
+        account_probe_stdout_error_seen = result.get("process_stdout_error_seen")
         with contextlib.suppress(Exception):
             service = current_fleet_service()
             service.record_gemini_usage(
@@ -31548,7 +31551,9 @@ def fleet_account_probe(*, account_id: str, expected_generation: int) -> dict[st
                 diagnostic_code=account_probe_diagnostic,
                 process_phase=account_probe_phase,
                 process_output_shape=result.get("process_output_shape"),
-                process_stdout_shape=result.get("process_stdout_shape"),
+                process_stdout_shape=account_probe_stdout_shape,
+                process_stdout_event_class=account_probe_stdout_event_class,
+                process_stdout_error_seen=account_probe_stdout_error_seen,
                 model=str(result.get("model") or "probe"),
             )
         return {**result, "raw_output": "not_returned"}

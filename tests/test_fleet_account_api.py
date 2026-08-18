@@ -26,7 +26,13 @@ from codex_master.fleet_registry import (
     SecretState,
 )
 from codex_master.fleet_recovery import RecoveryPhase
-from codex_master.fleet_runners import ProbeDiagnosticCode, ProbeResult, ProviderError, ProviderModelsResult
+from codex_master.fleet_runners import (
+    ProbeDiagnosticCode,
+    ProbeResult,
+    ProviderError,
+    ProbeStdoutEventClass,
+    ProviderModelsResult,
+)
 
 
 GEMINI_PROJECT_CREDENTIAL = "local-only-secret"
@@ -646,6 +652,10 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
     "expected_output_shape",
     "provided_stdout_shape",
     "expected_stdout_shape",
+    "provided_stdout_event_class",
+    "provided_stdout_error_seen",
+    "expected_stdout_event_class",
+    "expected_stdout_error_seen",
     "expected_process",
     "expected_observed_process",
     "expected_ready",
@@ -660,8 +670,32 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
         "gemini_probe_process_timeout",
         "gemini_probe_output_stdout_stderr",
         "gemini_probe_output_stdout_stderr",
-        "gemini_probe_stdout_terminal_jsonl",
-        "gemini_probe_stdout_terminal_jsonl",
+        "gemini_probe_stdout_jsonl_incomplete",
+        "gemini_probe_stdout_jsonl_incomplete",
+        "gemini_probe_stdout_event_init",
+        True,
+        "gemini_probe_stdout_event_init",
+        True,
+        "gemini_probe_timeout_output_unclassified",
+        "gemini_probe_timeout_output_unclassified",
+        False,
+        "provider_unavailable",
+        "failed",
+        None,
+    ),
+    (
+        "provider_unavailable",
+        False,
+        "gemini_probe_process_timeout",
+        "gemini_probe_process_timeout",
+        "gemini_probe_output_stdout_stderr",
+        "gemini_probe_output_stdout_stderr",
+        "gemini_probe_stdout_jsonl_incomplete",
+        "gemini_probe_stdout_jsonl_incomplete",
+        "mystery_event_class",
+        False,
+        None,
+        None,
         "gemini_probe_timeout_output_unclassified",
         "gemini_probe_timeout_output_unclassified",
         False,
@@ -678,24 +712,12 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
         None,
         None,
         None,
+        None,
+        None,
+        None,
+        None,
         "gemini_probe_process_group_unreaped",
         "gemini_probe_process_group_unreaped",
-        False,
-        "provider_unavailable",
-        "failed",
-        None,
-    ),
-    (
-        "provider_unavailable",
-        False,
-        "gemini_probe_process_timeout",
-        "gemini_probe_process_timeout",
-        "gemini_probe_output_stdout_stderr",
-        "gemini_probe_output_stdout_stderr",
-        "mystery_stdout_shape",
-        None,
-        "gemini_probe_timeout_output_unclassified",
-        "gemini_probe_timeout_output_unclassified",
         False,
         "provider_unavailable",
         "failed",
@@ -709,6 +731,10 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
         "mystery_output_shape",
         None,
         "gemini_probe_stdout_terminal_jsonl",
+        None,
+        None,
+        None,
+        None,
         None,
         "not_a_phase",
         None,
@@ -725,6 +751,10 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
         "gemini_probe_output_stdout_terminal",
         None,
         "gemini_probe_stdout_terminal_jsonl",
+        None,
+        None,
+        None,
+        None,
         None,
         "gemini_probe_normal_exit",
         "gemini_probe_normal_exit",
@@ -745,6 +775,10 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
     expected_output_shape: str | None,
     provided_stdout_shape: str | None,
     expected_stdout_shape: str | None,
+    provided_stdout_event_class: ProbeStdoutEventClass | None,
+    provided_stdout_error_seen: bool | None,
+    expected_stdout_event_class: ProbeStdoutEventClass | None,
+    expected_stdout_error_seen: bool | None,
     expected_process: str,
     expected_observed_process: str | None,
     expected_ready: bool,
@@ -787,6 +821,8 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
                 process_phase=expected_process,
                 process_output_shape=provided_output_shape,
                 process_stdout_shape=provided_stdout_shape,
+                process_stdout_event_class=provided_stdout_event_class,
+                process_stdout_error_seen=provided_stdout_error_seen,
             )
 
         return ProbeResult(
@@ -798,6 +834,8 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
             process_phase=expected_process,
             process_output_shape=provided_output_shape,
             process_stdout_shape=provided_stdout_shape,
+            process_stdout_event_class=provided_stdout_event_class,
+            process_stdout_error_seen=provided_stdout_error_seen,
         )
 
     monkeypatch.setattr(server, "probe_gemini_cli", fake_probe)
@@ -808,30 +846,28 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
     assert result["reason"] == expected_reason
     if expected_observed is None:
         assert "diagnostic_code" not in result
-        assert result.get("process_phase") == expected_observed_process
-        assert "process_output_shape" not in result
-        assert "process_stdout_shape" not in result
-        if model_name is not None:
-            assert result.get("model") == model_name
     else:
-        if model_name is not None:
-            assert result.get("model") == model_name
         assert result["diagnostic_code"] == expected_observed
-        assert result.get("process_phase") == expected_observed_process
-        if expected_output_shape is None:
-            assert "process_output_shape" not in result
-        else:
-            assert result["process_output_shape"] == expected_output_shape
-        if expected_stdout_shape is None:
-            assert "process_stdout_shape" not in result
-        else:
-            assert result["process_stdout_shape"] == expected_stdout_shape
+    assert result.get("process_phase") == expected_observed_process
     if expected_output_shape is None:
         assert "process_output_shape" not in result
+    else:
+        assert result["process_output_shape"] == expected_output_shape
     if expected_stdout_shape is None:
         assert "process_stdout_shape" not in result
     else:
         assert result["process_stdout_shape"] == expected_stdout_shape
+    if expected_stdout_event_class is None:
+        assert "process_stdout_event_class" not in result
+    else:
+        assert result["process_stdout_event_class"] == expected_stdout_event_class
+    if expected_stdout_error_seen is None:
+        assert "process_stdout_error_seen" not in result
+    else:
+        assert result["process_stdout_error_seen"] is expected_stdout_error_seen
+    if model_name is not None:
+        assert result.get("model") == model_name
+
     events = (server.STATE_ROOT / "fleet" / "events.jsonl").read_text(encoding="utf-8").splitlines()
     assert events, "missing account_probe event"
     event = json.loads(events[-1])
@@ -851,6 +887,14 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
         assert "process_stdout_shape" not in event
     else:
         assert event.get("process_stdout_shape") == expected_stdout_shape
+    if expected_stdout_event_class is None:
+        assert "process_stdout_event_class" not in event
+    else:
+        assert event.get("process_stdout_event_class") == expected_stdout_event_class
+    if expected_stdout_error_seen is None:
+        assert "process_stdout_error_seen" not in event
+    else:
+        assert event.get("process_stdout_error_seen") is expected_stdout_error_seen
     if expected_observed_process is None:
         assert "process_phase" not in event
     else:
@@ -869,6 +913,8 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
         process_phase="gemini_probe_normal_exit",
         process_output_shape="gemini_probe_output_stdout_terminal",
         process_stdout_shape="gemini_probe_stdout_terminal_jsonl",
+        process_stdout_event_class="gemini_probe_stdout_event_init",
+        process_stdout_error_seen=True,
         model="gemini-2.5-flash",
     )
     events = (server.STATE_ROOT / "fleet" / "events.jsonl").read_text(encoding="utf-8").splitlines()
@@ -879,6 +925,8 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
     assert service_event["diagnostic_code"] == "gemini_probe_runner_failure"
     assert "process_output_shape" not in service_event
     assert "process_stdout_shape" not in service_event
+    assert "process_stdout_event_class" not in service_event
+    assert "process_stdout_error_seen" not in service_event
 
 
 def test_account_delete_requires_disabled_unbound_account_and_removes_secret(

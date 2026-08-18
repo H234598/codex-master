@@ -77,6 +77,14 @@ ProbeStdoutShape = Literal[
     "gemini_probe_stdout_jsonl_incomplete",
     "gemini_probe_stdout_unclassified",
 ]
+ProbeStdoutEventClass = Literal[
+    "gemini_probe_stdout_event_init",
+    "gemini_probe_stdout_event_user_message",
+    "gemini_probe_stdout_event_assistant_message",
+    "gemini_probe_stdout_event_tool_use",
+    "gemini_probe_stdout_event_tool_result",
+    "gemini_probe_stdout_event_error",
+]
 GEMINI_PROBE_DIAGNOSTIC_CODES: Final[frozenset[ProbeDiagnosticCode]] = frozenset({
     "gemini_probe_structured_response",
     "gemini_probe_process_timeout",
@@ -107,6 +115,14 @@ GEMINI_PROBE_STDOUT_SHAPES: Final[frozenset[ProbeStdoutShape]] = frozenset({
     "gemini_probe_stdout_jsonl_incomplete",
     "gemini_probe_stdout_unclassified",
 })
+GEMINI_PROBE_STDOUT_EVENT_CLASSES: Final[frozenset[ProbeStdoutEventClass]] = frozenset({
+    "gemini_probe_stdout_event_init",
+    "gemini_probe_stdout_event_user_message",
+    "gemini_probe_stdout_event_assistant_message",
+    "gemini_probe_stdout_event_tool_use",
+    "gemini_probe_stdout_event_tool_result",
+    "gemini_probe_stdout_event_error",
+})
 
 
 def normalize_gemini_probe_diagnostic_code(value: object) -> ProbeDiagnosticCode | None:
@@ -123,6 +139,10 @@ def normalize_gemini_probe_output_shape(value: object) -> ProbeOutputShape | Non
 
 def normalize_gemini_probe_stdout_shape(value: object) -> ProbeStdoutShape | None:
     return value if isinstance(value, str) and value in GEMINI_PROBE_STDOUT_SHAPES else None
+
+
+def normalize_gemini_probe_stdout_event_class(value: object) -> ProbeStdoutEventClass | None:
+    return value if isinstance(value, str) and value in GEMINI_PROBE_STDOUT_EVENT_CLASSES else None
 
 
 class FleetRunnerError(ValueError):
@@ -183,11 +203,18 @@ class ProbeResult:
     process_phase: ProbeProcessPhase | None = None
     process_output_shape: ProbeOutputShape | None = None
     process_stdout_shape: ProbeStdoutShape | None = None
+    process_stdout_event_class: ProbeStdoutEventClass | None = None
+    process_stdout_error_seen: bool | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "process_phase", normalize_gemini_probe_process_phase(self.process_phase))
         object.__setattr__(self, "process_output_shape", normalize_gemini_probe_output_shape(self.process_output_shape))
         object.__setattr__(self, "process_stdout_shape", normalize_gemini_probe_stdout_shape(self.process_stdout_shape))
+        object.__setattr__(self, "process_stdout_event_class", normalize_gemini_probe_stdout_event_class(
+            self.process_stdout_event_class,
+        ))
+        if not isinstance(self.process_stdout_error_seen, bool):
+            object.__setattr__(self, "process_stdout_error_seen", None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -450,7 +477,14 @@ def _response_part(value: object) -> str | None:
     return value
 
 
-def parse_gemini_jsonl(lines: Iterable[str]) -> GeminiStreamResult:
+def _scan_gemini_jsonl(
+    lines: Iterable[str],
+) -> tuple[
+    GeminiStreamResult | None,
+    FleetRunnerError | None,
+    ProbeStdoutEventClass | None,
+    bool,
+]:
     response_parts: list[str] = []
     response_bytes = 0
     session_id: str | None = None
@@ -463,25 +497,28 @@ def parse_gemini_jsonl(lines: Iterable[str]) -> GeminiStreamResult:
     provider_error: ProviderError | None = None
     complete = False
     final_response: str | None = None
+    last_event_class: ProbeStdoutEventClass | None = None
+    error_seen = False
+    summary_valid = True
     for line in lines:
         if not isinstance(line, str):
-            _fail("invalid_gemini_jsonl")
+            return None, FleetRunnerError("invalid_gemini_jsonl"), None, False
         try:
             line_bytes = line.encode("utf-8")
         except UnicodeError:
-            _fail("invalid_gemini_jsonl")
+            return None, FleetRunnerError("invalid_gemini_jsonl"), None, False
         if len(line_bytes) > MAX_GEMINI_LINE_BYTES:
-            _fail("gemini_line_too_large")
+            return None, FleetRunnerError("gemini_line_too_large"), None, False
         event_count += 1
         if event_count > MAX_GEMINI_EVENTS:
-            _fail("gemini_event_limit_exceeded")
+            return None, FleetRunnerError("gemini_event_limit_exceeded"), None, False
         try:
             event = json.loads(line)
         except (UnicodeError, json.JSONDecodeError, RecursionError):
-            _fail("invalid_gemini_jsonl")
+            return None, FleetRunnerError("invalid_gemini_jsonl"), None, False
         raw = _mapping(event)
         if raw is None:
-            _fail("invalid_gemini_jsonl")
+            return None, FleetRunnerError("invalid_gemini_jsonl"), None, False
         event_type = raw.get("type")
         if event_type == "init":
             candidate_session_id = raw.get("session_id")
@@ -490,41 +527,68 @@ def parse_gemini_jsonl(lines: Iterable[str]) -> GeminiStreamResult:
                 session_id = candidate_session_id
             if isinstance(candidate_model, str):
                 model = candidate_model
+            last_event_class = "gemini_probe_stdout_event_init"
         elif event_type == "message":
+            role = raw.get("role")
+            if role == "user":
+                last_event_class = "gemini_probe_stdout_event_user_message"
+            elif role == "assistant":
+                last_event_class = "gemini_probe_stdout_event_assistant_message"
+            else:
+                summary_valid = False
             if raw.get("role") == "assistant":
                 content = _response_part(raw.get("content"))
                 if content is not None:
                     response_bytes += len(content.encode("utf-8"))
                     if response_bytes > MAX_GEMINI_RESPONSE_BYTES:
-                        _fail("gemini_response_too_large")
+                        return None, FleetRunnerError("gemini_response_too_large"), None, False
                     response_parts.append(content)
         elif event_type == "tool_use":
             tool_call_count += 1
+            last_event_class = "gemini_probe_stdout_event_tool_use"
         elif event_type == "tool_result":
-            pass
+            last_event_class = "gemini_probe_stdout_event_tool_result"
         elif event_type == "error":
             provider_error = classify_provider_error(Provider.GEMINI_API, raw, "")
+            error_seen = True
+            last_event_class = "gemini_probe_stdout_event_error"
         elif event_type == "result":
             if complete:
-                _fail("invalid_gemini_jsonl")
+                return None, FleetRunnerError("invalid_gemini_jsonl"), None, False
             complete = True
             content = _response_part(raw.get("response"))
             if content is not None:
                 response_bytes += len(content.encode("utf-8"))
                 if response_bytes > MAX_GEMINI_RESPONSE_BYTES:
-                    _fail("gemini_response_too_large")
+                    return None, FleetRunnerError("gemini_response_too_large"), None, False
                 final_response = content
             stats = _mapping(raw.get("stats"))
             if stats is not None:
                 input_tokens = _usage(stats.get("input_tokens"))
                 output_tokens = _usage(stats.get("output_tokens"))
         else:
+            summary_valid = False
             unknown_event_count += 1
     if not complete:
-        _fail("gemini_result_missing")
+        parse_error = FleetRunnerError("gemini_result_missing")
+        return (
+            None,
+            parse_error,
+            last_event_class if summary_valid else None,
+            bool(error_seen) if summary_valid else False,
+        )
     return GeminiStreamResult(final_response if final_response is not None else "".join(response_parts), session_id,
                               model, input_tokens, output_tokens, tool_call_count, event_count,
-                              unknown_event_count, provider_error)
+                              unknown_event_count, provider_error), None, (
+                                  last_event_class if summary_valid else None
+                              ), bool(error_seen) if summary_valid else False
+
+
+def parse_gemini_jsonl(lines: Iterable[str]) -> GeminiStreamResult:
+    parsed, error, _event_class, _error_seen = _scan_gemini_jsonl(lines)
+    if error is not None:
+        raise error
+    return parsed
 
 
 def model_is_agentic(provider: Provider, metadata: Mapping[str, object]) -> bool:
@@ -879,41 +943,45 @@ def probe_gemini_cli(
             registry.finish(job, result)
 
     if result.timed_out:
-        process_output_shape = None
+        process_output_shape: ProbeOutputShape | None = None
         process_stdout_shape = None
+        process_stdout_event_class = None
+        process_stdout_error_seen: bool | None = None
+        stdout_error: FleetRunnerError | None = None
+        stdout_event_class: ProbeStdoutEventClass | None = None
+        stdout_error_seen = None
         if result.stdout:
+            try:
+                stdout_lines = result.stdout.decode("utf-8").splitlines()
+            except UnicodeDecodeError:
+                stdout_error = FleetRunnerError("invalid_gemini_jsonl")
+            else:
+                _, stdout_error, stdout_event_class, stdout_error_seen = _scan_gemini_jsonl(stdout_lines)
             if not result.readers_alive and not result.stdout_truncated:
-                try:
-                    process_stdout_lines = result.stdout.decode("utf-8").splitlines()
-                except UnicodeDecodeError:
-                    process_stdout_shape = "gemini_probe_stdout_unclassified"
+                if stdout_error is None:
+                    process_stdout_shape = "gemini_probe_stdout_terminal_jsonl"
                 else:
-                    try:
-                        parse_gemini_jsonl(process_stdout_lines)
-                    except FleetRunnerError as exc:
-                        process_stdout_shape = (
-                            "gemini_probe_stdout_jsonl_incomplete"
-                            if getattr(exc, "code", None) == "gemini_result_missing"
-                            else "gemini_probe_stdout_unclassified"
-                        )
-                    else:
-                        process_stdout_shape = "gemini_probe_stdout_terminal_jsonl"
+                    process_stdout_shape = (
+                        "gemini_probe_stdout_jsonl_incomplete"
+                        if getattr(stdout_error, "code", None) == "gemini_result_missing"
+                        else "gemini_probe_stdout_unclassified"
+                    )
+                if process_stdout_shape == "gemini_probe_stdout_jsonl_incomplete" and isinstance(stdout_event_class, str) and isinstance(stdout_error_seen, bool):
+                    process_stdout_event_class = stdout_event_class
+                    process_stdout_error_seen = stdout_error_seen
+            else:
+                process_stdout_shape = None
         if result.readers_alive or result.stdout_truncated or result.stderr_truncated:
             process_output_shape = "gemini_probe_output_truncated_or_pipe_open"
         elif result.stdout == b"" and result.stderr == b"":
             process_output_shape = "gemini_probe_output_none"
         elif result.stderr == b"" and result.stdout != b"":
-            try:
-                parse_gemini_jsonl(result.stdout.decode("utf-8").splitlines())
-            except FleetRunnerError as exc:
-                if getattr(exc, "code", None) == "gemini_result_missing":
-                    process_output_shape = "gemini_probe_output_stdout_jsonl_incomplete"
-                else:
-                    process_output_shape = "gemini_probe_output_stdout_unclassified"
-            except UnicodeDecodeError:
-                process_output_shape = "gemini_probe_output_stdout_unclassified"
-            else:
+            if stdout_error is None:
                 process_output_shape = "gemini_probe_output_stdout_terminal"
+            elif getattr(stdout_error, "code", None) == "gemini_result_missing":
+                process_output_shape = "gemini_probe_output_stdout_jsonl_incomplete"
+            else:
+                process_output_shape = "gemini_probe_output_stdout_unclassified"
         elif result.stdout == b"" and result.stderr != b"":
             process_output_shape = "gemini_probe_output_stderr_only"
         elif result.stdout != b"" and result.stderr != b"":
@@ -922,15 +990,10 @@ def probe_gemini_cli(
         if result.stdout == b"" and result.stderr == b"":
             process_phase = "gemini_probe_timeout_no_output"
         elif result.stderr == b"" and result.stdout != b"":
-            try:
-                parse_gemini_jsonl(result.stdout.decode("utf-8").splitlines())
-            except FleetRunnerError as exc:
-                if getattr(exc, "code", None) == "gemini_result_missing":
-                    process_phase = "gemini_probe_timeout_structured_no_terminal"
-                else:
-                    process_phase = "gemini_probe_timeout_output_unclassified"
-            except UnicodeDecodeError:
+            if stdout_error is None:
                 process_phase = "gemini_probe_timeout_output_unclassified"
+            elif getattr(stdout_error, "code", None) == "gemini_result_missing":
+                process_phase = "gemini_probe_timeout_structured_no_terminal"
             else:
                 process_phase = "gemini_probe_timeout_output_unclassified"
         elif result.stdout == b"" and result.stderr != b"":
@@ -951,6 +1014,8 @@ def probe_gemini_cli(
             process_phase=process_phase,
             process_output_shape=process_output_shape,
             process_stdout_shape=process_stdout_shape,
+            process_stdout_event_class=process_stdout_event_class,
+            process_stdout_error_seen=process_stdout_error_seen,
         )
 
     if (
