@@ -752,6 +752,25 @@ def test_probe_model_scope_without_retry_or_accountwide_scopes_fail_closed(
     assert service._load_limits().get("shared", {}).get("reset_at_utc") == "2026-08-03T12:03:00Z"
 
 
+def test_record_gemini_event_unknown_diagnostic_code_is_omitted(tmp_path: Path) -> None:
+    service, _ = _service(tmp_path, _configured_snapshot())
+
+    result = service.record_gemini_event(
+        event_type="account_probe",
+        agent_id="probe",
+        account_id="shared",
+        assignment_id=None,
+        status="failed",
+        reason="provider_unavailable",
+        diagnostic_code="unknown_code",
+    )
+
+    assert result["recorded"] is True
+    events = service.gemini_event_status(limit=1)
+    assert len(events) == 1
+    assert "diagnostic_code" not in events[0]
+
+
 def test_detail_poor_429_binds_account_limit_to_existing_rate_cooldown(tmp_path: Path, monkeypatch) -> None:
     service, _ = _service(tmp_path, _configured_snapshot())
     reservation = service.reserve_gemini_request("shared")

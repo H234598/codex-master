@@ -34,7 +34,7 @@ from .fleet_registry import (
     public_fleet_snapshot,
 )
 from .fleet_runners import ProviderErrorQuotaObservation, ProbeResult
-from .fleet_runners import GEMINI_PROBE_DIAGNOSTIC_CODES, ProbeDiagnosticCode, normalize_gemini_probe_diagnostic_code
+from .fleet_runners import ProbeDiagnosticCode, normalize_gemini_probe_diagnostic_code
 from .selection import (
     FairnessLedger,
     ModelRole,
@@ -189,7 +189,6 @@ _GEMINI_LEGACY_GATE_CODES = MappingProxyType({
 })
 _GEMINI_EVENT_REASON_CODES = frozenset({
     *GEMINI_GATE_DIAGNOSTICS,
-    *GEMINI_PROBE_DIAGNOSTIC_CODES,
     "account_limited",
     "auth_invalid",
     "model_unavailable",
@@ -1026,11 +1025,13 @@ class FleetService:
         gate_action: str | None = None,
         gate_code: str | None = None,
         next_reset_at_utc: str | None = None,
+        diagnostic_code: ProbeDiagnosticCode | None = None,
     ) -> dict[str, object]:
         """Append a bounded, redacted Gemini event for master/dispatcher status."""
 
         if self._read_only:
             return {"recorded": False, "reason": "read_only"}
+        normalized_diagnostic_code = normalize_gemini_probe_diagnostic_code(diagnostic_code)
         values = {
             "event_type": event_type,
             "agent_id": agent_id,
@@ -1046,6 +1047,8 @@ class FleetService:
             "gate_code": gate_code,
             "next_reset_at_utc": next_reset_at_utc,
         }
+        if normalized_diagnostic_code is not None:
+            values["diagnostic_code"] = normalized_diagnostic_code
         for key in ("event_type", "status"):
             value = values[key]
             if not isinstance(value, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value):

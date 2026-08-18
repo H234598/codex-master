@@ -699,12 +699,11 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
     assert isinstance(event, dict)
     assert event["event_type"] == "account_probe"
     assert event["status"] == "failed"
+    assert event.get("reason") == "provider_unavailable"
     if expected_observed is None:
-        assert event.get("reason") != diagnostic_code
+        assert "diagnostic_code" not in event
     else:
-        assert event.get("reason") == expected_observed
-    if expected_observed is None:
-        assert event.get("reason") == "provider_unavailable"
+        assert event.get("diagnostic_code") == expected_observed
     assert GEMINI_READY_CREDENTIAL not in json.dumps(result)
 
 
