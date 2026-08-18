@@ -7230,9 +7230,10 @@ class ServerHelpersTest(unittest.TestCase):
             path = Path(tmp) / "hive-api-tokens"
             path.write_text(
                 "\n".join([
-                    "The_Hive_31=OUTSIDE_PLATFORM_RANGE",
+                    "The_Hive_100=OUTSIDE_PLATFORM_RANGE",
                     "The_Hive_1=valid1",
                     "The_Hive_2 = valid2",
+                    "The_Hive_40=valid40",
                 ]),
                 encoding="utf-8",
             )
@@ -7240,6 +7241,8 @@ class ServerHelpersTest(unittest.TestCase):
 
             selected = server_module._read_hive_api_tokens(path=path, selected_keys=[1, 2])
             self.assertEqual(selected, {1: "valid1", 2: "valid2"})
+            selected_high = server_module._read_hive_api_tokens(path=path, selected_keys=[40])
+            self.assertEqual(selected_high, {40: "valid40"})
 
             with self.assertRaisesRegex(
                 server_module.AgentError,
@@ -7248,9 +7251,10 @@ class ServerHelpersTest(unittest.TestCase):
                 server_module._read_hive_api_tokens(path=path)
 
     def test_read_hive_api_tokens_rejects_invalid_or_duplicate_selected_entry(self) -> None:
-        for label, text in (
-            ("invalid_selected_value", "The_Hive_1=valid one\nThe_Hive_2=valid2"),
-            ("duplicate_selected_key", "The_Hive_1=valid1\nThe_Hive_1=valid2"),
+        for label, text, selected_keys in (
+            ("invalid_selected_value", "The_Hive_1=valid one\nThe_Hive_2=valid2", [1, 2]),
+            ("duplicate_selected_key", "The_Hive_1=valid1\nThe_Hive_1=valid2", [1, 2]),
+            ("selected_key_out_of_range", "The_Hive_100=valid100", [100]),
         ):
             with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / "hive-api-tokens"
@@ -7261,7 +7265,78 @@ class ServerHelpersTest(unittest.TestCase):
                     server_module.AgentError,
                     "api_token_env_invalid",
                 ):
-                    server_module._read_hive_api_tokens(path=path, selected_keys=[1, 2])
+                    server_module._read_hive_api_tokens(path=path, selected_keys=selected_keys)
+
+    def test_fleet_account_sync_env_syncs_high_key_without_secret_exposure(self) -> None:
+        token = "synthetic-token-40"
+
+        class _DummyService:
+            generation = 1
+
+            def load(self) -> "_DummyService":
+                return self
+
+        service = _DummyService()
+        with patch.object(server_module, "_read_hive_api_tokens", return_value={40: token}) as reader, patch.object(
+            server_module,
+            "current_fleet_service",
+            return_value=service,
+        ), patch.object(
+            server_module,
+            "fleet_account_upsert",
+        ) as upsert, patch.object(
+            server_module,
+            "fleet_account_set_secret",
+        ) as set_secret, patch.object(
+            server_module,
+            "fleet_account_probe",
+            return_value={"probed": False, "ready": False, "reason": "not_ready", "raw_output": "not_returned"},
+        ) as probe:
+            result = server_module.fleet_account_sync_env(
+                first_key=40,
+                last_key=40,
+                activate_series=False,
+            )
+
+            self.assertEqual(result["requested_keys"], [40])
+            self.assertEqual(result["configured_keys"], [40])
+            self.assertEqual(result["missing_keys"], [])
+            self.assertEqual(
+                result["probe_results"],
+                [{"key": 40, "account_id": "the-hive-40", "probed": False, "ready": False, "reason": "not_ready", "raw_output": "not_returned"}],
+            )
+            self.assertEqual(result["activated_series"], [])
+            probe.assert_called_once_with(account_id="the-hive-40", expected_generation=1)
+            reader.assert_called_once_with(selected_keys=[40])
+            upsert.assert_called_once_with(
+                account_id="the-hive-40",
+                label="The Hive 40",
+                provider=server_module.Provider.GEMINI_API.value,
+                auth_kind=server_module.AuthKind.API_KEY.value,
+                enabled=True,
+                expected_generation=1,
+            )
+            set_secret.assert_called_once_with(
+                account_id="the-hive-40",
+                secret=token,
+                expected_generation=1,
+            )
+            self.assertNotIn(token, str(result))
+
+    def test_hive_series_prefix_legacy_stable_and_high_index_valid_and_unique(self) -> None:
+        max_keys = server_module.MAX_HIVE_API_KEYS
+        prefixes = {
+            number: server_module._hive_series_prefix(number)
+            for number in range(1, max_keys + 1)
+        }
+
+        for number in range(1, 21):
+            self.assertEqual(prefixes[number], chr(ord("f") + number))
+        for number in range(21, 31):
+            self.assertEqual(prefixes[number], f"a-{chr(ord('a') + number - 21)}")
+        self.assertEqual(prefixes[30], "a-j")
+        self.assertTrue(all(server_module.POOL_PREFIX_RE.fullmatch(prefix) for prefix in prefixes.values()))
+        self.assertEqual(len(set(prefixes.values())), max_keys)
 
     def test_fleet_account_sync_env_passes_selected_keys_and_noops_without_reader_result(self) -> None:
         with patch.object(server_module, "_read_hive_api_tokens", return_value={}) as read_hive, patch.object(

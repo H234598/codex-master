@@ -590,7 +590,7 @@ LEASE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 MAX_POOL_AGENTS = 1000
 MAX_POOL_SERIES = 26
 MAX_FLEET_SERIES_COUNT = 100
-MAX_HIVE_API_KEYS = 30
+MAX_HIVE_API_KEYS = 99
 MAX_POOL_SHARED_ASSETS = 40
 MAX_POOL_RUNTIME_DIRS = 40
 MAX_APPLET_AGENTS = 6
@@ -30968,7 +30968,7 @@ def _read_hive_api_tokens(
             continue
         if line.startswith("export "):
             line = line[7:].lstrip()
-        match = re.fullmatch(r"The_Hive_(\d{1,2})\s*=\s*(.*)", line)
+        match = re.fullmatch(r"The_Hive_(\d+)\s*=\s*(.*)", line)
         if match is None:
             continue
         number = int(match.group(1))
@@ -30995,7 +30995,9 @@ def _hive_series_prefix(number: int) -> str:
         raise AgentError("hive_series_prefix_unavailable")
     if number <= 20:
         return chr(ord("f") + number)
-    return f"a-{chr(ord('a') + number - 21)}"
+    if number <= 30:
+        return f"a-{chr(ord('a') + number - 21)}"
+    return f"x-{number}"
 
 
 def fleet_account_sync_env(
