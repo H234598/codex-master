@@ -30938,8 +30938,16 @@ def fleet_account_list() -> dict[str, Any]:
     }
 
 
-def _read_hive_api_tokens(path: Path = HIVE_API_TOKEN_ENV_FILE) -> dict[int, str]:
+def _read_hive_api_tokens(
+    path: Path = HIVE_API_TOKEN_ENV_FILE,
+    selected_keys: list[int] | None = None,
+) -> dict[int, str]:
     """Read only The_Hive_N assignments from the private local token file."""
+
+    if selected_keys is not None:
+        selected_set = set(selected_keys)
+    else:
+        selected_set = None
 
     try:
         file_stat = path.lstat()
@@ -30964,6 +30972,8 @@ def _read_hive_api_tokens(path: Path = HIVE_API_TOKEN_ENV_FILE) -> dict[int, str
         if match is None:
             continue
         number = int(match.group(1))
+        if selected_set is not None and number not in selected_set:
+            continue
         value = match.group(2).strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
             value = value[1:-1]
@@ -31006,7 +31016,7 @@ def fleet_account_sync_env(
         raise AgentError("invalid_hive_key_range")
     if not isinstance(activate_series, bool):
         raise AgentError("invalid_hive_series_flag")
-    tokens = _read_hive_api_tokens()
+    tokens = _read_hive_api_tokens(selected_keys=list(range(first_key, last_key + 1)))
     requested = list(range(first_key, last_key + 1))
     missing = [number for number in requested if number not in tokens]
     configured: list[int] = []

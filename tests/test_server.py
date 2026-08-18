@@ -7225,6 +7225,79 @@ class ServerHelpersTest(unittest.TestCase):
                     self.assertEqual(server_module.current_fleet_service().load().generation, 2)
                     self.assertTrue(all((pool / f"d{ordinal}").is_dir() for ordinal in range(1, 6)))
 
+    def test_read_hive_api_tokens_selection_ignores_unselected_out_of_range(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hive-api-tokens"
+            path.write_text(
+                "\n".join([
+                    "The_Hive_31=OUTSIDE_PLATFORM_RANGE",
+                    "The_Hive_1=valid1",
+                    "The_Hive_2 = valid2",
+                ]),
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+
+            selected = server_module._read_hive_api_tokens(path=path, selected_keys=[1, 2])
+            self.assertEqual(selected, {1: "valid1", 2: "valid2"})
+
+            with self.assertRaisesRegex(
+                server_module.AgentError,
+                "api_token_env_invalid",
+            ):
+                server_module._read_hive_api_tokens(path=path)
+
+    def test_read_hive_api_tokens_rejects_invalid_or_duplicate_selected_entry(self) -> None:
+        for label, text in (
+            ("invalid_selected_value", "The_Hive_1=valid one\nThe_Hive_2=valid2"),
+            ("duplicate_selected_key", "The_Hive_1=valid1\nThe_Hive_1=valid2"),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "hive-api-tokens"
+                path.write_text(text, encoding="utf-8")
+                path.chmod(0o600)
+
+                with self.assertRaisesRegex(
+                    server_module.AgentError,
+                    "api_token_env_invalid",
+                ):
+                    server_module._read_hive_api_tokens(path=path, selected_keys=[1, 2])
+
+    def test_fleet_account_sync_env_passes_selected_keys_and_noops_without_reader_result(self) -> None:
+        with patch.object(server_module, "_read_hive_api_tokens", return_value={}) as read_hive, patch.object(
+            server_module,
+            "fleet_account_upsert",
+        ) as upsert, patch.object(
+            server_module,
+            "fleet_account_set_secret",
+        ) as set_secret, patch.object(
+            server_module,
+            "fleet_account_probe",
+        ) as probe, patch.object(
+            server_module,
+            "fleet_series_apply",
+        ) as apply_series, patch.object(
+            server_module,
+            "_hive_series_prefix",
+        ) as hive_prefix:
+            result = server_module.fleet_account_sync_env(
+                first_key=1,
+                last_key=2,
+                activate_series=False,
+            )
+
+            self.assertEqual(result["requested_keys"], [1, 2])
+            self.assertEqual(result["configured_keys"], [])
+            self.assertEqual(result["missing_keys"], [1, 2])
+            self.assertEqual(result["probe_results"], [])
+            self.assertEqual(result["activated_series"], [])
+            read_hive.assert_called_once_with(selected_keys=[1, 2])
+            upsert.assert_not_called()
+            set_secret.assert_not_called()
+            probe.assert_not_called()
+            hive_prefix.assert_not_called()
+            apply_series.assert_not_called()
+
     def test_fleet_series_shrink_rejects_unknown_content_and_home_swap(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

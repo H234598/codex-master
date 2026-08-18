@@ -7,9 +7,12 @@ from pathlib import Path
 
 import pytest
 
+from codex_master.fleet_headless import HeadlessJobError, HeadlessProcessResult
 from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
 from codex_master.fleet_runners import (
     FleetRunnerError,
+    GEMINI_PROBE_TIMEOUT_SECONDS,
+    MAX_HEADLESS_TIMEOUT_SECONDS,
     HUGGINGFACE_MODELS_URL,
     MAX_PROVIDER_RESPONSE_BYTES,
     OLLAMA_MODELS_URL,
@@ -156,6 +159,7 @@ def test_gemini_provider_probe_is_stdin_only_bounded_and_isolated(
     assert "Reply with exactly OK. Do not modify files or use tools." not in argv
     assert "--prompt" in argv
     assert "--approval-mode=plan" in argv
+    assert argv.count("--skip-trust") == 1
     assert "gemini-3.1-flash-lite" in argv
     settings = json.loads(captured["settings"])  # type: ignore[arg-type]
     assert settings["general"]["maxAttempts"] == 1
@@ -168,6 +172,62 @@ def test_gemini_provider_probe_is_stdin_only_bounded_and_isolated(
     assert "GOOGLE_API_KEY" not in env
     assert '"enforcedType": "gemini-api-key"' in captured["settings"]
     assert "private-gemini-secret" not in repr(result)
+
+
+def test_gemini_provider_probe_timeout_maps_to_provider_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "gemini"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o700)
+
+    timeout_result = HeadlessProcessResult(
+        returncode=0,
+        stdout=b"",
+        stderr=b"",
+        stdout_truncated=False,
+        stderr_truncated=False,
+        timed_out=True,
+        cancelled=False,
+    )
+
+    captured_timeout: list[float] = []
+
+    def _run_bounded(*_args: object, timeout_seconds: float, **_kwargs: object) -> HeadlessProcessResult:
+        captured_timeout.append(timeout_seconds)
+        return timeout_result
+
+    monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+    result = probe_gemini_cli("private-gemini-secret", executable)
+
+    assert captured_timeout == [float(GEMINI_PROBE_TIMEOUT_SECONDS)]
+    assert GEMINI_PROBE_TIMEOUT_SECONDS == 90
+    assert GEMINI_PROBE_TIMEOUT_SECONDS <= MAX_HEADLESS_TIMEOUT_SECONDS
+    assert result.ok is False
+    assert result.error is not None
+    assert result.error.kind == "provider_unavailable"
+    assert result.error.retryable is True
+
+
+def test_gemini_provider_probe_headless_job_error_maps_to_runner_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = tmp_path / "gemini"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o700)
+
+    def _run_bounded(*_args: object, **_kwargs: object) -> HeadlessProcessResult:
+        raise HeadlessJobError("headless-failed")
+
+    monkeypatch.setattr("codex_master.fleet_runners.run_bounded_process", _run_bounded)
+    result = probe_gemini_cli("private-gemini-secret", executable)
+
+    assert result.ok is False
+    assert result.error is not None
+    assert result.error.kind == "runner_failed"
+    assert result.error.retryable is False
 
 
 def test_runner_plan_is_immutable_and_refuses_relative_or_controlled_executable(tmp_path: Path) -> None:

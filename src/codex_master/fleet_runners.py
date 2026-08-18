@@ -16,7 +16,13 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 from unicodedata import category
 
 from .fleet_registry import AgentDescriptor, Provider, RunnerKind
-from .fleet_headless import MAX_HEADLESS_TIMEOUT_SECONDS, HeadlessJob, HeadlessJobRegistry, run_bounded_process
+from .fleet_headless import (
+    MAX_HEADLESS_TIMEOUT_SECONDS,
+    HeadlessJob,
+    HeadlessJobError,
+    HeadlessJobRegistry,
+    run_bounded_process,
+)
 
 
 MAX_GEMINI_LINE_BYTES = 1024 * 1024
@@ -26,7 +32,7 @@ MAX_USAGE_TOKENS = 2**63 - 1
 MAX_PROVIDER_RESPONSE_BYTES = 1024 * 1024
 MAX_PROVIDER_MODELS = 1000
 PROVIDER_HTTP_TIMEOUT_SECONDS = 5
-GEMINI_PROBE_TIMEOUT_SECONDS = 30
+GEMINI_PROBE_TIMEOUT_SECONDS = 90
 GEMINI_DEFAULT_LIGHT_MODEL = "gemini-3.1-flash-lite"
 OLLAMA_MODELS_URL = "http://127.0.0.1:11434/api/tags"
 HUGGINGFACE_MODELS_URL = "https://router.huggingface.co/v1/models"
@@ -597,7 +603,7 @@ def probe_gemini_cli(
                 "GEMINI_CLI_TRUST_WORKSPACE": "true",
             })
             argv = [command, "--output-format", "stream-json", "--prompt", "", "--approval-mode=plan",
-                    "--model", model or GEMINI_DEFAULT_LIGHT_MODEL]
+                    "--skip-trust", "--model", model or GEMINI_DEFAULT_LIGHT_MODEL]
             registry.register(job)
             result = run_bounded_process(
                 job,
@@ -608,6 +614,11 @@ def probe_gemini_cli(
                 timeout_seconds=float(timeout_seconds),
                 popen_factory=popen_factory,
             )
+    except HeadlessJobError:
+        return ProbeResult(
+            Provider.GEMINI_API, False, None, False,
+            ProviderError("runner_failed", False, None, None),
+        )
     except Exception:
         return ProbeResult(
             Provider.GEMINI_API, False, None, False,
