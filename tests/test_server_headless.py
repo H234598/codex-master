@@ -2086,6 +2086,283 @@ def test_s5d_headless_recovery_keeps_inflight_when_process_end_is_unconfirmed(mo
     assert writes[-1]["headless_inflight_reservation_id"] == "inflight-recovery-unconfirmed"
 
 
+def _build_provider_limited_output(
+    quota_scope: str,
+    retry_delay: str | None = None,
+) -> bytes:
+    details: list[dict[str, object]] = [
+        {
+            "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+            "violations": [
+                {
+                    "quotaDimensions": (
+                        {"model": "gemini-3-flash-preview"}
+                        if quota_scope == "model"
+                        else {"provider": "gemini"}
+                        if quota_scope == "unknown"
+                        else {}
+                    ),
+                },
+            ],
+        },
+    ]
+    if retry_delay is not None:
+        details.append({
+            "@type": "type.googleapis.com/google.rpc.RetryInfo",
+            "retryDelay": retry_delay,
+        })
+    return (
+        b'{"type":"init","session_id":"session","model":"gemini-3-flash-preview"}\n'
+        + json.dumps({"type": "error", "status": "RESOURCE_EXHAUSTED", "error": {
+            "code": 429,
+            "reset_at_utc": "2026-08-03T12:00:00Z",
+            "details": details,
+        }}).encode("utf-8")
+        + b"\n"
+        + b'{"type":"result","response":"","stats":{"input_tokens":0,"output_tokens":0}}\n'
+    )
+
+
+def test_g8_b2_headless_terminal_account_limited_model_scope_uses_model_limited_usage_path(monkeypatch) -> None:
+    descriptor = type(
+        "Descriptor",
+        (),
+        {
+            "model": "gemini-3-flash-preview",
+            "account_id": "gemini-project",
+            "provider": server.Provider.GEMINI_API,
+            "runner": server.RunnerKind.GEMINI_CLI,
+            "home": Path("/tmp/managed-d1"),
+        },
+    )()
+
+    class Inventory:
+        def __init__(self) -> None:
+            self.agents = {"d1": descriptor}
+
+    class RunResult:
+        def __init__(self, stdout: bytes) -> None:
+            self.returncode = 17
+            self.stdout = stdout
+            self.stderr = b""
+            self.stdout_truncated = False
+            self.stderr_truncated = False
+            self.timed_out = False
+            self.cancelled = False
+
+    service = Mock()
+    service.load.return_value = object()
+    service.read_secret.return_value = "sekret"
+    release_calls: list[tuple[object, str, str]] = []
+    writes: list[dict[str, object]] = []
+
+    def write_headless_marker(_agent: str, value: dict[str, object]) -> None:
+        writes.append(dict(value))
+
+    monkeypatch.setattr(server, "canonical_agent_id", lambda _agent: "d1")
+    monkeypatch.setattr(server, "current_fleet_service", lambda: service)
+    monkeypatch.setattr(server, "_headless_descriptor", lambda _agent: descriptor)
+    monkeypatch.setattr(server, "_headless_marker", lambda _agent: {"state": "ready"})
+    monkeypatch.setattr(server, "status_agent", lambda *_args, **_kwargs: {"identity_guard": {"ok": True}})
+    monkeypatch.setattr(
+        server,
+        "_headless_admission_gate",
+        lambda _agent: Mock(allowed=True, account_id="gemini-project", generation=1),
+    )
+    monkeypatch.setattr(server, "_headless_executable", lambda _descriptor: Path("/tmp/managed-d1"))
+    monkeypatch.setattr(server, "_ensure_gemini_headless_retry_policy", lambda *_args: None)
+    monkeypatch.setattr(
+        server,
+        "build_runner_plan",
+        lambda *_args: type(
+            "Plan",
+            (),
+            {"unset_env": set(), "env": {}, "secret_env_name": "GEMINI_API_KEY", "argv": ("cmd",)},
+        )(),
+    )
+    monkeypatch.setattr(server, "build_inventory", lambda _snapshot, _root: Inventory())
+    monkeypatch.setattr(server, "subprocess", type(
+        "Subprocess",
+        (),
+        {"Popen": Mock(return_value=Mock(pid=None, stdin=io.BytesIO(b""), stdout=io.BytesIO(), stderr=io.BytesIO())),
+         "PIPE": object()},
+    ))
+    monkeypatch.setattr(server, "run_bounded_process", lambda *_args, **_kwargs: RunResult(
+        _build_provider_limited_output("model", "120s"),
+    ))
+    monkeypatch.setattr(server, "_write_headless_marker", write_headless_marker)
+    monkeypatch.setattr(
+        server,
+        "release_headless_inflight",
+        lambda reservation_id, _agent, assignment_id: (
+            release_calls.append((reservation_id, _agent, assignment_id))
+            or {"status": "released"}
+        ),
+    )
+    monkeypatch.setattr(server.HEADLESS_JOBS, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server.HEADLESS_JOBS, "finish", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server.HEADLESS_JOBS, "request_cancel", lambda *_args, **_kwargs: {"status": "not_running"})
+
+    result = server._run_headless_process(
+        "d1",
+        "prompt",
+        {"state": "held", "held_by_this_server": True},
+        5,
+        role="arbeitsbiene",
+        assignment_id="assignment-model-limited",
+        headless_inflight_reservation={"reservation_id": "inflight-model-limited"},
+        structured_gate={"action": "allow", "diagnostic_code": "gemini_limits_unknown", "account_id": "gemini-project", "raw_output": "not_returned"},
+        release_lease_on_completion=False,
+    )
+
+    assert result["status"] == "failed"
+    assert release_calls == [("inflight-model-limited", "d1", "assignment-model-limited")]
+    assert writes[0]["state"] == "running"
+    assert writes[-1]["state"] == "failed"
+
+    usage = service.record_gemini_usage.call_args.kwargs
+    assert usage["status"] == "rate_limited"
+    observed = usage["quota_observation"]
+    assert observed is not None
+    assert observed.scope == "model"
+    assert observed.retry_after_seconds == 120
+    event = service.record_gemini_event.call_args.kwargs
+    assert event.get("quota_observation") is None
+    assert "quota_observation" not in event
+    service.mark_limited.assert_not_called()
+    release_event = service.release_gemini_request.call_args.kwargs
+    assert release_event["outcome"] == "provider_error"
+    assert "reset_at_utc" not in release_event or release_event["reset_at_utc"] is None
+
+
+@pytest.mark.parametrize(
+    ("quota_scope", "retry_delay", "expected_observation_scope", "expected_retry_seconds"),
+    [
+        ("account", None, "account", None),
+        ("model", None, "model", None),
+        ("unknown", "120s", "unknown", 120),
+    ],
+)
+def test_g8_b2_headless_terminal_account_limited_fallbacks_to_accountwide_path(
+    monkeypatch,
+    quota_scope: str,
+    retry_delay: str | None,
+    expected_observation_scope: str,
+    expected_retry_seconds: int | None,
+) -> None:
+    descriptor = type(
+        "Descriptor",
+        (),
+        {
+            "model": "gemini-3-flash-preview",
+            "account_id": "gemini-project",
+            "provider": server.Provider.GEMINI_API,
+            "runner": server.RunnerKind.GEMINI_CLI,
+            "home": Path("/tmp/managed-d1"),
+        },
+    )()
+
+    class Inventory:
+        def __init__(self) -> None:
+            self.agents = {"d1": descriptor}
+
+    class RunResult:
+        def __init__(self, stdout: bytes) -> None:
+            self.returncode = 17
+            self.stdout = stdout
+            self.stderr = b""
+            self.stdout_truncated = False
+            self.stderr_truncated = False
+            self.timed_out = False
+            self.cancelled = False
+
+    service = Mock()
+    service.load.return_value = object()
+    service.read_secret.return_value = "sekret"
+    release_calls: list[tuple[object, str, str]] = []
+    writes: list[dict[str, object]] = []
+
+    def write_headless_marker(_agent: str, value: dict[str, object]) -> None:
+        writes.append(dict(value))
+
+    monkeypatch.setattr(server, "canonical_agent_id", lambda _agent: "d1")
+    monkeypatch.setattr(server, "current_fleet_service", lambda: service)
+    monkeypatch.setattr(server, "_headless_descriptor", lambda _agent: descriptor)
+    monkeypatch.setattr(server, "_headless_marker", lambda _agent: {"state": "ready"})
+    monkeypatch.setattr(server, "status_agent", lambda *_args, **_kwargs: {"identity_guard": {"ok": True}})
+    monkeypatch.setattr(
+        server,
+        "_headless_admission_gate",
+        lambda _agent: Mock(allowed=True, account_id="gemini-project", generation=1),
+    )
+    monkeypatch.setattr(server, "_headless_executable", lambda _descriptor: Path("/tmp/managed-d1"))
+    monkeypatch.setattr(server, "_ensure_gemini_headless_retry_policy", lambda *_args: None)
+    monkeypatch.setattr(
+        server,
+        "build_runner_plan",
+        lambda *_args: type(
+            "Plan",
+            (),
+            {"unset_env": set(), "env": {}, "secret_env_name": "GEMINI_API_KEY", "argv": ("cmd",)},
+        )(),
+    )
+    monkeypatch.setattr(server, "build_inventory", lambda _snapshot, _root: Inventory())
+    monkeypatch.setattr(server, "subprocess", type(
+        "Subprocess",
+        (),
+        {"Popen": Mock(return_value=Mock(pid=None, stdin=io.BytesIO(b""), stdout=io.BytesIO(), stderr=io.BytesIO())),
+         "PIPE": object()},
+    ))
+    monkeypatch.setattr(server, "run_bounded_process", lambda *_args, **_kwargs: RunResult(
+        _build_provider_limited_output(quota_scope, retry_delay),
+    ))
+    monkeypatch.setattr(server, "_write_headless_marker", write_headless_marker)
+    monkeypatch.setattr(
+        server,
+        "release_headless_inflight",
+        lambda reservation_id, _agent, assignment_id: (
+            release_calls.append((reservation_id, _agent, assignment_id))
+            or {"status": "released"}
+        ),
+    )
+    monkeypatch.setattr(server.HEADLESS_JOBS, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server.HEADLESS_JOBS, "finish", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server.HEADLESS_JOBS, "request_cancel", lambda *_args, **_kwargs: {"status": "not_running"})
+
+    server._run_headless_process(
+        "d1",
+        "prompt",
+        {"state": "held", "held_by_this_server": True},
+        5,
+        role="arbeitsbiene",
+        assignment_id="assignment-account-limited",
+        headless_inflight_reservation={"reservation_id": "inflight-account-limited"},
+        structured_gate={"action": "allow", "diagnostic_code": "gemini_limits_unknown", "account_id": "gemini-project", "raw_output": "not_returned"},
+        release_lease_on_completion=False,
+    )
+
+    assert service.record_gemini_usage.call_count == 1
+    usage = service.record_gemini_usage.call_args.kwargs
+    event_record = service.record_gemini_event.call_args.kwargs
+    assert usage["status"] == "rate_limited"
+    event_observation = usage.get("quota_observation")
+    assert event_observation is not None
+    assert event_observation.scope == expected_observation_scope
+    assert event_observation.retry_after_seconds == expected_retry_seconds
+    assert event_record.get("quota_observation") is None
+    assert "quota_observation" not in event_record
+    assert service.mark_limited.call_args.kwargs == {
+        "reason": "gemini_resource_exhausted",
+        "reset_at_utc": usage.get("next_reset_at_utc"),
+    }
+    event = service.release_gemini_request.call_args.kwargs
+    assert event["outcome"] == "rate_limited"
+    assert event["reset_at_utc"] == usage.get("next_reset_at_utc")
+    assert "quota_dimensions" not in repr(usage)
+    assert "quota_details" not in repr(usage)
+
+
+
 def test_generic_headless_assignment_preserves_requested_role(monkeypatch) -> None:
     assign = Mock(return_value={"status": "accepted"})
     monkeypatch.setattr(server, "single_agent_id", lambda _selector, _operation: "d1")

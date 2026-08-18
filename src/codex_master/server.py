@@ -181,6 +181,7 @@ from codex_master.fleet_runners import (
     FleetRunnerError,
     ProbeResult,
     ProviderError,
+    ProviderErrorQuotaObservation,
     build_runner_plan,
     parse_gemini_jsonl,
     probe_gemini_cli,
@@ -9993,7 +9994,23 @@ def _run_headless_process(
                 },
             )
             raise AgentError("invalid_headless_output") from exc
-        if parsed.error is not None and parsed.error.kind == "account_limited":
+        quota_observation = (
+            parsed.error.quota_observation
+            if parsed.error is not None
+            and parsed.error.kind == "account_limited"
+            and isinstance(parsed.error.quota_observation, ProviderErrorQuotaObservation)
+            else None
+        )
+        model_scope_quota_observation = (
+            quota_observation
+            if isinstance(quota_observation, ProviderErrorQuotaObservation)
+            and quota_observation.scope == "model"
+            and isinstance(quota_observation.retry_after_seconds, int)
+            and not isinstance(quota_observation.retry_after_seconds, bool)
+            and quota_observation.retry_after_seconds > 0
+            else None
+        )
+        if parsed.error is not None and parsed.error.kind == "account_limited" and model_scope_quota_observation is None:
             rate_outcome = "rate_limited"
             rate_reset_at_utc = parsed.error.reset_at_utc
             try:
@@ -10004,6 +10021,8 @@ def _run_headless_process(
                 )
             except Exception as exc:
                 raise AgentError("headless_limit_mark_failed") from exc
+        if parsed.error is not None and parsed.error.kind == "account_limited" and model_scope_quota_observation is not None:
+            rate_reset_at_utc = None
         terminal = "timeout" if result.timed_out else "cancelled" if result.cancelled else (
             "completed"
             if result.returncode == 0
@@ -10041,6 +10060,7 @@ def _run_headless_process(
                 gate_action=gate_action,
                 gate_code=gate_code,
                 next_reset_at_utc=rate_reset_at_utc,
+                quota_observation=quota_observation,
             )
         with contextlib.suppress(Exception):
             service.record_gemini_event(
