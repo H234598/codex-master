@@ -27,6 +27,7 @@ from codex_master.fleet_registry import (
     fleet_document,
 )
 from codex_master.fleet_runners import ProviderError, ProviderErrorQuotaObservation, ProbeResult
+from codex_master.fleet_service import FleetRateLimitError
 
 
 def test_fleet_paths_keep_registry_and_secrets_separate(tmp_path: Path) -> None:
@@ -595,6 +596,59 @@ def test_gemini_rate_reservation_applies_exponential_429_cooldown(tmp_path: Path
     assert '"in_flight": null' in paths.rate_limits.read_text(encoding="utf-8")
 
 
+def test_model_scoped_rate_requests_block_only_matching_model(tmp_path: Path) -> None:
+    service, paths = _service(tmp_path, _configured_snapshot())
+
+    a = service.reserve_gemini_request("shared", model="gemini-3-flash")
+    reserved = json.loads(paths.rate_limits.read_text(encoding="utf-8"))["accounts"]["shared"]
+    assert reserved["in_flight"]["reservation_id"] == a.reservation_id
+    assert reserved["models"]["gemini-3-flash"]["in_flight"]["reservation_id"] == a.reservation_id
+    service.release_gemini_request(
+        a,
+        outcome="rate_limited",
+        reset_at_utc="2026-08-03T12:10:00Z",
+    )
+
+    status_a = service.gemini_rate_status("shared", model="gemini-3-flash")
+    assert status_a["allowed"] is False
+    assert service.gemini_rate_status("shared", model="gemini-3.1-flash-lite")["allowed"] is True
+
+    service.reserve_gemini_request("shared", model="gemini-3.1-flash-lite")
+    with pytest.raises(FleetRateLimitError):
+        service.reserve_gemini_request("shared", model="gemini-3-flash")
+
+    rate_limits = json.loads(paths.rate_limits.read_text(encoding="utf-8"))
+    account_entry = rate_limits["accounts"]["shared"]
+    assert account_entry["cooldown_until_utc"] is None
+    assert "models" in account_entry
+    assert "gemini-3-flash" in account_entry["models"]
+
+
+def test_model_scoped_gemini_rate_limits_migrate_v1_to_v2(tmp_path: Path) -> None:
+    service, paths = _service(tmp_path, _configured_snapshot())
+    paths.rate_limits.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "accounts": {
+                "shared": {
+                    "next_allowed_at_utc": "2026-08-03T11:00:00Z",
+                    "cooldown_until_utc": None,
+                    "in_flight": None,
+                    "consecutive_429": 2,
+                }
+            },
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    service.reserve_gemini_request("shared", model="gemini-3-flash")
+
+    written = json.loads(paths.rate_limits.read_text(encoding="utf-8"))
+    assert written["schema_version"] == 2
+    assert "models" in written["accounts"]["shared"]
+    assert "gemini-3-flash" in written["accounts"]["shared"]["models"]
+
+
 def test_invalid_gemini_rate_state_fails_closed(tmp_path: Path) -> None:
     service, paths = _service(tmp_path, _configured_snapshot())
     paths.rate_limits.write_text("{invalid", encoding="utf-8")
@@ -604,6 +658,32 @@ def test_invalid_gemini_rate_state_fails_closed(tmp_path: Path) -> None:
 
     marker = paths.recovery.with_name("rate-limits.recovery.json")
     assert marker.exists()
+
+
+def test_v2_rate_limits_reject_unknown_fields_and_invalid_models(tmp_path: Path) -> None:
+    service, paths = _service(tmp_path, _configured_snapshot())
+    service.reserve_gemini_request("shared", model="gemini-3-flash")
+    valid_text = paths.rate_limits.read_text(encoding="utf-8")
+
+    raw = json.loads(valid_text)
+    raw["accounts"]["shared"]["unexpected"] = None
+    paths.rate_limits.write_text(json.dumps(raw) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid_gemini_rate_limits"):
+        service._load_rate_limits()
+
+    raw = json.loads(valid_text)
+    model_state = raw["accounts"]["shared"]["models"].pop("gemini-3-flash")
+    raw["accounts"]["shared"]["models"]["gemini-3-flash-preview"] = model_state
+    paths.rate_limits.write_text(json.dumps(raw) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid_gemini_rate_limits"):
+        service._load_rate_limits()
+
+    paths.rate_limits.write_text(valid_text, encoding="utf-8")
+    entries = service._load_rate_limits()
+    entries["shared"]["models"]["invalid-model"] = entries["shared"]["models"].pop("gemini-3-flash")
+    with pytest.raises(ValueError, match="invalid_gemini_rate_limits"):
+        service._write_rate_limits(entries)
+    assert paths.rate_limits.read_text(encoding="utf-8") == valid_text
 
 
 @pytest.mark.parametrize(
@@ -774,7 +854,7 @@ def test_record_gemini_event_unknown_diagnostic_code_is_omitted(tmp_path: Path) 
 def test_detail_poor_429_binds_account_limit_to_existing_rate_cooldown(tmp_path: Path, monkeypatch) -> None:
     service, _ = _service(tmp_path, _configured_snapshot())
     reservation = service.reserve_gemini_request("shared")
-    monkeypatch.setattr(service, "reserve_gemini_request", lambda _account_id: reservation)
+    monkeypatch.setattr(service, "reserve_gemini_request", lambda _account_id, **_kwargs: reservation)
 
     assert service.gemini_rate_status("shared").get("defer_until") == "2026-08-03T14:01:00Z"
 

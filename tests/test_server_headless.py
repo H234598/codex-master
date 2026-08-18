@@ -86,8 +86,8 @@ class FakeService:
     def mark_limited(self, *_args: object, **_kwargs: object) -> None:
         raise AssertionError("limit marking was not expected")
 
-    def reserve_gemini_request(self, account_id: str) -> object:
-        reservation = (account_id, "reservation")
+    def reserve_gemini_request(self, account_id: str, *, model: str | None = None) -> object:
+        reservation = (account_id, model, "reservation")
         self.reservations.append(reservation)
         return reservation
 
@@ -952,7 +952,7 @@ def test_p1w1_headless_calls_central_admission_before_rate_reservation(monkeypat
         **_kwargs: object,
     ) -> dict[str, object]:
         captured_headless_inflight["value"] = headless_inflight_reservation
-        service.reserve_gemini_request("gemini-project")
+        service.reserve_gemini_request("gemini-project", model="gemini-3-flash-preview")
         return {"agent": "d1", "status": "completed"}
 
     def reserve_headless_inflight_call(*_args: object, **_kwargs: object) -> object:
@@ -964,7 +964,7 @@ def test_p1w1_headless_calls_central_admission_before_rate_reservation(monkeypat
         return nullcontext()
 
     service.reserve_gemini_request.side_effect = (
-        lambda account_id: events.append(f"reserve:{account_id}") or object()
+        lambda account_id, *, model=None: events.append(f"reserve:{account_id}:{model}") or object()
     )
 
     monkeypatch.setattr(server, "canonical_agent_id", lambda _agent: "d1")
@@ -1004,7 +1004,7 @@ def test_p1w1_headless_calls_central_admission_before_rate_reservation(monkeypat
     )
 
     assert result["status"] == "completed"
-    assert events == ["admission_lock", "admission", "inflight", "reserve:gemini-project"]
+    assert events == ["admission_lock", "admission", "inflight", "reserve:gemini-project:gemini-3-flash-preview"]
     assert captured_headless_inflight["value"] is headless_inflight_reservation
 
 

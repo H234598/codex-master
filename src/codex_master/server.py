@@ -178,6 +178,7 @@ from codex_master.fleet_service import (
     MAX_EVENT_BYTES,
 )
 from codex_master.fleet_runners import (
+    GEMINI_DEFAULT_LIGHT_MODEL,
     FleetRunnerError,
     ProbeResult,
     ProviderError,
@@ -9929,7 +9930,7 @@ def _run_headless_process(
     try:
         try:
             if reservation is None and gate.account_id is not None:
-                reservation = service.reserve_gemini_request(gate.account_id)
+                reservation = service.reserve_gemini_request(gate.account_id, model=descriptor.model)
             secret = service.read_secret(gate.account_id, expected_generation=gate.generation)
             child_env[plan.secret_env_name] = secret
             try:
@@ -31404,7 +31405,7 @@ def fleet_provider_models(*, provider: str, account_id: str | None = None) -> di
     }
 
 
-def _fleet_account_probe(account: FleetAccount) -> ProbeResult:
+def _fleet_account_probe(account: FleetAccount, *, model: str | None = None) -> ProbeResult:
     if account.provider is Provider.GEMINI_API:
         service = current_fleet_service()
         try:
@@ -31446,7 +31447,7 @@ def _fleet_account_probe(account: FleetAccount) -> ProbeResult:
                 False,
                 ProviderError("provider_unavailable", False, None, None),
             )
-        return probe_gemini_cli(secret, executable)
+        return probe_gemini_cli(secret, executable, model=model)
     if account.provider is not Provider.HUGGINGFACE_INFERENCE:
         return ProbeResult(
             account.provider,
@@ -31492,9 +31493,11 @@ def fleet_account_probe(*, account_id: str, expected_generation: int) -> dict[st
     require_fleet_recovery_ready("fleet_limit_mutation")
     with fleet_mutation_lock():
         try:
+            probe_model = GEMINI_DEFAULT_LIGHT_MODEL
             result = current_fleet_service().probe_account(
                 account_id,
-                _fleet_account_probe,
+                lambda account: _fleet_account_probe(account, model=probe_model),
+                model=probe_model,
                 expected_generation=expected_generation,
             )
         except FleetRateLimitError as exc:

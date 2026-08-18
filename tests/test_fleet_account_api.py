@@ -6,6 +6,7 @@ import json
 import stat
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -616,6 +617,10 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
     monkeypatch.setattr(server.shutil, "which", lambda _name: "/usr/local/bin/gemini")
     monkeypatch.setattr(server, "trusted_gemini_executable", lambda path: path)
     captured: dict[str, object] = {}
+    service = server.current_fleet_service()
+    probe_account = Mock(wraps=service.probe_account)
+    monkeypatch.setattr(service, "probe_account", probe_account)
+    monkeypatch.setattr(server, "current_fleet_service", lambda: service)
 
     def fake_probe(secret: str, executable: Path, **_kwargs: object) -> ProbeResult:
         captured["secret"] = secret
@@ -640,6 +645,7 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
         "raw_output": "not_returned",
     }
     assert captured["secret"] == GEMINI_READY_CREDENTIAL
+    assert probe_account.call_args.kwargs["model"] == server.GEMINI_DEFAULT_LIGHT_MODEL
     assert GEMINI_READY_CREDENTIAL not in json.dumps(result)
 
 

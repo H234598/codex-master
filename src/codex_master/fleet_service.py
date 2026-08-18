@@ -244,6 +244,7 @@ class FleetRateLimitError(ValueError):
 @dataclass(frozen=True, slots=True)
 class GeminiRequestReservation:
     account_id: str
+    model: str | None
     reservation_id: str
     expires_at_utc: str
 
@@ -464,6 +465,43 @@ class FleetService:
         except Exception:
             pass
 
+    def _parse_rate_state(self, state: object) -> dict[str, object]:
+        required = {
+            "next_allowed_at_utc",
+            "cooldown_until_utc",
+            "in_flight",
+            "consecutive_429",
+        }
+        if not isinstance(state, dict) or set(state) != required:
+            raise ValueError("invalid_gemini_rate_limits")
+        next_allowed = self._parse_time(state.get("next_allowed_at_utc"))
+        cooldown = self._parse_time(state.get("cooldown_until_utc"))
+        if next_allowed is None:
+            raise ValueError("invalid_gemini_rate_limits")
+        in_flight = state.get("in_flight")
+        if in_flight is not None:
+            if (
+                not isinstance(in_flight, dict)
+                or set(in_flight) != {"reservation_id", "expires_at_utc"}
+                or not isinstance(in_flight.get("reservation_id"), str)
+                or not re.fullmatch(r"[0-9a-f]{32}", in_flight["reservation_id"])
+                or self._parse_time(in_flight.get("expires_at_utc")) is None
+            ):
+                raise ValueError("invalid_gemini_rate_limits")
+            in_flight = {
+                "reservation_id": in_flight["reservation_id"],
+                "expires_at_utc": in_flight["expires_at_utc"],
+            }
+        consecutive = state.get("consecutive_429")
+        if isinstance(consecutive, bool) or not isinstance(consecutive, int) or not 0 <= consecutive <= 32:
+            raise ValueError("invalid_gemini_rate_limits")
+        return {
+            "next_allowed_at_utc": next_allowed,
+            "cooldown_until_utc": cooldown,
+            "in_flight": in_flight,
+            "consecutive_429": consecutive,
+        }
+
     def _load_rate_limits(self) -> dict[str, dict[str, object]]:
         self._ensure_layout()
         try:
@@ -475,61 +513,97 @@ class FleetService:
             if text is None:
                 return {}
             raw = json.loads(text)
-            if (
-                not isinstance(raw, dict)
-                or set(raw) != {"schema_version", "accounts"}
-                or raw.get("schema_version") != 1
-                or not isinstance(raw.get("accounts"), dict)
-            ):
+            if not isinstance(raw, dict) or set(raw) != {"schema_version", "accounts"} or not isinstance(raw.get("accounts"), dict):
                 raise ValueError("invalid_gemini_rate_limits")
+            version = raw.get("schema_version")
+            if not isinstance(version, int):
+                raise ValueError("invalid_gemini_rate_limits")
+
             entries: dict[str, dict[str, object]] = {}
-            for account_id, value in raw["accounts"].items():
-                if (
-                    not isinstance(account_id, str)
-                    or not _ACCOUNT_ID_RE.fullmatch(account_id)
-                    or not isinstance(value, dict)
-                    or set(value) != {
-                        "next_allowed_at_utc", "cooldown_until_utc", "in_flight", "consecutive_429",
-                    }
-                ):
-                    raise ValueError("invalid_gemini_rate_limits")
-                next_allowed = self._parse_time(value.get("next_allowed_at_utc"))
-                cooldown = self._parse_time(value.get("cooldown_until_utc"))
-                if next_allowed is None:
-                    raise ValueError("invalid_gemini_rate_limits")
-                in_flight = value.get("in_flight")
-                if in_flight is not None:
+            if version == 1:
+                required = {"next_allowed_at_utc", "cooldown_until_utc", "in_flight", "consecutive_429"}
+                for account_id, value in raw["accounts"].items():
                     if (
-                        not isinstance(in_flight, dict)
-                        or set(in_flight) != {"reservation_id", "expires_at_utc"}
-                        or not isinstance(in_flight.get("reservation_id"), str)
-                        or not re.fullmatch(r"[0-9a-f]{32}", in_flight["reservation_id"])
-                        or self._parse_time(in_flight.get("expires_at_utc")) is None
+                        not isinstance(account_id, str)
+                        or not _ACCOUNT_ID_RE.fullmatch(account_id)
+                        or not isinstance(value, dict)
+                        or set(value) != required
                     ):
                         raise ValueError("invalid_gemini_rate_limits")
-                    in_flight = {
-                        "reservation_id": in_flight["reservation_id"],
-                        "expires_at_utc": in_flight["expires_at_utc"],
-                    }
-                consecutive = value.get("consecutive_429")
-                if isinstance(consecutive, bool) or not isinstance(consecutive, int) or not 0 <= consecutive <= 32:
-                    raise ValueError("invalid_gemini_rate_limits")
-                entries[account_id] = {
-                    "next_allowed_at_utc": next_allowed,
-                    "cooldown_until_utc": cooldown,
-                    "in_flight": in_flight,
-                    "consecutive_429": consecutive,
+                    state = self._parse_rate_state(value)
+                    entries[account_id] = {**state, "models": {}}
+            elif version == 2:
+                account_keys = {
+                    "next_allowed_at_utc",
+                    "cooldown_until_utc",
+                    "in_flight",
+                    "consecutive_429",
+                    "models",
                 }
+                for account_id, value in raw["accounts"].items():
+                    if (
+                        not isinstance(account_id, str)
+                        or not _ACCOUNT_ID_RE.fullmatch(account_id)
+                        or not isinstance(value, dict)
+                        or set(value) != account_keys
+                    ):
+                        raise ValueError("invalid_gemini_rate_limits")
+                    state = self._parse_rate_state(
+                        {
+                            "next_allowed_at_utc": value.get("next_allowed_at_utc"),
+                            "cooldown_until_utc": value.get("cooldown_until_utc"),
+                            "in_flight": value.get("in_flight"),
+                            "consecutive_429": value.get("consecutive_429"),
+                        },
+                    )
+                    models = value.get("models")
+                    if not isinstance(models, dict):
+                        raise ValueError("invalid_gemini_rate_limits")
+                    normalized_models: dict[str, dict[str, object]] = {}
+                    for model_key, model_state in models.items():
+                        if not isinstance(model_key, str) or self._normalize_gemini_model(model_key) != model_key:
+                            raise ValueError("invalid_gemini_rate_limits")
+                        normalized_models[model_key] = self._parse_rate_state(model_state)
+                    state["models"] = normalized_models
+                    entries[account_id] = state
+            else:
+                raise ValueError("invalid_gemini_rate_limits")
             return entries
         except Exception:
             self._quarantine_rate_limits()
             raise ValueError("invalid_gemini_rate_limits") from None
 
     def _write_rate_limits(self, entries: dict[str, dict[str, object]]) -> None:
-        document = {"schema_version": 1, "accounts": entries}
+        account_keys = {
+            "next_allowed_at_utc",
+            "cooldown_until_utc",
+            "in_flight",
+            "consecutive_429",
+            "models",
+        }
+        normalized: dict[str, dict[str, object]] = {}
+        for account_id, entry in entries.items():
+            if (
+                not isinstance(account_id, str)
+                or not _ACCOUNT_ID_RE.fullmatch(account_id)
+                or not isinstance(entry, dict)
+                or set(entry) != account_keys
+            ):
+                raise ValueError("invalid_gemini_rate_limits")
+            account_state = self._parse_rate_state({key: entry[key] for key in account_keys if key != "models"})
+            models = entry["models"]
+            if not isinstance(models, dict):
+                raise ValueError("invalid_gemini_rate_limits")
+            normalized_models: dict[str, dict[str, object]] = {}
+            for model_key, model_entry in models.items():
+                if not isinstance(model_key, str) or self._normalize_gemini_model(model_key) != model_key:
+                    raise ValueError("invalid_gemini_rate_limits")
+                normalized_models[model_key] = self._parse_rate_state(model_entry)
+            normalized[account_id] = {**account_state, "models": normalized_models}
+        document = {"schema_version": 2, "accounts": normalized}
         text = json.dumps(document, indent=2, sort_keys=True) + "\n"
         self._io.replace_text(self._paths.rate_limits, text)
-        if self._load_rate_limits() != entries:
+        if self._load_rate_limits() != normalized:
             raise ValueError("gemini_rate_limits_write_verification_failed")
 
     def _load_usage(self) -> dict[str, list[dict[str, object]]]:
@@ -1204,47 +1278,92 @@ class FleetService:
                 deadlines.append(parsed.astimezone(timezone.utc))
         return FleetService._rate_text(max(deadlines)) if deadlines else None
 
-    def reserve_gemini_request(self, account_id: str) -> GeminiRequestReservation:
+    def reserve_gemini_request(self, account_id: str, *, model: str | None = None) -> GeminiRequestReservation:
         if self._read_only:
             raise FleetRateLimitError("rate_limiter_read_only", 60)
         if not isinstance(account_id, str) or not _ACCOUNT_ID_RE.fullmatch(account_id):
             raise FleetRateLimitError("rate_limiter_invalid_account", 60)
+        model_key = self._normalize_gemini_model(model)
         with self._io.lock():
             now = self._rate_now()
             entries = self._load_rate_limits()
             quota = self.gemini_quota_profile(account_id)
             entry = entries.get(account_id)
+            if entry is None:
+                now_text = self._rate_text(now)
+                entry = {
+                    "next_allowed_at_utc": now_text,
+                    "cooldown_until_utc": None,
+                    "in_flight": None,
+                    "consecutive_429": 0,
+                    "models": {},
+                }
+                entries[account_id] = entry
             if entry is not None:
-                in_flight = entry.get("in_flight")
-                in_flight_until = in_flight.get("expires_at_utc") if isinstance(in_flight, dict) else None
-                retry_after = self._retry_after(
-                    now,
+                retries: list[str | None] = [
                     entry.get("next_allowed_at_utc") if isinstance(entry.get("next_allowed_at_utc"), str) else None,
                     entry.get("cooldown_until_utc") if isinstance(entry.get("cooldown_until_utc"), str) else None,
-                    in_flight_until if isinstance(in_flight_until, str) else None,
-                )
+                ]
+                in_flight = entry.get("in_flight")
+                if isinstance(in_flight, dict):
+                    retries.append(in_flight.get("expires_at_utc") if isinstance(in_flight.get("expires_at_utc"), str) else None)
+                if model_key is not None:
+                    models = entry.get("models")
+                    if isinstance(models, dict):
+                        model_entry = models.get(model_key)
+                        if isinstance(model_entry, dict):
+                            retries.append(
+                                model_entry.get("next_allowed_at_utc")
+                                if isinstance(model_entry.get("next_allowed_at_utc"), str)
+                                else None,
+                            )
+                            retries.append(
+                                model_entry.get("cooldown_until_utc")
+                                if isinstance(model_entry.get("cooldown_until_utc"), str)
+                                else None,
+                            )
+                            model_in_flight = model_entry.get("in_flight")
+                            if isinstance(model_in_flight, dict):
+                                retries.append(
+                                    model_in_flight.get("expires_at_utc")
+                                    if isinstance(model_in_flight.get("expires_at_utc"), str)
+                                    else None
+                                )
+                retry_after = self._retry_after(now, *retries)
                 if retry_after:
                     raise FleetRateLimitError("gemini_local_rate_limit", retry_after)
             reservation_id = uuid.uuid4().hex
             expires = now + timedelta(seconds=GEMINI_REQUEST_LEASE_SECONDS)
-            previous_cooldown = entry.get("cooldown_until_utc") if entry else None
-            previous_429 = entry.get("consecutive_429", 0) if entry else 0
-            entries[account_id] = {
-                "next_allowed_at_utc": self._rate_text(
-                    now + timedelta(seconds=int(quota["local_request_interval_seconds"]))
-                ),
-                "cooldown_until_utc": previous_cooldown if isinstance(previous_cooldown, str) else None,
-                "in_flight": {"reservation_id": reservation_id, "expires_at_utc": self._rate_text(expires)},
-                "consecutive_429": previous_429 if isinstance(previous_429, int) else 0,
-            }
+            previous_cooldown = entry.get("cooldown_until_utc")
+            next_allowed = self._rate_text(now + timedelta(seconds=int(quota["local_request_interval_seconds"])))
+            reservation_text = self._rate_text(expires)
+            entry["next_allowed_at_utc"] = next_allowed
+            entry["cooldown_until_utc"] = previous_cooldown if isinstance(previous_cooldown, str) else None
+            entry["in_flight"] = {"reservation_id": reservation_id, "expires_at_utc": reservation_text}
+            if model_key is not None:
+                models = entry["models"]
+                if not isinstance(models, dict):
+                    raise ValueError("invalid_gemini_rate_limits")
+                model_entry = models.get(model_key)
+                if not isinstance(model_entry, dict):
+                    model_entry = {
+                        "next_allowed_at_utc": next_allowed,
+                        "cooldown_until_utc": None,
+                        "in_flight": None,
+                        "consecutive_429": 0,
+                    }
+                model_entry["next_allowed_at_utc"] = next_allowed
+                model_entry["in_flight"] = {"reservation_id": reservation_id, "expires_at_utc": reservation_text}
+                models[model_key] = model_entry
             self._write_rate_limits(entries)
-        return GeminiRequestReservation(account_id, reservation_id, self._rate_text(expires))
+        return GeminiRequestReservation(account_id, model_key, reservation_id, self._rate_text(expires))
 
-    def gemini_rate_status(self, account_id: str) -> dict[str, object]:
+    def gemini_rate_status(self, account_id: str, *, model: str | None = None) -> dict[str, object]:
         """Return the local admission state without reserving a request."""
 
         now = self._rate_now()
         entry = self._load_rate_limits().get(account_id)
+        model_key = self._normalize_gemini_model(model)
         if entry is None:
             return {
                 "allowed": True,
@@ -1252,20 +1371,37 @@ class FleetService:
                 "retry_after_seconds": 0,
                 **self.gemini_quota_profile(account_id),
             }
+        rates: list[str | None] = [
+            entry.get("next_allowed_at_utc") if isinstance(entry.get("next_allowed_at_utc"), str) else None,
+            entry.get("cooldown_until_utc") if isinstance(entry.get("cooldown_until_utc"), str) else None,
+        ]
         in_flight = entry.get("in_flight")
-        in_flight_until = in_flight.get("expires_at_utc") if isinstance(in_flight, dict) else None
-        retry_after = self._retry_after(
-            now,
-            entry.get("next_allowed_at_utc") if isinstance(entry.get("next_allowed_at_utc"), str) else None,
-            entry.get("cooldown_until_utc") if isinstance(entry.get("cooldown_until_utc"), str) else None,
-            in_flight_until if isinstance(in_flight_until, str) else None,
-        )
-        defer_until = self._latest_deadline(
-            now,
-            entry.get("next_allowed_at_utc") if isinstance(entry.get("next_allowed_at_utc"), str) else None,
-            entry.get("cooldown_until_utc") if isinstance(entry.get("cooldown_until_utc"), str) else None,
-            in_flight_until if isinstance(in_flight_until, str) else None,
-        )
+        if isinstance(in_flight, dict):
+            rates.append(
+                in_flight.get("expires_at_utc") if isinstance(in_flight.get("expires_at_utc"), str) else None
+            )
+        if model_key is not None:
+            models = entry.get("models")
+            if isinstance(models, dict):
+                model_entry = models.get(model_key)
+                if isinstance(model_entry, dict):
+                    rates.extend([
+                        model_entry.get("next_allowed_at_utc")
+                        if isinstance(model_entry.get("next_allowed_at_utc"), str)
+                        else None,
+                        model_entry.get("cooldown_until_utc")
+                        if isinstance(model_entry.get("cooldown_until_utc"), str)
+                        else None,
+                    ])
+                    model_in_flight = model_entry.get("in_flight")
+                    if isinstance(model_in_flight, dict):
+                        rates.append(
+                            model_in_flight.get("expires_at_utc")
+                            if isinstance(model_in_flight.get("expires_at_utc"), str)
+                            else None
+                        )
+        retry_after = self._retry_after(now, *rates)
+        defer_until = self._latest_deadline(now, *rates)
         return {
             "allowed": retry_after == 0,
             "reason": "ready" if retry_after == 0 else "gemini_local_rate_limit",
@@ -1357,7 +1493,7 @@ class FleetService:
                         return "gemini_account_limited", None
                 else:
                     return "gemini_account_limited", deferred_until
-        rate = self.gemini_rate_status(account_id)
+        rate = self.gemini_rate_status(account_id, model=model)
         if rate["allowed"] is not True:
             return "gemini_local_rate_limited", rate.get("defer_until") if isinstance(rate.get("defer_until"), str) else None
         if not isinstance(observed, Mapping) or not isinstance(limits, Mapping):
@@ -1454,45 +1590,65 @@ class FleetService:
             now = self._rate_now()
             entries = self._load_rate_limits()
             entry = entries.get(reservation.account_id)
-            in_flight = entry.get("in_flight") if entry else None
+            if not isinstance(entry, dict):
+                return
+            account_in_flight = entry.get("in_flight")
             if (
-                entry is None
-                or not isinstance(in_flight, dict)
-                or in_flight.get("reservation_id") != reservation.reservation_id
+                not isinstance(account_in_flight, dict)
+                or account_in_flight.get("reservation_id") != reservation.reservation_id
             ):
                 return
-            next_allowed = entry.get("next_allowed_at_utc")
-            cooldown = entry.get("cooldown_until_utc")
-            consecutive = entry.get("consecutive_429", 0)
-            if not isinstance(consecutive, int):
-                consecutive = 0
-            if outcome == "rate_limited":
-                consecutive = min(32, consecutive + 1)
-                cooldown_at: datetime | None = None
-                if reset_at_utc is not None:
-                    try:
-                        cooldown_at = datetime.fromisoformat(reset_at_utc.replace("Z", "+00:00"))
-                    except ValueError:
-                        cooldown_at = None
-                    if cooldown_at is not None and cooldown_at.tzinfo is not None:
-                        cooldown_at = cooldown_at.astimezone(timezone.utc)
-                if cooldown_at is None or cooldown_at <= now:
-                    seconds = min(
-                        GEMINI_MAX_429_COOLDOWN_SECONDS,
-                        GEMINI_INITIAL_429_COOLDOWN_SECONDS * (2 ** min(consecutive - 1, 6)),
-                    )
-                    cooldown_at = now + timedelta(seconds=seconds)
-                cooldown = self._rate_text(cooldown_at)
-                next_allowed = cooldown
-            elif isinstance(cooldown, str) and self._retry_after(now, cooldown) == 0:
-                cooldown = None
-                consecutive = 0
-            entry = {
-                "next_allowed_at_utc": next_allowed,
-                "cooldown_until_utc": cooldown,
-                "in_flight": None,
-                "consecutive_429": consecutive,
-            }
+            model_entry: dict[str, object] | None = None
+            if reservation.model is not None:
+                models = entry.get("models")
+                if not isinstance(models, dict):
+                    return
+                candidate = models.get(reservation.model)
+                if not isinstance(candidate, dict):
+                    return
+                model_entry = candidate
+                model_in_flight = model_entry.get("in_flight")
+                if (
+                    not isinstance(model_in_flight, dict)
+                    or model_in_flight.get("reservation_id") != reservation.reservation_id
+                ):
+                    return
+
+            def release_state(state: dict[str, object], *, limited: bool) -> None:
+                cooldown = state.get("cooldown_until_utc")
+                consecutive = state.get("consecutive_429", 0)
+                if not isinstance(consecutive, int) or isinstance(consecutive, bool):
+                    consecutive = 0
+                if limited:
+                    consecutive = min(32, consecutive + 1)
+                    cooldown_at: datetime | None = None
+                    if reset_at_utc is not None:
+                        try:
+                            cooldown_at = datetime.fromisoformat(reset_at_utc.replace("Z", "+00:00"))
+                        except ValueError:
+                            cooldown_at = None
+                        if cooldown_at is not None and cooldown_at.tzinfo is not None:
+                            cooldown_at = cooldown_at.astimezone(timezone.utc)
+                    if cooldown_at is None or cooldown_at <= now:
+                        seconds = min(
+                            GEMINI_MAX_429_COOLDOWN_SECONDS,
+                            GEMINI_INITIAL_429_COOLDOWN_SECONDS * (2 ** min(consecutive - 1, 6)),
+                        )
+                        cooldown_at = now + timedelta(seconds=seconds)
+                    cooldown = self._rate_text(cooldown_at)
+                    state["next_allowed_at_utc"] = cooldown
+                elif isinstance(cooldown, str) and self._retry_after(now, cooldown) == 0:
+                    cooldown = None
+                    consecutive = 0
+                state["cooldown_until_utc"] = cooldown if isinstance(cooldown, str) else None
+                state["consecutive_429"] = consecutive
+                state["in_flight"] = None
+
+            release_state(entry, limited=outcome == "rate_limited" and reservation.model is None)
+            if reservation.model is not None and outcome == "rate_limited":
+                entry["next_allowed_at_utc"] = self._rate_text(now)
+            if model_entry is not None:
+                release_state(model_entry, limited=outcome == "rate_limited")
             entries[reservation.account_id] = entry
             self._write_rate_limits(entries)
 
@@ -2080,6 +2236,7 @@ class FleetService:
         account_id: str,
         probe: Callable[[FleetAccount], ProbeResult],
         *,
+        model: str | None = None,
         expected_generation: int,
     ) -> dict[str, object]:
         with self._io.lock():
@@ -2092,7 +2249,10 @@ class FleetService:
 
         reservation = None
         if account.provider.value == "gemini_api":
-            reservation = self.reserve_gemini_request(account.account_id)
+            reservation = self.reserve_gemini_request(
+                account.account_id,
+                model=model,
+            )
         result: ProbeResult | None = None
         try:
             result = probe(account)
