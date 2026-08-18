@@ -33,7 +33,7 @@ from .fleet_registry import (
     plan_account_upsert,
     public_fleet_snapshot,
 )
-from .fleet_runners import ProbeResult
+from .fleet_runners import ProviderErrorQuotaObservation, ProbeResult
 from .selection import (
     FairnessLedger,
     ModelRole,
@@ -92,6 +92,8 @@ GEMINI_PROJECT_QUOTA_SNAPSHOTS: dict[str, dict[str, dict[str, int]]] = {
 GEMINI_REQUEST_LEASE_SECONDS = 120 * 60 + 60
 GEMINI_INITIAL_429_COOLDOWN_SECONDS = 15 * 60
 GEMINI_MAX_429_COOLDOWN_SECONDS = 24 * 60 * 60
+_USAGE_QUOTA_SCOPES = frozenset({"model", "account", "unknown"})
+_GEMINI_MAX_USAGE_QUOTA_RETRY_SECONDS = 3600
 _ACCOUNT_ID_RE = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 _LIMIT_REASON_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _T = TypeVar("_T")
@@ -120,6 +122,10 @@ GEMINI_GATE_DIAGNOSTICS: Mapping[str, Mapping[str, object]] = MappingProxyType({
     "gemini_account_limited": MappingProxyType({
         "severity": "warning", "retryable": True, "action": "defer_until",
         "reason": "Gemini account has an active provider limit.",
+    }),
+    "gemini_model_limited": MappingProxyType({
+        "severity": "warning", "retryable": True, "action": "defer_until",
+        "reason": "Gemini model has an active provider limit.",
     }),
     "gemini_account_disabled": MappingProxyType({
         "severity": "error", "retryable": False, "action": "reject",
@@ -551,6 +557,25 @@ class FleetService:
                     gate_code = event.get("gate_code")
                     if gate_code is not None and gate_code not in GEMINI_GATE_DIAGNOSTICS:
                         raise ValueError("invalid_gemini_usage")
+                    quota_scope = event.get("quota_scope")
+                    quota_retry_after_seconds = event.get("quota_retry_after_seconds")
+                    if not isinstance(quota_scope, str) and quota_scope is not None:
+                        raise ValueError("invalid_gemini_usage")
+                    if quota_scope is None:
+                        quota_scope = None
+                        quota_retry_after_seconds = None
+                    elif quota_scope not in _USAGE_QUOTA_SCOPES:
+                        raise ValueError("invalid_gemini_usage")
+                    elif quota_retry_after_seconds is not None:
+                        if (
+                            isinstance(quota_retry_after_seconds, bool)
+                            or not isinstance(quota_retry_after_seconds, int)
+                            or quota_retry_after_seconds <= 0
+                            or quota_retry_after_seconds > _GEMINI_MAX_USAGE_QUOTA_RETRY_SECONDS
+                        ):
+                            raise ValueError("invalid_gemini_usage")
+                    else:
+                        quota_retry_after_seconds = None
                     reset_at = event.get("next_reset_at_utc")
                     if reset_at is not None and self._parse_time(reset_at) is None:
                         raise ValueError("invalid_gemini_usage")
@@ -563,6 +588,8 @@ class FleetService:
                         "status": status,
                         "gate_action": gate_action,
                         "gate_code": gate_code,
+                        "quota_scope": quota_scope,
+                        "quota_retry_after_seconds": quota_retry_after_seconds,
                         "next_reset_at_utc": reset_at,
                     })
                 result[account_id] = clean[-2000:]
@@ -701,6 +728,7 @@ class FleetService:
         gate_action: str | None = None,
         gate_code: str | None = None,
         next_reset_at_utc: str | None = None,
+        quota_observation: ProviderErrorQuotaObservation | None = None,
     ) -> dict[str, object]:
         if not isinstance(account_id, str) or not _ACCOUNT_ID_RE.fullmatch(account_id):
             raise ValueError("invalid_account")
@@ -723,7 +751,26 @@ class FleetService:
             raise ValueError("invalid_gemini_usage")
         if gate_code is not None and gate_code not in GEMINI_GATE_DIAGNOSTICS:
             raise ValueError("invalid_gemini_usage")
+        if quota_observation is not None and (
+            quota_observation.scope not in _USAGE_QUOTA_SCOPES
+            or not isinstance(quota_observation.retry_after_seconds, int | type(None))
+            or isinstance(quota_observation.retry_after_seconds, bool)
+            or (quota_observation.retry_after_seconds is not None
+                and (
+                    quota_observation.retry_after_seconds <= 0
+                    or quota_observation.retry_after_seconds > _GEMINI_MAX_USAGE_QUOTA_RETRY_SECONDS
+                ))
+        ):
+            raise ValueError("invalid_gemini_usage")
+        quota_scope = quota_observation.scope if quota_observation is not None else None
+        quota_retry_after_seconds = quota_observation.retry_after_seconds if quota_observation is not None else None
         if next_reset_at_utc is not None and self._parse_time(next_reset_at_utc) is None:
+            raise ValueError("invalid_gemini_usage")
+        if (
+            quota_retry_after_seconds is not None
+            and isinstance(quota_retry_after_seconds, int)
+            and quota_retry_after_seconds > _GEMINI_MAX_USAGE_QUOTA_RETRY_SECONDS
+        ):
             raise ValueError("invalid_gemini_usage")
         with self._io.lock():
             now = self._rate_now()
@@ -746,6 +793,8 @@ class FleetService:
                 "status": status,
                 "gate_action": gate_action,
                 "gate_code": gate_code,
+                "quota_scope": quota_scope,
+                "quota_retry_after_seconds": quota_retry_after_seconds,
                 "next_reset_at_utc": next_reset_at_utc,
             }
             events.append(event)
@@ -833,6 +882,26 @@ class FleetService:
                     utilization[metric] = round(float(value) / float(limit) * 100, 2)
                 else:
                     utilization[metric] = None
+            model_quota_observation: dict[str, object] | None = None
+            if model_day:
+                for candidate_event in reversed(model_day):
+                    scope = candidate_event.get("quota_scope")
+                    if scope not in _USAGE_QUOTA_SCOPES:
+                        continue
+                    retry_after_seconds = candidate_event.get("quota_retry_after_seconds")
+                    if (
+                        retry_after_seconds is None
+                        or (
+                            isinstance(retry_after_seconds, int)
+                            and not isinstance(retry_after_seconds, bool)
+                        )
+                    ):
+                        model_quota_observation = {
+                            "scope": scope,
+                            "retry_after_seconds": retry_after_seconds,
+                            "at_utc": candidate_event.get("at_utc"),
+                        }
+                    break
             model_evaluations[model] = {
                 "model": model,
                 "observed": model_observed,
@@ -845,6 +914,7 @@ class FleetService:
                     else "within_limits"
                 ),
                 "limits_source": model_profile["provider_quota_source"],
+                "quota_observation": model_quota_observation,
             }
         if model is not None and model in model_evaluations:
             quota_evaluation = model_evaluations[model]
@@ -1195,9 +1265,6 @@ class FleetService:
             account = next((item for item in snapshot.accounts if item.account_id == account_id), None)
             reset_at = account.reset_at_utc if account is not None else None
             return map_gemini_gate_code(account_gate.reason), reset_at
-        rate = self.gemini_rate_status(account_id)
-        if rate["allowed"] is not True:
-            return "gemini_local_rate_limited", rate.get("defer_until") if isinstance(rate.get("defer_until"), str) else None
         usage = self.gemini_usage_status(account_id, model=model)
         evaluation = usage.get("quota_evaluation")
         if not isinstance(evaluation, Mapping):
@@ -1205,6 +1272,42 @@ class FleetService:
         observed = evaluation.get("observed")
         limits = evaluation.get("limits")
         resets = evaluation.get("resets_at_utc")
+        quota_observation = evaluation.get("quota_observation")
+        if isinstance(quota_observation, Mapping):
+            scope = quota_observation.get("scope")
+            retry_after_seconds = quota_observation.get("retry_after_seconds")
+            observed_at = quota_observation.get("at_utc")
+            if scope in {"model", "account", "unknown"}:
+                deferred_until = None
+                valid_retry_observation = False
+                if (
+                    isinstance(retry_after_seconds, int)
+                    and not isinstance(retry_after_seconds, bool)
+                    and 0 < retry_after_seconds <= _GEMINI_MAX_USAGE_QUOTA_RETRY_SECONDS
+                ):
+                    observed_at_utc = self._parse_time(observed_at)
+                    if observed_at_utc is not None:
+                        try:
+                            defer_at = datetime.fromisoformat(observed_at_utc.replace("Z", "+00:00"))
+                        except ValueError:
+                            defer_at = None
+                        else:
+                            if defer_at.tzinfo is not None:
+                                deferred_at = defer_at.astimezone(timezone.utc) + timedelta(seconds=retry_after_seconds)
+                                now = self._rate_now()
+                                if now < deferred_at:
+                                    deferred_until = self._rate_text(deferred_at)
+                                valid_retry_observation = True
+                if scope == "model":
+                    if deferred_until is not None:
+                        return "gemini_model_limited", deferred_until
+                    if not valid_retry_observation:
+                        return "gemini_account_limited", None
+                else:
+                    return "gemini_account_limited", deferred_until
+        rate = self.gemini_rate_status(account_id)
+        if rate["allowed"] is not True:
+            return "gemini_local_rate_limited", rate.get("defer_until") if isinstance(rate.get("defer_until"), str) else None
         if not isinstance(observed, Mapping) or not isinstance(limits, Mapping):
             return "gemini_limits_unknown", None
         for metric, code in (("rpm", "gemini_rpm_exhausted"), ("tpm", "gemini_tpm_exhausted"), ("rpd", "gemini_rpd_exhausted")):
@@ -1861,6 +1964,38 @@ class FleetService:
             result = None
         finally:
             if reservation is not None:
+                model_limited = False
+                valid_model_limit = False
+                if (
+                    isinstance(result, ProbeResult)
+                    and result.error is not None
+                    and result.error.kind == "account_limited"
+                    and result.error.quota_observation is not None
+                    and isinstance(result.model, str)
+                    and result.error.quota_observation.scope == "model"
+                    and result.error.quota_observation.retry_after_seconds is not None
+                    and isinstance(result.error.quota_observation.retry_after_seconds, int)
+                    and not isinstance(result.error.quota_observation.retry_after_seconds, bool)
+                    and 0 < result.error.quota_observation.retry_after_seconds <= _GEMINI_MAX_USAGE_QUOTA_RETRY_SECONDS
+                ):
+                    valid_model_limit = True
+                if (
+                    isinstance(result, ProbeResult)
+                    and result.error is not None
+                    and result.error.kind == "account_limited"
+                    and result.error.quota_observation is not None
+                    and isinstance(result.model, str)
+                ):
+                    model_limited = valid_model_limit
+                    self.record_gemini_usage(
+                        account.account_id,
+                        model=result.model,
+                        status="failed",
+                        gate_action="defer_until",
+                        gate_code="gemini_model_limited" if model_limited else "gemini_account_limited",
+                        next_reset_at_utc=result.error.reset_at_utc,
+                        quota_observation=result.error.quota_observation,
+                    )
                 rate_limited = (
                     isinstance(result, ProbeResult)
                     and result.error is not None
@@ -1869,13 +2004,13 @@ class FleetService:
                 self.release_gemini_request(
                     reservation,
                     outcome=(
-                        "rate_limited" if rate_limited
+                        "rate_limited" if rate_limited and not model_limited
                         else "completed" if isinstance(result, ProbeResult) and result.ok
                         else "provider_error"
                     ),
                     reset_at_utc=(
                         result.error.reset_at_utc
-                        if rate_limited and result is not None and result.error is not None
+                        if rate_limited and not model_limited and result is not None and result.error is not None
                         else None
                     ),
                 )
@@ -1910,6 +2045,16 @@ class FleetService:
                     "model_unavailable": "model_unavailable",
                     "runner_failed": "provider_unavailable",
                 }.get(result.error.kind, "provider_unavailable")
+                if (
+                    result.error.kind == "account_limited"
+                    and result.error.quota_observation is not None
+                    and result.error.quota_observation.scope == "model"
+                    and result.error.quota_observation.retry_after_seconds is not None
+                    and isinstance(result.error.quota_observation.retry_after_seconds, int)
+                    and not isinstance(result.error.quota_observation.retry_after_seconds, bool)
+                    and 0 < result.error.quota_observation.retry_after_seconds <= _GEMINI_MAX_USAGE_QUOTA_RETRY_SECONDS
+                ):
+                    reason = "ready"
             else:
                 reason = "provider_unavailable"
 

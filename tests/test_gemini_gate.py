@@ -16,7 +16,7 @@ from codex_master.fleet_registry import (
     RunnerKind,
     SecretState,
 )
-from codex_master.fleet_runners import ProbeResult
+from codex_master.fleet_runners import ProbeResult, ProviderErrorQuotaObservation
 
 
 NOW = datetime(2026, 8, 3, 12, tzinfo=timezone.utc)
@@ -123,10 +123,11 @@ def test_probe_reservation_blocks_following_work_request_in_same_local_minute(tm
 def test_known_model_rpm_gate_rotates_to_equal_gemini_model_on_same_key(tmp_path: Path) -> None:
     service, _ = _service(
         tmp_path,
-        (_account("the-hive-4"),),
+        (_account("the-hive-4"), _account("the-hive-6")),
         (
             _series("d", "the-hive-4", "gemini-3-flash"),
             _series("e", "the-hive-4", "gemini-3.1-flash-lite"),
+            _series("f", "the-hive-6", "gemini-3-flash"),
         ),
     )
     for _ in range(5):
@@ -135,6 +136,34 @@ def test_known_model_rpm_gate_rotates_to_equal_gemini_model_on_same_key(tmp_path
     decision = service.gemini_headless_gate("d1")
 
     assert (decision.action, decision.target_agent_id) == ("rotate_model", "e1")
+
+
+def test_model_scope_limited_rotation_keeps_account_ready_and_rotates_model(tmp_path: Path) -> None:
+    service, _ = _service(
+        tmp_path,
+        (_account("shared"), _account("the-hive-6")),
+        (
+            _series("d", "shared", "gemini-3-flash"),
+            _series("e", "shared", "gemini-3.1-flash-lite"),
+            _series("f", "the-hive-6", "gemini-3-flash"),
+        ),
+    )
+    service.record_gemini_usage(
+        "shared",
+        model="gemini-3-flash",
+        status="failed",
+        gate_action="defer_until",
+        gate_code="gemini_model_limited",
+        next_reset_at_utc="2026-08-03T12:02:00Z",
+        quota_observation=ProviderErrorQuotaObservation(scope="model", retry_after_seconds=120),
+    )
+
+    decision = service.gemini_headless_gate("d1")
+
+    assert decision.action == "rotate_model"
+    assert decision.target_agent_id == "e1"
+    assert decision.diagnostic_code == "gemini_model_limited"
+    assert service.account_gate("d1").reason == "ready"
 
 
 def test_unknown_dashboard_limits_remain_explicitly_observed_only(tmp_path: Path) -> None:

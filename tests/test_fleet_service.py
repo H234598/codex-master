@@ -26,7 +26,7 @@ from codex_master.fleet_registry import (
     SecretState,
     fleet_document,
 )
-from codex_master.fleet_runners import ProbeResult, ProviderError
+from codex_master.fleet_runners import ProviderError, ProviderErrorQuotaObservation, ProbeResult
 
 
 def test_fleet_paths_keep_registry_and_secrets_separate(tmp_path: Path) -> None:
@@ -54,10 +54,16 @@ def _account(
                         secret_state, limit_state, enabled, None, None, None)
 
 
-def _series(prefix: str = "d", *, account_id: str | None = "shared", enabled: bool = True) -> FleetSeries:
+def _series(
+    prefix: str = "d",
+    *,
+    account_id: str | None = "shared",
+    enabled: bool = True,
+    model: str = "model",
+) -> FleetSeries:
     provider = Provider.OLLAMA_LOCAL if account_id is None else Provider.GEMINI_API
     runner = RunnerKind.CODEX_CLI if account_id is None else RunnerKind.GEMINI_CLI
-    return FleetSeries(prefix, f"Series {prefix}", 1, runner, provider, "model", account_id, enabled)
+    return FleetSeries(prefix, f"Series {prefix}", 1, runner, provider, model, account_id, enabled)
 
 
 def _service(tmp_path: Path, snapshot: FleetSnapshot | None = None):
@@ -497,6 +503,7 @@ def test_gemini_usage_status_reports_observations_without_fake_quota_percentages
     )
 
     status = service.gemini_usage_status("the-hive-1")
+    stored = service._load_usage().get("the-hive-1", [])
 
     assert status["rpm_observed"] == 1
     assert status["tpm_observed"] == 120
@@ -512,7 +519,56 @@ def test_gemini_usage_status_reports_observations_without_fake_quota_percentages
         "tpm": 0.0,
         "rpd": 0.0,
     }
+    assert status["quota_evaluation"]["quota_observation"] is None
+    assert stored
+    assert stored[0].get("quota_scope") is None
+    assert stored[0].get("quota_retry_after_seconds") is None
     assert status["spend_evaluation"]["state"] == "billing_export_required"
+
+
+def test_model_scoped_usage_observation_blocks_model_only_and_not_account_limits(tmp_path: Path) -> None:
+    account = replace(
+        _account("the-hive-1", secret_state=SecretState.CONFIGURED, limit_state=LimitState.READY),
+        last_probe_at_utc="2026-08-03T12:00:00Z",
+    )
+    service, _ = _service(
+        tmp_path,
+        FleetSnapshot(
+            1,
+            2,
+            (account,),
+            (_series("d", account_id="the-hive-1", model="gemini-3.1-flash-lite"),),
+        ),
+    )
+    service.record_gemini_usage(
+        "the-hive-1",
+        model="gemini-3.1-flash-lite",
+        status="failed",
+        gate_action="defer_until",
+        gate_code="gemini_model_limited",
+        next_reset_at_utc="2026-08-03T12:10:00Z",
+        quota_observation=ProviderErrorQuotaObservation(
+            scope="model",
+            retry_after_seconds=120,
+        ),
+    )
+
+    decision = service.gemini_headless_gate("d1")
+
+    assert decision.action == "defer_until"
+    assert decision.diagnostic_code == "gemini_model_limited"
+    assert decision.defer_until == "2026-08-03T12:02:00Z"
+    assert service.account_gate("d1").reason == "ready"
+    assert service._load_limits() == {}
+    events = service._load_usage().get("the-hive-1", [])
+    assert events and events[-1]["quota_scope"] == "model"
+    assert events[-1]["quota_retry_after_seconds"] == 120
+    assert events[-1]["gate_code"] == "gemini_model_limited"
+
+    service._io = replace(service._io, utc_now=lambda: datetime(2026, 8, 3, 12, 5, tzinfo=timezone.utc))
+    decision = service.gemini_headless_gate("d1")
+    assert decision.action == "allow"
+    assert decision.diagnostic_code == "gemini_ready"
 
 
 def test_gemini_rate_status_exposes_quota_profile_before_first_request(tmp_path: Path) -> None:
@@ -656,6 +712,168 @@ def test_probe_errors_become_fixed_gate_reasons(tmp_path: Path, kind: str, want:
     assert result["reason"] == want
     assert service.load().accounts[0].secret_state is secret_state
     assert service.account_gate("d1").reason == want
+
+
+@pytest.mark.parametrize(("quota_scope", "retry_after_seconds"), [
+    ("model", None),
+    ("account", 120),
+    ("unknown", 120),
+])
+def test_probe_model_scope_without_retry_or_accountwide_scopes_fail_closed(
+    tmp_path: Path,
+    quota_scope: str,
+    retry_after_seconds: int | None,
+) -> None:
+    service, _ = _service(tmp_path, _configured_snapshot())
+    error = ProviderError(
+        "account_limited",
+        True,
+        429,
+        "2026-08-03T12:03:00Z",
+        quota_observation=ProviderErrorQuotaObservation(
+            scope=quota_scope,
+            retry_after_seconds=retry_after_seconds,
+        ),
+    )
+
+    result = service.probe_account(
+        "shared",
+        lambda account: ProbeResult(account.provider, False, "gemini-3.1-flash", False, error),
+        expected_generation=2,
+    )
+
+    assert result["reason"] == "limit_active"
+    assert service.account_gate("d1").reason == "limit_active"
+    events = service._load_usage().get("shared", [])
+    assert events
+    assert events[-1]["quota_scope"] == quota_scope
+    assert events[-1]["quota_retry_after_seconds"] == retry_after_seconds
+    assert events[-1]["gate_code"] == "gemini_account_limited"
+    assert service._load_limits().get("shared", {}).get("reset_at_utc") == "2026-08-03T12:03:00Z"
+
+
+def test_legacy_usage_events_missing_quota_fields_normalize_to_none(
+    tmp_path: Path,
+) -> None:
+    service, paths = _service(tmp_path, _configured_snapshot())
+    paths.usage.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "accounts": {
+                    "shared": [{
+                        "at_utc": "2026-08-03T12:00:00Z",
+                        "model": "gemini-3.1-flash",
+                        "input_tokens": 1,
+                        "output_tokens": 0,
+                        "tool_call_count": 0,
+                        "status": "failed",
+                    }],
+                },
+            },
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    status = service.gemini_usage_status("shared")
+    loaded = service._load_usage()
+    assert status["quota_evaluation"]["quota_observation"] is None
+    assert loaded["shared"][-1]["quota_scope"] is None
+    assert loaded["shared"][-1]["quota_retry_after_seconds"] is None
+
+
+def test_probe_model_scope_limit_records_model_lock_not_account_limit(
+    tmp_path: Path,
+) -> None:
+    account = _account("shared", secret_state=SecretState.CONFIGURED, limit_state=LimitState.READY)
+    service, _ = _service(
+        tmp_path,
+        FleetSnapshot(
+            1,
+            2,
+            (account,),
+            (_series("d", account_id="shared", model="gemini-3-flash"),),
+        ),
+    )
+
+    error = ProviderError(
+        "account_limited",
+        True,
+        429,
+        "2026-08-03T12:03:00Z",
+        quota_observation=ProviderErrorQuotaObservation(scope="model", retry_after_seconds=120),
+    )
+
+    result = service.probe_account(
+        "shared",
+        lambda account: ProbeResult(account.provider, False, "gemini-3-flash", False, error),
+        expected_generation=2,
+    )
+    assert result["reason"] == "ready"
+    assert service.account_gate("d1").reason == "ready"
+    assert service._load_limits() == {}
+
+    decision = service.gemini_headless_gate("d1")
+    assert decision.diagnostic_code == "gemini_model_limited"
+    assert decision.action == "defer_until"
+    assert decision.defer_until == "2026-08-03T12:02:00Z"
+
+    rate_limits = service._load_rate_limits()
+    assert rate_limits.get("shared", {}).get("cooldown_until_utc") is None
+
+    service._io = replace(service._io, utc_now=lambda: datetime(2026, 8, 3, 12, 2, tzinfo=timezone.utc))
+    decision = service.gemini_headless_gate("d1")
+    assert decision.action == "allow"
+
+
+def test_model_scope_limit_survives_followup_model_usage_without_quota_fields(tmp_path: Path) -> None:
+    account = _account("shared", secret_state=SecretState.CONFIGURED, limit_state=LimitState.READY)
+    service, _ = _service(
+        tmp_path,
+        FleetSnapshot(
+            1,
+            2,
+            (account,),
+            (_series("d", account_id="shared", model="gemini-3-flash"),),
+        ),
+    )
+
+    service.record_gemini_usage(
+        "shared",
+        model="gemini-3-flash",
+        status="failed",
+        gate_action="defer_until",
+        gate_code="gemini_model_limited",
+        next_reset_at_utc="2026-08-03T12:04:00Z",
+        quota_observation=ProviderErrorQuotaObservation(
+            scope="model",
+            retry_after_seconds=120,
+        ),
+    )
+    service.record_gemini_usage(
+        "shared",
+        model="gemini-3-flash",
+        status="completed",
+    )
+    result = service.probe_account(
+        "shared",
+        lambda account: ProbeResult(account.provider, True, "gemini-3-flash", False, None),
+        expected_generation=2,
+    )
+    assert result["reason"] == "ready"
+
+    status = service.gemini_usage_status("shared", model="gemini-3-flash")
+    observation = status["quota_evaluation"]["quota_observation"]
+    assert isinstance(observation, dict)
+    assert observation["scope"] == "model"
+    assert observation["retry_after_seconds"] == 120
+
+    rate_limits = service._load_rate_limits()
+    assert rate_limits.get("shared", {}).get("cooldown_until_utc") is None
+
+    decision = service.gemini_headless_gate("d1")
+    assert decision.action == "defer_until"
+    assert decision.diagnostic_code == "gemini_model_limited"
 
 
 def test_probe_exception_is_redacted_from_public_result(tmp_path: Path) -> None:
