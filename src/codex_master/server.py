@@ -37,7 +37,7 @@ from collections.abc import Collection
 from pathlib import Path
 from functools import partial
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Literal, Mapping
 
 import yaml
 
@@ -7386,6 +7386,33 @@ _FLEET_COMMON_POLICY_FIELDS = frozenset({"schema_version", "generation", "digest
 _FLEET_RUNTIME_SKILL_PROFILE_FIELD = "runtime_skill_profile"
 
 
+@dataclass(frozen=True, slots=True)
+class FleetHomeTarget:
+    descriptor: AgentDescriptor
+    effective_skill_profile: str
+    runtime_skill_profile: str | None
+    files: tuple[tuple[str, bytes, int], ...]
+    marker_bytes: bytes
+    policy_schema_version: int
+    policy_generation: int
+    common_digest: str
+    provider_projection_digest: str
+    executable_checks: tuple[tuple[Path, os.stat_result], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FleetHomePolicyObservation:
+    state: Literal["absent", "current", "stale"]
+    expected_schema_version: int
+    expected_generation: int
+    expected_common_digest: str
+    expected_provider_projection_digest: str
+    observed_schema_version: int | None
+    observed_generation: int | None
+    observed_common_digest: str | None
+    observed_provider_artifact_digest: str | None
+
+
 def _runtime_class_projection_name(name: str) -> bool:
     return (
         name == "AGENTS.md"
@@ -7486,6 +7513,20 @@ def _fleet_current_policy_projection(
     descriptor: AgentDescriptor,
     error: str,
 ) -> Any:
+    common_policy = _fleet_marker_common_policy_value(marker, error)
+    try:
+        projection = fleet_markdown_projection(descriptor)
+    except Exception as exc:
+        raise AgentError(error) from exc
+    if common_policy != _fleet_marker_common_policy(projection):
+        raise AgentError(error)
+    return projection
+
+
+def _fleet_marker_common_policy_value(
+    marker: Mapping[str, Any],
+    error: str,
+) -> Mapping[str, Any]:
     common_policy = marker.get("common_policy")
     if (
         not isinstance(common_policy, dict)
@@ -7497,13 +7538,7 @@ def _fleet_current_policy_projection(
         or re.fullmatch(r"[0-9a-f]{64}", common_policy["digest"]) is None
     ):
         raise AgentError(error)
-    try:
-        projection = fleet_markdown_projection(descriptor)
-    except Exception as exc:
-        raise AgentError(error) from exc
-    if common_policy != _fleet_marker_common_policy(projection):
-        raise AgentError(error)
-    return projection
+    return common_policy
 
 
 def _fleet_read_current_agent_marker(
@@ -23651,6 +23686,130 @@ def _fleet_revalidate_executable(path: Path, expected: os.stat_result) -> None:
         raise AgentError("fleet_executable_changed")
 
 
+def _build_fleet_home_target(
+    descriptor: AgentDescriptor,
+    executable: Path,
+    *,
+    target_skill_profile: str | None = None,
+    executable_stat: os.stat_result | None = None,
+    bash_executable: Path = FLEET_BASH_EXECUTABLE,
+    bash_stat: os.stat_result | None = None,
+    taskset_executable: Path = FLEET_TASKSET_EXECUTABLE,
+    taskset_stat: os.stat_result | None = None,
+    true_executable: Path = FLEET_TRUE_EXECUTABLE,
+    true_stat: os.stat_result | None = None,
+    include_portable_skills: bool = True,
+) -> FleetHomeTarget:
+    executable_checks = tuple(
+        (path, expected)
+        for path, expected in (
+            (executable, executable_stat),
+            (bash_executable, bash_stat),
+            (taskset_executable, taskset_stat),
+            (true_executable, true_stat),
+        )
+        if expected is not None
+    )
+    for path, expected in executable_checks:
+        _fleet_revalidate_executable(path, expected)
+    effective_descriptor = (
+        dataclass_replace(descriptor, skill_profile=target_skill_profile)
+        if target_skill_profile is not None
+        else descriptor
+    )
+    projection = fleet_markdown_projection(effective_descriptor)
+    effective_skill_profile = projection.metadata.class_profile
+    runtime_skill_profile = (
+        effective_skill_profile
+        if target_skill_profile is not None
+        and descriptor.runner is RunnerKind.CODEX_CLI
+        and effective_skill_profile != "generic"
+        and effective_skill_profile != descriptor.skill_profile.strip().lower()
+        else None
+    )
+    wrapper_name = "codex" if descriptor.runner is RunnerKind.CODEX_CLI else "gemini"
+    config_name, config_text = fleet_minimal_config(effective_descriptor)
+    if descriptor.provider is Provider.OLLAMA_LOCAL and descriptor.runner is RunnerKind.CODEX_CLI:
+        config_text = (
+            config_text.rstrip("\n")
+            + f'\nmodel_catalog_json = {json.dumps(str(descriptor.home / "model.json"))}\n'
+        )
+    files: dict[str, tuple[bytes, int]] = {
+        wrapper_name: (
+            fleet_wrapper_text(
+                effective_descriptor,
+                executable,
+                bash_executable=bash_executable,
+                taskset_executable=taskset_executable,
+                true_executable=true_executable,
+            ).encode("utf-8"),
+            0o700,
+        ),
+        config_name: (config_text.encode("utf-8"), 0o600),
+        **{
+            name: (content, 0o600)
+            for name, content in projection.artifacts.items()
+        },
+    }
+    if descriptor.runner is RunnerKind.GEMINI_CLI:
+        policy = "\n".join(
+            (
+                "[[rule]]",
+                'toolName = "run_shell_command"',
+                'decision = "deny"',
+                "priority = 999",
+                "",
+            )
+        )
+        files[".gemini/policies/codex-master.toml"] = (policy.encode("utf-8"), 0o600)
+    if include_portable_skills and effective_skill_profile != "generic":
+        files.update(
+            {
+                name: (data, 0o600)
+                for name, data in portable_gemini_skill_artifacts(
+                    effective_skill_profile
+                ).items()
+            }
+        )
+    if descriptor.provider is Provider.OLLAMA_LOCAL and descriptor.runner is RunnerKind.CODEX_CLI:
+        files["model.json"] = (fleet_model_catalog(effective_descriptor).encode("utf-8"), 0o600)
+    marker: dict[str, Any] = {
+        "schema_version": 2,
+        "kind": "codex_master_fleet_agent",
+        "agent_id": descriptor.agent_id,
+        "prefix": descriptor.series_prefix,
+        "runner": descriptor.runner.value,
+        "provider": descriptor.provider.value,
+        "model": descriptor.model,
+        "common_policy": _fleet_marker_common_policy(projection),
+        "managed_files": sorted(files),
+        "files": {
+            name: hashlib.sha256(content).hexdigest()
+            for name, (content, _mode) in sorted(files.items())
+        },
+    }
+    if runtime_skill_profile is not None:
+        marker[_FLEET_RUNTIME_SKILL_PROFILE_FIELD] = runtime_skill_profile
+    marker_bytes = (json.dumps(marker, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    for path, expected in executable_checks:
+        _fleet_revalidate_executable(path, expected)
+    return FleetHomeTarget(
+        descriptor=descriptor,
+        effective_skill_profile=effective_skill_profile,
+        runtime_skill_profile=runtime_skill_profile,
+        files=tuple(
+            (name, content, mode)
+            for name, (content, mode) in sorted(files.items())
+        ),
+        marker_bytes=marker_bytes,
+        policy_schema_version=projection.metadata.schema_version,
+        policy_generation=projection.metadata.generation,
+        common_digest=projection.metadata.common_digest,
+        provider_projection_digest=projection.metadata.provider_artifact_digest,
+        executable_checks=executable_checks,
+    )
+
+
 @contextlib.contextmanager
 def _fleet_artifact_builder(
     runner: RunnerKind,
@@ -23733,86 +23892,307 @@ def _fleet_home_artifacts(
     include_portable_skills: bool = False,
     runtime_skill_profile: str | None = None,
 ) -> dict[str, Any]:
-    executable_checks = tuple(
-        (path, expected)
-        for path, expected in (
-            (executable, executable_stat),
-            (bash_executable, bash_stat),
-            (taskset_executable, taskset_stat),
-            (true_executable, true_stat),
-        )
-        if expected is not None
+    target = _build_fleet_home_target(
+        agent,
+        executable,
+        target_skill_profile=runtime_skill_profile,
+        executable_stat=executable_stat,
+        bash_executable=bash_executable,
+        bash_stat=bash_stat,
+        taskset_executable=taskset_executable,
+        taskset_stat=taskset_stat,
+        true_executable=true_executable,
+        true_stat=true_stat,
+        include_portable_skills=include_portable_skills,
     )
-    for path, expected in executable_checks:
-        _fleet_revalidate_executable(path, expected)
-    wrapper_name = "codex" if agent.runner is RunnerKind.CODEX_CLI else "gemini"
-    config_name, config_text = fleet_minimal_config(agent)
-    if agent.provider is Provider.OLLAMA_LOCAL and agent.runner is RunnerKind.CODEX_CLI:
-        config_text = (
-            config_text.rstrip("\n")
-            + f'\nmodel_catalog_json = {json.dumps(str(agent.home / "model.json"))}\n'
-        )
-    for path, expected in executable_checks:
-        _fleet_revalidate_executable(path, expected)
     files = {
-        wrapper_name: (
-            fleet_wrapper_text(
-                agent,
-                executable,
-                bash_executable=bash_executable,
-                taskset_executable=taskset_executable,
-                true_executable=true_executable,
-            ).encode("utf-8"),
-            0o700,
-        ),
-        config_name: (config_text.encode("utf-8"), 0o600),
+        name: (content, mode)
+        for name, content, mode in target.files
     }
-    markdown_projection = fleet_markdown_projection(agent)
-    files.update(
-        {
-            name: (content, 0o600)
-            for name, content in markdown_projection.artifacts.items()
-        }
+    files[FLEET_AGENT_MARKER_FILE] = (target.marker_bytes, 0o600)
+    return {
+        "files": files,
+        "marker": json.loads(target.marker_bytes.decode("utf-8")),
+        "executable_checks": target.executable_checks,
+    }
+
+
+def _fleet_home_policy_observation_at(
+    home_fd: int,
+    descriptor: AgentDescriptor,
+    target: FleetHomeTarget,
+) -> FleetHomePolicyObservation:
+    error = "fleet_home_content_invalid"
+    if target.descriptor != descriptor:
+        raise AgentError(error)
+
+    def observation(
+        state: Literal["absent", "current", "stale"],
+        *,
+        common_policy: Mapping[str, Any] | None = None,
+        provider_digest: str | None = None,
+    ) -> FleetHomePolicyObservation:
+        return FleetHomePolicyObservation(
+            state=state,
+            expected_schema_version=target.policy_schema_version,
+            expected_generation=target.policy_generation,
+            expected_common_digest=target.common_digest,
+            expected_provider_projection_digest=target.provider_projection_digest,
+            observed_schema_version=(
+                common_policy["schema_version"] if common_policy is not None else None
+            ),
+            observed_generation=(
+                common_policy["generation"] if common_policy is not None else None
+            ),
+            observed_common_digest=(
+                common_policy["digest"] if common_policy is not None else None
+            ),
+            observed_provider_artifact_digest=provider_digest,
+        )
+
+    marker_bytes, _marker_stat = _fleet_read_private_file_at(
+        home_fd,
+        FLEET_AGENT_MARKER_FILE,
+        0o600,
+        error,
     )
-    if agent.runner is RunnerKind.GEMINI_CLI:
-        bootstrap = {"advanced": {"autoConfigureMemory": False}}
-        policy = "\n".join(
-            (
-                "[[rule]]",
-                'toolName = "run_shell_command"',
-                'decision = "deny"',
-                "priority = 999",
-                "",
-            )
-        )
-        files["settings.json"] = (
-            (json.dumps(bootstrap, indent=2, sort_keys=True) + "\n").encode("utf-8"),
-            0o600,
-        )
-        files[".gemini/policies/codex-master.toml"] = (policy.encode("utf-8"), 0o600)
-    if include_portable_skills and agent.skill_profile != "generic":
-        files.update({name: (data, 0o600) for name, data in portable_gemini_skill_artifacts(agent.skill_profile).items()})
-    if agent.provider is Provider.OLLAMA_LOCAL and agent.runner is RunnerKind.CODEX_CLI:
-        files["model.json"] = (fleet_model_catalog(agent).encode("utf-8"), 0o600)
-    marker = {
-        "schema_version": 2,
-        "kind": "codex_master_fleet_agent",
-        "agent_id": agent.agent_id,
-        "prefix": agent.series_prefix,
-        "runner": agent.runner.value,
-        "provider": agent.provider.value,
-        "model": agent.model,
-        "common_policy": _fleet_marker_common_policy(markdown_projection),
-        _FLEET_RUNTIME_SKILL_PROFILE_FIELD: runtime_skill_profile,
-        "managed_files": sorted(files),
-        "files": {
-            name: hashlib.sha256(content).hexdigest()
-            for name, (content, _mode) in sorted(files.items())
-        },
+    try:
+        payload = json.loads(marker_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AgentError(error) from exc
+    marker = _fleet_validate_agent_marker_shape(
+        payload,
+        marker_error=error,
+        policy_error=error,
+    )
+    common_policy = _fleet_marker_common_policy_value(marker, error)
+    if (
+        marker.get("agent_id") != descriptor.agent_id
+        or marker.get("prefix") != descriptor.series_prefix
+        or marker.get("runner") != descriptor.runner.value
+        or marker.get("provider") != descriptor.provider.value
+        or marker.get("model") != descriptor.model
+    ):
+        raise AgentError(error)
+    observed_descriptor = _fleet_projection_descriptor_from_marker(
+        marker,
+        descriptor.home,
+        error,
+    )
+    marker_names = set(marker["files"])
+    target_files = {
+        name: (content, mode) for name, content, mode in target.files
     }
-    marker_bytes = (json.dumps(marker, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    files[FLEET_AGENT_MARKER_FILE] = (marker_bytes, 0o600)
-    return {"files": files, "marker": marker, "executable_checks": executable_checks}
+    target_names = set(target_files)
+    observed_class_name = (
+        f".gemini/AGENTS.class-{observed_descriptor.skill_profile}.md"
+        if descriptor.runner is RunnerKind.GEMINI_CLI
+        else f"AGENTS.class-{observed_descriptor.skill_profile}.md"
+    )
+    target_class_name = (
+        f".gemini/AGENTS.class-{target.effective_skill_profile}.md"
+        if descriptor.runner is RunnerKind.GEMINI_CLI
+        else f"AGENTS.class-{target.effective_skill_profile}.md"
+    )
+
+    def portable(name: str) -> bool:
+        return name.startswith("skills/.portable/") and name.endswith("/SKILL.md")
+
+    marker_core = {
+        name
+        for name in marker_names
+        if name != observed_class_name and not portable(name)
+    }
+    target_core = {
+        name
+        for name in target_names
+        if name != target_class_name and not portable(name)
+    }
+    if (
+        observed_class_name not in marker_names
+        or target_class_name not in target_names
+        or marker_core != target_core
+        or any(not _fleet_managed_name(name) for name in marker_names)
+    ):
+        raise AgentError(error)
+
+    codex_runtime_directories: Collection[str] = ()
+    shared_runtime_sources: contextlib.AbstractContextManager[dict[str, str]] = (
+        contextlib.nullcontext({})
+    )
+    if descriptor.runner is RunnerKind.CODEX_CLI:
+        codex_runtime_directories = _FLEET_CODEX_RUNTIME_DIRECTORIES
+        if descriptor.agent_id != f"{descriptor.series_prefix}1":
+            shared_runtime_sources = _fleet_pinned_shared_runtime_symlinks(
+                descriptor.home.parent,
+                descriptor,
+                error,
+            )
+    with shared_runtime_sources as codex_runtime_symlinks:
+        actual_files, actual_directories, actual_symlinks = _fleet_tree_entries(
+            home_fd,
+            error,
+            allow_gemini_runtime=descriptor.runner is RunnerKind.GEMINI_CLI,
+            opaque_runtime_directories=codex_runtime_directories,
+            allowed_runtime_symlinks=codex_runtime_symlinks,
+        )
+        expected_managed_files = marker_names | {FLEET_AGENT_MARKER_FILE}
+        expected_directories = _fleet_artifact_directories(
+            {name: None for name in expected_managed_files}
+        )
+        optional_runtime_files = actual_files & {"auth.json"}
+        if descriptor.runner is RunnerKind.CODEX_CLI:
+            runtime_regular_files = {
+                name
+                for name in actual_files
+                if name in _FLEET_CODEX_RUNTIME_FILES
+                or _FLEET_CODEX_RUNTIME_DATABASE_RE.fullmatch(name) is not None
+            }
+            runtime_directories = actual_directories & set(codex_runtime_directories)
+            for name in runtime_regular_files:
+                _fleet_codex_runtime_regular_file_stat(home_fd, name, error)
+        else:
+            optional_runtime_files |= actual_files & {".gemini/projects.json"}
+            runtime_regular_files = {
+                name
+                for name in actual_files
+                if name.startswith(".gemini/history/")
+                or name.startswith(".gemini/tmp/")
+            }
+            runtime_directories = {
+                name
+                for name in actual_directories
+                if name == ".gemini/history"
+                or name.startswith(".gemini/history/")
+                or name == ".gemini/tmp"
+                or name.startswith(".gemini/tmp/")
+            }
+            for name in runtime_regular_files:
+                _fleet_codex_runtime_regular_file_stat(home_fd, name, error)
+        if (
+            actual_files
+            != expected_managed_files | optional_runtime_files | runtime_regular_files
+            or actual_directories != expected_directories | runtime_directories
+            or set(actual_symlinks) - set(codex_runtime_symlinks)
+        ):
+            raise AgentError(error)
+        for name in optional_runtime_files:
+            _fleet_read_private_file_at(home_fd, name, 0o600, error)
+        _fleet_revalidate_symlink_snapshots(home_fd, actual_symlinks, error)
+
+    provider_name = (
+        ".gemini/GEMINI.md"
+        if descriptor.runner is RunnerKind.GEMINI_CLI
+        else "AGENTS.md"
+    )
+    provider_digest: str | None = None
+    for name in sorted(marker_names):
+        expected_digest = marker["files"].get(name)
+        if (
+            not isinstance(expected_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+        ):
+            raise AgentError(error)
+        target_file = target_files.get(name)
+        mode = (
+            target_file[1]
+            if target_file is not None
+            else 0o700 if name in {"codex", "gemini"} else 0o600
+        )
+        content, _file_stat = _fleet_read_private_file_at(
+            home_fd,
+            name,
+            mode,
+            error,
+        )
+        actual_digest = hashlib.sha256(content).hexdigest()
+        if not hmac.compare_digest(actual_digest, expected_digest):
+            raise AgentError(error)
+        if name == provider_name:
+            provider_digest = actual_digest
+    if provider_digest is None:
+        raise AgentError(error)
+    if (
+        observed_class_name == target_class_name
+        and not hmac.compare_digest(
+            marker["files"][observed_class_name],
+            hashlib.sha256(target_files[target_class_name][0]).hexdigest(),
+        )
+    ):
+        raise AgentError(error)
+    expected_common_policy = {
+        "schema_version": target.policy_schema_version,
+        "generation": target.policy_generation,
+        "digest": target.common_digest,
+    }
+    state: Literal["current", "stale"] = (
+        "current"
+        if common_policy == expected_common_policy
+        and hmac.compare_digest(
+            provider_digest,
+            target.provider_projection_digest,
+        )
+        and observed_class_name == target_class_name
+        else "stale"
+    )
+    return observation(
+        state,
+        common_policy=common_policy,
+        provider_digest=provider_digest,
+    )
+
+
+def _fleet_home_policy_observation(
+    descriptor: AgentDescriptor,
+    target: FleetHomeTarget,
+) -> FleetHomePolicyObservation:
+    error = "fleet_home_content_invalid"
+    if target.descriptor != descriptor:
+        raise AgentError(error)
+    try:
+        home_stat = descriptor.home.lstat()
+    except FileNotFoundError:
+        return FleetHomePolicyObservation(
+            state="absent",
+            expected_schema_version=target.policy_schema_version,
+            expected_generation=target.policy_generation,
+            expected_common_digest=target.common_digest,
+            expected_provider_projection_digest=target.provider_projection_digest,
+            observed_schema_version=None,
+            observed_generation=None,
+            observed_common_digest=None,
+            observed_provider_artifact_digest=None,
+        )
+    except OSError as exc:
+        raise AgentError(error) from exc
+    _fleet_private_directory_stat(home_stat, error)
+    home_fd = open_directory_no_follow_matching(
+        descriptor.home,
+        home_stat,
+        error_text=error,
+        changed_text=error,
+    )
+    try:
+        result = _fleet_home_policy_observation_at(home_fd, descriptor, target)
+        opened_final = os.fstat(home_fd)
+        try:
+            path_final = descriptor.home.lstat()
+        except OSError as exc:
+            raise AgentError(error) from exc
+        _fleet_private_directory_stat(opened_final, error)
+        _fleet_private_directory_stat(path_final, error)
+        if (
+            not source_identity_with_snapshot_matches(opened_final, home_stat)
+            or not source_identity_with_snapshot_matches(path_final, home_stat)
+        ):
+            raise AgentError(error)
+        return result
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError(error) from exc
+    finally:
+        os.close(home_fd)
 
 
 def _fleet_revalidate_artifact_executables(artifacts: dict[str, Any]) -> None:
@@ -35066,38 +35446,9 @@ def fleet_model_catalog(agent: AgentDescriptor) -> str:
 
 
 def _fleet_artifacts(agent: AgentDescriptor, executable: Path) -> dict[str, bytes]:
-    config_name, config_text = fleet_minimal_config(agent)
-    artifacts = {
-        ("gemini" if agent.runner is RunnerKind.GEMINI_CLI else "codex"): fleet_wrapper_text(agent, executable).encode(),
-        config_name: config_text.encode(),
-    }
-    markdown_projection = fleet_markdown_projection(agent)
-    artifacts.update(markdown_projection.artifacts)
-    if agent.provider is Provider.OLLAMA_LOCAL and agent.runner is RunnerKind.CODEX_CLI:
-        artifacts["model.json"] = fleet_model_catalog(agent).encode()
-    if agent.runner is RunnerKind.GEMINI_CLI:
-        artifacts[".gemini/settings.json"] = config_text.encode()
-        artifacts[".gemini/policies/codex-master.toml"] = b'approvalMode = "deny"\n'
-    # Skills are Markdown projections, not executable plugins.  Project them
-    # into every managed home so Codex, Gemini, and Ollama share the same
-    # vetted vocabulary.  The profile removes dangerous/contradictory skills
-    # before the agent can see them.
-    if agent.skill_profile != "generic":
-        artifacts.update(portable_gemini_skill_artifacts(agent.skill_profile))
-    marker = {
-        "schema_version": 2,
-        "kind": "codex_master_fleet_agent",
-        "agent_id": agent.agent_id,
-        "prefix": agent.series_prefix,
-        "runner": agent.runner.value,
-        "provider": agent.provider.value,
-        "model": agent.model,
-        "common_policy": _fleet_marker_common_policy(markdown_projection),
-        _FLEET_RUNTIME_SKILL_PROFILE_FIELD: None,
-        "managed_files": sorted(artifacts),
-        "files": {name: hashlib.sha256(data).hexdigest() for name, data in sorted(artifacts.items())},
-    }
-    artifacts[FLEET_AGENT_MARKER_FILE] = (json.dumps(marker, indent=2, sort_keys=True) + "\n").encode()
+    target = _build_fleet_home_target(agent, executable)
+    artifacts = {name: content for name, content, _mode in target.files}
+    artifacts[FLEET_AGENT_MARKER_FILE] = target.marker_bytes
     return artifacts
 
 

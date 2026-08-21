@@ -7296,7 +7296,6 @@ class ServerHelpersTest(unittest.TestCase):
             home = pool / "d1"
             expected_files = {
                 "gemini",
-                "settings.json",
                 ".gemini/settings.json",
                 ".gemini/GEMINI.md",
                 ".gemini/AGENTS.class-generic.md",
@@ -7307,10 +7306,7 @@ class ServerHelpersTest(unittest.TestCase):
             )
             self.assertEqual(set(marker["files"]), expected_files)
             self.assertEqual(set(marker["managed_files"]), expected_files)
-            self.assertEqual(
-                json.loads((home / "settings.json").read_text(encoding="utf-8")),
-                {"advanced": {"autoConfigureMemory": False}},
-            )
+            self.assertFalse((home / "settings.json").exists())
             core = json.loads((home / ".gemini/settings.json").read_text(encoding="utf-8"))
             self.assertTrue(core["advanced"]["ignoreLocalEnv"])
             self.assertFalse(core["advanced"]["autoConfigureMemory"])
@@ -9247,7 +9243,7 @@ google_accounts:
             self.assertNotIn("settings.json", after)
             self.assertEqual(switched_result["updated_count"], 1)
             self.assertIn("gemini", switched_names)
-            self.assertIn("settings.json", switched_names)
+            self.assertNotIn("settings.json", switched_names)
             self.assertNotIn("codex", switched_names)
             self.assertNotIn("config.toml", switched_names)
 
@@ -9362,6 +9358,561 @@ google_accounts:
 
             self.assertFalse((pool / "d1").exists())
 
+    def test_fleet_home_target_uses_one_projection_and_exact_provider_files(self) -> None:
+        common = (
+            Path(server_module.__file__).with_name("markdown") / "common.md"
+        ).read_bytes()
+        base_marker_fields = {
+            "schema_version",
+            "kind",
+            "agent_id",
+            "prefix",
+            "runner",
+            "provider",
+            "model",
+            "common_policy",
+            "managed_files",
+            "files",
+        }
+        for runner in (
+            server_module.RunnerKind.CODEX_CLI,
+            server_module.RunnerKind.GEMINI_CLI,
+        ):
+            with self.subTest(runner=runner.value), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                home = root / "pool" / "a1"
+                executable = root / (
+                    "gemini-native"
+                    if runner is server_module.RunnerKind.GEMINI_CLI
+                    else "codex-native"
+                )
+                descriptor = server_module.AgentDescriptor(
+                    agent_id="a1",
+                    series_prefix="a",
+                    ordinal=1,
+                    label="Agentin A1",
+                    runner=runner,
+                    provider=(
+                        server_module.Provider.GEMINI_API
+                        if runner is server_module.RunnerKind.GEMINI_CLI
+                        else server_module.Provider.OPENAI_CHATGPT
+                    ),
+                    model="test-model",
+                    account_id=(
+                        "gemini-project-1"
+                        if runner is server_module.RunnerKind.GEMINI_CLI
+                        else None
+                    ),
+                    home=home,
+                    session="session-a1",
+                    enabled=True,
+                    runner_path=home / (
+                        "gemini"
+                        if runner is server_module.RunnerKind.GEMINI_CLI
+                        else "codex"
+                    ),
+                    skill_profile="teamleiterin",
+                )
+                real_projection = server_module.fleet_markdown_projection
+                with patch.object(
+                    server_module,
+                    "fleet_markdown_projection",
+                    wraps=real_projection,
+                ) as projection:
+                    target = server_module._build_fleet_home_target(
+                        descriptor,
+                        executable,
+                        include_portable_skills=False,
+                    )
+
+                projection.assert_called_once()
+                files = {
+                    name: (content, mode)
+                    for name, content, mode in target.files
+                }
+                expected_files = (
+                    {
+                        "gemini",
+                        ".gemini/settings.json",
+                        ".gemini/GEMINI.md",
+                        ".gemini/AGENTS.class-teamleiterin.md",
+                        ".gemini/policies/codex-master.toml",
+                    }
+                    if runner is server_module.RunnerKind.GEMINI_CLI
+                    else {
+                        "codex",
+                        "config.toml",
+                        "AGENTS.md",
+                        "AGENTS.class-teamleiterin.md",
+                    }
+                )
+                primary_name = (
+                    ".gemini/GEMINI.md"
+                    if runner is server_module.RunnerKind.GEMINI_CLI
+                    else "AGENTS.md"
+                )
+                class_names = {
+                    name
+                    for name in files
+                    if re.search(r"(?:^|/)AGENTS\.class-[a-z0-9_-]+\.md$", name)
+                }
+                marker = json.loads(target.marker_bytes.decode("utf-8"))
+
+                self.assertEqual(set(files), expected_files)
+                self.assertEqual(len(class_names), 1)
+                self.assertNotIn("settings.json", files)
+                if runner is server_module.RunnerKind.GEMINI_CLI:
+                    self.assertNotIn("AGENTS.md", files)
+                self.assertTrue(files[primary_name][0].startswith(common))
+                self.assertEqual(marker["common_policy"], canonical_common_policy_marker_for_test())
+                self.assertEqual(set(marker), base_marker_fields)
+                self.assertEqual(marker["managed_files"], sorted(expected_files))
+                self.assertEqual(
+                    marker["files"],
+                    {
+                        name: hashlib.sha256(content).hexdigest()
+                        for name, (content, _mode) in sorted(files.items())
+                    },
+                )
+                self.assertEqual(
+                    target.provider_projection_digest,
+                    hashlib.sha256(files[primary_name][0]).hexdigest(),
+                )
+                repeated = server_module._build_fleet_home_target(
+                    descriptor,
+                    executable,
+                    include_portable_skills=False,
+                )
+                self.assertEqual(repeated, target)
+
+    def test_fleet_home_target_runtime_profile_is_only_optional_marker_field(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "pool" / "a1"
+            descriptor = server_module.AgentDescriptor(
+                agent_id="a1",
+                series_prefix="a",
+                ordinal=1,
+                label="Agentin A1",
+                runner=server_module.RunnerKind.CODEX_CLI,
+                provider=server_module.Provider.OPENAI_CHATGPT,
+                model="test-model",
+                account_id=None,
+                home=home,
+                session="session-a1",
+                enabled=True,
+                runner_path=home / "codex",
+                skill_profile="generic",
+            )
+
+            target = server_module._build_fleet_home_target(
+                descriptor,
+                root / "codex-native",
+                target_skill_profile="worker",
+                include_portable_skills=False,
+            )
+
+        marker = json.loads(target.marker_bytes.decode("utf-8"))
+        names = {name for name, _content, _mode in target.files}
+        class_names = {
+            name for name in names if re.fullmatch(r"AGENTS\.class-[a-z0-9_-]+\.md", name)
+        }
+        self.assertEqual(target.effective_skill_profile, "worker")
+        self.assertEqual(target.runtime_skill_profile, "worker")
+        self.assertEqual(class_names, {"AGENTS.class-worker.md"})
+        self.assertEqual(marker["runtime_skill_profile"], "worker")
+        self.assertEqual(
+            set(marker)
+            - {
+                "schema_version",
+                "kind",
+                "agent_id",
+                "prefix",
+                "runner",
+                "provider",
+                "model",
+                "common_policy",
+                "managed_files",
+                "files",
+            },
+            {"runtime_skill_profile"},
+        )
+
+    def test_fleet_home_target_omits_runtime_profile_for_explicit_normalized_same_profile(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "pool" / "a1"
+            descriptor = server_module.AgentDescriptor(
+                agent_id="a1",
+                series_prefix="a",
+                ordinal=1,
+                label="Agentin A1",
+                runner=server_module.RunnerKind.CODEX_CLI,
+                provider=server_module.Provider.OPENAI_CHATGPT,
+                model="test-model",
+                account_id=None,
+                home=home,
+                session="session-a1",
+                enabled=True,
+                runner_path=home / "codex",
+                skill_profile=" TeamLeiterin ",
+            )
+
+            target = server_module._build_fleet_home_target(
+                descriptor,
+                root / "codex-native",
+                target_skill_profile="teamleiterin",
+                include_portable_skills=False,
+            )
+
+        marker = json.loads(target.marker_bytes.decode("utf-8"))
+        self.assertEqual(target.effective_skill_profile, "teamleiterin")
+        self.assertIsNone(target.runtime_skill_profile)
+        self.assertNotIn("runtime_skill_profile", marker)
+
+    def test_fleet_home_target_is_only_artifact_composer(self) -> None:
+        for runner in (
+            server_module.RunnerKind.CODEX_CLI,
+            server_module.RunnerKind.GEMINI_CLI,
+        ):
+            with self.subTest(runner=runner.value), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                home = root / "pool" / "a1"
+                executable = root / (
+                    "gemini-native"
+                    if runner is server_module.RunnerKind.GEMINI_CLI
+                    else "codex-native"
+                )
+                descriptor = server_module.AgentDescriptor(
+                    agent_id="a1",
+                    series_prefix="a",
+                    ordinal=1,
+                    label="Agentin A1",
+                    runner=runner,
+                    provider=(
+                        server_module.Provider.GEMINI_API
+                        if runner is server_module.RunnerKind.GEMINI_CLI
+                        else server_module.Provider.OPENAI_CHATGPT
+                    ),
+                    model="test-model",
+                    account_id=(
+                        "gemini-project-1"
+                        if runner is server_module.RunnerKind.GEMINI_CLI
+                        else None
+                    ),
+                    home=home,
+                    session="session-a1",
+                    enabled=True,
+                    runner_path=home / (
+                        "gemini"
+                        if runner is server_module.RunnerKind.GEMINI_CLI
+                        else "codex"
+                    ),
+                )
+                target = server_module._build_fleet_home_target(
+                    descriptor,
+                    executable,
+                    include_portable_skills=False,
+                )
+                expected = {
+                    name: content for name, content, _mode in target.files
+                }
+                expected[server_module.FLEET_AGENT_MARKER_FILE] = target.marker_bytes
+
+                secure = server_module._fleet_home_artifacts(
+                    descriptor,
+                    executable,
+                    include_portable_skills=False,
+                )
+                flat = server_module._fleet_artifacts(descriptor, executable)
+
+                self.assertEqual(
+                    {
+                        name: content
+                        for name, (content, _mode) in server_module._fleet_artifact_files(
+                            secure
+                        ).items()
+                    },
+                    expected,
+                )
+                self.assertEqual(flat, expected)
+
+    def test_fleet_home_target_propagates_contract_failure_without_writing(self) -> None:
+        from codex_master.hive_policy import CommonPolicyError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "pool" / "a1"
+            descriptor = server_module.AgentDescriptor(
+                agent_id="a1",
+                series_prefix="a",
+                ordinal=1,
+                label="Agentin A1",
+                runner=server_module.RunnerKind.CODEX_CLI,
+                provider=server_module.Provider.OPENAI_CHATGPT,
+                model="test-model",
+                account_id=None,
+                home=home,
+                session="session-a1",
+                enabled=True,
+                runner_path=home / "codex",
+            )
+            with patch.object(
+                server_module,
+                "fleet_markdown_projection",
+                side_effect=CommonPolicyError("common policy file is missing"),
+            ):
+                with self.assertRaisesRegex(CommonPolicyError, "common policy file is missing"):
+                    server_module._build_fleet_home_target(
+                        descriptor,
+                        root / "codex-native",
+                    )
+
+            self.assertFalse(home.exists())
+            self.assertFalse(home.parent.exists())
+
+    def test_fleet_home_policy_observation_reports_current_and_stale(self) -> None:
+        for runner in (
+            server_module.RunnerKind.CODEX_CLI,
+            server_module.RunnerKind.GEMINI_CLI,
+        ):
+            for expected_state in ("current", "stale"):
+                with (
+                    self.subTest(runner=runner.value, expected_state=expected_state),
+                    tempfile.TemporaryDirectory() as tmp,
+                ):
+                    root = Path(tmp)
+                    _pool, descriptor = write_s2b1_policy_home_for_test(root, runner)
+                    executable = root / (
+                        "gemini-native"
+                        if runner is server_module.RunnerKind.GEMINI_CLI
+                        else "codex-native"
+                    )
+                    target = server_module._build_fleet_home_target(
+                        descriptor,
+                        executable,
+                    )
+                    primary_name = (
+                        ".gemini/GEMINI.md"
+                        if runner is server_module.RunnerKind.GEMINI_CLI
+                        else "AGENTS.md"
+                    )
+                    if expected_state == "stale":
+                        stale_primary = b"stale but internally consistent provider projection\n"
+                        (descriptor.home / primary_name).write_bytes(stale_primary)
+
+                        def make_stale(marker: dict[str, Any]) -> None:
+                            marker["common_policy"]["generation"] += 1
+                            marker["files"][primary_name] = hashlib.sha256(
+                                stale_primary
+                            ).hexdigest()
+
+                        rewrite_fleet_marker_for_test(descriptor.home, make_stale)
+
+                    observation = server_module._fleet_home_policy_observation(
+                        descriptor,
+                        target,
+                    )
+                    marker = json.loads(
+                        (descriptor.home / server_module.FLEET_AGENT_MARKER_FILE).read_text(
+                            encoding="utf-8"
+                        )
+                    )
+
+                    self.assertEqual(observation.state, expected_state)
+                    self.assertEqual(
+                        observation.expected_schema_version,
+                        target.policy_schema_version,
+                    )
+                    self.assertEqual(
+                        observation.expected_generation,
+                        target.policy_generation,
+                    )
+                    self.assertEqual(
+                        observation.expected_common_digest,
+                        target.common_digest,
+                    )
+                    self.assertEqual(
+                        observation.expected_provider_projection_digest,
+                        target.provider_projection_digest,
+                    )
+                    self.assertEqual(
+                        observation.observed_schema_version,
+                        marker["common_policy"]["schema_version"],
+                    )
+                    self.assertEqual(
+                        observation.observed_generation,
+                        marker["common_policy"]["generation"],
+                    )
+                    self.assertEqual(
+                        observation.observed_common_digest,
+                        marker["common_policy"]["digest"],
+                    )
+                    self.assertEqual(
+                        observation.observed_provider_artifact_digest,
+                        hashlib.sha256((descriptor.home / primary_name).read_bytes()).hexdigest(),
+                    )
+
+    def test_fleet_home_policy_observation_reports_absent_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "pool" / "a1"
+            descriptor = server_module.AgentDescriptor(
+                agent_id="a1",
+                series_prefix="a",
+                ordinal=1,
+                label="Agentin A1",
+                runner=server_module.RunnerKind.CODEX_CLI,
+                provider=server_module.Provider.OPENAI_CHATGPT,
+                model="test-model",
+                account_id=None,
+                home=home,
+                session="session-a1",
+                enabled=True,
+                runner_path=home / "codex",
+            )
+            target = server_module._build_fleet_home_target(
+                descriptor,
+                root / "codex-native",
+                include_portable_skills=False,
+            )
+
+            observation = server_module._fleet_home_policy_observation(
+                descriptor,
+                target,
+            )
+
+            self.assertEqual(observation.state, "absent")
+            self.assertIsNone(observation.observed_schema_version)
+            self.assertIsNone(observation.observed_generation)
+            self.assertIsNone(observation.observed_common_digest)
+            self.assertIsNone(observation.observed_provider_artifact_digest)
+            self.assertFalse(home.exists())
+            self.assertFalse(home.parent.exists())
+
+    def test_fleet_home_policy_observation_pins_home_and_rejects_path_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _pool, descriptor = write_s2b1_policy_home_for_test(
+                root,
+                server_module.RunnerKind.CODEX_CLI,
+            )
+            target = server_module._build_fleet_home_target(
+                descriptor,
+                root / "codex-native",
+            )
+            original_home = descriptor.home.with_name("a1-original")
+            real_read = server_module._fleet_read_private_file_at
+            swapped = False
+
+            def swap_then_read(*args: Any, **kwargs: Any) -> Any:
+                nonlocal swapped
+                if not swapped:
+                    descriptor.home.rename(original_home)
+                    descriptor.home.mkdir(mode=0o700)
+                    swapped = True
+                return real_read(*args, **kwargs)
+
+            with patch.object(
+                server_module,
+                "_fleet_read_private_file_at",
+                side_effect=swap_then_read,
+            ):
+                with self.assertRaisesRegex(AgentError, "fleet_home_content_invalid"):
+                    server_module._fleet_home_policy_observation(
+                        descriptor,
+                        target,
+                    )
+
+            self.assertTrue(swapped)
+            self.assertTrue(original_home.is_dir())
+            self.assertTrue(descriptor.home.is_dir())
+
+    def test_fleet_home_policy_observation_enforces_target_file_modes(self) -> None:
+        for relative, invalid_mode in (
+            ("codex", 0o600),
+            ("AGENTS.md", 0o700),
+        ):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                _pool, descriptor = write_s2b1_policy_home_for_test(
+                    root,
+                    server_module.RunnerKind.CODEX_CLI,
+                )
+                target = server_module._build_fleet_home_target(
+                    descriptor,
+                    root / "codex-native",
+                )
+                (descriptor.home / relative).chmod(invalid_mode)
+
+                with self.assertRaisesRegex(AgentError, "fleet_home_content_invalid"):
+                    server_module._fleet_home_policy_observation(
+                        descriptor,
+                        target,
+                    )
+
+    def test_fleet_home_policy_observation_rejects_invalid_existing_home(self) -> None:
+        invalid_cases = (
+            "missing_marker",
+            "v1",
+            "unknown_marker_field",
+            "unknown_policy_field",
+            "tamper",
+            "gemini_root_settings_alias",
+            "gemini_root_agents_alias",
+        )
+        for invalid_case in invalid_cases:
+            with self.subTest(invalid_case=invalid_case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                _pool, descriptor = write_s2b1_policy_home_for_test(
+                    root,
+                    server_module.RunnerKind.GEMINI_CLI,
+                )
+                target = server_module._build_fleet_home_target(
+                    descriptor,
+                    root / "gemini-native",
+                )
+                marker_path = descriptor.home / server_module.FLEET_AGENT_MARKER_FILE
+                primary = descriptor.home / ".gemini/GEMINI.md"
+                if invalid_case == "missing_marker":
+                    marker_path.unlink()
+                elif invalid_case == "v1":
+                    rewrite_fleet_marker_for_test(
+                        descriptor.home,
+                        lambda marker: (
+                            marker.__setitem__("schema_version", 1),
+                            marker.pop("common_policy"),
+                        ),
+                    )
+                elif invalid_case == "unknown_marker_field":
+                    rewrite_fleet_marker_for_test(
+                        descriptor.home,
+                        lambda marker: marker.__setitem__("unexpected", True),
+                    )
+                elif invalid_case == "unknown_policy_field":
+                    rewrite_fleet_marker_for_test(
+                        descriptor.home,
+                        lambda marker: marker["common_policy"].__setitem__(
+                            "unexpected", True
+                        ),
+                    )
+                elif invalid_case == "tamper":
+                    primary.write_bytes(primary.read_bytes() + b"tamper\n")
+                elif invalid_case == "gemini_root_settings_alias":
+                    alias = descriptor.home / "settings.json"
+                    alias.write_bytes(b"{}\n")
+                else:
+                    alias = descriptor.home / "AGENTS.md"
+                    alias.write_bytes(b"forbidden Gemini root alias\n")
+
+                with self.assertRaisesRegex(AgentError, "fleet_home_content_invalid"):
+                    server_module._fleet_home_policy_observation(
+                        descriptor,
+                        target,
+                    )
+
     def test_s2b1_marker_writers_emit_exact_v2_policy_for_both_providers(self) -> None:
         expected_common_policy = canonical_common_policy_marker_for_test()
         expected_fields = {
@@ -9373,7 +9924,6 @@ google_accounts:
             "provider",
             "model",
             "common_policy",
-            "runtime_skill_profile",
             "managed_files",
             "files",
         }
@@ -9601,7 +10151,7 @@ google_accounts:
         )
 
         self.assertIsNone(schema1_writer.search(source))
-        self.assertEqual(len(schema2_writer.findall(source)), 2)
+        self.assertEqual(len(schema2_writer.findall(source)), 1)
         self.assertFalse("def _fleet_legacy_marker_runtime_skill_profile" in source)
         self.assertFalse("def _fleet_legacy_marker_migration_allowed" in source)
 
