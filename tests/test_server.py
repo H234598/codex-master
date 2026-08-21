@@ -298,6 +298,72 @@ def write_managed_class_home_for_test(
     return pool, descriptor, inventory
 
 
+def write_s2b1_policy_home_for_test(
+    root: Path,
+    runner: server_module.RunnerKind,
+) -> tuple[Path, server_module.AgentDescriptor]:
+    """Create one marker-owned home through the production artifact writer."""
+
+    pool = root / "pool"
+    pool.mkdir(mode=0o700)
+    home = pool / "a1"
+    executable = root / ("gemini-native" if runner is server_module.RunnerKind.GEMINI_CLI else "codex-native")
+    shutil.copyfile(sys.executable, executable)
+    executable.chmod(0o700)
+    descriptor = server_module.AgentDescriptor(
+        agent_id="a1",
+        series_prefix="a",
+        ordinal=1,
+        label="Agentin A1",
+        runner=runner,
+        provider=(
+            server_module.Provider.GEMINI_API
+            if runner is server_module.RunnerKind.GEMINI_CLI
+            else server_module.Provider.OPENAI_CHATGPT
+        ),
+        model="test-model",
+        account_id="gemini-project-1" if runner is server_module.RunnerKind.GEMINI_CLI else None,
+        home=home,
+        session="session-a1",
+        enabled=True,
+        runner_path=home / ("gemini" if runner is server_module.RunnerKind.GEMINI_CLI else "codex"),
+    )
+    server_module._fleet_write_home(
+        home,
+        server_module._fleet_artifacts(descriptor, executable),
+    )
+    return pool, descriptor
+
+
+def canonical_common_policy_marker_for_test() -> dict[str, object]:
+    common = (
+        Path(server_module.__file__).with_name("markdown") / "common.md"
+    ).read_bytes()
+    header = common.splitlines()[0]
+    prefix = b"<!-- codex-master-common-policy:"
+    suffix = b" -->"
+    metadata = json.loads(header[len(prefix) : -len(suffix)].decode("ascii"))
+    return {
+        "schema_version": metadata["schema_version"],
+        "generation": metadata["generation"],
+        "digest": hashlib.sha256(common).hexdigest(),
+    }
+
+
+def rewrite_fleet_marker_for_test(
+    home: Path,
+    mutate: Any,
+) -> dict[str, Any]:
+    marker_path = home / server_module.FLEET_AGENT_MARKER_FILE
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    mutate(marker)
+    marker_path.write_text(
+        json.dumps(marker, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return marker
+
+
 def managed_home_tree_for_test(home: Path) -> dict[str, tuple[str, int, bytes | None]]:
     """Snapshot observable managed-home contents for transaction rollback tests."""
 
@@ -9295,6 +9361,321 @@ google_accounts:
                     )
 
             self.assertFalse((pool / "d1").exists())
+
+    def test_s2b1_marker_writers_emit_exact_v2_policy_for_both_providers(self) -> None:
+        expected_common_policy = canonical_common_policy_marker_for_test()
+        expected_fields = {
+            "schema_version",
+            "kind",
+            "agent_id",
+            "prefix",
+            "runner",
+            "provider",
+            "model",
+            "common_policy",
+            "runtime_skill_profile",
+            "managed_files",
+            "files",
+        }
+        for runner in (
+            server_module.RunnerKind.CODEX_CLI,
+            server_module.RunnerKind.GEMINI_CLI,
+        ):
+            with self.subTest(runner=runner.value), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                _pool, descriptor = write_s2b1_policy_home_for_test(root, runner)
+                executable = root / (
+                    "gemini-native"
+                    if runner is server_module.RunnerKind.GEMINI_CLI
+                    else "codex-native"
+                )
+                flat_marker = json.loads(
+                    (descriptor.home / server_module.FLEET_AGENT_MARKER_FILE).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                secure_marker = server_module._fleet_home_artifacts(
+                    descriptor,
+                    executable,
+                )["marker"]
+
+                for marker in (flat_marker, secure_marker):
+                    self.assertEqual(set(marker), expected_fields)
+                    self.assertEqual(marker["schema_version"], 2)
+                    self.assertEqual(marker["kind"], "codex_master_fleet_agent")
+                    self.assertEqual(marker["common_policy"], expected_common_policy)
+
+    def test_s2b1_home_current_accepts_codex_and_gemini_v2_projection(self) -> None:
+        for runner in (
+            server_module.RunnerKind.CODEX_CLI,
+            server_module.RunnerKind.GEMINI_CLI,
+        ):
+            with self.subTest(runner=runner.value), tempfile.TemporaryDirectory() as tmp:
+                pool, descriptor = write_s2b1_policy_home_for_test(Path(tmp), runner)
+
+                home_stat, runtime_profile = server_module._fleet_managed_home_details(
+                    pool,
+                    descriptor,
+                    strict_contents=True,
+                )
+
+                self.assertEqual(home_stat.st_ino, descriptor.home.stat().st_ino)
+                self.assertIsNone(runtime_profile)
+                self.assertTrue(server_module._fleet_existing_home_ok(descriptor.home, {}))
+
+    def test_s2b1_home_rejects_v1_without_translation_in_all_readers(self) -> None:
+        for runner in (
+            server_module.RunnerKind.CODEX_CLI,
+            server_module.RunnerKind.GEMINI_CLI,
+        ):
+            with self.subTest(runner=runner.value), tempfile.TemporaryDirectory() as tmp:
+                pool, descriptor = write_s2b1_policy_home_for_test(Path(tmp), runner)
+
+                def make_v1(marker: dict[str, Any]) -> None:
+                    marker["schema_version"] = 1
+                    marker.pop("common_policy", None)
+
+                rewrite_fleet_marker_for_test(descriptor.home, make_v1)
+
+                with self.assertRaisesRegex(AgentError, "common_policy_generation_stale"):
+                    server_module._fleet_managed_home_details(
+                        pool,
+                        descriptor,
+                        strict_contents=True,
+                    )
+                self.assertFalse(server_module._fleet_existing_home_ok(descriptor.home, {}))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pool, descriptor = write_s2b1_policy_home_for_test(
+                Path(tmp),
+                server_module.RunnerKind.CODEX_CLI,
+            )
+            rewrite_fleet_marker_for_test(
+                descriptor.home,
+                lambda marker: (
+                    marker.__setitem__("schema_version", 1),
+                    marker.pop("common_policy", None),
+                ),
+            )
+            before = managed_home_tree_for_test(descriptor.home)
+            with patch.object(server_module, "AGENT_POOL_ROOT", pool), patch.object(
+                server_module,
+                "portable_gemini_skill_artifacts",
+                return_value={},
+            ):
+                with self.assertRaisesRegex(AgentError, "agent_class_materialization_invalid"):
+                    server_module._materialize_managed_codex_runtime_class(
+                        descriptor,
+                        "arbeitsbiene",
+                        expected_pool_parent_stat=pool.parent.lstat(),
+                        expected_pool_root_stat=pool.lstat(),
+                        expected_home_stat=descriptor.home.lstat(),
+                    )
+            self.assertEqual(managed_home_tree_for_test(descriptor.home), before)
+
+    def test_s2b1_home_rejects_internally_consistent_stale_policy_and_projection(self) -> None:
+        current_policy = canonical_common_policy_marker_for_test()
+        for runner in (
+            server_module.RunnerKind.CODEX_CLI,
+            server_module.RunnerKind.GEMINI_CLI,
+        ):
+            for stale_kind in ("generation", "provider_projection"):
+                with (
+                    self.subTest(runner=runner.value, stale_kind=stale_kind),
+                    tempfile.TemporaryDirectory() as tmp,
+                ):
+                    pool, descriptor = write_s2b1_policy_home_for_test(Path(tmp), runner)
+                    primary_name = (
+                        ".gemini/GEMINI.md"
+                        if runner is server_module.RunnerKind.GEMINI_CLI
+                        else "AGENTS.md"
+                    )
+                    primary = descriptor.home / primary_name
+                    old_common = (
+                        b'<!-- codex-master-common-policy:{"generation":999,"schema_version":1} -->\n'
+                        b"# stale common\n"
+                    )
+                    old_primary = old_common + b"\n## Active class profile\n\nstale reference\n"
+                    primary.write_bytes(old_primary)
+
+                    def make_internally_consistent(marker: dict[str, Any]) -> None:
+                        marker["schema_version"] = 2
+                        marker["files"][primary_name] = hashlib.sha256(old_primary).hexdigest()
+                        marker["common_policy"] = (
+                            {
+                                "schema_version": 1,
+                                "generation": 999,
+                                "digest": hashlib.sha256(old_common).hexdigest(),
+                            }
+                            if stale_kind == "generation"
+                            else dict(current_policy)
+                        )
+
+                    rewrite_fleet_marker_for_test(
+                        descriptor.home,
+                        make_internally_consistent,
+                    )
+
+                    with self.assertRaisesRegex(AgentError, "common_policy_generation_stale"):
+                        server_module._fleet_managed_home_details(
+                            pool,
+                            descriptor,
+                            strict_contents=True,
+                        )
+                    self.assertFalse(
+                        server_module._fleet_existing_home_ok(descriptor.home, {})
+                    )
+
+    def test_s2b1_marker_rejects_unknown_fields_and_noncanonical_policy_types(self) -> None:
+        invalid_cases = (
+            ("marker_field", "unexpected"),
+            ("policy_field", "unexpected"),
+            ("schema_type", True),
+            ("generation_type", True),
+            ("digest", "A" * 64),
+        )
+        for invalid_kind, value in invalid_cases:
+            with self.subTest(invalid_kind=invalid_kind), tempfile.TemporaryDirectory() as tmp:
+                pool, descriptor = write_s2b1_policy_home_for_test(
+                    Path(tmp),
+                    server_module.RunnerKind.CODEX_CLI,
+                )
+
+                def invalidate(marker: dict[str, Any]) -> None:
+                    marker["schema_version"] = 2
+                    marker["common_policy"] = canonical_common_policy_marker_for_test()
+                    if invalid_kind == "marker_field":
+                        marker[value] = True
+                    elif invalid_kind == "policy_field":
+                        marker["common_policy"][value] = True
+                    elif invalid_kind == "schema_type":
+                        marker["common_policy"]["schema_version"] = value
+                    elif invalid_kind == "generation_type":
+                        marker["common_policy"]["generation"] = value
+                    else:
+                        marker["common_policy"]["digest"] = value
+
+                rewrite_fleet_marker_for_test(descriptor.home, invalidate)
+                expected_error = (
+                    "fleet_home_content_invalid"
+                    if invalid_kind == "marker_field"
+                    else "common_policy_generation_stale"
+                )
+                with self.assertRaisesRegex(AgentError, expected_error):
+                    server_module._fleet_managed_home_details(
+                        pool,
+                        descriptor,
+                        strict_contents=True,
+                    )
+                self.assertFalse(server_module._fleet_existing_home_ok(descriptor.home, {}))
+
+    def test_s2b1_home_keeps_per_file_tamper_rejection(self) -> None:
+        for runner in (
+            server_module.RunnerKind.CODEX_CLI,
+            server_module.RunnerKind.GEMINI_CLI,
+        ):
+            with self.subTest(runner=runner.value), tempfile.TemporaryDirectory() as tmp:
+                pool, descriptor = write_s2b1_policy_home_for_test(Path(tmp), runner)
+                primary = descriptor.home / (
+                    ".gemini/GEMINI.md"
+                    if runner is server_module.RunnerKind.GEMINI_CLI
+                    else "AGENTS.md"
+                )
+                primary.write_bytes(primary.read_bytes() + b"tampered\n")
+
+                with self.assertRaisesRegex(AgentError, "fleet_home_content_invalid"):
+                    server_module._fleet_managed_home_details(
+                        pool,
+                        descriptor,
+                        strict_contents=True,
+                    )
+                self.assertFalse(server_module._fleet_existing_home_ok(descriptor.home, {}))
+
+    def test_s2b1_marker_source_has_no_schema1_fleet_agent_writer(self) -> None:
+        source = Path(server_module.__file__).read_text(encoding="utf-8")
+        schema1_writer = re.compile(
+            r'"schema_version": 1,\s*\n\s*"kind": "codex_master_fleet_agent"'
+        )
+        schema2_writer = re.compile(
+            r'"schema_version": 2,\s*\n\s*"kind": "codex_master_fleet_agent"'
+        )
+
+        self.assertIsNone(schema1_writer.search(source))
+        self.assertEqual(len(schema2_writer.findall(source)), 2)
+        self.assertFalse("def _fleet_legacy_marker_runtime_skill_profile" in source)
+        self.assertFalse("def _fleet_legacy_marker_migration_allowed" in source)
+
+    def test_s2b1_gemini_marker_refresh_requires_current_v2_policy(self) -> None:
+        invalid_cases = ("v1", "stale_policy")
+        for invalid_case in invalid_cases:
+            with self.subTest(invalid_case=invalid_case), tempfile.TemporaryDirectory() as tmp:
+                _pool, descriptor = write_s2b1_policy_home_for_test(
+                    Path(tmp),
+                    server_module.RunnerKind.GEMINI_CLI,
+                )
+                settings = (descriptor.home / ".gemini/settings.json").read_text(
+                    encoding="utf-8"
+                )
+
+                def invalidate(marker: dict[str, Any]) -> None:
+                    if invalid_case == "v1":
+                        marker["schema_version"] = 1
+                        marker.pop("common_policy")
+                    else:
+                        marker["common_policy"]["generation"] += 1
+
+                rewrite_fleet_marker_for_test(descriptor.home, invalidate)
+                marker_path = descriptor.home / server_module.FLEET_AGENT_MARKER_FILE
+                before = marker_path.read_bytes()
+
+                with self.assertRaisesRegex(AgentError, "headless_marker_invalid"):
+                    server_module._refresh_gemini_fleet_marker(
+                        descriptor.home,
+                        settings,
+                    )
+
+                self.assertEqual(marker_path.read_bytes(), before)
+
+    def test_s2b1_gemini_marker_refresh_rejects_missing_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "gemini-home"
+            home.mkdir(mode=0o700)
+
+            with self.assertRaisesRegex(AgentError, "headless_marker_invalid"):
+                server_module._refresh_gemini_fleet_marker(home, "{}\n")
+
+    def test_s2b1_restore_does_not_trust_invalid_marker_file_list(self) -> None:
+        for invalid_case in ("v1", "unknown_field"):
+            with self.subTest(invalid_case=invalid_case), tempfile.TemporaryDirectory() as tmp:
+                _pool, descriptor = write_s2b1_policy_home_for_test(
+                    Path(tmp),
+                    server_module.RunnerKind.CODEX_CLI,
+                )
+                home = descriptor.home
+                backup = server_module._fleet_home_backup(home)
+                foreign = home / "foreign.txt"
+                foreign.write_bytes(b"must survive invalid marker rollback\n")
+                foreign.chmod(0o600)
+
+                def invalidate(marker: dict[str, Any]) -> None:
+                    marker["files"]["foreign.txt"] = hashlib.sha256(
+                        foreign.read_bytes()
+                    ).hexdigest()
+                    marker["managed_files"] = sorted(marker["files"])
+                    if invalid_case == "v1":
+                        marker["schema_version"] = 1
+                        marker.pop("common_policy")
+                    else:
+                        marker["unexpected"] = True
+
+                rewrite_fleet_marker_for_test(home, invalidate)
+
+                server_module._fleet_restore_home(home, backup)
+
+                self.assertEqual(
+                    foreign.read_bytes(),
+                    b"must survive invalid marker rollback\n",
+                )
 
     def test_fleet_homemarker_requires_private_single_link_regular_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

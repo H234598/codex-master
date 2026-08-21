@@ -176,7 +176,10 @@ from codex_master.fleet_inplace import (
     apply_series_update as apply_q_series_update,
     recover_series_update as recover_q_series_update,
 )
-from codex_master.fleet_markdown import fleet_markdown_artifacts, fleet_markdown_file_names
+from codex_master.fleet_markdown import (
+    fleet_markdown_artifacts,
+    fleet_markdown_projection,
+)
 from codex_master.fleet_service import (
     FleetConflictError,
     FleetPaths,
@@ -7374,10 +7377,12 @@ _FLEET_AGENT_MARKER_BASE_FIELDS = frozenset(
         "runner",
         "provider",
         "model",
+        "common_policy",
         "managed_files",
         "files",
     }
 )
+_FLEET_COMMON_POLICY_FIELDS = frozenset({"schema_version", "generation", "digest"})
 _FLEET_RUNTIME_SKILL_PROFILE_FIELD = "runtime_skill_profile"
 
 
@@ -7429,37 +7434,118 @@ def _fleet_marker_runtime_skill_profile(
     return value
 
 
-def _fleet_legacy_marker_runtime_skill_profile(
-    managed_files: list[Any],
+def _fleet_marker_common_policy(projection: Any) -> dict[str, Any]:
+    metadata = projection.metadata
+    return {
+        "schema_version": metadata.schema_version,
+        "generation": metadata.generation,
+        "digest": metadata.common_digest,
+    }
+
+
+def _fleet_validate_agent_marker_shape(
+    marker: Any,
+    *,
+    marker_error: str,
+    policy_error: str,
+) -> Mapping[str, Any]:
+    if not isinstance(marker, dict):
+        raise AgentError(marker_error)
+    if type(marker.get("schema_version")) is not int or marker["schema_version"] != 2:
+        raise AgentError(policy_error)
+    if "common_policy" not in marker:
+        raise AgentError(policy_error)
+    if set(marker) not in {
+        _FLEET_AGENT_MARKER_BASE_FIELDS,
+        _FLEET_AGENT_MARKER_BASE_FIELDS | {_FLEET_RUNTIME_SKILL_PROFILE_FIELD},
+    }:
+        raise AgentError(marker_error)
+    managed_files = marker.get("managed_files")
+    files = marker.get("files")
+    if (
+        marker.get("kind") != "codex_master_fleet_agent"
+        or not isinstance(marker.get("agent_id"), str)
+        or not isinstance(marker.get("prefix"), str)
+        or not isinstance(marker.get("runner"), str)
+        or not isinstance(marker.get("provider"), str)
+        or not isinstance(marker.get("model"), str)
+        or not isinstance(managed_files, list)
+        or not isinstance(files, dict)
+        or len(files) > MAX_PORTABLE_SKILLS + 8
+        or any(not isinstance(name, str) for name in managed_files)
+        or any(not isinstance(name, str) for name in files)
+        or managed_files != sorted(files)
+        or len(set(managed_files)) != len(managed_files)
+    ):
+        raise AgentError(marker_error)
+    return marker
+
+
+def _fleet_current_policy_projection(
+    marker: Mapping[str, Any],
     descriptor: AgentDescriptor,
     error: str,
-) -> str:
-    if descriptor.runner is not RunnerKind.CODEX_CLI:
+) -> Any:
+    common_policy = marker.get("common_policy")
+    if (
+        not isinstance(common_policy, dict)
+        or set(common_policy) != _FLEET_COMMON_POLICY_FIELDS
+        or type(common_policy.get("schema_version")) is not int
+        or type(common_policy.get("generation")) is not int
+        or common_policy["generation"] <= 0
+        or not isinstance(common_policy.get("digest"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", common_policy["digest"]) is None
+    ):
         raise AgentError(error)
-    class_files = [
-        name
-        for name in managed_files
-        if isinstance(name, str) and _RUNTIME_CLASS_MARKDOWN_RE.fullmatch(name) is not None
-    ]
-    if len(class_files) != 1:
-        raise AgentError(error)
-    profile = class_files[0][len("AGENTS.class-"):-len(".md")]
-    if profile == "generic" or profile not in _known_runtime_skill_profiles(error):
-        raise AgentError(error)
-    return profile
-
-
-def _fleet_legacy_marker_migration_allowed(descriptor: AgentDescriptor) -> bool:
-    if _fleet_tmux_state(descriptor.session) != "stopped":
-        return False
     try:
-        summary = agent_home_process_summary(descriptor.agent_id)
-    except Exception:
-        return False
-    return all(
-        type(summary.get(field)) is int and summary[field] == 0
-        for field in ("process_count", "managed_process_count", "external_process_count")
+        projection = fleet_markdown_projection(descriptor)
+    except Exception as exc:
+        raise AgentError(error) from exc
+    if common_policy != _fleet_marker_common_policy(projection):
+        raise AgentError(error)
+    return projection
+
+
+def _fleet_read_current_agent_marker(
+    home: Path,
+    error: str,
+    *,
+    missing_ok: bool = False,
+) -> tuple[bytes, Mapping[str, Any], Any] | None:
+    marker_bytes = fleet_read_optional_private_bytes(
+        home / FLEET_AGENT_MARKER_FILE,
+        MAX_FLEET_ARTIFACT_BYTES,
+        error,
     )
+    if marker_bytes is None:
+        if missing_ok:
+            return None
+        raise AgentError(error)
+    try:
+        payload = json.loads(marker_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AgentError(error) from exc
+    marker = _fleet_validate_agent_marker_shape(
+        payload,
+        marker_error=error,
+        policy_error=error,
+    )
+    descriptor = _fleet_projection_descriptor_from_marker(marker, home, error)
+    projection = _fleet_current_policy_projection(marker, descriptor, error)
+    provider_bytes = fleet_read_optional_private_bytes(
+        home / projection.metadata.provider_artifact_name,
+        MAX_FLEET_ARTIFACT_BYTES,
+        error,
+    )
+    if (
+        provider_bytes is None
+        or not hmac.compare_digest(
+            hashlib.sha256(provider_bytes).hexdigest(),
+            projection.metadata.provider_artifact_digest,
+        )
+    ):
+        raise AgentError(error)
+    return marker_bytes, marker, projection
 
 
 def _fleet_effective_runtime_descriptor(
@@ -8279,33 +8365,21 @@ def _materialize_managed_codex_runtime_class(
                 marker = json.loads(marker_bytes.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 raise AgentError("agent_class_materialization_invalid") from None
-            marker_fields = set(marker) if isinstance(marker, dict) else set()
-            marker_files = marker.get("files") if isinstance(marker, dict) else None
-            managed_files = marker.get("managed_files") if isinstance(marker, dict) else None
+            marker = _fleet_validate_agent_marker_shape(
+                marker,
+                marker_error="agent_class_materialization_invalid",
+                policy_error="agent_class_materialization_invalid",
+            )
+            marker_files = marker["files"]
             if (
-                not isinstance(marker, dict)
-                or marker_fields
-                not in {
-                    _FLEET_AGENT_MARKER_BASE_FIELDS,
-                    _FLEET_AGENT_MARKER_BASE_FIELDS | {_FLEET_RUNTIME_SKILL_PROFILE_FIELD},
-                }
-                or marker.get("schema_version") != 1
-                or marker.get("kind") != "codex_master_fleet_agent"
-                or marker.get("agent_id") != descriptor.agent_id
+                marker.get("agent_id") != descriptor.agent_id
                 or marker.get("prefix") != descriptor.series_prefix
                 or marker.get("runner") != descriptor.runner.value
                 or marker.get("provider") != descriptor.provider.value
-                or not isinstance(marker.get("model"), str)
-                or not isinstance(marker_files, dict)
-                or not isinstance(managed_files, list)
-                or len(marker_files) > MAX_PORTABLE_SKILLS + 8
-                or managed_files != sorted(marker_files)
-                or len(set(managed_files)) != len(managed_files)
             ):
                 raise AgentError("agent_class_materialization_invalid")
 
             projection: dict[str, tuple[bytes, os.stat_result]] = {}
-            home_refresh_drift: dict[str, tuple[bytes, os.stat_result]] = {}
             for name, digest in marker_files.items():
                 if (
                     not _fleet_managed_name(name)
@@ -8321,31 +8395,34 @@ def _materialize_managed_codex_runtime_class(
                     "agent_class_materialization_invalid",
                 )
                 if not hmac.compare_digest(hashlib.sha256(content).hexdigest(), digest):
-                    if name not in {"codex", "config.toml"}:
-                        raise AgentError("agent_class_materialization_invalid")
-                    home_refresh_drift[name] = (content, current_stat)
+                    raise AgentError("agent_class_materialization_invalid")
                 if _runtime_class_projection_name(name):
                     projection[name] = (content, current_stat)
 
-            legacy_runtime_profile: str | None = None
-            if _FLEET_RUNTIME_SKILL_PROFILE_FIELD not in marker:
-                legacy_runtime_profile = _fleet_legacy_marker_runtime_skill_profile(
-                    managed_files,
-                    descriptor,
-                    "agent_class_materialization_invalid",
-                )
-                if not _fleet_legacy_marker_migration_allowed(descriptor):
-                    raise AgentError("agent_class_materialization_invalid")
-                current_descriptor = dataclass_replace(descriptor, skill_profile=legacy_runtime_profile)
-            else:
-                current_descriptor, _current_runtime_profile = _fleet_effective_runtime_descriptor(
-                    marker,
-                    descriptor,
-                    "agent_class_materialization_invalid",
-                )
-            if marker.get("model") != descriptor.model and legacy_runtime_profile is None:
+            current_descriptor, _current_runtime_profile = _fleet_effective_runtime_descriptor(
+                marker,
+                descriptor,
+                "agent_class_materialization_invalid",
+            )
+            if marker.get("model") != descriptor.model:
                 raise AgentError("agent_class_materialization_invalid")
-            current_markdown = fleet_markdown_file_names(current_descriptor)
+            policy_projection = _fleet_current_policy_projection(
+                marker,
+                current_descriptor,
+                "agent_class_materialization_invalid",
+            )
+            provider_artifact = projection.get(
+                policy_projection.metadata.provider_artifact_name
+            )
+            if (
+                provider_artifact is None
+                or not hmac.compare_digest(
+                    hashlib.sha256(provider_artifact[0]).hexdigest(),
+                    policy_projection.metadata.provider_artifact_digest,
+                )
+            ):
+                raise AgentError("agent_class_materialization_invalid")
+            current_markdown = set(policy_projection.artifacts)
             marker_markdown = {
                 name
                 for name in projection
@@ -8353,36 +8430,6 @@ def _materialize_managed_codex_runtime_class(
             }
             if marker_markdown != current_markdown:
                 raise AgentError("agent_class_materialization_invalid")
-
-            home_refresh = bool(home_refresh_drift)
-            if home_refresh:
-                if (
-                    set(home_refresh_drift) != {"codex", "config.toml"}
-                    or legacy_runtime_profile is None
-                    or not _fleet_legacy_marker_migration_allowed(descriptor)
-                ):
-                    raise AgentError("agent_class_materialization_invalid")
-                try:
-                    legacy_wrapper = home_refresh_drift["codex"][0].decode("utf-8")
-                    legacy_runner = _legacy_pool_wrapper_runner(descriptor.home, legacy_wrapper)
-                    trusted_runner = trusted_runner_executable(legacy_runner)
-                    refreshed_config = _home_refresh_config(
-                        descriptor.home,
-                        home_refresh_drift["config.toml"][0],
-                        model=descriptor.model,
-                        reasoning_effort=model_reasoning_effort,
-                    )
-                except (AgentError, UnicodeDecodeError):
-                    raise AgentError("agent_class_materialization_invalid") from None
-                if not confirm_home_refresh:
-                    raise AgentError("agent_home_refresh_confirmation_required")
-                desired["codex"] = pool_wrapper_text(
-                    descriptor.agent_id,
-                    descriptor.home,
-                    str(trusted_runner),
-                ).encode("utf-8")
-                desired["config.toml"] = refreshed_config
-                projection.update(home_refresh_drift)
 
             next_digests = {
                 name: digest
@@ -8402,9 +8449,7 @@ def _materialize_managed_codex_runtime_class(
             next_runtime_profile = (
                 None if runtime_profile == descriptor.skill_profile else runtime_profile
             )
-            if legacy_runtime_profile is not None:
-                next_marker[_FLEET_RUNTIME_SKILL_PROFILE_FIELD] = runtime_profile
-            elif (
+            if (
                 _FLEET_RUNTIME_SKILL_PROFILE_FIELD in marker
                 or next_runtime_profile is not None
             ):
@@ -11232,25 +11277,23 @@ def _ensure_gemini_headless_retry_policy(home: Path) -> None:
 def _refresh_gemini_fleet_marker(home: Path, settings_text: str) -> None:
     """Keep the managed-home digest in sync with the bounded retry policy."""
 
-    marker_path = home / FLEET_AGENT_MARKER_FILE
-    marker_text = fleet_read_optional_private_text(
-        marker_path,
-        256 * 1024,
+    marker_record = _fleet_read_current_agent_marker(
+        home,
         "headless_marker_invalid",
     )
-    if marker_text is None:
-        return
-    try:
-        marker = json.loads(marker_text)
-    except (json.JSONDecodeError, UnicodeError) as exc:
-        raise AgentError("headless_marker_invalid") from exc
-    if not isinstance(marker, dict) or not isinstance(marker.get("files"), dict):
+    if marker_record is None:
+        raise AgentError("headless_marker_invalid")
+    _marker_bytes, marker, _projection = marker_record
+    if marker["runner"] != RunnerKind.GEMINI_CLI.value:
         raise AgentError("headless_marker_invalid")
     files = marker["files"]
     if ".gemini/settings.json" not in files:
-        return
+        raise AgentError("headless_marker_invalid")
     files[".gemini/settings.json"] = hashlib.sha256(settings_text.encode("utf-8")).hexdigest()
-    replace_private_text(marker_path, json.dumps(marker, indent=2, sort_keys=True) + "\n")
+    replace_private_text(
+        home / FLEET_AGENT_MARKER_FILE,
+        json.dumps(marker, indent=2, sort_keys=True) + "\n",
+    )
 
 
 def _headless_marker(agent: str) -> dict[str, Any]:
@@ -23724,7 +23767,13 @@ def _fleet_home_artifacts(
         ),
         config_name: (config_text.encode("utf-8"), 0o600),
     }
-    files.update({name: (content, 0o600) for name, content in fleet_markdown_artifacts(agent).items()})
+    markdown_projection = fleet_markdown_projection(agent)
+    files.update(
+        {
+            name: (content, 0o600)
+            for name, content in markdown_projection.artifacts.items()
+        }
+    )
     if agent.runner is RunnerKind.GEMINI_CLI:
         bootstrap = {"advanced": {"autoConfigureMemory": False}}
         policy = "\n".join(
@@ -23746,13 +23795,14 @@ def _fleet_home_artifacts(
     if agent.provider is Provider.OLLAMA_LOCAL and agent.runner is RunnerKind.CODEX_CLI:
         files["model.json"] = (fleet_model_catalog(agent).encode("utf-8"), 0o600)
     marker = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "codex_master_fleet_agent",
         "agent_id": agent.agent_id,
         "prefix": agent.series_prefix,
         "runner": agent.runner.value,
         "provider": agent.provider.value,
         "model": agent.model,
+        "common_policy": _fleet_marker_common_policy(markdown_projection),
         _FLEET_RUNTIME_SKILL_PROFILE_FIELD: runtime_skill_profile,
         "managed_files": sorted(files),
         "files": {
@@ -23870,6 +23920,7 @@ _FLEET_CODEX_SHARED_RUNTIME_FILES = frozenset(
     {".personality_migration", "models_cache.json", "version.json"}
 )
 _FLEET_CODEX_RUNTIME_FILE_MODES = frozenset({0o600, 0o644})
+_FLEET_PROC_FD_PATH_RE = re.compile(r"/proc/self/fd/([0-9]+)\Z")
 
 
 def _fleet_codex_runtime_regular_file_stat(
@@ -23908,6 +23959,36 @@ def _fleet_codex_runtime_regular_file_stat(
         os.close(parent_fd)
 
 
+def _fleet_open_shared_runtime_root(root: Path, error: str) -> int:
+    proc_fd = _FLEET_PROC_FD_PATH_RE.fullmatch(str(root))
+    if proc_fd is not None:
+        root_fd = -1
+        try:
+            root_fd = os.dup(int(proc_fd.group(1)))
+            _fleet_private_directory_stat(os.fstat(root_fd), error)
+            return root_fd
+        except AgentError:
+            if root_fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(root_fd)
+            raise
+        except (OSError, ValueError) as exc:
+            raise AgentError(error) from exc
+    try:
+        root_stat = root.lstat()
+        _fleet_private_directory_stat(root_stat, error)
+        return open_directory_chain_no_follow_matching(
+            root,
+            root_stat,
+            error_text=error,
+            changed_text=error,
+        )
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError(error) from exc
+
+
 @contextlib.contextmanager
 def _fleet_pinned_shared_runtime_symlinks(
     root: Path,
@@ -23919,14 +24000,7 @@ def _fleet_pinned_shared_runtime_symlinks(
     source_fds: dict[str, int] = {}
     source_stats: dict[str, os.stat_result] = {}
     try:
-        root_stat = root.lstat()
-        _fleet_private_directory_stat(root_stat, error)
-        root_fd = open_directory_chain_no_follow_matching(
-            root,
-            root_stat,
-            error_text=error,
-            changed_text=error,
-        )
+        root_fd = _fleet_open_shared_runtime_root(root, error)
         template_agent = f"{agent.series_prefix}1"
         try:
             template_stat = os.stat(template_agent, dir_fd=root_fd, follow_symlinks=False)
@@ -25225,22 +25299,23 @@ def _fleet_managed_home_details(
             marker = json.loads(marker_bytes.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise AgentError("fleet_home_content_invalid") from None
-        marker_fields = set(marker) if isinstance(marker, dict) else set()
-        if (
-            marker_fields
-            not in {
-                _FLEET_AGENT_MARKER_BASE_FIELDS,
-                _FLEET_AGENT_MARKER_BASE_FIELDS | {_FLEET_RUNTIME_SKILL_PROFILE_FIELD},
-            }
-        ):
-            raise AgentError("fleet_home_content_invalid")
+        marker = _fleet_validate_agent_marker_shape(
+            marker,
+            marker_error="fleet_home_content_invalid",
+            policy_error="common_policy_generation_stale",
+        )
         effective_agent, runtime_skill_profile = _fleet_effective_runtime_descriptor(
             marker,
             agent,
             "fleet_home_content_invalid",
         )
+        policy_projection = _fleet_current_policy_projection(
+            marker,
+            effective_agent,
+            "common_policy_generation_stale",
+        )
         wrapper_name = "codex" if agent.runner is RunnerKind.CODEX_CLI else "gemini"
-        markdown_files = fleet_markdown_file_names(effective_agent)
+        markdown_files = set(policy_projection.artifacts)
         base_expected_files = (
             {wrapper_name, "config.toml"} | markdown_files
             | ({"model.json"} if agent.provider is Provider.OLLAMA_LOCAL else set())
@@ -25252,16 +25327,11 @@ def _fleet_managed_home_details(
             } | markdown_files
         )
         if (
-            not isinstance(marker, dict)
-            or marker.get("schema_version") != 1
-            or marker.get("kind") != "codex_master_fleet_agent"
-            or marker.get("agent_id") != agent.agent_id
+            marker.get("agent_id") != agent.agent_id
             or marker.get("prefix") != agent.series_prefix
             or marker.get("runner") != agent.runner.value
             or marker.get("provider") != agent.provider.value
             or marker.get("model") != agent.model
-            or not isinstance(marker.get("managed_files"), list)
-            or not isinstance(marker.get("files"), dict)
         ):
             raise AgentError("fleet_home_content_invalid")
         marker_files = set(marker["managed_files"])
@@ -25287,6 +25357,7 @@ def _fleet_managed_home_details(
         ):
             raise AgentError("fleet_home_content_invalid")
         expected_files = marker_files
+        provider_artifact_digest: str | None = None
         for name in expected_files:
             digest = marker["files"].get(name)
             if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
@@ -25298,8 +25369,19 @@ def _fleet_managed_home_details(
                 mode,
                 "fleet_home_content_invalid",
             )
-            if not hmac.compare_digest(hashlib.sha256(content).hexdigest(), digest):
+            actual_digest = hashlib.sha256(content).hexdigest()
+            if not hmac.compare_digest(actual_digest, digest):
                 raise AgentError("fleet_home_content_invalid")
+            if name == policy_projection.metadata.provider_artifact_name:
+                provider_artifact_digest = actual_digest
+        if (
+            provider_artifact_digest is None
+            or not hmac.compare_digest(
+                provider_artifact_digest,
+                policy_projection.metadata.provider_artifact_digest,
+            )
+        ):
+            raise AgentError("common_policy_generation_stale")
         codex_runtime_directories: Collection[str] = ()
         shared_runtime_sources: contextlib.AbstractContextManager[dict[str, str]] = contextlib.nullcontext({})
         if agent.runner is RunnerKind.CODEX_CLI:
@@ -34973,7 +35055,8 @@ def _fleet_artifacts(agent: AgentDescriptor, executable: Path) -> dict[str, byte
         ("gemini" if agent.runner is RunnerKind.GEMINI_CLI else "codex"): fleet_wrapper_text(agent, executable).encode(),
         config_name: config_text.encode(),
     }
-    artifacts.update(fleet_markdown_artifacts(agent))
+    markdown_projection = fleet_markdown_projection(agent)
+    artifacts.update(markdown_projection.artifacts)
     if agent.provider is Provider.OLLAMA_LOCAL and agent.runner is RunnerKind.CODEX_CLI:
         artifacts["model.json"] = fleet_model_catalog(agent).encode()
     if agent.runner is RunnerKind.GEMINI_CLI:
@@ -34986,13 +35069,14 @@ def _fleet_artifacts(agent: AgentDescriptor, executable: Path) -> dict[str, byte
     if agent.skill_profile != "generic":
         artifacts.update(portable_gemini_skill_artifacts(agent.skill_profile))
     marker = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "codex_master_fleet_agent",
         "agent_id": agent.agent_id,
         "prefix": agent.series_prefix,
         "runner": agent.runner.value,
         "provider": agent.provider.value,
         "model": agent.model,
+        "common_policy": _fleet_marker_common_policy(markdown_projection),
         _FLEET_RUNTIME_SKILL_PROFILE_FIELD: None,
         "managed_files": sorted(artifacts),
         "files": {name: hashlib.sha256(data).hexdigest() for name, data in sorted(artifacts.items())},
@@ -35204,20 +35288,14 @@ def _fleet_managed_name(name: object) -> bool:
 def _fleet_home_backup(home: Path) -> dict[str, bytes]:
     if not _fleet_existing_home_ok(home, {}):
         raise AgentError("fleet_home_verification_failed")
-    marker = fleet_read_optional_private_bytes(
-        home / FLEET_AGENT_MARKER_FILE,
-        MAX_FLEET_ARTIFACT_BYTES,
+    marker_record = _fleet_read_current_agent_marker(
+        home,
         "fleet_home_verification_failed",
     )
-    if marker is None:
+    if marker_record is None:
         raise AgentError("fleet_home_verification_failed")
-    try:
-        payload = json.loads(marker.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise AgentError("fleet_home_verification_failed") from exc
-    files = payload.get("files") if isinstance(payload, dict) else None
-    if not isinstance(files, dict):
-        raise AgentError("fleet_home_verification_failed")
+    marker, payload, _projection = marker_record
+    files = payload["files"]
     backup = {FLEET_AGENT_MARKER_FILE: marker}
     for name in files:
         if not _fleet_managed_name(name):
@@ -35243,20 +35321,18 @@ def _fleet_write_recovery_backup(home: Path, backup: dict[str, bytes]) -> None:
 
 
 def _fleet_restore_home(home: Path, backup: dict[str, bytes]) -> None:
-    current_marker = fleet_read_optional_private_bytes(
-        home / FLEET_AGENT_MARKER_FILE,
-        MAX_FLEET_ARTIFACT_BYTES,
-        "fleet_home_rollback_failed",
-    )
     current_files: set[str] = set()
-    if current_marker is not None:
-        try:
-            payload = json.loads(current_marker.decode("utf-8"))
-            files = payload.get("files") if isinstance(payload, dict) else {}
-            if isinstance(files, dict):
-                current_files = {name for name in files if _fleet_managed_name(name)}
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            current_files = set()
+    try:
+        marker_record = _fleet_read_current_agent_marker(
+            home,
+            "fleet_home_rollback_failed",
+            missing_ok=True,
+        )
+    except AgentError:
+        marker_record = None
+    if marker_record is not None:
+        _marker_bytes, payload, _projection = marker_record
+        current_files = {name for name in payload["files"] if _fleet_managed_name(name)}
     for name in sorted(current_files - set(backup)):
         with contextlib.suppress(OSError):
             (home / name).unlink()
@@ -35264,6 +35340,59 @@ def _fleet_restore_home(home: Path, backup: dict[str, bytes]) -> None:
         target = home / name
         ensure_private_dir(target.parent)
         replace_private_bytes(target, data, mode=0o700 if name in {"codex", "gemini"} else 0o600)
+
+
+def _fleet_projection_descriptor_from_marker(
+    marker: Mapping[str, Any],
+    home: Path,
+    error: str,
+) -> AgentDescriptor:
+    try:
+        runner = RunnerKind(marker["runner"])
+        provider = Provider(marker["provider"])
+    except (KeyError, TypeError, ValueError):
+        raise AgentError(error) from None
+    files = marker["files"]
+    class_profiles: list[str] = []
+    for name in files:
+        class_name = (
+            name[len(".gemini/") :]
+            if runner is RunnerKind.GEMINI_CLI and name.startswith(".gemini/")
+            else name
+        )
+        if _RUNTIME_CLASS_MARKDOWN_RE.fullmatch(class_name) is not None:
+            class_profiles.append(
+                class_name[len("AGENTS.class-") : -len(".md")]
+            )
+    if len(class_profiles) != 1:
+        raise AgentError(error)
+    profile = class_profiles[0]
+    runtime_profile = marker.get(_FLEET_RUNTIME_SKILL_PROFILE_FIELD)
+    if runtime_profile is not None and (
+        not isinstance(runtime_profile, str)
+        or runtime_profile != profile
+        or runtime_profile == "generic"
+        or runner is not RunnerKind.CODEX_CLI
+        or runtime_profile not in _known_runtime_skill_profiles(error)
+    ):
+        raise AgentError(error)
+    if not marker["agent_id"] or not marker["prefix"] or not marker["model"]:
+        raise AgentError(error)
+    return AgentDescriptor(
+        agent_id=marker["agent_id"],
+        series_prefix=marker["prefix"],
+        ordinal=1,
+        label=marker["agent_id"],
+        runner=runner,
+        provider=provider,
+        model=marker["model"],
+        account_id=None,
+        home=home,
+        session="",
+        enabled=True,
+        runner_path=home / ("gemini" if runner is RunnerKind.GEMINI_CLI else "codex"),
+        skill_profile=profile,
+    )
 
 
 def _fleet_existing_home_ok(home: Path, artifacts: dict[str, bytes]) -> bool:
@@ -35274,18 +35403,17 @@ def _fleet_existing_home_ok(home: Path, artifacts: dict[str, bytes]) -> bool:
     if not stat_module.S_ISDIR(current.st_mode) or stat_module.S_ISLNK(current.st_mode):
         return False
     try:
-        marker_bytes = fleet_read_optional_private_bytes(
-            home / FLEET_AGENT_MARKER_FILE,
-            MAX_FLEET_ARTIFACT_BYTES,
+        marker_record = _fleet_read_current_agent_marker(
+            home,
             "fleet_home_verification_failed",
         )
-        if marker_bytes is None:
+        if marker_record is None:
             return False
-        payload = json.loads(marker_bytes.decode("utf-8"))
-    except (AgentError, UnicodeDecodeError, json.JSONDecodeError):
+        marker_bytes, marker, policy_projection = marker_record
+    except AgentError:
         return False
-    files = payload.get("files") if isinstance(payload, dict) else None
-    if not isinstance(files, dict) or any(
+    files = marker["files"]
+    if any(
         not _fleet_managed_name(name)
         or not isinstance(value, str)
         or not re.fullmatch(r"[0-9a-f]{64}", value)
@@ -35294,6 +35422,7 @@ def _fleet_existing_home_ok(home: Path, artifacts: dict[str, bytes]) -> bool:
         return False
     if artifacts and marker_bytes != artifacts.get(FLEET_AGENT_MARKER_FILE):
         return False
+    provider_artifact_digest: str | None = None
     for name, digest in files.items():
         target = home / name
         try:
@@ -35302,11 +35431,22 @@ def _fleet_existing_home_ok(home: Path, artifacts: dict[str, bytes]) -> bool:
                 MAX_FLEET_ARTIFACT_BYTES,
                 "fleet_home_verification_failed",
             )
-            if data is None or hashlib.sha256(data).hexdigest() != digest:
+            if data is None:
                 return False
+            actual_digest = hashlib.sha256(data).hexdigest()
+            if actual_digest != digest:
+                return False
+            if name == policy_projection.metadata.provider_artifact_name:
+                provider_artifact_digest = actual_digest
         except AgentError:
             return False
-    return True
+    return (
+        provider_artifact_digest is not None
+        and hmac.compare_digest(
+            provider_artifact_digest,
+            policy_projection.metadata.provider_artifact_digest,
+        )
+    )
 
 
 def _fleet_plan(
