@@ -1179,9 +1179,9 @@ def test_gemini_rest_probe_uses_capability_checked_generate_content_contract() -
     (404, {"status": "MODEL_NOT_FOUND"}, "model_unavailable", False,
      "gemini_probe_generate_content_http_4xx_model_not_found"),
     (404, {"code": "not_found"}, "runner_failed", False,
-     "gemini_probe_generate_content_http_4xx_route_not_found"),
+     "gemini_probe_generate_content_http_4xx_not_found_unclassified"),
     (404, {"status": "NOT_FOUND"}, "runner_failed", False,
-     "gemini_probe_generate_content_http_4xx_route_not_found"),
+     "gemini_probe_generate_content_http_4xx_not_found_unclassified"),
     (429, {"code": "rate_limit_exceeded"}, "account_limited", True,
      "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted"),
     (429, {"code": "quota_exceeded"}, "account_limited", True,
@@ -1258,6 +1258,41 @@ def test_gemini_rest_probe_classifies_only_allowlisted_redacted_error_semantics(
         assert marker not in rendered
     assert model_response.closed is True
     assert content_response.closed is True
+
+
+@pytest.mark.parametrize("provider_fields", [
+    {"code": "not_found"},
+    {"status": "NOT_FOUND"},
+])
+def test_gemini_rest_probe_classifies_direct_not_found_response_neutrally(
+    provider_fields: dict[str, str],
+) -> None:
+    model_response = _gemini_models_response()
+    content_url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-3.1-flash-lite:generateContent"
+    )
+    content_response = FakeProviderResponse(
+        content_url,
+        json.dumps({"error": provider_fields}).encode(),
+        status=404,
+    )
+    responses = iter([model_response, content_response])
+
+    result = probe_gemini_rest(
+        "private-gemini-key",
+        opener=lambda *_args, **_kwargs: next(responses),
+    )
+
+    assert result.ok is False
+    assert result.error is not None
+    assert result.error.kind == "runner_failed"
+    assert result.error.retryable is False
+    assert result.error.diagnostic_code == (
+        "gemini_probe_generate_content_http_4xx_not_found_unclassified"
+    )
+    assert result.error.quota_observation is None
+    assert result.http_class == "4xx"
 
 
 def test_gemini_rest_probe_preserves_redacted_quota_scope_and_retry() -> None:
@@ -1341,7 +1376,7 @@ def test_gemini_rest_probe_rejects_invalid_generate_content_json_without_leak(bo
     "gemini_probe_generate_content_http_4xx_authentication",
     "gemini_probe_generate_content_http_4xx_auth_or_billing_denied",
     "gemini_probe_generate_content_http_4xx_model_not_found",
-    "gemini_probe_generate_content_http_4xx_route_not_found",
+    "gemini_probe_generate_content_http_4xx_not_found_unclassified",
     "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted",
     "gemini_probe_generate_content_http_4xx_client_rejected_unknown",
     "gemini_probe_generate_content_http_5xx_provider_unavailable",
@@ -1360,8 +1395,9 @@ def test_gemini_probe_normalizer_accepts_only_generate_content_probe_diagnostics
     "gemini_probe_rest_interaction_not_completed",
     "gemini_probe_rest_steps_invalid",
     "gemini_probe_rest_model_output_missing",
+    "gemini_probe_generate_content_http_4xx_route_not_found",
 ])
-def test_gemini_probe_normalizer_rejects_retired_interactions_diagnostics(retired: str) -> None:
+def test_gemini_probe_normalizer_rejects_retired_diagnostics(retired: str) -> None:
     assert normalize_gemini_probe_diagnostic_code(retired) is None
 
 
@@ -1623,9 +1659,12 @@ def test_gemini_rest_probe_rejects_direct_models_redirect_before_body_parse() ->
 
 
 def test_gemini_rest_probe_uses_valid_custom_model_after_capability_check() -> None:
-    model = "gemini-9.9-future-preview"
+    model = "gemini-2.5-flash-lite"
     model_response = _gemini_models_response(model=model)
-    content_url = f"{GEMINI_MODELS_URL}/{model}:generateContent"
+    content_url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-2.5-flash-lite:generateContent"
+    )
     content_response = FakeProviderResponse(
         content_url,
         json.dumps({"candidates": [{"finishReason": "MAX_TOKENS"}]}).encode(),
@@ -1642,6 +1681,8 @@ def test_gemini_rest_probe_uses_valid_custom_model_after_capability_check() -> N
     assert result.ok is True
     assert result.model == model
     assert observed_urls == [model_response.geturl(), content_url]
+    assert "models/models/" not in observed_urls[1]
+    assert "%2F" not in observed_urls[1]
 
 
 @pytest.mark.parametrize(("error_code", "expected_kind", "retryable"), [

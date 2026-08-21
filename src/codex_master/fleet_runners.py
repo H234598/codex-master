@@ -79,7 +79,7 @@ ProbeDiagnosticCode = Literal[
     "gemini_probe_generate_content_http_4xx_authentication",
     "gemini_probe_generate_content_http_4xx_auth_or_billing_denied",
     "gemini_probe_generate_content_http_4xx_model_not_found",
-    "gemini_probe_generate_content_http_4xx_route_not_found",
+    "gemini_probe_generate_content_http_4xx_not_found_unclassified",
     "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted",
     "gemini_probe_generate_content_http_4xx_client_rejected_unknown",
     "gemini_probe_generate_content_http_5xx_provider_unavailable",
@@ -132,7 +132,7 @@ GEMINI_PROBE_DIAGNOSTIC_CODES: Final[frozenset[ProbeDiagnosticCode]] = frozenset
     "gemini_probe_generate_content_http_4xx_authentication",
     "gemini_probe_generate_content_http_4xx_auth_or_billing_denied",
     "gemini_probe_generate_content_http_4xx_model_not_found",
-    "gemini_probe_generate_content_http_4xx_route_not_found",
+    "gemini_probe_generate_content_http_4xx_not_found_unclassified",
     "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted",
     "gemini_probe_generate_content_http_4xx_client_rejected_unknown",
     "gemini_probe_generate_content_http_5xx_provider_unavailable",
@@ -1108,7 +1108,7 @@ def _gemini_http_error(status: int, raw: object) -> ProviderError:
     if code == "not_found" or status_name == "NOT_FOUND":
         return ProviderError(
             "runner_failed", False, None, None,
-            diagnostic_code="gemini_probe_generate_content_http_4xx_route_not_found",
+            diagnostic_code="gemini_probe_generate_content_http_4xx_not_found_unclassified",
         )
     if code in {"invalid_request", "parameter_unknown"} or status_name == "INVALID_ARGUMENT":
         return ProviderError(
