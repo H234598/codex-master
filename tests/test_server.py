@@ -25961,7 +25961,10 @@ google_accounts:
         replacement.chmod(0o600)
         tree_entries = server_module._fleet_tree_entries
 
-        def replace_source_after_scan(*args: Any, **kwargs: Any) -> tuple[set[str], set[str], set[str]]:
+        def replace_source_after_scan(
+            *args: Any,
+            **kwargs: Any,
+        ) -> tuple[set[str], set[str], dict[str, tuple[os.stat_result, str]]]:
             result = tree_entries(*args, **kwargs)
             os.replace(replacement, source)
             return result
@@ -25969,6 +25972,52 @@ google_accounts:
         with patch.object(server_module, "_fleet_tree_entries", side_effect=replace_source_after_scan):
             with self.assertRaisesRegex(AgentError, "^fleet_home_content_invalid$"):
                 server_module._fleet_managed_home_state(pool, descriptor, strict_contents=True)
+
+    def test_fleet_managed_home_rejects_consumer_link_swap_after_scan(self) -> None:
+        for target_kind in ("outside", "cross_series"):
+            with self.subTest(target_kind=target_kind), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                pool, descriptor, _inventory = write_managed_class_home_for_test(root)
+                template = pool / "a1"
+                template.mkdir(mode=0o700)
+                source = template / "models_cache.json"
+                source.write_bytes(b"{}\n")
+                source.chmod(0o600)
+                consumer = descriptor.home / "models_cache.json"
+                consumer.symlink_to("../a1/models_cache.json")
+                if target_kind == "outside":
+                    outside = root / "outside-models-cache.json"
+                    outside.write_bytes(b'{"outside":true}\n')
+                    outside.chmod(0o600)
+                    replacement_target = str(outside)
+                else:
+                    redirected = pool / "b1"
+                    redirected.mkdir(mode=0o700)
+                    (redirected / "models_cache.json").write_bytes(b'{"redirected":true}\n')
+                    (redirected / "models_cache.json").chmod(0o600)
+                    replacement_target = "../b1/models_cache.json"
+                tree_entries = server_module._fleet_tree_entries
+
+                def replace_consumer_after_scan(
+                    *args: Any,
+                    **kwargs: Any,
+                ) -> tuple[set[str], set[str], dict[str, tuple[os.stat_result, str]]]:
+                    result = tree_entries(*args, **kwargs)
+                    consumer.unlink()
+                    consumer.symlink_to(replacement_target)
+                    return result
+
+                with patch.object(
+                    server_module,
+                    "_fleet_tree_entries",
+                    side_effect=replace_consumer_after_scan,
+                ):
+                    with self.assertRaisesRegex(AgentError, "^fleet_home_content_invalid$"):
+                        server_module._fleet_managed_home_state(
+                            pool,
+                            descriptor,
+                            strict_contents=True,
+                        )
 
     def test_fleet_managed_home_rejects_unsafe_codex_runtime_files(self) -> None:
         for name, mode in (

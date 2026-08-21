@@ -24000,10 +24000,10 @@ def _fleet_tree_entries(
     allow_gemini_runtime: bool = False,
     opaque_runtime_directories: Collection[str] = (),
     allowed_runtime_symlinks: Mapping[str, str] | None = None,
-) -> tuple[set[str], set[str], set[str]]:
+) -> tuple[set[str], set[str], dict[str, tuple[os.stat_result, str]]]:
     files: set[str] = set()
     directories: set[str] = set()
-    symlinks: set[str] = set()
+    symlinks: dict[str, tuple[os.stat_result, str]] = {}
     entry_count = 0
 
     def visit(current_fd: int, prefix: str, depth: int) -> None:
@@ -24091,9 +24091,10 @@ def _fleet_tree_entries(
                     if allowed_runtime_symlinks is not None
                     else None
                 )
-                if expected_target is None or os.readlink(name, dir_fd=current_fd) != expected_target:
+                target = os.readlink(name, dir_fd=current_fd)
+                if expected_target is None or target != expected_target:
                     raise AgentError(error)
-                symlinks.add(relative)
+                symlinks[relative] = (current, target)
             elif (
                 stat_module.S_ISREG(current.st_mode)
                 and getattr(current, "st_nlink", 1) == 1
@@ -24110,6 +24111,34 @@ def _fleet_tree_entries(
     except OSError as exc:
         raise AgentError(error) from exc
     return files, directories, symlinks
+
+
+def _fleet_revalidate_symlink_snapshots(
+    directory_fd: int,
+    symlinks: Mapping[str, tuple[os.stat_result, str]],
+    error: str,
+) -> None:
+    for name, (expected_stat, expected_target) in symlinks.items():
+        parent_fd, basename = _fleet_open_artifact_parent(
+            directory_fd,
+            name,
+            create=False,
+            error=error,
+        )
+        try:
+            current = os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                not stat_module.S_ISLNK(current.st_mode)
+                or not source_identity_with_snapshot_matches(current, expected_stat)
+                or os.readlink(basename, dir_fd=parent_fd) != expected_target
+            ):
+                raise AgentError(error)
+        except AgentError:
+            raise
+        except OSError as exc:
+            raise AgentError(error) from exc
+        finally:
+            os.close(parent_fd)
 
 
 def _fleet_read_private_file_at(
@@ -24220,7 +24249,7 @@ def _fleet_verify_home(
             home_fd,
             "fleet_home_verification_failed",
         )
-        actual_entries = actual_files | actual_symlinks
+        actual_entries = actual_files | set(actual_symlinks)
         expected_directories = _fleet_artifact_directories(artifact_files)
         if exact_contents:
             if actual_entries != set(artifact_files) or actual_directories != expected_directories:
@@ -24334,7 +24363,7 @@ def _fleet_create_home(
             "fleet_home_verification_failed",
         )
         if (
-            (actual_files | actual_symlinks) != set(artifact_files)
+            (actual_files | set(actual_symlinks)) != set(artifact_files)
             or actual_directories != _fleet_artifact_directories(artifact_files)
         ):
             raise AgentError("fleet_home_verification_failed")
@@ -24434,11 +24463,11 @@ def _fleet_created_home_unchanged(
                 "fleet_create_rollback_diverged",
             )
             if (
-                not (actual_files | actual_symlinks) <= set(artifact_files)
+                not (actual_files | set(actual_symlinks)) <= set(artifact_files)
                 or not actual_directories <= _fleet_artifact_directories(artifact_files)
             ):
                 return False
-            for name in actual_files | actual_symlinks:
+            for name in actual_files | set(actual_symlinks):
                 content, mode = artifact_files[name]
                 _fleet_read_exact_file_at(
                     home_fd,
@@ -25312,7 +25341,7 @@ def _fleet_managed_home_details(
                             path,
                             "fleet_home_content_invalid",
                         )
-                    runtime_files = runtime_regular_files | actual_symlinks
+                    runtime_files = runtime_regular_files | set(actual_symlinks)
                     runtime_directories = actual_directories & set(codex_runtime_directories)
                 else:
                     runtime_files = {
@@ -25330,10 +25359,15 @@ def _fleet_managed_home_details(
                         or path.startswith(".gemini/tmp/")
                     }
                 if (
-                    not (actual_files | actual_symlinks) <= allowed_files | runtime_files
+                    not (actual_files | set(actual_symlinks)) <= allowed_files | runtime_files
                     or actual_directories != expected_directories | runtime_directories
                 ):
                     raise AgentError("fleet_home_content_invalid")
+        _fleet_revalidate_symlink_snapshots(
+            home_fd,
+            actual_symlinks,
+            "fleet_home_content_invalid",
+        )
         if "auth.json" in actual_files:
             _fleet_read_private_file_at(
                 home_fd,
@@ -25868,7 +25902,7 @@ def _fleet_home_tree_snapshot(home_fd: int) -> dict[str, tuple[tuple[int, ...], 
             snapshot[name] = (_fleet_snapshot_metadata(current), None)
         finally:
             os.close(parent_fd)
-    for name in sorted(files | symlinks):
+    for name in sorted(files | set(symlinks)):
         parent_fd, basename = _fleet_open_artifact_parent(
             home_fd,
             name,
