@@ -154,6 +154,10 @@ GEMINI_GATE_DIAGNOSTICS: Mapping[str, Mapping[str, object]] = MappingProxyType({
         "severity": "error", "retryable": False, "action": "reject",
         "reason": "Gemini account authentication is invalid.",
     }),
+    "gemini_auth_or_billing_denied": MappingProxyType({
+        "severity": "error", "retryable": False, "action": "reject",
+        "reason": "Gemini account authorization or billing access is denied.",
+    }),
     "gemini_provider_unavailable": MappingProxyType({
         "severity": "warning", "retryable": True, "action": "reject",
         "reason": "Gemini provider is unavailable.",
@@ -161,6 +165,10 @@ GEMINI_GATE_DIAGNOSTICS: Mapping[str, Mapping[str, object]] = MappingProxyType({
     "gemini_model_unavailable": MappingProxyType({
         "severity": "error", "retryable": False, "action": "reject",
         "reason": "Gemini model is unavailable.",
+    }),
+    "gemini_runner_failed": MappingProxyType({
+        "severity": "error", "retryable": False, "action": "reject",
+        "reason": "Gemini probe contract was rejected or failed locally.",
     }),
     "gemini_account_limit_unknown": MappingProxyType({
         "severity": "warning", "retryable": True, "action": "reject",
@@ -197,14 +205,17 @@ _GEMINI_LEGACY_GATE_CODES = MappingProxyType({
     "credential_binding_unknown": "gemini_credential_unverified",
     "secret_missing": "gemini_secret_missing",
     "auth_invalid": "gemini_auth_invalid",
+    "auth_or_billing_denied": "gemini_auth_or_billing_denied",
     "provider_unavailable": "gemini_provider_unavailable",
     "model_unavailable": "gemini_model_unavailable",
+    "runner_failed": "gemini_runner_failed",
     "limit_unknown": "gemini_account_limit_unknown",
 })
 _GEMINI_EVENT_REASON_CODES = frozenset({
     *GEMINI_GATE_DIAGNOSTICS,
     "account_limited",
     "auth_invalid",
+    "auth_or_billing_denied",
     "model_unavailable",
     "provider_unavailable",
     "runner_failed",
@@ -2210,7 +2221,7 @@ class FleetService:
                 last_probe_at_utc=None,
                 limit_reason=None,
             )
-        if reason in {"provider_unavailable", "model_unavailable"}:
+        if reason in {"auth_or_billing_denied", "provider_unavailable", "model_unavailable", "runner_failed"}:
             return dataclass_replace(
                 account,
                 secret_state=SecretState.CONFIGURED,
@@ -2339,10 +2350,11 @@ class FleetService:
                 reason = {
                     "account_limited": "limit_active",
                     "auth_invalid": "auth_invalid",
+                    "auth_or_billing_denied": "auth_or_billing_denied",
                     "secret_missing": "secret_missing",
                     "provider_unavailable": "provider_unavailable",
                     "model_unavailable": "model_unavailable",
-                    "runner_failed": "provider_unavailable",
+                    "runner_failed": "runner_failed",
                 }.get(result.error.kind, "provider_unavailable")
                 if (
                     result.error.kind == "account_limited"
@@ -2552,10 +2564,14 @@ class FleetService:
             reason = "secret_missing"
         elif account.secret_state is SecretState.INVALID:
             reason = "auth_invalid"
+        elif account.limit_reason == "auth_or_billing_denied":
+            reason = "auth_or_billing_denied"
         elif account.limit_reason == "provider_unavailable":
             reason = "provider_unavailable"
         elif account.limit_reason == "model_unavailable":
             reason = "model_unavailable"
+        elif account.limit_reason == "runner_failed":
+            reason = "runner_failed"
         elif provider is Provider.OPENAI_CHATGPT:
             # Native Codex sessions are authenticated by each home’s
             # auth.json.  They have no provider quota probe and must not be

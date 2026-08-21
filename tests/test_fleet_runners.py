@@ -16,7 +16,6 @@ from codex_master.fleet_runners import (
     GEMINI_MODELS_URL,
     MAX_GEMINI_MODELS_RESPONSE_BYTES,
     MAX_GEMINI_MODELS_PAGE_SIZE,
-    GEMINI_PROBE_URL,
     MAX_GEMINI_PROBE_REQUEST_BYTES,
     MAX_GEMINI_PROBE_RESPONSE_BYTES,
     GEMINI_PROBE_TIMEOUT_SECONDS,
@@ -31,7 +30,6 @@ from codex_master.fleet_runners import (
     model_is_agentic,
     normalize_gemini_probe_diagnostic_code,
     parse_gemini_jsonl,
-    ProbeResult,
     ProbeStdoutEventClass,
     probe_gemini_cli,
     probe_gemini_models,
@@ -1050,271 +1048,343 @@ class FakeProviderResponse:
         self.closed = True
 
 
-def test_gemini_rest_probe_uses_fixed_model_header_key_and_bounded_json() -> None:
-    response = FakeProviderResponse(
-        GEMINI_PROBE_URL,
-        json.dumps({
-            "status": "completed",
-            "steps": [{"type": "model_output", "content": [{"type": "text", "text": "OK"}]}],
-        }).encode(),
-    )
-    observed: dict[str, object] = {}
+def _gemini_models_response(
+    *,
+    model: str = GEMINI_DEFAULT_LIGHT_MODEL,
+    methods: list[str] | None = None,
+    include_model: bool = True,
+) -> FakeProviderResponse:
+    url = f"{GEMINI_MODELS_URL}?pageSize={MAX_GEMINI_MODELS_PAGE_SIZE}"
+    models = []
+    if include_model:
+        models.append({
+            "name": f"models/{model}",
+            "supportedGenerationMethods": methods if methods is not None else ["generateContent"],
+        })
+    return FakeProviderResponse(url, json.dumps({"models": models}).encode())
+
+
+@pytest.mark.parametrize(("include_model", "methods", "expected_code"), [
+    (False, None, "gemini_probe_generate_content_capability_model_missing"),
+    (True, ["countTokens"], "gemini_probe_generate_content_capability_method_missing"),
+])
+def test_gemini_rest_probe_stops_before_content_without_exact_capability(
+    include_model: bool,
+    methods: list[str] | None,
+    expected_code: str,
+) -> None:
+    model_response = _gemini_models_response(include_model=include_model, methods=methods)
+    observed_urls: list[str] = []
 
     def opener(request: object, *, timeout: int) -> FakeProviderResponse:
-        observed["url"] = request.full_url  # type: ignore[attr-defined]
-        observed["method"] = request.get_method()  # type: ignore[attr-defined]
-        observed["key"] = request.get_header("X-goog-api-key")  # type: ignore[attr-defined]
-        observed["authorization"] = request.get_header("Authorization")  # type: ignore[attr-defined]
-        observed["body"] = request.data  # type: ignore[attr-defined]
-        observed["timeout"] = timeout
+        observed_urls.append(request.full_url)  # type: ignore[attr-defined]
+        if len(observed_urls) > 1:
+            pytest.fail("content request occurred without generateContent capability")
+        return model_response
+
+    result = probe_gemini_rest("private-gemini-key", opener=opener)
+
+    assert observed_urls == [model_response.geturl()]
+    assert result.ok is False
+    assert result.model == GEMINI_DEFAULT_LIGHT_MODEL
+    assert result.error is not None
+    assert result.error.kind == "model_unavailable"
+    assert result.error.diagnostic_code == expected_code
+    assert getattr(result, "endpoint_role", None) == "generate_content"
+    assert getattr(result, "http_class", "unexpected") is None
+
+
+def test_gemini_rest_probe_uses_capability_checked_generate_content_contract() -> None:
+    model_response = _gemini_models_response()
+    content_url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-3.1-flash-lite:generateContent"
+    )
+    content_response = FakeProviderResponse(
+        content_url,
+        json.dumps({"candidates": [{"finishReason": "MAX_TOKENS"}]}).encode(),
+    )
+    responses = iter([model_response, content_response])
+    observed: list[dict[str, object]] = []
+
+    def opener(request: object, *, timeout: int) -> FakeProviderResponse:
+        observed.append({
+            "url": request.full_url,  # type: ignore[attr-defined]
+            "method": request.get_method(),  # type: ignore[attr-defined]
+            "key": request.get_header("X-goog-api-key"),  # type: ignore[attr-defined]
+            "authorization": request.get_header("Authorization"),  # type: ignore[attr-defined]
+            "content_type": request.get_header("Content-type"),  # type: ignore[attr-defined]
+            "body": request.data,  # type: ignore[attr-defined]
+            "timeout": timeout,
+        })
+        return next(responses)
+
+    result = probe_gemini_rest("private-gemini-key", opener=opener)
+
+    assert result.ok is True
+    assert result.model == GEMINI_DEFAULT_LIGHT_MODEL
+    assert result.supports_tools is True
+    assert result.error is None
+    assert getattr(result, "endpoint_role", None) == "generate_content"
+    assert getattr(result, "http_class", None) == "2xx"
+    assert observed == [
+        {
+            "url": model_response.geturl(),
+            "method": "GET",
+            "key": "private-gemini-key",
+            "authorization": None,
+            "content_type": None,
+            "body": None,
+            "timeout": 5,
+        },
+        {
+            "url": content_url,
+            "method": "POST",
+            "key": "private-gemini-key",
+            "authorization": None,
+            "content_type": "application/json",
+            "body": json.dumps({
+                "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+                "generationConfig": {"maxOutputTokens": 1},
+            }, separators=(",", ":"), sort_keys=True).encode(),
+            "timeout": 5,
+        },
+    ]
+    assert len(observed[1]["body"]) <= MAX_GEMINI_PROBE_REQUEST_BYTES  # type: ignore[arg-type]
+    assert b"private-gemini-key" not in observed[1]["body"]  # type: ignore[operator]
+    assert model_response.closed is True
+    assert content_response.read_sizes == [MAX_GEMINI_PROBE_RESPONSE_BYTES + 1]
+    assert content_response.closed is True
+    assert "private-gemini-key" not in repr(result)
+    assert content_url not in repr(result)
+
+
+@pytest.mark.parametrize(("status", "provider_fields", "expected_kind", "retryable", "expected_code"), [
+    (400, {"code": "invalid_request"}, "runner_failed", False,
+     "gemini_probe_generate_content_http_4xx_contract_rejected"),
+    (400, {"code": "parameter_unknown"}, "runner_failed", False,
+     "gemini_probe_generate_content_http_4xx_contract_rejected"),
+    (400, {"status": "INVALID_ARGUMENT"}, "runner_failed", False,
+     "gemini_probe_generate_content_http_4xx_contract_rejected"),
+    (401, {"code": "authentication"}, "auth_invalid", False,
+     "gemini_probe_generate_content_http_4xx_authentication"),
+    (401, {"status": "UNAUTHENTICATED"}, "auth_invalid", False,
+     "gemini_probe_generate_content_http_4xx_authentication"),
+    (403, {"code": "permission_denied"}, "auth_or_billing_denied", False,
+     "gemini_probe_generate_content_http_4xx_auth_or_billing_denied"),
+    (403, {"status": "PERMISSION_DENIED"}, "auth_or_billing_denied", False,
+     "gemini_probe_generate_content_http_4xx_auth_or_billing_denied"),
+    (404, {"code": "model_not_found"}, "model_unavailable", False,
+     "gemini_probe_generate_content_http_4xx_model_not_found"),
+    (404, {"status": "MODEL_NOT_FOUND"}, "model_unavailable", False,
+     "gemini_probe_generate_content_http_4xx_model_not_found"),
+    (404, {"code": "not_found"}, "runner_failed", False,
+     "gemini_probe_generate_content_http_4xx_route_not_found"),
+    (404, {"status": "NOT_FOUND"}, "runner_failed", False,
+     "gemini_probe_generate_content_http_4xx_route_not_found"),
+    (429, {"code": "rate_limit_exceeded"}, "account_limited", True,
+     "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted"),
+    (429, {"code": "quota_exceeded"}, "account_limited", True,
+     "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted"),
+    (429, {"status": "RESOURCE_EXHAUSTED"}, "account_limited", True,
+     "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted"),
+    (500, {"code": "api_error"}, "provider_unavailable", True,
+     "gemini_probe_generate_content_http_5xx_provider_unavailable"),
+    (503, {"code": "service_unavailable"}, "provider_unavailable", True,
+     "gemini_probe_generate_content_http_5xx_provider_unavailable"),
+    (503, {"status": "UNAVAILABLE"}, "provider_unavailable", True,
+     "gemini_probe_generate_content_http_5xx_provider_unavailable"),
+    (418, {"code": "vendor-private-project-marker"}, "runner_failed", False,
+     "gemini_probe_generate_content_http_4xx_client_rejected_unknown"),
+])
+def test_gemini_rest_probe_classifies_only_allowlisted_redacted_error_semantics(
+    status: int,
+    provider_fields: dict[str, object],
+    expected_kind: str,
+    retryable: bool,
+    expected_code: str,
+) -> None:
+    model_response = _gemini_models_response()
+    content_url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-3.1-flash-lite:generateContent"
+    )
+    body_marker = f"private-provider-message-{status}"
+    header_marker = f"private-provider-header-{status}"
+    project_marker = f"private-project-{status}"
+    error_body = json.dumps({
+        "error": {
+            **provider_fields,
+            "message": body_marker,
+            "project": project_marker,
+        },
+    }).encode()
+    content_response = FakeProviderResponse(
+        content_url,
+        error_body,
+        status=status,
+        headers={"X-Private-Diagnostic": header_marker},
+    )
+    failure = HTTPError(content_url, status, "private-http-reason", None, content_response)
+    responses: list[object] = [model_response, failure]
+
+    def opener(*_args: object, **_kwargs: object) -> FakeProviderResponse:
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
         return response
 
     result = probe_gemini_rest("private-gemini-key", opener=opener)
 
-    assert result == ProbeResult(Provider.GEMINI_API, True, GEMINI_DEFAULT_LIGHT_MODEL, True, None)
-    assert observed["url"] == GEMINI_PROBE_URL
-    assert observed["method"] == "POST"
-    assert observed["key"] == "private-gemini-key"
-    assert observed["authorization"] is None
-    assert isinstance(observed["body"], bytes)
-    assert len(observed["body"]) <= MAX_GEMINI_PROBE_REQUEST_BYTES
-    assert json.loads(observed["body"]) == {
-        "model": GEMINI_DEFAULT_LIGHT_MODEL,
-        "input": "Reply with exactly OK.",
-        "generation_config": {"max_output_tokens": 1},
-        "store": False,
-    }
-    assert b"private-gemini-key" not in observed["body"]
-    assert observed["timeout"] == 5
-    assert response.read_sizes == [MAX_GEMINI_PROBE_RESPONSE_BYTES + 1]
-    assert response.closed is True
-    assert "private-gemini-key" not in repr(result)
-
-
-def test_gemini_rest_probe_classifies_structured_and_detailless_429() -> None:
-    structured = {
-        "error": {
-            "code": 429,
-            "status": "RESOURCE_EXHAUSTED",
-            "details": [
-                {
-                    "@type": "type.googleapis.com/google.rpc.QuotaFailure",
-                    "violations": [{"quotaDimensions": {"model": GEMINI_DEFAULT_LIGHT_MODEL}}],
-                },
-                {
-                    "@type": "type.googleapis.com/google.rpc.RetryInfo",
-                    "retryDelay": "7s",
-                },
-            ],
-        },
-    }
-    response = FakeProviderResponse(GEMINI_PROBE_URL, json.dumps(structured).encode(), status=429)
-    result = probe_gemini_rest("private-gemini-key", opener=lambda *_args, **_kwargs: response)
     assert result.ok is False
     assert result.model == GEMINI_DEFAULT_LIGHT_MODEL
     assert result.error is not None
-    assert result.error.quota_observation == ProviderErrorQuotaObservation("model", 7)
+    assert result.error.kind == expected_kind
+    assert result.error.retryable is retryable
+    assert result.error.status_code is None
+    assert result.error.diagnostic_code == expected_code
+    assert getattr(result, "endpoint_role", None) == "generate_content"
+    assert getattr(result, "http_class", None) == ("5xx" if status >= 500 else "4xx")
+    rendered = repr(result)
+    for marker in (
+        body_marker,
+        header_marker,
+        project_marker,
+        "vendor-private-project-marker",
+        "private-http-reason",
+        "private-gemini-key",
+        content_url,
+    ):
+        assert marker not in rendered
+    assert model_response.closed is True
+    assert content_response.closed is True
 
-    detail_less = FakeProviderResponse(
-        GEMINI_PROBE_URL,
-        json.dumps({"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}}).encode(),
+
+def test_gemini_rest_probe_preserves_redacted_quota_scope_and_retry() -> None:
+    model_response = _gemini_models_response()
+    content_url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-3.1-flash-lite:generateContent"
+    )
+    content_response = FakeProviderResponse(
+        content_url,
+        json.dumps({
+            "error": {
+                "code": "quota_exceeded",
+                "message": "private quota body",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                        "violations": [{"quotaDimensions": {"model": "private-model-value"}}],
+                    },
+                    {
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": "7s",
+                    },
+                ],
+            },
+        }).encode(),
         status=429,
     )
-    result = probe_gemini_rest("private-gemini-key", opener=lambda *_args, **_kwargs: detail_less)
-    assert result.ok is False
-    assert result.model == GEMINI_DEFAULT_LIGHT_MODEL
+    failure = HTTPError(content_url, 429, "private", None, content_response)
+    responses: list[object] = [model_response, failure]
+
+    def opener(*_args: object, **_kwargs: object) -> FakeProviderResponse:
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    result = probe_gemini_rest("private-gemini-key", opener=opener)
+
     assert result.error is not None
-    assert result.error.quota_observation == ProviderErrorQuotaObservation("unknown", None)
+    assert result.error.kind == "account_limited"
+    assert result.error.quota_observation == ProviderErrorQuotaObservation("model", 7)
+    assert "private quota body" not in repr(result)
+    assert "private-model-value" not in repr(result)
 
 
-@pytest.mark.parametrize(("body", "status", "url", "expected_kind", "expected_code", "redacted_value"), [
-    (
-        json.dumps({"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": "redacted-400-body"}}).encode(),
-        400,
-        GEMINI_PROBE_URL,
-        "runner_failed",
-        "gemini_probe_rest_interactions_http_4xx",
-        "redacted-400-body",
-    ),
-    (
-        json.dumps({"error": {"code": 401, "status": "UNAUTHENTICATED", "message": "redacted-401-body"}}).encode(),
-        401,
-        GEMINI_PROBE_URL,
-        "auth_invalid",
-        "gemini_probe_rest_interactions_http_4xx",
-        "redacted-401-body",
-    ),
-    (
-        json.dumps({"error": {"code": 403, "status": "PERMISSION_DENIED", "message": "redacted-403-body"}}).encode(),
-        403,
-        GEMINI_PROBE_URL,
-        "auth_invalid",
-        "gemini_probe_rest_interactions_http_4xx",
-        "redacted-403-body",
-    ),
-    (
-        json.dumps({"error": {"code": 404, "status": "NOT_FOUND", "message": "redacted-404-body"}}).encode(),
-        404,
-        GEMINI_PROBE_URL,
-        "runner_failed",
-        "gemini_probe_rest_interactions_http_4xx",
-        "redacted-404-body",
-    ),
-    (
-        json.dumps({"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "redacted-429-body"}}).encode(),
-        429,
-        GEMINI_PROBE_URL,
-        "account_limited",
-        "gemini_probe_rest_interactions_http_4xx",
-        "redacted-429-body",
-    ),
-    (
-        json.dumps({"error": {"code": 503, "status": "UNAVAILABLE", "message": "redacted-5xx-body"}}).encode(),
-        503,
-        GEMINI_PROBE_URL,
-        "provider_unavailable",
-        "gemini_probe_rest_interactions_http_5xx",
-        "redacted-5xx-body",
-    ),
-    (b"{", 200, GEMINI_PROBE_URL, "provider_unavailable", "gemini_probe_rest_provider_json_invalid", None),
-    (
-        b"{}" + b"x" * MAX_GEMINI_PROBE_RESPONSE_BYTES,
-        200,
-        GEMINI_PROBE_URL,
-        "provider_unavailable",
-        "gemini_probe_rest_provider_json_invalid",
-        None,
-    ),
-    (
-        json.dumps({"status": "in_progress", "steps": []}).encode(),
-        200,
-        GEMINI_PROBE_URL,
-        "provider_unavailable",
-        "gemini_probe_rest_interaction_not_completed",
-        None,
-    ),
-    (
-        json.dumps({"status": "completed", "steps": "invalid"}).encode(),
-        200,
-        GEMINI_PROBE_URL,
-        "provider_unavailable",
-        "gemini_probe_rest_steps_invalid",
-        None,
-    ),
-    (
-        json.dumps({"status": "completed", "steps": [{"type": "text"}]}).encode(),
-        200,
-        GEMINI_PROBE_URL,
-        "provider_unavailable",
-        "gemini_probe_rest_model_output_missing",
-        None,
-    ),
+@pytest.mark.parametrize("body", [
+    b"{",
+    b"[]",
+    b"{}",
+    b"{}" + b"x" * MAX_GEMINI_PROBE_RESPONSE_BYTES,
 ])
-def test_gemini_rest_probe_returns_redacted_diagnostic_for_each_response_branch(
-    body: bytes,
-    status: int,
-    url: str,
-    expected_kind: str,
-    expected_code: str,
-    redacted_value: str | None,
-) -> None:
-    response = FakeProviderResponse(url, body, status=status)
+def test_gemini_rest_probe_rejects_invalid_generate_content_json_without_leak(body: bytes) -> None:
+    model_response = _gemini_models_response()
+    content_url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-3.1-flash-lite:generateContent"
+    )
+    content_response = FakeProviderResponse(content_url, body)
+    responses = iter([model_response, content_response])
+
     result = probe_gemini_rest(
         "private-gemini-key",
-        opener=lambda *_args, **_kwargs: response,
-    )
-
-    assert result.ok is False
-    assert result.model == GEMINI_DEFAULT_LIGHT_MODEL
-    assert result.error is not None
-    assert result.error.kind == expected_kind
-    assert result.error.diagnostic_code == expected_code
-    assert "private-gemini-key" not in repr(result)
-    assert url not in repr(result)
-    if redacted_value is not None:
-        assert redacted_value not in repr(result)
-    assert response.closed is True
-
-
-@pytest.mark.parametrize(("status", "expected_kind", "expected_code"), [
-    (403, "auth_invalid", "gemini_probe_rest_interactions_http_4xx"),
-    (503, "provider_unavailable", "gemini_probe_rest_interactions_http_5xx"),
-])
-def test_gemini_rest_probe_classifies_httperror_by_redacted_endpoint_role(
-    status: int,
-    expected_kind: str,
-    expected_code: str,
-) -> None:
-    body_marker = f"redacted-httperror-{status}-body"
-    response = FakeProviderResponse(
-        GEMINI_PROBE_URL,
-        json.dumps({"error": {"code": status, "message": body_marker}}).encode(),
-        status=status,
-    )
-    failure = HTTPError(GEMINI_PROBE_URL, status, "redacted", None, response)
-    result = probe_gemini_rest(
-        "private-gemini-key",
-        opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+        opener=lambda *_args, **_kwargs: next(responses),
     )
 
     assert result.ok is False
     assert result.error is not None
-    assert result.error.kind == expected_kind
-    assert result.error.diagnostic_code == expected_code
-    assert body_marker not in repr(result)
-    assert GEMINI_PROBE_URL not in repr(result)
-    assert "private-gemini-key" not in repr(result)
-    assert response.closed is True
+    assert result.error.kind == "provider_unavailable"
+    assert result.error.diagnostic_code == "gemini_probe_generate_content_http_2xx_json_invalid"
+    assert getattr(result, "endpoint_role", None) == "generate_content"
+    assert getattr(result, "http_class", None) == "2xx"
+    assert body.decode("utf-8", errors="ignore") not in repr(result)
+    assert content_url not in repr(result)
 
 
 @pytest.mark.parametrize("value", [
-    "gemini_probe_rest_interactions_http_4xx",
-    "gemini_probe_rest_interactions_http_5xx",
+    "gemini_probe_generate_content_capability_model_missing",
+    "gemini_probe_generate_content_capability_method_missing",
+    "gemini_probe_generate_content_http_4xx_contract_rejected",
+    "gemini_probe_generate_content_http_4xx_authentication",
+    "gemini_probe_generate_content_http_4xx_auth_or_billing_denied",
+    "gemini_probe_generate_content_http_4xx_model_not_found",
+    "gemini_probe_generate_content_http_4xx_route_not_found",
+    "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted",
+    "gemini_probe_generate_content_http_4xx_client_rejected_unknown",
+    "gemini_probe_generate_content_http_5xx_provider_unavailable",
+    "gemini_probe_generate_content_http_2xx_json_invalid",
+    "gemini_probe_generate_content_redirect_rejected",
+    "gemini_probe_generate_content_transport",
 ])
-def test_gemini_probe_normalizer_accepts_redacted_http_endpoint_diagnostics(value: str) -> None:
+def test_gemini_probe_normalizer_accepts_only_generate_content_probe_diagnostics(value: str) -> None:
     assert normalize_gemini_probe_diagnostic_code(value) == value
 
 
-def test_gemini_rest_probe_maps_transport_to_redacted_diagnostic() -> None:
-    result = probe_gemini_rest(
-        "private-gemini-key",
-        opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(URLError("offline")),
-    )
+@pytest.mark.parametrize("retired", [
+    "gemini_probe_rest_http_unclassified",
+    "gemini_probe_rest_interactions_http_4xx",
+    "gemini_probe_rest_interactions_http_5xx",
+    "gemini_probe_rest_interaction_not_completed",
+    "gemini_probe_rest_steps_invalid",
+    "gemini_probe_rest_model_output_missing",
+])
+def test_gemini_probe_normalizer_rejects_retired_interactions_diagnostics(retired: str) -> None:
+    assert normalize_gemini_probe_diagnostic_code(retired) is None
+
+
+def test_gemini_rest_probe_maps_generate_content_transport_without_leak() -> None:
+    model_response = _gemini_models_response()
+    responses: list[object] = [model_response, URLError("private-offline-marker")]
+
+    def opener(*_args: object, **_kwargs: object) -> FakeProviderResponse:
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    result = probe_gemini_rest("private-gemini-key", opener=opener)
 
     assert result.ok is False
     assert result.model == GEMINI_DEFAULT_LIGHT_MODEL
     assert result.error is not None
     assert result.error.kind == "provider_unavailable"
-    assert result.error.diagnostic_code == "gemini_probe_rest_transport"
-    assert "offline" not in repr(result)
-
-
-def test_gemini_rest_probe_rotates_only_to_canonical_25_model() -> None:
-    model = "gemini-2.5-flash-lite"
-    response = FakeProviderResponse(
-        GEMINI_PROBE_URL,
-        json.dumps({"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}}).encode(),
-        status=429,
-    )
-    observed: dict[str, object] = {}
-
-    def opener(request: object, *, timeout: int) -> FakeProviderResponse:
-        observed["url"] = request.full_url  # type: ignore[attr-defined]
-        observed["body"] = request.data  # type: ignore[attr-defined]
-        return response
-
-    result = probe_gemini_rest("private-gemini-key", model=model, opener=opener)
-
-    assert observed["url"] == response.geturl()
-    assert json.loads(observed["body"]) == {
-        "model": model,
-        "input": "Reply with exactly OK.",
-        "generation_config": {"max_output_tokens": 1},
-        "store": False,
-    }
-    assert result.model == model
-    assert result.error is not None
-    assert result.error.kind == "account_limited"
+    assert result.error.diagnostic_code == "gemini_probe_generate_content_transport"
+    assert getattr(result, "endpoint_role", None) == "generate_content"
+    assert getattr(result, "http_class", None) == "transport"
+    assert "private-offline-marker" not in repr(result)
 
 
 @pytest.mark.parametrize("model", [
@@ -1407,6 +1477,206 @@ def test_gemini_models_catalog_is_paged_bounded_and_projects_safe_fields() -> No
     assert second_response.read_sizes == [MAX_GEMINI_MODELS_RESPONSE_BYTES + 1]
 
 
+@pytest.mark.parametrize(("status", "provider_fields", "expected_error"), [
+    (400, {"code": "invalid_request"}, "runner_failed"),
+    (403, {"code": "permission_denied"}, "auth_or_billing_denied"),
+    (404, {"code": "model_not_found"}, "model_unavailable"),
+    (429, {"code": "quota_exceeded"}, "account_limited"),
+    (503, {"code": "service_unavailable"}, "provider_unavailable"),
+])
+def test_gemini_models_uses_shared_redacted_http_error_normalization(
+    status: int,
+    provider_fields: dict[str, object],
+    expected_error: str,
+) -> None:
+    url = f"{GEMINI_MODELS_URL}?pageSize={MAX_GEMINI_MODELS_PAGE_SIZE}"
+    body_marker = f"private-models-body-{status}"
+    response = FakeProviderResponse(
+        url,
+        json.dumps({"error": {**provider_fields, "message": body_marker}}).encode(),
+        status=status,
+    )
+    failure = HTTPError(url, status, "private-models-reason", None, response)
+
+    result = probe_gemini_models(
+        "private-gemini-key",
+        opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    assert result.available is False
+    assert result.models == ()
+    assert result.error == expected_error
+    assert body_marker not in repr(result)
+    assert "private-models-reason" not in repr(result)
+    assert "private-gemini-key" not in repr(result)
+    assert response.closed is True
+
+
+def test_gemini_rest_probe_preserves_models_list_normalized_error() -> None:
+    url = f"{GEMINI_MODELS_URL}?pageSize={MAX_GEMINI_MODELS_PAGE_SIZE}"
+    response = FakeProviderResponse(
+        url,
+        json.dumps({
+            "error": {
+                "code": "permission_denied",
+                "message": "private-models-permission-body",
+            },
+        }).encode(),
+        status=403,
+    )
+    failure = HTTPError(url, 403, "private-models-permission-reason", None, response)
+
+    result = probe_gemini_rest(
+        "private-gemini-key",
+        opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    assert result.ok is False
+    assert result.error is not None
+    assert result.error.kind == "auth_or_billing_denied"
+    assert result.error.retryable is False
+    assert result.error.status_code is None
+    assert result.error.diagnostic_code == "gemini_probe_generate_content_http_4xx_auth_or_billing_denied"
+    assert result.endpoint_role == "generate_content"
+    assert result.http_class == "4xx"
+    assert "private-models-permission" not in repr(result)
+    assert "private-gemini-key" not in repr(result)
+
+
+def test_gemini_rest_probe_preserves_direct_models_http_diagnostic() -> None:
+    url = f"{GEMINI_MODELS_URL}?pageSize={MAX_GEMINI_MODELS_PAGE_SIZE}"
+    response = FakeProviderResponse(
+        url,
+        json.dumps({
+            "error": {
+                "code": "invalid_request",
+                "message": "private-direct-models-body",
+            },
+        }).encode(),
+        status=400,
+    )
+
+    result = probe_gemini_rest("private-gemini-key", opener=lambda *_args, **_kwargs: response)
+
+    assert result.ok is False
+    assert result.error is not None
+    assert result.error.kind == "runner_failed"
+    assert result.error.retryable is False
+    assert result.error.diagnostic_code == "gemini_probe_generate_content_http_4xx_contract_rejected"
+    assert result.http_class == "4xx"
+    assert "private-direct-models-body" not in repr(result)
+    assert "private-gemini-key" not in repr(result)
+
+
+def test_gemini_rest_probe_preserves_models_list_model_quota_observation() -> None:
+    url = f"{GEMINI_MODELS_URL}?pageSize={MAX_GEMINI_MODELS_PAGE_SIZE}"
+    response = FakeProviderResponse(
+        url,
+        json.dumps({
+            "error": {
+                "code": "quota_exceeded",
+                "message": "private-models-quota-body",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                        "violations": [{"quotaDimensions": {"model": "private-model-value"}}],
+                    },
+                    {
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": "11s",
+                    },
+                ],
+            },
+        }).encode(),
+        status=429,
+    )
+
+    result = probe_gemini_rest("private-gemini-key", opener=lambda *_args, **_kwargs: response)
+
+    assert result.ok is False
+    assert result.model == GEMINI_DEFAULT_LIGHT_MODEL
+    assert result.error is not None
+    assert result.error.kind == "account_limited"
+    assert result.error.retryable is True
+    assert result.error.quota_observation == ProviderErrorQuotaObservation("model", 11)
+    assert result.error.diagnostic_code == "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted"
+    assert result.http_class == "4xx"
+    assert "private-models-quota-body" not in repr(result)
+    assert "private-model-value" not in repr(result)
+
+
+def test_gemini_rest_probe_rejects_direct_models_redirect_before_body_parse() -> None:
+    url = f"{GEMINI_MODELS_URL}?pageSize={MAX_GEMINI_MODELS_PAGE_SIZE}"
+    response = FakeProviderResponse(url, b"private-redirect-body", status=302)
+
+    result = probe_gemini_rest("private-gemini-key", opener=lambda *_args, **_kwargs: response)
+
+    assert result.ok is False
+    assert result.error is not None
+    assert result.error.kind == "provider_unavailable"
+    assert result.error.retryable is True
+    assert result.error.diagnostic_code == "gemini_probe_generate_content_redirect_rejected"
+    assert result.http_class == "transport"
+    assert response.read_sizes == []
+    assert response.closed is True
+    assert "private-redirect-body" not in repr(result)
+
+
+def test_gemini_rest_probe_uses_valid_custom_model_after_capability_check() -> None:
+    model = "gemini-9.9-future-preview"
+    model_response = _gemini_models_response(model=model)
+    content_url = f"{GEMINI_MODELS_URL}/{model}:generateContent"
+    content_response = FakeProviderResponse(
+        content_url,
+        json.dumps({"candidates": [{"finishReason": "MAX_TOKENS"}]}).encode(),
+    )
+    responses = iter([model_response, content_response])
+    observed_urls: list[str] = []
+
+    def opener(request: object, **_kwargs: object) -> FakeProviderResponse:
+        observed_urls.append(request.full_url)  # type: ignore[attr-defined]
+        return next(responses)
+
+    result = probe_gemini_rest("private-gemini-key", model=model, opener=opener)
+
+    assert result.ok is True
+    assert result.model == model
+    assert observed_urls == [model_response.geturl(), content_url]
+
+
+@pytest.mark.parametrize(("error_code", "expected_kind", "retryable"), [
+    ("auth_invalid", "auth_invalid", False),
+    ("account_limited", "account_limited", True),
+    ("model_unavailable", "model_unavailable", False),
+    ("provider_unavailable", "provider_unavailable", True),
+    ("runner_failed", "runner_failed", False),
+    ("private_unclassified_error", "runner_failed", False),
+])
+def test_gemini_rest_probe_preserves_fleet_runner_error_semantics(
+    error_code: str,
+    expected_kind: str,
+    retryable: bool,
+) -> None:
+    model_response = _gemini_models_response()
+    responses: list[object] = [model_response, FleetRunnerError(error_code)]
+
+    def opener(*_args: object, **_kwargs: object) -> FakeProviderResponse:
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    result = probe_gemini_rest("private-gemini-key", opener=opener)
+
+    assert result.ok is False
+    assert result.error is not None
+    assert result.error.kind == expected_kind
+    assert result.error.retryable is retryable
+    assert result.error.status_code is None
+    assert "private_unclassified_error" not in repr(result)
+    assert "private-gemini-key" not in repr(result)
+
+
 def test_gemini_model_validator_accepts_future_ids_and_rejects_path_injection() -> None:
     assert validate_gemini_probe_model("gemini-9.9-future-preview") == "gemini-9.9-future-preview"
     for value in (
@@ -1425,12 +1695,23 @@ def test_gemini_model_validator_accepts_future_ids_and_rejects_path_injection() 
 
 
 def test_gemini_rest_probe_rejects_redirects() -> None:
-    redirected = FakeProviderResponse("https://example.invalid/redirect", b"{}", status=429)
-    result = probe_gemini_rest("private-gemini-key", opener=lambda *_args, **_kwargs: redirected)
+    model_response = _gemini_models_response()
+    redirected = FakeProviderResponse("https://example.invalid/private-redirect", b"{}")
+    responses = iter([model_response, redirected])
+
+    result = probe_gemini_rest(
+        "private-gemini-key",
+        opener=lambda *_args, **_kwargs: next(responses),
+    )
+
     assert result.ok is False
     assert result.error is not None
     assert result.error.kind == "provider_unavailable"
-    assert result.error.diagnostic_code == "gemini_probe_rest_redirect_rejected"
+    assert result.error.diagnostic_code == "gemini_probe_generate_content_redirect_rejected"
+    assert getattr(result, "endpoint_role", None) == "generate_content"
+    assert getattr(result, "http_class", None) == "transport"
+    assert "private-redirect" not in repr(result)
+    assert model_response.closed is True
     assert redirected.closed is True
 
 

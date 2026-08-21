@@ -12,7 +12,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Final, Literal
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 from unicodedata import category
 
@@ -35,7 +35,6 @@ MAX_PROVIDER_MODELS = 1000
 PROVIDER_HTTP_TIMEOUT_SECONDS = 5
 GEMINI_PROBE_TIMEOUT_SECONDS = 90
 GEMINI_DEFAULT_LIGHT_MODEL = "gemini-3.1-flash-lite"
-GEMINI_PROBE_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 MAX_GEMINI_MODEL_ID_BYTES = 128
 MAX_GEMINI_MODELS_PAGES = 4
@@ -74,16 +73,22 @@ ProbeDiagnosticCode = Literal[
     "gemini_probe_process_timeout",
     "gemini_probe_runner_failure",
     "gemini_probe_jsonl_terminal_invalid",
-    "gemini_probe_rest_http_unclassified",
-    "gemini_probe_rest_interactions_http_4xx",
-    "gemini_probe_rest_interactions_http_5xx",
-    "gemini_probe_rest_provider_json_invalid",
-    "gemini_probe_rest_interaction_not_completed",
-    "gemini_probe_rest_steps_invalid",
-    "gemini_probe_rest_model_output_missing",
-    "gemini_probe_rest_redirect_rejected",
-    "gemini_probe_rest_transport",
+    "gemini_probe_generate_content_capability_model_missing",
+    "gemini_probe_generate_content_capability_method_missing",
+    "gemini_probe_generate_content_http_4xx_contract_rejected",
+    "gemini_probe_generate_content_http_4xx_authentication",
+    "gemini_probe_generate_content_http_4xx_auth_or_billing_denied",
+    "gemini_probe_generate_content_http_4xx_model_not_found",
+    "gemini_probe_generate_content_http_4xx_route_not_found",
+    "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted",
+    "gemini_probe_generate_content_http_4xx_client_rejected_unknown",
+    "gemini_probe_generate_content_http_5xx_provider_unavailable",
+    "gemini_probe_generate_content_http_2xx_json_invalid",
+    "gemini_probe_generate_content_redirect_rejected",
+    "gemini_probe_generate_content_transport",
 ]
+ProbeEndpointRole = Literal["generate_content"]
+ProbeHttpClass = Literal["2xx", "4xx", "5xx", "transport"]
 ProbeProcessPhase = Literal[
     "gemini_probe_runner_not_started_or_failed",
     "gemini_probe_timeout_no_output",
@@ -121,15 +126,19 @@ GEMINI_PROBE_DIAGNOSTIC_CODES: Final[frozenset[ProbeDiagnosticCode]] = frozenset
     "gemini_probe_process_timeout",
     "gemini_probe_runner_failure",
     "gemini_probe_jsonl_terminal_invalid",
-    "gemini_probe_rest_http_unclassified",
-    "gemini_probe_rest_interactions_http_4xx",
-    "gemini_probe_rest_interactions_http_5xx",
-    "gemini_probe_rest_provider_json_invalid",
-    "gemini_probe_rest_interaction_not_completed",
-    "gemini_probe_rest_steps_invalid",
-    "gemini_probe_rest_model_output_missing",
-    "gemini_probe_rest_redirect_rejected",
-    "gemini_probe_rest_transport",
+    "gemini_probe_generate_content_capability_model_missing",
+    "gemini_probe_generate_content_capability_method_missing",
+    "gemini_probe_generate_content_http_4xx_contract_rejected",
+    "gemini_probe_generate_content_http_4xx_authentication",
+    "gemini_probe_generate_content_http_4xx_auth_or_billing_denied",
+    "gemini_probe_generate_content_http_4xx_model_not_found",
+    "gemini_probe_generate_content_http_4xx_route_not_found",
+    "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted",
+    "gemini_probe_generate_content_http_4xx_client_rejected_unknown",
+    "gemini_probe_generate_content_http_5xx_provider_unavailable",
+    "gemini_probe_generate_content_http_2xx_json_invalid",
+    "gemini_probe_generate_content_redirect_rejected",
+    "gemini_probe_generate_content_transport",
 })
 GEMINI_PROBE_PROCESS_PHASES: Final[frozenset[ProbeProcessPhase]] = frozenset({
     "gemini_probe_runner_not_started_or_failed",
@@ -213,9 +222,15 @@ class ProviderModelsResult:
     available: bool
     models: tuple[Mapping[str, object], ...]
     error: str | None
+    provider_error: ProviderError | None = None
+    http_class: ProbeHttpClass | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "models", tuple(dict(model) for model in self.models))
+        if not isinstance(self.provider_error, ProviderError):
+            object.__setattr__(self, "provider_error", None)
+        if self.http_class not in {"2xx", "4xx", "5xx", "transport"}:
+            object.__setattr__(self, "http_class", None)
 
 
 class _RedirectRejected(FleetRunnerError):
@@ -236,8 +251,8 @@ class ProviderErrorQuotaObservation:
 @dataclass(frozen=True, slots=True)
 class ProviderError:
     kind: Literal[
-        "account_limited", "auth_invalid", "secret_missing", "provider_unavailable", "model_unavailable",
-        "runner_failed",
+        "account_limited", "auth_invalid", "auth_or_billing_denied", "secret_missing",
+        "provider_unavailable", "model_unavailable", "runner_failed",
     ]
     retryable: bool
     status_code: int | None
@@ -247,6 +262,13 @@ class ProviderError:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "diagnostic_code", normalize_gemini_probe_diagnostic_code(self.diagnostic_code))
+
+
+class _GeminiHttpFailure(FleetRunnerError):
+    def __init__(self, error: ProviderError, http_class: ProbeHttpClass) -> None:
+        self.error = error
+        self.http_class = http_class
+        super().__init__(error.kind)
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,6 +283,8 @@ class ProbeResult:
     process_stdout_shape: ProbeStdoutShape | None = None
     process_stdout_event_class: ProbeStdoutEventClass | None = None
     process_stdout_error_seen: bool | None = None
+    endpoint_role: ProbeEndpointRole | None = None
+    http_class: ProbeHttpClass | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "process_phase", normalize_gemini_probe_process_phase(self.process_phase))
@@ -271,6 +295,10 @@ class ProbeResult:
         ))
         if not isinstance(self.process_stdout_error_seen, bool):
             object.__setattr__(self, "process_stdout_error_seen", None)
+        if self.endpoint_role != "generate_content":
+            object.__setattr__(self, "endpoint_role", None)
+        if self.http_class not in {"2xx", "4xx", "5xx", "transport"}:
+            object.__setattr__(self, "http_class", None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -900,23 +928,34 @@ def _gemini_models_http_json(
             status = getcode() if callable(getcode) else None
         if not isinstance(status, int):
             raise FleetRunnerError("provider_unavailable")
+        if 300 <= status < 400:
+            raise _RedirectRejected("redirect_rejected")
         if not 200 <= status < 300:
-            if status in {401, 403}:
-                raise FleetRunnerError("auth_invalid")
-            if status == 429:
-                raise FleetRunnerError("account_limited")
-            raise FleetRunnerError("provider_unavailable")
+            try:
+                raw = _provider_json_body(response, url, max_bytes=MAX_GEMINI_MODELS_RESPONSE_BYTES)
+            except _RedirectRejected:
+                raise
+            except FleetRunnerError:
+                raw = None
+            http_class: ProbeHttpClass = "5xx" if 500 <= status < 600 else "4xx"
+            raise _GeminiHttpFailure(_gemini_http_error(status, raw), http_class)
         return _provider_json_body(response, url, max_bytes=MAX_GEMINI_MODELS_RESPONSE_BYTES)
     except _RedirectRejected:
         raise
     except FleetRunnerError:
         raise
     except HTTPError as exc:
-        if exc.code in {401, 403}:
-            raise FleetRunnerError("auth_invalid") from None
-        if exc.code == 429:
-            raise FleetRunnerError("account_limited") from None
-        raise FleetRunnerError("provider_unavailable") from None
+        response = exc
+        if 300 <= exc.code < 400:
+            raise _RedirectRejected("redirect_rejected") from None
+        try:
+            raw = _provider_json_body(exc, url, max_bytes=MAX_GEMINI_MODELS_RESPONSE_BYTES)
+        except _RedirectRejected:
+            raise
+        except FleetRunnerError:
+            raw = None
+        http_class = "5xx" if 500 <= exc.code < 600 else "4xx"
+        raise _GeminiHttpFailure(_gemini_http_error(exc.code, raw), http_class) from None
     except (OSError, URLError, TimeoutError, ValueError, TypeError):
         raise FleetRunnerError("provider_unavailable") from None
     finally:
@@ -1017,68 +1056,78 @@ def probe_gemini_models(
         else:
             raise FleetRunnerError("provider_model_limit_exceeded")
         projected = _gemini_model_result(raw_models_all)
+    except _GeminiHttpFailure as exc:
+        return ProviderModelsResult(
+            Provider.GEMINI_API, False, (), exc.code, exc.error, exc.http_class,
+        )
+    except _RedirectRejected as exc:
+        return ProviderModelsResult(
+            Provider.GEMINI_API, False, (), exc.code, None, "transport",
+        )
     except FleetRunnerError as exc:
         return ProviderModelsResult(Provider.GEMINI_API, False, (), exc.code)
     return ProviderModelsResult(Provider.GEMINI_API, True, tuple(projected.values()), None)
 
 
-def _gemini_probe_error_payload(status: int, raw: object) -> object:
-    """Keep HTTP classification structured without exposing provider details."""
+def _gemini_http_error(status: int, raw: object) -> ProviderError:
+    payload = _mapping(raw)
+    details = _mapping(payload.get("error")) if payload is not None else None
+    code = details.get("code") if details is not None else None
+    status_name = details.get("status") if details is not None else None
+    code = code if isinstance(code, str) else ""
+    status_name = status_name if isinstance(status_name, str) else ""
 
-    if not isinstance(raw, Mapping):
-        return {"code": status}
-    payload = dict(raw)
-    nested = payload.get("error")
-    if isinstance(nested, Mapping):
-        error = dict(nested)
-        error.setdefault("code", status)
-        payload["error"] = error
-    else:
-        payload.setdefault("code", status)
-    return payload
-
-
-def _gemini_probe_response_diagnostic(raw: object) -> ProbeDiagnosticCode | None:
-    if not isinstance(raw, Mapping):
-        return "gemini_probe_rest_provider_json_invalid"
-    if raw.get("status") != "completed":
-        return "gemini_probe_rest_interaction_not_completed"
-    steps = raw.get("steps")
-    if not isinstance(steps, list) or not 1 <= len(steps) <= 8:
-        return "gemini_probe_rest_steps_invalid"
-    if any(not isinstance(step, Mapping) for step in steps):
-        return "gemini_probe_rest_steps_invalid"
-    model_outputs = [step for step in steps if step.get("type") == "model_output"]
-    if not model_outputs:
-        return "gemini_probe_rest_model_output_missing"
-    if any(
-        not isinstance(step.get("content"), list)
-        or not 1 <= len(step["content"]) <= 8
-        or any(not isinstance(part, Mapping) for part in step["content"])
-        for step in model_outputs
-    ):
-        return "gemini_probe_rest_steps_invalid"
-    return None
-
-
-def _gemini_probe_error_with_diagnostic(
-    error: ProviderError,
-    diagnostic_code: ProbeDiagnosticCode,
-) -> ProviderError:
+    if 500 <= status < 600:
+        return ProviderError(
+            "provider_unavailable", True, None, None,
+            diagnostic_code="gemini_probe_generate_content_http_5xx_provider_unavailable",
+        )
+    if status == 429 or code in {"rate_limit_exceeded", "quota_exceeded"} or status_name in {
+        "RESOURCE_EXHAUSTED", "BUDGET_EXHAUSTED", "ADMINISTRATIVE_QUOTA_LOCKED",
+    }:
+        quota_observation = _quota_observation(details) if details is not None else None
+        return ProviderError(
+            "account_limited", True, None, None, quota_observation,
+            "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted",
+        )
+    if status == 401 or code == "authentication" or status_name == "UNAUTHENTICATED":
+        return ProviderError(
+            "auth_invalid", False, None, None,
+            diagnostic_code="gemini_probe_generate_content_http_4xx_authentication",
+        )
+    if status == 403 or code == "permission_denied" or status_name == "PERMISSION_DENIED":
+        return ProviderError(
+            "auth_or_billing_denied", False, None, None,
+            diagnostic_code="gemini_probe_generate_content_http_4xx_auth_or_billing_denied",
+        )
+    if code == "model_not_found" or status_name == "MODEL_NOT_FOUND":
+        return ProviderError(
+            "model_unavailable", False, None, None,
+            diagnostic_code="gemini_probe_generate_content_http_4xx_model_not_found",
+        )
+    if code == "not_found" or status_name == "NOT_FOUND":
+        return ProviderError(
+            "runner_failed", False, None, None,
+            diagnostic_code="gemini_probe_generate_content_http_4xx_route_not_found",
+        )
+    if code in {"invalid_request", "parameter_unknown"} or status_name == "INVALID_ARGUMENT":
+        return ProviderError(
+            "runner_failed", False, None, None,
+            diagnostic_code="gemini_probe_generate_content_http_4xx_contract_rejected",
+        )
     return ProviderError(
-        error.kind,
-        error.retryable,
-        error.status_code,
-        error.reset_at_utc,
-        error.quota_observation,
-        diagnostic_code,
+        "runner_failed", False, None, None,
+        diagnostic_code="gemini_probe_generate_content_http_4xx_client_rejected_unknown",
     )
 
 
-def _gemini_probe_json_diagnostic(error: FleetRunnerError) -> ProbeDiagnosticCode | None:
-    if error.code in {"provider_response_invalid", "provider_response_too_large"}:
-        return "gemini_probe_rest_provider_json_invalid"
-    return None
+def _gemini_generate_content_response_valid(raw: object) -> bool:
+    if not isinstance(raw, Mapping):
+        return False
+    candidates = raw.get("candidates")
+    if isinstance(candidates, list) and 1 <= len(candidates) <= 8:
+        return all(isinstance(candidate, Mapping) for candidate in candidates)
+    return isinstance(raw.get("promptFeedback"), Mapping)
 
 
 def probe_gemini_rest(
@@ -1087,7 +1136,7 @@ def probe_gemini_rest(
     model: str | None = None,
     opener: Callable[..., object] | None = None,
 ) -> ProbeResult:
-    """Run one bounded Gemini REST readiness probe using a header-only key."""
+    """Run one capability-checked, bounded Gemini GenerateContent readiness probe."""
 
     try:
         model = validate_gemini_probe_model(model)
@@ -1098,6 +1147,7 @@ def probe_gemini_rest(
             None,
             False,
             ProviderError("model_unavailable", False, None, None),
+            endpoint_role="generate_content",
         )
     if not isinstance(secret, str) or not 1 <= len(secret.encode("utf-8")) <= MAX_PROVIDER_RESPONSE_BYTES:
         return ProbeResult(
@@ -1106,14 +1156,95 @@ def probe_gemini_rest(
             model,
             False,
             ProviderError("auth_invalid", False, None, None),
+            endpoint_role="generate_content",
+        )
+
+    catalog = probe_gemini_models(secret, opener=opener)
+    if not catalog.available:
+        if catalog.provider_error is not None:
+            error = catalog.provider_error
+            http_class = catalog.http_class
+        elif catalog.error in {"auth_invalid", "secret_invalid", "secret_missing"}:
+            error = ProviderError(
+                "auth_invalid", False, None, None,
+                diagnostic_code="gemini_probe_generate_content_http_4xx_authentication",
+            )
+            http_class: ProbeHttpClass | None = "4xx"
+        elif catalog.error == "auth_or_billing_denied":
+            error = ProviderError(
+                "auth_or_billing_denied", False, None, None,
+                diagnostic_code="gemini_probe_generate_content_http_4xx_auth_or_billing_denied",
+            )
+            http_class = "4xx"
+        elif catalog.error == "account_limited":
+            error = ProviderError(
+                "account_limited", True, None, None,
+                diagnostic_code="gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted",
+            )
+            http_class = "4xx"
+        elif catalog.error == "model_unavailable":
+            error = ProviderError(
+                "model_unavailable", False, None, None,
+                diagnostic_code="gemini_probe_generate_content_http_4xx_model_not_found",
+            )
+            http_class = "4xx"
+        elif catalog.error == "runner_failed":
+            error = ProviderError("runner_failed", False, None, None)
+            http_class = None
+        elif catalog.error == "redirect_rejected":
+            error = ProviderError(
+                "provider_unavailable", True, None, None,
+                diagnostic_code="gemini_probe_generate_content_redirect_rejected",
+            )
+            http_class = "transport"
+        elif catalog.error in {
+            "provider_unavailable", "provider_response_invalid", "provider_response_too_large",
+            "provider_model_limit_exceeded",
+        }:
+            error = ProviderError(
+                "provider_unavailable", True, None, None,
+                diagnostic_code="gemini_probe_generate_content_transport",
+            )
+            http_class = "transport"
+        else:
+            error = ProviderError("runner_failed", False, None, None)
+            http_class = None
+        return ProbeResult(
+            Provider.GEMINI_API, False, model, False, error,
+            endpoint_role="generate_content", http_class=http_class,
+        )
+
+    metadata = next((item for item in catalog.models if item.get("id") == model), None)
+    if metadata is None:
+        return ProbeResult(
+            Provider.GEMINI_API,
+            False,
+            model,
+            False,
+            ProviderError(
+                "model_unavailable", False, None, None,
+                diagnostic_code="gemini_probe_generate_content_capability_model_missing",
+            ),
+            endpoint_role="generate_content",
+        )
+    methods = metadata.get("supported_generation_methods")
+    if not isinstance(methods, list) or "generateContent" not in methods:
+        return ProbeResult(
+            Provider.GEMINI_API,
+            False,
+            model,
+            False,
+            ProviderError(
+                "model_unavailable", False, None, None,
+                diagnostic_code="gemini_probe_generate_content_capability_method_missing",
+            ),
+            endpoint_role="generate_content",
         )
 
     body = json.dumps(
         {
-            "model": model,
-            "input": "Reply with exactly OK.",
-            "generation_config": {"max_output_tokens": 1},
-            "store": False,
+            "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+            "generationConfig": {"maxOutputTokens": 1},
         },
         separators=(",", ":"),
         sort_keys=True,
@@ -1125,10 +1256,12 @@ def probe_gemini_rest(
             model,
             False,
             ProviderError("runner_failed", False, None, None),
+            endpoint_role="generate_content",
         )
 
+    content_url = f"{GEMINI_MODELS_URL}/{quote(model, safe='')}:generateContent"
     request = Request(
-        GEMINI_PROBE_URL,
+        content_url,
         data=body,
         headers={
             "Accept": "application/json",
@@ -1149,50 +1282,52 @@ def probe_gemini_rest(
             status = getcode() if callable(getcode) else None
         if not isinstance(status, int):
             raise FleetRunnerError("provider_unavailable")
+        if 300 <= status < 400:
+            raise _RedirectRejected("redirect_rejected")
         if not 200 <= status < 300:
-            diagnostic_code = None
             try:
                 raw = _provider_json_body(
                     response,
-                    GEMINI_PROBE_URL,
+                    content_url,
                     max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES,
                 )
             except _RedirectRejected:
                 raise
-            except FleetRunnerError as exc:
-                raw = {}
-                diagnostic_code = _gemini_probe_json_diagnostic(exc)
-            error = classify_provider_error(
-                Provider.GEMINI_API,
-                _gemini_probe_error_payload(status, raw),
-                "",
+            except FleetRunnerError:
+                raw = None
+            error = _gemini_http_error(status, raw)
+            http_class = "5xx" if 500 <= status < 600 else "4xx"
+            return ProbeResult(
+                Provider.GEMINI_API, False, model, False, error,
+                endpoint_role="generate_content", http_class=http_class,
             )
-            if diagnostic_code is None:
-                if 400 <= status < 500:
-                    diagnostic_code = "gemini_probe_rest_interactions_http_4xx"
-                elif 500 <= status < 600:
-                    diagnostic_code = "gemini_probe_rest_interactions_http_5xx"
-                elif error.kind == "runner_failed":
-                    diagnostic_code = "gemini_probe_rest_http_unclassified"
-            if diagnostic_code is not None:
-                error = _gemini_probe_error_with_diagnostic(error, diagnostic_code)
-            return ProbeResult(Provider.GEMINI_API, False, model, False, error)
-        raw = _provider_json_body(response, GEMINI_PROBE_URL, max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES)
-        diagnostic_code = _gemini_probe_response_diagnostic(raw)
-        if diagnostic_code is not None:
+        try:
+            raw = _provider_json_body(response, content_url, max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES)
+        except _RedirectRejected:
+            raise
+        except FleetRunnerError:
+            raw = None
+        if not _gemini_generate_content_response_valid(raw):
             return ProbeResult(
                 Provider.GEMINI_API,
                 False,
                 model,
                 False,
-                ProviderError("provider_unavailable", True, None, None, diagnostic_code=diagnostic_code),
+                ProviderError(
+                    "provider_unavailable", True, None, None,
+                    diagnostic_code="gemini_probe_generate_content_http_2xx_json_invalid",
+                ),
+                endpoint_role="generate_content",
+                http_class="2xx",
             )
-        return ProbeResult(Provider.GEMINI_API, True, model, True, None)
+        return ProbeResult(
+            Provider.GEMINI_API, True, model, True, None,
+            endpoint_role="generate_content", http_class="2xx",
+        )
     except HTTPError as exc:
         response = exc
-        diagnostic_code = None
         try:
-            raw = _provider_json_body(exc, GEMINI_PROBE_URL, max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES)
+            raw = _provider_json_body(exc, content_url, max_bytes=MAX_GEMINI_PROBE_RESPONSE_BYTES)
         except _RedirectRejected:
             return ProbeResult(
                 Provider.GEMINI_API,
@@ -1204,27 +1339,19 @@ def probe_gemini_rest(
                     True,
                     None,
                     None,
-                    diagnostic_code="gemini_probe_rest_redirect_rejected",
+                    diagnostic_code="gemini_probe_generate_content_redirect_rejected",
                 ),
+                endpoint_role="generate_content",
+                http_class="transport",
             )
-        except FleetRunnerError as body_error:
-            raw = {}
-            diagnostic_code = _gemini_probe_json_diagnostic(body_error)
-        error = classify_provider_error(
-            Provider.GEMINI_API,
-            _gemini_probe_error_payload(exc.code, raw),
-            "",
+        except FleetRunnerError:
+            raw = None
+        error = _gemini_http_error(exc.code, raw)
+        http_class = "5xx" if 500 <= exc.code < 600 else "4xx"
+        return ProbeResult(
+            Provider.GEMINI_API, False, model, False, error,
+            endpoint_role="generate_content", http_class=http_class,
         )
-        if diagnostic_code is None:
-            if 400 <= exc.code < 500:
-                diagnostic_code = "gemini_probe_rest_interactions_http_4xx"
-            elif 500 <= exc.code < 600:
-                diagnostic_code = "gemini_probe_rest_interactions_http_5xx"
-            elif error.kind == "runner_failed":
-                diagnostic_code = "gemini_probe_rest_http_unclassified"
-        if diagnostic_code is not None:
-            error = _gemini_probe_error_with_diagnostic(error, diagnostic_code)
-        return ProbeResult(Provider.GEMINI_API, False, model, False, error)
     except _RedirectRejected:
         return ProbeResult(
             Provider.GEMINI_API,
@@ -1236,25 +1363,41 @@ def probe_gemini_rest(
                 True,
                 None,
                 None,
-                diagnostic_code="gemini_probe_rest_redirect_rejected",
+                diagnostic_code="gemini_probe_generate_content_redirect_rejected",
             ),
+            endpoint_role="generate_content",
+            http_class="transport",
         )
     except FleetRunnerError as exc:
-        diagnostic_code = _gemini_probe_json_diagnostic(exc)
-        if diagnostic_code is None and exc.code == "provider_unavailable":
-            diagnostic_code = "gemini_probe_rest_transport"
+        if exc.code == "account_limited":
+            error = ProviderError("account_limited", True, None, None)
+            http_class = None
+        elif exc.code in {"auth_invalid", "secret_invalid", "secret_missing"}:
+            error = ProviderError("auth_invalid", False, None, None)
+            http_class = None
+        elif exc.code == "auth_or_billing_denied":
+            error = ProviderError("auth_or_billing_denied", False, None, None)
+            http_class = None
+        elif exc.code in {"model_unavailable", "gemini_model_invalid"}:
+            error = ProviderError("model_unavailable", False, None, None)
+            http_class = None
+        elif exc.code == "provider_unavailable":
+            error = ProviderError(
+                "provider_unavailable", True, None, None,
+                diagnostic_code="gemini_probe_generate_content_transport",
+            )
+            http_class = "transport"
+        else:
+            error = ProviderError("runner_failed", False, None, None)
+            http_class = None
         return ProbeResult(
             Provider.GEMINI_API,
             False,
             model,
             False,
-            ProviderError(
-                "provider_unavailable",
-                True,
-                None,
-                None,
-                diagnostic_code=diagnostic_code,
-            ),
+            error,
+            endpoint_role="generate_content",
+            http_class=http_class,
         )
     except (OSError, URLError, TimeoutError, ValueError, TypeError):
         return ProbeResult(
@@ -1267,8 +1410,10 @@ def probe_gemini_rest(
                 True,
                 None,
                 None,
-                diagnostic_code="gemini_probe_rest_transport",
+                diagnostic_code="gemini_probe_generate_content_transport",
             ),
+            endpoint_role="generate_content",
+            http_class="transport",
         )
     finally:
         close = getattr(response, "close", None)

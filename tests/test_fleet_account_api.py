@@ -31,6 +31,7 @@ from codex_master.fleet_runners import (
     ProbeDiagnosticCode,
     ProbeResult,
     ProviderError,
+    ProviderErrorQuotaObservation,
     ProbeStdoutEventClass,
     ProviderModelsResult,
 )
@@ -791,8 +792,7 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
     (
         "runner_failed",
         False,
-        "gemini_probe_runner_failure",
-        "gemini_probe_runner_failure",
+        "gemini_probe_generate_content_http_4xx_contract_rejected",
         None,
         None,
         None,
@@ -801,10 +801,11 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
         None,
         None,
         None,
-        "gemini_probe_process_group_unreaped",
-        "gemini_probe_process_group_unreaped",
+        None,
+        None,
+        None,
         False,
-        "provider_unavailable",
+        "runner_failed",
         "failed",
         None,
     ),
@@ -829,10 +830,30 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
         None,
     ),
     (
+        "account_limited",
+        True,
+        "gemini_probe_generate_content_http_4xx_rate_or_quota_exhausted",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        "gemini_probe_normal_exit",
+        "gemini_probe_normal_exit",
+        True,
+        "ready",
+        "completed",
+        "gemini-9.9-future-preview",
+    ),
+    (
         "provider_unavailable",
         False,
-        "gemini_probe_rest_interaction_not_completed",
-        "gemini_probe_rest_interaction_not_completed",
+        "gemini_probe_generate_content_http_5xx_provider_unavailable",
+        "gemini_probe_generate_content_http_5xx_provider_unavailable",
         "mystery_output_shape",
         None,
         "gemini_probe_stdout_terminal_jsonl",
@@ -845,6 +866,26 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
         None,
         False,
         "provider_unavailable",
+        "failed",
+        None,
+    ),
+    (
+        "auth_or_billing_denied",
+        False,
+        "gemini_probe_generate_content_http_4xx_auth_or_billing_denied",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        "gemini_probe_normal_exit",
+        "gemini_probe_normal_exit",
+        False,
+        "auth_or_billing_denied",
         "failed",
         None,
     ),
@@ -884,7 +925,7 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
     provided_stdout_error_seen: bool | None,
     expected_stdout_event_class: ProbeStdoutEventClass | None,
     expected_stdout_error_seen: bool | None,
-    expected_process: str,
+    expected_process: str | None,
     expected_observed_process: str | None,
     expected_ready: bool,
     expected_reason: str,
@@ -909,17 +950,23 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
     monkeypatch.setattr(server.shutil, "which", lambda _name: pytest.fail("CLI lookup is not part of account probe"))
 
     def fake_probe(secret: str, *, model: str | None = None) -> ProbeResult:
-        if not expected_ready:
+        if not expected_ready or error_kind == "account_limited":
+            quota_observation = (
+                ProviderErrorQuotaObservation("model", 11)
+                if error_kind == "account_limited"
+                else None
+            )
             return ProbeResult(
                 Provider.GEMINI_API,
                 False,
-                None,
+                model_name,
                 False,
                 ProviderError(
                     error_kind,
                     error_retryable,
                     None,
                     None,
+                    quota_observation=quota_observation,
                     diagnostic_code=diagnostic_code,
                 ),
                 process_phase=expected_process,
@@ -1004,6 +1051,11 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
         assert "process_phase" not in event
     else:
         assert event.get("process_phase") == expected_observed_process
+    if expected_reason in {"auth_or_billing_denied", "runner_failed"}:
+        account = server.current_fleet_service().load().accounts[0]
+        assert account.secret_state is SecretState.CONFIGURED
+        assert account.limit_state is LimitState.UNKNOWN
+        assert account.limit_reason == expected_reason
     assert GEMINI_READY_CREDENTIAL not in json.dumps(result)
 
     service = server.current_fleet_service()

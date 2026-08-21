@@ -826,20 +826,21 @@ def test_probe_rejects_generation_change_while_external_call_runs(tmp_path: Path
 
 
 @pytest.mark.parametrize(
-    ("kind", "want", "secret_state"),
+    ("kind", "want", "secret_state", "retryable", "status_code"),
     [
-        ("account_limited", "limit_active", SecretState.CONFIGURED),
-        ("auth_invalid", "auth_invalid", SecretState.INVALID),
-        ("secret_missing", "secret_missing", SecretState.MISSING),
-        ("provider_unavailable", "provider_unavailable", SecretState.CONFIGURED),
-        ("model_unavailable", "model_unavailable", SecretState.CONFIGURED),
-        ("runner_failed", "provider_unavailable", SecretState.CONFIGURED),
+        ("account_limited", "limit_active", SecretState.CONFIGURED, True, 429),
+        ("auth_invalid", "auth_invalid", SecretState.INVALID, True, 429),
+        ("secret_missing", "secret_missing", SecretState.MISSING, True, 429),
+        ("provider_unavailable", "provider_unavailable", SecretState.CONFIGURED, True, 429),
+        ("model_unavailable", "model_unavailable", SecretState.CONFIGURED, True, 429),
+        ("runner_failed", "runner_failed", SecretState.CONFIGURED, False, None),
     ],
 )
 def test_probe_errors_become_fixed_gate_reasons(tmp_path: Path, kind: str, want: str,
-                                                secret_state: SecretState) -> None:
+                                                secret_state: SecretState, retryable: bool,
+                                                status_code: int | None) -> None:
     service, _ = _service(tmp_path, _configured_snapshot())
-    error = ProviderError(kind, True, 429, None)  # type: ignore[arg-type]
+    error = ProviderError(kind, retryable, status_code, None)  # type: ignore[arg-type]
     result = service.probe_account(
         "shared", lambda account: ProbeResult(account.provider, False, "model", False, error),
         expected_generation=2,
@@ -847,6 +848,25 @@ def test_probe_errors_become_fixed_gate_reasons(tmp_path: Path, kind: str, want:
     assert result["reason"] == want
     assert service.load().accounts[0].secret_state is secret_state
     assert service.account_gate("d1").reason == want
+    if kind == "runner_failed":
+        gate = service.gemini_headless_gate("d1")
+        assert gate.diagnostic_code == "gemini_runner_failed"
+        assert gate.retryable is False
+        assert gate.action == "reject"
+        service.record_gemini_event(
+            event_type="account_probe",
+            agent_id="probe",
+            account_id="shared",
+            assignment_id=None,
+            status="failed",
+            reason=want,
+            gate_action=gate.action,
+            gate_code=gate.diagnostic_code,
+        )
+        event = service.gemini_event_status(limit=1)[0]
+        assert event["reason"] == "runner_failed"
+        assert event["gate_code"] == "gemini_runner_failed"
+        assert event["gate_action"] == "reject"
 
 
 @pytest.mark.parametrize(("quota_scope", "retry_after_seconds"), [
