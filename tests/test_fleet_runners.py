@@ -4,7 +4,7 @@ import io
 import json
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -29,6 +29,7 @@ from codex_master.fleet_runners import (
     ProviderError,
     ProviderErrorQuotaObservation,
     model_is_agentic,
+    normalize_gemini_probe_diagnostic_code,
     parse_gemini_jsonl,
     ProbeResult,
     ProbeStdoutEventClass,
@@ -1126,21 +1127,63 @@ def test_gemini_rest_probe_classifies_structured_and_detailless_429() -> None:
     assert result.error.quota_observation == ProviderErrorQuotaObservation("unknown", None)
 
 
-@pytest.mark.parametrize(("body", "status", "url", "expected_kind", "expected_code"), [
+@pytest.mark.parametrize(("body", "status", "url", "expected_kind", "expected_code", "redacted_value"), [
     (
-        json.dumps({"error": {"code": 418, "status": "TEAPOT"}}).encode(),
-        418,
+        json.dumps({"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": "redacted-400-body"}}).encode(),
+        400,
         GEMINI_PROBE_URL,
         "runner_failed",
-        "gemini_probe_rest_http_unclassified",
+        "gemini_probe_rest_interactions_http_4xx",
+        "redacted-400-body",
     ),
-    (b"{", 200, GEMINI_PROBE_URL, "provider_unavailable", "gemini_probe_rest_provider_json_invalid"),
+    (
+        json.dumps({"error": {"code": 401, "status": "UNAUTHENTICATED", "message": "redacted-401-body"}}).encode(),
+        401,
+        GEMINI_PROBE_URL,
+        "auth_invalid",
+        "gemini_probe_rest_interactions_http_4xx",
+        "redacted-401-body",
+    ),
+    (
+        json.dumps({"error": {"code": 403, "status": "PERMISSION_DENIED", "message": "redacted-403-body"}}).encode(),
+        403,
+        GEMINI_PROBE_URL,
+        "auth_invalid",
+        "gemini_probe_rest_interactions_http_4xx",
+        "redacted-403-body",
+    ),
+    (
+        json.dumps({"error": {"code": 404, "status": "NOT_FOUND", "message": "redacted-404-body"}}).encode(),
+        404,
+        GEMINI_PROBE_URL,
+        "runner_failed",
+        "gemini_probe_rest_interactions_http_4xx",
+        "redacted-404-body",
+    ),
+    (
+        json.dumps({"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "redacted-429-body"}}).encode(),
+        429,
+        GEMINI_PROBE_URL,
+        "account_limited",
+        "gemini_probe_rest_interactions_http_4xx",
+        "redacted-429-body",
+    ),
+    (
+        json.dumps({"error": {"code": 503, "status": "UNAVAILABLE", "message": "redacted-5xx-body"}}).encode(),
+        503,
+        GEMINI_PROBE_URL,
+        "provider_unavailable",
+        "gemini_probe_rest_interactions_http_5xx",
+        "redacted-5xx-body",
+    ),
+    (b"{", 200, GEMINI_PROBE_URL, "provider_unavailable", "gemini_probe_rest_provider_json_invalid", None),
     (
         b"{}" + b"x" * MAX_GEMINI_PROBE_RESPONSE_BYTES,
         200,
         GEMINI_PROBE_URL,
         "provider_unavailable",
         "gemini_probe_rest_provider_json_invalid",
+        None,
     ),
     (
         json.dumps({"status": "in_progress", "steps": []}).encode(),
@@ -1148,6 +1191,7 @@ def test_gemini_rest_probe_classifies_structured_and_detailless_429() -> None:
         GEMINI_PROBE_URL,
         "provider_unavailable",
         "gemini_probe_rest_interaction_not_completed",
+        None,
     ),
     (
         json.dumps({"status": "completed", "steps": "invalid"}).encode(),
@@ -1155,6 +1199,7 @@ def test_gemini_rest_probe_classifies_structured_and_detailless_429() -> None:
         GEMINI_PROBE_URL,
         "provider_unavailable",
         "gemini_probe_rest_steps_invalid",
+        None,
     ),
     (
         json.dumps({"status": "completed", "steps": [{"type": "text"}]}).encode(),
@@ -1162,6 +1207,7 @@ def test_gemini_rest_probe_classifies_structured_and_detailless_429() -> None:
         GEMINI_PROBE_URL,
         "provider_unavailable",
         "gemini_probe_rest_model_output_missing",
+        None,
     ),
 ])
 def test_gemini_rest_probe_returns_redacted_diagnostic_for_each_response_branch(
@@ -1170,6 +1216,7 @@ def test_gemini_rest_probe_returns_redacted_diagnostic_for_each_response_branch(
     url: str,
     expected_kind: str,
     expected_code: str,
+    redacted_value: str | None,
 ) -> None:
     response = FakeProviderResponse(url, body, status=status)
     result = probe_gemini_rest(
@@ -1183,7 +1230,49 @@ def test_gemini_rest_probe_returns_redacted_diagnostic_for_each_response_branch(
     assert result.error.kind == expected_kind
     assert result.error.diagnostic_code == expected_code
     assert "private-gemini-key" not in repr(result)
+    assert url not in repr(result)
+    if redacted_value is not None:
+        assert redacted_value not in repr(result)
     assert response.closed is True
+
+
+@pytest.mark.parametrize(("status", "expected_kind", "expected_code"), [
+    (403, "auth_invalid", "gemini_probe_rest_interactions_http_4xx"),
+    (503, "provider_unavailable", "gemini_probe_rest_interactions_http_5xx"),
+])
+def test_gemini_rest_probe_classifies_httperror_by_redacted_endpoint_role(
+    status: int,
+    expected_kind: str,
+    expected_code: str,
+) -> None:
+    body_marker = f"redacted-httperror-{status}-body"
+    response = FakeProviderResponse(
+        GEMINI_PROBE_URL,
+        json.dumps({"error": {"code": status, "message": body_marker}}).encode(),
+        status=status,
+    )
+    failure = HTTPError(GEMINI_PROBE_URL, status, "redacted", None, response)
+    result = probe_gemini_rest(
+        "private-gemini-key",
+        opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    assert result.ok is False
+    assert result.error is not None
+    assert result.error.kind == expected_kind
+    assert result.error.diagnostic_code == expected_code
+    assert body_marker not in repr(result)
+    assert GEMINI_PROBE_URL not in repr(result)
+    assert "private-gemini-key" not in repr(result)
+    assert response.closed is True
+
+
+@pytest.mark.parametrize("value", [
+    "gemini_probe_rest_interactions_http_4xx",
+    "gemini_probe_rest_interactions_http_5xx",
+])
+def test_gemini_probe_normalizer_accepts_redacted_http_endpoint_diagnostics(value: str) -> None:
+    assert normalize_gemini_probe_diagnostic_code(value) == value
 
 
 def test_gemini_rest_probe_maps_transport_to_redacted_diagnostic() -> None:

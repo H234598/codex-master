@@ -75,6 +75,8 @@ ProbeDiagnosticCode = Literal[
     "gemini_probe_runner_failure",
     "gemini_probe_jsonl_terminal_invalid",
     "gemini_probe_rest_http_unclassified",
+    "gemini_probe_rest_interactions_http_4xx",
+    "gemini_probe_rest_interactions_http_5xx",
     "gemini_probe_rest_provider_json_invalid",
     "gemini_probe_rest_interaction_not_completed",
     "gemini_probe_rest_steps_invalid",
@@ -120,6 +122,8 @@ GEMINI_PROBE_DIAGNOSTIC_CODES: Final[frozenset[ProbeDiagnosticCode]] = frozenset
     "gemini_probe_runner_failure",
     "gemini_probe_jsonl_terminal_invalid",
     "gemini_probe_rest_http_unclassified",
+    "gemini_probe_rest_interactions_http_4xx",
+    "gemini_probe_rest_interactions_http_5xx",
     "gemini_probe_rest_provider_json_invalid",
     "gemini_probe_rest_interaction_not_completed",
     "gemini_probe_rest_steps_invalid",
@@ -1163,8 +1167,13 @@ def probe_gemini_rest(
                 _gemini_probe_error_payload(status, raw),
                 "",
             )
-            if diagnostic_code is None and error.kind == "runner_failed":
-                diagnostic_code = "gemini_probe_rest_http_unclassified"
+            if diagnostic_code is None:
+                if 400 <= status < 500:
+                    diagnostic_code = "gemini_probe_rest_interactions_http_4xx"
+                elif 500 <= status < 600:
+                    diagnostic_code = "gemini_probe_rest_interactions_http_5xx"
+                elif error.kind == "runner_failed":
+                    diagnostic_code = "gemini_probe_rest_http_unclassified"
             if diagnostic_code is not None:
                 error = _gemini_probe_error_with_diagnostic(error, diagnostic_code)
             return ProbeResult(Provider.GEMINI_API, False, model, False, error)
@@ -1206,8 +1215,13 @@ def probe_gemini_rest(
             _gemini_probe_error_payload(exc.code, raw),
             "",
         )
-        if diagnostic_code is None and error.kind == "runner_failed":
-            diagnostic_code = "gemini_probe_rest_http_unclassified"
+        if diagnostic_code is None:
+            if 400 <= exc.code < 500:
+                diagnostic_code = "gemini_probe_rest_interactions_http_4xx"
+            elif 500 <= exc.code < 600:
+                diagnostic_code = "gemini_probe_rest_interactions_http_5xx"
+            elif error.kind == "runner_failed":
+                diagnostic_code = "gemini_probe_rest_http_unclassified"
         if diagnostic_code is not None:
             error = _gemini_probe_error_with_diagnostic(error, diagnostic_code)
         return ProbeResult(Provider.GEMINI_API, False, model, False, error)
