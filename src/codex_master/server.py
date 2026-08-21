@@ -39,6 +39,8 @@ from functools import partial
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Iterator, Mapping
 
+import yaml
+
 from codex_master import __version__
 from codex_master.fleet_registry import (
     AgentDescriptor,
@@ -63,10 +65,13 @@ from codex_master.fleet_registry import (
     normalize_fleet_document,
 )
 from codex_master.fleet_overview import (
+    FleetOverviewAgentContext,
     build_fleet_overview,
     enrich_fleet_overview_usage,
     render_fleet_overview,
 )
+from codex_master.hive_metrics import fleet_metric_values, render_openmetrics
+from codex_master.observability_http import MetricsHttpServer, TimedMetricsReader
 from codex_master.goddess_reporting import (
     ReporterStateStore,
     aggregate_task_rows,
@@ -93,17 +98,20 @@ from codex_master.hive.state import HiveStateStore
 from codex_master.resource_cgroup import (
     APPROVED_CPUSET,
     ApprovedCgroupRuntimeV1,
+    RunnerExecutionTargetV1,
     build_approved_cgroup_runtime,
     CgroupPreflightError,
     CgroupPreflightV1,
     CgroupProfileV1,
     CgroupIoPressureEvidenceV1,
     PreparedAgentScope,
+    RESOURCE_SCOPE_GATE_PATH,
     REQUIRED_CONTROLLERS,
     read_hive_io_pressure,
     SystemdUserCgroupAdapter,
     require_cgroup_preflight,
-    start_verified_scope,
+    confirm_verified_scope,
+    start_released_scope,
 )
 from codex_master.resource_monitor import (
     ResourceGateFacts,
@@ -168,6 +176,7 @@ from codex_master.fleet_inplace import (
     apply_series_update as apply_q_series_update,
     recover_series_update as recover_q_series_update,
 )
+from codex_master.fleet_markdown import fleet_markdown_artifacts, fleet_markdown_file_names
 from codex_master.fleet_service import (
     FleetConflictError,
     FleetPaths,
@@ -249,6 +258,30 @@ from codex_master.hive.config import load_agent_class_catalog, load_hive_config
 from codex_master.hive.runtime import HiveRuntime, build_hive_runtime
 from codex_master.hive.tools import call_hive_tool, hive_tool_definitions
 from codex_master.selection.model_policy import load_model_policy
+from codex_master.fast_mode import (
+    active_mode,
+    maybe_notify_fast,
+    set_mode,
+    snapshot as fast_mode_snapshot,
+)
+from codex_master.limit_tracker import (
+    advance_emergency_queen,
+    emergency_recommendation,
+    emergency_refresh_needed,
+    emergency_queen_status,
+    evaluate_account,
+    finish_emergency_queen,
+    preferred_delta_window,
+    refresh_usage_snapshots,
+    set_emergency_display_override,
+    set_emergency_queen_blocked,
+    set_emergency_queen_running,
+    register_emergency_queen_child,
+    unregister_emergency_queen_child,
+    set_spark_priority,
+    spark_priority_active,
+    request_emergency_queen_work,
+)
 from codex_master.selection.task_classification import (
     TaskClassificationRequest,
     TaskClassifier,
@@ -300,10 +333,18 @@ HEADLESS_JOBS = HeadlessJobRegistry()
 HEADLESS_META_KEY = "headless_job"
 G5_TMUX_SOCKET_META_KEY = "tmux_socket"
 G5_TMUX_SOCKET_RE = re.compile(r"g5-[0-9a-f]{20}")
+G5_NATIVE_RUNNER_META_KEY = "g5_native_runner"
+G5_SCOPE_UNIT_RE = re.compile(r"codex-master-resource-[a-f0-9]{32}\.scope")
 DEFAULT_HEADLESS_TIMEOUT_SECONDS = 600
 
 
-def agent_base_args(model: str, reasoning_effort: str, *, agent_class: str | None = None) -> list[str]:
+def agent_base_args(
+    model: str,
+    reasoning_effort: str,
+    *,
+    agent_class: str | None = None,
+    service_tier: str = "flex",
+) -> list[str]:
     model_registry = load_model_policy(repo_root() / "codex-model-policy.json")
     definition = model_registry.get_exact(model)
     if definition is None or not definition.enabled or definition.spawn_behavior != "manual":
@@ -340,11 +381,20 @@ def agent_base_args(model: str, reasoning_effort: str, *, agent_class: str | Non
         f'model="{model}"',
         "-c",
         f'model_reasoning_effort="{reasoning_effort}"',
+        "-c",
+        f'service_tier="{service_tier}"',
         "--yolo",
         "-s",
         "danger-full-access",
         "--search",
     ]
+
+
+def _fast_service_tier_for_agent(agent: str) -> str:
+    """Return the account-scoped tier override for a newly started agent."""
+    routing = read_meta(agent).get("routing")
+    account = routing.get("account") if isinstance(routing, Mapping) else None
+    return "fast" if isinstance(account, str) and active_mode(account) is not None else "flex"
 MAX_TAIL_LINES = 80
 MAX_TAIL_CHARS = 8192
 MAX_RAW_LOG_BYTES = 5 * 1024 * 1024
@@ -425,13 +475,11 @@ RESOURCE_MAX_LOAD_PER_CPU = 1.75
 RESOURCE_MAX_CPU_BUSY_PERCENT = 90.0
 RESOURCE_MAX_IO_WAIT_PERCENT = 50.0
 RESOURCE_MIN_AVAILABLE_MEMORY_MIB = 7 * 1024
-RESOURCE_MAX_RUNNING_AGENTS = 10
+MAX_SPAWN_REQUESTED_SLOTS = 10
 HIVE_IO_PRESSURE_SOME_AVG10_LIMIT = 95.0
 HIVE_IO_PRESSURE_FULL_AVG10_LIMIT = 85.0
 HIVE_IO_PRESSURE_FULL_AVG60_LIMIT = 80.0
 RESOURCE_PRESSURE_LIMITS_ENABLED = True
-OLLAMA_MAX_CONCURRENT_AGENTS = 2
-OLLAMA_CONCURRENCY_LIMIT_ENABLED = True
 OLLAMA_SIMPLE_TASK_MAX_CHARS = 800
 SPAWN_OFFER_TTL_SECONDS = 5
 SPAWN_OFFER_RETRY_AFTER_SECONDS = 15
@@ -444,8 +492,6 @@ RESOURCE_REASON_CODES = frozenset(
         "cpu_pressure_high",
         "io_pressure_high",
         "memory_pressure_high",
-        "running_agent_limit",
-        "insufficient_slots",
         "cgroup_preflight_failed",
         "spawn_warmup_active",
         "temperature_pressure_high",
@@ -454,6 +500,7 @@ RESOURCE_REASON_CODES = frozenset(
         "resource_snapshot_invalid",
         "resource_snapshot_generation_mismatch",
         "resource_access_denied",
+        "replacement_reservation_pending",
     }
 )
 MAX_CODEX_USAGE_SNAPSHOT_BYTES = 64 * 1024
@@ -518,6 +565,13 @@ TEAMLEADER_TOOL_NAMES = frozenset(
         "hive_authority_check",
         "hive_admission_status",
         "agent_selection_status",
+        "usage_fast_mode_status",
+        "usage_fast_mode",
+        "usage_fast_mode_reconcile",
+        "emergency_queen_status",
+        "emergency_queen_plan_completed",
+        "emergency_queen_child_started",
+        "emergency_queen_child_completed",
     }
 )
 MAX_PAGED_OFFSET = 10_000_000
@@ -547,10 +601,22 @@ FLEET_DESKTOP_ENTRY_NAME = "de.teladi.CodexMaster.ControlCenter.desktop"
 MAX_FLEET_DESKTOP_ENTRY_BYTES = 16 * 1024
 FLEET_DESKTOP_COMMAND_RE = re.compile(r"^/[-A-Za-z0-9._+@/ ]+$")
 AGENT_POOL_ROOT = Path(os.environ.get("CODEX_AGENT_POOL_ROOT", "~/.codex-agents")).expanduser()
+CODEX_USAGE_PROFILES_ROOT = Path(
+    os.environ.get(
+        "CODEX_USAGE_PROFILES_ROOT",
+        "/home/teladi/.local/share/codex-usage/profiles",
+    )
+).expanduser()
 HIVE_API_TOKEN_ENV_FILE = Path(
     os.environ.get(
         "CODEX_MASTER_MCP_API_TOKEN_ENV",
         "~/.config/codex-master-mcp/api-token.env",
+    )
+).expanduser()
+HIVE_API_TOKEN_YAML_FILE = Path(
+    os.environ.get(
+        "CODEX_MASTER_MCP_API_TOKEN_YAML",
+        "~/.config/codex-master-mcp/api-token.yaml",
     )
 ).expanduser()
 POOL_SPEC_FILE = "codex-agent-pool.json"
@@ -595,6 +661,8 @@ MAX_POOL_AGENTS = 1000
 MAX_POOL_SERIES = 26
 MAX_FLEET_SERIES_COUNT = 100
 MAX_HIVE_API_KEYS = 99
+HIVE_API_TOKEN_YAML_SCHEMA_VERSION = 1
+MAX_HIVE_API_TOKEN_DOCUMENT_BYTES = 8 * 1024 * 1024
 MAX_POOL_SHARED_ASSETS = 40
 MAX_POOL_RUNTIME_DIRS = 40
 MAX_APPLET_AGENTS = 6
@@ -620,7 +688,7 @@ NATIVE_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 NATIVE_AGENT_TYPE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 APPLET_STATUS_TIMEOUT_SECONDS = 8.0
 APPLET_TMUX_TIMEOUT_SECONDS = 1.0
-AGENT_SERIES = ("a", "b", "c")
+AGENT_SERIES = ("a", "b", "c", "u")
 AGENTS_PER_SERIES = 100
 DEFAULT_ORDINAL_AGENT_SERIES = ("a", "b", "c")
 AGENT_SELECTOR_SERIES_ENV = "CODEX_MASTER_AGENT_SELECTOR_SERIES"
@@ -632,9 +700,9 @@ SERIES_AGENT_IDS = {
     for series in AGENT_SERIES
 }
 AGENT_SELECTOR_DESCRIPTION = (
-    "Agentin selector: a1..a100, b1..b100, c1..c100; legacy aliases a/b; "
+    "Agentin selector: a1..a100, b1..b100, c1..c100, u1; legacy aliases a/b; "
     "numeric ordinal selectors 1=a1, 2=b1, 3=c1 by default; "
-    "group selectors active, both, all, a-series, b-series, c-series."
+    "group selectors active, both, all, a-series, b-series, c-series, u-series."
 )
 DEFAULT_AGENTIN_BASE_NAMES = (
     "Mila",
@@ -668,6 +736,7 @@ WATCHDOG_TIMER_NAME = "codex-master-watchdog.timer"
 RESOURCE_MONITOR_SERVICE_NAME = "codex-master-resource-monitor.service"
 RESOURCE_MONITOR_SLICE_NAME = "codex-master.slice"
 RESOURCE_MONITOR_UNIT_NAMES = (RESOURCE_MONITOR_SERVICE_NAME, RESOURCE_MONITOR_SLICE_NAME)
+RESOURCE_SCOPE_GATE_NAME = "codex-master-resource-scope-gate"
 MAX_SYSTEMD_UNIT_BYTES = 64 * 1024
 MAX_SYSTEMD_SECURITY_OUTPUT_BYTES = 64 * 1024
 RESOURCE_MONITOR_SYSTEMCTL_TIMEOUT_SECONDS = 15.0
@@ -962,9 +1031,11 @@ def _resource_gate_runtime_scope(runtime: ResourceGateRuntime) -> Iterator[None]
         _RESOURCE_GATE_RUNTIME.reset(token)
 
 
-def _compose_resource_gate_runtime() -> ResourceGateRuntime | None:
+def _compose_resource_gate_runtime(*, monitor_self_cgroup: bool = False) -> ResourceGateRuntime | None:
     """Bind one authorized Hive state to the G5 callflow; no fallback store exists."""
 
+    if type(monitor_self_cgroup) is not bool:
+        return None
     try:
         hive_runtime = build_current_hive_runtime(repository_roots={}, materialize_principals=False)
         state = hive_runtime.state
@@ -978,7 +1049,11 @@ def _compose_resource_gate_runtime() -> ResourceGateRuntime | None:
     cgroup_adapter = None
     h2_ready = False
     try:
-        snapshot = build_approved_cgroup_runtime()
+        snapshot = (
+            build_approved_cgroup_runtime(monitor_self_cgroup=True)
+            if monitor_self_cgroup
+            else build_approved_cgroup_runtime()
+        )
     except Exception:
         pass
     else:
@@ -1108,13 +1183,38 @@ def _resource_operator_document(status: ResourceOperatorStatus) -> dict[str, Any
 def run_resource_monitor() -> None:
     """Run the monitor with only the central composer's authorized Hive state."""
 
-    runtime = _compose_resource_gate_runtime()
+    runtime = _compose_resource_gate_runtime(monitor_self_cgroup=True)
     if runtime is None:
         raise AgentError("resource_monitor_unavailable")
-    run_resource_monitor_loop(runtime.state)
+    run_resource_monitor_loop(
+        runtime.state,
+        cgroup_preflight=lambda: _resource_monitor_cgroup_preflight(runtime),
+    )
+
+
+def _resource_monitor_cgroup_preflight(runtime: ResourceGateRuntime) -> bool:
+    """Recheck pinned G5 cgroup evidence for one monitor sample without rebinding."""
+
+    if (
+        not isinstance(runtime, ResourceGateRuntime)
+        or runtime.h2_ready is not True
+        or type(runtime.cgroup_profile) is not CgroupProfileV1
+        or type(runtime.cgroup_adapter) is not SystemdUserCgroupAdapter
+    ):
+        return False
+    try:
+        require_cgroup_preflight(runtime.cgroup_adapter, runtime.cgroup_profile)
+    except Exception:
+        return False
+    return True
 
 
 RUNNER_EXECUTION_FDS: dict[str, int] = {}
+_MANAGED_CODEX_WRAPPER_MAX_BYTES = 16 * 1024
+_MANAGED_CODEX_METADATA_MAX_BYTES = 16 * 1024
+_MANAGED_CODEX_MAX_SYMLINKS = 8
+_MANAGED_CODEX_ELF_MAGIC = b"\x7fELF"
+_MANAGED_CODEX_BIN_LINE = re.compile(r"^  CODEX_AGENT_BIN=([^\n]+)$", re.MULTILINE)
 
 
 def _legacy_pool_ids() -> tuple[str, ...]:
@@ -1261,7 +1361,10 @@ def effective_observation_inventory() -> tuple[InventorySnapshot | None, bool]:
         if not fleet.series:
             return published, False
         provider_inventory = build_inventory(fleet, AGENT_POOL_ROOT)
-        preserved = legacy_agent_inventory({"b92": AGENTS["b92"]}) if "b92" in AGENTS else None
+        preserved_configs = {"b92": AGENTS["b92"]} if "b92" in AGENTS else {}
+        if "u1" in AGENTS:
+            preserved_configs["u1"] = AGENTS["u1"]
+        preserved = legacy_agent_inventory(preserved_configs) if preserved_configs else None
         return (
             merge_agent_inventories(provider_inventory, preserved)
             if preserved is not None
@@ -4034,8 +4137,48 @@ def write_meta(agent: str, data: dict[str, Any]) -> None:
         or data.get("session") != agent_config(agent).get("session")
     ):
         raise AgentError("private tmux routing metadata is invalid")
+    if G5_NATIVE_RUNNER_META_KEY in data and _g5_native_runner_attestation(
+        data,
+        agent=agent,
+        session=agent_config(agent).get("session"),
+    ) is None:
+        raise AgentError("private tmux routing metadata is invalid")
     path = meta_path(agent)
     replace_private_text(path, json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def _g5_native_runner_attestation(
+    meta: Mapping[str, Any], *, agent: str, session: object
+) -> tuple[int, int, str] | None:
+    if (
+        not isinstance(meta, Mapping)
+        or meta.get("agent") != agent
+        or meta.get("session") != session
+        or not isinstance(session, str)
+    ):
+        return None
+    socket_name = meta.get(G5_TMUX_SOCKET_META_KEY)
+    runner = meta.get(G5_NATIVE_RUNNER_META_KEY)
+    if (
+        not isinstance(socket_name, str)
+        or G5_TMUX_SOCKET_RE.fullmatch(socket_name) is None
+        or not isinstance(runner, Mapping)
+        or set(runner) != {"device", "inode", "scope_unit"}
+    ):
+        return None
+    device = runner.get("device")
+    inode = runner.get("inode")
+    scope_unit = runner.get("scope_unit")
+    if (
+        type(device) is not int
+        or type(inode) is not int
+        or not 0 <= device <= (1 << 64) - 1
+        or not 0 < inode <= (1 << 64) - 1
+        or not isinstance(scope_unit, str)
+        or G5_SCOPE_UNIT_RE.fullmatch(scope_unit) is None
+    ):
+        return None
+    return device, inode, scope_unit
 
 
 def replace_private_text(path: Path, text: str, mode: int = 0o600) -> None:
@@ -4893,6 +5036,7 @@ def _read_native_agent_registry() -> tuple[dict[str, Any], str]:
         return payload, "degraded"
     normalized = _native_agent_normalize_registry(loaded)
     if normalized != loaded:
+        empty_legacy = loaded == {"schema_version": 1, "agents": []}
         stale_only = (
             loaded.get("schema_version") == 2
             and loaded.get("agents") == normalized.get("agents")
@@ -4909,7 +5053,7 @@ def _read_native_agent_registry() -> tuple[dict[str, Any], str]:
                 for row in loaded["reservations"]
             )
         )
-        if stale_only:
+        if stale_only or empty_legacy:
             _write_native_agent_registry(normalized)
         else:
             degraded = True
@@ -5289,8 +5433,8 @@ def native_agent_status(
             )
             if len(expected_ids) != len(expected_parent_session_ids):
                 expected_ids = frozenset({"__invalid_expected_parent_session_ids__"})
-    minimum_coverage = 1
-    if expected_parent_sessions is not None:
+    minimum_coverage = len(expected_ids) if expected_ids is not None else 1
+    if expected_ids is None and expected_parent_sessions is not None:
         if (
             isinstance(expected_parent_sessions, bool)
             or not isinstance(expected_parent_sessions, int)
@@ -5397,9 +5541,6 @@ def spawn_resource_policy() -> dict[str, Any]:
         "max_cpu_busy_percent": RESOURCE_MAX_CPU_BUSY_PERCENT,
         "max_io_wait_percent": RESOURCE_MAX_IO_WAIT_PERCENT,
         "min_available_memory_mib": RESOURCE_MIN_AVAILABLE_MEMORY_MIB,
-        "max_running_agents": RESOURCE_MAX_RUNNING_AGENTS,
-        "ollama_concurrency_limit_enabled": OLLAMA_CONCURRENCY_LIMIT_ENABLED,
-        "ollama_max_concurrent_agents": OLLAMA_MAX_CONCURRENT_AGENTS,
         "raw_output": "not_returned",
     }
 
@@ -5565,15 +5706,12 @@ def reserve_native_agent_spawn(payload: Any) -> dict[str, Any]:
 
 
 def reserve_managed_replacement(managed_session: Any) -> dict[str, Any]:
-    """Reserve a concrete, schema-2-covered managed session replacement."""
+    """Reserve a concrete managed session replacement without consuming fleet capacity."""
     if not _validate_native_agent_identifier(managed_session, NATIVE_AGENT_ID_RE):
         return {"allowed": False, "error_code": "spawn_capacity_unavailable", "reason_codes": ["session_metrics_unavailable"]}
     with spawn_admission_lock():
         managed_ids = _managed_tmux_session_ids()
         if managed_ids is None or managed_session not in managed_ids:
-            return {"allowed": False, "error_code": "spawn_capacity_unavailable", "reason_codes": ["session_metrics_unavailable"]}
-        coverage = native_agent_status(expected_parent_session_ids={managed_session})
-        if coverage.get("bridge_state") != "ready":
             return {"allowed": False, "error_code": "spawn_capacity_unavailable", "reason_codes": ["session_metrics_unavailable"]}
         with native_agent_registry_lock():
             registry, state = _read_native_agent_registry()
@@ -5584,12 +5722,11 @@ def reserve_managed_replacement(managed_session: Any) -> dict[str, Any]:
                 row.get("kind") == "managed_replacement" and row.get("managed_session") == managed_session
                 for row in reservations if isinstance(row, dict)
             ):
-                return {"allowed": False, "error_code": "spawn_capacity_unavailable", "reason_codes": ["running_agent_limit"]}
-            total = _total_running_agent_count(managed_ids=managed_ids)
-            if total is None:
-                return {"allowed": False, "error_code": "spawn_capacity_unavailable", "reason_codes": ["session_metrics_unavailable"]}
-            if total > RESOURCE_MAX_RUNNING_AGENTS:
-                return {"allowed": False, "error_code": "spawn_capacity_unavailable", "reason_codes": ["running_agent_limit"]}
+                return {
+                    "allowed": False,
+                    "error_code": "spawn_capacity_unavailable",
+                    "reason_codes": ["replacement_reservation_pending"],
+                }
             reservation = {
                 "reservation_id": uuid.uuid4().hex,
                 "kind": "managed_replacement",
@@ -5713,7 +5850,7 @@ def _raise_replacement_capacity_denied(decision: Mapping[str, Any]) -> None:
         if isinstance(item, str) and item in RESOURCE_REASON_CODES
     ]
     if not reason_codes:
-        reason_codes = ["session_metrics_unavailable"]
+        reason_codes = ["resource_snapshot_invalid"]
     errors = decision.get("errors")
     if not isinstance(errors, list):
         errors = spawn_error_details(reason_codes)
@@ -5733,11 +5870,13 @@ def _total_running_agent_count(*, managed_ids: frozenset[str] | None = None) -> 
     if managed_ids is None:
         managed_ids = _managed_tmux_session_ids()
     if managed_ids is None:
-        managed = _managed_tmux_session_count()
-        native = native_agent_status()
-    else:
-        managed = len(managed_ids)
-        native = native_agent_status()
+        return None
+    managed = len(managed_ids)
+    native = (
+        native_agent_status(expected_parent_session_ids=managed_ids)
+        if not managed_ids
+        else native_agent_status()
+    )
     counts = native.get("counts") if isinstance(native, dict) else None
     if managed is None or native.get("bridge_state") != "ready" or not isinstance(counts, dict):
         return None
@@ -5840,7 +5979,7 @@ def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> di
         reasons.append("resource_snapshot_invalid")
     reasons.extend(declared)
     return {
-        "ok": not reasons,
+        "ok": not [reason for reason in reasons if reason != "session_metrics_unavailable"],
         "_typed_hive_io_pressure": typed_hive_io_pressure,
         "_g5_facts": True,
         "load_per_cpu": legacy.load_per_cpu,
@@ -5872,13 +6011,6 @@ def _valid_spawn_policy(policy: Any) -> bool:
         and policy["max_io_wait_percent"] <= 100.0
         and type(policy.get("min_available_memory_mib")) is int
         and policy["min_available_memory_mib"] == RESOURCE_MIN_AVAILABLE_MEMORY_MIB
-        and isinstance(policy.get("max_running_agents"), int)
-        and not isinstance(policy["max_running_agents"], bool)
-        and 1 <= policy["max_running_agents"] <= 10
-        and policy.get("ollama_concurrency_limit_enabled") is True
-        and isinstance(policy.get("ollama_max_concurrent_agents"), int)
-        and not isinstance(policy["ollama_max_concurrent_agents"], bool)
-        and 1 <= policy["ollama_max_concurrent_agents"] <= policy["max_running_agents"]
     )
 
 
@@ -5886,31 +6018,24 @@ def _admission_result(
     *,
     required_slots: int,
     allowed: bool,
-    available_slots: int | None,
     reason_codes: list[str],
 ) -> dict[str, Any]:
     reason_codes = list(dict.fromkeys(reason_codes))
     result = {
         "allowed": allowed,
         "required_slots": required_slots,
-        "available_slots": available_slots,
         "reason_codes": reason_codes,
         "raw_output": "not_returned",
     }
     if reason_codes:
         result["errors"] = spawn_error_details(
             reason_codes,
-            required_slots=required_slots,
-            available_slots=available_slots,
         )
     return result
 
 
 def spawn_error_details(
     reason_codes: Iterable[str],
-    *,
-    required_slots: int = 1,
-    available_slots: int | None = None,
 ) -> list[dict[str, str]]:
     """Translate stable admission codes into data-sparse operator errors."""
 
@@ -5930,8 +6055,8 @@ def spawn_error_details(
         "session_metrics_unavailable": (
             "Gesamtzahl nicht bestimmbar",
             "Laufende und unbestaetigte Bienen konnten nicht verlaesslich gezaehlt werden.",
-            "Ohne belastbare Gesamtzahl wird kein Spawn zugelassen.",
-            "Tmux- und Native-Agent-Registry pruefen, dann erneut versuchen.",
+            "Die Zahl bleibt Observability-Evidenz; sie ist keine reguläre Spawn-Grenze.",
+            "Nur session-gebundene Lifecycle-Operationen nach Evidenz wiederholen.",
         ),
         "policy_invalid": (
             "Ressourcenpolicy ungueltig",
@@ -5960,40 +6085,22 @@ def spawn_error_details(
             f"Aktive Grenze: mindestens {RESOURCE_MIN_AVAILABLE_MEMORY_MIB} MiB frei.",
             "Speicher freigeben oder erneut versuchen.",
         ),
-        "ollama_concurrency_limit": (
-            "Ollama-Parallelgrenze erreicht",
-            f"Bereits {OLLAMA_MAX_CONCURRENT_AGENTS} Ollama-Bienen laufen.",
-            f"Konfigurierte Ollama-Grenze: {OLLAMA_MAX_CONCURRENT_AGENTS} gleichzeitig; das aktive Admission-Gate ist verbindlich.",
-            "Ollama-Biene beenden oder erneut versuchen.",
-        ),
         "ollama_simple_task_only": (
             "Aufgabe fuer Ollama zu komplex",
             "Gewaehlte Ollama-Serie akzeptiert nur einfache, begrenzte Aufgaben.",
             "Capability-Gate bleibt unabhaengig vom Ressourcenstatus aktiv.",
             "Aufgabe vereinfachen oder eine passende Codex-Serie waehlen.",
         ),
+        "replacement_reservation_pending": (
+            "Ersatzstart bereits reserviert",
+            "Fuer diese verwaltete Sitzung besteht bereits eine Ersatzstart-Reservierung.",
+            "Pro konkrete Sitzung darf nur eine laufende Ersatzreservierung bestehen.",
+            "Bestehende Lifecycle-Operation abwarten oder erneut versuchen.",
+        ),
     }
     details: list[dict[str, str]] = []
     for code in dict.fromkeys(reason_codes):
-        if code == "running_agent_limit":
-            free = max(0, available_slots or 0)
-            running = RESOURCE_MAX_RUNNING_AGENTS - (available_slots or 0)
-            row = (
-                "Globale Bienengrenze erreicht",
-                f"{running} von {RESOURCE_MAX_RUNNING_AGENTS} Gesamtslots sind belegt; {free} sind frei.",
-                "Ab 10 laufenden oder unbestaetigten Bienen ist jeder weitere Spawn verboten.",
-                "Mindestens eine Biene beenden und erneut versuchen.",
-            )
-        elif code == "insufficient_slots":
-            free = max(0, available_slots or 0)
-            row = (
-                "Zu wenige Gesamtslots",
-                f"{required_slots} Slots angefordert, aber nur {free} von {RESOURCE_MAX_RUNNING_AGENTS} Slots sind frei.",
-                "Angeforderte Slots muessen vollstaendig unter die globale Zehnergrenze passen.",
-                "Weniger Bienen anfordern oder laufende Bienen beenden.",
-            )
-        else:
-            row = configured.get(code)
+        row = configured.get(code)
         if row is None:
             continue
         details.append({
@@ -6010,7 +6117,6 @@ def _resource_pressure_reason_codes(snapshot: Mapping[str, Any], policy: Mapping
     fallback = [
         "cpu_metrics_unavailable",
         "memory_metrics_unavailable",
-        "session_metrics_unavailable",
     ]
     if not isinstance(snapshot, Mapping) or not isinstance(policy, Mapping):
         return fallback
@@ -6023,6 +6129,8 @@ def _resource_pressure_reason_codes(snapshot: Mapping[str, Any], policy: Mapping
         or any(not isinstance(item, str) or item not in RESOURCE_REASON_CODES for item in declared)
     ):
         return ["resource_snapshot_invalid"] if g5_blocked else fallback
+    if isinstance(declared, list):
+        declared = [reason for reason in declared if reason != "session_metrics_unavailable"]
     had_declared = bool(declared)
     had_declared_memory_reason = (
         isinstance(declared, list)
@@ -6146,9 +6254,8 @@ def _resource_admission_decision(
     snapshot: Mapping[str, Any] | None = None,
     inventory: Any = None,
     enforce_pressure: bool = True,
-    reserved_slots: int = 0,
 ) -> dict[str, Any]:
-    """Compose one resource snapshot with capacity, provider, then pressure precedence."""
+    """Apply pressure/cgroup/capability gates; required_slots is only a bounded operator batch size."""
 
     snapshot = system_resource_snapshot() if snapshot is None else snapshot
     policy = spawn_resource_policy()
@@ -6156,47 +6263,19 @@ def _resource_admission_decision(
         result = _admission_result(
             required_slots=required_slots,
             allowed=False,
-            available_slots=None,
             reason_codes=["policy_invalid"],
         )
     elif not isinstance(snapshot, Mapping):
         result = _admission_result(
             required_slots=required_slots,
             allowed=False,
-            available_slots=None,
             reason_codes=[
                 "cpu_metrics_unavailable",
                 "memory_metrics_unavailable",
-                "session_metrics_unavailable",
             ],
         )
     else:
-        pressure_reasons: list[str] = []
-        capacity_reasons: list[str] = []
-        running_agents = snapshot.get("running_agents")
-        available_slots: int | None = None
-        if (
-            type(reserved_slots) is not int
-            or reserved_slots < 0
-            or reserved_slots > required_slots
-        ):
-            capacity_reasons.append("session_metrics_unavailable")
-        elif (
-            isinstance(running_agents, int)
-            and not isinstance(running_agents, bool)
-            and running_agents >= reserved_slots
-        ):
-            effective_running_agents = running_agents - reserved_slots
-            available_slots = policy["max_running_agents"] - effective_running_agents
-            if effective_running_agents >= policy["max_running_agents"]:
-                capacity_reasons.append("running_agent_limit")
-            elif available_slots < required_slots:
-                capacity_reasons.append("insufficient_slots")
-        else:
-            capacity_reasons.append("session_metrics_unavailable")
-
-        reasons = list(capacity_reasons)
-        running_ollama: int | None = None
+        reasons: list[str] = []
         descriptor = None
         if agent is not None:
             try:
@@ -6207,33 +6286,6 @@ def _resource_admission_decision(
                 descriptor = None
                 inventory = None
         if descriptor is not None and descriptor.provider is Provider.OLLAMA_LOCAL:
-            running_ollama = 0
-            count_known = True
-            try:
-                candidates = inventory.agent_ids
-                agents = inventory.agents
-                for candidate in candidates:
-                    item = agents[candidate]
-                    if item.provider is not Provider.OLLAMA_LOCAL:
-                        continue
-                    try:
-                        alive = tmux_alive(item.session, snapshot=inventory)
-                    except Exception:
-                        count_known = False
-                        break
-                    if type(alive) is not bool:
-                        count_known = False
-                        break
-                    if alive:
-                        running_ollama += 1
-            except (AttributeError, KeyError, TypeError, ValueError):
-                count_known = False
-            if not count_known:
-                reasons.append("session_metrics_unavailable")
-            elif policy["ollama_concurrency_limit_enabled"] and running_ollama >= policy["ollama_max_concurrent_agents"]:
-                reasons.append("ollama_concurrency_limit")
-        reasons.extend(pressure_reasons)
-        if descriptor is not None and descriptor.provider is Provider.OLLAMA_LOCAL:
             task_ok = task is None or _ollama_simple_task_allowed(task, role)
             if descriptor.task_profile == "simple_only" and not task_ok:
                 reasons.append("ollama_simple_task_only")
@@ -6242,18 +6294,15 @@ def _resource_admission_decision(
                 reasons.append("cgroup_preflight_failed")
         if enforce_pressure and policy["pressure_limits_enabled"] and "cgroup_preflight_failed" not in reasons:
             pressure_reasons = _resource_pressure_reason_codes(snapshot, policy)
-            reasons.extend(pressure_reasons)
+            reasons.extend(reason for reason in pressure_reasons if reason != "session_metrics_unavailable")
         if enforce_pressure and snapshot.get("_g5_facts") is True and not reasons and _g5_warmup_active():
             reasons.append("spawn_warmup_active")
 
         result = _admission_result(
             required_slots=required_slots,
             allowed=not reasons,
-            available_slots=available_slots,
             reason_codes=reasons,
         )
-        if running_ollama is not None:
-            result["running_ollama_agents"] = running_ollama
 
     if agent is not None:
         result["resource_snapshot"] = snapshot
@@ -6268,10 +6317,16 @@ def spawn_admission_decision(
     agent: str | None = None,
     task: str | None = None,
     role: str = "arbeitsbiene",
-    reserved_slots: int = 0,
     inventory: Any = None,
 ) -> dict[str, Any]:
-    required_slots = normalize_int_field(required_slots, field="required_slots", minimum=1, maximum=10)
+    """Return admission; required_slots caps one operator request, never running concurrency."""
+
+    required_slots = normalize_int_field(
+        required_slots,
+        field="required_slots",
+        minimum=1,
+        maximum=MAX_SPAWN_REQUESTED_SLOTS,
+    )
     scope = _resource_gate_composer_scope() if enforce_pressure else contextlib.nullcontext()
     with scope:
         snapshot = (
@@ -6286,7 +6341,6 @@ def spawn_admission_decision(
             agent=agent,
             task=task,
             role=role,
-            reserved_slots=reserved_slots,
             inventory=inventory,
         )
 
@@ -6297,14 +6351,12 @@ def require_spawn_capacity(
     agent: str | None = None,
     task: str | None = None,
     role: str = "arbeitsbiene",
-    reserved_slots: int = 0,
 ) -> dict[str, Any]:
     admission = spawn_admission_decision(
         required_slots,
         agent=agent,
         task=task,
         role=role,
-        reserved_slots=reserved_slots,
     )
     if admission.get("allowed") is True:
         return admission
@@ -6314,7 +6366,7 @@ def require_spawn_capacity(
         if isinstance(reason, str) and reason in RESOURCE_REASON_CODES
     ]
     if not reason_codes:
-        reason_codes = ["session_metrics_unavailable"]
+        reason_codes = ["resource_snapshot_invalid"]
     raise AgentCapacityError(
         "capacity unavailable",
         {
@@ -6339,7 +6391,7 @@ def _ollama_simple_task_allowed(task: str, role: str) -> bool:
 
 
 def ollama_resource_status(agent: str, *, task: str | None = None, role: str = "arbeitsbiene") -> dict[str, Any]:
-    """Return the conservative local admission decision for Ollama."""
+    """Return pressure/capability admission for Ollama without a provider concurrency cap."""
 
     inventory = current_agent_inventory()
     descriptor = inventory.agents.get(agent)
@@ -6358,14 +6410,10 @@ def ollama_resource_status(agent: str, *, task: str | None = None, role: str = "
         "provider": "ollama_local",
         "agent": agent,
         "task_profile": descriptor.task_profile,
-        "running_ollama_agents": decision.get("running_ollama_agents"),
-        "max_concurrent_ollama_agents": OLLAMA_MAX_CONCURRENT_AGENTS,
-        "concurrency_limit_enforced": OLLAMA_CONCURRENCY_LIMIT_ENABLED,
-        "temporary_global_agent_cap": RESOURCE_MAX_RUNNING_AGENTS,
         "resource_snapshot": decision.get("resource_snapshot"),
         "reason_codes": reason_codes,
         "errors": decision.get("errors", []),
-        "benchmark_policy": "single_agent_default; two_agent_cap_active",
+        "benchmark_policy": "resource_pressure_and_simple_task_capability",
         "raw_output": "not_returned",
     }
 
@@ -6424,7 +6472,12 @@ def _spawn_priority_routes() -> tuple[str, ...]:
 
 
 def agent_spawn_offers(required_slots: int = 1) -> dict[str, Any]:
-    required_slots = normalize_int_field(required_slots, field="required_slots", minimum=1, maximum=10)
+    required_slots = normalize_int_field(
+        required_slots,
+        field="required_slots",
+        minimum=1,
+        maximum=MAX_SPAWN_REQUESTED_SLOTS,
+    )
     admission = spawn_admission_decision(required_slots)
     routes = _spawn_priority_routes()
     allowed = admission.get("allowed") is True
@@ -6439,7 +6492,7 @@ def agent_spawn_offers(required_slots: int = 1) -> dict[str, Any]:
             if isinstance(reason, str) and reason in RESOURCE_REASON_CODES
         ]
     if not allowed and not reason_codes:
-        reason_codes = ["session_metrics_unavailable"]
+        reason_codes = ["resource_snapshot_invalid"]
     retryable = not allowed
     result = {
         "ok": allowed,
@@ -6456,11 +6509,7 @@ def agent_spawn_offers(required_slots: int = 1) -> dict[str, Any]:
     if not allowed:
         result["errors"] = admission.get(
             "errors",
-            spawn_error_details(
-                reason_codes,
-                required_slots=required_slots,
-                available_slots=admission.get("available_slots"),
-            ),
+            spawn_error_details(reason_codes),
         )
     return result
 
@@ -7028,30 +7077,1489 @@ def close_runner_execution_fd(agent: str) -> None:
             os.close(fd)
 
 
-def open_runner_execution_path(
-    agent: str,
-    path: Path,
-    expected_stat: os.stat_result,
-) -> Path:
-    flags = getattr(os, "O_PATH", os.O_RDONLY)
+def _managed_codex_home(home: Path) -> Path:
+    if not isinstance(home, Path) or not home.is_absolute():
+        raise AgentError("managed_codex_home_invalid")
+    try:
+        metadata = home.lstat()
+    except OSError as exc:
+        raise AgentError("managed_codex_home_invalid") from exc
+    if (
+        stat_module.S_ISLNK(metadata.st_mode)
+        or not stat_module.S_ISDIR(metadata.st_mode)
+        or metadata.st_mode & 0o022
+    ):
+        raise AgentError("managed_codex_home_invalid")
+    return home
+
+
+def _managed_codex_wrapper_snapshot(wrapper: Path) -> os.stat_result:
+    if not isinstance(wrapper, Path) or not wrapper.is_absolute():
+        raise AgentError("managed_codex_runner_metadata_invalid")
+    try:
+        expected = wrapper.lstat()
+    except OSError as exc:
+        raise AgentError("managed_codex_runner_metadata_invalid") from exc
+    if (
+        stat_module.S_ISLNK(expected.st_mode)
+        or not stat_module.S_ISREG(expected.st_mode)
+        or getattr(expected, "st_nlink", 1) != 1
+        or expected.st_mode & 0o022
+        or expected.st_mode & 0o111 == 0
+        or expected.st_size > _MANAGED_CODEX_WRAPPER_MAX_BYTES
+    ):
+        raise AgentError("managed_codex_runner_metadata_invalid")
+    return expected
+
+
+def _read_managed_codex_wrapper(wrapper: Path, expected: os.stat_result) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        current_before = wrapper.lstat()
+        if not source_identity_with_snapshot_matches(current_before, expected):
+            raise AgentError("managed_codex_runner_changed")
+        fd = os.open(wrapper, flags)
+    except OSError as exc:
+        raise AgentError("managed_codex_runner_changed") from exc
+    try:
+        opened = os.fstat(fd)
+        data = os.read(fd, _MANAGED_CODEX_WRAPPER_MAX_BYTES + 1)
+        current = wrapper.lstat()
+    except OSError as exc:
+        raise AgentError("managed_codex_runner_changed") from exc
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+    if (
+        len(data) > _MANAGED_CODEX_WRAPPER_MAX_BYTES
+        or not source_identity_with_snapshot_matches(opened, expected)
+        or not source_identity_with_snapshot_matches(current, expected)
+        or not stat_module.S_ISREG(opened.st_mode)
+        or getattr(opened, "st_nlink", 1) != 1
+        or opened.st_mode & 0o022
+        or opened.st_mode & 0o111 == 0
+    ):
+        raise AgentError("managed_codex_runner_changed")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise AgentError("managed_codex_runner_metadata_invalid") from exc
+
+
+def _read_managed_codex_metadata(path: Path) -> dict[str, Any]:
+    if (
+        not path.is_absolute()
+        or not directory_chain_is_real_no_symlink(path.parent)
+        or not executable_directory_chain_is_trusted(path.parent)
+    ):
+        raise AgentError("managed_codex_runner_metadata_invalid")
+    try:
+        expected = path.lstat()
+    except OSError as exc:
+        raise AgentError("managed_codex_runner_metadata_invalid") from exc
+    if (
+        not stat_module.S_ISREG(expected.st_mode)
+        or getattr(expected, "st_nlink", 1) != 1
+        or expected.st_uid != 0
+        or expected.st_mode & 0o022
+        or expected.st_size > _MANAGED_CODEX_METADATA_MAX_BYTES
+    ):
+        raise AgentError("managed_codex_runner_metadata_invalid")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
         fd = os.open(path, flags)
     except OSError as exc:
-        raise AgentError("runner changed unexpectedly") from exc
+        raise AgentError("managed_codex_runner_metadata_invalid") from exc
+    try:
+        opened = os.fstat(fd)
+        data = os.read(fd, _MANAGED_CODEX_METADATA_MAX_BYTES + 1)
+        current = path.lstat()
+    except OSError as exc:
+        raise AgentError("managed_codex_runner_metadata_invalid") from exc
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+    if (
+        len(data) > _MANAGED_CODEX_METADATA_MAX_BYTES
+        or not source_identity_with_snapshot_matches(opened, expected)
+        or not source_identity_with_snapshot_matches(current, expected)
+        or not stat_module.S_ISREG(opened.st_mode)
+        or getattr(opened, "st_nlink", 1) != 1
+        or opened.st_uid != 0
+        or opened.st_mode & 0o022
+    ):
+        raise AgentError("managed_codex_runner_metadata_invalid")
+    try:
+        metadata = json.loads(data)
+    except (TypeError, ValueError, UnicodeDecodeError) as exc:
+        raise AgentError("managed_codex_runner_metadata_invalid") from exc
+    if not isinstance(metadata, dict):
+        raise AgentError("managed_codex_runner_metadata_invalid")
+    return metadata
+
+
+def _managed_codex_platform_layout() -> tuple[str, str]:
+    try:
+        platform_name = os.uname().sysname
+        machine = os.uname().machine
+    except (AttributeError, OSError) as exc:
+        raise AgentError("managed_codex_runner_platform_unsupported") from exc
+    layouts = {
+        ("Linux", "x86_64"): ("codex-linux-x64", "x86_64-unknown-linux-musl"),
+        ("Linux", "aarch64"): ("codex-linux-arm64", "aarch64-unknown-linux-musl"),
+    }
+    layout = layouts.get((platform_name, machine))
+    if layout is None:
+        raise AgentError("managed_codex_runner_platform_unsupported")
+    return layout
+
+
+def _managed_codex_launcher(path: Path) -> Path:
+    if not path.is_absolute():
+        raise AgentError("managed_codex_runner_metadata_invalid")
+    current = path
+    for _ in range(_MANAGED_CODEX_MAX_SYMLINKS + 1):
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            raise AgentError("managed_codex_runner_metadata_invalid") from exc
+        if not stat_module.S_ISLNK(metadata.st_mode):
+            break
+        if metadata.st_uid != 0:
+            raise AgentError("managed_codex_runner_metadata_invalid")
+        try:
+            target = os.readlink(current)
+        except OSError as exc:
+            raise AgentError("managed_codex_runner_metadata_invalid") from exc
+        current = Path(os.path.abspath(target if os.path.isabs(target) else current.parent / target))
+    else:
+        raise AgentError("managed_codex_runner_metadata_invalid")
+    try:
+        final = current.lstat()
+    except OSError as exc:
+        raise AgentError("managed_codex_runner_metadata_invalid") from exc
+    if (
+        current.name != "codex.js"
+        or not stat_module.S_ISREG(final.st_mode)
+        or getattr(final, "st_nlink", 1) != 1
+        or final.st_uid != 0
+        or final.st_mode & 0o022
+        or final.st_mode & 0o111 == 0
+        or not directory_chain_is_real_no_symlink(path.parent)
+        or not directory_chain_is_real_no_symlink(current.parent)
+        or not executable_directory_chain_is_trusted(path.parent)
+        or not executable_directory_chain_is_trusted(current.parent)
+    ):
+        raise AgentError("managed_codex_runner_metadata_invalid")
+    return current
+
+
+def _managed_codex_native_from_launcher(launcher_path: Path) -> Path:
+    launcher = _managed_codex_launcher(launcher_path)
+    if launcher.parent.name != "bin":
+        raise AgentError("managed_codex_runner_metadata_invalid")
+    package_root = launcher.parent.parent
+    try:
+        package_stat = package_root.lstat()
+    except OSError as exc:
+        raise AgentError("managed_codex_runner_metadata_invalid") from exc
+    if (
+        not stat_module.S_ISDIR(package_stat.st_mode)
+        or package_stat.st_uid != 0
+        or package_stat.st_mode & 0o022
+    ):
+        raise AgentError("managed_codex_runner_metadata_invalid")
+    package = _read_managed_codex_metadata(package_root / "package.json")
+    if package.get("name") != "@openai/codex" or package.get("bin") != {"codex": "bin/codex.js"}:
+        raise AgentError("managed_codex_runner_metadata_invalid")
+    package_name, target_triple = _managed_codex_platform_layout()
+    optional_dependencies = package.get("optionalDependencies")
+    if not isinstance(optional_dependencies, dict) or f"@openai/{package_name}" not in optional_dependencies:
+        raise AgentError("managed_codex_runner_platform_unsupported")
+    candidate_roots = (
+        package_root / "node_modules" / "@openai" / package_name / "vendor" / target_triple,
+        package_root / "vendor" / target_triple,
+    )
+    candidates: list[Path] = []
+    for root in candidate_roots:
+        candidate = root / "bin" / "codex"
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise AgentError("managed_codex_runner_metadata_invalid") from exc
+        candidates.append(candidate)
+    if not candidates:
+        raise AgentError("managed_codex_runner_native_missing")
+    if len(candidates) != 1:
+        raise AgentError("managed_codex_runner_native_ambiguous")
+    native = candidates[0]
+    try:
+        native.relative_to(package_root)
+    except ValueError as exc:
+        raise AgentError("managed_codex_runner_metadata_invalid") from exc
+    vendor_metadata = _read_managed_codex_metadata(native.parents[1] / "codex-package.json")
+    if (
+        vendor_metadata.get("layoutVersion") != 1
+        or vendor_metadata.get("variant") != "codex"
+        or vendor_metadata.get("target") != target_triple
+        or vendor_metadata.get("entrypoint") != "bin/codex"
+    ):
+        raise AgentError("managed_codex_runner_metadata_invalid")
+    return native
+
+
+def _managed_codex_native_snapshot(native: Path) -> os.stat_result:
+    try:
+        expected = native.lstat()
+    except OSError as exc:
+        raise AgentError("managed_codex_runner_invalid") from exc
+    if (
+        stat_module.S_ISLNK(expected.st_mode)
+        or not stat_module.S_ISREG(expected.st_mode)
+        or getattr(expected, "st_nlink", 1) != 1
+        or expected.st_mode & 0o022
+        or expected.st_mode & 0o111 == 0
+    ):
+        raise AgentError("managed_codex_runner_invalid")
+    return expected
+
+
+def _managed_codex_native_path(
+    agent: str,
+    home: Path,
+    wrapper: Path,
+    wrapper_snapshot: os.stat_result,
+) -> tuple[Path, os.stat_result]:
+    home = _managed_codex_home(home)
+    wrapper_text = _read_managed_codex_wrapper(wrapper, wrapper_snapshot)
+    candidates = _MANAGED_CODEX_BIN_LINE.findall(wrapper_text)
+    if not candidates:
+        raise AgentError("managed_codex_runner_metadata_missing")
+    if len(candidates) != 1:
+        raise AgentError("managed_codex_runner_metadata_ambiguous")
+    try:
+        words = shlex.split(candidates[0], posix=True)
+    except ValueError as exc:
+        raise AgentError("managed_codex_runner_metadata_invalid") from exc
+    if len(words) != 1:
+        raise AgentError("managed_codex_runner_metadata_invalid")
+    configured = Path(words[0])
+    if not configured.is_absolute() or wrapper_text != pool_wrapper_text(agent, home, str(configured)):
+        raise AgentError("managed_codex_runner_metadata_invalid")
+    try:
+        configured_stat = configured.lstat()
+    except OSError as exc:
+        raise AgentError("managed_codex_runner_invalid") from exc
+    native = (
+        _managed_codex_native_from_launcher(configured)
+        if stat_module.S_ISLNK(configured_stat.st_mode) or configured.name == "codex.js"
+        else configured
+    )
+    return native, _managed_codex_native_snapshot(native)
+
+
+_RUNTIME_CLASS_MARKDOWN_RE = re.compile(r"AGENTS\.class-[a-z0-9][a-z0-9_-]{0,63}\.md\Z")
+_FLEET_AGENT_MARKER_BASE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "agent_id",
+        "prefix",
+        "runner",
+        "provider",
+        "model",
+        "managed_files",
+        "files",
+    }
+)
+_FLEET_RUNTIME_SKILL_PROFILE_FIELD = "runtime_skill_profile"
+
+
+def _runtime_class_projection_name(name: str) -> bool:
+    return (
+        name == "AGENTS.md"
+        or _RUNTIME_CLASS_MARKDOWN_RE.fullmatch(name) is not None
+        or (name.startswith("skills/.portable/") and name.endswith("/SKILL.md"))
+    )
+
+
+def _runtime_class_skill_profile(agent_class: str) -> str:
+    profile = load_agent_class_catalog(repo_root() / "codex-agent-classes.json").get(agent_class)
+    if profile is None:
+        raise AgentError("agent_class_materialization_invalid")
+    return "worker" if profile.role_kind == "worker" else profile.class_id
+
+
+def _known_runtime_skill_profiles(error: str) -> frozenset[str]:
+    try:
+        profiles = load_agent_class_catalog(repo_root() / "codex-agent-classes.json").values()
+        return frozenset(
+            "worker" if profile.role_kind == "worker" else profile.class_id
+            for profile in profiles
+        )
+    except Exception as exc:
+        raise AgentError(error) from exc
+
+
+def _fleet_marker_runtime_skill_profile(
+    marker: Mapping[str, Any],
+    descriptor: AgentDescriptor,
+    error: str,
+) -> str | None:
+    if _FLEET_RUNTIME_SKILL_PROFILE_FIELD not in marker:
+        return None
+    value = marker[_FLEET_RUNTIME_SKILL_PROFILE_FIELD]
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or value == "generic"
+        or descriptor.runner is not RunnerKind.CODEX_CLI
+    ):
+        raise AgentError(error)
+    allowed = _known_runtime_skill_profiles(error)
+    if value not in allowed:
+        raise AgentError(error)
+    return value
+
+
+def _fleet_legacy_marker_runtime_skill_profile(
+    managed_files: list[Any],
+    descriptor: AgentDescriptor,
+    error: str,
+) -> str:
+    if descriptor.runner is not RunnerKind.CODEX_CLI:
+        raise AgentError(error)
+    class_files = [
+        name
+        for name in managed_files
+        if isinstance(name, str) and _RUNTIME_CLASS_MARKDOWN_RE.fullmatch(name) is not None
+    ]
+    if len(class_files) != 1:
+        raise AgentError(error)
+    profile = class_files[0][len("AGENTS.class-"):-len(".md")]
+    if profile == "generic" or profile not in _known_runtime_skill_profiles(error):
+        raise AgentError(error)
+    return profile
+
+
+def _fleet_legacy_marker_migration_allowed(descriptor: AgentDescriptor) -> bool:
+    if _fleet_tmux_state(descriptor.session) != "stopped":
+        return False
+    try:
+        summary = agent_home_process_summary(descriptor.agent_id)
+    except Exception:
+        return False
+    return all(
+        type(summary.get(field)) is int and summary[field] == 0
+        for field in ("process_count", "managed_process_count", "external_process_count")
+    )
+
+
+def _fleet_effective_runtime_descriptor(
+    marker: Mapping[str, Any],
+    descriptor: AgentDescriptor,
+    error: str,
+) -> tuple[AgentDescriptor, str | None]:
+    runtime_profile = _fleet_marker_runtime_skill_profile(marker, descriptor, error)
+    return (
+        dataclass_replace(descriptor, skill_profile=runtime_profile)
+        if runtime_profile is not None
+        else descriptor,
+        runtime_profile,
+    )
+
+
+def _legacy_pool_wrapper_runner(home: Path, text: str) -> Path:
+    """Return runner from one exact authorized pool wrapper template."""
+
+    home_text = pool_shell_double_content(str(home))
+    prefix = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            "",
+            f'export CODEX_HOME="{home_text}"',
+            'if [[ -z "${CODEX_AGENT_BIN:-}" ]]; then',
+            "  CODEX_AGENT_BIN=",
+        ]
+    )
+    suffixes = (
+        "\n".join(
+            [
+                "",
+                "fi",
+                "export CODEX_AGENT_BIN",
+                "unset CODEX_ACCESS_TOKEN OPENAI_API_KEY",
+                "if taskset --cpu-list 4-10 /usr/bin/true >/dev/null 2>&1; then",
+                '  exec taskset --cpu-list 4-10 /usr/bin/env -- "${CODEX_AGENT_BIN}" "$@"',
+                "fi",
+                'exec /usr/bin/env -- "${CODEX_AGENT_BIN}" "$@"',
+                "",
+            ]
+        ),
+        "\n".join(
+            [
+                "",
+                "fi",
+                "export CODEX_AGENT_BIN",
+                "unset CODEX_ACCESS_TOKEN OPENAI_API_KEY",
+                'exec "${CODEX_AGENT_BIN}" "$@"',
+                "",
+            ]
+        ),
+        "\n".join(
+            [
+                "",
+                "fi",
+                "export CODEX_AGENT_BIN",
+                "unset CODEX_ACCESS_TOKEN OPENAI_API_KEY",
+                'exec -- "${CODEX_AGENT_BIN}" "$@"',
+                "",
+            ]
+        ),
+        "\n".join(
+            [
+                "",
+                "fi",
+                "export CODEX_AGENT_BIN",
+                "unset CODEX_ACCESS_TOKEN OPENAI_API_KEY",
+                'exec taskset --cpu-list 4-10 /usr/bin/env -- "${CODEX_AGENT_BIN}" "$@"',
+                "",
+            ]
+        ),
+    )
+    for suffix in suffixes:
+        if not text.startswith(prefix) or not text.endswith(suffix):
+            continue
+        encoded = text[len(prefix):-len(suffix)]
+        try:
+            words = shlex.split(encoded, posix=True)
+        except ValueError:
+            continue
+        if len(words) != 1:
+            continue
+        runner = Path(words[0])
+        if runner.is_absolute() and text == prefix + shlex.quote(str(runner)) + suffix:
+            return runner
+
+    legacy_prefix = "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            "",
+            f'export CODEX_HOME="{home_text}"',
+            ': "${CODEX_AGENT_BIN:=',
+        ]
+    )
+    legacy_suffix = "\n".join(
+        [
+            '}"',
+            "unset CODEX_ACCESS_TOKEN OPENAI_API_KEY",
+            'exec "${CODEX_AGENT_BIN}" "$@"',
+            "",
+        ]
+    )
+    if text.startswith(legacy_prefix) and text.endswith(legacy_suffix):
+        encoded = text[len(legacy_prefix):-len(legacy_suffix)]
+        if re.fullmatch(r"(?:[^\\\"\n]|\\[\\\"$`])*", encoded):
+            unescaped = re.sub(r"\\([\\\"$`])", r"\1", encoded)
+            runner = Path(unescaped)
+            if runner.is_absolute() and text == legacy_prefix + pool_shell_double_content(str(runner)) + legacy_suffix:
+                return runner
+    raise AgentError("agent_class_materialization_invalid")
+
+
+def _home_refresh_text(value: Any, *, field: str, maximum: int) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > maximum
+        or "\x00" in value
+        or any(ord(char) < 32 for char in value)
+    ):
+        raise AgentError("agent_class_materialization_invalid")
+    return value
+
+
+_HOME_REFRESH_PLUGIN_HOOK_ID_RE = re.compile(
+    r"(?P<plugin>[a-z0-9][a-z0-9_-]{0,63})@"
+    r"(?P<source>[a-z0-9][a-z0-9_-]{0,63}):"
+    r"hooks/hooks\.json:"
+    r"(?P<event>[a-z][a-z0-9_]{0,63}):"
+    r"(?P<group>0|[1-9][0-9]{0,3}):"
+    r"(?P<handler>0|[1-9][0-9]{0,3})"
+)
+_HOME_REFRESH_PLUGIN_EVENT_NAMES = MappingProxyType(
+    {
+        "session_start": "SessionStart",
+        "stop": "Stop",
+    }
+)
+
+
+def _home_refresh_open_trusted_directory_at(parent_fd: int, name: str) -> int:
+    current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        not stat_module.S_ISDIR(current.st_mode)
+        or current.st_uid not in {0, os.geteuid()}
+        or current.st_mode & 0o022
+        or current.st_mode & 0o500 != 0o500
+    ):
+        raise AgentError("agent_class_materialization_invalid")
+    return open_directory_no_follow_matching(
+        name,
+        current,
+        error_text="agent_class_materialization_invalid",
+        changed_text="agent_class_materialization_invalid",
+        dir_fd=parent_fd,
+    )
+
+
+def _home_refresh_read_trusted_json_at(parent_fd: int, name: str) -> dict[str, Any]:
+    current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        not stat_module.S_ISREG(current.st_mode)
+        or getattr(current, "st_nlink", 1) != 1
+        or current.st_uid not in {0, os.geteuid()}
+        or current.st_mode & 0o022
+        or current.st_mode & 0o444 == 0
+        or current.st_size > MAX_PLUGIN_MANIFEST_BYTES
+    ):
+        raise AgentError("agent_class_materialization_invalid")
+    parent = Path(f"/proc/self/fd/{parent_fd}")
+    text = read_private_regular_text(
+        parent / name,
+        MAX_PLUGIN_MANIFEST_BYTES,
+        "agent_class_materialization_invalid",
+        expected_parent_stat=parent.lstat(),
+        expected_target_stat=current,
+    )
+    after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not source_identity_with_snapshot_matches(after, current):
+        raise AgentError("agent_class_materialization_invalid")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        raise AgentError("agent_class_materialization_invalid") from None
+    if not isinstance(payload, dict):
+        raise AgentError("agent_class_materialization_invalid")
+    return payload
+
+
+def _home_refresh_plugin_hook_hash(
+    event: str,
+    group: dict[str, Any],
+    handler: dict[str, Any],
+) -> str:
+    if event == "session_start":
+        if set(group) != {"matcher", "hooks"} or set(handler) != {
+            "type",
+            "command",
+            "commandWindows",
+            "timeout",
+            "statusMessage",
+        }:
+            raise AgentError("agent_class_materialization_invalid")
+        matcher = _home_refresh_text(group["matcher"], field="matcher", maximum=1024)
+        status_message = _home_refresh_text(
+            handler["statusMessage"],
+            field="statusMessage",
+            maximum=1024,
+        )
+    elif event == "stop":
+        if set(group) != {"hooks"} or set(handler) != {
+            "type",
+            "command",
+            "commandWindows",
+            "timeout",
+        }:
+            raise AgentError("agent_class_materialization_invalid")
+        matcher = None
+        status_message = None
+    else:
+        raise AgentError("agent_class_materialization_invalid")
+    command = _home_refresh_text(handler["command"], field="command", maximum=4096)
+    _home_refresh_text(handler["commandWindows"], field="commandWindows", maximum=4096)
+    timeout = handler["timeout"]
+    if handler["type"] != "command" or type(timeout) is not int or not 0 <= timeout <= 86_400:
+        raise AgentError("agent_class_materialization_invalid")
+    normalized_handler: dict[str, Any] = {
+        "type": "command",
+        "command": command,
+        "timeout": max(timeout, 1),
+        "async": False,
+    }
+    if status_message is not None:
+        normalized_handler["statusMessage"] = status_message
+    identity: dict[str, Any] = {
+        "event_name": event,
+        "hooks": [normalized_handler],
+    }
+    if matcher is not None:
+        identity["matcher"] = matcher
+    canonical = json.dumps(
+        identity,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def _home_refresh_authorize_plugin_hook(
+    match: re.Match[str],
+    trusted_hash: str,
+) -> None:
+    fds: list[int] = []
+    try:
+        cache_root = codex_plugin_cache_root().parents[1]
+        if (
+            not directory_chain_is_real_no_symlink(cache_root)
+            or not executable_directory_chain_is_trusted(cache_root)
+        ):
+            raise AgentError("agent_class_materialization_invalid")
+        cache_stat = cache_root.lstat()
+        cache_fd = open_directory_chain_no_follow_matching(
+            cache_root,
+            cache_stat,
+            error_text="agent_class_materialization_invalid",
+            changed_text="agent_class_materialization_invalid",
+        )
+        fds.append(cache_fd)
+        source_fd = _home_refresh_open_trusted_directory_at(cache_fd, match["source"])
+        fds.append(source_fd)
+        plugin_fd = _home_refresh_open_trusted_directory_at(source_fd, match["plugin"])
+        fds.append(plugin_fd)
+
+        entries = sorted(os.listdir(plugin_fd))
+        marker_name = ".codex-remote-plugin-install.json"
+        version_names = [name for name in entries if name != marker_name]
+        if len(version_names) != 1 or PLUGIN_VERSION_RE.fullmatch(version_names[0]) is None:
+            raise AgentError("agent_class_materialization_invalid")
+        marker = _home_refresh_read_trusted_json_at(plugin_fd, marker_name)
+        if (
+            set(marker) != {"schema_version", "remote_plugin_id"}
+            or marker["schema_version"] != 1
+            or not isinstance(marker["remote_plugin_id"], str)
+            or re.fullmatch(r"plugins_[0-9a-f]{32}", marker["remote_plugin_id"]) is None
+        ):
+            raise AgentError("agent_class_materialization_invalid")
+
+        version = version_names[0]
+        version_fd = _home_refresh_open_trusted_directory_at(plugin_fd, version)
+        fds.append(version_fd)
+        plugin_manifest_fd = _home_refresh_open_trusted_directory_at(version_fd, ".codex-plugin")
+        fds.append(plugin_manifest_fd)
+        plugin_manifest = _home_refresh_read_trusted_json_at(plugin_manifest_fd, "plugin.json")
+        if plugin_manifest.get("name") != match["plugin"] or plugin_manifest.get("version") != version:
+            raise AgentError("agent_class_materialization_invalid")
+
+        hooks_fd = _home_refresh_open_trusted_directory_at(version_fd, "hooks")
+        fds.append(hooks_fd)
+        if os.listdir(hooks_fd) != ["hooks.json"]:
+            raise AgentError("agent_class_materialization_invalid")
+        hook_manifest = _home_refresh_read_trusted_json_at(hooks_fd, "hooks.json")
+        if set(hook_manifest) != {"hooks"} or not isinstance(hook_manifest["hooks"], dict):
+            raise AgentError("agent_class_materialization_invalid")
+        manifest_event = _HOME_REFRESH_PLUGIN_EVENT_NAMES.get(match["event"])
+        groups = hook_manifest["hooks"].get(manifest_event) if manifest_event is not None else None
+        if not isinstance(groups, list):
+            raise AgentError("agent_class_materialization_invalid")
+        group_index = int(match["group"])
+        handler_index = int(match["handler"])
+        if group_index >= len(groups) or not isinstance(groups[group_index], dict):
+            raise AgentError("agent_class_materialization_invalid")
+        group = groups[group_index]
+        handlers = group.get("hooks")
+        if (
+            not isinstance(handlers, list)
+            or handler_index >= len(handlers)
+            or not isinstance(handlers[handler_index], dict)
+        ):
+            raise AgentError("agent_class_materialization_invalid")
+        derived_hash = _home_refresh_plugin_hook_hash(
+            match["event"],
+            group,
+            handlers[handler_index],
+        )
+        if not hmac.compare_digest(derived_hash, trusted_hash):
+            raise AgentError("agent_class_materialization_invalid")
+    except (AgentError, IndexError, OSError, TypeError, ValueError):
+        raise AgentError("agent_class_materialization_invalid") from None
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+def _home_refresh_config(
+    home: Path,
+    data: bytes,
+    *,
+    model: Any,
+    reasoning_effort: Any,
+) -> bytes:
+    """Keep narrow user trust state while restoring Fleet-owned Codex settings."""
+
+    try:
+        document = tomllib.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        raise AgentError("agent_class_materialization_invalid") from None
+    if not isinstance(document, dict) or set(document) - {
+        "model_catalog_json",
+        "service_tier",
+        "model",
+        "model_reasoning_effort",
+        "approval_policy",
+        "sandbox_mode",
+        "tui",
+        "projects",
+        "hooks",
+    }:
+        raise AgentError("agent_class_materialization_invalid")
+    catalog = document.get("model_catalog_json")
+    if catalog is not None:
+        catalog = _home_refresh_text(catalog, field="model_catalog_json", maximum=MAX_PATH_TEXT)
+        if not Path(catalog).is_absolute():
+            raise AgentError("agent_class_materialization_invalid")
+    tier = document.get("service_tier")
+    if tier is not None and (
+        not isinstance(tier, str)
+        or re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", tier) is None
+    ):
+        raise AgentError("agent_class_materialization_invalid")
+    for field, maximum in (
+        ("model", 128),
+        ("approval_policy", 64),
+        ("sandbox_mode", 64),
+    ):
+        if field in document:
+            _home_refresh_text(document[field], field=field, maximum=maximum)
+    if "model_reasoning_effort" in document and document["model_reasoning_effort"] not in {
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    }:
+        raise AgentError("agent_class_materialization_invalid")
+    tui = document.get("tui", {})
+    if not isinstance(tui, dict) or set(tui) - {"animations"} or (
+        "animations" in tui and type(tui["animations"]) is not bool
+    ):
+        raise AgentError("agent_class_materialization_invalid")
+    projects = document.get("projects", {})
+    if not isinstance(projects, dict):
+        raise AgentError("agent_class_materialization_invalid")
+    preserved_projects: set[str] = set()
+    for path, state in projects.items():
+        if (
+            not isinstance(path, str)
+            or not Path(path).is_absolute()
+            or not isinstance(state, dict)
+            or state != {"trust_level": "trusted"}
+        ):
+            raise AgentError("agent_class_materialization_invalid")
+        preserved_projects.add(path)
+    hooks = document.get("hooks")
+    hook_state: dict[str, str | dict[str, str]] = {}
+    if hooks is not None:
+        if not isinstance(hooks, dict) or set(hooks) != {"state"} or not isinstance(hooks["state"], dict):
+            raise AgentError("agent_class_materialization_invalid")
+        for hook_id, value in hooks["state"].items():
+            plugin_match: re.Match[str] | None = None
+            if hook_id == "trusted_hash":
+                hash_value = value
+            elif (
+                isinstance(hook_id, str)
+                and len(hook_id) <= 128
+                and isinstance(value, dict)
+                and set(value) == {"trusted_hash"}
+            ):
+                plugin_match = _HOME_REFRESH_PLUGIN_HOOK_ID_RE.fullmatch(hook_id)
+                if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", hook_id) is None and plugin_match is None:
+                    raise AgentError("agent_class_materialization_invalid")
+                hash_value = value["trusted_hash"]
+            else:
+                raise AgentError("agent_class_materialization_invalid")
+            if not isinstance(hash_value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", hash_value) is None:
+                raise AgentError("agent_class_materialization_invalid")
+            if plugin_match is not None:
+                _home_refresh_authorize_plugin_hook(plugin_match, hash_value)
+            hook_state[hook_id] = hash_value if hook_id == "trusted_hash" else {"trusted_hash": hash_value}
+
+    current_model = _home_refresh_text(model, field="model", maximum=128)
+    if reasoning_effort not in {"low", "medium", "high", "xhigh", "max"}:
+        raise AgentError("agent_class_materialization_invalid")
+    preserved_projects.discard(str(home))
+    lines = []
+    if catalog is not None:
+        lines.append(f"model_catalog_json = {json.dumps(catalog)}")
+    if tier is not None:
+        lines.append(f"service_tier = {json.dumps(tier)}")
+    lines.extend(
+        [
+            f"model = {json.dumps(current_model)}",
+            f"model_reasoning_effort = {json.dumps(reasoning_effort)}",
+            'approval_policy = "never"',
+            'sandbox_mode = "danger-full-access"',
+            "",
+            "[tui]",
+            "animations = false",
+        ]
+    )
+    for path in sorted((*preserved_projects, str(home))):
+        lines.extend(["", f"[projects.{json.dumps(path)}]", 'trust_level = "trusted"'])
+    if hooks is not None:
+        lines.extend(["", "[hooks.state]"])
+        if "trusted_hash" in hook_state:
+            lines.append(f"trusted_hash = {json.dumps(hook_state['trusted_hash'])}")
+        for hook_id in sorted(key for key in hook_state if key != "trusted_hash"):
+            value = hook_state[hook_id]
+            serialized_hook_id = (
+                hook_id
+                if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", hook_id) is not None
+                else json.dumps(hook_id)
+            )
+            lines.extend(
+                [
+                    "",
+                    f"[hooks.state.{serialized_hook_id}]",
+                    f"trusted_hash = {json.dumps(value['trusted_hash'])}",
+                ]
+            )
+    return ("\n".join((*lines, ""))).encode("utf-8")
+
+
+def _materialize_managed_codex_runtime_class(
+    descriptor: AgentDescriptor,
+    agent_class: str,
+    *,
+    expected_pool_parent_stat: os.stat_result,
+    expected_pool_root_stat: os.stat_result,
+    expected_home_stat: os.stat_result,
+    confirm_home_refresh: bool = False,
+    model_reasoning_effort: str | None = None,
+) -> bool:
+    """Project resolver-selected class context into one stopped, pinned Fleet home."""
+
+    if (
+        descriptor.runner is not RunnerKind.CODEX_CLI
+        or descriptor.home != AGENT_POOL_ROOT / descriptor.agent_id
+        or type(confirm_home_refresh) is not bool
+    ):
+        raise AgentError("agent_class_materialization_invalid")
+    runtime_profile = _runtime_class_skill_profile(agent_class)
+    projected = dataclass_replace(descriptor, skill_profile=runtime_profile)
+    desired = fleet_markdown_artifacts(projected)
+    if runtime_profile != "generic":
+        desired.update(portable_gemini_skill_artifacts(runtime_profile))
+    if (
+        not desired
+        or len(desired) > MAX_PORTABLE_SKILLS + 2
+        or any(not _runtime_class_projection_name(name) for name in desired)
+    ):
+        raise AgentError("agent_class_materialization_invalid")
+
+    journal: list[dict[str, Any]] = []
+
+    def replace_at(
+        home_fd: int,
+        name: str,
+        data: bytes,
+        expected: os.stat_result | None,
+        mode: int = 0o600,
+    ) -> os.stat_result:
+        parent_fd, basename = _fleet_open_artifact_parent(
+            home_fd,
+            name,
+            create=False,
+            error="agent_class_materialization_changed",
+        )
+        try:
+            replace_private_bytes(
+                Path(f"/proc/self/fd/{parent_fd}") / basename,
+                data,
+                mode=mode,
+                expected_existing_stat=expected,
+            )
+            current = os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                not stat_module.S_ISREG(current.st_mode)
+                or getattr(current, "st_nlink", 1) != 1
+                or current.st_uid != os.geteuid()
+                or stat_module.S_IMODE(current.st_mode) != mode
+            ):
+                raise AgentError("agent_class_materialization_changed")
+            return current
+        except AgentError:
+            raise
+        except OSError as exc:
+            raise AgentError("agent_class_materialization_changed") from exc
+        finally:
+            os.close(parent_fd)
+
+    def optional_file_at(
+        home_fd: int,
+        name: str,
+        mode: int,
+    ) -> tuple[bytes, os.stat_result] | None:
+        parent_fd, basename = _fleet_open_artifact_parent(
+            home_fd,
+            name,
+            create=False,
+            error="agent_class_materialization_changed",
+        )
+        try:
+            try:
+                os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+        finally:
+            os.close(parent_fd)
+        return _fleet_read_private_file_at(
+            home_fd,
+            name,
+            mode,
+            "agent_class_materialization_changed",
+        )
+
+    def optional_directory_at(home_fd: int, name: str) -> os.stat_result | None:
+        parent_fd, basename = _fleet_open_artifact_parent(
+            home_fd,
+            name,
+            create=False,
+            error="agent_class_materialization_changed",
+        )
+        try:
+            try:
+                current = os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+            _fleet_private_directory_stat(current, "agent_class_materialization_changed")
+            return current
+        finally:
+            os.close(parent_fd)
+
+    def ensure_directory_at(home_fd: int, name: str) -> None:
+        current = optional_directory_at(home_fd, name)
+        if current is not None:
+            return
+        journal.append({"kind": "directory_create", "name": name})
+        parent_fd, basename = _fleet_open_artifact_parent(
+            home_fd,
+            name,
+            create=False,
+            error="agent_class_materialization_changed",
+        )
+        child_fd = -1
+        try:
+            os.mkdir(basename, 0o700, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            child_fd = open_directory_no_follow_matching(
+                basename,
+                os.stat(basename, dir_fd=parent_fd, follow_symlinks=False),
+                error_text="agent_class_materialization_changed",
+                changed_text="agent_class_materialization_changed",
+                dir_fd=parent_fd,
+            )
+            _fleet_private_directory_stat(
+                os.fstat(child_fd),
+                "agent_class_materialization_changed",
+            )
+        finally:
+            if child_fd >= 0:
+                os.close(child_fd)
+            os.close(parent_fd)
+
+    def remove_empty_directory_at(home_fd: int, name: str) -> None:
+        current = optional_directory_at(home_fd, name)
+        if current is None:
+            return
+        entry = {"kind": "directory_remove", "name": name, "before_stat": current}
+        journal.append(entry)
+        parent_fd, basename = _fleet_open_artifact_parent(
+            home_fd,
+            name,
+            create=False,
+            error="agent_class_materialization_changed",
+        )
+        try:
+            try:
+                os.rmdir(basename, dir_fd=parent_fd)
+            except OSError as exc:
+                if exc.errno in {errno.ENOTEMPTY, errno.EEXIST}:
+                    journal.pop()
+                    return
+                raise
+            os.fsync(parent_fd)
+            try:
+                os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            raise AgentError("agent_class_materialization_changed")
+        finally:
+            os.close(parent_fd)
+
+    def journal_file(
+        name: str,
+        before_data: bytes | None,
+        before_stat: os.stat_result | None,
+        after_data: bytes | None,
+        mode: int = 0o600,
+    ) -> None:
+        journal.append(
+            {
+                "kind": "file",
+                "name": name,
+                "before_data": before_data,
+                "before_stat": before_stat,
+                "after_data": after_data,
+                "mode": mode,
+            }
+        )
+
+    def unlink_at(home_fd: int, name: str, expected: os.stat_result) -> None:
+        parent_fd, basename = _fleet_open_artifact_parent(
+            home_fd,
+            name,
+            create=False,
+            error="agent_class_materialization_changed",
+        )
+        try:
+            current = os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                not source_identity_with_snapshot_matches(current, expected)
+                or not stat_module.S_ISREG(current.st_mode)
+                or getattr(current, "st_nlink", 1) != 1
+            ):
+                raise AgentError("agent_class_materialization_changed")
+            os.unlink(basename, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except AgentError:
+            raise
+        except OSError as exc:
+            raise AgentError("agent_class_materialization_changed") from exc
+        finally:
+            os.close(parent_fd)
+
+    def rollback_file(home_fd: int, entry: Mapping[str, Any]) -> None:
+        name = str(entry["name"])
+        mode = int(entry["mode"])
+        before_data = entry["before_data"]
+        before_stat = entry["before_stat"]
+        after_data = entry["after_data"]
+        current = optional_file_at(home_fd, name, mode)
+        if before_data is not None and current is not None:
+            current_data, current_stat = current
+            if (
+                current_data == before_data
+                and before_stat is not None
+                and source_identity_with_snapshot_matches(current_stat, before_stat)
+            ):
+                return
+        if after_data is None:
+            if current is not None or before_data is None:
+                if current is None and before_data is None:
+                    return
+                raise AgentError("agent_class_materialization_rollback_failed")
+            replace_at(home_fd, name, before_data, None, mode=mode)
+            return
+        if current is None or current[0] != after_data:
+            if current is None and before_data is None:
+                return
+            raise AgentError("agent_class_materialization_rollback_failed")
+        if before_data is None:
+            unlink_at(home_fd, name, current[1])
+        else:
+            replace_at(home_fd, name, before_data, current[1], mode=mode)
+
+    def rollback_directory(home_fd: int, entry: Mapping[str, Any]) -> None:
+        name = str(entry["name"])
+        current = optional_directory_at(home_fd, name)
+        if entry["kind"] == "directory_remove":
+            before_stat = entry["before_stat"]
+            if current is not None:
+                if source_identity_with_snapshot_matches(current, before_stat):
+                    return
+                raise AgentError("agent_class_materialization_rollback_failed")
+            parent_fd, basename = _fleet_open_artifact_parent(
+                home_fd,
+                name,
+                create=False,
+                error="agent_class_materialization_rollback_failed",
+            )
+            try:
+                os.mkdir(basename, 0o700, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+            return
+        if current is None:
+            return
+        parent_fd, basename = _fleet_open_artifact_parent(
+            home_fd,
+            name,
+            create=False,
+            error="agent_class_materialization_rollback_failed",
+        )
+        child_fd = -1
+        try:
+            child_fd = open_directory_no_follow_matching(
+                basename,
+                current,
+                error_text="agent_class_materialization_rollback_failed",
+                changed_text="agent_class_materialization_rollback_failed",
+                dir_fd=parent_fd,
+            )
+            if os.listdir(child_fd):
+                raise AgentError("agent_class_materialization_rollback_failed")
+            os.close(child_fd)
+            child_fd = -1
+            os.rmdir(basename, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            if child_fd >= 0:
+                os.close(child_fd)
+            os.close(parent_fd)
+
+    def rollback(home_fd: int) -> bool:
+        restored = True
+        for entry in reversed(journal):
+            try:
+                if entry["kind"] == "file":
+                    rollback_file(home_fd, entry)
+                else:
+                    rollback_directory(home_fd, entry)
+            except BaseException:
+                restored = False
+        return restored
+
+    with pool_root_lock(AGENT_POOL_ROOT), pool_root_operation(
+        AGENT_POOL_ROOT,
+        ensure=False,
+        error_text="agent_class_materialization_changed",
+        expected_parent_stat=expected_pool_parent_stat,
+        expected_root_stat=expected_pool_root_stat,
+        require_private=True,
+    ) as root:
+        root_fd = -1
+        home_fd = -1
+        try:
+            root_fd = open_directory_no_follow_matching(
+                root,
+                expected_pool_root_stat,
+                error_text="agent_class_materialization_changed",
+                changed_text="agent_class_materialization_changed",
+            )
+            home_fd = open_directory_no_follow_matching(
+                descriptor.agent_id,
+                expected_home_stat,
+                error_text="agent_class_materialization_changed",
+                changed_text="agent_class_materialization_changed",
+                dir_fd=root_fd,
+            )
+            _fleet_private_directory_stat(
+                os.fstat(home_fd),
+                "agent_class_materialization_changed",
+            )
+            marker_bytes, marker_stat = _fleet_read_private_file_at(
+                home_fd,
+                FLEET_AGENT_MARKER_FILE,
+                0o600,
+                "agent_class_materialization_invalid",
+            )
+            try:
+                marker = json.loads(marker_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise AgentError("agent_class_materialization_invalid") from None
+            marker_fields = set(marker) if isinstance(marker, dict) else set()
+            marker_files = marker.get("files") if isinstance(marker, dict) else None
+            managed_files = marker.get("managed_files") if isinstance(marker, dict) else None
+            if (
+                not isinstance(marker, dict)
+                or marker_fields
+                not in {
+                    _FLEET_AGENT_MARKER_BASE_FIELDS,
+                    _FLEET_AGENT_MARKER_BASE_FIELDS | {_FLEET_RUNTIME_SKILL_PROFILE_FIELD},
+                }
+                or marker.get("schema_version") != 1
+                or marker.get("kind") != "codex_master_fleet_agent"
+                or marker.get("agent_id") != descriptor.agent_id
+                or marker.get("prefix") != descriptor.series_prefix
+                or marker.get("runner") != descriptor.runner.value
+                or marker.get("provider") != descriptor.provider.value
+                or not isinstance(marker.get("model"), str)
+                or not isinstance(marker_files, dict)
+                or not isinstance(managed_files, list)
+                or len(marker_files) > MAX_PORTABLE_SKILLS + 8
+                or managed_files != sorted(marker_files)
+                or len(set(managed_files)) != len(managed_files)
+            ):
+                raise AgentError("agent_class_materialization_invalid")
+
+            projection: dict[str, tuple[bytes, os.stat_result]] = {}
+            home_refresh_drift: dict[str, tuple[bytes, os.stat_result]] = {}
+            for name, digest in marker_files.items():
+                if (
+                    not _fleet_managed_name(name)
+                    or not isinstance(digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                ):
+                    raise AgentError("agent_class_materialization_invalid")
+                mode = 0o700 if name == "codex" else 0o600
+                content, current_stat = _fleet_read_private_file_at(
+                    home_fd,
+                    name,
+                    mode,
+                    "agent_class_materialization_invalid",
+                )
+                if not hmac.compare_digest(hashlib.sha256(content).hexdigest(), digest):
+                    if name not in {"codex", "config.toml"}:
+                        raise AgentError("agent_class_materialization_invalid")
+                    home_refresh_drift[name] = (content, current_stat)
+                if _runtime_class_projection_name(name):
+                    projection[name] = (content, current_stat)
+
+            legacy_runtime_profile: str | None = None
+            if _FLEET_RUNTIME_SKILL_PROFILE_FIELD not in marker:
+                legacy_runtime_profile = _fleet_legacy_marker_runtime_skill_profile(
+                    managed_files,
+                    descriptor,
+                    "agent_class_materialization_invalid",
+                )
+                if not _fleet_legacy_marker_migration_allowed(descriptor):
+                    raise AgentError("agent_class_materialization_invalid")
+                current_descriptor = dataclass_replace(descriptor, skill_profile=legacy_runtime_profile)
+            else:
+                current_descriptor, _current_runtime_profile = _fleet_effective_runtime_descriptor(
+                    marker,
+                    descriptor,
+                    "agent_class_materialization_invalid",
+                )
+            if marker.get("model") != descriptor.model and legacy_runtime_profile is None:
+                raise AgentError("agent_class_materialization_invalid")
+            current_markdown = fleet_markdown_file_names(current_descriptor)
+            marker_markdown = {
+                name
+                for name in projection
+                if name == "AGENTS.md" or _RUNTIME_CLASS_MARKDOWN_RE.fullmatch(name) is not None
+            }
+            if marker_markdown != current_markdown:
+                raise AgentError("agent_class_materialization_invalid")
+
+            home_refresh = bool(home_refresh_drift)
+            if home_refresh:
+                if (
+                    set(home_refresh_drift) != {"codex", "config.toml"}
+                    or legacy_runtime_profile is None
+                    or not _fleet_legacy_marker_migration_allowed(descriptor)
+                ):
+                    raise AgentError("agent_class_materialization_invalid")
+                try:
+                    legacy_wrapper = home_refresh_drift["codex"][0].decode("utf-8")
+                    legacy_runner = _legacy_pool_wrapper_runner(descriptor.home, legacy_wrapper)
+                    trusted_runner = trusted_runner_executable(legacy_runner)
+                    refreshed_config = _home_refresh_config(
+                        descriptor.home,
+                        home_refresh_drift["config.toml"][0],
+                        model=descriptor.model,
+                        reasoning_effort=model_reasoning_effort,
+                    )
+                except (AgentError, UnicodeDecodeError):
+                    raise AgentError("agent_class_materialization_invalid") from None
+                if not confirm_home_refresh:
+                    raise AgentError("agent_home_refresh_confirmation_required")
+                desired["codex"] = pool_wrapper_text(
+                    descriptor.agent_id,
+                    descriptor.home,
+                    str(trusted_runner),
+                ).encode("utf-8")
+                desired["config.toml"] = refreshed_config
+                projection.update(home_refresh_drift)
+
+            next_digests = {
+                name: digest
+                for name, digest in marker_files.items()
+                if not _runtime_class_projection_name(name)
+            }
+            next_digests.update(
+                {name: hashlib.sha256(content).hexdigest() for name, content in desired.items()}
+            )
+            next_marker = dict(marker)
+            next_marker["model"] = descriptor.model
+            next_marker["managed_files"] = sorted(next_digests)
+            next_marker["files"] = {
+                name: next_digests[name]
+                for name in sorted(next_digests)
+            }
+            next_runtime_profile = (
+                None if runtime_profile == descriptor.skill_profile else runtime_profile
+            )
+            if legacy_runtime_profile is not None:
+                next_marker[_FLEET_RUNTIME_SKILL_PROFILE_FIELD] = runtime_profile
+            elif (
+                _FLEET_RUNTIME_SKILL_PROFILE_FIELD in marker
+                or next_runtime_profile is not None
+            ):
+                next_marker[_FLEET_RUNTIME_SKILL_PROFILE_FIELD] = next_runtime_profile
+            next_marker_bytes = (json.dumps(next_marker, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            stale = set(projection) - set(desired)
+            current_directories = _fleet_artifact_directories(projection)
+            desired_directories = _fleet_artifact_directories(desired)
+            if (
+                not stale
+                and marker_bytes == next_marker_bytes
+                and all(projection.get(name, (None, None))[0] == content for name, content in desired.items())
+            ):
+                _fleet_managed_home_state(
+                    AGENT_POOL_ROOT,
+                    descriptor,
+                    strict_contents=True,
+                )
+                return False
+
+            try:
+                for name in sorted(desired_directories, key=lambda item: (len(Path(item).parts), item)):
+                    ensure_directory_at(home_fd, name)
+                for name, content in sorted(desired.items()):
+                    old = projection.get(name)
+                    if old is not None and old[0] == content:
+                        continue
+                    journal_file(
+                        name,
+                        old[0] if old is not None else None,
+                        old[1] if old is not None else None,
+                        content,
+                        mode=0o700 if name == "codex" else 0o600,
+                    )
+                    replace_at(
+                        home_fd,
+                        name,
+                        content,
+                        old[1] if old is not None else None,
+                        mode=0o700 if name == "codex" else 0o600,
+                    )
+                for name in sorted(stale):
+                    old_content, old_stat = projection[name]
+                    journal_file(name, old_content, old_stat, None)
+                    unlink_at(home_fd, name, old_stat)
+                for name in sorted(
+                    current_directories - desired_directories,
+                    key=lambda item: (-len(Path(item).parts), item),
+                ):
+                    remove_empty_directory_at(home_fd, name)
+                journal_file(
+                    FLEET_AGENT_MARKER_FILE,
+                    marker_bytes,
+                    marker_stat,
+                    next_marker_bytes,
+                )
+                replace_at(
+                    home_fd,
+                    FLEET_AGENT_MARKER_FILE,
+                    next_marker_bytes,
+                    marker_stat,
+                )
+                for name, digest in next_marker["files"].items():
+                    mode = 0o700 if name == "codex" else 0o600
+                    content, _current_stat = _fleet_read_private_file_at(
+                        home_fd,
+                        name,
+                        mode,
+                        "agent_class_materialization_changed",
+                    )
+                    if not hmac.compare_digest(hashlib.sha256(content).hexdigest(), digest):
+                        raise AgentError("agent_class_materialization_changed")
+                verified_marker, _verified_marker_stat = _fleet_read_private_file_at(
+                    home_fd,
+                    FLEET_AGENT_MARKER_FILE,
+                    0o600,
+                    "agent_class_materialization_changed",
+                )
+                if verified_marker != next_marker_bytes:
+                    raise AgentError("agent_class_materialization_changed")
+                _fleet_managed_home_state(
+                    AGENT_POOL_ROOT,
+                    descriptor,
+                    strict_contents=True,
+                )
+            except BaseException as exc:
+                if not rollback(home_fd):
+                    raise AgentError("agent_class_materialization_rollback_failed") from exc
+                if isinstance(exc, AgentError):
+                    raise
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                raise AgentError("agent_class_materialization_failed") from exc
+            return True
+        except AgentError:
+            raise
+        except OSError as exc:
+            raise AgentError("agent_class_materialization_changed") from exc
+        finally:
+            if home_fd >= 0:
+                os.close(home_fd)
+            if root_fd >= 0:
+                os.close(root_fd)
+
+
+def open_runner_execution_path(
+    agent: str,
+    path: Path,
+    expected_stat: os.stat_result,
+    *,
+    require_elf: bool = False,
+    error_code: str = "runner changed unexpectedly",
+) -> RunnerExecutionTargetV1:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise AgentError(error_code) from exc
     try:
         opened_stat = os.fstat(fd)
+        current_stat = path.lstat()
         if (
             not stat_module.S_ISREG(opened_stat.st_mode)
-            or getattr(opened_stat, "st_nlink", 1) > 1
-            or not source_identity_matches(opened_stat, expected_stat)
+            or getattr(opened_stat, "st_nlink", 1) != 1
+            or opened_stat.st_mode & 0o022
+            or not stat_module.S_ISREG(current_stat.st_mode)
+            or getattr(current_stat, "st_nlink", 1) != 1
+            or current_stat.st_mode & 0o022
+            or not source_identity_with_snapshot_matches(opened_stat, expected_stat)
+            or not source_identity_with_snapshot_matches(current_stat, expected_stat)
             or not os.access(Path(f"/proc/{os.getpid()}/fd/{fd}"), os.X_OK)
         ):
-            raise AgentError("runner changed unexpectedly")
+            raise AgentError(error_code)
+        if require_elf:
+            magic = os.pread(fd, len(_MANAGED_CODEX_ELF_MAGIC), 0)
+            if (
+                opened_stat.st_mode & 0o022
+                or opened_stat.st_mode & 0o111 == 0
+                or magic != _MANAGED_CODEX_ELF_MAGIC
+            ):
+                raise AgentError("managed_codex_runner_invalid")
         close_runner_execution_fd(agent)
         RUNNER_EXECUTION_FDS[agent] = fd
-        return Path(f"/proc/{os.getpid()}/fd/{fd}")
+        return RunnerExecutionTargetV1(
+            owner_pid=os.getpid(),
+            fd=fd,
+            device=opened_stat.st_dev,
+            inode=opened_stat.st_ino,
+        )
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        raise AgentError(error_code) from exc
     except Exception:
         with contextlib.suppress(OSError):
             os.close(fd)
@@ -7555,10 +9063,18 @@ def resolve_runtime_agent_selection(
         load_model_policy(repo_root() / "codex-model-policy.json"),
     )
     if authority_class is not None:
-        allowed_class_ids = delegable_nonleadership_class_ids(
+        allowed_class_ids = set(delegable_nonleadership_class_ids(
             authority_class,
             class_catalog,
-        )
+        ))
+        authority = class_catalog.get(authority_class)
+        if (
+            authority_class == "koenigin"
+            and requested_class == "teamleiterin"
+            and authority is not None
+            and "teamleiterin" in authority.delegation_targets
+        ):
+            allowed_class_ids.add("teamleiterin")
         classes = tuple(item for item in classes if item.class_id in allowed_class_ids)
     available_models = available_model_ids_for_routing(models, routing)
     try:
@@ -7593,6 +9109,9 @@ def available_model_ids_for_routing(
     available = {item.model_id for item in models}
     if routing is not None and routing.get("decision") != "spark":
         available -= {item.model_id for item in models if item.family == "spark"}
+        account = routing.get("account") if isinstance(routing, Mapping) else None
+        if isinstance(account, str) and spark_priority_active(account):
+            available.update(item.model_id for item in models if item.family == "spark")
     return available
 
 
@@ -7647,14 +9166,9 @@ def _resolver_target_selection_inputs(
     requested_class: str | None,
     authority_class: str | None,
 ) -> tuple[str | None, str | None]:
-    descriptor = current_agent_inventory().agents.get(agent)
-    verified_leadership_target = bool(
-        descriptor is not None
-        and getattr(descriptor, "series_prefix", None) == "q"
-        and (authority_class is None or authority_class in LEADERSHIP_CLASS_IDS)
-    )
-    if verified_leadership_target:
-        return "teamleiterin", None
+    """Keep role selection bound to verified authority, never target series."""
+
+    del agent
     return requested_class, authority_class
 
 
@@ -7723,15 +9237,18 @@ def agent_selection_options(
         class_catalog,
         load_model_policy(repo_root() / "codex-model-policy.json"),
     )
-    target_class, _resolver_authority = _resolver_target_selection_inputs(agent, None, authority_class)
-    if target_class == "teamleiterin":
-        classes = tuple(item for item in classes if item.class_id == target_class)
-    else:
-        allowed_class_ids = delegable_nonleadership_class_ids(
-            authority_class,
-            class_catalog,
-        )
-        classes = tuple(item for item in classes if item.class_id in allowed_class_ids)
+    allowed_class_ids = set(delegable_nonleadership_class_ids(
+        authority_class,
+        class_catalog,
+    ))
+    authority = class_catalog.get(authority_class)
+    if (
+        authority_class == "koenigin"
+        and authority is not None
+        and "teamleiterin" in authority.delegation_targets
+    ):
+        allowed_class_ids.add("teamleiterin")
+    classes = tuple(item for item in classes if item.class_id in allowed_class_ids)
     routing = codex_usage_routing_decision(agent, role="arbeitsbiene")
     if routing.get("decision") == "blocked" or routing.get("model") is None:
         raise AgentError(
@@ -7749,7 +9266,7 @@ def agent_selection_options(
         if str(exc).startswith(("required_model_unavailable:", "required_model_effort_unavailable:")):
             raise AgentError(str(exc)) from exc
         raise
-    if target_class == "teamleiterin" and not offer.options:
+    if authority_class == "koenigin" and "teamleiterin" in allowed_class_ids and not offer.options:
         if "gpt-5.6-terra" not in available_models:
             raise AgentError("required_model_unavailable:gpt-5.6-terra")
         raise AgentError("required_model_effort_unavailable:gpt-5.6-terra:xhigh")
@@ -8449,6 +9966,170 @@ def same_path_text(left: str, right: Path) -> bool:
         return False
 
 
+def _managed_g5_native_pane_evidence(agent: str) -> tuple[int, int, int, str] | None:
+    cfg = agent_config(agent)
+    session = cfg.get("session")
+    if not isinstance(session, str):
+        return None
+    attestation = _g5_native_runner_attestation(read_meta(agent), agent=agent, session=session)
+    if attestation is None:
+        return None
+    pane_process_id = pane_pid(session)
+    if type(pane_process_id) is not int or pane_process_id <= 0:
+        return None
+    device, inode, scope_unit = attestation
+    return pane_process_id, device, inode, scope_unit
+
+
+def _read_bounded_proc_evidence(pid_dir: Path, name: str, *, max_bytes: int) -> bytes | None:
+    if name not in {"cgroup", "environ", "status"} or type(max_bytes) is not int or max_bytes <= 0:
+        return None
+    descriptor = -1
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(pid_dir / name, flags)
+        before = os.fstat(descriptor)
+        if not stat_module.S_ISREG(before.st_mode):
+            return None
+        payload = bytearray()
+        while len(payload) <= max_bytes:
+            chunk = os.read(descriptor, min(1024, max_bytes + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        after = os.fstat(descriptor)
+        if len(payload) > max_bytes or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            return None
+        return bytes(payload)
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+
+
+def _proc_is_in_g5_scope(pid_dir: Path, scope_unit: str) -> bool:
+    if not isinstance(scope_unit, str) or not scope_unit:
+        return False
+    cgroup = _read_bounded_proc_evidence(pid_dir, "cgroup", max_bytes=4096)
+    expected_cgroup_suffix = f"/{scope_unit}\n".encode("ascii")
+    return (
+        cgroup is not None
+        and cgroup.startswith(b"0::/")
+        and cgroup.count(b"\n") == 1
+        and cgroup.endswith(expected_cgroup_suffix)
+    )
+
+
+def _proc_has_exact_g5_home_evidence(pid_dir: Path, home: Path, *, require_markers: bool) -> bool:
+    raw = _read_bounded_proc_evidence(pid_dir, "environ", max_bytes=16 * 1024)
+    if raw is None:
+        return False
+    expected = {b"CODEX_HOME", b"CODEX_MASTER_MCP", b"CODEX_AGENT_MCP"}
+    values: dict[bytes, bytes] = {}
+    for item in raw.split(b"\0"):
+        if not item or b"=" not in item:
+            continue
+        key, value = item.split(b"=", 1)
+        if key in expected:
+            if key in values:
+                return False
+            values[key] = value
+    try:
+        codex_home = values[b"CODEX_HOME"].decode("utf-8")
+    except (KeyError, UnicodeDecodeError):
+        return False
+    if not same_path_text(codex_home, home):
+        return False
+    return not require_markers or (
+        values.get(b"CODEX_MASTER_MCP") == b"1" and values.get(b"CODEX_AGENT_MCP") == b"1"
+    )
+
+
+def _proc_parent_pid_from_bounded_status(pid_dir: Path) -> int | None:
+    raw = _read_bounded_proc_evidence(pid_dir, "status", max_bytes=4096)
+    if raw is None:
+        return None
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        return None
+    values = [line.partition(":")[2].strip() for line in lines if line.startswith("PPid:")]
+    if len(values) != 1 or not values[0].isdigit() or (len(values[0]) > 1 and values[0][0] == "0"):
+        return None
+    parent = int(values[0])
+    return parent if 0 < parent <= (1 << 31) - 1 else None
+
+
+def _proc_matches_g5_native_pane(
+    pid_dir: Path,
+    *,
+    pid: int,
+    pane_process_id: int,
+    device: int,
+    inode: int,
+    scope_unit: str,
+) -> bool:
+    if pid != pane_process_id:
+        return False
+    try:
+        executable = (pid_dir / "exe").stat()
+    except OSError:
+        return False
+    return (
+        stat_module.S_ISREG(executable.st_mode)
+        and executable.st_mode & 0o111 != 0
+        and (executable.st_dev, executable.st_ino) == (device, inode)
+        and _proc_is_in_g5_scope(pid_dir, scope_unit)
+    )
+
+
+def _proc_matches_g5_native_descendant(
+    pid_dir: Path,
+    *,
+    pid: int,
+    pane_process_id: int,
+    device: int,
+    inode: int,
+    scope_unit: str,
+    home: Path,
+) -> bool:
+    if pid == pane_process_id or pid <= 0 or pane_process_id <= 0:
+        return False
+    if not _proc_has_exact_g5_home_evidence(pid_dir, home, require_markers=False):
+        return False
+    proc_root = pid_dir.parent
+    current_pid = pid
+    current_dir = pid_dir
+    visited = {pid}
+    for _depth in range(16):
+        if not _proc_is_in_g5_scope(current_dir, scope_unit):
+            return False
+        parent_pid = _proc_parent_pid_from_bounded_status(current_dir)
+        if parent_pid is None or parent_pid in visited:
+            return False
+        if parent_pid == pane_process_id:
+            pane_dir = proc_root / str(pane_process_id)
+            return (
+                _proc_has_exact_g5_home_evidence(pane_dir, home, require_markers=True)
+                and _proc_matches_g5_native_pane(
+                    pane_dir,
+                    pid=pane_process_id,
+                    pane_process_id=pane_process_id,
+                    device=device,
+                    inode=inode,
+                    scope_unit=scope_unit,
+                )
+            )
+        visited.add(parent_pid)
+        current_pid = parent_pid
+        current_dir = proc_root / str(current_pid)
+    return False
+
+
 def public_path(path: Any) -> str | None:
     if path is None or str(path) == "":
         return None
@@ -8467,6 +10148,7 @@ def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[di
     agent = canonical_agent_id(agent)
     cfg = agent_config(agent)
     home = cfg["home"]
+    native_g5_evidence = _managed_g5_native_pane_evidence(agent)
     processes: list[dict[str, Any]] = []
     if not proc_root.exists():
         return None
@@ -8482,6 +10164,10 @@ def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[di
             continue
         uid_parts = status.get("Uid", "").split()
         if uid_parts and uid_parts[0].isdigit() and int(uid_parts[0]) != os.getuid():
+            continue
+        try:
+            pid = int(pid_dir.name)
+        except ValueError:
             continue
         env = read_proc_environ(pid_dir)
         matches_home = False
@@ -8523,8 +10209,32 @@ def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[di
             managed = (
                 env.get("CODEX_AGENT_MCP") == "1" or env.get("CODEX_MASTER_MCP") == "1"
             ) and proc_is_codex_like(status, read_proc_cmdline(pid_dir))
+            if native_g5_evidence is not None:
+                pane_process_id, device, inode, scope_unit = native_g5_evidence
+                managed = managed or (
+                    _proc_has_exact_g5_home_evidence(pid_dir, home, require_markers=True)
+                    and _proc_matches_g5_native_pane(
+                        pid_dir,
+                        pid=pid,
+                        pane_process_id=pane_process_id,
+                        device=device,
+                        inode=inode,
+                        scope_unit=scope_unit,
+                    )
+                )
         if not matches_home:
             continue
+        if not managed and native_g5_evidence is not None:
+            pane_process_id, device, inode, scope_unit = native_g5_evidence
+            managed = _proc_matches_g5_native_descendant(
+                pid_dir,
+                pid=pid,
+                pane_process_id=pane_process_id,
+                device=device,
+                inode=inode,
+                scope_unit=scope_unit,
+                home=home,
+            )
         if (
             not managed
             and env is not None
@@ -8540,10 +10250,6 @@ def agent_home_processes(agent: str, proc_root: Path = Path("/proc")) -> list[di
             continue
         ppid_parts = status.get("PPid", "0").split()
         ppid = int(ppid_parts[0]) if ppid_parts and ppid_parts[0].isdigit() else None
-        try:
-            pid = int(pid_dir.name)
-        except ValueError:
-            continue
         processes.append(
             {
                 "pid": pid,
@@ -8581,26 +10287,7 @@ def agent_home_process_summary(agent: str, proc_root: Path = Path("/proc")) -> d
         for item in managed
         if item.get("ppid") not in managed_process_id_set
     ]
-    processes_by_pid = {item["pid"]: item for item in processes}
-
-    def has_managed_ancestor(item: dict[str, Any]) -> bool:
-        parent_id = item.get("ppid")
-        visited: set[int] = set()
-        while isinstance(parent_id, int) and parent_id not in visited:
-            if parent_id in managed_process_id_set:
-                return True
-            visited.add(parent_id)
-            parent = processes_by_pid.get(parent_id)
-            if parent is None:
-                break
-            parent_id = parent.get("ppid")
-        return False
-
-    external = [
-        item
-        for item in processes
-        if not item["managed_by_masterjet"] and not has_managed_ancestor(item)
-    ]
+    external = [item for item in processes if not item["managed_by_masterjet"]]
     return {
         "agent": agent,
         "home": PATH_NOT_RETURNED,
@@ -8969,7 +10656,9 @@ def release_start_lease_if_safe(
     release_agent(agent, force=True)
 
 
-def _g5_start_scope(session: str) -> tuple[ResourceGateRuntime, PreparedAgentScope]:
+def _g5_start_scope(
+    session: str, runner_target: RunnerExecutionTargetV1
+) -> tuple[ResourceGateRuntime, PreparedAgentScope]:
     """Create only a newly verified injected scope; missing evidence remains a denial."""
 
     runtime = _RESOURCE_GATE_RUNTIME.get()
@@ -8997,11 +10686,12 @@ def _g5_start_scope(session: str) -> tuple[ResourceGateRuntime, PreparedAgentSco
             },
         )
     try:
-        scope = start_verified_scope(
+        scope = start_released_scope(
             cgroup_runtime[1],
             profile=cgroup_runtime[0],
             socket_name=f"g5-{uuid.uuid4().hex[:20]}",
             session_name=session,
+            runner_target=runner_target,
         )
     except CgroupPreflightError as exc:
         raise AgentCapacityError(
@@ -9015,6 +10705,36 @@ def _g5_start_scope(session: str) -> tuple[ResourceGateRuntime, PreparedAgentSco
             },
         ) from exc
     return runtime, scope
+
+
+def _g5_confirm_scope(runtime: ResourceGateRuntime, scope: PreparedAgentScope) -> None:
+    """Publish a G5 scope only after its Gate attests the pinned runner exec."""
+
+    adapter = runtime.cgroup_adapter
+    if adapter is None:
+        raise AgentCapacityError(
+            "capacity unavailable",
+            {
+                "error_code": "spawn_capacity_unavailable",
+                "retryable": True,
+                "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS,
+                "reason_codes": ["cgroup_preflight_failed"],
+                "errors": spawn_error_details(["cgroup_preflight_failed"]),
+            },
+        )
+    try:
+        confirm_verified_scope(adapter, scope)
+    except CgroupPreflightError as exc:
+        raise AgentCapacityError(
+            "capacity unavailable",
+            {
+                "error_code": "spawn_capacity_unavailable",
+                "retryable": True,
+                "retry_after_seconds": SPAWN_OFFER_RETRY_AFTER_SECONDS,
+                "reason_codes": ["cgroup_preflight_failed"],
+                "errors": spawn_error_details(["cgroup_preflight_failed"]),
+            },
+        ) from exc
 
 
 def _cleanup_g5_scope(runtime: ResourceGateRuntime | None, scope: PreparedAgentScope | None) -> None:
@@ -9083,8 +10803,11 @@ def start_agent(
     agent_class: str | None = None,
     name: str | None = None,
     replacement_reservation_id: str | None = None,
+    confirm_home_refresh: bool = False,
 ) -> dict[str, Any]:
     require_fleet_recovery_ready("agent_start")
+    if type(confirm_home_refresh) is not bool:
+        raise AgentError("confirm_home_refresh must be a boolean")
     agent = canonical_agent_id(agent)
     with agent_lifecycle_lock(agent):
         with _resource_gate_composer_scope():
@@ -9092,6 +10815,11 @@ def start_agent(
             replacement_args = (
                 {"replacement_reservation_id": replacement_reservation_id}
                 if replacement_reservation_id is not None
+                else {}
+            )
+            home_refresh_args = (
+                {"confirm_home_refresh": True}
+                if confirm_home_refresh
                 else {}
             )
             return _start_agent_unlocked(
@@ -9105,6 +10833,7 @@ def start_agent(
                 agent_class,
                 **name_args,
                 **replacement_args,
+                **home_refresh_args,
             )
 
 
@@ -9119,8 +10848,11 @@ def _start_agent_unlocked(
     agent_class: str | None = None,
     name: str | None = None,
     replacement_reservation_id: str | None = None,
+    confirm_home_refresh: bool = False,
 ) -> dict[str, Any]:
     require_fleet_recovery_ready("agent_start")
+    if type(confirm_home_refresh) is not bool:
+        raise AgentError("confirm_home_refresh must be a boolean")
     agent = canonical_agent_id(agent)
     ollama_descriptor = _ollama_descriptor(agent)
     g5_runtime: ResourceGateRuntime | None = None
@@ -9136,16 +10868,38 @@ def _start_agent_unlocked(
         enroll_managed_principal(agent, "teamleiterin")
     runner = cfg["runner"]
     session = cfg["session"]
-    try:
-        runner_stat = runner.lstat()
-    except OSError as exc:
-        raise AgentError(f"runner for agent {agent} must be a regular executable file") from exc
-    if (
-        not stat_module.S_ISREG(runner_stat.st_mode)
-        or getattr(runner_stat, "st_nlink", 1) > 1
-        or not os.access(runner, os.X_OK)
-    ):
-        raise AgentError(f"runner for agent {agent} must be a regular executable file")
+    managed_codex = descriptor is not None and descriptor.runner is RunnerKind.CODEX_CLI
+    if managed_codex:
+        managed_home = _managed_codex_home(cfg["home"])
+        managed_wrapper_snapshot = _managed_codex_wrapper_snapshot(runner)
+        if agent_class is not None:
+            try:
+                managed_pool_parent_stat = AGENT_POOL_ROOT.parent.lstat()
+                managed_pool_root_stat = AGENT_POOL_ROOT.lstat()
+                managed_home_stat = managed_home.lstat()
+            except OSError as exc:
+                raise AgentError("agent_class_materialization_changed") from exc
+            if descriptor.home != managed_home or descriptor.home != AGENT_POOL_ROOT / agent:
+                raise AgentError("agent_class_materialization_invalid")
+            _fleet_private_directory_stat(
+                managed_pool_root_stat,
+                "agent_class_materialization_invalid",
+            )
+            _fleet_private_directory_stat(
+                managed_home_stat,
+                "agent_class_materialization_invalid",
+            )
+    else:
+        try:
+            runner_stat = runner.lstat()
+        except OSError as exc:
+            raise AgentError(f"runner for agent {agent} must be a regular executable file") from exc
+        if (
+            not stat_module.S_ISREG(runner_stat.st_mode)
+            or getattr(runner_stat, "st_nlink", 1) > 1
+            or not os.access(runner, os.X_OK)
+        ):
+            raise AgentError(f"runner for agent {agent} must be a regular executable file")
     if tmux_alive(session):
         if replacement_reservation_id is not None:
             _raise_replacement_capacity_denied(
@@ -9182,7 +10936,6 @@ def _start_agent_unlocked(
             agent=agent if ollama_descriptor is not None else None,
             task=prompt if ollama_descriptor is not None else None,
             role="arbeitsbiene",
-            reserved_slots=1 if replacement_reservation_id is not None else 0,
         )
         process_summary = agent_home_process_summary(agent)
         identity_guard = agent_identity_guard(False, process_summary)
@@ -9198,6 +10951,28 @@ def _start_agent_unlocked(
                 f"agent {agent} CODEX_HOME is already used by {process_summary['managed_process_count']} "
                 "managed process(es) without the managed tmux session; stop the orphaned process(es) before starting "
                 "through codex-master-mcp"
+            )
+
+        if managed_codex and agent_class is not None:
+            refresh_reasoning_effort = model_reasoning_effort or (
+                WRITE_AGENT_MODEL_EFFORT if model == WRITE_AGENT_MODEL else DEFAULT_AGENT_MODEL_EFFORT
+            )
+            refreshed = _materialize_managed_codex_runtime_class(
+                descriptor,
+                agent_class,
+                expected_pool_parent_stat=managed_pool_parent_stat,
+                expected_pool_root_stat=managed_pool_root_stat,
+                expected_home_stat=managed_home_stat,
+                confirm_home_refresh=confirm_home_refresh,
+                model_reasoning_effort=refresh_reasoning_effort,
+            )
+            if refreshed:
+                managed_wrapper_snapshot = _managed_codex_wrapper_snapshot(runner)
+        elif managed_codex:
+            _fleet_managed_home_state(
+                AGENT_POOL_ROOT,
+                descriptor,
+                strict_contents=True,
             )
 
         close_runner_execution_fd(agent)
@@ -9220,10 +10995,30 @@ def _start_agent_unlocked(
         routed_args = (
             ["--yolo", "-s", "danger-full-access"]
             if ollama_descriptor is not None
-            else agent_base_args(model, reasoning_effort, agent_class=agent_class)
+            else agent_base_args(
+                model,
+                reasoning_effort,
+                agent_class=agent_class,
+                service_tier=_fast_service_tier_for_agent(agent),
+            )
         )
 
-        runner_execution_path = open_runner_execution_path(agent, runner, runner_stat)
+        if managed_codex:
+            execution_path, execution_stat = _managed_codex_native_path(
+                agent,
+                managed_home,
+                runner,
+                managed_wrapper_snapshot,
+            )
+            runner_target = open_runner_execution_path(
+                agent,
+                execution_path,
+                execution_stat,
+                require_elf=True,
+                error_code="managed_codex_runner_changed",
+            )
+        else:
+            runner_target = open_runner_execution_path(agent, runner, runner_stat)
         run_id = f"{now_id()}-{agent}"
         raw_log = RAW_DIR / f"{run_id}.log"
         raw_log_created = False
@@ -9238,19 +11033,29 @@ def _start_agent_unlocked(
             close_runner_execution_fd(agent)
             raise
 
-        argv = [str(runner_execution_path), *routed_args]
+        argv = [*routed_args]
         if prompt:
             argv.append(prompt)
 
-        command = "env CODEX_MASTER_MCP=1 CODEX_AGENT_MCP=1 " + shlex.join(argv)
+        if managed_codex:
+            command = (
+                "env -u CODEX_ACCESS_TOKEN -u OPENAI_API_KEY "
+                f"CODEX_HOME={shlex.quote(str(managed_home))} "
+                "CODEX_MASTER_MCP=1 CODEX_AGENT_MCP=1 \"${CODEX_MASTER_RUNNER_EXEC_PATH:?}\""
+            )
+        else:
+            command = "env CODEX_MASTER_MCP=1 CODEX_AGENT_MCP=1 \"${CODEX_MASTER_RUNNER_EXEC_PATH:?}\""
+        if argv:
+            command += " " + shlex.join(argv)
         try:
-            g5_runtime, g5_scope = _g5_start_scope(session)
+            g5_runtime, g5_scope = _g5_start_scope(session, runner_target)
         except Exception:
             with contextlib.suppress(Exception):
                 cleanup_failed_start(session, raw_log, kill_session=False)
             close_runner_execution_fd(agent)
             release_start_lease_if_safe(agent, lease, release_lease_on_failure)
             raise
+        close_runner_execution_fd(agent)
         tmux_prefix = ["-L", g5_scope.socket_name]
         try:
             cp = run_tmux(
@@ -9273,6 +11078,14 @@ def _start_agent_unlocked(
             close_runner_execution_fd(agent)
             release_start_lease_if_safe(agent, lease, release_lease_on_failure)
             raise AgentError(f"tmux start failed for agent {agent}")
+
+        try:
+            _g5_confirm_scope(g5_runtime, g5_scope)
+        except Exception:
+            _cleanup_failed_g5_start(g5_runtime, g5_scope, raw_log)
+            close_runner_execution_fd(agent)
+            release_start_lease_if_safe(agent, lease, release_lease_on_failure)
+            raise
 
         try:
             pipe_command = raw_log_writer_command(raw_log)
@@ -9299,6 +11112,7 @@ def _start_agent_unlocked(
             "args": routed_args,
             "model": effective_model,
             "model_reasoning_effort": reasoning_effort,
+            "agent_class": agent_class,
             "started_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "run_id": run_id,
             "raw_log": str(raw_log),
@@ -9306,6 +11120,12 @@ def _start_agent_unlocked(
             "raw_log_max_bytes": MAX_RAW_LOG_BYTES,
             G5_TMUX_SOCKET_META_KEY: g5_scope.socket_name,
         }
+        if managed_codex:
+            data[G5_NATIVE_RUNNER_META_KEY] = {
+                "device": runner_target.device,
+                "inode": runner_target.inode,
+                "scope_unit": g5_scope.unit_name,
+            }
         try:
             write_meta(agent, data)
             _start_g5_warmup(g5_runtime)
@@ -10457,12 +12277,20 @@ def start_agent_with_lease(
     reasoning_effort: str | None = None,
     complexity: str = "unknown",
     name: str | None = None,
+    confirm_home_refresh: bool = False,
 ) -> dict[str, Any]:
     require_fleet_recovery_ready("agent_start")
+    if type(confirm_home_refresh) is not bool:
+        raise AgentError("confirm_home_refresh must be a boolean")
     agent = canonical_agent_id(agent)
     with agent_lifecycle_lock(agent):
         with _resource_gate_composer_scope():
             name_args = {"name": name} if name is not None else {}
+            home_refresh_args = (
+                {"confirm_home_refresh": True}
+                if confirm_home_refresh
+                else {}
+            )
             return _start_agent_with_lease_unlocked(
                 agent,
                 cwd,
@@ -10474,6 +12302,7 @@ def start_agent_with_lease(
                 reasoning_effort=reasoning_effort,
                 complexity=complexity,
                 **name_args,
+                **home_refresh_args,
             )
 
 
@@ -10490,11 +12319,16 @@ def _start_agent_with_lease_unlocked(
     complexity: str = "unknown",
     authority_class: str | None = None,
     name: str | None = None,
+    confirm_home_refresh: bool = False,
 ) -> dict[str, Any]:
     require_fleet_recovery_ready("agent_start")
+    if type(confirm_home_refresh) is not bool:
+        raise AgentError("confirm_home_refresh must be a boolean")
     agent = canonical_agent_id(agent)
     headless_descriptor = _headless_descriptor(agent)
     if headless_descriptor is not None:
+        if confirm_home_refresh:
+            raise AgentError("agent_home_refresh_not_supported_for_headless")
         return _start_headless_agent_unlocked(agent)
     task_profile = classify_runtime_task(
         TaskClassificationRequest(
@@ -10560,9 +12394,14 @@ def _start_agent_with_lease_unlocked(
             if ollama_descriptor is not None
             else WRITE_AGENT_MODEL_EFFORT if active_model == WRITE_AGENT_MODEL else DEFAULT_AGENT_MODEL_EFFORT
         )
-        if active_model != selected_model or active_effort != selected_effort:
+        active_class = read_meta(agent).get("agent_class")
+        if (
+            active_model != selected_model
+            or active_effort != selected_effort
+            or (selection is not None and active_class != selection.class_id)
+        ):
             raise AgentError(
-                "routed model differs from active session; controlled restart requires "
+                "routed model or class differs from active session; controlled restart requires "
                 "an inactive Agentin"
             )
 
@@ -10573,6 +12412,11 @@ def _start_agent_with_lease_unlocked(
     result: dict[str, Any] | None = None
 
     def invoke_start() -> dict[str, Any]:
+        home_refresh_args = (
+            {"confirm_home_refresh": True}
+            if confirm_home_refresh
+            else {}
+        )
         return start_agent(
             agent,
             cwd,
@@ -10583,6 +12427,7 @@ def _start_agent_with_lease_unlocked(
             model_reasoning_effort=selected_effort,
             agent_class=selection.class_id if selection is not None else None,
             **name_args,
+            **home_refresh_args,
         )
 
     if tmux_alive(agent_config(agent)["session"]):
@@ -12375,7 +14220,7 @@ def codex_usage_eligibility(
 def _codex_usage_v2_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any] | None:
     """Normalize the current codex-usage window shape without copying secrets."""
 
-    modern_keys = {"main", "five_hour", "weekly"}
+    modern_keys = {"main", "five_hour", "weekly", "spark", "monthly", "30d", "thirty_day"}
     if not any(key in snapshot for key in modern_keys):
         return None
 
@@ -12399,12 +14244,23 @@ def _codex_usage_v2_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any] | 
         raise AgentError("could_not_read_codex_usage_snapshot")
     if not raw_windows:
         raw_windows = []
-        for key in ("five_hour", "weekly"):
+        for key in ("five_hour", "weekly", "spark", "monthly", "30d", "thirty_day"):
             if key in snapshot:
                 value = snapshot[key]
                 if not isinstance(value, dict):
                     raise AgentError("could_not_read_codex_usage_snapshot")
-                raw_windows.append(value)
+                nested = value.get("windows")
+                if nested is not None:
+                    if not isinstance(nested, list):
+                        raise AgentError("could_not_read_codex_usage_snapshot")
+                    if any(not isinstance(item, dict) for item in nested):
+                        raise AgentError("could_not_read_codex_usage_snapshot")
+                    raw_windows.extend(
+                        item | {"name": item.get("name", key)}
+                        for item in nested
+                    )
+                else:
+                    raw_windows.append(value | {"name": value.get("name", key)})
     if len(raw_windows) > 64:
         raise AgentError("could_not_read_codex_usage_snapshot")
 
@@ -13263,6 +15119,348 @@ def fleet_usage_watchdog(agent: str = "all", *, dry_run: bool = False) -> dict[s
     }
 
 
+def usage_fast_mode(
+    account: str,
+    *,
+    action: str = "activate",
+    reason: str = "",
+    until_utc: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Switch one Codex account between Fast and Flex without killing jobs."""
+    if not CODEX_USAGE_ACCOUNT_RE.fullmatch(account):
+        raise AgentError("invalid usage account")
+    if action not in {"activate", "deactivate"}:
+        raise AgentError("fast mode action must be activate or deactivate")
+    if until_utc is not None:
+        try:
+            parsed = _dt.datetime.fromisoformat(until_utc.replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise ValueError
+        except ValueError as exc:
+            raise AgentError("until_utc must be RFC3339") from exc
+    mode = None if dry_run else set_mode(
+        account,
+        enabled=action == "activate",
+        reason=reason,
+        until_utc=until_utc,
+    )
+    affected: list[dict[str, Any]] = []
+    for agent in all_agent_ids():
+        meta = read_meta(agent)
+        routing = meta.get("routing")
+        routed_account = routing.get("account") if isinstance(routing, Mapping) else None
+        if routed_account != account:
+            continue
+        running = bool(tmux_alive(agent_config(agent)["session"]))
+        marker = {
+            "state": "active" if action == "activate" else "flex",
+            "requested_service_tier": "fast" if action == "activate" else "flex",
+            "graceful_sleep_after_job": action == "activate",
+            "updated_at_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        }
+        if not dry_run:
+            meta["fast_mode"] = marker
+            write_meta(agent, meta)
+        signal = ""
+        if running and not dry_run:
+            signal_text = (
+                "Masterjet Fast-Modus ist aktiv. Beende deinen aktuellen Job sauber; "
+                "danach graceful schlafen und ResumeCapsule hinterlassen. Keine neue Arbeit annehmen."
+                if action == "activate"
+                else "Masterjet Fast-Modus ist beendet. Nach deinem aktuellen Job normal mit Flex weiterarbeiten."
+            )
+            try:
+                send_agent(agent, signal_text, operation="usage_fast_mode")
+                signal = "sent"
+            except Exception as exc:
+                signal = f"not_sent:{type(exc).__name__}"
+        affected.append({"agent": agent, "running": running, "signal": signal, "raw_output": "not_returned"})
+    return {
+        "account": account,
+        "action": action,
+        "dry_run": dry_run,
+        "requested_service_tier": "fast" if action == "activate" else "flex",
+        "mode": mode or {"account": account, "state": "would_change"},
+        "affected_agents": affected,
+        "affected_count": len(affected),
+        "raw_output": "not_returned",
+    }
+
+
+def emergency_working_worker_count() -> dict[str, Any]:
+    """Count only running worker assignments; leadership is never a worker slot."""
+    working: list[str] = []
+    for agent in all_agent_ids():
+        try:
+            assignment = latest_assignment_summary(agent, initialize_state=False)
+            if not assignment or assignment.get("role") != "arbeitsbiene":
+                continue
+            if not tmux_alive(agent_config(agent)["session"]):
+                continue
+            status = status_agent(agent, initialize_state=False)
+            state = (status.get("response_state") or {}).get("state")
+            if state in {"running_recent_output", "running_no_output_observed", "headless_running"}:
+                working.append(agent)
+        except Exception:
+            continue
+    return {"count": len(working), "agents": working, "leadership_excluded": True}
+
+
+def _emergency_queen_agent_candidates() -> list[str]:
+    """Return dedicated materialized runtime targets for a Queen lease.
+
+    The canonical class policy defines Queens as logical principals with no
+    native home. Current q-homes happen to carry Teamleiterin profiles, but
+    neither a provider nor a series is intrinsically bound to a class. A Hive
+    Queen still cannot be fabricated by promoting an arbitrary native home;
+    the materialized runtime adapter has not been released yet, so fail closed.
+    """
+    return []
+
+
+def ensure_emergency_queen(*, dry_run: bool = False) -> dict[str, Any] | None:
+    """Materialize the one requested emergency Queen, or persist a blocker."""
+    state = emergency_queen_status()
+    if state["state"] in {"running", "finishing", "next", "draining"}:
+        return {"status": "already_active", "state": state, "raw_output": "not_returned"}
+    if state["state"] != "requested":
+        return {"status": "not_requested", "state": state, "raw_output": "not_returned"}
+    candidates = _emergency_queen_agent_candidates()
+    if not candidates:
+        blocked = set_emergency_queen_blocked(
+            int(state["generation"]),
+            "queen_spawn_unavailable:hive_queen_runtime_not_materialized",
+        )
+        return {
+            "status": "blocked",
+            "error_code": "queen_spawn_unavailable",
+            "reason": "hive_queen_runtime_not_materialized",
+            "state": blocked.get("state", state),
+            "raw_output": "not_returned",
+        }
+    queen_agent = candidates[0]
+    if dry_run:
+        return {
+            "status": "would_start",
+            "agent": queen_agent,
+            "state": state,
+            "raw_output": "not_returned",
+        }
+    prompt = (
+        "Du bist die Notfall-Königin des codex-master-Repositories. "
+        "Arbeite ausschließlich den aktuell zugewiesenen freigegebenen Plan ab: "
+        f"{state['current_plan'] or 'kein Plan ausgewählt'}. "
+        "Nach vollständigem Abschluss melde den Planabschluss an Masterjet. "
+        "Wenn der Notfall noch aktiv ist, warte auf den nächsten Plan; nach "
+        "Notfallende beende dich und deine Kinder graceful mit ResumeCapsule."
+    )
+    try:
+        result = start_agent_with_lease(
+            queen_agent,
+            cwd=str(repo_root()),
+            prompt=prompt,
+            agent_class="koenigin",
+            lifecycle="persistent",
+            complexity="complex",
+            name="Notfall-Königin",
+        )
+    except Exception as exc:
+        blocked = set_emergency_queen_blocked(
+            int(state["generation"]),
+            f"queen_spawn_failed:{type(exc).__name__}",
+        )
+        return {
+            "status": "blocked",
+            "error_code": "queen_spawn_failed",
+            "reason": type(exc).__name__,
+            "state": blocked.get("state", state),
+            "raw_output": "not_returned",
+        }
+    if result.get("status") not in {"started", "already_running"}:
+        blocked = set_emergency_queen_blocked(
+            int(state["generation"]),
+            "queen_spawn_rejected:" + str(result.get("status", "unknown"))[:120],
+        )
+        return {
+            "status": "blocked",
+            "error_code": "queen_spawn_rejected",
+            "reason": result.get("status"),
+            "state": blocked.get("state", state),
+            "raw_output": "not_returned",
+        }
+    running = set_emergency_queen_running(int(state["generation"]), queen_agent)
+    return {
+        "status": "started" if result.get("status") == "started" else "already_running",
+        "agent": queen_agent,
+        "state": running.get("state", state),
+        "raw_output": "not_returned",
+    }
+
+
+def emergency_queen_plan_completed(
+    generation: int,
+    plan: str,
+    *,
+    emergency_active: bool,
+) -> dict[str, Any]:
+    """Accept one Queen completion marker and advance its serialized queue."""
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise AgentError("invalid_emergency_queen_generation")
+    if not isinstance(plan, str) or not plan or len(plan) > 4096:
+        raise AgentError("invalid_emergency_queen_plan")
+    if not isinstance(emergency_active, bool):
+        raise AgentError("invalid_emergency_state")
+    result = advance_emergency_queen(generation, emergency_active=emergency_active, completed_plan=plan)
+    if result.get("updated") is not True:
+        return result
+    state = result.get("state", {})
+    if state.get("state") == "draining":
+        shutdown_agents = [state.get("queen_agent"), *state.get("children", [])]
+        shutdown_agents = [agent for agent in shutdown_agents if isinstance(agent, str)]
+        if any(tmux_alive(agent_config(agent)["session"]) for agent in shutdown_agents):
+            queen_agent = state.get("queen_agent")
+            try:
+                for agent in shutdown_agents:
+                    if tmux_alive(agent_config(agent)["session"]):
+                        send_agent(agent, "Masterjet: Notfall beendet. Aktuellen Job graceful abschließen, ResumeCapsule hinterlassen, keine neue Arbeit annehmen.", operation="emergency_queen_draining")
+            except Exception:
+                # The durable state remains draining and can be retried by the
+                # watchdog; never claim that graceful shutdown succeeded.
+                result["shutdown_signal"] = "not_sent"
+            else:
+                result["shutdown_signal"] = "sent"
+    elif state.get("state") == "next":
+        queen_agent = state.get("queen_agent")
+        if isinstance(queen_agent, str) and tmux_alive(agent_config(queen_agent)["session"]):
+            try:
+                send_agent(
+                    queen_agent,
+                    "Masterjet: Der nächste freigegebene Notfallplan ist jetzt zu bearbeiten: "
+                    + str(state.get("current_plan") or "kein Plan")
+                    + ". Arbeite ihn vollständig ab und melde danach erneut den Abschluss.",
+                    operation="emergency_queen_next_plan",
+                )
+            except Exception:
+                result["next_plan_signal"] = "not_sent"
+            else:
+                result["next_plan_signal"] = "sent"
+    return result
+
+
+def reconcile_emergency_queen_lifecycle() -> dict[str, Any]:
+    """Reap a drained Queen only after its managed session has ended."""
+    state = emergency_queen_status()
+    if state.get("state") != "draining":
+        return {"status": "unchanged", "state": state, "raw_output": "not_returned"}
+    managed_agents = [state.get("queen_agent"), *state.get("children", [])]
+    managed_agents = [agent for agent in managed_agents if isinstance(agent, str)]
+    if any(tmux_alive(agent_config(agent)["session"]) for agent in managed_agents):
+        return {"status": "waiting_for_graceful_shutdown", "state": state, "raw_output": "not_returned"}
+    result = finish_emergency_queen(int(state["generation"]))
+    result["status"] = "finished" if result.get("updated") else "not_finished"
+    return result
+
+
+def reconcile_usage_fast_modes(*, dry_run: bool = False, emergency_only: bool = False) -> dict[str, Any]:
+    queen_lifecycle = reconcile_emergency_queen_lifecycle() if emergency_only and not dry_run else None
+    accounts = sorted(
+        path.stem
+        for path in (Path.home() / ".local/share/codex-usage/snapshots").glob("*.json")
+        if path.stem not in {"authcheck", "blocked"}
+    )
+    decisions = []
+    refresh = {"attempted": False, "ok": None, "reason": "normal_tracker"}
+    current_by_account = {account: active_mode(account) is not None for account in accounts}
+    evaluations = {
+        account: evaluate_account(account, active_fast=current_by_account[account])
+        for account in accounts
+    }
+    if emergency_only and not dry_run and any(
+        emergency_refresh_needed(evaluations[account], active_fast=current_by_account[account])
+        for account in accounts
+    ):
+        refresh = refresh_usage_snapshots()
+        refresh["reason"] = "emergency_hot_window_or_fast_active"
+        # The pull updates codex-usage's durable snapshots. Re-evaluate every
+        # account against the same fresh view, not only the account that
+        # triggered the pull.
+        evaluations = {
+            account: evaluate_account(account, active_fast=current_by_account[account])
+            for account in accounts
+        }
+    worker_activity = emergency_working_worker_count() if emergency_only else {"count": None, "agents": [], "leadership_excluded": True}
+    queen_fallback = None
+    queen_needed = False
+    for account in accounts:
+        current = current_by_account[account]
+        if emergency_only and current:
+            maybe_notify_fast(account)
+        evaluation = evaluations[account]
+        recommendation = (
+            emergency_recommendation(evaluation, active_fast=current)
+            if emergency_only else evaluation.get("recommended_action")
+        )
+        action = (
+            "activate" if recommendation == "activate"
+            else "deactivate" if current and recommendation == "flex"
+            else None
+        )
+        try:
+            payload = json.loads((Path.home() / ".local/share/codex-usage/snapshots" / f"{account}.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            payload = {}
+        delta_window = preferred_delta_window(payload, pool="main")
+        spark = evaluation.get("spark") if isinstance(evaluation, dict) else {}
+        spark_action = spark.get("recommended_action") if isinstance(spark, dict) else "flex"
+        result = None
+        if action:
+            result = usage_fast_mode(
+                account,
+                action=action,
+                reason=("EMA60-Notfalltracker: 5h/Endfenster" if emergency_only else "EMA60-Limittracker: automatische Fast/Flex-Steuerung"),
+                dry_run=dry_run,
+            )
+        display = None
+        spark_priority = None
+        if emergency_only and recommendation in {"activate", "keep_fast"} and not dry_run:
+            display = set_emergency_display_override(
+                account, enabled=True, limit_window=delta_window,
+                reason="Notfall-Tokenverbrauch: Delta automatisch aktiviert",
+            )
+        elif emergency_only and recommendation == "flex" and not dry_run:
+            display = set_emergency_display_override(account, enabled=False)
+        if spark_action == "activate" and emergency_only:
+            spark_window = preferred_delta_window(payload, pool="spark")
+            spark_priority = set_spark_priority(account, enabled=True, reason="Spark-Limittracker: Workerinnen bevorzugen Spark") if not dry_run else {"account": account, "active": True}
+            if not dry_run:
+                set_emergency_display_override(account, enabled=True, limit_window=spark_window, reason="Spark-Notfallbeobachtung")
+        elif spark_action == "flex" and spark_priority_active(account) and not dry_run:
+            spark_priority = set_spark_priority(account, enabled=False)
+            if not current:
+                set_emergency_display_override(account, enabled=False)
+        if emergency_only and (recommendation == "activate" or spark_action == "activate") and worker_activity["count"] == 0 and queen_fallback is None:
+            queen_needed = True
+            queen_fallback = (
+                request_emergency_queen_work(reason="Notfallmodus ohne arbeitende Workerinnen")
+                if not dry_run
+                else {"queued": False, "would_queue": True, "raw_output": "not_returned"}
+            )
+        decisions.append({"account": account, "evaluation": evaluation, "action": result, "delta_override": display, "spark_priority": spark_priority, "raw_output": "not_returned"})
+    queen_controller = ensure_emergency_queen(dry_run=dry_run) if emergency_only and queen_needed else None
+    return {
+        "dry_run": dry_run,
+        "emergency_only": emergency_only,
+        "usage_refresh": refresh,
+        "accounts": decisions,
+        "worker_activity": worker_activity,
+        "queen_fallback": queen_fallback,
+        "queen_controller": queen_controller,
+        "queen_lifecycle": queen_lifecycle,
+        "raw_output": "not_returned",
+    }
+
+
 def fleet_watchdog(
     agent: str = "all",
     *,
@@ -13739,8 +15937,8 @@ def assignment_prompt(
     if subagents_permitted:
         subagent_lines.extend(
             [
-                "Vor jedem Spawn frisch pruefen: insgesamt maximal 10 laufende oder unbestaetigte Bienen.",
-                "Ab 10 Bienen keine weitere Biene starten.",
+                "Vor jedem Spawn frische gemeinsame Ressourcen-Admission pruefen; Druck-, Scope- und Capability-Gates bleiben fail-closed.",
+                "Es gibt keine numerische Flotten-, Serien- oder Provider-Spawn-Grenze.",
             ]
         )
     elif allow_subagents and subagent_reason_codes:
@@ -13812,7 +16010,12 @@ def ensure_assignment_session_model(
         if ollama_descriptor is not None
         else WRITE_AGENT_MODEL_EFFORT if current_model == WRITE_AGENT_MODEL else DEFAULT_AGENT_MODEL_EFFORT
     )
-    if current_model == model and current_reasoning_effort == reasoning_effort:
+    current_agent_class = meta.get("agent_class")
+    if (
+        current_model == model
+        and current_reasoning_effort == reasoning_effort
+        and (agent_class is None or current_agent_class == agent_class)
+    ):
         return {
             "status": "unchanged",
             "previous_model": current_model,
@@ -13823,7 +16026,7 @@ def ensure_assignment_session_model(
     response_state = (status.get("response_state") or {}).get("state")
     if response_state not in {"running_tui_starter_context", "running_idle"}:
         raise AgentError(
-            "routed model differs from active session; controlled restart requires "
+            "routed model or class differs from active session; controlled restart requires "
             f"an inactive Agentin; current_state={response_state}"
         )
     with spawn_admission_lock():
@@ -17621,7 +19824,9 @@ def _resource_monitor_error(code: str, returncode: int | None = None) -> dict[st
     return error
 
 
-_RESOURCE_MONITOR_SUPPORTED_UNIT_FILE_STATES = frozenset({"not-found", "enabled", "enabled-runtime", "disabled"})
+_RESOURCE_MONITOR_SUPPORTED_UNIT_FILE_STATES = frozenset(
+    {"not-found", "enabled", "enabled-runtime", "disabled", "static"}
+)
 _RESOURCE_MONITOR_SUPPORTED_ACTIVE_STATES = frozenset({"active", "inactive"})
 
 
@@ -17638,7 +19843,12 @@ def _resource_monitor_previous_state(show: Mapping[str, Any]) -> dict[str, Any]:
         raise AgentError("resource_monitor_service_state_unknown")
     if load_state == "not-found" and raw_unit_file_state in {"", None} and active_state == "inactive":
         unit_file_state = "not-found"
-    elif load_state != "not-found" and raw_unit_file_state in {"enabled", "enabled-runtime", "disabled"}:
+    elif load_state != "not-found" and raw_unit_file_state in {
+        "enabled",
+        "enabled-runtime",
+        "disabled",
+        "static",
+    }:
         unit_file_state = raw_unit_file_state
     else:
         raise AgentError("resource_monitor_service_state_unknown")
@@ -17902,6 +20112,77 @@ def install_resource_monitor(
 class _ResourceMonitorPrimaryFailure(Exception):
     def __init__(self, error: dict[str, Any]):
         self.error = error
+
+
+def install_resource_scope_gate(
+    *,
+    root: Path | None = None,
+    target: Path | None = None,
+) -> dict[str, Any]:
+    if os.geteuid() != 0:
+        raise AgentError("resource_scope_gate_install_requires_root")
+    root = root or repo_root()
+    target = target or Path(RESOURCE_SCOPE_GATE_PATH)
+    if not isinstance(root, Path) or not isinstance(target, Path) or not target.is_absolute() or target.name != RESOURCE_SCOPE_GATE_NAME:
+        raise AgentError("resource_scope_gate_target_untrusted")
+    source = root / "bin" / RESOURCE_SCOPE_GATE_NAME
+    raw, _source_stat = _resource_monitor_read_source(source)
+    try:
+        parent_stat = target.parent.lstat()
+    except OSError as exc:
+        raise AgentError("resource_scope_gate_target_untrusted") from exc
+    if not stat_module.S_ISDIR(parent_stat.st_mode) or not directory_chain_is_real_no_symlink(target.parent):
+        raise AgentError("resource_scope_gate_target_untrusted")
+    directory_fd = -1
+    staged_name: str | None = None
+    try:
+        try:
+            directory_fd = _resource_monitor_open_directory(target.parent)
+        except AgentError as exc:
+            raise AgentError("resource_scope_gate_target_untrusted") from exc
+        try:
+            installed, installed_stat = _resource_monitor_read_regular_at_fd(
+                directory_fd,
+                target.name,
+                missing_ok=True,
+            )
+        except AgentError as exc:
+            raise AgentError("resource_scope_gate_target_untrusted") from exc
+        if (
+            installed == raw
+            and installed_stat is not None
+            and stat_module.S_IMODE(installed_stat.st_mode) == 0o755
+        ):
+            return {"ok": True, "status": "already_installed", "raw_output": "not_returned"}
+        staged_name, _staged_stat = _resource_monitor_temp_bytes(directory_fd, target.name, raw, 0o755)
+        os.replace(staged_name, target.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        staged_name = None
+        os.fsync(directory_fd)
+        try:
+            verified, verified_stat = _resource_monitor_read_regular_at_fd(
+                directory_fd,
+                target.name,
+                missing_ok=False,
+            )
+        except AgentError as exc:
+            raise AgentError("resource_scope_gate_target_untrusted") from exc
+        if (
+            verified != raw
+            or verified_stat is None
+            or stat_module.S_IMODE(verified_stat.st_mode) != 0o755
+        ):
+            raise AgentError("resource_scope_gate_target_untrusted")
+        return {"ok": True, "status": "installed", "raw_output": "not_returned"}
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError("resource_scope_gate_install_failed") from exc
+    finally:
+        if staged_name is not None and directory_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.unlink(staged_name, dir_fd=directory_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
 
 
 def native_hook_coverage_status(*, root: Path | None = None, now: float | None = None) -> dict[str, Any]:
@@ -20073,6 +22354,39 @@ def call_tool(
     if name == "fleet_status_compact":
         rendered = _fleet_overview_local_admin(active_only=True, format="compact")
         return {"status": rendered, "raw_output": "not_returned"}
+    if name == "usage_fast_mode_status":
+        state = fast_mode_snapshot()
+        state["tracking"] = [evaluate_account(account, active_fast=True) for account in state.get("modes", {})]
+        return state
+    if name == "usage_fast_mode_reconcile":
+        return reconcile_usage_fast_modes(
+            dry_run=bool_arg(args, "dry_run", False),
+            emergency_only=bool_arg(args, "emergency_only", False),
+        )
+    if name == "usage_fast_mode":
+        return usage_fast_mode(
+            str(args.get("account", "")),
+            action=str(args.get("action", "activate")),
+            reason=str(args.get("reason", "")),
+            until_utc=args.get("until_utc") if isinstance(args.get("until_utc"), str) else None,
+            dry_run=bool_arg(args, "dry_run", False),
+        )
+    if name == "emergency_queen_status":
+        return emergency_queen_status()
+    if name == "emergency_queen_plan_completed":
+        return emergency_queen_plan_completed(
+            int_arg(args, "generation", 0),
+            str(args.get("plan", "")),
+            emergency_active=bool_arg(args, "emergency_active", False),
+        )
+    if name == "emergency_queen_child_started":
+        return register_emergency_queen_child(
+            int_arg(args, "generation", 0), str(args.get("agent", ""))
+        )
+    if name == "emergency_queen_child_completed":
+        return unregister_emergency_queen_child(
+            int_arg(args, "generation", 0), str(args.get("agent", ""))
+        )
     if name == "goddess_report_status":
         return _goddess_report_status_local()
     if name == "goddess_report_list":
@@ -20103,6 +22417,7 @@ def call_tool(
     if name == "agent_start":
         selected = agent_ids(str(args.get("agent", "both")))
         allow_unauthenticated = bool_arg(args, "allow_unauthenticated", False)
+        confirm_home_refresh = bool_arg(args, "confirm_home_refresh", False)
         broad_selection = require_broad_mutation_confirmation(
             selected,
             operation="agent_start",
@@ -20125,6 +22440,7 @@ def call_tool(
                         complexity=str(args.get("complexity", "unknown")),
                         authority_class=authority_class,
                         **({"name": args["name"]} if "name" in args else {}),
+                        **({"confirm_home_refresh": True} if confirm_home_refresh else {}),
                     )
                 ),
             ),
@@ -20796,7 +23112,7 @@ def task_evidence_cli_args(args: Any) -> dict[str, Any]:
 
 def agent_selector_schema(*, default: str | None = None, single: bool = False) -> dict[str, Any]:
     description = (
-        "Concrete Agentin id, legacy alias, or ordinal selector: a1..a100, b1..b100, c1..c100, a, b, 1, 2, 3."
+        "Concrete Agentin id, legacy alias, or ordinal selector: a1..a100, b1..b100, c1..c100, u1, a, b, 1, 2, 3."
         if single
         else AGENT_SELECTOR_DESCRIPTION
     )
@@ -21372,6 +23688,7 @@ def _fleet_home_artifacts(
     true_executable: Path = FLEET_TRUE_EXECUTABLE,
     true_stat: os.stat_result | None = None,
     include_portable_skills: bool = False,
+    runtime_skill_profile: str | None = None,
 ) -> dict[str, Any]:
     executable_checks = tuple(
         (path, expected)
@@ -21407,6 +23724,7 @@ def _fleet_home_artifacts(
         ),
         config_name: (config_text.encode("utf-8"), 0o600),
     }
+    files.update({name: (content, 0o600) for name, content in fleet_markdown_artifacts(agent).items()})
     if agent.runner is RunnerKind.GEMINI_CLI:
         bootstrap = {"advanced": {"autoConfigureMemory": False}}
         policy = "\n".join(
@@ -21435,6 +23753,7 @@ def _fleet_home_artifacts(
         "runner": agent.runner.value,
         "provider": agent.provider.value,
         "model": agent.model,
+        _FLEET_RUNTIME_SKILL_PROFILE_FIELD: runtime_skill_profile,
         "managed_files": sorted(files),
         "files": {
             name: hashlib.sha256(content).hexdigest()
@@ -21519,14 +23838,172 @@ def _fleet_open_artifact_parent(
         raise AgentError(error) from exc
 
 
+# ponytail: Only inert Codex runtime roots stay opaque. Active skills/.system,
+# plugins, and memories fail closed; never migrate or delete them before a
+# separate, version-bound trust policy exists.
+_FLEET_CODEX_RUNTIME_DIRECTORIES = frozenset(
+    {
+        ".tmp",
+        "cache",
+        "log",
+        "logs",
+        "sessions",
+        "shell_snapshots",
+        "thread-writer-locks",
+        "tmp",
+    }
+)
+_FLEET_CODEX_RUNTIME_FILES = frozenset(
+    {
+        ".personality_migration",
+        ".sandbox_migration",
+        "history.jsonl",
+        "installation_id",
+        "models_cache.json",
+        "version.json",
+    }
+)
+_FLEET_CODEX_RUNTIME_DATABASE_RE = re.compile(
+    r"(?:goals|logs|memories|queue|state|thread_history)_[1-9][0-9]*\.sqlite(?:-shm|-wal)?\Z"
+)
+_FLEET_CODEX_SHARED_RUNTIME_FILES = frozenset(
+    {".personality_migration", "models_cache.json", "version.json"}
+)
+_FLEET_CODEX_RUNTIME_FILE_MODES = frozenset({0o600, 0o644})
+
+
+def _fleet_codex_runtime_regular_file_stat(
+    directory_fd: int,
+    name: str,
+    error: str,
+    *,
+    missing_ok: bool = False,
+) -> os.stat_result | None:
+    parent_fd, basename = _fleet_open_artifact_parent(
+        directory_fd,
+        name,
+        create=False,
+        error=error,
+    )
+    try:
+        try:
+            current = os.stat(basename, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise AgentError(error) from None
+        if (
+            not stat_module.S_ISREG(current.st_mode)
+            or getattr(current, "st_nlink", 1) != 1
+            or current.st_uid != os.geteuid()
+            or stat_module.S_IMODE(current.st_mode) not in _FLEET_CODEX_RUNTIME_FILE_MODES
+        ):
+            raise AgentError(error)
+        return current
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError(error) from exc
+    finally:
+        os.close(parent_fd)
+
+
+@contextlib.contextmanager
+def _fleet_pinned_shared_runtime_symlinks(
+    root: Path,
+    agent: AgentDescriptor,
+    error: str,
+) -> Iterator[dict[str, str]]:
+    root_fd = -1
+    template_fd = -1
+    source_fds: dict[str, int] = {}
+    source_stats: dict[str, os.stat_result] = {}
+    try:
+        root_stat = root.lstat()
+        _fleet_private_directory_stat(root_stat, error)
+        root_fd = open_directory_chain_no_follow_matching(
+            root,
+            root_stat,
+            error_text=error,
+            changed_text=error,
+        )
+        template_agent = f"{agent.series_prefix}1"
+        try:
+            template_stat = os.stat(template_agent, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            yield {}
+            return
+        _fleet_private_directory_stat(template_stat, error)
+        template_fd = open_directory_no_follow_matching(
+            template_agent,
+            template_stat,
+            error_text=error,
+            changed_text=error,
+            dir_fd=root_fd,
+        )
+        for name in _FLEET_CODEX_SHARED_RUNTIME_FILES:
+            source_stat = _fleet_codex_runtime_regular_file_stat(
+                template_fd,
+                name,
+                error,
+                missing_ok=True,
+            )
+            if source_stat is None:
+                continue
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            source_fd = os.open(name, flags, dir_fd=template_fd)
+            opened = os.fstat(source_fd)
+            if not source_identity_with_snapshot_matches(opened, source_stat):
+                os.close(source_fd)
+                raise AgentError(error)
+            source_fds[name] = source_fd
+            source_stats[name] = source_stat
+        yield {name: f"../{template_agent}/{name}" for name in source_stats}
+        current_template = os.stat(template_agent, dir_fd=root_fd, follow_symlinks=False)
+        if (
+            not source_identity_with_snapshot_matches(current_template, template_stat)
+            or not stat_module.S_ISDIR(current_template.st_mode)
+            or stat_module.S_ISLNK(current_template.st_mode)
+            or current_template.st_uid != os.geteuid()
+            or stat_module.S_IMODE(current_template.st_mode) != 0o700
+        ):
+            raise AgentError(error)
+        for name, source_stat in source_stats.items():
+            current = _fleet_codex_runtime_regular_file_stat(template_fd, name, error)
+            opened = os.fstat(source_fds[name])
+            if (
+                current is None
+                or not source_identity_with_snapshot_matches(current, source_stat)
+                or not source_identity_with_snapshot_matches(opened, source_stat)
+            ):
+                raise AgentError(error)
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError(error) from exc
+    finally:
+        for source_fd in source_fds.values():
+            with contextlib.suppress(OSError):
+                os.close(source_fd)
+        if template_fd >= 0:
+            os.close(template_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+
+
 def _fleet_tree_entries(
     directory_fd: int,
     error: str,
     *,
     allow_gemini_runtime: bool = False,
-) -> tuple[set[str], set[str]]:
+    opaque_runtime_directories: Collection[str] = (),
+    allowed_runtime_symlinks: Mapping[str, str] | None = None,
+) -> tuple[set[str], set[str], set[str]]:
     files: set[str] = set()
     directories: set[str] = set()
+    symlinks: set[str] = set()
     entry_count = 0
 
     def visit(current_fd: int, prefix: str, depth: int) -> None:
@@ -21567,6 +24044,7 @@ def _fleet_tree_entries(
             relative = f"{prefix}/{name}" if prefix else name
             current = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
             if stat_module.S_ISDIR(current.st_mode) and not stat_module.S_ISLNK(current.st_mode):
+                relative_is_opaque_runtime = relative in opaque_runtime_directories
                 relative_is_gemini_runtime = (
                     allow_gemini_runtime
                     and (
@@ -21576,7 +24054,7 @@ def _fleet_tree_entries(
                         or relative.startswith(".gemini/tmp/")
                     )
                 )
-                if relative_is_gemini_runtime:
+                if relative_is_gemini_runtime or relative_is_opaque_runtime:
                     if (
                         current.st_uid != os.geteuid()
                         or stat_module.S_IMODE(current.st_mode) not in {0o700, 0o755}
@@ -21585,13 +24063,14 @@ def _fleet_tree_entries(
                         raise AgentError(error)
                 else:
                     _fleet_private_directory_stat(current, error)
+                directories.add(relative)
                 flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
                 if hasattr(os, "O_NOFOLLOW"):
                     flags |= os.O_NOFOLLOW
                 child_fd = os.open(name, flags, dir_fd=current_fd)
                 try:
                     child_stat = os.fstat(child_fd)
-                    if relative_is_gemini_runtime:
+                    if relative_is_gemini_runtime or relative_is_opaque_runtime:
                         if (
                             child_stat.st_uid != os.geteuid()
                             or stat_module.S_IMODE(child_stat.st_mode) not in {0o700, 0o755}
@@ -21600,10 +24079,21 @@ def _fleet_tree_entries(
                             raise AgentError(error)
                     else:
                         _fleet_private_directory_stat(child_stat, error)
-                    directories.add(relative)
-                    visit(child_fd, relative, depth + 1)
+                    if not source_identity_matches(child_stat, current):
+                        raise AgentError(error)
+                    if not relative_is_opaque_runtime:
+                        visit(child_fd, relative, depth + 1)
                 finally:
                     os.close(child_fd)
+            elif stat_module.S_ISLNK(current.st_mode):
+                expected_target = (
+                    allowed_runtime_symlinks.get(relative)
+                    if allowed_runtime_symlinks is not None
+                    else None
+                )
+                if expected_target is None or os.readlink(name, dir_fd=current_fd) != expected_target:
+                    raise AgentError(error)
+                symlinks.add(relative)
             elif (
                 stat_module.S_ISREG(current.st_mode)
                 and getattr(current, "st_nlink", 1) == 1
@@ -21619,7 +24109,7 @@ def _fleet_tree_entries(
         raise
     except OSError as exc:
         raise AgentError(error) from exc
-    return files, directories
+    return files, directories, symlinks
 
 
 def _fleet_read_private_file_at(
@@ -21726,15 +24216,16 @@ def _fleet_verify_home(
     )
     try:
         artifact_files = _fleet_artifact_files(artifacts)
-        actual_files, actual_directories = _fleet_tree_entries(
+        actual_files, actual_directories, actual_symlinks = _fleet_tree_entries(
             home_fd,
             "fleet_home_verification_failed",
         )
+        actual_entries = actual_files | actual_symlinks
         expected_directories = _fleet_artifact_directories(artifact_files)
         if exact_contents:
-            if actual_files != set(artifact_files) or actual_directories != expected_directories:
+            if actual_entries != set(artifact_files) or actual_directories != expected_directories:
                 raise AgentError("fleet_home_verification_failed")
-        elif not set(artifact_files) <= actual_files or not expected_directories <= actual_directories:
+        elif not set(artifact_files) <= actual_entries or not expected_directories <= actual_directories:
             raise AgentError("fleet_home_verification_failed")
         for name, (content, mode) in artifact_files.items():
             _fleet_read_exact_file_at(
@@ -21838,12 +24329,12 @@ def _fleet_create_home(
                 write_private_new_bytes(Path(basename), content, mode=mode, dir_fd=parent_fd)
             finally:
                 os.close(parent_fd)
-        actual_files, actual_directories = _fleet_tree_entries(
+        actual_files, actual_directories, actual_symlinks = _fleet_tree_entries(
             home_fd,
             "fleet_home_verification_failed",
         )
         if (
-            actual_files != set(artifact_files)
+            (actual_files | actual_symlinks) != set(artifact_files)
             or actual_directories != _fleet_artifact_directories(artifact_files)
         ):
             raise AgentError("fleet_home_verification_failed")
@@ -21938,16 +24429,16 @@ def _fleet_created_home_unchanged(
         )
         try:
             artifact_files = _fleet_artifact_files(artifacts)
-            actual_files, actual_directories = _fleet_tree_entries(
+            actual_files, actual_directories, actual_symlinks = _fleet_tree_entries(
                 home_fd,
                 "fleet_create_rollback_diverged",
             )
             if (
-                not actual_files <= set(artifact_files)
+                not (actual_files | actual_symlinks) <= set(artifact_files)
                 or not actual_directories <= _fleet_artifact_directories(artifact_files)
             ):
                 return False
-            for name in actual_files:
+            for name in actual_files | actual_symlinks:
                 content, mode = artifact_files[name]
                 _fleet_read_exact_file_at(
                     home_fd,
@@ -22675,13 +25166,13 @@ def _fleet_tmux_state(session: str) -> str:
     return "unknown"
 
 
-def _fleet_managed_home_state(
+def _fleet_managed_home_details(
     root: Path,
     agent: AgentDescriptor,
     *,
     entry_name: str | None = None,
     strict_contents: bool,
-) -> os.stat_result:
+) -> tuple[os.stat_result, str | None]:
     home = root / (entry_name or agent.agent_id)
     try:
         home_stat = home.lstat()
@@ -22705,31 +25196,34 @@ def _fleet_managed_home_state(
             marker = json.loads(marker_bytes.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise AgentError("fleet_home_content_invalid") from None
-        expected_fields = {
-            "schema_version",
-            "kind",
-            "agent_id",
-            "prefix",
-            "runner",
-            "provider",
-            "model",
-            "managed_files",
-            "files",
-        }
+        marker_fields = set(marker) if isinstance(marker, dict) else set()
+        if (
+            marker_fields
+            not in {
+                _FLEET_AGENT_MARKER_BASE_FIELDS,
+                _FLEET_AGENT_MARKER_BASE_FIELDS | {_FLEET_RUNTIME_SKILL_PROFILE_FIELD},
+            }
+        ):
+            raise AgentError("fleet_home_content_invalid")
+        effective_agent, runtime_skill_profile = _fleet_effective_runtime_descriptor(
+            marker,
+            agent,
+            "fleet_home_content_invalid",
+        )
         wrapper_name = "codex" if agent.runner is RunnerKind.CODEX_CLI else "gemini"
+        markdown_files = fleet_markdown_file_names(effective_agent)
         base_expected_files = (
-            {wrapper_name, "config.toml"}
+            {wrapper_name, "config.toml"} | markdown_files
             | ({"model.json"} if agent.provider is Provider.OLLAMA_LOCAL else set())
             if agent.runner is RunnerKind.CODEX_CLI
             else {
                 wrapper_name,
                 ".gemini/settings.json",
                 ".gemini/policies/codex-master.toml",
-            }
+            } | markdown_files
         )
         if (
             not isinstance(marker, dict)
-            or set(marker) != expected_fields
             or marker.get("schema_version") != 1
             or marker.get("kind") != "codex_master_fleet_agent"
             or marker.get("agent_id") != agent.agent_id
@@ -22743,7 +25237,11 @@ def _fleet_managed_home_state(
             raise AgentError("fleet_home_content_invalid")
         marker_files = set(marker["managed_files"])
         marker_digest_files = set(marker["files"])
-        compatibility_files = {"settings.json"} if agent.runner is RunnerKind.GEMINI_CLI else set()
+        compatibility_files = (
+            {"settings.json"} | markdown_files
+            if agent.runner is RunnerKind.GEMINI_CLI
+            else markdown_files
+        )
         portable_files = {
             name for name in marker_files
             if isinstance(name, str) and name.startswith("skills/.portable/") and name.endswith("/SKILL.md")
@@ -22773,39 +25271,69 @@ def _fleet_managed_home_state(
             )
             if not hmac.compare_digest(hashlib.sha256(content).hexdigest(), digest):
                 raise AgentError("fleet_home_content_invalid")
-        actual_files, actual_directories = _fleet_tree_entries(
-            home_fd,
-            "fleet_home_content_invalid",
-            allow_gemini_runtime=True,
-        )
-        allowed_files = {
-            FLEET_AGENT_MARKER_FILE,
-            *expected_files,
-            "auth.json",
-            ".gemini/projects.json",
-            "settings.json",
-        }
-        expected_directories = _fleet_artifact_directories({name: None for name in expected_files})
-        if strict_contents:
-            runtime_files = {
-                path
-                for path in actual_files
-                if path.startswith(".gemini/history/")
-                or path.startswith(".gemini/tmp/")
+        codex_runtime_directories: Collection[str] = ()
+        shared_runtime_sources: contextlib.AbstractContextManager[dict[str, str]] = contextlib.nullcontext({})
+        if agent.runner is RunnerKind.CODEX_CLI:
+            codex_runtime_directories = _FLEET_CODEX_RUNTIME_DIRECTORIES
+            template_agent = f"{agent.series_prefix}1"
+            if agent.agent_id != template_agent:
+                shared_runtime_sources = _fleet_pinned_shared_runtime_symlinks(
+                    root,
+                    agent,
+                    "fleet_home_content_invalid",
+                )
+        with shared_runtime_sources as codex_runtime_symlinks:
+            actual_files, actual_directories, actual_symlinks = _fleet_tree_entries(
+                home_fd,
+                "fleet_home_content_invalid",
+                allow_gemini_runtime=True,
+                opaque_runtime_directories=codex_runtime_directories,
+                allowed_runtime_symlinks=codex_runtime_symlinks,
+            )
+            allowed_files = {
+                FLEET_AGENT_MARKER_FILE,
+                *expected_files,
+                "auth.json",
+                ".gemini/projects.json",
+                "settings.json",
             }
-            runtime_directories = {
-                path
-                for path in actual_directories
-                if path == ".gemini/history"
-                or path.startswith(".gemini/history/")
-                or path == ".gemini/tmp"
-                or path.startswith(".gemini/tmp/")
-            }
-            if (
-                not actual_files <= allowed_files | runtime_files
-                or actual_directories != expected_directories | runtime_directories
-            ):
-                raise AgentError("fleet_home_content_invalid")
+            expected_directories = _fleet_artifact_directories({name: None for name in expected_files})
+            if strict_contents:
+                if agent.runner is RunnerKind.CODEX_CLI:
+                    runtime_regular_files = {
+                        path
+                        for path in actual_files
+                        if path in _FLEET_CODEX_RUNTIME_FILES
+                        or _FLEET_CODEX_RUNTIME_DATABASE_RE.fullmatch(path) is not None
+                    }
+                    for path in runtime_regular_files:
+                        _fleet_codex_runtime_regular_file_stat(
+                            home_fd,
+                            path,
+                            "fleet_home_content_invalid",
+                        )
+                    runtime_files = runtime_regular_files | actual_symlinks
+                    runtime_directories = actual_directories & set(codex_runtime_directories)
+                else:
+                    runtime_files = {
+                        path
+                        for path in actual_files
+                        if path.startswith(".gemini/history/")
+                        or path.startswith(".gemini/tmp/")
+                    }
+                    runtime_directories = {
+                        path
+                        for path in actual_directories
+                        if path == ".gemini/history"
+                        or path.startswith(".gemini/history/")
+                        or path == ".gemini/tmp"
+                        or path.startswith(".gemini/tmp/")
+                    }
+                if (
+                    not (actual_files | actual_symlinks) <= allowed_files | runtime_files
+                    or actual_directories != expected_directories | runtime_directories
+                ):
+                    raise AgentError("fleet_home_content_invalid")
         if "auth.json" in actual_files:
             _fleet_read_private_file_at(
                 home_fd,
@@ -22813,11 +25341,26 @@ def _fleet_managed_home_state(
                 0o600,
                 "fleet_home_content_invalid",
             )
-        return home_stat
+        return home_stat, runtime_skill_profile
     except OSError as exc:
         raise AgentError("fleet_home_content_invalid") from exc
     finally:
         os.close(home_fd)
+
+
+def _fleet_managed_home_state(
+    root: Path,
+    agent: AgentDescriptor,
+    *,
+    entry_name: str | None = None,
+    strict_contents: bool,
+) -> os.stat_result:
+    return _fleet_managed_home_details(
+        root,
+        agent,
+        entry_name=entry_name,
+        strict_contents=strict_contents,
+    )[0]
 
 
 def _fleet_validate_materialized_series_homes(
@@ -23308,7 +25851,7 @@ def _fleet_snapshot_metadata(current: os.stat_result) -> tuple[int, ...]:
 
 def _fleet_home_tree_snapshot(home_fd: int) -> dict[str, tuple[tuple[int, ...], str | None]]:
     error = "fleet_home_content_invalid"
-    files, directories = _fleet_tree_entries(home_fd, error)
+    files, directories, symlinks = _fleet_tree_entries(home_fd, error)
     snapshot: dict[str, tuple[tuple[int, ...], str | None]] = {
         "": (_fleet_snapshot_metadata(os.fstat(home_fd)), None)
     }
@@ -23325,7 +25868,7 @@ def _fleet_home_tree_snapshot(home_fd: int) -> dict[str, tuple[tuple[int, ...], 
             snapshot[name] = (_fleet_snapshot_metadata(current), None)
         finally:
             os.close(parent_fd)
-    for name in sorted(files):
+    for name in sorted(files | symlinks):
         parent_fd, basename = _fleet_open_artifact_parent(
             home_fd,
             name,
@@ -23842,7 +26385,9 @@ def _fleet_apply_managed_update(
 _Q_INPLACE_MANAGED_FILES = {
     "codex",
     "config.toml",
-    FLEET_AGENT_MARKER_FILE,
+            "AGENTS.md",
+            "AGENTS.class-teamleiterin.md",
+            FLEET_AGENT_MARKER_FILE,
 }
 
 
@@ -23886,7 +26431,7 @@ def _fleet_q_inplace_failure(
                 else "Der transaktionale Q-Serien-Updatepfad hat die Aenderung sicher abgebrochen."
             ),
             "rule": (
-                "Q-Homes bleiben bestehen; nur codex, config.toml und der Fleet-Marker "
+                "Q-Homes bleiben bestehen; nur codex, config.toml, die Hive-Markdown-Dateien und der Fleet-Marker "
                 "duerfen unter genau einem Registry-CAS geaendert werden."
             ),
             "action": (
@@ -24033,6 +26578,8 @@ def _fleet_apply_q_inplace_update(
                     home=descriptor.home,
                     wrapper=files["codex"][0],
                     config=files["config.toml"][0],
+                    instructions=files["AGENTS.md"][0],
+                    class_instructions=files["AGENTS.class-teamleiterin.md"][0],
                     marker=files[FLEET_AGENT_MARKER_FILE][0],
                 )
             )
@@ -25024,6 +27571,8 @@ def pool_normalize_spec(
     series_ids: dict[str, list[str]] = {}
     templates: dict[str, str] = {}
     authenticated: set[str] = set()
+    series_accounts: dict[str, str | None] = {}
+    agent_accounts: dict[str, str | None] = {}
     prefixes: set[str] = set()
     for index, item in enumerate(raw_series):
         if not isinstance(item, dict):
@@ -25047,6 +27596,13 @@ def pool_normalize_spec(
             raise AgentError(f"series[{index}].authenticated contains unknown Agentin ids")
         for agent in current_ids:
             templates[agent] = template
+        account = item.get("codex_usage_account")
+        if account is not None:
+            if not isinstance(account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(account):
+                raise AgentError(f"series[{index}].codex_usage_account is invalid")
+        series_accounts[f"{prefix}-series"] = account
+        for agent in current_ids:
+            agent_accounts[agent] = account
         authenticated.update(auth_items)
         series_ids[f"{prefix}-series"] = current_ids
         ids.extend(current_ids)
@@ -25111,6 +27667,9 @@ def pool_normalize_spec(
         "series_ids": series_ids,
         "templates": templates,
         "authenticated": sorted(authenticated),
+        "series_accounts": series_accounts,
+        "agent_accounts": agent_accounts,
+        "codex_usage_profiles_root": CODEX_USAGE_PROFILES_ROOT,
         "aliases": aliases,
         "shared_assets": shared_asset_paths,
         "runtime_dirs": runtime_dir_paths,
@@ -25296,6 +27855,7 @@ def pool_read_private_bytes(
     expected_parent_stat: os.stat_result | None = None,
     expected_target_stat: os.stat_result | None = None,
     expected_mode: int | None = None,
+    expected_uid: int | None = None,
 ) -> bytes:
     parent_fd = -1
     try:
@@ -25342,6 +27902,7 @@ def pool_read_private_bytes(
             or getattr(opened, "st_nlink", 1) != 1
             or opened.st_size > max_bytes
             or (expected_mode is not None and stat_module.S_IMODE(opened.st_mode) != expected_mode)
+            or (expected_uid is not None and opened.st_uid != expected_uid)
         ):
             raise AgentError(error_text)
         with os.fdopen(fd, "rb") as fh:
@@ -25723,6 +28284,23 @@ def pool_root_operation(
             os.close(parent_fd)
 
 
+def pool_codex_usage_auth_source(normalized: dict[str, Any], account: str) -> Path:
+    """Resolve one canonical codex-usage auth file without following untrusted links."""
+    if not isinstance(account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(account):
+        raise AgentError("codex-usage account id is invalid")
+    profiles_root = normalized["codex_usage_profiles_root"]
+    if not isinstance(profiles_root, Path) or not is_real_directory_no_symlink(profiles_root):
+        raise AgentError("codex-usage profiles root is missing or invalid")
+    profile = profiles_root / account
+    codex_home = profile / "codex-home"
+    if not is_real_directory_no_symlink(profile) or not is_real_directory_no_symlink(codex_home):
+        raise AgentError("codex-usage profile codex-home is missing or invalid")
+    source = codex_home / "auth.json"
+    if not is_regular_file_no_symlink(source):
+        raise AgentError("codex-usage profile auth is missing or invalid")
+    return source
+
+
 def _agent_pool_install_unlocked(
     normalized: dict[str, Any],
     *,
@@ -25751,6 +28329,9 @@ def _agent_pool_install_unlocked(
         linked_assets = 0
         missing_asset_sources = 0
         skipped_existing_assets = 0
+        auth_copied = 0
+        auth_skipped_existing = 0
+        auth_skipped_unconfigured = 0
 
         for agent in normalized["ids"]:
             home = root / agent
@@ -25770,6 +28351,27 @@ def _agent_pool_install_unlocked(
             if not is_regular_file_no_symlink(config_path):
                 pool_write_private_file(config_path, pool_minimal_config(logical_home), 0o600)
                 created_configs += 1
+
+            account = normalized["agent_accounts"].get(agent)
+            if account is None:
+                auth_skipped_unconfigured += 1
+            else:
+                target_auth = home / "auth.json"
+                if path_present_no_follow(target_auth):
+                    auth_skipped_existing += 1
+                else:
+                    source = pool_codex_usage_auth_source(normalized, account)
+                    if pool_write_private_bytes_if_absent(
+                        target_auth,
+                        pool_read_private_bytes(
+                            source,
+                            MAX_CODEX_CONFIG_BYTES,
+                            "codex-usage profile auth is missing or invalid",
+                        ),
+                    ):
+                        auth_copied += 1
+                    else:
+                        auth_skipped_existing += 1
 
             for runtime_dir in normalized["runtime_dirs"]:
                 runtime_path = home / runtime_dir
@@ -25887,6 +28489,9 @@ def _agent_pool_install_unlocked(
             "linked_shared_assets": linked_assets,
             "skipped_existing_shared_assets": skipped_existing_assets,
             "missing_shared_asset_sources": missing_asset_sources,
+            "auth_copied_count": auth_copied,
+            "auth_skipped_existing_count": auth_skipped_existing,
+            "auth_skipped_unconfigured_count": auth_skipped_unconfigured,
             "auth": auth_result,
             "raw_output": "not_returned",
         }
@@ -26015,6 +28620,124 @@ def agent_pool_copy_auth(
             yes=yes,
             overwrite=overwrite,
         )
+
+
+def _agent_pool_refresh_auth_unlocked(
+    normalized: dict[str, Any],
+    *,
+    agent: str,
+    yes: bool,
+) -> dict[str, Any]:
+    root = normalized["pool_root"]
+    pool_guard_root(root)
+    try:
+        expected_parent_stat = root.parent.lstat()
+        expected_root_stat = root.lstat()
+    except OSError as exc:
+        raise AgentError("auth refresh pool root is missing or invalid") from exc
+    with pool_root_operation(
+        root,
+        ensure=False,
+        error_text="auth refresh pool root changed unexpectedly",
+        expected_parent_stat=expected_parent_stat,
+        expected_root_stat=expected_root_stat,
+        require_private=True,
+    ) as root:
+        home = root / agent
+        try:
+            expected_home_stat = home.lstat()
+            expected_home_parent_stat = home.parent.lstat()
+        except OSError as exc:
+            raise AgentError("auth refresh target home is missing or invalid") from exc
+        _fleet_private_directory_stat(expected_home_stat, "auth refresh target home is missing or invalid")
+        with pool_root_operation(
+            home,
+            ensure=False,
+            error_text="auth refresh target home changed unexpectedly",
+            expected_parent_stat=expected_home_parent_stat,
+            expected_root_stat=expected_home_stat,
+            require_private=True,
+        ) as home:
+            if tmux_alive(agent_config(agent)["session"]):
+                raise AgentError("auth refresh target is running or in use")
+            processes = pool_home_processes(home)
+            if processes is None or processes:
+                raise AgentError("auth refresh target is running or in use")
+
+            target = home / "auth.json"
+            try:
+                expected_target_stat = target.lstat()
+            except FileNotFoundError:
+                expected_target_stat = None
+            except OSError as exc:
+                raise AgentError("auth refresh target auth is missing or invalid") from exc
+            if expected_target_stat is not None and (
+                not stat_module.S_ISREG(expected_target_stat.st_mode)
+                or getattr(expected_target_stat, "st_nlink", 1) != 1
+                or expected_target_stat.st_uid != os.geteuid()
+                or stat_module.S_IMODE(expected_target_stat.st_mode) != 0o600
+            ):
+                raise AgentError("auth refresh target auth is missing or invalid")
+
+            account = normalized["agent_accounts"].get(agent)
+            if not isinstance(account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(account):
+                raise AgentError("auth refresh target has no canonical codex-usage account")
+            source = pool_codex_usage_auth_source(normalized, account)
+            try:
+                expected_source_stat = source.lstat()
+            except OSError as exc:
+                raise AgentError("codex-usage profile auth is missing or invalid") from exc
+            auth_bytes = pool_read_private_bytes(
+                source,
+                MAX_CODEX_CONFIG_BYTES,
+                "codex-usage profile auth is missing or invalid",
+                expected_target_stat=expected_source_stat,
+                expected_mode=0o600,
+                expected_uid=os.geteuid(),
+            )
+            if yes:
+                replace_private_bytes(
+                    target,
+                    auth_bytes,
+                    mode=0o600,
+                    expected_existing_stat=expected_target_stat,
+                )
+            return {
+                "ok": True,
+                "dry_run": not yes,
+                "target_agent": "not_returned",
+                "target_agent_state": "set",
+                "source_profile": "not_returned",
+                "source_profile_state": "set",
+                "target_auth_state": "present" if expected_target_stat is not None else "missing",
+                "refreshed": yes,
+                "auth_content": "not_returned",
+                "pool_root": PATH_NOT_RETURNED,
+                "raw_output": "not_returned",
+            }
+
+
+def agent_pool_refresh_auth(
+    spec: str | None = None,
+    target_dir: str | None = None,
+    codex_bin: str | None = None,
+    *,
+    agent: str,
+    yes: bool = False,
+) -> dict[str, Any]:
+    normalized = pool_normalize_spec(spec, target_dir=target_dir, codex_bin=codex_bin)
+    if not isinstance(agent, str):
+        raise AgentError("auth refresh target must be a concrete pool Agentin id")
+    agent = agent.strip().lower()
+    if agent not in normalized["ids"]:
+        raise AgentError("auth refresh target is not part of the pool")
+    try:
+        if canonical_agent_id(agent) != agent:
+            raise AgentError("auth refresh target is not a managed Agentin")
+    except AgentError:
+        raise AgentError("auth refresh target is not a managed Agentin") from None
+    with agent_lifecycle_lock(agent), pool_root_lock(normalized["pool_root"]):
+        return _agent_pool_refresh_auth_unlocked(normalized, agent=agent, yes=yes)
 
 
 @contextlib.contextmanager
@@ -26570,21 +29293,15 @@ def applet_capacity_observation(admission: Any) -> dict[str, Any] | None:
     if not isinstance(admission, dict):
         return None
     allowed = admission.get("allowed")
-    available_slots = admission.get("available_slots")
     reason_codes = admission.get("reason_codes")
     if (
         not isinstance(allowed, bool)
-        or (
-            available_slots is not None
-            and (isinstance(available_slots, bool) or not isinstance(available_slots, int) or available_slots < 0)
-        )
         or not isinstance(reason_codes, list)
         or any(not isinstance(reason, str) or reason not in RESOURCE_REASON_CODES for reason in reason_codes)
     ):
         return None
     return {
         "allowed": allowed,
-        "available_slots": available_slots,
         "reason_codes": sorted(set(reason_codes)),
     }
 
@@ -27265,6 +29982,11 @@ TOOLS: list[dict[str, Any]] = [
                 "name": text_schema(MAX_AGENTIN_NAME),
                 "allow_unauthenticated": allow_unauthenticated_schema(),
                 "allow_broad_selector": allow_broad_selector_schema(),
+                "confirm_home_refresh": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Required before a stopped legacy home with validated wrapper/config drift is refreshed.",
+                },
                 **resolver_request_schema(),
             },
             "additionalProperties": False,
@@ -27413,6 +30135,78 @@ TOOLS: list[dict[str, Any]] = [
                 "agent": agent_selector_schema(default="all"),
                 "dry_run": {"type": "boolean", "default": False},
             },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "usage_fast_mode_status",
+        "description": "Return account-scoped Fast/Flex mode state without changing agents.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "usage_fast_mode_reconcile",
+        "description": "Evaluate OpenAI weekly/monthly and 5-hour windows with EMA60 and apply account-scoped Fast/Flex transitions.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dry_run": {"type": "boolean", "default": False},
+                "emergency_only": {"type": "boolean", "default": False, "description": "Use the 10-minute final-window guard only."},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "usage_fast_mode",
+        "description": "Activate or deactivate Fast mode for one Codex account. Running agents receive a graceful-sleep signal and are never forcibly disconnected by this tool; new and resumed agents use the selected tier.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["account"],
+            "properties": {
+                "account": text_schema(MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID),
+                "action": {"type": "string", "enum": ["activate", "deactivate"], "default": "activate"},
+                "reason": text_schema(500, description="Why the time-critical limit-consumption mode is needed."),
+                "until_utc": text_schema(64, description="Optional RFC3339 expiry; expiry automatically returns this account to Flex."),
+                "dry_run": {"type": "boolean", "default": False},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "emergency_queen_status",
+        "description": "Return the durable emergency-Queen state and serialized approved-plan queue without raw output.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "emergency_queen_plan_completed",
+        "description": "Record one completed emergency plan; advances the one-Queen queue or begins graceful draining.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["generation", "plan", "emergency_active"],
+            "properties": {
+                "generation": {"type": "integer", "minimum": 1},
+                "plan": text_schema(4096),
+                "emergency_active": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "emergency_queen_child_started",
+        "description": "Register one child of the active emergency Queen so graceful draining waits for it.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["generation", "agent"],
+            "properties": {"generation": {"type": "integer", "minimum": 1}, "agent": agent_selector_schema(single=True)},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "emergency_queen_child_completed",
+        "description": "Remove one completed emergency-Queen child from the durable draining set.",
+        "inputSchema": {
+            "type": "object",
+            "required": ["generation", "agent"],
+            "properties": {"generation": {"type": "integer", "minimum": 1}, "agent": agent_selector_schema(single=True)},
             "additionalProperties": False,
         },
     },
@@ -28797,6 +31591,84 @@ def _fleet_overview_local_admin(
         raise AgentError("fleet_overview_unavailable") from None
 
 
+def _hive_metrics_local_admin(*, clock: Callable[[], _dt.datetime] | None = None) -> str:
+    selected_clock = clock if clock is not None else (lambda: _dt.datetime.now(_dt.timezone.utc))
+    paths = FleetPaths.from_state_root(STATE_ROOT)
+    try:
+        with _fleet_registry_read_lock(paths.lock):
+            registry_snapshot = _readonly_fleet_service().registry_snapshot()
+            inventory = build_inventory(registry_snapshot, AGENT_POOL_ROOT)
+        observation = create_fleet_snapshot(
+            agent_homes={agent_id: inventory.agents[agent_id].home for agent_id in inventory.agent_ids},
+            agent_sessions={agent_id: inventory.agents[agent_id].session for agent_id in inventory.agent_ids},
+            tmux_runner=run_tmux,
+        )
+        contexts: dict[str, FleetOverviewAgentContext] = {}
+        observation_errors = 0
+        for agent_id in inventory.agent_ids:
+            try:
+                status = status_agent(agent_id, initialize_state=False, snapshot=observation)
+                active = status.get("running") is True
+                last_assignment = status.get("last_assignment") if isinstance(status.get("last_assignment"), dict) else {}
+                meta = read_meta(agent_id)
+                principal_role = meta.get("agent_class")
+                if not isinstance(principal_role, str) or not principal_role:
+                    principal_role = last_assignment.get("role")
+                if not isinstance(principal_role, str) or not principal_role:
+                    principal_role = None
+                contexts[agent_id] = FleetOverviewAgentContext(
+                    active, "running" if active else "stopped", principal_role,
+                    last_assignment.get("assignment_id") if isinstance(last_assignment.get("assignment_id"), str) else None,
+                )
+            except Exception:
+                observation_errors += 1
+                contexts[agent_id] = FleetOverviewAgentContext(False, "unknown")
+        overview = build_fleet_overview(
+            registry_snapshot, inventory, active_only=True, contexts=contexts, created_at=observation.created_at,
+        )
+        native = native_agent_status()
+        native_counts = native.get("counts") if isinstance(native.get("counts"), dict) else {}
+        native_active = native_counts.get("active")
+        native_unconfirmed = native_counts.get("unconfirmed")
+        if type(native_active) is not int or native_active < 0:
+            native_active = 0
+        if type(native_unconfirmed) is not int or native_unconfirmed < 0:
+            native_unconfirmed = 0
+        values = fleet_metric_values(overview, native_active=native_active, observed_at=selected_clock())
+        values.update({
+            "codex_master_agent_observation_errors": observation_errors,
+            "codex_master_native_bridge_ready": int(native.get("bridge_state") == "ready"),
+            "codex_master_bees_native_unconfirmed": native_unconfirmed,
+            "codex_master_process_scan_available": int(observation.process_scan_available),
+            "codex_master_tmux_scan_available": int(observation.tmux_scan_available),
+        })
+        return render_openmetrics(values)
+    except Exception:
+        raise AgentError("hive_metrics_unavailable") from None
+
+
+def _observability_serve_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="codex-master-mcp observability-serve")
+    parser.add_argument("--host", choices=("127.0.0.1", "::1"), default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=9798)
+    parser.add_argument("--cache-seconds", type=float, default=5.0)
+    args = parser.parse_args(argv)
+    if not 1024 <= args.port <= 65535 or not 0.25 <= args.cache_seconds <= 60:
+        print_json({"error": "invalid_observability_configuration"})
+        return 2
+    server = MetricsHttpServer(
+        (args.host, args.port),
+        TimedMetricsReader(_hive_metrics_local_admin, ttl_seconds=args.cache_seconds),
+    )
+    try:
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
 def _fleet_overview_cli(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="codex-master-mcp fleet overview")
     parser.add_argument("--format", choices=("compact", "json", "markdown"), default="compact")
@@ -28845,6 +31717,18 @@ def _resource_monitor_install_cli(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     try:
         result = install_resource_monitor(force=args.force)
+        print_json(result)
+        return 0 if result.get("ok") else 1
+    except Exception as exc:
+        print_json(public_error_payload(exc))
+        return 1
+
+
+def _resource_scope_gate_install_cli(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="codex-master-mcp install-resource-scope-gate")
+    parser.parse_args(argv)
+    try:
+        result = install_resource_scope_gate()
         print_json(result)
         return 0 if result.get("ok") else 1
     except Exception as exc:
@@ -29246,8 +32130,30 @@ def main_cli(argv: list[str]) -> int:
         return _resource_status_cli(argv[1:])
     if argv[:1] == ["install-resource-monitor"]:
         return _resource_monitor_install_cli(argv[1:])
+    if argv[:1] == ["install-resource-scope-gate"]:
+        return _resource_scope_gate_install_cli(argv[1:])
     if argv[:1] == ["resource-monitor-status"]:
         return _resource_monitor_status_cli(argv[1:])
+    if argv[:1] == ["observability-serve"]:
+        previous_inventory = swap_agent_inventory(None)
+        try:
+            _fleet_initialize_recovery_startup_state()
+            _publish_startup_fleet_inventory()
+            return _observability_serve_cli(argv[1:])
+        finally:
+            swap_agent_inventory(previous_inventory)
+    if argv[:1] == ["hive-metrics"]:
+        previous_inventory = swap_agent_inventory(None)
+        try:
+            _fleet_initialize_recovery_startup_state()
+            _publish_startup_fleet_inventory()
+            print(_hive_metrics_local_admin(), end="")
+            return 0
+        except Exception:
+            print_json({"error": "hive_metrics_unavailable"})
+            return 1
+        finally:
+            swap_agent_inventory(previous_inventory)
 
     global _FLEET_STARTUP_ERROR
     previous_inventory = swap_agent_inventory(None)
@@ -29270,6 +32176,7 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_start.add_argument("--prompt")
     p_start.add_argument("--allow-unauthenticated", action="store_true")
     p_start.add_argument("--allow-broad-selector", action="store_true")
+    p_start.add_argument("--confirm-home-refresh", action="store_true")
 
     p_spawn_offers = sub.add_parser("spawn-offers")
     p_spawn_offers.add_argument("--required-slots", type=int, default=1)
@@ -29300,7 +32207,7 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_selection_preview.add_argument("--limit", type=int, default=8)
 
     p_wait = sub.add_parser("wait")
-    p_wait.add_argument("agent", help="Concrete Agentin id or legacy alias: a1..a100, b1..b100, c1..c100, a, b.")
+    p_wait.add_argument("agent", help="Concrete Agentin id or legacy alias: a1..a100, b1..b100, c1..c100, u1, a, b.")
     p_wait.add_argument("--timeout-seconds", type=int, default=DEFAULT_WAIT_SECONDS)
     p_wait.add_argument("--poll-interval-seconds", type=int, default=DEFAULT_WAIT_POLL_SECONDS)
 
@@ -29648,6 +32555,11 @@ def _main_cli_impl(argv: list[str]) -> int:
     p_pool_copy_auth.add_argument("--yes", action="store_true")
     p_pool_copy_auth.add_argument("--overwrite", action="store_true")
 
+    p_pool_refresh_auth = pool_sub.add_parser("refresh_auth", aliases=["refresh-auth"])
+    add_pool_common(p_pool_refresh_auth)
+    p_pool_refresh_auth.add_argument("--agent", required=True)
+    p_pool_refresh_auth.add_argument("--yes", action="store_true")
+
     p_pool_destroy = pool_sub.add_parser("destroy_pool", aliases=["destroy-pool"])
     add_pool_common(p_pool_destroy)
     p_pool_destroy.add_argument("--yes", action="store_true")
@@ -29779,6 +32691,7 @@ def _main_cli_impl(argv: list[str]) -> int:
                         "prompt": args.prompt,
                         "allow_unauthenticated": True if args.allow_unauthenticated else None,
                         "allow_broad_selector": True if args.allow_broad_selector else None,
+                        "confirm_home_refresh": True if args.confirm_home_refresh else None,
                     },
                 )
             )
@@ -30199,6 +33112,16 @@ def _main_cli_impl(argv: list[str]) -> int:
                             "yes": args.yes,
                             "overwrite": args.overwrite,
                         },
+                    )
+                )
+            if args.pool_command in {"refresh_auth", "refresh-auth"}:
+                return print_json(
+                    agent_pool_refresh_auth(
+                        args.spec,
+                        args.target_dir,
+                        args.codex_bin,
+                        agent=args.agent,
+                        yes=args.yes,
                     )
                 )
             if args.pool_command in {"destroy_pool", "destroy-pool"}:
@@ -30965,29 +33888,127 @@ def fleet_account_list() -> dict[str, Any]:
     }
 
 
-def _read_hive_api_tokens(
-    path: Path = HIVE_API_TOKEN_ENV_FILE,
-    selected_keys: list[int] | None = None,
-) -> dict[int, str]:
-    """Read only The_Hive_N assignments from the private local token file."""
+def _selected_hive_key_set(selected_keys: list[int] | None, *, error_code: str) -> set[int] | None:
+    if selected_keys is None:
+        return None
+    selected_set: set[int] = set()
+    for number in selected_keys:
+        if isinstance(number, bool) or not isinstance(number, int) or not 1 <= number <= MAX_HIVE_API_KEYS:
+            raise AgentError(error_code)
+        selected_set.add(number)
+    return selected_set
 
-    if selected_keys is not None:
-        selected_set = set(selected_keys)
-    else:
-        selected_set = None
 
+def _validate_private_hive_token_file(
+    path: Path,
+    *,
+    invalid_code: str,
+    unavailable_code: str,
+) -> os.stat_result:
     try:
         file_stat = path.lstat()
     except OSError as exc:
-        raise AgentError("api_token_env_unavailable") from exc
+        raise AgentError(unavailable_code) from exc
     if (
         not stat_module.S_ISREG(file_stat.st_mode)
         or getattr(file_stat, "st_nlink", 1) != 1
         or file_stat.st_uid != os.geteuid()
         or stat_module.S_IMODE(file_stat.st_mode) & 0o077
     ):
-        raise AgentError("api_token_env_invalid")
-    text = read_private_regular_text(path, 512 * 1024, "api_token_env_unavailable")
+        raise AgentError(invalid_code)
+    return file_stat
+
+
+def _validate_hive_api_secret_value(value: Any, *, error_code: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise AgentError(error_code)
+    if (
+        len(value.encode("utf-8")) > 16 * 1024
+        or any(character.isspace() or ord(character) < 32 for character in value)
+    ):
+        raise AgentError(error_code)
+    return value
+
+
+def _hive_api_token_number_from_project_ref(value: Any, *, error_code: str) -> int:
+    if not isinstance(value, str):
+        raise AgentError(error_code)
+    match = re.fullmatch(r"the-hive-(\d+)", value)
+    if match is None:
+        raise AgentError(error_code)
+    number = int(match.group(1))
+    if not 1 <= number <= MAX_HIVE_API_KEYS or match.group(1) != str(number):
+        raise AgentError(error_code)
+    return number
+
+
+def _validate_hive_api_token_yaml_keys(
+    mapping: Mapping[Any, Any],
+    *,
+    allowed_keys: set[str],
+    required_keys: set[str],
+) -> None:
+    if not all(isinstance(key, str) for key in mapping):
+        raise AgentError("api_token_yaml_invalid_structure")
+    keys = set(mapping)
+    if not required_keys <= keys or not keys <= allowed_keys:
+        raise AgentError("api_token_yaml_invalid_structure")
+
+
+def _validate_yaml_ref(value: Any, *, error_code: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value.strip() != value
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", value) is None
+    ):
+        raise AgentError(error_code)
+    return value
+
+
+def _optional_yaml_string_or_null(
+    value: Any,
+    *,
+    error_code: str,
+    allow_empty: bool = False,
+) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and (value or allow_empty) and not any(ord(character) < 32 for character in value):
+        return value
+    raise AgentError(error_code)
+
+
+def _record_unique_non_null_yaml_value(
+    seen_values: set[str],
+    value: str | None,
+    *,
+    error_code: str,
+) -> None:
+    if value is None:
+        return
+    if value in seen_values:
+        raise AgentError(error_code)
+    seen_values.add(value)
+
+
+def _read_hive_api_token_env(
+    path: Path = HIVE_API_TOKEN_ENV_FILE,
+    selected_keys: list[int] | None = None,
+) -> dict[int, str]:
+    """Read only The_Hive_N assignments from the private local token file."""
+
+    selected_set = _selected_hive_key_set(selected_keys, error_code="api_token_env_invalid")
+    _validate_private_hive_token_file(
+        path,
+        invalid_code="api_token_env_invalid",
+        unavailable_code="api_token_env_unavailable",
+    )
+    text = read_private_regular_text(
+        path,
+        MAX_HIVE_API_TOKEN_DOCUMENT_BYTES,
+        "api_token_env_unavailable",
+    )
     tokens: dict[int, str] = {}
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -31006,14 +34027,297 @@ def _read_hive_api_tokens(
             value = value[1:-1]
         if not value:
             continue
-        if (
-            not 1 <= number <= MAX_HIVE_API_KEYS
-            or len(value.encode("utf-8")) > 16 * 1024
-            or any(character.isspace() or ord(character) < 32 for character in value)
-            or number in tokens
-        ):
+        if not 1 <= number <= MAX_HIVE_API_KEYS or number in tokens:
             raise AgentError("api_token_env_invalid")
-        tokens[number] = value
+        tokens[number] = _validate_hive_api_secret_value(
+            value,
+            error_code="api_token_env_invalid",
+        )
+    return tokens
+
+
+def _read_hive_api_token_yaml(
+    path: Path = HIVE_API_TOKEN_YAML_FILE,
+    selected_keys: list[int] | None = None,
+) -> dict[int, str]:
+    """Read The_Hive_N project credentials from the structured private YAML file."""
+
+    selected_set = _selected_hive_key_set(selected_keys, error_code="api_token_yaml_invalid")
+    _validate_private_hive_token_file(
+        path,
+        invalid_code="api_token_yaml_invalid_permissions",
+        unavailable_code="api_token_yaml_unavailable",
+    )
+    text = read_private_regular_text(
+        path,
+        MAX_HIVE_API_TOKEN_DOCUMENT_BYTES,
+        "api_token_yaml_unavailable",
+    )
+    try:
+        document = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise AgentError("api_token_yaml_invalid") from exc
+    if not isinstance(document, dict):
+        raise AgentError("api_token_yaml_invalid_structure")
+    _validate_hive_api_token_yaml_keys(
+        document,
+        allowed_keys={"schema_version", "google_accounts"},
+        required_keys={"schema_version", "google_accounts"},
+    )
+    schema_version = document.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version != HIVE_API_TOKEN_YAML_SCHEMA_VERSION:
+        raise AgentError("api_token_yaml_invalid_schema")
+
+    google_accounts = document["google_accounts"]
+    if not isinstance(google_accounts, list):
+        raise AgentError("api_token_yaml_invalid_structure")
+
+    google_account_refs: set[str] = set()
+    google_subject_ids: set[str] = set()
+    google_login_emails: set[str] = set()
+    billing_account_refs: set[str] = set()
+    billing_account_ids: set[str] = set()
+    project_refs: set[str] = set()
+    project_ids: set[str] = set()
+    project_numbers: set[str] = set()
+    key_ids: set[str] = set()
+    key_uids: set[str] = set()
+    tokens: dict[int, str] = {}
+    for google_account in google_accounts:
+        if not isinstance(google_account, dict):
+            raise AgentError("api_token_yaml_invalid_structure")
+        _validate_hive_api_token_yaml_keys(
+            google_account,
+            allowed_keys={
+                "ref",
+                "label",
+                "login_email",
+                "recovery_email",
+                "subject_id",
+                "billing_accounts",
+                "projects",
+            },
+            required_keys={
+                "ref",
+                "login_email",
+                "recovery_email",
+                "subject_id",
+                "billing_accounts",
+                "projects",
+            },
+        )
+        account_ref = _validate_yaml_ref(
+            google_account.get("ref"),
+            error_code="api_token_yaml_invalid_google_account_ref",
+        )
+        if account_ref in google_account_refs:
+            raise AgentError("api_token_yaml_duplicate_google_account")
+        google_account_refs.add(account_ref)
+        login_email = _optional_yaml_string_or_null(
+            google_account.get("login_email"),
+            error_code="api_token_yaml_invalid_structure",
+        )
+        if login_email is None or "@" not in login_email:
+            raise AgentError("api_token_yaml_invalid_login_email")
+        normalized_login_email = login_email.casefold()
+        if normalized_login_email in google_login_emails:
+            raise AgentError("api_token_yaml_duplicate_login_email")
+        google_login_emails.add(normalized_login_email)
+        recovery_email = _optional_yaml_string_or_null(
+            google_account.get("recovery_email"),
+            error_code="api_token_yaml_invalid_structure",
+        )
+        if recovery_email is not None and "@" not in recovery_email:
+            raise AgentError("api_token_yaml_invalid_recovery_email")
+        if "label" in google_account:
+            _optional_yaml_string_or_null(
+                google_account.get("label"),
+                error_code="api_token_yaml_invalid_structure",
+                allow_empty=True,
+            )
+        subject_id = (
+            _optional_yaml_string_or_null(
+                google_account.get("subject_id"),
+                error_code="api_token_yaml_invalid_structure",
+            )
+            if "subject_id" in google_account
+            else None
+        )
+        _record_unique_non_null_yaml_value(
+            google_subject_ids,
+            subject_id,
+            error_code="api_token_yaml_duplicate_subject_id",
+        )
+        billing_accounts = google_account.get("billing_accounts")
+        projects = google_account.get("projects")
+        if not isinstance(billing_accounts, list) or not isinstance(projects, list):
+            raise AgentError("api_token_yaml_invalid_structure")
+        if len(billing_accounts) > 4:
+            raise AgentError("api_token_yaml_google_account_billing_limit_exceeded")
+        if len(projects) > 10:
+            raise AgentError("api_token_yaml_google_account_project_limit_exceeded")
+
+        local_billing_refs: set[str] = set()
+        for billing_account in billing_accounts:
+            if not isinstance(billing_account, dict):
+                raise AgentError("api_token_yaml_invalid_structure")
+            _validate_hive_api_token_yaml_keys(
+                billing_account,
+                allowed_keys={"ref", "billing_account_id", "label"},
+                required_keys={"ref", "billing_account_id"},
+            )
+            billing_ref = _validate_yaml_ref(
+                billing_account.get("ref"),
+                error_code="api_token_yaml_invalid_billing_account_ref",
+            )
+            if billing_ref in billing_account_refs:
+                raise AgentError("api_token_yaml_duplicate_billing_account")
+            billing_account_refs.add(billing_ref)
+            local_billing_refs.add(billing_ref)
+            billing_account_id = _optional_yaml_string_or_null(
+                billing_account.get("billing_account_id"),
+                error_code="api_token_yaml_invalid_structure",
+            )
+            _record_unique_non_null_yaml_value(
+                billing_account_ids,
+                billing_account_id,
+                error_code="api_token_yaml_duplicate_billing_account_id",
+            )
+            if "label" in billing_account:
+                _optional_yaml_string_or_null(
+                    billing_account.get("label"),
+                    error_code="api_token_yaml_invalid_structure",
+                    allow_empty=True,
+                )
+
+        for project in projects:
+            if not isinstance(project, dict):
+                raise AgentError("api_token_yaml_invalid_structure")
+            _validate_hive_api_token_yaml_keys(
+                project,
+                allowed_keys={
+                    "ref",
+                    "billing_account_ref",
+                    "status",
+                    "project_id",
+                    "project_number",
+                    "key_id",
+                    "key_uid",
+                    "secret",
+                    "label",
+                },
+                required_keys={
+                    "ref",
+                    "billing_account_ref",
+                    "status",
+                    "project_id",
+                    "project_number",
+                    "key_id",
+                    "key_uid",
+                    "secret",
+                },
+            )
+            project_ref = project.get("ref")
+            number = _hive_api_token_number_from_project_ref(
+                project_ref,
+                error_code="api_token_yaml_invalid_project_ref",
+            )
+            if project_ref in project_refs:
+                raise AgentError("api_token_yaml_duplicate_project")
+            project_refs.add(project_ref)
+            billing_account_ref = _optional_yaml_string_or_null(
+                project.get("billing_account_ref"),
+                error_code="api_token_yaml_invalid_structure",
+            )
+            if billing_account_ref is not None and billing_account_ref not in local_billing_refs:
+                raise AgentError("api_token_yaml_unknown_billing_account_ref")
+            status = project.get("status")
+            if status not in {"active", "blocked"}:
+                raise AgentError("api_token_yaml_invalid_project_status")
+            project_id = _optional_yaml_string_or_null(
+                project.get("project_id"),
+                error_code="api_token_yaml_invalid_structure",
+            )
+            project_number = _optional_yaml_string_or_null(
+                project.get("project_number"),
+                error_code="api_token_yaml_invalid_structure",
+            )
+            key_id = _optional_yaml_string_or_null(
+                project.get("key_id"),
+                error_code="api_token_yaml_invalid_structure",
+            )
+            key_uid = _optional_yaml_string_or_null(
+                project.get("key_uid"),
+                error_code="api_token_yaml_invalid_structure",
+            )
+            _record_unique_non_null_yaml_value(
+                project_ids,
+                project_id,
+                error_code="api_token_yaml_duplicate_project_id",
+            )
+            _record_unique_non_null_yaml_value(
+                project_numbers,
+                project_number,
+                error_code="api_token_yaml_duplicate_project_number",
+            )
+            _record_unique_non_null_yaml_value(
+                key_ids,
+                key_id,
+                error_code="api_token_yaml_duplicate_key_id",
+            )
+            _record_unique_non_null_yaml_value(
+                key_uids,
+                key_uid,
+                error_code="api_token_yaml_duplicate_key_uid",
+            )
+            if "label" in project:
+                _optional_yaml_string_or_null(
+                    project.get("label"),
+                    error_code="api_token_yaml_invalid_structure",
+                    allow_empty=True,
+                )
+            secret_value = project.get("secret")
+            if status == "blocked":
+                if secret_value is not None:
+                    raise AgentError("api_token_yaml_blocked_project_has_secret")
+                continue
+            secret = _validate_hive_api_secret_value(
+                secret_value,
+                error_code="api_token_yaml_secret_missing",
+            )
+            if selected_set is None or number in selected_set:
+                tokens[number] = secret
+    return tokens
+
+
+def _read_hive_api_tokens_with_source(
+    *,
+    env_path: Path = HIVE_API_TOKEN_ENV_FILE,
+    yaml_path: Path = HIVE_API_TOKEN_YAML_FILE,
+    selected_keys: list[int] | None = None,
+) -> tuple[dict[int, str], str]:
+    try:
+        yaml_path.lstat()
+    except OSError:
+        return (
+            _read_hive_api_token_env(path=env_path, selected_keys=selected_keys),
+            "private_api_token_env",
+        )
+    return (
+        _read_hive_api_token_yaml(path=yaml_path, selected_keys=selected_keys),
+        "private_api_token_yaml",
+    )
+
+
+def _read_hive_api_tokens(
+    path: Path | None = None,
+    selected_keys: list[int] | None = None,
+) -> dict[int, str]:
+    """Compatibility wrapper: explicit path reads legacy ENV, default prefers YAML."""
+
+    if path is not None:
+        return _read_hive_api_token_env(path=path, selected_keys=selected_keys)
+    tokens, _source = _read_hive_api_tokens_with_source(selected_keys=selected_keys)
     return tokens
 
 
@@ -31045,7 +34349,9 @@ def fleet_account_sync_env(
         raise AgentError("invalid_hive_key_range")
     if not isinstance(activate_series, bool):
         raise AgentError("invalid_hive_series_flag")
-    tokens = _read_hive_api_tokens(selected_keys=list(range(first_key, last_key + 1)))
+    tokens, source = _read_hive_api_tokens_with_source(
+        selected_keys=list(range(first_key, last_key + 1)),
+    )
     requested = list(range(first_key, last_key + 1))
     missing = [number for number in requested if number not in tokens]
     configured: list[int] = []
@@ -31125,7 +34431,7 @@ def fleet_account_sync_env(
         "missing_keys": missing,
         "probe_results": probe_results,
         "activated_series": activated,
-        "source": "private_api_token_env",
+        "source": source,
         "credential_values": "not_returned",
         "raw_output": "not_returned",
     }
@@ -31153,18 +34459,32 @@ def fleet_sync_skill_projections() -> dict[str, Any]:
                 if found is None:
                     raise AgentError("fleet_executable_unavailable")
                 executable = trusted_runner_executable(Path(found))
-            home_artifacts = _fleet_home_artifacts(
-                descriptor,
-                executable,
-                include_portable_skills=True,
-            )
-            _fleet_write_home(
-                descriptor.home,
-                {
-                    name: value
-                    for name, (value, _mode) in _fleet_artifact_files(home_artifacts).items()
-                },
-            )
+            # Projection refresh is a lifecycle operation too: never replace
+            # class context while a bee still owns the home.
+            with _fleet_idle_agent_locks(inventory, [agent_id]):
+                _home_stat, runtime_skill_profile = _fleet_managed_home_details(
+                    AGENT_POOL_ROOT,
+                    descriptor,
+                    strict_contents=False,
+                )
+                effective_descriptor = (
+                    dataclass_replace(descriptor, skill_profile=runtime_skill_profile)
+                    if runtime_skill_profile is not None
+                    else descriptor
+                )
+                home_artifacts = _fleet_home_artifacts(
+                    effective_descriptor,
+                    executable,
+                    include_portable_skills=True,
+                    runtime_skill_profile=runtime_skill_profile,
+                )
+                _fleet_write_home(
+                    descriptor.home,
+                    {
+                        name: value
+                        for name, (value, _mode) in _fleet_artifact_files(home_artifacts).items()
+                    },
+                )
         except Exception as exc:
             failed.append({
                 "agent": agent_id,
@@ -31619,6 +34939,7 @@ def _fleet_artifacts(agent: AgentDescriptor, executable: Path) -> dict[str, byte
         ("gemini" if agent.runner is RunnerKind.GEMINI_CLI else "codex"): fleet_wrapper_text(agent, executable).encode(),
         config_name: config_text.encode(),
     }
+    artifacts.update(fleet_markdown_artifacts(agent))
     if agent.provider is Provider.OLLAMA_LOCAL and agent.runner is RunnerKind.CODEX_CLI:
         artifacts["model.json"] = fleet_model_catalog(agent).encode()
     if agent.runner is RunnerKind.GEMINI_CLI:
@@ -31638,6 +34959,7 @@ def _fleet_artifacts(agent: AgentDescriptor, executable: Path) -> dict[str, byte
         "runner": agent.runner.value,
         "provider": agent.provider.value,
         "model": agent.model,
+        _FLEET_RUNTIME_SKILL_PROFILE_FIELD: None,
         "managed_files": sorted(artifacts),
         "files": {name: hashlib.sha256(data).hexdigest() for name, data in sorted(artifacts.items())},
     }
