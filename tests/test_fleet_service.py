@@ -840,15 +840,38 @@ def test_probe_errors_become_fixed_gate_reasons(tmp_path: Path, kind: str, want:
                                                 secret_state: SecretState, retryable: bool,
                                                 status_code: int | None) -> None:
     service, _ = _service(tmp_path, _configured_snapshot())
-    error = ProviderError(kind, retryable, status_code, None)  # type: ignore[arg-type]
+    diagnostic_code = (
+        "gemini_probe_generate_content_http_4xx_contract_rejected"
+        if kind == "runner_failed"
+        else None
+    )
+    error = ProviderError(  # type: ignore[arg-type]
+        kind,
+        retryable,
+        status_code,
+        None,
+        diagnostic_code=diagnostic_code,
+    )
     result = service.probe_account(
-        "shared", lambda account: ProbeResult(account.provider, False, "model", False, error),
+        "shared",
+        lambda account: ProbeResult(
+            account.provider,
+            False,
+            "model",
+            False,
+            error,
+            endpoint_role="generate_content" if kind == "runner_failed" else None,
+            http_class="4xx" if kind == "runner_failed" else None,
+        ),
         expected_generation=2,
     )
     assert result["reason"] == want
     assert service.load().accounts[0].secret_state is secret_state
     assert service.account_gate("d1").reason == want
     if kind == "runner_failed":
+        assert result["diagnostic_code"] == "gemini_probe_generate_content_http_4xx_contract_rejected"
+        assert result["endpoint_role"] == "generate_content"
+        assert result["http_class"] == "4xx"
         gate = service.gemini_headless_gate("d1")
         assert gate.diagnostic_code == "gemini_runner_failed"
         assert gate.retryable is False
@@ -862,11 +885,17 @@ def test_probe_errors_become_fixed_gate_reasons(tmp_path: Path, kind: str, want:
             reason=want,
             gate_action=gate.action,
             gate_code=gate.diagnostic_code,
+            diagnostic_code=result["diagnostic_code"],
+            endpoint_role=result["endpoint_role"],
+            http_class=result["http_class"],
         )
         event = service.gemini_event_status(limit=1)[0]
         assert event["reason"] == "runner_failed"
         assert event["gate_code"] == "gemini_runner_failed"
         assert event["gate_action"] == "reject"
+        assert event["diagnostic_code"] == "gemini_probe_generate_content_http_4xx_contract_rejected"
+        assert event["endpoint_role"] == "generate_content"
+        assert event["http_class"] == "4xx"
 
 
 @pytest.mark.parametrize(("quota_scope", "retry_after_seconds"), [
@@ -910,20 +939,33 @@ def test_probe_model_scope_without_retry_or_accountwide_scopes_fail_closed(
 def test_record_gemini_event_unknown_diagnostic_code_is_omitted(tmp_path: Path) -> None:
     service, _ = _service(tmp_path, _configured_snapshot())
 
-    result = service.record_gemini_event(
-        event_type="account_probe",
-        agent_id="probe",
-        account_id="shared",
-        assignment_id=None,
-        status="failed",
-        reason="provider_unavailable",
-        diagnostic_code="unknown_code",
-    )
+    for malformed_http_class in ({"class": "4xx"}, ["4xx"]):
+        probe_status = service._probe_status(
+            service.load(),
+            ready=False,
+            reason="runner_failed",
+            http_class=malformed_http_class,  # type: ignore[arg-type]
+        )
+        assert "http_class" not in probe_status
 
-    assert result["recorded"] is True
-    events = service.gemini_event_status(limit=1)
-    assert len(events) == 1
-    assert "diagnostic_code" not in events[0]
+        result = service.record_gemini_event(
+            event_type="account_probe",
+            agent_id="probe",
+            account_id="shared",
+            assignment_id=None,
+            status="failed",
+            reason="provider_unavailable",
+            diagnostic_code="unknown_code",
+            endpoint_role="unknown_endpoint",
+            http_class=malformed_http_class,  # type: ignore[arg-type]
+        )
+
+        assert result["recorded"] is True
+        events = service.gemini_event_status(limit=1)
+        assert len(events) == 1
+        assert "diagnostic_code" not in events[0]
+        assert "endpoint_role" not in events[0]
+        assert "http_class" not in events[0]
 
 
 def test_detail_poor_429_binds_account_limit_to_existing_rate_cooldown(tmp_path: Path, monkeypatch) -> None:

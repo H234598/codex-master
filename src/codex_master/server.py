@@ -34966,9 +34966,23 @@ def fleet_account_probe(
         account_probe_reason: str | None = result.get("reason") if isinstance(result.get("reason"), str) else None
         account_probe_diagnostic = (
             normalize_gemini_probe_diagnostic_code(result.get("diagnostic_code"))
-            if account_probe_reason == "provider_unavailable"
+            if account_probe_reason in {"provider_unavailable", "runner_failed"}
             else None
         )
+        account_probe_endpoint_role = (
+            "generate_content" if result.get("endpoint_role") == "generate_content" else None
+        )
+        account_probe_http_class_value = result.get("http_class")
+        account_probe_http_class = (
+            account_probe_http_class_value
+            if (
+                isinstance(account_probe_http_class_value, str)
+                and account_probe_http_class_value in {"2xx", "4xx", "5xx", "transport"}
+            )
+            else None
+        )
+        if account_probe_http_class is None:
+            result.pop("http_class", None)
         account_probe_phase = result.get("process_phase")
         account_probe_stdout_shape = result.get("process_stdout_shape")
         account_probe_stdout_event_class = result.get("process_stdout_event_class")
@@ -34988,6 +35002,8 @@ def fleet_account_probe(
                 status="completed" if result.get("ready") is True else "failed",
                 reason=account_probe_reason,
                 diagnostic_code=account_probe_diagnostic,
+                endpoint_role=account_probe_endpoint_role,
+                http_class=account_probe_http_class,
                 process_phase=account_probe_phase,
                 process_output_shape=result.get("process_output_shape"),
                 process_stdout_shape=account_probe_stdout_shape,

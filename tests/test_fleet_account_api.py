@@ -793,7 +793,7 @@ def test_gemini_account_probe_returns_verified_model_without_secret_leak(
         "runner_failed",
         False,
         "gemini_probe_generate_content_http_4xx_contract_rejected",
-        None,
+        "gemini_probe_generate_content_http_4xx_contract_rejected",
         None,
         None,
         None,
@@ -974,6 +974,8 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
                 process_stdout_shape=provided_stdout_shape,
                 process_stdout_event_class=provided_stdout_event_class,
                 process_stdout_error_seen=provided_stdout_error_seen,
+                endpoint_role="generate_content" if error_kind == "runner_failed" else None,
+                http_class="4xx" if error_kind == "runner_failed" else None,
             )
 
         return ProbeResult(
@@ -999,6 +1001,12 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
         assert "diagnostic_code" not in result
     else:
         assert result["diagnostic_code"] == expected_observed
+    if error_kind == "runner_failed":
+        assert result["endpoint_role"] == "generate_content"
+        assert result["http_class"] == "4xx"
+    else:
+        assert "endpoint_role" not in result
+        assert "http_class" not in result
     assert result.get("process_phase") == expected_observed_process
     if expected_output_shape is None:
         assert "process_output_shape" not in result
@@ -1031,6 +1039,12 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
         assert "diagnostic_code" not in event
     else:
         assert event.get("diagnostic_code") == expected_observed
+    if error_kind == "runner_failed":
+        assert event["endpoint_role"] == "generate_content"
+        assert event["http_class"] == "4xx"
+    else:
+        assert "endpoint_role" not in event
+        assert "http_class" not in event
     if expected_output_shape is None:
         assert "process_output_shape" not in event
     else:
@@ -1056,9 +1070,41 @@ def test_gemini_account_probe_persists_probe_diagnostic_code_for_provider_unavai
         assert account.secret_state is SecretState.CONFIGURED
         assert account.limit_state is LimitState.UNKNOWN
         assert account.limit_reason == expected_reason
+    forbidden_telemetry = {"body", "raw_body", "headers", "url", "secret", "status_code"}
+    assert forbidden_telemetry.isdisjoint(result)
+    assert forbidden_telemetry.isdisjoint(event)
     assert GEMINI_READY_CREDENTIAL not in json.dumps(result)
 
     service = server.current_fleet_service()
+    if error_kind == "runner_failed":
+        monkeypatch.setattr(server, "current_fleet_service", lambda: service)
+        for malformed_http_class in ({"class": "4xx"}, ["4xx"]):
+            monkeypatch.setattr(
+                service,
+                "probe_account",
+                lambda *_args, malformed=malformed_http_class, **_kwargs: {
+                    "probed": True,
+                    "generation": 4,
+                    "ready": False,
+                    "reason": "runner_failed",
+                    "model": "gemini-2.5-flash-lite",
+                    "diagnostic_code": "gemini_probe_generate_content_http_4xx_contract_rejected",
+                    "endpoint_role": "generate_content",
+                    "http_class": malformed,
+                },
+            )
+            malformed_result = server.fleet_account_probe(
+                account_id="gemini-ready",
+                expected_generation=4,
+            )
+            assert "http_class" not in malformed_result
+            malformed_event = json.loads(
+                (server.STATE_ROOT / "fleet" / "events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[-1]
+            )
+            assert "http_class" not in malformed_event
+
     service.record_gemini_event(
         event_type="account_probe",
         agent_id=None,

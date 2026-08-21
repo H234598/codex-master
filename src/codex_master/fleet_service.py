@@ -36,6 +36,8 @@ from .fleet_registry import (
 from .fleet_runners import (
     FleetRunnerError,
     ProbeDiagnosticCode,
+    ProbeEndpointRole,
+    ProbeHttpClass,
     ProbeOutputShape,
     ProbeStdoutEventClass,
     ProbeStdoutShape,
@@ -1125,6 +1127,8 @@ class FleetService:
         gate_code: str | None = None,
         next_reset_at_utc: str | None = None,
         diagnostic_code: ProbeDiagnosticCode | None = None,
+        endpoint_role: ProbeEndpointRole | None = None,
+        http_class: ProbeHttpClass | None = None,
         process_phase: ProbeProcessPhase | None = None,
         process_output_shape: ProbeOutputShape | None = None,
         process_stdout_shape: ProbeStdoutShape | None = None,
@@ -1136,6 +1140,12 @@ class FleetService:
         if self._read_only:
             return {"recorded": False, "reason": "read_only"}
         normalized_diagnostic_code = normalize_gemini_probe_diagnostic_code(diagnostic_code)
+        normalized_endpoint_role = endpoint_role if endpoint_role == "generate_content" else None
+        normalized_http_class = (
+            http_class
+            if isinstance(http_class, str) and http_class in {"2xx", "4xx", "5xx", "transport"}
+            else None
+        )
         normalized_process_phase = normalize_gemini_probe_process_phase(process_phase)
         normalized_process_output_shape = FleetService._normalize_probe_output_shape_for_timeout(
             normalized_diagnostic_code,
@@ -1170,6 +1180,10 @@ class FleetService:
         }
         if normalized_diagnostic_code is not None:
             values["diagnostic_code"] = normalized_diagnostic_code
+        if normalized_endpoint_role is not None:
+            values["endpoint_role"] = normalized_endpoint_role
+        if normalized_http_class is not None:
+            values["http_class"] = normalized_http_class
         if normalized_process_phase is not None:
             values["process_phase"] = normalized_process_phase
         if normalized_process_output_shape is not None:
@@ -2093,6 +2107,8 @@ class FleetService:
         ready: bool,
         reason: str,
         diagnostic_code: ProbeDiagnosticCode | None = None,
+        endpoint_role: ProbeEndpointRole | None = None,
+        http_class: ProbeHttpClass | None = None,
         process_phase: ProbeProcessPhase | None = None,
         process_output_shape: ProbeOutputShape | None = None,
         process_stdout_shape: ProbeStdoutShape | None = None,
@@ -2112,6 +2128,16 @@ class FleetService:
         normalized_diagnostic_code = normalize_gemini_probe_diagnostic_code(diagnostic_code)
         if isinstance(diagnostic_code, str) and normalized_diagnostic_code:
             status["diagnostic_code"] = diagnostic_code
+        normalized_endpoint_role = endpoint_role if endpoint_role == "generate_content" else None
+        if normalized_endpoint_role is not None:
+            status["endpoint_role"] = normalized_endpoint_role
+        normalized_http_class = (
+            http_class
+            if isinstance(http_class, str) and http_class in {"2xx", "4xx", "5xx", "transport"}
+            else None
+        )
+        if normalized_http_class is not None:
+            status["http_class"] = normalized_http_class
         normalized_process_output_shape = FleetService._normalize_probe_output_shape_for_timeout(
             normalized_diagnostic_code,
             normalized_process_phase,
@@ -2371,7 +2397,7 @@ class FleetService:
                     result.error.diagnostic_code
                     if (
                         isinstance(result, ProbeResult)
-                        and reason == "provider_unavailable"
+                        and reason in {"provider_unavailable", "runner_failed"}
                         and result.error is not None
                     ) else None
                 )
@@ -2399,6 +2425,16 @@ class FleetService:
             )
             process_stdout_error_seen = (
                 result.process_stdout_error_seen
+                if isinstance(result, ProbeResult)
+                else None
+            )
+            endpoint_role: ProbeEndpointRole | None = (
+                result.endpoint_role
+                if isinstance(result, ProbeResult)
+                else None
+            )
+            http_class: ProbeHttpClass | None = (
+                result.http_class
                 if isinstance(result, ProbeResult)
                 else None
             )
@@ -2454,6 +2490,8 @@ class FleetService:
                     ready=False,
                     reason=reason,
                     diagnostic_code=diagnostic_code,
+                    endpoint_role=endpoint_role,
+                    http_class=http_class,
                     process_phase=process_phase,
                     process_output_shape=process_output_shape,
                     process_stdout_shape=process_stdout_shape,
@@ -2484,6 +2522,8 @@ class FleetService:
                 ready=reason == "ready",
                 reason=reason,
                 diagnostic_code=diagnostic_code,
+                endpoint_role=endpoint_role,
+                http_class=http_class,
                 process_phase=process_phase,
                 process_output_shape=process_output_shape,
                 process_stdout_shape=process_stdout_shape,
