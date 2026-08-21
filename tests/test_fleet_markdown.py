@@ -1,0 +1,199 @@
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+import pytest
+
+from codex_master import fleet_markdown
+from codex_master.fleet_registry import AgentDescriptor, Provider, RunnerKind
+from codex_master.hive_policy import (
+    MAX_COMMON_POLICY_BYTES,
+    CommonPolicyError,
+    load_common_policy,
+)
+
+
+_MARKDOWN_ROOT = Path(fleet_markdown.__file__).with_name("markdown")
+_COMMON_BYTES = (_MARKDOWN_ROOT / "common.md").read_bytes()
+
+
+def _agent(
+    runner: RunnerKind = RunnerKind.CODEX_CLI,
+    skill_profile: str = "worker",
+) -> AgentDescriptor:
+    provider = (
+        Provider.GEMINI_API
+        if runner is RunnerKind.GEMINI_CLI
+        else Provider.OPENAI_CHATGPT
+    )
+    return AgentDescriptor(
+        agent_id="a1",
+        series_prefix="a",
+        ordinal=1,
+        label="Agentin A1",
+        runner=runner,
+        provider=provider,
+        model="test-model",
+        account_id=None,
+        home=Path("/unused/a1"),
+        session="agent-a1",
+        enabled=True,
+        skill_profile=skill_profile,
+    )
+
+
+def test_codex_projection_preserves_artifact_api_and_profile_path() -> None:
+    agent = _agent()
+    class_name = "AGENTS.class-worker.md"
+    expected_primary = _COMMON_BYTES + (
+        "\n\n## Active class profile\n\n"
+        f"Read `./{class_name}` before acting. "
+        "Only that class profile is active in this home.\n"
+    ).encode()
+    expected_artifacts = {
+        "AGENTS.md": expected_primary,
+        class_name: (_MARKDOWN_ROOT / "classes" / "worker.md").read_bytes(),
+    }
+
+    projection = fleet_markdown.fleet_markdown_projection(agent)
+
+    assert dict(projection.artifacts) == expected_artifacts
+    assert fleet_markdown.fleet_markdown_artifacts(agent) == expected_artifacts
+    assert type(fleet_markdown.fleet_markdown_artifacts(agent)) is dict
+    assert fleet_markdown.fleet_markdown_file_names(agent) == set(expected_artifacts)
+
+
+def test_gemini_projection_preserves_provider_paths() -> None:
+    agent = _agent(RunnerKind.GEMINI_CLI)
+    class_name = "AGENTS.class-worker.md"
+    expected_primary = _COMMON_BYTES + (
+        f"\n\n## Active class profile\n\n@./{class_name}\n"
+    ).encode()
+    expected_artifacts = {
+        ".gemini/GEMINI.md": expected_primary,
+        f".gemini/{class_name}": (
+            _MARKDOWN_ROOT / "classes" / "worker.md"
+        ).read_bytes(),
+    }
+
+    projection = fleet_markdown.fleet_markdown_projection(agent)
+
+    assert dict(projection.artifacts) == expected_artifacts
+    assert fleet_markdown.fleet_markdown_artifacts(agent) == expected_artifacts
+
+
+def test_providers_share_exact_common_prefix_and_only_reference_class_body() -> None:
+    class_name = b"AGENTS.class-worker.md"
+    worker_body = (_MARKDOWN_ROOT / "classes" / "worker.md").read_bytes()
+    codex = fleet_markdown.fleet_markdown_projection(_agent())
+    gemini = fleet_markdown.fleet_markdown_projection(
+        _agent(RunnerKind.GEMINI_CLI)
+    )
+
+    for projection in (codex, gemini):
+        primary = projection.artifacts[projection.metadata.provider_artifact_name]
+        suffix = primary[len(_COMMON_BYTES) :]
+        assert primary[: len(_COMMON_BYTES)] == _COMMON_BYTES
+        assert suffix.count(class_name) == 1
+        assert worker_body not in primary
+
+
+def test_projection_metadata_exposes_bounded_contract_and_full_digest() -> None:
+    projection = fleet_markdown.fleet_markdown_projection(_agent())
+    metadata = projection.metadata
+    primary = projection.artifacts[metadata.provider_artifact_name]
+
+    assert metadata.schema_version == 1
+    assert metadata.generation == 1
+    assert metadata.common_digest == hashlib.sha256(_COMMON_BYTES).hexdigest()
+    assert metadata.common_size == len(_COMMON_BYTES) <= MAX_COMMON_POLICY_BYTES
+    assert metadata.provider_artifact_name == "AGENTS.md"
+    assert metadata.provider_artifact_digest == hashlib.sha256(primary).hexdigest()
+    assert metadata.provider_artifact_size == len(primary)
+    assert metadata.class_profile == "worker"
+    assert metadata.class_artifact_name == "AGENTS.class-worker.md"
+
+
+def test_provider_projection_digests_are_deterministic_and_distinct() -> None:
+    codex_first = fleet_markdown.fleet_markdown_projection(_agent())
+    codex_second = fleet_markdown.fleet_markdown_projection(_agent())
+    gemini = fleet_markdown.fleet_markdown_projection(
+        _agent(RunnerKind.GEMINI_CLI)
+    )
+
+    assert codex_first.metadata == codex_second.metadata
+    assert dict(codex_first.artifacts) == dict(codex_second.artifacts)
+    assert codex_first.metadata.common_digest == gemini.metadata.common_digest
+    assert (
+        codex_first.metadata.provider_artifact_digest
+        != gemini.metadata.provider_artifact_digest
+    )
+
+
+def test_canonical_header_remains_first_in_both_provider_artifacts() -> None:
+    expected_header = (
+        b'<!-- codex-master-common-policy:{"generation":1,"schema_version":1} -->'
+    )
+
+    for runner in (RunnerKind.CODEX_CLI, RunnerKind.GEMINI_CLI):
+        projection = fleet_markdown.fleet_markdown_projection(_agent(runner))
+        primary = projection.artifacts[projection.metadata.provider_artifact_name]
+        assert primary.splitlines()[0] == expected_header
+
+
+@pytest.mark.parametrize("profile", ["../../worker", "worker.md", "", "x" * 65])
+def test_invalid_profile_falls_back_only_to_generic_class_projection(
+    profile: str,
+) -> None:
+    projection = fleet_markdown.fleet_markdown_projection(
+        _agent(skill_profile=profile)
+    )
+
+    assert projection.metadata.class_profile == "generic"
+    assert projection.metadata.class_artifact_name == "AGENTS.class-generic.md"
+    assert projection.artifacts["AGENTS.class-generic.md"] == (
+        _MARKDOWN_ROOT / "classes" / "generic.md"
+    ).read_bytes()
+    assert projection.metadata.common_digest == hashlib.sha256(_COMMON_BYTES).hexdigest()
+
+
+def test_profile_normalization_and_known_class_body_are_preserved() -> None:
+    projection = fleet_markdown.fleet_markdown_projection(
+        _agent(skill_profile="  WORKER  ")
+    )
+
+    assert projection.metadata.class_profile == "worker"
+    assert projection.artifacts["AGENTS.class-worker.md"] == (
+        _MARKDOWN_ROOT / "classes" / "worker.md"
+    ).read_bytes()
+
+
+def test_unknown_valid_profile_keeps_path_and_uses_existing_placeholder() -> None:
+    projection = fleet_markdown.fleet_markdown_projection(
+        _agent(skill_profile="specialist")
+    )
+
+    assert projection.metadata.class_profile == "specialist"
+    assert projection.metadata.class_artifact_name == "AGENTS.class-specialist.md"
+    assert projection.artifacts["AGENTS.class-specialist.md"] == (
+        b"# Hive class profile: `specialist`\n\n"
+        b"This profile has no additional class-specific policy yet. Follow the "
+        b"common Hive context and the assigned task scope.\n"
+    )
+
+
+def test_malformed_common_header_error_propagates_without_policy_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    malformed_policy = tmp_path / "common.md"
+    malformed_policy.write_bytes(b"# missing contract header\n")
+    monkeypatch.setattr(
+        fleet_markdown,
+        "load_common_policy",
+        lambda: load_common_policy(malformed_policy),
+    )
+
+    with pytest.raises(CommonPolicyError, match="common_policy_header_invalid"):
+        fleet_markdown.fleet_markdown_artifacts(_agent())
