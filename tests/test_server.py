@@ -1,3 +1,4 @@
+import ast
 import base64
 import contextlib
 import functools
@@ -14,6 +15,7 @@ import tempfile
 import threading
 import tomllib
 import unittest
+from collections.abc import Iterator
 from dataclasses import replace as dataclass_replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -376,6 +378,42 @@ def managed_home_tree_for_test(home: Path) -> dict[str, tuple[str, int, bytes | 
         else:
             result[relative] = ("file", stat.S_IMODE(current.st_mode), path.read_bytes())
     return result
+
+
+def fleet_identity_snapshot_for_test(path: Path) -> tuple[tuple[int, ...], str | None]:
+    current = path.lstat()
+    digest = hashlib.sha256(path.read_bytes()).hexdigest() if stat.S_ISREG(current.st_mode) else None
+    return server_module._fleet_snapshot_metadata(current), digest
+
+
+@contextlib.contextmanager
+def fleet_identity_home_fds_for_test(
+    tmp: str,
+) -> Iterator[
+    tuple[
+        Path,
+        Path,
+        int,
+        int,
+        list[server_module._FleetIdentityJournal],
+    ]
+]:
+    parent = Path(tmp) / "pool"
+    home = parent / "a1"
+    parent.mkdir(mode=0o700)
+    home.mkdir(mode=0o700)
+    parent_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    home_fd = os.open(home, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    journals: list[server_module._FleetIdentityJournal] = []
+    try:
+        yield parent, home, parent_fd, home_fd, journals
+    finally:
+        for journal in reversed(journals):
+            if journal.fd >= 0:
+                os.close(journal.fd)
+                journal.fd = -1
+        os.close(home_fd)
+        os.close(parent_fd)
 
 
 def write_legacy_home_refresh_for_test(
@@ -9912,6 +9950,933 @@ google_accounts:
                         descriptor,
                         target,
                     )
+
+    def test_fleet_identity_journal_rename_between_pinned_fds_is_noreplace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            target = root / "target"
+            source.mkdir(mode=0o700)
+            target.mkdir(mode=0o700)
+            original = source / "object"
+            original.write_bytes(b"original\n")
+            original.chmod(0o600)
+            expected = fleet_identity_snapshot_for_test(original)
+            source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            target_fd = os.open(target, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                server_module._fleet_identity_journal_rename_noreplace_at(
+                    source_fd,
+                    "object",
+                    target_fd,
+                    "moved",
+                    expected,
+                )
+                self.assertFalse(original.exists())
+                self.assertEqual(
+                    fleet_identity_snapshot_for_test(target / "moved"),
+                    expected,
+                )
+                other = source / "other"
+                other.write_bytes(b"other\n")
+                other.chmod(0o600)
+                with self.assertRaisesRegex(
+                    AgentError,
+                    "fleet_identity_journal_collision",
+                ):
+                    server_module._fleet_identity_journal_rename_noreplace_at(
+                        source_fd,
+                        "other",
+                        target_fd,
+                        "moved",
+                        fleet_identity_snapshot_for_test(other),
+                    )
+                self.assertEqual(other.read_bytes(), b"other\n")
+            finally:
+                os.close(target_fd)
+                os.close(source_fd)
+
+    def test_fleet_identity_journal_prepare_switch_and_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, fleet_identity_home_fds_for_test(tmp) as (
+            parent,
+            home,
+            parent_fd,
+            home_fd,
+            journals,
+        ):
+            original = home / "ordered-last"
+            original.write_bytes(b"old\n")
+            original.chmod(0o700)
+            parent_before = server_module._fleet_snapshot_metadata(parent.lstat())
+            entries = (
+                server_module._FleetIdentityJournalEntry(
+                    "ordered-last",
+                    fleet_identity_snapshot_for_test(original),
+                    "file",
+                    0o700,
+                    b"new\n",
+                ),
+                server_module._FleetIdentityJournalEntry(
+                    "private-directory", None, "directory", 0o700, None
+                ),
+            )
+            journal = server_module._fleet_identity_journal_prepare(
+                parent_fd,
+                home_fd,
+                server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
+                server_module._fleet_snapshot_metadata(os.fstat(home_fd)),
+                entries,
+            )
+            journals.append(journal)
+            self.assertEqual(original.read_bytes(), b"old\n")
+            self.assertEqual(tuple(state.entry for state in journal.states), entries)
+            self.assertFalse(hasattr(journal, "home_before"))
+            self.assertFalse(hasattr(journal, "entries"))
+            server_module._fleet_identity_journal_switch(home_fd, journal)
+            self.assertEqual(stat.S_IMODE(original.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE((home / "private-directory").stat().st_mode), 0o700)
+            server_module._fleet_identity_journal_commit(parent_fd, journal)
+            self.assertEqual(original.read_bytes(), b"new\n")
+            self.assertEqual(server_module._fleet_snapshot_metadata(parent.lstat()), parent_before)
+
+    def test_fleet_identity_journal_faultpoints_restore_exact_nested_tree(self) -> None:
+        for selected in (
+            "before_switch",
+            "during_switch:1",
+            "during_switch:2",
+            "during_switch:3",
+            "during_switch:4",
+            "after_switch",
+        ):
+            with (
+                self.subTest(selected=selected),
+                tempfile.TemporaryDirectory() as tmp,
+                fleet_identity_home_fds_for_test(tmp) as (
+                    parent,
+                    home,
+                    parent_fd,
+                    home_fd,
+                    journals,
+                ),
+            ):
+                nested = home / "nested"
+                nested.mkdir(mode=0o700)
+                data = nested / "data"
+                data.write_bytes(b"old-data\n")
+                data.chmod(0o700)
+                ordered_last = home / "ordered-last"
+                ordered_last.write_bytes(b"old-last\n")
+                ordered_last.chmod(0o600)
+
+                def snapshot() -> dict[str, tuple[tuple[int, ...], bytes | None]]:
+                    return {
+                        path.relative_to(parent.parent).as_posix(): (
+                            server_module._fleet_snapshot_metadata(path.lstat()),
+                            None if path.is_dir() else path.read_bytes(),
+                        )
+                        for path in (parent, home, *sorted(home.rglob("*")))
+                    }
+
+                before = snapshot()
+                entries = (
+                    server_module._FleetIdentityJournalEntry(
+                        "nested/data",
+                        fleet_identity_snapshot_for_test(data),
+                        "file",
+                        0o700,
+                        b"new-data\n",
+                    ),
+                    server_module._FleetIdentityJournalEntry(
+                        "new-directory", None, "directory", 0o700, None
+                    ),
+                    server_module._FleetIdentityJournalEntry(
+                        "new-directory/item", None, "file", 0o600, b"new-item\n"
+                    ),
+                    server_module._FleetIdentityJournalEntry(
+                        "ordered-last",
+                        fleet_identity_snapshot_for_test(ordered_last),
+                        "file",
+                        0o600,
+                        b"new-last\n",
+                    ),
+                )
+                journal = server_module._fleet_identity_journal_prepare(
+                    parent_fd,
+                    home_fd,
+                    server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
+                    server_module._fleet_snapshot_metadata(os.fstat(home_fd)),
+                    entries,
+                )
+                journals.append(journal)
+
+                during_count = 0
+
+                def fail(name: str) -> None:
+                    nonlocal during_count
+                    if name == "during_switch":
+                        during_count += 1
+                    point = f"{name}:{during_count}" if name == "during_switch" else name
+                    if point == selected:
+                        raise OSError(f"injected {name}")
+
+                with self.assertRaises(OSError):
+                    server_module._fleet_identity_journal_switch(
+                        home_fd,
+                        journal,
+                        faultpoint=fail,
+                    )
+                server_module._fleet_identity_journal_rollback(
+                    parent_fd,
+                    home_fd,
+                    journal,
+                )
+                self.assertFalse((home / "new-directory").exists())
+                self.assertEqual(snapshot(), before)
+
+    def test_fleet_identity_journal_rejects_uid_mode_nlink_and_cleanup_drift(self) -> None:
+        for drift in ("uid", "mode", "nlink", "cleanup", "old_slot_sha"):
+            with (
+                self.subTest(drift=drift),
+                tempfile.TemporaryDirectory() as tmp,
+                fleet_identity_home_fds_for_test(tmp) as (
+                    _parent,
+                    home,
+                    parent_fd,
+                    home_fd,
+                    journals,
+                ),
+            ):
+                original = home / "object"
+                original.write_bytes(b"old\n")
+                original.chmod(0o600)
+                expected = fleet_identity_snapshot_for_test(original)
+                if drift == "uid":
+                    metadata, digest = expected
+                    expected = ((*metadata[:3], metadata[3] + 1, *metadata[4:]), digest)
+                    with self.assertRaisesRegex(
+                        AgentError,
+                        "fleet_identity_journal_changed",
+                    ):
+                        server_module._fleet_identity_journal_prepare(
+                            parent_fd,
+                            home_fd,
+                            server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
+                            server_module._fleet_snapshot_metadata(os.fstat(home_fd)),
+                            (
+                                server_module._FleetIdentityJournalEntry(
+                                    "object", expected, "file", 0o600, b"new\n"
+                                ),
+                            ),
+                        )
+                    continue
+                journal = server_module._fleet_identity_journal_prepare(
+                    parent_fd,
+                    home_fd,
+                    server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
+                    server_module._fleet_snapshot_metadata(os.fstat(home_fd)),
+                    (
+                        server_module._FleetIdentityJournalEntry(
+                            "object", expected, "file", 0o600, b"new\n"
+                        ),
+                    ),
+                )
+                journals.append(journal)
+                if drift == "mode":
+                    original.chmod(0o640)
+                elif drift == "nlink":
+                    os.link(original, home / "hardlink")
+                else:
+                    server_module._fleet_identity_journal_switch(home_fd, journal)
+                    old_slot = journal.states[0].old_slot
+                    self.assertIsNotNone(old_slot)
+                    if drift == "cleanup":
+                        os.chmod(old_slot or "", 0o640, dir_fd=journal.fd)
+                    else:
+                        old_snapshot = journal.states[0].entry.before
+                        self.assertIsNotNone(old_snapshot)
+                        fd = os.open(old_slot or "", os.O_WRONLY, dir_fd=journal.fd)
+                        try:
+                            os.write(fd, b"bad\n")
+                            os.fsync(fd)
+                        finally:
+                            os.close(fd)
+                        current = os.stat(
+                            old_slot or "",
+                            dir_fd=journal.fd,
+                            follow_symlinks=False,
+                        )
+                        os.utime(
+                            old_slot or "",
+                            ns=(current.st_atime_ns, (old_snapshot or ((), None))[0][7]),
+                            dir_fd=journal.fd,
+                            follow_symlinks=False,
+                        )
+                    with self.assertRaisesRegex(
+                        AgentError,
+                        "fleet_identity_journal_cleanup_diverged",
+                    ):
+                        server_module._fleet_identity_journal_commit(parent_fd, journal)
+                    self.assertEqual(original.read_bytes(), b"new\n")
+                    self.assertTrue(
+                        stat.S_ISREG(
+                            os.stat(
+                                old_slot or "",
+                                dir_fd=journal.fd,
+                                follow_symlinks=False,
+                            ).st_mode
+                        )
+                    )
+                    continue
+                inode = original.stat().st_ino
+                with self.assertRaisesRegex(
+                    AgentError,
+                    "fleet_identity_journal_changed",
+                ):
+                    server_module._fleet_identity_journal_switch(home_fd, journal)
+                self.assertEqual(original.stat().st_ino, inode)
+                self.assertEqual(original.read_bytes(), b"old\n")
+
+    def test_fleet_identity_journal_prepare_cleanup_is_exact_and_fail_closed(self) -> None:
+        for foreign_slot in (False, True):
+            with (
+                self.subTest(foreign_slot=foreign_slot),
+                tempfile.TemporaryDirectory() as tmp,
+                fleet_identity_home_fds_for_test(tmp) as (
+                    parent,
+                    _home,
+                    parent_fd,
+                    home_fd,
+                    _tracked_journals,
+                ),
+            ):
+                parent_before = server_module._fleet_snapshot_metadata(parent.lstat())
+                real_writer = server_module.write_private_new_bytes
+                writes = 0
+
+                def fail_second_write(
+                    path: Path,
+                    data: bytes,
+                    mode: int = 0o600,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> None:
+                    nonlocal writes
+                    writes += 1
+                    if writes == 2:
+                        if foreign_slot:
+                            real_writer(Path("foreign"), b"foreign\n", dir_fd=dir_fd)
+                        raise OSError("injected staging failure")
+                    real_writer(path, data, mode=mode, dir_fd=dir_fd)
+
+                entries = (
+                    server_module._FleetIdentityJournalEntry(
+                        "first", None, "file", 0o600, b"first\n"
+                    ),
+                    server_module._FleetIdentityJournalEntry(
+                        "second", None, "file", 0o600, b"second\n"
+                    ),
+                )
+                expected_error = (
+                    "fleet_identity_journal_cleanup_diverged"
+                    if foreign_slot
+                    else "injected staging failure"
+                )
+                with patch.object(
+                    server_module,
+                    "write_private_new_bytes",
+                    side_effect=fail_second_write,
+                ), self.assertRaisesRegex((AgentError, OSError), expected_error):
+                    server_module._fleet_identity_journal_prepare(
+                        parent_fd,
+                        home_fd,
+                        server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
+                        server_module._fleet_snapshot_metadata(os.fstat(home_fd)),
+                        entries,
+                    )
+                journals = list(parent.glob(".fleet-identity-staging-*"))
+                journals.extend(parent.glob(".fleet-identity-journal-*"))
+                if foreign_slot:
+                    self.assertEqual(len(journals), 1)
+                    self.assertEqual((journals[0] / "foreign").read_bytes(), b"foreign\n")
+                else:
+                    self.assertEqual(journals, [])
+                    self.assertEqual(
+                        server_module._fleet_snapshot_metadata(parent.lstat()),
+                        parent_before,
+                    )
+
+    def test_fleet_identity_journal_prepare_publish_faultpoints_are_identity_bound(self) -> None:
+        faultpoints = (
+            "after_staging_mkdir",
+            "after_staging_pin",
+            "after_staging_fstat",
+            "after_staging_validation",
+            "after_staging_path_stat",
+            "after_staging_empty_check",
+            "after_parent_fstat",
+            "after_staging_fsync",
+            "after_staging_final_fstat",
+            "after_staging_final_path_validation",
+            "after_journal_publish",
+        )
+        for selected in faultpoints:
+            for drift in (False, True):
+                with (
+                    self.subTest(selected=selected, drift=drift),
+                    tempfile.TemporaryDirectory() as tmp,
+                    fleet_identity_home_fds_for_test(tmp) as (
+                        parent,
+                        _home,
+                        parent_fd,
+                        home_fd,
+                        _tracked_journals,
+                    ),
+                ):
+                    parent_before = server_module._fleet_snapshot_metadata(parent.lstat())
+                    moved: Path | None = None
+
+                    def fail(point: str) -> None:
+                        nonlocal moved
+                        if point != selected:
+                            return
+                        candidates = list(parent.glob(".fleet-identity-staging-*"))
+                        candidates.extend(parent.glob(".fleet-identity-journal-*"))
+                        self.assertEqual(len(candidates), 1)
+                        if drift:
+                            current = candidates[0]
+                            moved = current.with_name(f"{current.name}-moved")
+                            current.rename(moved)
+                            current.mkdir(mode=0o700)
+                            foreign = current / "foreign"
+                            foreign.write_bytes(b"foreign\n")
+                            foreign.chmod(0o600)
+                            if selected == "after_staging_mkdir":
+                                return
+                        raise OSError(f"injected {point}")
+
+                    expected_error = (
+                        "fleet_identity_journal_cleanup_diverged"
+                        if drift
+                        else f"injected {selected}"
+                    )
+                    with self.assertRaisesRegex((AgentError, OSError), expected_error):
+                        server_module._fleet_identity_journal_prepare(
+                            parent_fd,
+                            home_fd,
+                            server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
+                            server_module._fleet_snapshot_metadata(os.fstat(home_fd)),
+                            (),
+                            faultpoint=fail,
+                        )
+
+                    staging = list(parent.glob(".fleet-identity-staging-*"))
+                    journals = list(parent.glob(".fleet-identity-journal-*"))
+                    if drift:
+                        candidates = [*staging, *journals]
+                        foreign_candidates = [
+                            path for path in candidates if (path / "foreign").is_file()
+                        ]
+                        self.assertEqual(len(candidates), 2)
+                        self.assertEqual(len(foreign_candidates), 1)
+                        self.assertEqual(
+                            (foreign_candidates[0] / "foreign").read_bytes(),
+                            b"foreign\n",
+                        )
+                        self.assertIsNotNone(moved)
+                        self.assertTrue((moved or parent).is_dir())
+                        self.assertEqual(
+                            server_module._fleet_snapshot_metadata(parent.lstat())[:2],
+                            parent_before[:2],
+                        )
+                    elif selected == "after_staging_mkdir":
+                        self.assertEqual(len(staging), 1)
+                        self.assertEqual(journals, [])
+                        self.assertEqual(list(staging[0].iterdir()), [])
+                        self.assertEqual(
+                            server_module._fleet_snapshot_metadata(parent.lstat())[:2],
+                            parent_before[:2],
+                        )
+                    else:
+                        self.assertEqual(staging, [])
+                        self.assertEqual(journals, [])
+                        self.assertEqual(
+                            server_module._fleet_snapshot_metadata(parent.lstat()),
+                            parent_before,
+                        )
+
+    def test_fleet_identity_journal_pre_publish_revalidates_complete_transaction(self) -> None:
+        cases = (
+            ("replacement_sha", "fleet_identity_journal_cleanup_diverged", True),
+            ("extra_slot", "fleet_identity_journal_cleanup_diverged", True),
+            ("staging_path", "fleet_identity_journal_cleanup_diverged", 2),
+            ("home", "fleet_identity_journal_changed", False),
+            ("original", "fleet_identity_journal_changed", False),
+            ("expected_absence", "fleet_identity_journal_changed", False),
+            ("captured_parent", "fleet_identity_journal_changed", False),
+            ("pool_parent", "fleet_identity_journal_cleanup_diverged", True),
+        )
+        for drift, expected_error, retains_staging in cases:
+            with (
+                self.subTest(drift=drift),
+                tempfile.TemporaryDirectory() as tmp,
+                fleet_identity_home_fds_for_test(tmp) as (
+                    parent,
+                    home,
+                    parent_fd,
+                    home_fd,
+                    tracked_journals,
+                ),
+            ):
+                nested = home / "nested"
+                nested.mkdir(mode=0o700)
+                original = nested / "object"
+                original.write_bytes(b"old!\n")
+                original.chmod(0o600)
+                entries = (
+                    server_module._FleetIdentityJournalEntry(
+                        "nested/object",
+                        fleet_identity_snapshot_for_test(original),
+                        "file",
+                        0o600,
+                        b"new!\n",
+                    ),
+                    server_module._FleetIdentityJournalEntry(
+                        "missing",
+                        None,
+                        "file",
+                        0o600,
+                        b"made\n",
+                    ),
+                )
+
+                def inject(point: str) -> None:
+                    if point != "after_staging_final_path_validation":
+                        return
+                    (staging,) = parent.glob(".fleet-identity-staging-*")
+                    if drift == "replacement_sha":
+                        slot = staging / "replacement-0000"
+                        before = slot.stat()
+                        slot.write_bytes(b"evil\n")
+                        os.utime(slot, ns=(before.st_atime_ns, before.st_mtime_ns))
+                    elif drift == "extra_slot":
+                        foreign = staging / "foreign"
+                        foreign.write_bytes(b"foreign\n")
+                        foreign.chmod(0o600)
+                    elif drift == "staging_path":
+                        moved = staging.with_name(f"{staging.name}-moved")
+                        staging.rename(moved)
+                        staging.mkdir(mode=0o700)
+                        foreign = staging / "foreign"
+                        foreign.write_bytes(b"foreign\n")
+                        foreign.chmod(0o600)
+                    elif drift == "home":
+                        foreign = home / "home-foreign"
+                        foreign.write_bytes(b"foreign\n")
+                        foreign.chmod(0o600)
+                    elif drift == "original":
+                        before = original.stat()
+                        original.write_bytes(b"evil\n")
+                        os.utime(original, ns=(before.st_atime_ns, before.st_mtime_ns))
+                    elif drift == "expected_absence":
+                        foreign = home / "missing"
+                        foreign.write_bytes(b"foreign\n")
+                        foreign.chmod(0o600)
+                    elif drift == "captured_parent":
+                        foreign = nested / "foreign"
+                        foreign.write_bytes(b"foreign\n")
+                        foreign.chmod(0o600)
+                    else:
+                        foreign = parent / "pool-foreign"
+                        foreign.write_bytes(b"foreign\n")
+                        foreign.chmod(0o600)
+
+                actual_error: str | None = None
+                try:
+                    journal = server_module._fleet_identity_journal_prepare(
+                        parent_fd,
+                        home_fd,
+                        server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
+                        server_module._fleet_snapshot_metadata(os.fstat(home_fd)),
+                        entries,
+                        faultpoint=inject,
+                    )
+                except AgentError as exc:
+                    actual_error = str(exc)
+                else:
+                    tracked_journals.append(journal)
+
+                self.assertEqual(actual_error, expected_error)
+                self.assertEqual(list(parent.glob(".fleet-identity-journal-*")), [])
+                staging = list(parent.glob(".fleet-identity-staging-*"))
+                self.assertEqual(len(staging), int(retains_staging))
+                if drift == "replacement_sha":
+                    self.assertEqual((staging[0] / "replacement-0000").read_bytes(), b"evil\n")
+                elif drift == "extra_slot":
+                    self.assertEqual((staging[0] / "foreign").read_bytes(), b"foreign\n")
+                elif drift == "staging_path":
+                    foreign_staging = [path for path in staging if (path / "foreign").is_file()]
+                    self.assertEqual(len(foreign_staging), 1)
+                    self.assertEqual(
+                        (foreign_staging[0] / "foreign").read_bytes(),
+                        b"foreign\n",
+                    )
+                elif drift == "home":
+                    self.assertEqual((home / "home-foreign").read_bytes(), b"foreign\n")
+                elif drift == "original":
+                    self.assertEqual(original.read_bytes(), b"evil\n")
+                elif drift == "expected_absence":
+                    self.assertEqual((home / "missing").read_bytes(), b"foreign\n")
+                elif drift == "captured_parent":
+                    self.assertEqual((nested / "foreign").read_bytes(), b"foreign\n")
+                else:
+                    self.assertEqual((parent / "pool-foreign").read_bytes(), b"foreign\n")
+
+    def test_fleet_identity_journal_rejects_invalid_kind_and_same_size_tamper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, fleet_identity_home_fds_for_test(tmp) as (
+            _parent,
+            home,
+            parent_fd,
+            home_fd,
+            journals,
+        ):
+            original = home / "object"
+            original.write_bytes(b"old!\n")
+            original.chmod(0o700)
+            with self.assertRaisesRegex(AgentError, "fleet_identity_journal_changed"):
+                server_module._fleet_identity_journal_prepare(
+                    parent_fd,
+                    home_fd,
+                    server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
+                    server_module._fleet_snapshot_metadata(os.fstat(home_fd)),
+                    (
+                        server_module._FleetIdentityJournalEntry(
+                            "invalid", None, "symlink", 0o700, None  # type: ignore[arg-type]
+                        ),
+                    ),
+                )
+            for kind, mode, content in (
+                ("file", 0o640, b"invalid\n"),
+                ("directory", 0o750, None),
+            ):
+                with self.subTest(kind=kind, mode=oct(mode)), self.assertRaisesRegex(
+                    AgentError,
+                    "fleet_identity_journal_changed",
+                ):
+                    server_module._fleet_identity_journal_prepare(
+                        parent_fd,
+                        home_fd,
+                        server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
+                        server_module._fleet_snapshot_metadata(os.fstat(home_fd)),
+                        (
+                            server_module._FleetIdentityJournalEntry(
+                                "invalid-mode",
+                                None,
+                                kind,  # type: ignore[arg-type]
+                                mode,
+                                content,
+                            ),
+                        ),
+                    )
+            journal = server_module._fleet_identity_journal_prepare(
+                parent_fd,
+                home_fd,
+                server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
+                server_module._fleet_snapshot_metadata(os.fstat(home_fd)),
+                (
+                    server_module._FleetIdentityJournalEntry(
+                        "object",
+                        fleet_identity_snapshot_for_test(original),
+                        "file",
+                        0o700,
+                        b"new!\n",
+                    ),
+                ),
+            )
+            journals.append(journal)
+            replacement_slot = journal.states[0].replacement_slot
+            replacement_snapshot = journal.states[0].replacement_snapshot
+            self.assertIsNotNone(replacement_slot)
+            self.assertIsNotNone(replacement_snapshot)
+            replacement_metadata, _ = replacement_snapshot or ((), None)
+            fd = os.open(replacement_slot or "", os.O_WRONLY, dir_fd=journal.fd)
+            try:
+                os.write(fd, b"bad!\n")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            current = os.stat(
+                replacement_slot or "",
+                dir_fd=journal.fd,
+                follow_symlinks=False,
+            )
+            os.utime(
+                replacement_slot or "",
+                ns=(current.st_atime_ns, replacement_metadata[7]),
+                dir_fd=journal.fd,
+                follow_symlinks=False,
+            )
+            with self.assertRaisesRegex(AgentError, "fleet_identity_journal_changed"):
+                server_module._fleet_identity_journal_switch(home_fd, journal)
+            self.assertEqual(original.read_bytes(), b"old!\n")
+
+    def test_fleet_identity_journal_rejects_mode_and_sha_drift_across_transitions(
+        self,
+    ) -> None:
+        for drift in ("original_sha", "rollback_mode", "rollback_old_slot_sha"):
+            with (
+                self.subTest(drift=drift),
+                tempfile.TemporaryDirectory() as tmp,
+                fleet_identity_home_fds_for_test(tmp) as (
+                    _parent,
+                    home,
+                    parent_fd,
+                    home_fd,
+                    journals,
+                ),
+            ):
+                original = home / "object"
+                original.write_bytes(b"old\n")
+                original.chmod(0o600)
+                original_snapshot = fleet_identity_snapshot_for_test(original)
+                journal = server_module._fleet_identity_journal_prepare(
+                    parent_fd,
+                    home_fd,
+                    server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
+                    server_module._fleet_snapshot_metadata(os.fstat(home_fd)),
+                    (
+                        server_module._FleetIdentityJournalEntry(
+                            "object", original_snapshot, "file", 0o600, b"new\n"
+                        ),
+                    ),
+                )
+                journals.append(journal)
+                if drift == "original_sha":
+                    original.write_bytes(b"bad\n")
+                    current = original.lstat()
+                    os.utime(
+                        original,
+                        ns=(current.st_atime_ns, original_snapshot[0][7]),
+                        follow_symlinks=False,
+                    )
+                    with self.assertRaisesRegex(
+                        AgentError,
+                        "fleet_identity_journal_changed",
+                    ):
+                        server_module._fleet_identity_journal_switch(home_fd, journal)
+                    continue
+                server_module._fleet_identity_journal_switch(home_fd, journal)
+                if drift == "rollback_mode":
+                    original.chmod(0o640)
+                else:
+                    old_slot = journal.states[0].old_slot
+                    self.assertIsNotNone(old_slot)
+                    fd = os.open(old_slot or "", os.O_WRONLY, dir_fd=journal.fd)
+                    try:
+                        os.write(fd, b"bad\n")
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                    current = os.stat(
+                        old_slot or "",
+                        dir_fd=journal.fd,
+                        follow_symlinks=False,
+                    )
+                    os.utime(
+                        old_slot or "",
+                        ns=(current.st_atime_ns, original_snapshot[0][7]),
+                        dir_fd=journal.fd,
+                        follow_symlinks=False,
+                    )
+                with self.assertRaisesRegex(
+                    AgentError,
+                    "fleet_identity_journal_rollback_diverged",
+                ):
+                    server_module._fleet_identity_journal_rollback(
+                        parent_fd,
+                        home_fd,
+                        journal,
+                    )
+
+    def test_fleet_identity_journal_rollback_checks_untouched_entries_before_finalize(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp, fleet_identity_home_fds_for_test(tmp) as (
+            _parent,
+            home,
+            parent_fd,
+            home_fd,
+            journals,
+        ):
+            first = home / "first"
+            untouched = home / "untouched"
+            for path, content in ((first, b"first\n"), (untouched, b"clean\n")):
+                path.write_bytes(content)
+                path.chmod(0o600)
+            untouched_snapshot = fleet_identity_snapshot_for_test(untouched)
+            journal = server_module._fleet_identity_journal_prepare(
+                parent_fd,
+                home_fd,
+                server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
+                server_module._fleet_snapshot_metadata(os.fstat(home_fd)),
+                (
+                    server_module._FleetIdentityJournalEntry(
+                        "first",
+                        fleet_identity_snapshot_for_test(first),
+                        "file",
+                        0o600,
+                        b"FIRST\n",
+                    ),
+                    server_module._FleetIdentityJournalEntry(
+                        "untouched", untouched_snapshot, "file", 0o600, b"CLEAN\n"
+                    ),
+                ),
+            )
+            journals.append(journal)
+
+            def fail_after_first(name: str) -> None:
+                if name == "during_switch":
+                    raise OSError("injected after first")
+
+            with self.assertRaises(OSError):
+                server_module._fleet_identity_journal_switch(
+                    home_fd,
+                    journal,
+                    faultpoint=fail_after_first,
+                )
+            untouched.write_bytes(b"dirty\n")
+            current = untouched.lstat()
+            os.utime(
+                untouched,
+                ns=(current.st_atime_ns, untouched_snapshot[0][7]),
+                follow_symlinks=False,
+            )
+            with patch.object(
+                server_module.os,
+                "utime",
+                side_effect=AssertionError("mtime restoration ran before entry verification"),
+            ), self.assertRaisesRegex(
+                AgentError,
+                "fleet_identity_journal_rollback_diverged",
+            ):
+                server_module._fleet_identity_journal_rollback(
+                    parent_fd,
+                    home_fd,
+                    journal,
+                )
+            self.assertGreater(len(os.listdir(journal.fd)), 0)
+
+    def test_fleet_identity_journal_rejects_journal_swap_without_foreign_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, fleet_identity_home_fds_for_test(tmp) as (
+            parent,
+            home,
+            parent_fd,
+            home_fd,
+            journals,
+        ):
+            original = home / "object"
+            original.write_bytes(b"old\n")
+            original.chmod(0o600)
+            journal = server_module._fleet_identity_journal_prepare(
+                parent_fd,
+                home_fd,
+                server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
+                server_module._fleet_snapshot_metadata(os.fstat(home_fd)),
+                (
+                    server_module._FleetIdentityJournalEntry(
+                        "object",
+                        fleet_identity_snapshot_for_test(original),
+                        "file",
+                        0o600,
+                        b"new\n",
+                    ),
+                ),
+            )
+            journals.append(journal)
+            server_module._fleet_identity_journal_switch(home_fd, journal)
+            moved_name = f"{journal.name}-moved"
+            os.rename(journal.name, moved_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            os.mkdir(journal.name, 0o700, dir_fd=parent_fd)
+            foreign = parent / journal.name / "foreign"
+            foreign.write_bytes(b"foreign\n")
+            foreign.chmod(0o600)
+            with self.assertRaisesRegex(
+                AgentError,
+                "fleet_identity_journal_cleanup_diverged",
+            ):
+                server_module._fleet_identity_journal_commit(parent_fd, journal)
+            self.assertEqual(foreign.read_bytes(), b"foreign\n")
+            self.assertTrue((parent / moved_name).is_dir())
+
+    def test_fleet_identity_journal_has_no_production_reference(self) -> None:
+        source = Path(server_module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        core_names = {
+            "_fleet_identity_journal_snapshot_at",
+            "_fleet_identity_journal_rename_noreplace_at",
+            "_fleet_identity_journal_prepare",
+            "_fleet_identity_journal_switch",
+            "_fleet_identity_journal_finalize",
+            "_fleet_identity_journal_rollback",
+            "_fleet_identity_journal_commit",
+        }
+        parents = {
+            child: node
+            for node in ast.walk(tree)
+            for child in ast.iter_child_nodes(node)
+        }
+        callers: dict[str, set[str]] = {name: set() for name in core_names}
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id in core_names
+            ):
+                continue
+            owner = "<module>"
+            current = parents.get(node)
+            while current is not None:
+                if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    owner = current.name
+                    break
+                current = parents.get(current)
+            callers[node.id].add(owner)
+        self.assertEqual(
+            callers,
+            {
+                "_fleet_identity_journal_snapshot_at": {
+                    "_fleet_identity_journal_rename_noreplace_at",
+                    "_fleet_identity_journal_prepare",
+                    "_fleet_identity_journal_switch",
+                    "_fleet_identity_journal_finalize",
+                    "_fleet_identity_journal_rollback",
+                },
+                "_fleet_identity_journal_rename_noreplace_at": {
+                    "_fleet_identity_journal_switch",
+                    "_fleet_identity_journal_rollback",
+                },
+                "_fleet_identity_journal_prepare": set(),
+                "_fleet_identity_journal_switch": set(),
+                "_fleet_identity_journal_finalize": {
+                    "finalize_cleanup",
+                    "_fleet_identity_journal_rollback",
+                    "_fleet_identity_journal_commit",
+                },
+                "_fleet_identity_journal_rollback": set(),
+                "_fleet_identity_journal_commit": set(),
+            },
+        )
+        functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for name in (
+            "_fleet_identity_journal_switch",
+            "_fleet_identity_journal_rollback",
+        ):
+            self.assertFalse(any(isinstance(node, ast.Lambda) for node in ast.walk(functions[name])))
+        self.assertNotIn("def _materialize_managed_fleet_home", source)
+        self.assertNotIn("def _fleet_rebuild_stopped_home_at", source)
 
     def test_s2b1_marker_writers_emit_exact_v2_policy_for_both_providers(self) -> None:
         expected_common_policy = canonical_common_policy_marker_for_test()

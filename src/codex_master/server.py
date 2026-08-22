@@ -23998,10 +23998,17 @@ def _fleet_home_policy_observation_at(
     def portable(name: str) -> bool:
         return name.startswith("skills/.portable/") and name.endswith("/SKILL.md")
 
+    removable_gemini_aliases = (
+        marker_names & {"settings.json", "AGENTS.md"}
+        if descriptor.runner is RunnerKind.GEMINI_CLI
+        else set()
+    )
     marker_core = {
         name
         for name in marker_names
-        if name != observed_class_name and not portable(name)
+        if name != observed_class_name
+        and name not in removable_gemini_aliases
+        and not portable(name)
     }
     target_core = {
         name
@@ -24133,6 +24140,7 @@ def _fleet_home_policy_observation_at(
             target.provider_projection_digest,
         )
         and observed_class_name == target_class_name
+        and not removable_gemini_aliases
         else "stale"
     )
     return observation(
@@ -25937,7 +25945,13 @@ def _fleet_rename_noreplace_at(
     renameat2 = getattr(libc, "renameat2", None)
     if renameat2 is None:
         raise AgentError("fleet_noreplace_unavailable")
-    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
     renameat2.restype = ctypes.c_int
     result = renameat2(
         root_fd,
@@ -26343,6 +26357,928 @@ def _fleet_snapshot_metadata(current: os.stat_result) -> tuple[int, ...]:
         current.st_size,
         current.st_mtime_ns,
     )
+
+
+_FleetIdentitySnapshot = tuple[tuple[int, ...], str | None]
+
+
+@dataclass(frozen=True, slots=True)
+class _FleetIdentityJournalEntry:
+    name: str
+    before: _FleetIdentitySnapshot | None
+    replacement_kind: Literal["file", "directory"] | None
+    replacement_mode: int | None
+    replacement_bytes: bytes | None
+
+
+@dataclass(slots=True)
+class _FleetIdentityJournalState:
+    entry: _FleetIdentityJournalEntry
+    old_slot: str | None
+    replacement_slot: str | None
+    replacement_snapshot: _FleetIdentitySnapshot | None
+    old_moved: bool = False
+    replacement_moved: bool = False
+
+
+@dataclass(slots=True)
+class _FleetIdentityJournal:
+    name: str
+    fd: int
+    snapshot: tuple[int, ...]
+    parent_before: tuple[int, ...]
+    parent_current: tuple[int, ...]
+    directory_before: dict[str, tuple[int, ...]]
+    directory_current: dict[str, tuple[int, ...]]
+    states: list[_FleetIdentityJournalState]
+
+
+def _fleet_identity_journal_snapshot_at(
+    directory_fd: int,
+    name: str,
+    error: str,
+) -> _FleetIdentitySnapshot:
+    if not name or name in {".", ".."} or "/" in name:
+        raise AgentError(error)
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        metadata = _fleet_snapshot_metadata(current)
+        mode = stat_module.S_IMODE(current.st_mode)
+        if stat_module.S_ISREG(current.st_mode):
+            if current.st_uid != os.geteuid() or current.st_nlink != 1 or mode not in {0o600, 0o700}:
+                raise AgentError(error)
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(name, flags, dir_fd=directory_fd)
+            try:
+                if _fleet_snapshot_metadata(os.fstat(fd)) != metadata:
+                    raise AgentError(error)
+                digest = hashlib.sha256()
+                while chunk := os.read(fd, 1024 * 1024):
+                    digest.update(chunk)
+                if _fleet_snapshot_metadata(os.fstat(fd)) != metadata:
+                    raise AgentError(error)
+            finally:
+                os.close(fd)
+            return metadata, digest.hexdigest()
+        if stat_module.S_ISDIR(current.st_mode) and not stat_module.S_ISLNK(current.st_mode):
+            if current.st_uid != os.geteuid() or mode != 0o700:
+                raise AgentError(error)
+            fd = open_directory_no_follow_matching(
+                name,
+                current,
+                error_text=error,
+                changed_text=error,
+                dir_fd=directory_fd,
+            )
+            try:
+                if _fleet_snapshot_metadata(os.fstat(fd)) != metadata:
+                    raise AgentError(error)
+            finally:
+                os.close(fd)
+            return metadata, None
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError(error) from exc
+    raise AgentError(error)
+
+
+def _fleet_identity_journal_rename_noreplace_at(
+    source_fd: int,
+    source: str,
+    target_fd: int,
+    target: str,
+    expected_source: _FleetIdentitySnapshot,
+    *,
+    error: str = "fleet_identity_journal_changed",
+    transition: tuple[
+        _FleetIdentityJournal,
+        _FleetIdentityJournalState,
+        str,
+        int,
+        Literal["old_moved", "replacement_moved"],
+        bool,
+        _FleetIdentitySnapshot | None,
+    ]
+    | None = None,
+) -> None:
+    def transition_callback() -> None:
+        if transition is None:
+            return
+        journal, state, parent_name, parent_fd, field, value, replacement_snapshot = transition
+        setattr(state, field, value)
+        if replacement_snapshot is not None:
+            state.replacement_snapshot = replacement_snapshot
+        journal.directory_current[parent_name] = _fleet_snapshot_metadata(os.fstat(parent_fd))
+        journal.snapshot = _fleet_snapshot_metadata(os.fstat(journal.fd))
+
+    if (
+        not source
+        or not target
+        or source in {".", ".."}
+        or target in {".", ".."}
+        or "/" in source
+        or "/" in target
+    ):
+        raise AgentError(error)
+    if (
+        _fleet_identity_journal_snapshot_at(
+            source_fd,
+            source,
+            error,
+        )
+        != expected_source
+    ):
+        raise AgentError(error)
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise AgentError("fleet_noreplace_unavailable")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+        source_fd,
+        os.fsencode(source),
+        target_fd,
+        os.fsencode(target),
+        1,
+    ) != 0:
+        current_errno = ctypes.get_errno()
+        if current_errno == errno.EEXIST:
+            raise AgentError("fleet_identity_journal_collision")
+        raise AgentError(error)
+    transition_callback()
+    try:
+        os.fsync(source_fd)
+        if target_fd != source_fd:
+            os.fsync(target_fd)
+        try:
+            os.stat(source, dir_fd=source_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise AgentError(error)
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError(error) from exc
+    if (
+        _fleet_identity_journal_snapshot_at(
+            target_fd,
+            target,
+            error,
+        )
+        != expected_source
+    ):
+        raise AgentError(error)
+
+
+def _fleet_identity_journal_prepare(
+    parent_fd: int,
+    home_fd: int,
+    parent_snapshot: tuple[int, ...],
+    home_snapshot: tuple[int, ...],
+    entries: tuple[_FleetIdentityJournalEntry, ...],
+    *,
+    faultpoint: Callable[[str], None] | None = None,
+) -> _FleetIdentityJournal:
+    error = "fleet_identity_journal_changed"
+    if (
+        _fleet_snapshot_metadata(os.fstat(parent_fd)) != parent_snapshot
+        or _fleet_snapshot_metadata(os.fstat(home_fd)) != home_snapshot
+    ):
+        raise AgentError(error)
+    _fleet_private_directory_stat(os.fstat(parent_fd), error)
+    _fleet_private_directory_stat(os.fstat(home_fd), error)
+    names: set[str] = set()
+    future_directories: set[str] = set()
+    directory_before = {"": home_snapshot}
+    for entry in entries:
+        path = Path(entry.name)
+        if (
+            path.is_absolute()
+            or not path.parts
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or entry.name in names
+            or entry.replacement_kind not in {None, "file", "directory"}
+            or (
+                entry.replacement_kind == "file"
+                and (
+                    type(entry.replacement_bytes) is not bytes
+                    or type(entry.replacement_mode) is not int
+                    or entry.replacement_mode not in {0o600, 0o700}
+                )
+            )
+            or (
+                entry.replacement_kind == "directory"
+                and (
+                    entry.replacement_bytes is not None
+                    or type(entry.replacement_mode) is not int
+                    or entry.replacement_mode != 0o700
+                )
+            )
+            or (
+                entry.replacement_kind is None
+                and (entry.replacement_bytes is not None or entry.replacement_mode is not None)
+            )
+        ):
+            raise AgentError(error)
+        if entry.before is not None:
+            metadata, digest = entry.before
+            if (
+                not isinstance(metadata, tuple)
+                or len(metadata) != 8
+                or any(type(value) is not int for value in metadata)
+                or (
+                    stat_module.S_ISREG(metadata[2])
+                    and (
+                        stat_module.S_IMODE(metadata[2]) not in {0o600, 0o700}
+                        or not isinstance(digest, str)
+                        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                    )
+                )
+                or (
+                    stat_module.S_ISDIR(metadata[2])
+                    and (stat_module.S_IMODE(metadata[2]) != 0o700 or digest is not None)
+                )
+                or not (stat_module.S_ISREG(metadata[2]) or stat_module.S_ISDIR(metadata[2]))
+            ):
+                raise AgentError(error)
+        names.add(entry.name)
+        parent_name = path.parent.as_posix()
+        parent_name = "" if parent_name == "." else parent_name
+        parent_is_future = any(
+            parent_name == name or parent_name.startswith(f"{name}/")
+            for name in future_directories
+        )
+        if parent_is_future:
+            if entry.before is not None:
+                raise AgentError(error)
+        else:
+            entry_parent_fd, basename = _fleet_open_artifact_parent(
+                home_fd,
+                entry.name,
+                create=False,
+                error=error,
+            )
+            try:
+                parent_current = os.fstat(entry_parent_fd)
+                _fleet_private_directory_stat(parent_current, error)
+                directory_before.setdefault(
+                    parent_name,
+                    _fleet_snapshot_metadata(parent_current),
+                )
+                if entry.before is None:
+                    try:
+                        os.stat(
+                            basename,
+                            dir_fd=entry_parent_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        raise AgentError(error)
+                elif _fleet_identity_journal_snapshot_at(entry_parent_fd, basename, error) != entry.before:
+                    raise AgentError(error)
+            finally:
+                os.close(entry_parent_fd)
+        if entry.before is None and entry.replacement_kind == "directory":
+            future_directories.add(entry.name)
+    if (
+        _fleet_snapshot_metadata(os.fstat(parent_fd)) != parent_snapshot
+        or _fleet_snapshot_metadata(os.fstat(home_fd)) != home_snapshot
+    ):
+        raise AgentError(error)
+
+    nonce = uuid.uuid4().hex
+    staging_name = f".fleet-identity-staging-{nonce}"
+    journal_name = f".fleet-identity-journal-{nonce}"
+    journal_path_name = staging_name
+    journal_fd = -1
+    journal_snapshot: tuple[int, ...] | None = None
+    parent_current: tuple[int, ...] | None = None
+    states: list[_FleetIdentityJournalState] = []
+    cleanup_error = "fleet_identity_journal_cleanup_diverged"
+
+    def finalize_cleanup(cleanup_fd: int, cleanup_snapshot: tuple[int, ...]) -> None:
+        if parent_current is None:
+            raise AgentError(cleanup_error)
+        cleanup_journal = _FleetIdentityJournal(
+            journal_path_name,
+            cleanup_fd,
+            cleanup_snapshot,
+            parent_snapshot,
+            parent_current,
+            directory_before,
+            dict(directory_before),
+            states,
+        )
+        cleanup_slots = tuple(
+            (state.replacement_slot, state.replacement_snapshot)
+            for state in states
+            if state.replacement_slot is not None and state.replacement_snapshot is not None
+        )
+        try:
+            _fleet_identity_journal_finalize(
+                parent_fd,
+                cleanup_journal,
+                cleanup_slots,
+                cleanup_error,
+            )
+        except Exception as cleanup_exc:
+            if cleanup_journal.fd >= 0:
+                os.close(cleanup_journal.fd)
+                cleanup_journal.fd = -1
+            if isinstance(cleanup_exc, AgentError) and str(cleanup_exc) == cleanup_error:
+                raise
+            raise AgentError(cleanup_error) from cleanup_exc
+
+    try:
+        os.mkdir(staging_name, 0o700, dir_fd=parent_fd)
+        if faultpoint is not None:
+            faultpoint("after_staging_mkdir")
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        journal_fd = os.open(staging_name, flags, dir_fd=parent_fd)
+        if faultpoint is not None:
+            faultpoint("after_staging_pin")
+        journal_stat = os.fstat(journal_fd)
+        journal_snapshot = _fleet_snapshot_metadata(journal_stat)
+        if faultpoint is not None:
+            faultpoint("after_staging_fstat")
+        _fleet_private_directory_stat(journal_stat, error)
+        if faultpoint is not None:
+            faultpoint("after_staging_validation")
+        journal_path_stat = os.stat(
+            staging_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if _fleet_snapshot_metadata(journal_path_stat) != journal_snapshot:
+            raise AgentError(error)
+        if faultpoint is not None:
+            faultpoint("after_staging_path_stat")
+        if os.listdir(journal_fd):
+            raise AgentError(error)
+        if faultpoint is not None:
+            faultpoint("after_staging_empty_check")
+        parent_current = _fleet_snapshot_metadata(os.fstat(parent_fd))
+        if faultpoint is not None:
+            faultpoint("after_parent_fstat")
+        for index, entry in enumerate(entries):
+            old_slot = f"old-{index:04d}" if entry.before is not None else None
+            replacement_slot = (
+                f"replacement-{index:04d}" if entry.replacement_kind is not None else None
+            )
+            replacement_snapshot = None
+            if replacement_slot is not None:
+                if entry.replacement_kind == "file":
+                    write_private_new_bytes(
+                        Path(replacement_slot),
+                        entry.replacement_bytes,
+                        mode=entry.replacement_mode,
+                        dir_fd=journal_fd,
+                    )
+                else:
+                    os.mkdir(replacement_slot, entry.replacement_mode, dir_fd=journal_fd)
+                replacement_snapshot = _fleet_identity_journal_snapshot_at(
+                    journal_fd,
+                    replacement_slot,
+                    error,
+                )
+                expected_digest = (
+                    hashlib.sha256(entry.replacement_bytes).hexdigest()
+                    if entry.replacement_kind == "file"
+                    else None
+                )
+                if replacement_snapshot[1] != expected_digest:
+                    raise AgentError(error)
+            states.append(
+                _FleetIdentityJournalState(
+                    entry,
+                    old_slot,
+                    replacement_slot,
+                    replacement_snapshot,
+                )
+            )
+            journal_snapshot = _fleet_snapshot_metadata(os.fstat(journal_fd))
+        os.fsync(journal_fd)
+        if faultpoint is not None:
+            faultpoint("after_staging_fsync")
+        journal_stat = os.fstat(journal_fd)
+        journal_snapshot = _fleet_snapshot_metadata(journal_stat)
+        if faultpoint is not None:
+            faultpoint("after_staging_final_fstat")
+        if (
+            _fleet_identity_journal_snapshot_at(parent_fd, staging_name, error)
+            != (journal_snapshot, None)
+        ):
+            raise AgentError(error)
+        if faultpoint is not None:
+            faultpoint("after_staging_final_path_validation")
+
+        expected_slots: dict[str, _FleetIdentitySnapshot] = {}
+        for state in states:
+            if state.replacement_slot is None or state.replacement_snapshot is None:
+                if state.replacement_slot is not None or state.replacement_snapshot is not None:
+                    raise AgentError(error)
+                continue
+            if state.replacement_slot in expected_slots:
+                raise AgentError(error)
+            expected_slots[state.replacement_slot] = state.replacement_snapshot
+        with contextlib.suppress(OSError):
+            os.lseek(journal_fd, 0, os.SEEK_SET)
+        if set(os.listdir(journal_fd)) != set(expected_slots):
+            raise AgentError(error)
+        for slot, expected_snapshot in expected_slots.items():
+            if (
+                _fleet_identity_journal_snapshot_at(journal_fd, slot, error)
+                != expected_snapshot
+            ):
+                raise AgentError(error)
+
+        validated_parents = {""}
+        for state in states:
+            entry = state.entry
+            path = Path(entry.name)
+            parent_name = path.parent.as_posix()
+            parent_name = "" if parent_name == "." else parent_name
+            parent_is_future = any(
+                parent_name == name or parent_name.startswith(f"{name}/")
+                for name in future_directories
+            )
+            if parent_is_future:
+                continue
+            expected_parent = directory_before.get(parent_name)
+            if expected_parent is None:
+                raise AgentError(error)
+            entry_parent_fd, basename = _fleet_open_artifact_parent(
+                home_fd,
+                entry.name,
+                create=False,
+                error=error,
+            )
+            try:
+                parent_stat = os.fstat(entry_parent_fd)
+                _fleet_private_directory_stat(parent_stat, error)
+                if _fleet_snapshot_metadata(parent_stat) != expected_parent:
+                    raise AgentError(error)
+                if entry.before is None:
+                    try:
+                        os.stat(
+                            basename,
+                            dir_fd=entry_parent_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        raise AgentError(error)
+                elif (
+                    _fleet_identity_journal_snapshot_at(entry_parent_fd, basename, error)
+                    != entry.before
+                ):
+                    raise AgentError(error)
+                if _fleet_snapshot_metadata(os.fstat(entry_parent_fd)) != expected_parent:
+                    raise AgentError(error)
+                validated_parents.add(parent_name)
+            finally:
+                os.close(entry_parent_fd)
+        if validated_parents != set(directory_before):
+            raise AgentError(error)
+        if (
+            parent_current is None
+            or _fleet_snapshot_metadata(os.fstat(parent_fd)) != parent_current
+            or _fleet_snapshot_metadata(os.fstat(home_fd)) != home_snapshot
+            or _fleet_snapshot_metadata(os.fstat(journal_fd)) != journal_snapshot
+            or _fleet_identity_journal_snapshot_at(parent_fd, staging_name, error)
+            != (journal_snapshot, None)
+        ):
+            raise AgentError(error)
+
+        def mark_published() -> None:
+            nonlocal journal_path_name, parent_current
+            journal_path_name = journal_name
+            parent_current = _fleet_snapshot_metadata(os.fstat(parent_fd))
+            if faultpoint is not None:
+                faultpoint("after_journal_publish")
+
+        _fleet_rename_noreplace_at(
+            parent_fd,
+            staging_name,
+            journal_name,
+            journal_stat,
+            error,
+            collision_text="fleet_identity_journal_collision",
+            committed=mark_published,
+        )
+        parent_current = _fleet_snapshot_metadata(os.fstat(parent_fd))
+        if (
+            _fleet_snapshot_metadata(os.fstat(journal_fd)) != journal_snapshot
+            or _fleet_identity_journal_snapshot_at(parent_fd, journal_name, error)
+            != (journal_snapshot, None)
+        ):
+            raise AgentError(error)
+        os.fsync(parent_fd)
+        return _FleetIdentityJournal(
+            journal_name,
+            journal_fd,
+            _fleet_snapshot_metadata(os.fstat(journal_fd)),
+            parent_snapshot,
+            parent_current,
+            directory_before,
+            dict(directory_before),
+            states,
+        )
+    except Exception:
+        if journal_fd >= 0:
+            try:
+                cleanup_stat = os.fstat(journal_fd)
+                _fleet_private_directory_stat(cleanup_stat, cleanup_error)
+                journal_snapshot = _fleet_snapshot_metadata(cleanup_stat)
+                if parent_current is None:
+                    parent_current = _fleet_snapshot_metadata(os.fstat(parent_fd))
+            except Exception as cleanup_exc:
+                os.close(journal_fd)
+                journal_fd = -1
+                raise AgentError(cleanup_error) from cleanup_exc
+            owned_journal_fd = journal_fd
+            journal_fd = -1
+            finalize_cleanup(owned_journal_fd, journal_snapshot)
+        raise
+
+
+def _fleet_identity_journal_switch(
+    home_fd: int,
+    journal: _FleetIdentityJournal,
+    *,
+    faultpoint: Callable[[str], None] | None = None,
+) -> None:
+    error = "fleet_identity_journal_changed"
+    if journal.fd < 0 or _fleet_snapshot_metadata(os.fstat(home_fd)) != journal.directory_current[""]:
+        raise AgentError(error)
+    replacement_slots = {
+        state.replacement_slot
+        for state in journal.states
+        if state.replacement_slot is not None
+    }
+    with contextlib.suppress(OSError):
+        os.lseek(journal.fd, 0, os.SEEK_SET)
+    if set(os.listdir(journal.fd)) != replacement_slots:
+        raise AgentError(error)
+    for state in journal.states:
+        if state.entry.replacement_kind not in {None, "file", "directory"}:
+            raise AgentError(error)
+        if state.replacement_slot is not None and (
+            state.replacement_snapshot is None
+            or _fleet_identity_journal_snapshot_at(
+                journal.fd,
+                state.replacement_slot,
+                error,
+            )
+            != state.replacement_snapshot
+        ):
+            raise AgentError(error)
+    if faultpoint is not None:
+        faultpoint("before_switch")
+    for state in journal.states:
+        entry = state.entry
+        path = Path(entry.name)
+        parent_name = path.parent.as_posix()
+        parent_name = "" if parent_name == "." else parent_name
+        entry_parent_fd, basename = _fleet_open_artifact_parent(
+            home_fd,
+            entry.name,
+            create=False,
+            error=error,
+        )
+        try:
+            if (
+                _fleet_snapshot_metadata(os.fstat(entry_parent_fd))
+                != journal.directory_current[parent_name]
+                or _fleet_snapshot_metadata(os.fstat(journal.fd)) != journal.snapshot
+            ):
+                raise AgentError(error)
+            if state.old_slot is not None and entry.before is not None:
+                _fleet_identity_journal_rename_noreplace_at(
+                    entry_parent_fd,
+                    basename,
+                    journal.fd,
+                    state.old_slot,
+                    entry.before,
+                    transition=(
+                        journal,
+                        state,
+                        parent_name,
+                        entry_parent_fd,
+                        "old_moved",
+                        True,
+                        None,
+                    ),
+                )
+            if state.replacement_slot is not None and state.replacement_snapshot is not None:
+                _fleet_identity_journal_rename_noreplace_at(
+                    journal.fd,
+                    state.replacement_slot,
+                    entry_parent_fd,
+                    basename,
+                    state.replacement_snapshot,
+                    transition=(
+                        journal,
+                        state,
+                        parent_name,
+                        entry_parent_fd,
+                        "replacement_moved",
+                        True,
+                        None,
+                    ),
+                )
+                if entry.replacement_kind == "directory":
+                    journal.directory_current[entry.name] = state.replacement_snapshot[0]
+            if _fleet_snapshot_metadata(os.fstat(home_fd)) != journal.directory_current[""]:
+                raise AgentError(error)
+        finally:
+            os.close(entry_parent_fd)
+        if faultpoint is not None:
+            faultpoint("during_switch")
+    if faultpoint is not None:
+        faultpoint("after_switch")
+
+
+def _fleet_identity_journal_finalize(
+    parent_fd: int,
+    journal: _FleetIdentityJournal,
+    slots: tuple[tuple[str, _FleetIdentitySnapshot], ...],
+    error: str,
+) -> None:
+    try:
+        if (
+            journal.fd < 0
+            or _fleet_snapshot_metadata(os.fstat(parent_fd)) != journal.parent_current
+            or _fleet_snapshot_metadata(os.fstat(journal.fd)) != journal.snapshot
+        ):
+            raise AgentError(error)
+        journal_path_stat = os.stat(
+            journal.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if _fleet_snapshot_metadata(journal_path_stat) != journal.snapshot:
+            raise AgentError(error)
+        verified_fd = open_directory_no_follow_matching(
+            journal.name,
+            journal_path_stat,
+            error_text=error,
+            changed_text=error,
+            dir_fd=parent_fd,
+        )
+        try:
+            if _fleet_snapshot_metadata(os.fstat(verified_fd)) != journal.snapshot:
+                raise AgentError(error)
+        finally:
+            os.close(verified_fd)
+        slot_names = [name for name, _snapshot in slots]
+        if len(slot_names) != len(set(slot_names)):
+            raise AgentError(error)
+        with contextlib.suppress(OSError):
+            os.lseek(journal.fd, 0, os.SEEK_SET)
+        if set(os.listdir(journal.fd)) != set(slot_names):
+            raise AgentError(error)
+        for name, expected in slots:
+            if _fleet_identity_journal_snapshot_at(journal.fd, name, error) != expected:
+                raise AgentError(error)
+        for name, expected in reversed(slots):
+            if (
+                _fleet_snapshot_metadata(os.fstat(journal.fd)) != journal.snapshot
+                or _fleet_identity_journal_snapshot_at(journal.fd, name, error) != expected
+            ):
+                raise AgentError(error)
+            mode = expected[0][2]
+            if stat_module.S_ISDIR(mode):
+                os.rmdir(name, dir_fd=journal.fd)
+            elif stat_module.S_ISREG(mode):
+                os.unlink(name, dir_fd=journal.fd)
+            else:
+                raise AgentError(error)
+            journal.snapshot = _fleet_snapshot_metadata(os.fstat(journal.fd))
+        with contextlib.suppress(OSError):
+            os.lseek(journal.fd, 0, os.SEEK_SET)
+        if os.listdir(journal.fd):
+            raise AgentError(error)
+        journal_path_stat = os.stat(
+            journal.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            _fleet_snapshot_metadata(journal_path_stat) != journal.snapshot
+            or _fleet_snapshot_metadata(os.fstat(parent_fd)) != journal.parent_current
+        ):
+            raise AgentError(error)
+        os.rmdir(journal.name, dir_fd=parent_fd)
+        os.close(journal.fd)
+        journal.fd = -1
+        parent_after_remove = _fleet_snapshot_metadata(os.fstat(parent_fd))
+        if (
+            parent_after_remove[:7] != journal.parent_before[:7]
+            or _fleet_snapshot_metadata(os.fstat(parent_fd)) != parent_after_remove
+        ):
+            raise AgentError(error)
+        current_parent = os.fstat(parent_fd)
+        os.utime(parent_fd, ns=(current_parent.st_atime_ns, journal.parent_before[7]))
+        if _fleet_snapshot_metadata(os.fstat(parent_fd)) != journal.parent_before:
+            raise AgentError(error)
+    except AgentError:
+        raise
+    except OSError as exc:
+        raise AgentError(error) from exc
+
+
+def _fleet_identity_journal_rollback(
+    parent_fd: int,
+    home_fd: int,
+    journal: _FleetIdentityJournal,
+) -> None:
+    error = "fleet_identity_journal_rollback_diverged"
+    if (
+        journal.fd < 0
+        or _fleet_snapshot_metadata(os.fstat(parent_fd)) != journal.parent_current
+        or _fleet_snapshot_metadata(os.fstat(home_fd)) != journal.directory_current[""]
+        or _fleet_snapshot_metadata(os.fstat(journal.fd)) != journal.snapshot
+    ):
+        raise AgentError(error)
+    if any(
+        state.entry.replacement_kind not in {None, "file", "directory"}
+        for state in journal.states
+    ):
+        raise AgentError(error)
+    for state in reversed(journal.states):
+        if not state.old_moved and not state.replacement_moved:
+            continue
+        entry = state.entry
+        path = Path(entry.name)
+        parent_name = path.parent.as_posix()
+        parent_name = "" if parent_name == "." else parent_name
+        entry_parent_fd, basename = _fleet_open_artifact_parent(
+            home_fd,
+            entry.name,
+            create=False,
+            error=error,
+        )
+        try:
+            if (
+                _fleet_snapshot_metadata(os.fstat(entry_parent_fd))
+                != journal.directory_current[parent_name]
+                or _fleet_snapshot_metadata(os.fstat(journal.fd)) != journal.snapshot
+            ):
+                raise AgentError(error)
+            if state.replacement_moved:
+                expected_replacement = (
+                    (journal.directory_current[entry.name], None)
+                    if entry.replacement_kind == "directory"
+                    else state.replacement_snapshot
+                )
+                if state.replacement_slot is None or expected_replacement is None:
+                    raise AgentError(error)
+                _fleet_identity_journal_rename_noreplace_at(
+                    entry_parent_fd,
+                    basename,
+                    journal.fd,
+                    state.replacement_slot,
+                    expected_replacement,
+                    error=error,
+                    transition=(
+                        journal,
+                        state,
+                        parent_name,
+                        entry_parent_fd,
+                        "replacement_moved",
+                        False,
+                        expected_replacement,
+                    ),
+                )
+                if entry.replacement_kind == "directory":
+                    journal.directory_current.pop(entry.name, None)
+            if state.old_moved:
+                if state.old_slot is None or entry.before is None:
+                    raise AgentError(error)
+                _fleet_identity_journal_rename_noreplace_at(
+                    journal.fd,
+                    state.old_slot,
+                    entry_parent_fd,
+                    basename,
+                    entry.before,
+                    error=error,
+                    transition=(
+                        journal,
+                        state,
+                        parent_name,
+                        entry_parent_fd,
+                        "old_moved",
+                        False,
+                        None,
+                    ),
+                )
+        finally:
+            os.close(entry_parent_fd)
+
+    absent_directories: set[str] = set()
+    for state in journal.states:
+        entry = state.entry
+        path = Path(entry.name)
+        parent_name = path.parent.as_posix()
+        parent_name = "" if parent_name == "." else parent_name
+        parent_was_absent = any(
+            parent_name == name or parent_name.startswith(f"{name}/")
+            for name in absent_directories
+        )
+        if entry.before is None and parent_was_absent:
+            if entry.replacement_kind == "directory":
+                absent_directories.add(entry.name)
+            continue
+        entry_parent_fd, basename = _fleet_open_artifact_parent(
+            home_fd,
+            entry.name,
+            create=False,
+            error=error,
+        )
+        try:
+            if entry.before is None:
+                try:
+                    os.stat(basename, dir_fd=entry_parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise AgentError(error)
+                if entry.replacement_kind == "directory":
+                    absent_directories.add(entry.name)
+            elif (
+                _fleet_identity_journal_snapshot_at(entry_parent_fd, basename, error)
+                != entry.before
+            ):
+                raise AgentError(error)
+        finally:
+            os.close(entry_parent_fd)
+
+    for _, name, expected in sorted(
+        (
+            (len(Path(name).parts), name, expected)
+            for name, expected in journal.directory_before.items()
+        ),
+        reverse=True,
+    ):
+        if name:
+            directory_parent_fd, basename = _fleet_open_artifact_parent(
+                home_fd,
+                name,
+                create=False,
+                error=error,
+            )
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                directory_fd = os.open(basename, flags, dir_fd=directory_parent_fd)
+            finally:
+                os.close(directory_parent_fd)
+        else:
+            directory_fd = os.dup(home_fd)
+        try:
+            current = os.fstat(directory_fd)
+            if _fleet_snapshot_metadata(current) != journal.directory_current[name]:
+                raise AgentError(error)
+            os.utime(directory_fd, ns=(current.st_atime_ns, expected[7]))
+            if _fleet_snapshot_metadata(os.fstat(directory_fd)) != expected:
+                raise AgentError(error)
+            journal.directory_current[name] = expected
+        finally:
+            os.close(directory_fd)
+
+    replacement_slots = tuple(
+        (state.replacement_slot, state.replacement_snapshot)
+        for state in journal.states
+        if state.replacement_slot is not None and state.replacement_snapshot is not None
+    )
+    _fleet_identity_journal_finalize(parent_fd, journal, replacement_slots, error)
+
+
+def _fleet_identity_journal_commit(
+    parent_fd: int,
+    journal: _FleetIdentityJournal,
+) -> None:
+    error = "fleet_identity_journal_cleanup_diverged"
+    original_slots = tuple(
+        (state.old_slot, state.entry.before)
+        for state in journal.states
+        if state.old_slot is not None and state.entry.before is not None
+    )
+    _fleet_identity_journal_finalize(parent_fd, journal, original_slots, error)
 
 
 def _fleet_home_tree_snapshot(home_fd: int) -> dict[str, tuple[tuple[int, ...], str | None]]:
