@@ -15,6 +15,7 @@ import tempfile
 import threading
 import tomllib
 import unittest
+import uuid
 from collections.abc import Iterator
 from dataclasses import replace as dataclass_replace
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,7 @@ import codex_master.resource_cgroup as resource_cgroup
 from codex_master import __version__
 from codex_master.hive.types import TaskComplexity
 from codex_master.hive.state import HiveStateStore
+from codex_master.fleet_home_recovery import make_fleet_identity_journal_plan
 from codex_master.resource_cgroup import (
     CgroupPreflightError,
     CgroupProfileV1,
@@ -384,6 +386,34 @@ def fleet_identity_snapshot_for_test(path: Path) -> tuple[tuple[int, ...], str |
     current = path.lstat()
     digest = hashlib.sha256(path.read_bytes()).hexdigest() if stat.S_ISREG(current.st_mode) else None
     return server_module._fleet_snapshot_metadata(current), digest
+
+
+def fleet_identity_journal_prepare_for_test(
+    parent_fd: int,
+    home_fd: int,
+    parent_snapshot: tuple[int, ...],
+    home_snapshot: tuple[int, ...],
+    entries: tuple[server_module._FleetIdentityJournalEntry, ...],
+    *,
+    faultpoint: Any = None,
+) -> server_module._FleetIdentityJournal:
+    plan = make_fleet_identity_journal_plan(
+        uuid.uuid4().hex,
+        tuple(
+            (entry.name, entry.before is not None, entry.replacement_kind is not None)
+            for entry in entries
+        ),
+    )
+    prepare = server_module._fleet_identity_journal_prepare
+    return prepare(
+        parent_fd,
+        home_fd,
+        parent_snapshot,
+        home_snapshot,
+        entries,
+        plan,
+        faultpoint=faultpoint,
+    )
 
 
 @contextlib.contextmanager
@@ -10020,14 +10050,34 @@ google_accounts:
                     "private-directory", None, "directory", 0o700, None
                 ),
             )
+            plan = make_fleet_identity_journal_plan(
+                "0123456789abcdef0123456789abcdef",
+                (("ordered-last", True, True), ("private-directory", False, True)),
+            )
+            with self.assertRaisesRegex(AgentError, "fleet_identity_journal_changed"):
+                server_module._fleet_identity_journal_prepare(
+                    parent_fd,
+                    home_fd,
+                    server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
+                    server_module._fleet_snapshot_metadata(os.fstat(home_fd)),
+                    entries,
+                    dataclass_replace(plan, journal_name=".fleet-identity-journal-wrong"),
+                )
+            self.assertFalse(any(parent.glob(".fleet-identity-*")))
             journal = server_module._fleet_identity_journal_prepare(
                 parent_fd,
                 home_fd,
                 server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
                 server_module._fleet_snapshot_metadata(os.fstat(home_fd)),
                 entries,
+                plan,
             )
             journals.append(journal)
+            self.assertEqual(journal.name, plan.journal_name)
+            self.assertEqual(
+                tuple((state.old_slot, state.replacement_slot) for state in journal.states),
+                tuple((slot.old, slot.replacement) for slot in plan.slots),
+            )
             self.assertEqual(original.read_bytes(), b"old\n")
             self.assertEqual(tuple(state.entry for state in journal.states), entries)
             self.assertFalse(hasattr(journal, "home_before"))
@@ -10100,7 +10150,7 @@ google_accounts:
                         b"new-last\n",
                     ),
                 )
-                journal = server_module._fleet_identity_journal_prepare(
+                journal = fleet_identity_journal_prepare_for_test(
                     parent_fd,
                     home_fd,
                     server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
@@ -10157,7 +10207,7 @@ google_accounts:
                         AgentError,
                         "fleet_identity_journal_changed",
                     ):
-                        server_module._fleet_identity_journal_prepare(
+                        fleet_identity_journal_prepare_for_test(
                             parent_fd,
                             home_fd,
                             server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
@@ -10169,7 +10219,7 @@ google_accounts:
                             ),
                         )
                     continue
-                journal = server_module._fleet_identity_journal_prepare(
+                journal = fleet_identity_journal_prepare_for_test(
                     parent_fd,
                     home_fd,
                     server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
@@ -10286,7 +10336,7 @@ google_accounts:
                     "write_private_new_bytes",
                     side_effect=fail_second_write,
                 ), self.assertRaisesRegex((AgentError, OSError), expected_error):
-                    server_module._fleet_identity_journal_prepare(
+                    fleet_identity_journal_prepare_for_test(
                         parent_fd,
                         home_fd,
                         server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
@@ -10360,7 +10410,7 @@ google_accounts:
                         else f"injected {selected}"
                     )
                     with self.assertRaisesRegex((AgentError, OSError), expected_error):
-                        server_module._fleet_identity_journal_prepare(
+                        fleet_identity_journal_prepare_for_test(
                             parent_fd,
                             home_fd,
                             server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
@@ -10492,7 +10542,7 @@ google_accounts:
 
                 actual_error: str | None = None
                 try:
-                    journal = server_module._fleet_identity_journal_prepare(
+                    journal = fleet_identity_journal_prepare_for_test(
                         parent_fd,
                         home_fd,
                         server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
@@ -10543,7 +10593,7 @@ google_accounts:
             original.write_bytes(b"old!\n")
             original.chmod(0o700)
             with self.assertRaisesRegex(AgentError, "fleet_identity_journal_changed"):
-                server_module._fleet_identity_journal_prepare(
+                fleet_identity_journal_prepare_for_test(
                     parent_fd,
                     home_fd,
                     server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
@@ -10562,7 +10612,7 @@ google_accounts:
                     AgentError,
                     "fleet_identity_journal_changed",
                 ):
-                    server_module._fleet_identity_journal_prepare(
+                    fleet_identity_journal_prepare_for_test(
                         parent_fd,
                         home_fd,
                         server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
@@ -10577,7 +10627,7 @@ google_accounts:
                             ),
                         ),
                     )
-            journal = server_module._fleet_identity_journal_prepare(
+            journal = fleet_identity_journal_prepare_for_test(
                 parent_fd,
                 home_fd,
                 server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
@@ -10638,7 +10688,7 @@ google_accounts:
                 original.write_bytes(b"old\n")
                 original.chmod(0o600)
                 original_snapshot = fleet_identity_snapshot_for_test(original)
-                journal = server_module._fleet_identity_journal_prepare(
+                journal = fleet_identity_journal_prepare_for_test(
                     parent_fd,
                     home_fd,
                     server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
@@ -10713,7 +10763,7 @@ google_accounts:
                 path.write_bytes(content)
                 path.chmod(0o600)
             untouched_snapshot = fleet_identity_snapshot_for_test(untouched)
-            journal = server_module._fleet_identity_journal_prepare(
+            journal = fleet_identity_journal_prepare_for_test(
                 parent_fd,
                 home_fd,
                 server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
@@ -10776,7 +10826,7 @@ google_accounts:
             original = home / "object"
             original.write_bytes(b"old\n")
             original.chmod(0o600)
-            journal = server_module._fleet_identity_journal_prepare(
+            journal = fleet_identity_journal_prepare_for_test(
                 parent_fd,
                 home_fd,
                 server_module._fleet_snapshot_metadata(os.fstat(parent_fd)),
@@ -10870,6 +10920,14 @@ google_accounts:
             for node in tree.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
+        prepare = functions["_fleet_identity_journal_prepare"]
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Attribute)
+                and node.attr in {"uuid4", "token_hex", "token_urlsafe"}
+                for node in ast.walk(prepare)
+            )
+        )
         for name in (
             "_fleet_identity_journal_switch",
             "_fleet_identity_journal_rollback",

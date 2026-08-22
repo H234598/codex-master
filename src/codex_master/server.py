@@ -162,6 +162,11 @@ from codex_master.fleet_recovery import (
     g_migration_journal_document,
     normalize_g_migration_journal,
 )
+from codex_master.fleet_home_recovery import (
+    FleetHomeRecoveryValidationError,
+    FleetIdentityJournalPlan,
+    validate_fleet_identity_journal_plan,
+)
 from codex_master.fleet_migration_apply import (
     GMigrationApplyError,
     GMigrationManifest,
@@ -26545,10 +26550,21 @@ def _fleet_identity_journal_prepare(
     parent_snapshot: tuple[int, ...],
     home_snapshot: tuple[int, ...],
     entries: tuple[_FleetIdentityJournalEntry, ...],
+    plan: FleetIdentityJournalPlan,
     *,
     faultpoint: Callable[[str], None] | None = None,
 ) -> _FleetIdentityJournal:
     error = "fleet_identity_journal_changed"
+    try:
+        validate_fleet_identity_journal_plan(
+            plan,
+            tuple(
+                (entry.name, entry.before is not None, entry.replacement_kind is not None)
+                for entry in entries
+            ),
+        )
+    except FleetHomeRecoveryValidationError as exc:
+        raise AgentError(error) from exc
     if (
         _fleet_snapshot_metadata(os.fstat(parent_fd)) != parent_snapshot
         or _fleet_snapshot_metadata(os.fstat(home_fd)) != home_snapshot
@@ -26657,9 +26673,8 @@ def _fleet_identity_journal_prepare(
     ):
         raise AgentError(error)
 
-    nonce = uuid.uuid4().hex
-    staging_name = f".fleet-identity-staging-{nonce}"
-    journal_name = f".fleet-identity-journal-{nonce}"
+    staging_name = plan.staging_name
+    journal_name = plan.journal_name
     journal_path_name = staging_name
     journal_fd = -1
     journal_snapshot: tuple[int, ...] | None = None
@@ -26731,11 +26746,9 @@ def _fleet_identity_journal_prepare(
         parent_current = _fleet_snapshot_metadata(os.fstat(parent_fd))
         if faultpoint is not None:
             faultpoint("after_parent_fstat")
-        for index, entry in enumerate(entries):
-            old_slot = f"old-{index:04d}" if entry.before is not None else None
-            replacement_slot = (
-                f"replacement-{index:04d}" if entry.replacement_kind is not None else None
-            )
+        for entry, planned_slot in zip(entries, plan.slots, strict=True):
+            old_slot = planned_slot.old
+            replacement_slot = planned_slot.replacement
             replacement_snapshot = None
             if replacement_slot is not None:
                 if entry.replacement_kind == "file":
