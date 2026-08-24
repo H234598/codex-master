@@ -1,0 +1,8 @@
+/usr/lib/codex-master-home-broker(/.*)? gen_context(system_u:object_r:codex_master_home_broker_package_t,s0)
+/usr/libexec/codex-master-home-broker -- gen_context(system_u:object_r:codex_master_home_broker_exec_t,s0)
+/usr/libexec/codex-master-broker-verify -- gen_context(system_u:object_r:codex_master_home_broker_exec_t,s0)
+/var/lib/codex-master-home-broker(/.*)? gen_context(system_u:object_r:codex_master_home_broker_state_t,s0)
+/etc/codex-master/home-broker.conf -- gen_context(system_u:object_r:codex_master_home_broker_config_t,s0)
+/usr/libexec/codex-master-agent-launcher -- gen_context(system_u:object_r:codex_master_agent_exec_t,s0)
+/run/codex-master-agent -d gen_context(system_u:object_r:codex_master_agent_endpoint_t,s0)
+/run/codex-master-agent/home(/.*)? gen_context(system_u:object_r:codex_master_agent_home_t,s0)
