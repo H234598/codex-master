@@ -44,3 +44,22 @@ git diff --check
 ```
 
 No full suite. No live auth inspection.
+
+## 2026-08-24 implementation checkpoint
+
+The DP0 contract and its fail-closed broker-attestation checks are committed.
+The legacy `agent_start` path rejects an explicit `teamleiterin` before auth,
+Codex-Usage routing, resolver work, or legacy-home materialization.
+
+Live cutover remains correctly blocked by independent safety evidence:
+
+- active Fleet Registry is schema version 1 and has no V2
+  `credential_binding_id` fields;
+- no live CHPB/2 broker service/socket is installed; only protocol, emulator,
+  and unintegrated identity/Linux primitives exist.
+
+Therefore no runtime home, auth projection, or inventory mutation is allowed
+from this slice.  The next owner must first install an attested broker and
+atomically publish a V2 registry/profile binding, then wire the existing
+contract to that one broker and Registry CAS path.  Do not re-enable or repair
+the legacy Teamleiterin route.

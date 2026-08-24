@@ -10877,6 +10877,18 @@ def _start_g5_warmup(runtime: ResourceGateRuntime | None) -> None:
     _SPAWN_WARMUP_UNTIL_NS = now_ns + 15_000_000_000
 
 
+def _reject_legacy_teamlead_start_target(agent_class: str | None) -> None:
+    """Keep legacy inventory IDs out of the V2 Teamleiterin start path.
+
+    Dynamic Teamleiterinnen require a V2 registry binding and a committed
+    CHPB/2 home attestation.  The legacy ``start_agent`` path has neither, so
+    it must stop before auth, routing, resolver, or home materialization.
+    """
+
+    if agent_class == "teamleiterin":
+        raise AgentError("dynamic_teamlead_legacy_target_forbidden")
+
+
 def start_agent(
     agent: str,
     cwd: str | None = None,
@@ -10894,6 +10906,7 @@ def start_agent(
     if type(confirm_home_refresh) is not bool:
         raise AgentError("confirm_home_refresh must be a boolean")
     agent = canonical_agent_id(agent)
+    _reject_legacy_teamlead_start_target(agent_class)
     with agent_lifecycle_lock(agent):
         with _resource_gate_composer_scope():
             name_args = {"name": name} if name is not None else {}
@@ -10939,6 +10952,7 @@ def _start_agent_unlocked(
     if type(confirm_home_refresh) is not bool:
         raise AgentError("confirm_home_refresh must be a boolean")
     agent = canonical_agent_id(agent)
+    _reject_legacy_teamlead_start_target(agent_class)
     ollama_descriptor = _ollama_descriptor(agent)
     g5_runtime: ResourceGateRuntime | None = None
     g5_scope: PreparedAgentScope | None = None
@@ -12408,6 +12422,7 @@ def _start_agent_with_lease_unlocked(
     if type(confirm_home_refresh) is not bool:
         raise AgentError("confirm_home_refresh must be a boolean")
     agent = canonical_agent_id(agent)
+    _reject_legacy_teamlead_start_target(agent_class)
     headless_descriptor = _headless_descriptor(agent)
     if headless_descriptor is not None:
         if confirm_home_refresh:
@@ -12462,6 +12477,7 @@ def _start_agent_with_lease_unlocked(
             requested_reasoning=reasoning_effort,
             authority_class=resolver_authority,
         )
+        _reject_legacy_teamlead_start_target(selection.class_id)
         selected_model = selection.model
         selected_effort = selection.reasoning
 

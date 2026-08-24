@@ -27645,6 +27645,81 @@ google_accounts:
             None,
         )
 
+    def test_legacy_teamlead_target_stops_before_auth_routing_or_materialization(self) -> None:
+        with patch.object(server_module, "require_fleet_recovery_ready"), patch.object(
+            server_module, "require_authenticated_agent_for_mutation"
+        ) as auth, patch.object(
+            server_module, "codex_usage_routing_decision"
+        ) as routing, patch.object(
+            server_module, "start_agent"
+        ) as lease_start:
+            with self.assertRaisesRegex(AgentError, "^dynamic_teamlead_legacy_target_forbidden$"):
+                server_module._start_agent_with_lease_unlocked(
+                    "a1",
+                    agent_class="teamleiterin",
+                    lifecycle="persistent",
+                    model="gpt-5.6-terra",
+                    reasoning_effort="xhigh",
+                )
+
+        auth.assert_not_called()
+        routing.assert_not_called()
+        lease_start.assert_not_called()
+
+    def test_masterjet_agent_start_reports_legacy_teamlead_target_without_auth_or_routing(self) -> None:
+        with patch.object(server_module, "agent_ids", return_value=["a1"]), patch.object(
+            server_module, "require_broad_mutation_confirmation", return_value={"required": False}
+        ), patch.object(
+            server_module, "call_agent_lifecycle", side_effect=lambda _agent, callback: callback()
+        ), patch.object(
+            server_module, "require_fleet_recovery_ready"
+        ), patch.object(
+            server_module, "require_authenticated_agent_for_mutation"
+        ) as auth, patch.object(
+            server_module, "codex_usage_routing_decision"
+        ) as routing:
+            result = server_module.call_tool(
+                "agent_start",
+                {
+                    "agent": "a1",
+                    "class": "teamleiterin",
+                    "lifecycle": "persistent",
+                    "model": "gpt-5.6-terra",
+                    "reasoning_effort": "xhigh",
+                },
+            )
+
+        self.assertEqual(result["results"][0]["error"], "dynamic_teamlead_legacy_target_forbidden")
+        auth.assert_not_called()
+        routing.assert_not_called()
+
+    def test_resolved_legacy_teamlead_stops_before_lease_or_materialization(self) -> None:
+        selection = SimpleNamespace(class_id="teamleiterin", model="gpt-5.6-terra", reasoning="xhigh")
+        with patch.object(server_module, "require_fleet_recovery_ready"), patch.object(
+            server_module, "classify_runtime_task"
+        ), patch.object(
+            server_module, "ensure_agent_not_blocked_by_codex_usage"
+        ), patch.object(
+            server_module, "_resolver_target_selection_inputs", return_value=(None, None)
+        ), patch.object(
+            server_module, "resolve_runtime_agent_selection", return_value=selection
+        ), patch.object(
+            server_module, "claim_agent"
+        ) as claim:
+            with self.assertRaisesRegex(AgentError, "^dynamic_teamlead_legacy_target_forbidden$"):
+                server_module._start_agent_with_lease_unlocked("a1", allow_unauthenticated=True)
+
+        claim.assert_not_called()
+
+    def test_direct_legacy_teamlead_start_never_reaches_materialization(self) -> None:
+        with patch.object(server_module, "require_fleet_recovery_ready"), patch.object(
+            server_module, "_start_agent_unlocked"
+        ) as start:
+            with self.assertRaisesRegex(AgentError, "^dynamic_teamlead_legacy_target_forbidden$"):
+                start_agent("a1", agent_class="teamleiterin")
+
+        start.assert_not_called()
+
     def test_start_agent_materializes_resolved_worker_before_g5_and_preserves_unmanaged_file(self) -> None:
         process_summary = {
             "process_count": 0,
