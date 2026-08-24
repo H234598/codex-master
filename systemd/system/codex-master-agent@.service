@@ -1,0 +1,18 @@
+[Unit]
+Description=Codex Master agent launcher
+
+[Service]
+Type=exec
+DynamicUser=yes
+ExecStart=/usr/libexec/codex-master-agent-launcher
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+PrivateMounts=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=~@mount @module @keyring bpf
