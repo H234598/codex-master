@@ -1,0 +1,41 @@
+#!/usr/bin/python3
+
+import runpy
+import sys
+
+
+PAYLOAD_PARENT = "/usr/lib/codex-master-home-broker"
+PAYLOAD_VERSION = "0.10.5"
+PAYLOAD_ROOT = "/usr/lib/codex-master-home-broker/0.10.5"
+MANIFEST_PATH = "/usr/lib/codex-master-home-broker/manifest-v1.json"
+BOOTSTRAP_PATH = "/usr/libexec/codex_master_bootstrap.py"
+BROKER_VERIFY_PATH = "/usr/libexec/codex-master-broker-verify"
+BROKER_PATH = "/usr/libexec/codex-master-home-broker"
+AGENT_PATH = "/usr/libexec/codex-master-agent-launcher"
+PYTHON = "/usr/bin/python3"
+INERT_EXIT_CODE = 78
+_ERROR = "codex-master bootstrap verification failed\n"
+
+
+def main() -> int:
+    try:
+        bootstrap = runpy.run_path(BOOTSTRAP_PATH)
+        operations = bootstrap["SystemOperations"]()
+        verified = bootstrap["dispatch"]("broker", operations)
+        try:
+            runpy.run_path(
+                verified.payload_root + "/bin/codex-master-home-broker",
+                run_name="__main__",
+            )
+        except SystemExit:
+            raise
+        return 0
+    except SystemExit:
+        raise
+    except Exception:
+        sys.stderr.write(_ERROR)
+        return INERT_EXIT_CODE
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

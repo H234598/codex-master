@@ -1,0 +1,54 @@
+#!/usr/bin/python3
+
+import importlib
+import os
+import runpy
+import sys
+
+
+PAYLOAD_PARENT = "/usr/lib/codex-master-home-broker"
+PAYLOAD_VERSION = "0.10.5"
+PAYLOAD_ROOT = "/usr/lib/codex-master-home-broker/0.10.5"
+MANIFEST_PATH = "/usr/lib/codex-master-home-broker/manifest-v1.json"
+BOOTSTRAP_PATH = "/usr/libexec/codex_master_bootstrap.py"
+BROKER_VERIFY_PATH = "/usr/libexec/codex-master-broker-verify"
+BROKER_PATH = "/usr/libexec/codex-master-home-broker"
+AGENT_PATH = "/usr/libexec/codex-master-agent-launcher"
+PYTHON = "/usr/bin/python3"
+INERT_EXIT_CODE = 78
+_ERROR = "codex-master bootstrap verification failed\n"
+
+
+def main() -> int:
+    try:
+        bootstrap = runpy.run_path(BOOTSTRAP_PATH)
+        operations = bootstrap["SystemOperations"]()
+        verified = bootstrap["dispatch"]("agent", operations)
+        if any(
+            isinstance(key, str) and key.startswith("codex_master")
+            for key in sys.modules
+        ):
+            raise RuntimeError("launcher package already loaded")
+        python_root = verified.payload_root + "/python"
+        sys.path.insert(0, python_root)
+        module = importlib.import_module("codex_master.fleet_agent_launcher")
+        python_root_real = os.path.realpath(python_root)
+        expected_file = os.path.realpath(
+            python_root + "/codex_master/fleet_agent_launcher.py"
+        )
+        module_file = getattr(module, "__file__", None)
+        if type(module_file) is not str:
+            raise RuntimeError("launcher module has no file")
+        module_file_real = os.path.realpath(module_file)
+        if os.path.commonpath((python_root_real, module_file_real)) != python_root_real:
+            raise RuntimeError("launcher module escaped payload")
+        if module_file_real != expected_file:
+            raise RuntimeError("launcher module is not verified")
+        return INERT_EXIT_CODE
+    except Exception:
+        sys.stderr.write(_ERROR)
+        return INERT_EXIT_CODE
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
