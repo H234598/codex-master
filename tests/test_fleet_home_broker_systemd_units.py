@@ -58,7 +58,9 @@ def test_broker_unit_has_static_root_verifier_contract():
     assert service["Environment"] == ["PATH=/usr/sbin:/usr/bin"]
     assert service["StateDirectory"] == ["codex-master-home-broker"]
     assert service["StateDirectoryMode"] == ["0700"]
-    assert service["ExecStart"] == ["/usr/libexec/codex-master-broker-verify"]
+    assert service["ExecStart"] == [
+        "/usr/bin/python3 -I -E -s -P /usr/libexec/codex-master-home-broker"
+    ]
     assert service["NoNewPrivileges"] == ["yes"]
     assert service["ProtectSystem"] == ["strict"]
     assert service["ProtectHome"] == ["yes"]
@@ -81,6 +83,17 @@ def test_broker_unit_has_static_root_verifier_contract():
         "IPAddressDeny",
         "DeviceAllow",
         "RestrictNamespaces",
+        "ExecStartPre",
+        "ExecStartPost",
+        "ExecReload",
+        "Requires",
+        "Wants",
+        "Requisite",
+        "BindsTo",
+        "PartOf",
+        "After",
+        "Before",
+        "Sockets",
     }
     assert not forbidden.intersection(service)
     assert "Install" not in unit
@@ -127,7 +140,9 @@ def test_agent_template_has_dynamic_user_launcher_contract_without_activation_ed
     assert service["PrivateMounts"] == ["yes"]
     assert "User" not in service
     assert "Group" not in service
-    assert service["ExecStart"] == ["/usr/libexec/codex-master-agent-launcher"]
+    assert service["ExecStart"] == [
+        "/usr/bin/python3 -I -E -s -P /usr/libexec/codex-master-agent-launcher"
+    ]
     assert service["NoNewPrivileges"] == ["yes"]
     assert service["ProtectSystem"] == ["strict"]
     assert service["ProtectHome"] == ["yes"]
@@ -158,6 +173,9 @@ def test_agent_template_has_dynamic_user_launcher_contract_without_activation_ed
         "IPAddressDeny",
         "DeviceAllow",
         "RestrictNamespaces",
+        "ExecStartPre",
+        "ExecStartPost",
+        "ExecReload",
     }
     assert not forbidden.intersection(service)
     assert "Install" not in unit

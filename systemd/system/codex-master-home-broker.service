@@ -9,7 +9,7 @@ WorkingDirectory=/var/empty
 Environment=PATH=/usr/sbin:/usr/bin
 StateDirectory=codex-master-home-broker
 StateDirectoryMode=0700
-ExecStart=/usr/libexec/codex-master-broker-verify
+ExecStart=/usr/bin/python3 -I -E -s -P /usr/libexec/codex-master-home-broker
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

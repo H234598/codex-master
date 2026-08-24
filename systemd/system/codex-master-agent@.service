@@ -4,7 +4,7 @@ Description=Codex Master agent launcher
 [Service]
 Type=exec
 DynamicUser=yes
-ExecStart=/usr/libexec/codex-master-agent-launcher
+ExecStart=/usr/bin/python3 -I -E -s -P /usr/libexec/codex-master-agent-launcher
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
