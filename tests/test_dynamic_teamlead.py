@@ -313,6 +313,122 @@ def test_prepare_prioritizes_identity_over_account_eligibility() -> None:
     assert caught.value.code is DynamicTeamleadCode.PROFILE_IDENTITY_MISMATCH
 
 
+def test_prepare_prioritizes_identity_over_request_model_capability() -> None:
+    with pytest.raises(DynamicTeamleadError) as caught:
+        prepare_dynamic_teamlead(
+            snapshot(runtime_principals=(principal(profile_id="other-profile"),)),
+            request(model="gpt-5.6-luna"),
+            binding(),
+        )
+
+    assert caught.value.code is DynamicTeamleadCode.PROFILE_IDENTITY_MISMATCH
+
+
+def test_prepare_prioritizes_hmac_identity_over_request_reasoning_capability() -> None:
+    with pytest.raises(DynamicTeamleadError) as caught:
+        prepare_dynamic_teamlead(
+            snapshot(
+                runtime_principals=(
+                    principal(credential_binding_id="hmac-sha256:" + "b" * 64),
+                )
+            ),
+            request(reasoning="high"),
+            binding(),
+        )
+
+    assert caught.value.code is DynamicTeamleadCode.PROFILE_IDENTITY_MISMATCH
+
+
+def test_prepare_prioritizes_identity_over_principal_eligibility() -> None:
+    with pytest.raises(DynamicTeamleadError) as caught:
+        prepare_dynamic_teamlead(
+            snapshot(
+                runtime_principals=(
+                    principal(enabled=False, profile_id="other-profile"),
+                )
+            ),
+            request(),
+            binding(),
+        )
+
+    assert caught.value.code is DynamicTeamleadCode.PROFILE_IDENTITY_MISMATCH
+
+
+def test_prepare_prioritizes_capability_over_principal_eligibility() -> None:
+    with pytest.raises(DynamicTeamleadError) as caught:
+        prepare_dynamic_teamlead(
+            snapshot(
+                runtime_principals=(
+                    principal(enabled=False, class_id="other-class"),
+                )
+            ),
+            request(),
+            binding(),
+        )
+
+    assert caught.value.code is DynamicTeamleadCode.INVALID_CLASS_SELECTION
+
+
+def test_prepare_prioritizes_request_capability_over_account_eligibility() -> None:
+    with pytest.raises(DynamicTeamleadError) as caught:
+        prepare_dynamic_teamlead(
+            snapshot(accounts=(account(enabled=False),)),
+            request(model="gpt-5.6-luna"),
+            binding(),
+        )
+
+    assert caught.value.code is DynamicTeamleadCode.INVALID_CLASS_SELECTION
+
+
+def test_prepare_prioritizes_principal_capability_over_account_eligibility() -> None:
+    with pytest.raises(DynamicTeamleadError) as caught:
+        prepare_dynamic_teamlead(
+            snapshot(
+                accounts=(account(enabled=False),),
+                runtime_principals=(principal(class_id="other-class"),),
+            ),
+            request(),
+            binding(),
+        )
+
+    assert caught.value.code is DynamicTeamleadCode.INVALID_CLASS_SELECTION
+
+
+def test_prepare_prioritizes_principal_eligibility_over_account_eligibility() -> None:
+    with pytest.raises(DynamicTeamleadError) as caught:
+        prepare_dynamic_teamlead(
+            snapshot(
+                accounts=(account(enabled=False),),
+                runtime_principals=(principal(enabled=False),),
+            ),
+            request(),
+            binding(),
+        )
+
+    assert caught.value.code is DynamicTeamleadCode.RUNTIME_PRINCIPAL_INVALID
+
+
+@pytest.mark.parametrize(
+    "runtime_principals",
+    [
+        (),
+        (principal(), principal()),
+        (SimpleNamespace(principal_id=AGENT_ID, enabled=True),),
+    ],
+)
+def test_prepare_prioritizes_principal_selection_over_later_capability_error(
+    runtime_principals: tuple[object, ...],
+) -> None:
+    with pytest.raises(DynamicTeamleadError) as caught:
+        prepare_dynamic_teamlead(
+            snapshot(runtime_principals=runtime_principals),
+            request(model="gpt-5.6-luna"),
+            binding(),
+        )
+
+    assert caught.value.code is DynamicTeamleadCode.RUNTIME_PRINCIPAL_INVALID
+
+
 def test_prepare_rejects_v1_registry_without_legacy_fallback() -> None:
     legacy = FleetSnapshot(
         1,

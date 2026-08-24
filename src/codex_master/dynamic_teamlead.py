@@ -110,8 +110,6 @@ def _valid_request(value: object) -> DynamicTeamleadRequest:
         _fail(DynamicTeamleadCode.ACCOUNT_NOT_FOUND)
     if type(value.registry_generation) is not int or value.registry_generation < 1:
         _fail(DynamicTeamleadCode.STALE_REGISTRY)
-    if value.model != "gpt-5.6-terra" or value.reasoning != "xhigh":
-        _fail(DynamicTeamleadCode.INVALID_CLASS_SELECTION)
     return value
 
 
@@ -151,10 +149,7 @@ def _runtime_principal(snapshot: FleetSnapshotV2, agent_id: str) -> FleetRuntime
     )
     if len(matches) != 1 or type(matches[0]) is not FleetRuntimePrincipalV2:
         _fail(DynamicTeamleadCode.RUNTIME_PRINCIPAL_INVALID)
-    principal = matches[0]
-    if principal.enabled is not True:
-        _fail(DynamicTeamleadCode.RUNTIME_PRINCIPAL_INVALID)
-    return principal
+    return matches[0]
 
 
 def prepare_dynamic_teamlead(
@@ -190,7 +185,9 @@ def prepare_dynamic_teamlead(
     ):
         _fail(DynamicTeamleadCode.PROFILE_IDENTITY_MISMATCH)
     if (
-        principal.class_id != "teamleiterin"
+        selected.model != "gpt-5.6-terra"
+        or selected.reasoning != "xhigh"
+        or principal.class_id != "teamleiterin"
         or principal.lifecycle != "persistent"
         or principal.provider is not Provider.OPENAI_CHATGPT
         or principal.runner is not RunnerKind.CODEX_CLI
@@ -198,6 +195,8 @@ def prepare_dynamic_teamlead(
         or principal.reasoning != "xhigh"
     ):
         _fail(DynamicTeamleadCode.INVALID_CLASS_SELECTION)
+    if principal.enabled is not True:
+        _fail(DynamicTeamleadCode.RUNTIME_PRINCIPAL_INVALID)
     _eligible_account(account)
     return DynamicTeamleadPlan(selected, binding, principal)
 
