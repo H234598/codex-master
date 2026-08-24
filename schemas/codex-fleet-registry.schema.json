@@ -24,6 +24,25 @@
         {"if": {"properties": {"provider": {"const": "ollama_local"}}}, "then": {"properties": {"auth_kind": {"const": "none"}}}}
       ]
     },
+    "v2_account": {
+      "allOf": [
+        {"$ref": "#/$defs/account"},
+        {
+          "if": {
+            "properties": {
+              "provider": {"const": "openai_chatgpt"},
+              "credential_binding_id": {"type": "string"}
+            },
+            "required": ["credential_binding_id"]
+          },
+          "then": {
+            "properties": {
+              "credential_binding_id": {"type": "string", "pattern": "^hmac-sha256:[0-9a-f]{64}$"}
+            }
+          }
+        }
+      ]
+    },
     "v1_series": {
       "type": "object", "required": ["prefix", "display_name", "count", "runner", "provider", "model", "account_id", "enabled"], "additionalProperties": false,
       "properties": {
@@ -60,7 +79,25 @@
         {"if": {"properties": {"provider": {"enum": ["openai_chatgpt", "openai_api", "ollama_local", "huggingface_inference"]}}}, "then": {"properties": {"runner": {"const": "codex_cli"}}}}
       ]
     },
+    "runtime_principal": {
+      "type": "object",
+      "required": ["principal_id", "account_id", "profile_id", "credential_binding_id", "class_id", "lifecycle", "provider", "runner", "model", "reasoning", "enabled"],
+      "additionalProperties": false,
+      "properties": {
+        "principal_id": {"type": "string", "pattern": "^tl-[0-9a-f]{32}$"},
+        "account_id": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$"},
+        "profile_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"},
+        "credential_binding_id": {"type": "string", "pattern": "^hmac-sha256:[0-9a-f]{64}$"},
+        "class_id": {"const": "teamleiterin"},
+        "lifecycle": {"const": "persistent"},
+        "provider": {"const": "openai_chatgpt"},
+        "runner": {"const": "codex_cli"},
+        "model": {"const": "gpt-5.6-terra"},
+        "reasoning": {"const": "xhigh"},
+        "enabled": {"type": "boolean"}
+      }
+    },
     "v1": {"type": "object", "required": ["schema_version", "generation", "accounts", "series"], "additionalProperties": false, "properties": {"schema_version": {"const": 1}, "generation": {"type": "integer", "minimum": 0}, "accounts": {"type": "array", "maxItems": 64, "items": {"allOf": [{"$ref": "#/$defs/account"}, {"not": {"required": ["credential_binding_id"]}}]}}, "series": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/v1_series"}}}},
-    "v2": {"type": "object", "required": ["schema_version", "generation", "accounts", "series"], "additionalProperties": false, "properties": {"schema_version": {"const": 2}, "generation": {"type": "integer", "minimum": 0}, "accounts": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/account"}}, "series": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/v2_series"}}}}
+    "v2": {"type": "object", "required": ["schema_version", "generation", "accounts", "series", "runtime_principals"], "additionalProperties": false, "properties": {"schema_version": {"const": 2}, "generation": {"type": "integer", "minimum": 0}, "accounts": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/v2_account"}}, "series": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/v2_series"}}, "runtime_principals": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/runtime_principal"}}}}
   }
 }

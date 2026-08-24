@@ -12,6 +12,7 @@ import pytest
 from codex_master.fleet_registry import (
     AuthKind,
     FleetAccount,
+    FleetRuntimePrincipalV2,
     FleetSeries,
     FleetSnapshotV2,
     FleetValidationError,
@@ -27,6 +28,9 @@ from codex_master.fleet_registry import (
     plan_account_delete,
     plan_account_disable,
     plan_account_upsert,
+    plan_runtime_principal_delete,
+    plan_runtime_principal_disable,
+    plan_runtime_principal_upsert,
     plan_series_apply,
     plan_series_delete,
     plan_series_disable,
@@ -40,6 +44,14 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 def load_fixture(name: str) -> dict[str, object]:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def valid_runtime_principal_document() -> dict[str, object]:
+    return load_fixture("fleet-registry-v2.json")
+
+
+def runtime_principal_dict(document: dict[str, object]) -> dict[str, object]:
+    return deepcopy(document["runtime_principals"][0])  # type: ignore[index]
 
 
 def test_v1_fixture_expands_deterministically_without_final_member_ids() -> None:
@@ -69,8 +81,213 @@ def test_v2_fixture_round_trips_and_derives_count() -> None:
     assert isinstance(snapshot, FleetSnapshotV2)
     assert snapshot.schema_version == 2
     assert snapshot.series[0].count == 2
+    assert isinstance(snapshot.runtime_principals, tuple)
+    assert len(snapshot.runtime_principals) == 1
     assert "count" not in fleet_document(snapshot)["series"][0]
     assert normalize_fleet_document(fleet_document(snapshot)) == snapshot
+
+
+def test_v2_requires_runtime_principals_root_field() -> None:
+    document = load_fixture("fleet-registry-v2.json")
+    document.pop("runtime_principals")
+    with pytest.raises(FleetValidationError) as caught:
+        normalize_fleet_document(document)
+    assert caught.value.code == "invalid_document"
+
+
+def test_v2_runtime_principals_are_frozen_and_slotted() -> None:
+    snapshot = normalize_fleet_document(load_fixture("fleet-registry-v2.json"))
+    principal = snapshot.runtime_principals[0]
+    assert isinstance(principal, FleetRuntimePrincipalV2)
+    with pytest.raises(FrozenInstanceError):
+        principal.enabled = False  # type: ignore[misc]
+    with pytest.raises(AttributeError):
+        principal.extra = "nope"  # type: ignore[attr-defined]
+
+
+def test_v2_runtime_principal_repr_and_str_are_redacted() -> None:
+    principal = FleetRuntimePrincipalV2(
+        principal_id="tl-" + "a" * 32,
+        account_id="chatgpt-teamlead-1",
+        profile_id="profile-marker-123",
+        credential_binding_id="binding-marker-456",
+        class_id="class-marker-789",
+        lifecycle="persistent",
+        provider=Provider.OPENAI_CHATGPT,
+        runner=RunnerKind.CODEX_CLI,
+        model="gpt-5.6-terra",
+        reasoning="xhigh",
+        enabled=True,
+    )
+
+    assert repr(principal) == "FleetRuntimePrincipalV2(<redacted>)"
+    assert str(principal) == "FleetRuntimePrincipalV2(<redacted>)"
+    assert "tl-" + "a" * 32 not in repr(principal)
+    assert "profile-marker-123" not in repr(principal)
+    assert "binding-marker-456" not in repr(principal)
+    assert "class-marker-789" not in repr(principal)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("principal_id", "tl-not-hex"),
+        ("account_id", ""),
+        ("profile_id", "bad/profile"),
+        ("credential_binding_id", "binding-one"),
+        ("class_id", "lead"),
+        ("lifecycle", "ephemeral"),
+        ("provider", "gemini_api"),
+        ("runner", "gemini_cli"),
+        ("model", "gpt-5.6"),
+        ("reasoning", "high"),
+        ("enabled", "true"),
+    ],
+)
+def test_v2_rejects_invalid_runtime_principal_fields(field: str, value: object) -> None:
+    document = valid_runtime_principal_document()
+    document["runtime_principals"][0][field] = value  # type: ignore[index]
+    with pytest.raises(FleetValidationError) as caught:
+        normalize_fleet_document(document)
+    assert caught.value.code == "invalid_runtime_principal"
+
+
+@pytest.mark.parametrize("field", ["series", "home", "auth", "prefix", "members", "secret"])
+def test_v2_rejects_runtime_principal_private_or_series_fields(field: str) -> None:
+    document = valid_runtime_principal_document()
+    document["runtime_principals"][0][field] = "forbidden"  # type: ignore[index]
+    with pytest.raises(FleetValidationError) as caught:
+        normalize_fleet_document(document)
+    assert caught.value.code == "invalid_runtime_principal"
+
+
+def test_v2_rejects_runtime_principal_account_identity_or_eligibility_mismatches() -> None:
+    document = valid_runtime_principal_document()
+    document["runtime_principals"][0]["account_id"] = "missing-account"  # type: ignore[index]
+    with pytest.raises(FleetValidationError, match="invalid_runtime_principal"):
+        normalize_fleet_document(document)
+
+    document = valid_runtime_principal_document()
+    document["accounts"][2]["enabled"] = False  # type: ignore[index]
+    with pytest.raises(FleetValidationError, match="invalid_runtime_principal"):
+        normalize_fleet_document(document)
+
+    document = valid_runtime_principal_document()
+    document["accounts"][2]["secret_state"] = "missing"  # type: ignore[index]
+    with pytest.raises(FleetValidationError, match="invalid_runtime_principal"):
+        normalize_fleet_document(document)
+
+    document = valid_runtime_principal_document()
+    document["accounts"][2]["limit_state"] = "unknown"  # type: ignore[index]
+    with pytest.raises(FleetValidationError, match="invalid_runtime_principal"):
+        normalize_fleet_document(document)
+
+    document = valid_runtime_principal_document()
+    document["accounts"][2]["provider"] = "openai_api"  # type: ignore[index]
+    document["accounts"][2]["auth_kind"] = "api_key"  # type: ignore[index]
+    with pytest.raises(FleetValidationError, match="invalid_runtime_principal"):
+        normalize_fleet_document(document)
+
+    document = valid_runtime_principal_document()
+    document["accounts"][2]["credential_binding_id"] = None  # type: ignore[index]
+    with pytest.raises(FleetValidationError, match="invalid_runtime_principal"):
+        normalize_fleet_document(document)
+
+    document = valid_runtime_principal_document()
+    document["accounts"][2]["credential_binding_id"] = "hmac-sha256:" + "b" * 64  # type: ignore[index]
+    with pytest.raises(FleetValidationError, match="invalid_runtime_principal"):
+        normalize_fleet_document(document)
+
+
+@pytest.mark.parametrize("account_field", ["enabled", "limit_state"])
+def test_v2_allows_disabled_runtime_principal_with_bound_but_unavailable_account(account_field: str) -> None:
+    document = valid_runtime_principal_document()
+    document["runtime_principals"][0]["enabled"] = False  # type: ignore[index]
+    document["accounts"][2][account_field] = False if account_field == "enabled" else "unknown"  # type: ignore[index]
+    snapshot = normalize_fleet_document(document)
+    account = next(account for account in snapshot.accounts if account.account_id == "chatgpt-teamlead-1")
+    assert snapshot.runtime_principals[0].enabled is False
+    assert snapshot.runtime_principals[0].account_id == account.account_id
+    assert snapshot.runtime_principals[0].credential_binding_id == account.credential_binding_id
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("account_id", "missing-account"),
+        ("credential_binding_id", "hmac-sha256:" + "b" * 64),
+    ],
+)
+def test_v2_rejects_disabled_runtime_principal_without_exact_account_binding(field: str, value: str) -> None:
+    document = valid_runtime_principal_document()
+    document["runtime_principals"][0].update(enabled=False, **{field: value})  # type: ignore[index]
+    with pytest.raises(FleetValidationError) as caught:
+        normalize_fleet_document(document)
+    assert caught.value.code == "invalid_runtime_principal"
+
+
+def test_v2_rejects_duplicate_enabled_binding_across_all_providers_when_principal_targets_it() -> None:
+    document = valid_runtime_principal_document()
+    document["accounts"][0]["credential_binding_id"] = document["runtime_principals"][0]["credential_binding_id"]  # type: ignore[index]
+    document["accounts"][0]["enabled"] = True  # type: ignore[index]
+    with pytest.raises(FleetValidationError) as caught:
+        normalize_fleet_document(document)
+    assert caught.value.code == "duplicate_credential_binding"
+
+
+def test_public_v2_snapshot_redacts_runtime_principals() -> None:
+    public = public_fleet_snapshot(normalize_fleet_document(load_fixture("fleet-registry-v2.json")))
+    rendered = json.dumps(public)
+    assert public["runtime_principal_count"] == 1
+    assert "runtime_principals" not in public
+    assert "principal_id" not in rendered
+    assert "profile_id" not in rendered
+    assert "credential_binding_id" not in rendered
+
+
+def test_v2_runtime_principal_planners_apply_cas_and_disable_before_delete() -> None:
+    snapshot = normalize_fleet_document(load_fixture("fleet-registry-v2.json"))
+    principal = FleetRuntimePrincipalV2(
+        principal_id="tl-" + "2" * 32,
+        account_id="chatgpt-teamlead-1",
+        profile_id="teamlead.beta",
+        credential_binding_id=snapshot.runtime_principals[0].credential_binding_id,
+        class_id="teamleiterin",
+        lifecycle="persistent",
+        provider=Provider.OPENAI_CHATGPT,
+        runner=RunnerKind.CODEX_CLI,
+        model="gpt-5.6-terra",
+        reasoning="xhigh",
+        enabled=False,
+    )
+
+    with pytest.raises(FleetValidationError, match="generation_conflict"):
+        plan_runtime_principal_upsert(snapshot, principal, expected_generation=snapshot.generation + 1)
+
+    updated = plan_runtime_principal_upsert(snapshot, principal, expected_generation=snapshot.generation)
+    assert isinstance(updated, FleetSnapshotV2)
+    assert updated.generation == snapshot.generation + 1
+    assert updated.runtime_principals[-1] == principal
+
+    enabled = replace(principal, enabled=True)
+    enabled_snapshot = plan_runtime_principal_upsert(
+        updated, enabled, expected_generation=updated.generation
+    )
+    assert enabled_snapshot.runtime_principals[-1] == enabled
+
+    with pytest.raises(FleetValidationError, match="runtime_principal_must_be_disabled"):
+        plan_runtime_principal_delete(snapshot, snapshot.runtime_principals[0].principal_id, expected_generation=snapshot.generation)
+
+    disabled = plan_runtime_principal_disable(snapshot, snapshot.runtime_principals[0].principal_id, expected_generation=snapshot.generation)
+    assert disabled.runtime_principals[0].enabled is False
+
+    deleted = plan_runtime_principal_delete(
+        disabled,
+        disabled.runtime_principals[0].principal_id,
+        expected_generation=disabled.generation,
+    )
+    assert deleted.generation == disabled.generation + 1
+    assert deleted.runtime_principals == ()
 
 
 @pytest.mark.parametrize("member_id", [None, "v1:g:1", "11111111-1111-1111-8111-111111111111",
@@ -166,6 +383,7 @@ def test_v2_repfx_and_profile_changes_preserve_final_member_ids() -> None:
     document = load_fixture("fleet-registry-v2.json")
     before = {m["ordinal"]: m["member_id"] for m in document["series"][0]["members"]}  # type: ignore[index]
     document["accounts"] = []
+    document["runtime_principals"] = []
     document["series"][0].update(prefix="d", provider="ollama_local", runner="codex_cli", model="new-model", skill_profile="new-skill", task_profile="new-task")
     for member in document["series"][0]["members"]:
         member["account_id"] = None  # type: ignore[index]
@@ -244,6 +462,7 @@ def test_v2_inventory_uses_member_account_and_overrides(tmp_path: Path) -> None:
 def test_v2_allows_accountless_local_member_and_rejects_missing_required_account() -> None:
     document = load_fixture("fleet-registry-v2.json")
     document["accounts"] = []
+    document["runtime_principals"] = []
     document["series"][0].update(prefix="d", provider="ollama_local", runner="codex_cli")
     for member in document["series"][0]["members"]:
         member["account_id"] = None
@@ -256,6 +475,7 @@ def test_v2_allows_accountless_local_member_and_rejects_missing_required_account
 def test_v2_rejects_disabled_required_accountless_member() -> None:
     document = load_fixture("fleet-registry-v2.json")
     document["accounts"] = []
+    document["runtime_principals"] = []
     document["series"][0].update(prefix="d", provider="openai_api", runner="codex_cli")
     for member in document["series"][0]["members"]:
         member["account_id"] = None
@@ -289,13 +509,21 @@ def test_v2_writer_rejects_nonfinal_member_id() -> None:
         fleet_document(invalid)
 
 
-def test_duplicate_non_gemini_credential_bindings_are_allowed() -> None:
+def test_duplicate_non_gemini_credential_bindings_are_rejected() -> None:
     document = load_fixture("fleet-registry-v2.json")
-    for account in document["accounts"]:
-        account["provider"] = "openai_api"
-        account["credential_binding_id"] = "shared-binding"
-    document["series"][0].update(prefix="o", provider="openai_api", runner="codex_cli")
-    assert normalize_fleet_document(document).schema_version == 2
+    document["accounts"].append({
+        "account_id": "unused-openai-api",
+        "label": "Unused OpenAI API",
+        "provider": "openai_api",
+        "auth_kind": "api_key",
+        "secret_state": "configured",
+        "limit_state": "ready",
+        "enabled": True,
+        "credential_binding_id": document["accounts"][0]["credential_binding_id"],  # type: ignore[index]
+    })
+    with pytest.raises(FleetValidationError) as caught:
+        normalize_fleet_document(document)
+    assert caught.value.code == "duplicate_credential_binding"
 
 
 def test_registry_schema_declares_separate_v1_and_v2_contracts() -> None:
@@ -305,6 +533,15 @@ def test_registry_schema_declares_separate_v1_and_v2_contracts() -> None:
     assert "members" in schema["$defs"]["v2_series"]["required"]
     assert "count" not in schema["$defs"]["v2_series"]["properties"]
     assert "member_id" in schema["$defs"]["member"]["required"]
+    assert "runtime_principals" in schema["$defs"]["v2"]["required"]
+    assert "runtime_principals" not in schema["$defs"]["v1"]["properties"]
+    assert set(schema["$defs"]["runtime_principal"]["required"]) == {
+        "principal_id", "account_id", "profile_id", "credential_binding_id", "class_id",
+        "lifecycle", "provider", "runner", "model", "reasoning", "enabled",
+    }
+    assert schema["$defs"]["runtime_principal"]["additionalProperties"] is False
+    assert schema["$defs"]["v2"]["additionalProperties"] is False
+    assert schema["$defs"]["v2"]["properties"]["runtime_principals"]["maxItems"] == 64
 
 
 def test_registry_schema_rejects_v1_provider_runner_regressions_and_invalid_v2_text() -> None:
@@ -316,8 +553,19 @@ def test_registry_schema_rejects_v1_provider_runner_regressions_and_invalid_v2_t
     v1["series"][0].update(provider="gemini_api", runner="codex_cli", account_id=None)
     assert list(validator.iter_errors(v1))
     v2 = load_fixture("fleet-registry-v2.json")
+    assert not list(validator.iter_errors(v2))
     v2["series"][0]["members"][0]["model_override"] = ""
     assert list(validator.iter_errors(v2))
+    missing_principals = load_fixture("fleet-registry-v2.json")
+    missing_principals.pop("runtime_principals")
+    assert list(validator.iter_errors(missing_principals))
+    for field in ("home", "series"):
+        invalid_principal = load_fixture("fleet-registry-v2.json")
+        invalid_principal["runtime_principals"][0][field] = "forbidden"  # type: ignore[index]
+        assert list(validator.iter_errors(invalid_principal))
+    invalid_binding = load_fixture("fleet-registry-v2.json")
+    invalid_binding["runtime_principals"][0]["credential_binding_id"] = "binding-one"  # type: ignore[index]
+    assert list(validator.iter_errors(invalid_binding))
 
 
 def test_registry_schema_rejects_v2_model_control_characters() -> None:

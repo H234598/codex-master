@@ -16,11 +16,15 @@ from unicodedata import category
 MAX_DOCUMENT_BYTES = 1024 * 1024
 MAX_ACCOUNTS = 64
 MAX_SERIES = 64
+MAX_RUNTIME_PRINCIPALS = 64
 MAX_AGENTS = 1000
 MAX_SERIES_COUNT = 100
 MAX_GENERATION = 2**63 - 1
 _ACCOUNT_ID_RE = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 _LIMIT_REASON_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+_PROFILE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+_CREDENTIAL_BINDING_HMAC_RE = re.compile(r"hmac-sha256:[0-9a-f]{64}\Z")
+_RUNTIME_PRINCIPAL_ID_RE = re.compile(r"tl-[0-9a-f]{32}\Z")
 _RFC3339_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\Z"
 )
@@ -187,15 +191,38 @@ class FleetSeriesV2:
 
 
 @dataclass(frozen=True, slots=True)
+class FleetRuntimePrincipalV2:
+    principal_id: str
+    account_id: str
+    profile_id: str
+    credential_binding_id: str
+    class_id: str
+    lifecycle: str
+    provider: Provider
+    runner: RunnerKind
+    model: str
+    reasoning: str
+    enabled: bool
+
+    def __repr__(self) -> str:
+        return "FleetRuntimePrincipalV2(<redacted>)"
+
+    def __str__(self) -> str:
+        return repr(self)
+
+
+@dataclass(frozen=True, slots=True)
 class FleetSnapshotV2:
     schema_version: int
     generation: int
     accounts: tuple[FleetAccountV2, ...]
     series: tuple[FleetSeriesV2, ...]
+    runtime_principals: tuple[FleetRuntimePrincipalV2, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "accounts", tuple(self.accounts))
         object.__setattr__(self, "series", tuple(self.series))
+        object.__setattr__(self, "runtime_principals", tuple(self.runtime_principals))
 
     def __repr__(self) -> str:
         return "FleetSnapshotV2(<redacted>)"
@@ -257,7 +284,8 @@ _PROVIDER_RULES = {
     Provider.OLLAMA_LOCAL: (RunnerKind.CODEX_CLI, AuthKind.NONE, False),
     Provider.HUGGINGFACE_INFERENCE: (RunnerKind.CODEX_CLI, AuthKind.API_KEY, True),
 }
-_ROOT_FIELDS = frozenset({"schema_version", "generation", "accounts", "series"})
+_V1_ROOT_FIELDS = frozenset({"schema_version", "generation", "accounts", "series"})
+_V2_ROOT_FIELDS = frozenset({"schema_version", "generation", "accounts", "series", "runtime_principals"})
 _ACCOUNT_FIELDS = frozenset({
     "account_id", "label", "provider", "auth_kind", "secret_state", "limit_state",
     "enabled", "reset_at_utc", "last_probe_at_utc", "limit_reason", "billing_group",
@@ -274,6 +302,10 @@ _V2_SERIES_FIELDS = frozenset({
 _MEMBER_FIELDS = frozenset({
     "member_id", "ordinal", "account_id", "enabled", "model_override",
     "skill_profile_override", "task_profile_override",
+})
+_RUNTIME_PRINCIPAL_FIELDS = frozenset({
+    "principal_id", "account_id", "profile_id", "credential_binding_id", "class_id",
+    "lifecycle", "provider", "runner", "model", "reasoning", "enabled",
 })
 
 
@@ -334,6 +366,15 @@ def _optional_reason(value: object, code: str) -> str | None:
     return text
 
 
+def _binding_id(value: object, *, code: str, require_hmac: bool) -> str | None:
+    if value is None:
+        return None
+    text = _text(value, minimum=1, maximum=200, code=code)
+    if require_hmac and not _CREDENTIAL_BINDING_HMAC_RE.fullmatch(text):
+        _fail(code)
+    return text
+
+
 def _account(value: object, *, v2: bool = False) -> FleetAccount | FleetAccountV2:
     code = "invalid_account"
     raw = _mapping(value, code)
@@ -359,9 +400,11 @@ def _account(value: object, *, v2: bool = False) -> FleetAccount | FleetAccountV
         billing_group = _text(billing_group, minimum=1, maximum=64, code=code)
         if not _ACCOUNT_ID_RE.fullmatch(billing_group):
             _fail(code)
-    credential_binding_id = raw.get("credential_binding_id")
-    if credential_binding_id is not None:
-        credential_binding_id = _text(credential_binding_id, minimum=1, maximum=200, code=code)
+    credential_binding_id = _binding_id(
+        raw.get("credential_binding_id"),
+        code=code,
+        require_hmac=v2 and provider is Provider.OPENAI_CHATGPT,
+    )
     if v2:
         return FleetAccountV2(
             account_id, _text(raw["label"], minimum=1, maximum=120, code=code), provider, auth_kind,
@@ -478,6 +521,52 @@ def _series_v2(value: object) -> FleetSeriesV2:
     )
 
 
+def _runtime_principal(value: object) -> FleetRuntimePrincipalV2:
+    code = "invalid_runtime_principal"
+    raw = _mapping(value, code)
+    if set(raw) - _RUNTIME_PRINCIPAL_FIELDS or _RUNTIME_PRINCIPAL_FIELDS - set(raw):
+        _fail(code)
+    principal_id = _text(raw["principal_id"], minimum=1, maximum=35, code=code)
+    if not _RUNTIME_PRINCIPAL_ID_RE.fullmatch(principal_id):
+        _fail(code)
+    account_id = _text(raw["account_id"], minimum=1, maximum=64, code=code)
+    if not _ACCOUNT_ID_RE.fullmatch(account_id):
+        _fail(code)
+    profile_id = _text(raw["profile_id"], minimum=1, maximum=128, code=code)
+    if not _PROFILE_ID_RE.fullmatch(profile_id):
+        _fail(code)
+    credential_binding_id = _binding_id(raw["credential_binding_id"], code=code, require_hmac=True)
+    if credential_binding_id is None:
+        _fail(code)
+    return FleetRuntimePrincipalV2(
+        principal_id=principal_id,
+        account_id=account_id,
+        profile_id=profile_id,
+        credential_binding_id=credential_binding_id,
+        class_id=_exact_text(raw["class_id"], expected="teamleiterin", code=code),
+        lifecycle=_exact_text(raw["lifecycle"], expected="persistent", code=code),
+        provider=_exact_enum(Provider, raw["provider"], expected=Provider.OPENAI_CHATGPT, code=code),
+        runner=_exact_enum(RunnerKind, raw["runner"], expected=RunnerKind.CODEX_CLI, code=code),
+        model=_exact_text(raw["model"], expected="gpt-5.6-terra", code=code),
+        reasoning=_exact_text(raw["reasoning"], expected="xhigh", code=code),
+        enabled=_boolean(raw["enabled"], code),
+    )
+
+
+def _exact_text(value: object, *, expected: str, code: str) -> str:
+    text = _text(value, minimum=1, maximum=max(1, len(expected)), code=code)
+    if text != expected:
+        _fail(code)
+    return text
+
+
+def _exact_enum(enum: type[Enum], value: object, *, expected: Enum, code: str) -> Any:
+    resolved = _enum(enum, value, code)
+    if resolved is not expected:
+        _fail(code)
+    return resolved
+
+
 def normalize_fleet_document(raw: object) -> FleetSnapshot | FleetSnapshotV2:
     try:
         encoded = json.dumps(raw, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
@@ -487,7 +576,10 @@ def normalize_fleet_document(raw: object) -> FleetSnapshot | FleetSnapshotV2:
     if len(encoded_bytes) > MAX_DOCUMENT_BYTES:
         _fail("invalid_document")
     document = _mapping(raw, "invalid_document")
-    if set(document) != _ROOT_FIELDS or document.get("schema_version") not in (1, 2):
+    if document.get("schema_version") not in (1, 2):
+        _fail("invalid_document")
+    is_v2 = document.get("schema_version") == 2
+    if set(document) != (_V2_ROOT_FIELDS if is_v2 else _V1_ROOT_FIELDS):
         _fail("invalid_document")
     generation = document.get("generation")
     if (
@@ -502,9 +594,16 @@ def normalize_fleet_document(raw: object) -> FleetSnapshot | FleetSnapshotV2:
         _fail("invalid_document")
     if len(accounts_raw) > MAX_ACCOUNTS or len(series_raw) > MAX_SERIES:
         _fail("invalid_document")
-    is_v2 = document.get("schema_version") == 2
     accounts = tuple(sorted((_account(item, v2=is_v2) for item in accounts_raw), key=lambda item: item.account_id))
     series = tuple(sorted(((_series_v2(item) if is_v2 else _series(item)) for item in series_raw), key=lambda item: item.prefix))
+    runtime_principals_raw = document.get("runtime_principals", [])
+    if not isinstance(runtime_principals_raw, list):
+        _fail("invalid_document")
+    if len(runtime_principals_raw) > MAX_RUNTIME_PRINCIPALS:
+        _fail("invalid_document")
+    runtime_principals = tuple(
+        sorted((_runtime_principal(item) for item in runtime_principals_raw), key=lambda item: item.principal_id)
+    )
     if len({item.account_id for item in accounts}) != len(accounts):
         _fail("invalid_account")
     if len({item.prefix for item in series}) != len(series):
@@ -535,11 +634,33 @@ def normalize_fleet_document(raw: object) -> FleetSnapshot | FleetSnapshotV2:
             if account is None or account.provider is not item.provider:
                 _fail("invalid_series")
     if is_v2:
-        bindings = [account.credential_binding_id for account in accounts
-                    if account.provider is Provider.GEMINI_API and account.enabled and account.credential_binding_id]
+        if len({item.principal_id for item in runtime_principals}) != len(runtime_principals):
+            _fail("invalid_runtime_principal")
+        bindings = [
+            account.credential_binding_id
+            for account in accounts
+            if account.enabled and account.credential_binding_id is not None
+        ]
         if len(bindings) != len(set(bindings)):
             _fail("duplicate_credential_binding")
-        return FleetSnapshotV2(2, generation, accounts, series)
+        for principal in runtime_principals:
+            account = accounts_by_id.get(principal.account_id)
+            if (
+                account is None
+                or account.provider is not Provider.OPENAI_CHATGPT
+                or account.auth_kind is not AuthKind.CHATGPT_SESSION
+                or account.credential_binding_id != principal.credential_binding_id
+            ):
+                _fail("invalid_runtime_principal")
+            if not principal.enabled:
+                continue
+            if (
+                not account.enabled
+                or account.secret_state is not SecretState.CONFIGURED
+                or account.limit_state is not LimitState.READY
+            ):
+                _fail("invalid_runtime_principal")
+        return FleetSnapshotV2(2, generation, accounts, series, runtime_principals)
     return FleetSnapshot(1, generation, accounts, series)
 
 
@@ -573,8 +694,16 @@ def fleet_document(snapshot: FleetSnapshot | FleetSnapshotV2 | FleetMigrationSna
                       "skill_profile_override": member.skill_profile_override,
                       "task_profile_override": member.task_profile_override}
                      for member in item.members
-                 ]}
+                ]}
                 for item in snapshot.series
+            ],
+            "runtime_principals": [
+                {"principal_id": item.principal_id, "account_id": item.account_id,
+                 "profile_id": item.profile_id, "credential_binding_id": item.credential_binding_id,
+                 "class_id": item.class_id, "lifecycle": item.lifecycle,
+                 "provider": item.provider.value, "runner": item.runner.value,
+                 "model": item.model, "reasoning": item.reasoning, "enabled": item.enabled}
+                for item in snapshot.runtime_principals
             ],
         }
     return {
@@ -658,6 +787,7 @@ def public_fleet_snapshot(snapshot: FleetSnapshot | FleetSnapshotV2) -> dict[str
         return {
             "generation": snapshot.generation, "account_count": len(snapshot.accounts),
             "series_count": len(snapshot.series), "agent_count": sum(item.count for item in snapshot.series),
+            "runtime_principal_count": len(snapshot.runtime_principals),
             "accounts": [
                 {"label": item.label, "provider": item.provider.value, "auth_kind": item.auth_kind.value,
                  "secret_state": item.secret_state.value, "limit_state": item.limit_state.value,
@@ -712,13 +842,25 @@ def _generation(snapshot: FleetSnapshot | FleetSnapshotV2, expected_generation: 
 
 def _next(snapshot: FleetSnapshot | FleetSnapshotV2, *,
           accounts: Iterable[FleetAccount] | Iterable[FleetAccountV2] | None = None,
-          series: Iterable[FleetSeries] | Iterable[FleetSeriesV2] | None = None) -> FleetSnapshot | FleetSnapshotV2:
+          series: Iterable[FleetSeries] | Iterable[FleetSeriesV2] | None = None,
+          runtime_principals: Iterable[FleetRuntimePrincipalV2] | None = None) -> FleetSnapshot | FleetSnapshotV2:
     if snapshot.generation >= MAX_GENERATION:
         _fail("invalid_document")
-    candidate_type = FleetSnapshotV2 if isinstance(snapshot, FleetSnapshotV2) else FleetSnapshot
-    candidate = candidate_type(snapshot.schema_version, snapshot.generation + 1,
-                               tuple(snapshot.accounts if accounts is None else accounts),
-                               tuple(snapshot.series if series is None else series))
+    if isinstance(snapshot, FleetSnapshotV2):
+        candidate = FleetSnapshotV2(
+            snapshot.schema_version,
+            snapshot.generation + 1,
+            tuple(snapshot.accounts if accounts is None else accounts),
+            tuple(snapshot.series if series is None else series),
+            tuple(snapshot.runtime_principals if runtime_principals is None else runtime_principals),
+        )
+    else:
+        candidate = FleetSnapshot(
+            snapshot.schema_version,
+            snapshot.generation + 1,
+            tuple(snapshot.accounts if accounts is None else accounts),
+            tuple(snapshot.series if series is None else series),
+        )
     return normalize_fleet_document(fleet_document(candidate))
 
 
@@ -733,6 +875,59 @@ def plan_account_upsert(
         _fail("invalid_account")
     accounts = [item for item in snapshot.accounts if item.account_id != account.account_id] + [account]
     return _next(snapshot, accounts=accounts)
+
+
+def plan_runtime_principal_upsert(
+    snapshot: FleetSnapshotV2,
+    principal: FleetRuntimePrincipalV2,
+    *,
+    expected_generation: int,
+) -> FleetSnapshotV2:
+    if not isinstance(snapshot, FleetSnapshotV2):
+        _fail("invalid_document")
+    if not isinstance(principal, FleetRuntimePrincipalV2):
+        _fail("invalid_runtime_principal")
+    _generation(snapshot, expected_generation)
+    runtime_principals = [
+        item for item in snapshot.runtime_principals if item.principal_id != principal.principal_id
+    ] + [principal]
+    return _next(snapshot, runtime_principals=runtime_principals)  # type: ignore[return-value]
+
+
+def plan_runtime_principal_disable(
+    snapshot: FleetSnapshotV2,
+    principal_id: str,
+    *,
+    expected_generation: int,
+) -> FleetSnapshotV2:
+    if not isinstance(snapshot, FleetSnapshotV2):
+        _fail("invalid_document")
+    _generation(snapshot, expected_generation)
+    if not any(item.principal_id == principal_id for item in snapshot.runtime_principals):
+        _fail("invalid_runtime_principal")
+    runtime_principals = [
+        replace(item, enabled=False) if item.principal_id == principal_id else item
+        for item in snapshot.runtime_principals
+    ]
+    return _next(snapshot, runtime_principals=runtime_principals)  # type: ignore[return-value]
+
+
+def plan_runtime_principal_delete(
+    snapshot: FleetSnapshotV2,
+    principal_id: str,
+    *,
+    expected_generation: int,
+) -> FleetSnapshotV2:
+    if not isinstance(snapshot, FleetSnapshotV2):
+        _fail("invalid_document")
+    _generation(snapshot, expected_generation)
+    existing = next((item for item in snapshot.runtime_principals if item.principal_id == principal_id), None)
+    if existing is None:
+        _fail("invalid_runtime_principal")
+    if existing.enabled:
+        _fail("runtime_principal_must_be_disabled")
+    runtime_principals = [item for item in snapshot.runtime_principals if item.principal_id != principal_id]
+    return _next(snapshot, runtime_principals=runtime_principals)  # type: ignore[return-value]
 
 
 def plan_account_disable(snapshot: FleetSnapshot, account_id: str, *, expected_generation: int) -> FleetSnapshot:

@@ -29,6 +29,20 @@
       "limit_reason": null,
       "billing_group": null,
       "credential_binding_id": "binding-two"
+    },
+    {
+      "account_id": "chatgpt-teamlead-1",
+      "label": "ChatGPT Teamlead 1",
+      "provider": "openai_chatgpt",
+      "auth_kind": "chatgpt_session",
+      "secret_state": "configured",
+      "limit_state": "ready",
+      "enabled": true,
+      "reset_at_utc": null,
+      "last_probe_at_utc": null,
+      "limit_reason": null,
+      "billing_group": null,
+      "credential_binding_id": "hmac-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     }
   ],
   "series": [
@@ -61,6 +75,21 @@
           "task_profile_override": null
         }
       ]
+    }
+  ],
+  "runtime_principals": [
+    {
+      "principal_id": "tl-11111111111111111111111111111111",
+      "account_id": "chatgpt-teamlead-1",
+      "profile_id": "teamlead.alpha",
+      "credential_binding_id": "hmac-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "class_id": "teamleiterin",
+      "lifecycle": "persistent",
+      "provider": "openai_chatgpt",
+      "runner": "codex_cli",
+      "model": "gpt-5.6-terra",
+      "reasoning": "xhigh",
+      "enabled": true
     }
   ]
 }
