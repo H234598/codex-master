@@ -12,9 +12,13 @@ from codex_master.fleet_overview import (
     FleetOverviewSnapshot,
 )
 from codex_master.hive_metrics import (
+    FleetMetricBlockDevice,
+    FleetMetricIoPsi,
     FleetMetricObservation,
+    FleetMetricSnapshot,
     HiveMetricsError,
     fleet_metric_values,
+    pcp_htop_meter_config,
     project_hive_metrics,
     render_openmetrics,
 )
@@ -426,3 +430,336 @@ def test_openmetrics_renderer_is_deterministic_and_rejects_nonfinite_values() ->
     )
     with pytest.raises(HiveMetricsError, match="invalid_metric_values"):
         render_openmetrics({"codex_master_bees_total": float("nan")})
+
+
+def test_projection_consumes_one_typed_snapshot_without_runtime_or_callback_inputs() -> None:
+    snapshot = FleetMetricSnapshot(
+        observations=(
+            observation("native", "gottbiene", detail=False),
+            observation("ollama_local", "arbeitsbiene", detail=False),
+        ),
+        registered_homes=7,
+        captured_at=CAPTURED,
+        block_devices=(
+            FleetMetricBlockDevice(
+                "nvme0n1", 12.5, 3.25, 2, 14.0, 0.125, "nvme", True,
+            ),
+        ),
+        hive_io_psi=FleetMetricIoPsi(4.0, 2.0, 1.0),
+        health_state="WARN",
+    )
+
+    projection = project_hive_metrics(snapshot=snapshot, observed_at=CAPTURED)
+
+    assert projection.registered_homes == 7
+    assert projection.active_bees == 2
+    assert projection.health_state == "WARN"
+    assert projection.block_devices == snapshot.block_devices
+    assert projection.hive_io_psi == snapshot.hive_io_psi
+
+
+def test_metric_values_accepts_typed_snapshot_without_separate_native_count() -> None:
+    snapshot = FleetMetricSnapshot(
+        observations=(observation("native", "unknown", detail=False),),
+        registered_homes=3,
+        captured_at=CAPTURED,
+    )
+
+    values = fleet_metric_values(snapshot, observed_at=CAPTURED)
+
+    assert values["codex_master_bees_total"] == 1
+    assert values["codex_master_homes_registered"] == 3
+    assert values["codex_master_bees_native"] == 1
+
+
+def test_snapshot_projection_preserves_all_provider_and_role_buckets() -> None:
+    projection = project_hive_metrics(
+        snapshot=FleetMetricSnapshot(
+            observations=tuple(
+                observation(provider, role, detail=False)
+                for provider, role in (
+                    ("native", "gottbiene"),
+                    ("codex_cli", "koenigin"),
+                    ("gemini_api", "tl"),
+                    ("anthropic", "arbeitsbiene"),
+                    ("huggingface_inference", "rogue"),
+                    ("ollama_local", "worker"),
+                    ("deepseek", "queen"),
+                    ("provider-from-next-runtime", "role-from-next-runtime"),
+                )
+            ),
+            registered_homes=8,
+            captured_at=CAPTURED,
+        ),
+        observed_at=CAPTURED,
+    )
+
+    assert dict(projection.provider_counts or ()) == {
+        "native": 1,
+        "codex": 1,
+        "gemini": 1,
+        "claude": 1,
+        "hf": 1,
+        "ollama": 1,
+        "deepseek": 1,
+        "unknown": 1,
+    }
+    assert dict(projection.role_counts or ()) == {
+        "godbee": 1,
+        "queen": 2,
+        "team_lead": 1,
+        "worker": 2,
+        "rogue": 1,
+        "unknown": 1,
+    }
+
+
+@pytest.mark.parametrize("state", ("OK", "WARN", "BLOCK", "CONTAMINATED", "STALE", "RUCKEL-HOLD"))
+def test_snapshot_projection_exposes_each_plan_state(state: str) -> None:
+    projection = project_hive_metrics(
+        snapshot=FleetMetricSnapshot(
+            observations=(observation("gemini", "worker", detail=False),),
+            registered_homes=1,
+            captured_at=CAPTURED,
+            health_state=state,
+        ),
+        observed_at=CAPTURED,
+    )
+
+    assert projection.health_state == state
+
+
+def test_snapshot_projection_explicitly_marks_age_expiry_stale() -> None:
+    projection = project_hive_metrics(
+        snapshot=FleetMetricSnapshot(
+            observations=(observation("gemini", "worker", detail=False),),
+            registered_homes=1,
+            captured_at=CAPTURED,
+            health_state="OK",
+        ),
+        observed_at=CAPTURED + timedelta(seconds=61),
+    )
+
+    assert projection.health_state == "STALE"
+    assert projection.active_bees == 1
+
+
+def test_snapshot_projection_keeps_all_lifecycle_values_exactly() -> None:
+    for lifecycle in ("ephemeral", "invocation", "binding", "persistent"):
+        projection = project_hive_metrics(
+            snapshot=FleetMetricSnapshot(
+                observations=(observation("gemini", "worker", lifecycle=lifecycle),),
+                registered_homes=1,
+                captured_at=CAPTURED,
+            ),
+            observed_at=CAPTURED,
+        )
+
+        assert projection.details[0].lifecycle == lifecycle
+
+
+def test_pcp_htop_meter_config_has_exactly_two_complete_canonical_blocks() -> None:
+    blocks = pcp_htop_meter_config()
+
+    assert blocks == (
+        "[textmeter provider_runtime]\n"
+        "metrics = codex_master_bees_native,codex_master_bees_codex,"
+        "codex_master_bees_gemini,codex_master_bees_claude,"
+        "codex_master_bees_hf,codex_master_bees_ollama,"
+        "codex_master_bees_deepseek,codex_master_bees_unknown\n"
+        "labels = Native,Codex/OpenAI,Gemini,Claude,HF,Ollama,DeepSeek,unknown\n",
+        "[textmeter hierarchy]\n"
+        "metrics = codex_master_roles_godbee,codex_master_roles_queen,"
+        "codex_master_roles_team_lead,codex_master_roles_worker,"
+        "codex_master_roles_rogue,codex_master_roles_unknown\n"
+        "labels = Gottbiene,Königin,TL,Arbeiterin,Rogue,unknown\n",
+    )
+    assert "OpenAI/Codex" not in "\n".join(blocks)
+
+
+@pytest.mark.parametrize(
+    ("device", "transport"),
+    (("dm-0", "nvme"), ("vda", "scsi"), ("xvda", "scsi"), ("nvme0n1", "virtio")),
+)
+def test_snapshot_projection_rejects_virtual_or_nonphysical_devices(
+    device: str, transport: str,
+) -> None:
+    projection = project_hive_metrics(
+        snapshot=FleetMetricSnapshot(
+            observations=(),
+            registered_homes=0,
+            captured_at=CAPTURED,
+            block_devices=(FleetMetricBlockDevice(device, 1.0, 1.0, 1, 1.0, 1.0, transport, True),),
+        ),
+        observed_at=CAPTURED,
+    )
+
+    assert projection.state == "invalid"
+    assert projection.health_state == "CONTAMINATED"
+    assert projection.block_devices == ()
+
+
+@pytest.mark.parametrize(
+    ("device", "transport"),
+    (("/dev/nvme0n1", "nvme"), ("nvme0n1", "unknown"), ("unknown", "nvme")),
+)
+def test_snapshot_projection_fails_closed_without_physicality_evidence(
+    device: str, transport: str,
+) -> None:
+    projection = project_hive_metrics(
+        snapshot=FleetMetricSnapshot(
+            observations=(),
+            registered_homes=0,
+            captured_at=CAPTURED,
+            block_devices=(FleetMetricBlockDevice(device, 1.0, 1.0, 1, 1.0, 1.0, transport, True),),
+        ),
+        observed_at=CAPTURED,
+    )
+
+    assert projection.state == "invalid"
+    assert projection.health_state == "CONTAMINATED"
+    assert projection.block_devices == ()
+    assert device not in repr(projection)
+
+
+def test_snapshot_projection_keeps_validated_physical_devices_bounded_scalar_and_path_free() -> None:
+    projection = project_hive_metrics(
+        snapshot=FleetMetricSnapshot(
+            observations=(),
+            registered_homes=0,
+            captured_at=CAPTURED,
+            block_devices=(FleetMetricBlockDevice("nvme0n1", 1.0, 2.0, 3, 4.0, 5.0, "nvme", True),),
+        ),
+        observed_at=CAPTURED,
+    )
+
+    assert projection.state == "fresh"
+    assert len(projection.block_devices) == 1
+    assert projection.block_devices[0] == FleetMetricBlockDevice(
+        "nvme0n1", 1.0, 2.0, 3, 4.0, 5.0, "nvme", True,
+    )
+    assert "/" not in projection.block_devices[0].device
+
+
+def test_explicit_stale_snapshot_sets_freshness_and_stale_metric_consistently() -> None:
+    snapshot = FleetMetricSnapshot(
+        observations=(observation("gemini", "worker", detail=False),),
+        registered_homes=1,
+        captured_at=CAPTURED,
+        health_state="STALE",
+    )
+
+    projection = project_hive_metrics(snapshot=snapshot, observed_at=CAPTURED)
+    values = fleet_metric_values(snapshot, observed_at=CAPTURED)
+
+    assert projection.state == "stale"
+    assert projection.health_state == "STALE"
+    assert values["codex_master_hive_metrics_stale"] == 1
+
+
+def test_age_stale_snapshot_sets_freshness_health_and_stale_metric_consistently() -> None:
+    snapshot = FleetMetricSnapshot(
+        observations=(observation("gemini", "worker", detail=False),),
+        registered_homes=1,
+        captured_at=CAPTURED,
+        health_state="OK",
+    )
+
+    projection = project_hive_metrics(
+        snapshot=snapshot,
+        observed_at=CAPTURED + timedelta(seconds=61),
+    )
+    values = fleet_metric_values(snapshot, observed_at=CAPTURED + timedelta(seconds=61))
+
+    assert projection.state == "stale"
+    assert projection.health_state == "STALE"
+    assert values["codex_master_hive_metrics_stale"] == 1
+
+
+def test_snapshot_projection_bounds_and_redacts_untrusted_detail_values() -> None:
+    projection = project_hive_metrics(
+        snapshot=FleetMetricSnapshot(
+            observations=(
+                observation("gemini", "worker", special_class="credential=secret"),
+            ),
+            registered_homes=1,
+            captured_at=CAPTURED,
+            block_devices=(
+                FleetMetricBlockDevice(
+                    "nvme0n1", 1.0, 1.0, 1, 1.0, 1.0, "nvme", True,
+                ),
+            ),
+        ),
+        observed_at=CAPTURED,
+    )
+
+    assert projection.details[0].special_class == "unknown"
+    assert projection.block_devices[0].device == "nvme0n1"
+    assert projection.block_devices[0].transport == "nvme"
+    assert "credential=secret" not in repr(projection)
+    assert "private-secret" not in repr(projection)
+
+
+class _NeverEnterIterable:
+    def __init__(self) -> None:
+        self.iterated = False
+        self.len_called = False
+
+    def __iter__(self):
+        self.iterated = True
+        raise AssertionError("foreign iterable was entered")
+
+    def __len__(self):
+        self.len_called = True
+        raise AssertionError("foreign iterable length was read")
+
+
+def test_snapshot_rejects_foreign_observations_without_entering_iterable() -> None:
+    observations = _NeverEnterIterable()
+
+    with pytest.raises(HiveMetricsError, match="invalid_metric_input"):
+        FleetMetricSnapshot(observations, 0, CAPTURED)
+
+    assert observations.iterated is False
+    assert observations.len_called is False
+
+
+def test_snapshot_rejects_foreign_devices_without_entering_iterable() -> None:
+    block_devices = _NeverEnterIterable()
+
+    with pytest.raises(HiveMetricsError, match="invalid_metric_input"):
+        FleetMetricSnapshot((), 0, CAPTURED, block_devices)
+
+    assert block_devices.iterated is False
+    assert block_devices.len_called is False
+
+
+def test_snapshot_accepts_exact_tuple_inputs_without_coercion() -> None:
+    observations = (observation("gemini", "worker", detail=False),)
+    block_devices = (FleetMetricBlockDevice("nvme0n1", 1.0, 1.0, 1, 1.0, 1.0, "nvme", True),)
+
+    snapshot = FleetMetricSnapshot(observations, 1, CAPTURED, block_devices)
+
+    assert snapshot.observations is observations
+    assert snapshot.block_devices is block_devices
+
+
+def test_snapshot_tuple_observations_above_bound_remain_fail_closed() -> None:
+    snapshot = FleetMetricSnapshot(
+        tuple(observation("gemini", "worker", detail=False) for _ in range(MAX_OBSERVATIONS + 1)),
+        MAX_OBSERVATIONS,
+        CAPTURED,
+    )
+
+    with pytest.raises(HiveMetricsError, match="invalid_metric_input"):
+        project_hive_metrics(snapshot=snapshot, observed_at=CAPTURED)
+
+
+def test_snapshot_tuple_devices_above_bound_remain_fail_closed() -> None:
+    device = FleetMetricBlockDevice("nvme0n1", 1.0, 1.0, 1, 1.0, 1.0, "nvme", True)
+    snapshot = FleetMetricSnapshot((), 0, CAPTURED, (device,) * 65)
+
+    projection = project_hive_metrics(snapshot=snapshot, observed_at=CAPTURED)
+
+    assert projection.state == "invalid"
+    assert projection.health_state == "CONTAMINATED"
