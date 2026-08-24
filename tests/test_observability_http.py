@@ -125,6 +125,177 @@ def test_health_endpoints_are_available_without_calling_metrics_source() -> None
     assert calls == 0
 
 
+def test_http_serves_fresh_valid_metrics_without_untrusted_state_header() -> None:
+    reader = observability_http.TimedMetricsReader(
+        lambda: "fresh\n", ttl_seconds=5.0, clock=lambda: 0.0
+    )
+    server = MetricsHttpServer(("127.0.0.1", 0), reader)
+
+    with running(server):
+        status, headers, body = get(server, "/metrics")
+
+    assert status == 200
+    assert body == b"fresh\n"
+    assert headers.get("X-Codex-Metrics-State") is None
+
+
+def test_http_returns_503_after_expired_last_good_on_source_error() -> None:
+    now = 0.0
+    calls = 0
+
+    def source() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "last-good\n"
+        raise RuntimeError("source secret token /run/internal.sock")
+
+    reader = observability_http.TimedMetricsReader(
+        source, ttl_seconds=1.0, clock=lambda: now
+    )
+    server = MetricsHttpServer(("127.0.0.1", 0), reader)
+
+    with running(server):
+        fresh = get(server, "/metrics")
+        now = 1.0
+        failed = get(server, "/metrics")
+
+    assert fresh[0] == 200
+    assert failed[0] == 503
+    assert failed[1].get("X-Codex-Metrics-State") is None
+    assert failed[2] == b"metrics unavailable\n"
+
+
+def test_http_returns_503_for_source_error_without_last_good() -> None:
+    def source() -> str:
+        raise RuntimeError("internal secret token /run/internal.sock")
+
+    server = MetricsHttpServer(("127.0.0.1", 0), source)
+
+    with running(server):
+        status, headers, body = get(server, "/metrics")
+
+    assert status == 503
+    assert body == b"metrics unavailable\n"
+    assert headers.get("X-Codex-Metrics-State") is None
+
+
+def test_http_returns_503_for_validation_error_without_last_good() -> None:
+    def source() -> str:
+        raise ValueError("schema token /run/internal.sock")
+
+    server = MetricsHttpServer(("127.0.0.1", 0), source)
+
+    with running(server):
+        status, _headers, body = get(server, "/metrics")
+
+    assert status == 503
+    assert body == b"metrics unavailable\n"
+
+
+def test_http_returns_503_for_validation_error_with_last_good() -> None:
+    calls = 0
+
+    def source() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "last-good\n"
+        raise ValueError("schema token /run/internal.sock")
+
+    now = 0.0
+    reader = observability_http.TimedMetricsReader(
+        source, ttl_seconds=1.0, clock=lambda: now
+    )
+    server = MetricsHttpServer(("127.0.0.1", 0), reader)
+
+    with running(server):
+        assert get(server, "/metrics")[0] == 200
+        now = 1.0
+        status, headers, body = get(server, "/metrics")
+
+    assert status == 503
+    assert headers.get("X-Codex-Metrics-State") is None
+    assert body == b"metrics unavailable\n"
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ("", "\ud800", "x" * (observability_http.MAX_METRICS_BYTES + 1)),
+    ids=("empty", "invalid-utf8", "oversize"),
+)
+def test_http_returns_503_for_invalid_refresh_with_last_good(invalid: object) -> None:
+    calls = 0
+
+    def source() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "last-good\n"
+        return invalid  # type: ignore[return-value]
+
+    now = 0.0
+    reader = observability_http.TimedMetricsReader(
+        source, ttl_seconds=1.0, clock=lambda: now
+    )
+    server = MetricsHttpServer(("127.0.0.1", 0), reader)
+
+    with running(server):
+        assert get(server, "/metrics")[0] == 200
+        now = 1.0
+        status, headers, body = get(server, "/metrics")
+
+    assert status == 503
+    assert headers.get("X-Codex-Metrics-State") is None
+    assert body == b"metrics unavailable\n"
+
+
+def test_health_remains_available_when_metrics_source_is_broken() -> None:
+    def source() -> str:
+        raise RuntimeError("host=/secret/socket token=private")
+
+    server = MetricsHttpServer(("127.0.0.1", 0), source)
+
+    with running(server):
+        status, _headers, body = get(server, "/health")
+
+    assert status == 200
+    assert body == b"ok\n"
+
+
+def test_http_error_response_redacts_internal_details() -> None:
+    details = b"secret token socket host /private/internal/path"
+
+    def source() -> str:
+        raise RuntimeError(details.decode())
+
+    server = MetricsHttpServer(("127.0.0.1", 0), source)
+
+    with running(server):
+        status, headers, body = get(server, "/metrics")
+
+    serialized = repr(headers).encode() + body
+    assert status == 503
+    assert serialized == repr(headers).encode() + b"metrics unavailable\n"
+    assert details not in serialized
+
+
+def test_http_passthroughs_valid_stale_openmetrics_without_fresh_header() -> None:
+    payload = (
+        "codex_master_snapshot_state{state=\"stale\"} 1\n"
+        "codex_master_snapshot_age_seconds 61\n"
+        "# EOF\n"
+    )
+    server = MetricsHttpServer(("127.0.0.1", 0), lambda: payload)
+
+    with running(server):
+        status, headers, body = get(server, "/metrics")
+
+    assert status == 200
+    assert headers.get("X-Codex-Metrics-State") is None
+    assert body == payload.encode("utf-8")
+
+
 def test_unknown_path_returns_not_found() -> None:
     server = MetricsHttpServer(("127.0.0.1", 0), lambda: "# EOF\n")
     with running(server):
