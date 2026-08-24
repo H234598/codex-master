@@ -22,9 +22,11 @@ from .fleet_home_broker_protocol import (
 from .fleet_registry import (
     AuthKind,
     FleetAccountV2,
+    FleetRuntimePrincipalV2,
     FleetSnapshotV2,
     LimitState,
     Provider,
+    RunnerKind,
     SecretState,
 )
 
@@ -41,6 +43,7 @@ class DynamicTeamleadCode(str, Enum):
     ACCOUNT_NOT_FOUND = "account_not_found"
     ACCOUNT_INELIGIBLE = "account_ineligible"
     PROFILE_BINDING_INVALID = "profile_binding_invalid"
+    RUNTIME_PRINCIPAL_INVALID = "runtime_principal_invalid"
     PROFILE_IDENTITY_MISMATCH = "profile_identity_mismatch"
     INVALID_CLASS_SELECTION = "invalid_class_selection"
     HOME_BROKER_UNAVAILABLE = "home_broker_unavailable"
@@ -77,6 +80,7 @@ class ProfileBinding:
 class DynamicTeamleadPlan:
     request: DynamicTeamleadRequest
     profile_binding: ProfileBinding
+    principal: FleetRuntimePrincipalV2
     class_id: str = "teamleiterin"
     lifecycle: str = "persistent"
 
@@ -119,10 +123,14 @@ def _valid_profile_binding(value: object) -> ProfileBinding:
     return value
 
 
-def _eligible_account(snapshot: FleetSnapshotV2, account_id: str) -> FleetAccountV2:
+def _account(snapshot: FleetSnapshotV2, account_id: str) -> FleetAccountV2:
     account = next((item for item in snapshot.accounts if item.account_id == account_id), None)
     if type(account) is not FleetAccountV2:
         _fail(DynamicTeamleadCode.ACCOUNT_NOT_FOUND)
+    return account
+
+
+def _eligible_account(account: FleetAccountV2) -> FleetAccountV2:
     if (
         account.provider is not Provider.OPENAI_CHATGPT
         or account.auth_kind is not AuthKind.CHATGPT_SESSION
@@ -131,8 +139,22 @@ def _eligible_account(snapshot: FleetSnapshotV2, account_id: str) -> FleetAccoun
         or account.enabled is not True
     ):
         _fail(DynamicTeamleadCode.ACCOUNT_INELIGIBLE)
-    _valid_binding(account.credential_binding_id)
     return account
+
+
+def _runtime_principal(snapshot: FleetSnapshotV2, agent_id: str) -> FleetRuntimePrincipalV2:
+    principals = snapshot.runtime_principals
+    matches = tuple(
+        item
+        for item in principals
+        if getattr(item, "principal_id", object()) == agent_id
+    )
+    if len(matches) != 1 or type(matches[0]) is not FleetRuntimePrincipalV2:
+        _fail(DynamicTeamleadCode.RUNTIME_PRINCIPAL_INVALID)
+    principal = matches[0]
+    if principal.enabled is not True:
+        _fail(DynamicTeamleadCode.RUNTIME_PRINCIPAL_INVALID)
+    return principal
 
 
 def prepare_dynamic_teamlead(
@@ -153,10 +175,31 @@ def prepare_dynamic_teamlead(
     binding = _valid_profile_binding(profile_binding)
     if snapshot.generation != selected.registry_generation:
         _fail(DynamicTeamleadCode.STALE_REGISTRY)
-    account = _eligible_account(snapshot, selected.account_id)
-    if account.credential_binding_id != binding.credential_binding_id:
+    principal = _runtime_principal(snapshot, selected.agent_id)
+    account = _account(snapshot, selected.account_id)
+    _valid_binding(account.credential_binding_id)
+    if (
+        principal.principal_id != selected.agent_id
+        or principal.account_id != selected.account_id
+        or principal.account_id != account.account_id
+        or account.account_id != selected.account_id
+        or principal.profile_id != binding.profile_id
+        or principal.credential_binding_id != binding.credential_binding_id
+        or principal.credential_binding_id != account.credential_binding_id
+        or account.credential_binding_id != binding.credential_binding_id
+    ):
         _fail(DynamicTeamleadCode.PROFILE_IDENTITY_MISMATCH)
-    return DynamicTeamleadPlan(selected, binding)
+    if (
+        principal.class_id != "teamleiterin"
+        or principal.lifecycle != "persistent"
+        or principal.provider is not Provider.OPENAI_CHATGPT
+        or principal.runner is not RunnerKind.CODEX_CLI
+        or principal.model != "gpt-5.6-terra"
+        or principal.reasoning != "xhigh"
+    ):
+        _fail(DynamicTeamleadCode.INVALID_CLASS_SELECTION)
+    _eligible_account(account)
+    return DynamicTeamleadPlan(selected, binding, principal)
 
 
 def require_committed_home_attestation(
