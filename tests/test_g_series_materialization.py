@@ -21,6 +21,7 @@ from codex_master.fleet_registry import (
     RunnerKind,
     SecretState,
     fleet_document,
+    normalize_fleet_document,
 )
 from codex_master.fleet_migration_materialization import (
     GMigrationMaterializationError,
@@ -314,6 +315,23 @@ def test_materialize_preserves_non_gemini_and_relocates_occupied_g() -> None:
     assert by_prefix["m"].provider is Provider.OLLAMA_LOCAL
     assert by_prefix["m"].members[0].account_id is None
     assert by_prefix["g"].provider is Provider.GEMINI_API
+
+
+def test_materialize_emits_empty_runtime_principals_and_roundtrips_canonically() -> None:
+    source = source_snapshot()
+    bindings = unique_bindings()
+    plan = migration_plan(source, bindings)
+    candidate = materialize_g_series_v2(
+        source,
+        plan,
+        credential_bindings=bindings,
+        allocations=allocations_for(source, plan),
+    )
+
+    assert candidate.runtime_principals == ()
+    document = fleet_document(candidate)
+    assert document["runtime_principals"] == []
+    assert normalize_fleet_document(document) == candidate
 
 
 def test_materialize_merges_g_winners_and_preserves_source_profiles_as_overrides() -> None:

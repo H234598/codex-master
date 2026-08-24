@@ -576,7 +576,7 @@ def materialize_g_series_v2(
             allocation_by_identity,
             accounts_by_id,
         )
-        candidate = _FleetSnapshotV2(2, snapshot.generation + 1, materialized_accounts, materialized_series)
+        candidate = _FleetSnapshotV2(2, snapshot.generation + 1, materialized_accounts, materialized_series, ())
         normalized = _normalize_fleet_document(_fleet_document(candidate))
         if type(normalized) is not _FleetSnapshotV2:
             _fail("invalid_migration_materialization")
