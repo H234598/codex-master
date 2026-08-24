@@ -428,6 +428,7 @@ DEFAULT_AGENT_LEASE_SECONDS = 1800
 MAX_AGENT_LEASE_SECONDS = 7200
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2024-11-05")
 MCP_SERVER_NAME = "codex-master-mcp"
+MCP_DEFAULT_TOOLS_APPROVAL_MODE = "approve"
 DEFAULT_INSTALL_PATH = Path("~/.local/bin/codex-master-mcp").expanduser()
 CONTROL_CENTER_ENV_KEYS = frozenset(
     {
@@ -1987,7 +1988,7 @@ def codex_config_path() -> Path:
     return root / "config.toml"
 
 
-def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | float | None]:
+def _updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | float | None]:
     lines = text.splitlines()
     previous: int | float | None = None
     section_start: int | None = None
@@ -2107,6 +2108,143 @@ def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | floa
     return "\n".join(lines) + "\n", True, previous
 
 
+def _updated_mcp_default_tools_approval_config(text: str) -> tuple[str, bool]:
+    payload = tomllib.loads(text)
+    mcp_servers = payload.get("mcp_servers")
+    server_config = mcp_servers.get(MCP_SERVER_NAME) if isinstance(mcp_servers, dict) else None
+    if not isinstance(server_config, dict):
+        raise AgentError("codex master MCP config missing")
+    approval_key = "default_tools_approval_mode"
+    if server_config.get(approval_key) == MCP_DEFAULT_TOOLS_APPROVAL_MODE:
+        return text if text.endswith("\n") else text + "\n", False
+
+    lines = text.splitlines()
+    server_key = rf'''(?:{re.escape(MCP_SERVER_NAME)}|"{re.escape(MCP_SERVER_NAME)}"|'{re.escape(MCP_SERVER_NAME)}')'''
+    approval_key_pattern = rf'''(?:{approval_key}|"{approval_key}"|'{approval_key}')'''
+    section_start: int | None = None
+    section_end = len(lines)
+    for index, line in enumerate(lines):
+        header = line.split("#", 1)[0].strip()
+        if re.fullmatch(rf"\[\s*mcp_servers\s*\.\s*{server_key}\s*\]", header):
+            section_start = index
+            break
+
+    if section_start is not None:
+        for index in range(section_start + 1, len(lines)):
+            if lines[index].lstrip().startswith("["):
+                section_end = index
+                break
+        key_re = re.compile(rf"^(\s*{approval_key_pattern}\s*=\s*)")
+        for index in range(section_start + 1, section_end):
+            match = key_re.match(lines[index])
+            if not match:
+                continue
+            value_end = index
+            for candidate_end in range(index, section_end):
+                try:
+                    candidate = tomllib.loads("\n".join(lines[section_start : candidate_end + 1]))
+                except tomllib.TOMLDecodeError:
+                    continue
+                candidate_servers = candidate.get("mcp_servers")
+                candidate_server = (
+                    candidate_servers.get(MCP_SERVER_NAME) if isinstance(candidate_servers, dict) else None
+                )
+                if isinstance(candidate_server, dict) and approval_key in candidate_server:
+                    value_end = candidate_end
+                    break
+            lines[index : value_end + 1] = [
+                f'{match.group(1)}"{MCP_DEFAULT_TOOLS_APPROVAL_MODE}"'
+            ]
+            break
+        else:
+            insert_at = section_end
+            while insert_at > section_start + 1 and not lines[insert_at - 1].strip():
+                insert_at -= 1
+            lines.insert(insert_at, f'{approval_key} = "{MCP_DEFAULT_TOOLS_APPROVAL_MODE}"')
+        updated = "\n".join(lines) + "\n"
+    else:
+        dotted_key_re = re.compile(
+            rf'''^(\s*mcp_servers\s*\.\s*{server_key}\s*\.\s*{approval_key_pattern}\s*=\s*)'''
+            rf'''(?:"[^"]*"|'[^']*')(\s*(?:#.*)?)$'''
+        )
+        for index, line in enumerate(lines):
+            match = dotted_key_re.match(line)
+            if match:
+                lines[index] = (
+                    f'{match.group(1)}"{MCP_DEFAULT_TOOLS_APPROVAL_MODE}"{match.group(2)}'
+                )
+                updated = "\n".join(lines) + "\n"
+                break
+        else:
+            dotted_server_re = re.compile(rf"^\s*mcp_servers\s*\.\s*{server_key}\s*\.")
+            dotted_server_lines = [
+                index for index, line in enumerate(lines) if dotted_server_re.match(line)
+            ]
+            if dotted_server_lines:
+                lines.insert(
+                    dotted_server_lines[-1] + 1,
+                    f'mcp_servers."{MCP_SERVER_NAME}".{approval_key} = '
+                    f'"{MCP_DEFAULT_TOOLS_APPROVAL_MODE}"',
+                )
+                updated = "\n".join(lines) + "\n"
+            else:
+                inline_server_prefix = rf"(mcp_servers\s*=\s*\{{.*?{server_key}\s*=\s*\{{)"
+                inline_server_re = re.compile(inline_server_prefix + r"(.*?)(\}\s*\})", re.DOTALL)
+                inline_match = inline_server_re.search(text)
+                if inline_match:
+                    inline_approval_re = re.compile(
+                        inline_server_prefix
+                        + rf'''(.*?{approval_key_pattern}\s*=\s*)(?:"[^"]*"|'[^']*')''',
+                        re.DOTALL,
+                    )
+                    approval_match = inline_approval_re.search(text)
+                    if approval_match:
+                        updated = (
+                            text[: approval_match.start()]
+                            + approval_match.group(1)
+                            + approval_match.group(2)
+                            + f'"{MCP_DEFAULT_TOOLS_APPROVAL_MODE}"'
+                            + text[approval_match.end() :]
+                        )
+                    else:
+                        body = inline_match.group(2).rstrip()
+                        separator = ", " if body else ""
+                        replacement = (
+                            inline_match.group(1)
+                            + body
+                            + separator
+                            + f'{approval_key} = "{MCP_DEFAULT_TOOLS_APPROVAL_MODE}" '
+                            + inline_match.group(3)
+                        )
+                        updated = text[: inline_match.start()] + replacement + text[inline_match.end() :]
+                    if not updated.endswith("\n"):
+                        updated += "\n"
+                else:
+                    prefix = text if text.endswith("\n") else text + "\n"
+                    updated = (
+                        prefix
+                        + f'mcp_servers."{MCP_SERVER_NAME}".{approval_key} = '
+                        + f'"{MCP_DEFAULT_TOOLS_APPROVAL_MODE}"\n'
+                    )
+
+    updated_payload = tomllib.loads(updated)
+    expected_payload = dict(payload)
+    expected_servers = dict(mcp_servers)
+    expected_server = dict(server_config)
+    expected_server[approval_key] = MCP_DEFAULT_TOOLS_APPROVAL_MODE
+    expected_servers[MCP_SERVER_NAME] = expected_server
+    expected_payload["mcp_servers"] = expected_servers
+    if updated_payload != expected_payload:
+        raise AgentError("could not safely update codex master MCP approval config")
+    return updated, True
+
+
+def updated_mcp_startup_timeout_config(text: str) -> tuple[str, bool, int | float | None]:
+    updated, timeout_changed, previous = _updated_mcp_startup_timeout_config(text)
+    updated, approval_changed = _updated_mcp_default_tools_approval_config(updated)
+    return updated, timeout_changed or approval_changed, previous
+
+
 def ensure_mcp_startup_timeout_configured(
     config_path: Path | None = None,
     *,
@@ -2145,6 +2283,7 @@ def ensure_mcp_startup_timeout_configured(
         "status": "updated" if changed else "already_configured",
         "startup_timeout_sec": RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
         "previous_startup_timeout_sec": previous,
+        "default_tools_approval_mode": MCP_DEFAULT_TOOLS_APPROVAL_MODE,
         "config_path": "not_returned",
         "raw_output": "not_returned",
     }
@@ -2236,6 +2375,8 @@ def codex_client_mcp_config_status(
         "startup_timeout_sec": None,
         "startup_timeout_ok": False,
         "startup_timeout_recommended_sec": RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
+        "default_tools_approval_mode": None,
+        "default_tools_approval_mode_ok": False,
         "ok": False,
         "raw_output": "not_returned",
     }
@@ -2288,6 +2429,8 @@ def codex_client_mcp_config_status(
     startup_timeout_ok = (
         startup_timeout_sec is not None and startup_timeout_sec >= RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS
     )
+    default_tools_approval_mode = server_config.get("default_tools_approval_mode")
+    default_tools_approval_mode_ok = default_tools_approval_mode == MCP_DEFAULT_TOOLS_APPROVAL_MODE
     command_matches = command_configured and command.strip() == str(command_path)
     result.update(
         {
@@ -2296,7 +2439,9 @@ def codex_client_mcp_config_status(
             "command_matches_install_path": command_matches,
             "startup_timeout_sec": startup_timeout_sec,
             "startup_timeout_ok": startup_timeout_ok,
-            "ok": command_matches and startup_timeout_ok,
+            "default_tools_approval_mode": default_tools_approval_mode,
+            "default_tools_approval_mode_ok": default_tools_approval_mode_ok,
+            "ok": command_matches and startup_timeout_ok and default_tools_approval_mode_ok,
         }
     )
     if not result["ok"]:
@@ -2304,8 +2449,10 @@ def codex_client_mcp_config_status(
             result["reason"] = "mcp_command_missing"
         elif not command_matches:
             result["reason"] = "mcp_command_mismatch"
-        else:
+        elif not startup_timeout_ok:
             result["reason"] = "mcp_startup_timeout_too_low"
+        else:
+            result["reason"] = "mcp_default_tools_approval_mode_not_approve"
     return result
 
 
@@ -21557,7 +21704,9 @@ def _install_enrolled_unlocked(
                 startup_timeout_snapshot = startup_timeout_config.pop("_config_snapshot", None)
             else:
                 client_config = codex_client_mcp_config_status(command_path=install_path)
-                if not client_config.get("startup_timeout_ok"):
+                if not client_config.get("startup_timeout_ok") or not client_config.get(
+                    "default_tools_approval_mode_ok"
+                ):
                     startup_timeout_config = ensure_mcp_startup_timeout_configured(capture_snapshot=True)
                     startup_timeout_snapshot = startup_timeout_config.pop("_config_snapshot", None)
                 else:
@@ -23358,6 +23507,7 @@ def fleet_minimal_config(agent: AgentDescriptor) -> tuple[str, str]:
                 f"[mcp_servers.{MCP_SERVER_NAME}]",
                 f"command = {json.dumps(str(DEFAULT_INSTALL_PATH))}",
                 f"startup_timeout_sec = {RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS}",
+                f"default_tools_approval_mode = {json.dumps(MCP_DEFAULT_TOOLS_APPROVAL_MODE)}",
             ]
         )
     lines.extend(

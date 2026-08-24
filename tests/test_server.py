@@ -5555,6 +5555,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "[mcp_servers.codex-master-mcp]",
                 'command = "/tmp/codex-master-mcp"',
                 "startup_timeout_sec = 30",
+                'default_tools_approval_mode = "approve"',
                 "",
                 "[features]",
                 "memories = true",
@@ -5608,7 +5609,10 @@ class ServerHelpersTest(unittest.TestCase):
         inserted, inserted_changed, inserted_previous = updated_mcp_startup_timeout_config(missing_value)
         self.assertTrue(inserted_changed)
         self.assertIsNone(inserted_previous)
-        self.assertIn('command = "/tmp/codex-master-mcp"\nstartup_timeout_sec = 120', inserted)
+        self.assertEqual(
+            tomllib.loads(inserted)["mcp_servers"]["codex-master-mcp"]["startup_timeout_sec"],
+            120,
+        )
 
         commented_header = existing_low.replace(
             "[mcp_servers.codex-master-mcp]", "[mcp_servers.codex-master-mcp] # keep this section"
@@ -5722,6 +5726,98 @@ class ServerHelpersTest(unittest.TestCase):
                 loads(multiline_updated)["mcp_servers"]["codex-master-mcp"]["startup_timeout_sec"],
                 120,
             )
+
+    def test_updated_mcp_config_adds_approval_only_to_master_server(self) -> None:
+        existing = "\n".join(
+            [
+                "[mcp_servers.unrelated]",
+                'command = "/tmp/unrelated"',
+                'default_tools_approval_mode = "prompt"',
+                "",
+                "[mcp_servers.codex-master-mcp]",
+                'command = "/tmp/codex-master-mcp"',
+                "startup_timeout_sec = 120",
+                "",
+                "[features]",
+                "memories = true",
+            ]
+        ) + "\n"
+
+        updated, changed, _previous = updated_mcp_startup_timeout_config(existing)
+        config = tomllib.loads(updated)
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            config["mcp_servers"]["codex-master-mcp"]["default_tools_approval_mode"],
+            "approve",
+        )
+        self.assertEqual(
+            config["mcp_servers"]["unrelated"],
+            {
+                "command": "/tmp/unrelated",
+                "default_tools_approval_mode": "prompt",
+            },
+        )
+        self.assertEqual(config["features"], {"memories": True})
+
+    def test_updated_mcp_config_replaces_inline_approval_without_duplicate_key(self) -> None:
+        existing = "\n".join(
+            [
+                'theme = "dark"',
+                'mcp_servers = { codex-master-mcp = { command = "/tmp/codex-master-mcp", startup_timeout_sec = 120, default_tools_approval_mode = "prompt" }, unrelated = { command = "/tmp/unrelated" } }',
+                "[features]",
+                "memories = true",
+            ]
+        ) + "\n"
+
+        updated, changed, previous = updated_mcp_startup_timeout_config(existing)
+
+        self.assertTrue(changed)
+        self.assertEqual(previous, 120)
+        self.assertEqual(
+            tomllib.loads(updated),
+            {
+                "theme": "dark",
+                "mcp_servers": {
+                    "codex-master-mcp": {
+                        "command": "/tmp/codex-master-mcp",
+                        "startup_timeout_sec": 120,
+                        "default_tools_approval_mode": "approve",
+                    },
+                    "unrelated": {"command": "/tmp/unrelated"},
+                },
+                "features": {"memories": True},
+            },
+        )
+
+    def test_updated_mcp_config_replaces_dotted_approval_and_preserves_comment(self) -> None:
+        existing = "\n".join(
+            [
+                'theme = "dark"',
+                'mcp_servers."codex-master-mcp".command = "/tmp/codex-master-mcp"',
+                'mcp_servers."codex-master-mcp".startup_timeout_sec = 120',
+                'mcp_servers."codex-master-mcp".default_tools_approval_mode = "prompt" # keep',
+            ]
+        ) + "\n"
+
+        updated, changed, previous = updated_mcp_startup_timeout_config(existing)
+
+        self.assertTrue(changed)
+        self.assertEqual(previous, 120)
+        self.assertIn('default_tools_approval_mode = "approve" # keep', updated)
+        self.assertEqual(
+            tomllib.loads(updated),
+            {
+                "theme": "dark",
+                "mcp_servers": {
+                    "codex-master-mcp": {
+                        "command": "/tmp/codex-master-mcp",
+                        "startup_timeout_sec": 120,
+                        "default_tools_approval_mode": "approve",
+                    }
+                },
+            },
+        )
 
     def test_ensure_mcp_startup_timeout_configured_is_path_sparse_and_no_follow(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5840,6 +5936,7 @@ class ServerHelpersTest(unittest.TestCase):
                         "[mcp_servers.codex-master-mcp]",
                         f'command = "{install_path}"',
                         "startup_timeout_sec = 120",
+                        'default_tools_approval_mode = "approve"',
                     ]
                 )
                 + "\n",
@@ -5852,8 +5949,36 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(result["server_declared"])
         self.assertTrue(result["command_matches_install_path"])
         self.assertTrue(result["startup_timeout_ok"])
+        self.assertTrue(result["default_tools_approval_mode_ok"])
         self.assertEqual(result["path"], "not_returned")
         self.assertNotIn(str(install_path), json.dumps(result, sort_keys=True))
+
+    def test_codex_client_mcp_config_status_requires_approve_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = Path(tmpdir) / ".codex" / "config.toml"
+            install_path = Path(tmpdir) / "bin" / "codex-master-mcp"
+            config.parent.mkdir()
+            base = "\n".join(
+                [
+                    "[mcp_servers.codex-master-mcp]",
+                    f'command = "{install_path}"',
+                    "startup_timeout_sec = 120",
+                ]
+            )
+            for configured_value in (None, "prompt"):
+                with self.subTest(configured_value=configured_value):
+                    approval = (
+                        ""
+                        if configured_value is None
+                        else f'\ndefault_tools_approval_mode = "{configured_value}"'
+                    )
+                    config.write_text(base + approval + "\n", encoding="utf-8")
+
+                    result = codex_client_mcp_config_status(config, install_path)
+
+                    self.assertFalse(result["ok"])
+                    self.assertFalse(result["default_tools_approval_mode_ok"])
+                    self.assertEqual(result["reason"], "mcp_default_tools_approval_mode_not_approve")
 
     def test_codex_client_mcp_config_status_rejects_non_finite_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -7252,6 +7377,7 @@ class ServerHelpersTest(unittest.TestCase):
                     self.assertEqual(config.get("model_provider"), model_provider)
                     self.assertEqual(config["tui"], {"animations": False})
                     self.assertEqual(next(iter(config["projects"].values())), {"trust_level": "trusted"})
+                    self.assertNotIn("mcp_servers", config)
                     if provider is Provider.OLLAMA_LOCAL:
                         self.assertEqual(
                             config["model_providers"]["ollama-launch"],
@@ -7289,6 +7415,7 @@ class ServerHelpersTest(unittest.TestCase):
                 {
                     "command": str(server_module.DEFAULT_INSTALL_PATH),
                     "startup_timeout_sec": server_module.RECOMMENDED_MCP_STARTUP_TIMEOUT_SECONDS,
+                    "default_tools_approval_mode": "approve",
                 },
             )
 
@@ -36448,6 +36575,7 @@ class CliLifecycleTest(unittest.TestCase):
         self.assertEqual(payload["plugin_cache_install"]["cache_entry"], "not_returned")
         self.assertEqual(payload["plugin_cache_install"]["plugin_cache"]["path"], "not_returned")
         self.assertIn("startup_timeout_sec = 120", config_content)
+        self.assertIn('default_tools_approval_mode = "approve"', config_content)
         self.assertTrue(link_created)
         payload_text = json.dumps(payload, sort_keys=True)
         self.assertNotIn(str(install_link), payload_text)
@@ -36934,6 +37062,54 @@ class CliLifecycleTest(unittest.TestCase):
 
         self.assertEqual(result["mcp"]["status"], "already_registered")
         self.assertEqual(result["mcp"]["startup_timeout"]["status"], "updated")
+        mock_run.assert_not_called()
+
+    @patch("codex_master.server.run_command")
+    @patch("codex_master.server.ensure_mcp_startup_timeout_configured")
+    @patch("codex_master.server.codex_client_mcp_config_status")
+    @patch("codex_master.server.check_mcp_registration")
+    @patch("codex_master.server.mcp_command_startup_self_test")
+    @patch("codex_master.server.repo_wrapper_path")
+    def test_install_migrates_matching_registration_when_approval_mode_is_prompt(
+        self,
+        mock_wrapper_path,
+        mock_self_test,
+        mock_registration,
+        mock_client_config,
+        mock_timeout,
+        mock_run,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wrapper = tmp_path / "wrapper"
+            install_link = tmp_path / "bin" / "codex-master-mcp"
+            wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+            mock_wrapper_path.return_value = wrapper
+            mock_self_test.return_value = {"ok": True, "status": "ok", "raw_output": "not_returned"}
+            mock_registration.return_value = {
+                "registered": True,
+                "command_matches": True,
+                "ok": True,
+                "startup_timeout_ok": True,
+            }
+            mock_client_config.return_value = {
+                "startup_timeout_ok": True,
+                "default_tools_approval_mode": "prompt",
+                "default_tools_approval_mode_ok": False,
+            }
+            mock_timeout.return_value = {"status": "updated", "raw_output": "not_returned"}
+
+            with patch.object(server_module, "ensure_applet_action_key"):
+                result = server_module._install_enrolled_unlocked(
+                    register=True,
+                    install_path=install_link,
+                    sync_plugin_cache=False,
+                )
+
+        self.assertEqual(result["mcp"]["status"], "already_registered")
+        self.assertEqual(result["mcp"]["startup_timeout"]["status"], "updated")
+        mock_timeout.assert_called_once_with(capture_snapshot=True)
         mock_run.assert_not_called()
 
     @patch("codex_master.server._run_mcp_probe")
