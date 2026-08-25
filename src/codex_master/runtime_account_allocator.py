@@ -7,7 +7,11 @@ from secrets import token_urlsafe
 from threading import Lock
 from typing import Protocol
 
-from codex_master.agent_resolver import ResolutionDecision
+from codex_master.agent_resolver import (
+    ResolutionDecision,
+    SelectionOffer,
+    SelectionOption,
+)
 
 
 class AllocationDenied(Exception):
@@ -46,7 +50,8 @@ class _RedactedNonSerializable:
 class ValidatedAllocationTicket(_RedactedNonSerializable):
     ticket_id: str
     resolution_decision: ResolutionDecision
-    resolver_offer_generation: int
+    selection_offer: SelectionOffer
+    resolver_offer_generation: str
     policy_generation: int
     capability_binding_digest: str
     ledger_revision: int
@@ -55,14 +60,18 @@ class ValidatedAllocationTicket(_RedactedNonSerializable):
 
     def __post_init__(self) -> None:
         self._redact_text_fields(
-            "ticket_id", "capability_binding_digest", "phase", "fencing_token"
+            "ticket_id",
+            "resolver_offer_generation",
+            "capability_binding_digest",
+            "phase",
+            "fencing_token",
         )
 
 
 @dataclass(frozen=True, slots=True, repr=False)
 class CapacityEvidence(_RedactedNonSerializable):
     ticket_id: str
-    resolver_offer_generation: int
+    resolver_offer_generation: str
     policy_generation: int
     capability_binding_digest: str
     ledger_revision: int
@@ -79,6 +88,7 @@ class CapacityEvidence(_RedactedNonSerializable):
     def __post_init__(self) -> None:
         self._redact_text_fields(
             "ticket_id",
+            "resolver_offer_generation",
             "capability_binding_digest",
             "fencing_token",
             "provider_adapter_id",
@@ -157,11 +167,12 @@ class CapabilityProviderAdapter(Protocol):
         self, capability_binding_digest: str, capacity_evidence: CapacityEvidence
     ) -> AccountReservation | None: ...
 
-    def release_reservation(self, reservation: AccountReservation) -> None: ...
+    def release_reservation(self, reservation: AccountReservation) -> bool: ...
 
 
 class LeaseState(str, Enum):
     RESERVED = "reserved"
+    RELEASE_PENDING = "release_pending"
     REVOKED = "revoked"
 
 
@@ -176,11 +187,27 @@ class _LeaseRecord(_RedactedNonSerializable):
     phase: str
     evidence_revision: int
     state: LeaseState
+    pending_release_id: str | None
 
     def __post_init__(self) -> None:
         self._redact_text_fields(
-            "ticket_id", "capability_binding_digest", "fencing_token", "phase"
+            "ticket_id",
+            "capability_binding_digest",
+            "fencing_token",
+            "phase",
+            "pending_release_id",
         )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _PendingRelease(_RedactedNonSerializable):
+    pending_release_id: str
+    reservation: AccountReservation
+    active_key: str
+    lease_id: str | None
+
+    def __post_init__(self) -> None:
+        self._redact_text_fields("pending_release_id", "active_key", "lease_id")
 
 
 class RuntimeAccountAllocator:
@@ -188,8 +215,10 @@ class RuntimeAccountAllocator:
         "_active_by_account",
         "_latest_by_account",
         "_lock",
+        "_pending_releases",
         "_provider_adapter",
         "_records",
+        "_release_lock",
     )
 
     def __init__(self, provider_adapter: CapabilityProviderAdapter) -> None:
@@ -197,7 +226,9 @@ class RuntimeAccountAllocator:
         self._active_by_account: dict[str, dict[str, tuple[int, int]]] = {}
         self._latest_by_account: dict[str, tuple[int, int]] = {}
         self._lock = Lock()
+        self._pending_releases: dict[str, _PendingRelease] = {}
         self._records: dict[str, _LeaseRecord] = {}
+        self._release_lock = Lock()
 
     def allocate(self, ticket: object, capacity_evidence: object) -> CredentialLease:
         if not self._ticket_is_valid(ticket) or not self._evidence_is_valid(
@@ -224,11 +255,15 @@ class RuntimeAccountAllocator:
         except Exception:
             raise AllocationDenied("runtime account allocation denied") from None
         if not self._reservation_matches_evidence(reservation, capacity_evidence):
-            if type(reservation) is AccountReservation:
+            if self._reservation_is_well_formed(reservation):
+                pending_release_id = self._queue_pending_release(reservation)
+                self._retry_pending_release(pending_release_id)
+            elif type(reservation) is AccountReservation:
                 self._release_reservation(reservation)
             raise AllocationDenied("runtime account allocation denied") from None
 
         rejected = False
+        pending_release_id = None
         with self._lock:
             active = self._active_by_account.get(reservation.account_binding_digest, {})
             latest = self._latest_by_account.get(reservation.account_binding_digest)
@@ -249,6 +284,7 @@ class RuntimeAccountAllocator:
                 <= len(active)
             ):
                 rejected = True
+                pending_release_id = self._queue_pending_release_locked(reservation)
             else:
                 lease = CredentialLease(
                     lease_id=token_urlsafe(18),
@@ -268,6 +304,7 @@ class RuntimeAccountAllocator:
                     phase="LEASE_RESERVED",
                     evidence_revision=capacity_evidence.evidence_revision,
                     state=LeaseState.RESERVED,
+                    pending_release_id=None,
                 )
                 self._active_by_account.setdefault(
                     reservation.account_binding_digest, {}
@@ -281,7 +318,7 @@ class RuntimeAccountAllocator:
                 )
 
         if rejected:
-            self._release_reservation(reservation)
+            self._retry_pending_release(pending_release_id)
             raise AllocationDenied("runtime account allocation denied") from None
         return lease
 
@@ -289,19 +326,29 @@ class RuntimeAccountAllocator:
         del reason
         if type(lease) is not CredentialLease:
             return
-        reservation = None
+        pending_release_id = None
         with self._lock:
             record = self._records.get(lease.lease_id)
             if record is None or record.lease is not lease:
                 return
             if record.state is LeaseState.REVOKED:
                 return
-            self._records[lease.lease_id] = replace(record, state=LeaseState.REVOKED)
-            active = self._active_by_account.get(lease.account_binding_digest)
-            if active is not None:
-                active.pop(lease.lease_id, None)
-            reservation = record.reservation
-        self._release_reservation(reservation)
+            if record.state is LeaseState.RESERVED:
+                pending_release_id = self._queue_pending_release_locked(
+                    record.reservation,
+                    lease_id=lease.lease_id,
+                    active_key=lease.lease_id,
+                )
+                self._records[lease.lease_id] = replace(
+                    record,
+                    state=LeaseState.RELEASE_PENDING,
+                    phase="RELEASE_PENDING",
+                    pending_release_id=pending_release_id,
+                )
+            elif record.state is LeaseState.RELEASE_PENDING:
+                pending_release_id = record.pending_release_id
+        if pending_release_id is not None:
+            self._retry_pending_release(pending_release_id)
 
     def recover(self, lease: object, transaction_evidence: object) -> LeaseState:
         if not (
@@ -314,7 +361,6 @@ class RuntimeAccountAllocator:
             if (
                 record is None
                 or record.lease is not lease
-                or record.state is not LeaseState.RESERVED
                 or (
                     transaction_evidence.ticket_id != record.ticket_id
                     or transaction_evidence.lease_id != lease.lease_id
@@ -331,23 +377,46 @@ class RuntimeAccountAllocator:
                     != lease.provider_adapter_id
                     or transaction_evidence.fencing_token != record.fencing_token
                     or transaction_evidence.phase != record.phase
-                    or transaction_evidence.phase != "LEASE_RESERVED"
                 )
             ):
                 raise AllocationDenied("runtime account allocation denied")
+            if record.state is LeaseState.RESERVED:
+                if transaction_evidence.phase != "LEASE_RESERVED":
+                    raise AllocationDenied("runtime account allocation denied")
+                return record.state
+            if (
+                record.state is not LeaseState.RELEASE_PENDING
+                or transaction_evidence.phase != "RELEASE_PENDING"
+                or record.pending_release_id is None
+            ):
+                raise AllocationDenied("runtime account allocation denied")
+            pending_release_id = record.pending_release_id
+
+        self._retry_pending_release(pending_release_id)
+        with self._lock:
+            record = self._records.get(lease.lease_id)
+            if record is None or record.lease is not lease:
+                raise AllocationDenied("runtime account allocation denied")
             return record.state
+
+    def recover_pending_releases(self) -> int:
+        with self._lock:
+            pending_release_ids = tuple(self._pending_releases)
+        for pending_release_id in pending_release_ids:
+            self._retry_pending_release(pending_release_id)
+        with self._lock:
+            return len(self._pending_releases)
 
     @staticmethod
     def _ticket_is_valid(ticket: object) -> bool:
         if type(ticket) is not ValidatedAllocationTicket:
             return False
         return (
-            type(ticket.resolution_decision) is ResolutionDecision
+            RuntimeAccountAllocator._resolution_is_bound(ticket)
             and ticket.phase == "OFFER_VALIDATED"
             and all(
                 type(value) is int and value > 0
                 for value in (
-                    ticket.resolver_offer_generation,
                     ticket.policy_generation,
                     ticket.ledger_revision,
                 )
@@ -356,6 +425,7 @@ class RuntimeAccountAllocator:
                 type(value) is _OpaqueText and bool(value)
                 for value in (
                     ticket.ticket_id,
+                    ticket.resolver_offer_generation,
                     ticket.capability_binding_digest,
                     ticket.fencing_token,
                 )
@@ -369,7 +439,6 @@ class RuntimeAccountAllocator:
         if type(capacity_evidence) is not CapacityEvidence:
             return False
         numeric_evidence = (
-            capacity_evidence.resolver_offer_generation,
             capacity_evidence.policy_generation,
             capacity_evidence.ledger_revision,
             capacity_evidence.capacity_units,
@@ -384,6 +453,7 @@ class RuntimeAccountAllocator:
             type(value) is _OpaqueText and bool(value)
             for value in (
                 capacity_evidence.ticket_id,
+                capacity_evidence.resolver_offer_generation,
                 capacity_evidence.capability_binding_digest,
                 capacity_evidence.fencing_token,
                 capacity_evidence.provider_adapter_id,
@@ -418,6 +488,75 @@ class RuntimeAccountAllocator:
         )
 
     @staticmethod
+    def _resolution_is_bound(ticket: ValidatedAllocationTicket) -> bool:
+        decision = ticket.resolution_decision
+        offer = ticket.selection_offer
+        if (
+            type(decision) is not ResolutionDecision
+            or type(offer) is not SelectionOffer
+        ):
+            return False
+        decision_fields = (
+            decision.class_id,
+            decision.lifecycle,
+            decision.model,
+            decision.reasoning,
+        )
+        if not all(type(value) is str and bool(value) for value in decision_fields):
+            return False
+        if (
+            type(decision.reason_codes) is not tuple
+            or any(
+                type(value) is not str or not value for value in decision.reason_codes
+            )
+            or type(decision.fallback) is not bool
+            or any(
+                value is not None and (type(value) is not str or not value)
+                for value in (
+                    decision.requested_class,
+                    decision.requested_lifecycle,
+                    decision.requested_model,
+                    decision.requested_reasoning,
+                )
+            )
+        ):
+            return False
+        if (
+            type(offer.generation) is not str
+            or not offer.generation
+            or ticket.resolver_offer_generation != offer.generation
+            or any(
+                type(values) is not tuple
+                or any(type(value) is not str or not value for value in values)
+                for values in (
+                    offer.classes,
+                    offer.lifecycles,
+                    offer.models,
+                    offer.reasoning_levels,
+                )
+            )
+            or type(offer.options) is not tuple
+        ):
+            return False
+        return (
+            decision.class_id in offer.classes
+            and decision.lifecycle in offer.lifecycles
+            and decision.model in offer.models
+            and decision.reasoning in offer.reasoning_levels
+            and any(
+                type(option) is SelectionOption
+                and (
+                    option.class_id,
+                    option.lifecycle,
+                    option.model,
+                    option.reasoning,
+                )
+                == decision_fields
+                for option in offer.options
+            )
+        )
+
+    @staticmethod
     def _transaction_evidence_is_valid(transaction_evidence: object) -> bool:
         return type(transaction_evidence) is TransactionEvidence and (
             all(
@@ -447,25 +586,10 @@ class RuntimeAccountAllocator:
         reservation: object, capacity_evidence: CapacityEvidence
     ) -> bool:
         try:
-            return type(reservation) is AccountReservation and (
-                all(
-                    type(value) is _OpaqueText and bool(value)
-                    for value in (
-                        reservation.reservation_id,
-                        reservation.account_binding_digest,
-                        reservation.profile_binding_digest,
-                        reservation.provider_adapter_id,
-                        reservation.fencing_token,
-                    )
-                )
-                and type(reservation.lease_revision) is int
-                and reservation.lease_revision > 0
-                and type(reservation.evidence_revision) is int
-                and reservation.evidence_revision > 0
-                and type(reservation.expires_at_utc) is datetime
-                and reservation.expires_at_utc.tzinfo is not None
-                and reservation.provider_adapter_id
-                == capacity_evidence.provider_adapter_id
+            return RuntimeAccountAllocator._reservation_is_well_formed(
+                reservation
+            ) and (
+                reservation.provider_adapter_id == capacity_evidence.provider_adapter_id
                 and reservation.evidence_revision == capacity_evidence.evidence_revision
                 and reservation.fencing_token == capacity_evidence.fencing_token
                 and reservation.expires_at_utc == capacity_evidence.expires_at_utc
@@ -473,11 +597,99 @@ class RuntimeAccountAllocator:
         except Exception:
             return False
 
-    def _release_reservation(self, reservation: AccountReservation) -> None:
+    @staticmethod
+    def _reservation_is_well_formed(reservation: object) -> bool:
+        return type(reservation) is AccountReservation and (
+            all(
+                type(value) is _OpaqueText and bool(value)
+                for value in (
+                    reservation.reservation_id,
+                    reservation.account_binding_digest,
+                    reservation.profile_binding_digest,
+                    reservation.provider_adapter_id,
+                    reservation.fencing_token,
+                )
+            )
+            and type(reservation.lease_revision) is int
+            and reservation.lease_revision > 0
+            and type(reservation.evidence_revision) is int
+            and reservation.evidence_revision > 0
+            and type(reservation.expires_at_utc) is datetime
+            and reservation.expires_at_utc.tzinfo is not None
+        )
+
+    def _queue_pending_release(
+        self,
+        reservation: AccountReservation,
+        *,
+        lease_id: str | None = None,
+        active_key: str | None = None,
+    ) -> str:
+        with self._lock:
+            return self._queue_pending_release_locked(
+                reservation,
+                lease_id=lease_id,
+                active_key=active_key,
+            )
+
+    def _queue_pending_release_locked(
+        self,
+        reservation: AccountReservation,
+        *,
+        lease_id: str | None = None,
+        active_key: str | None = None,
+    ) -> str:
+        pending_release_id = token_urlsafe(18)
+        pending = _PendingRelease(
+            pending_release_id=pending_release_id,
+            reservation=reservation,
+            active_key=active_key or pending_release_id,
+            lease_id=lease_id,
+        )
+        self._pending_releases[pending.pending_release_id] = pending
+        self._active_by_account.setdefault(reservation.account_binding_digest, {})[
+            pending.active_key
+        ] = (reservation.evidence_revision, reservation.lease_revision)
+        return pending.pending_release_id
+
+    def _retry_pending_release(self, pending_release_id: str) -> bool:
+        with self._release_lock:
+            with self._lock:
+                pending = self._pending_releases.get(pending_release_id)
+            if pending is None:
+                return True
+            if not self._release_reservation(pending.reservation):
+                return False
+            with self._lock:
+                if self._pending_releases.get(pending_release_id) is not pending:
+                    return pending_release_id not in self._pending_releases
+                self._pending_releases.pop(pending_release_id)
+                active = self._active_by_account.get(
+                    pending.reservation.account_binding_digest
+                )
+                if active is not None:
+                    active.pop(pending.active_key, None)
+                if pending.lease_id is not None:
+                    record = self._records.get(pending.lease_id)
+                    if (
+                        record is not None
+                        and record.reservation is pending.reservation
+                        and record.pending_release_id == pending_release_id
+                    ):
+                        self._records[pending.lease_id] = replace(
+                            record,
+                            state=LeaseState.REVOKED,
+                            phase="LEASE_REVOKED",
+                            pending_release_id=None,
+                        )
+            return True
+
+    def _release_reservation(self, reservation: AccountReservation) -> bool:
         try:
-            self._provider_adapter.release_reservation(reservation)
+            released = self._provider_adapter.release_reservation(reservation)
         except Exception:
-            return
+            return False
+        return type(released) is bool and released
 
 
 __all__ = [

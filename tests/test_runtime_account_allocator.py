@@ -13,7 +13,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from codex_master.agent_resolver import ResolutionDecision as CentralResolutionDecision
+from codex_master.agent_resolver import (
+    AgentClassPolicy,
+    ModelPolicy,
+    ResolutionDecision as CentralResolutionDecision,
+    ResolutionRequest,
+    build_selection_offer,
+    resolve_agent_selection,
+)
 
 
 MODULE_PATH = (
@@ -34,26 +41,48 @@ def _allocator_module():
     return module
 
 
-def _central_decision() -> CentralResolutionDecision:
-    return CentralResolutionDecision(
-        class_id="worker",
-        lifecycle="ephemeral",
-        model="gpt-5.4-mini",
-        reasoning="medium",
-        reason_codes=("resolved",),
-        fallback=False,
-        requested_class=None,
-        requested_lifecycle=None,
-        requested_model=None,
-        requested_reasoning=None,
+def _real_resolution_contract():
+    classes = (
+        AgentClassPolicy(
+            class_id="arbeitsbiene",
+            default_lifecycle="ephemeral",
+            allowed_lifecycles=("ephemeral",),
+            allowed_families=("luna",),
+            min_reasoning="low",
+            max_reasoning="high",
+            supported_scopes=("read",),
+        ),
     )
+    models = (
+        ModelPolicy(
+            model_id="gpt-5.6-luna",
+            family="luna",
+            rank=20,
+            reasoning_levels=("low", "medium", "high"),
+        ),
+    )
+    available_models = {models[0].model_id}
+    offer = build_selection_offer(
+        classes=classes,
+        models=models,
+        available_models=available_models,
+    )
+    decision = resolve_agent_selection(
+        ResolutionRequest("read", "simple", requested_class="arbeitsbiene"),
+        classes=classes,
+        models=models,
+        available_models=available_models,
+    )
+    return offer, decision
 
 
 def _central_ticket(module, **changes):
+    offer, decision = _real_resolution_contract()
     values = {
         "ticket_id": "ticket-A",
-        "resolution_decision": _central_decision(),
-        "resolver_offer_generation": 7,
+        "resolution_decision": decision,
+        "selection_offer": offer,
+        "resolver_offer_generation": offer.generation,
         "policy_generation": 11,
         "capability_binding_digest": "capability-A",
         "ledger_revision": 3,
@@ -66,9 +95,10 @@ def _central_ticket(module, **changes):
 
 def _unselected_capacity_evidence(module, **changes):
     now = datetime.now(UTC)
+    offer, _decision = _real_resolution_contract()
     values = {
         "ticket_id": "ticket-A",
-        "resolver_offer_generation": 7,
+        "resolver_offer_generation": offer.generation,
         "policy_generation": 11,
         "capability_binding_digest": "capability-A",
         "ledger_revision": 3,
@@ -113,8 +143,35 @@ class _AtomicAdapter:
             expires_at_utc=capacity_evidence.expires_at_utc,
         )
 
-    def release_reservation(self, reservation) -> None:
+    def release_reservation(self, reservation) -> bool:
         self.released_reservation_ids.append(reservation.reservation_id)
+        return True
+
+
+class _ReleaseProofAdapter(_AtomicAdapter):
+    def __init__(self, module, *release_outcomes) -> None:
+        super().__init__(module)
+        self._release_outcomes = list(release_outcomes)
+        self.outstanding_reservation_ids: set[str] = set()
+        self.release_calls: list[str] = []
+
+    def reserve_capability_atomically(
+        self, capability_binding_digest, capacity_evidence
+    ):
+        reservation = super().reserve_capability_atomically(
+            capability_binding_digest, capacity_evidence
+        )
+        self.outstanding_reservation_ids.add(reservation.reservation_id)
+        return reservation
+
+    def release_reservation(self, reservation):
+        self.release_calls.append(reservation.reservation_id)
+        outcome = self._release_outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        if outcome is True:
+            self.outstanding_reservation_ids.remove(reservation.reservation_id)
+        return outcome
 
 
 def test_allocator_consumes_central_decision_and_adapter_selects_account() -> None:
@@ -128,6 +185,93 @@ def test_allocator_consumes_central_decision_and_adapter_selects_account() -> No
     assert module.ResolutionDecision is CentralResolutionDecision
     assert lease.account_binding_digest == "account-from-adapter"
     assert lease.profile_binding_digest == "profile-from-adapter"
+
+
+def test_allocator_accepts_real_resolution_and_string_offer_generation() -> None:
+    module = _allocator_module()
+    adapter = _AtomicAdapter(module)
+    offer, decision = _real_resolution_contract()
+    ticket = module.ValidatedAllocationTicket(
+        ticket_id="ticket-A",
+        resolution_decision=decision,
+        selection_offer=offer,
+        resolver_offer_generation=offer.generation,
+        policy_generation=11,
+        capability_binding_digest="capability-A",
+        ledger_revision=3,
+        phase="OFFER_VALIDATED",
+        fencing_token="fence-A",
+    )
+    evidence = _unselected_capacity_evidence(
+        module,
+        resolver_offer_generation=offer.generation,
+    )
+
+    lease = module.RuntimeAccountAllocator(adapter).allocate(ticket, evidence)
+
+    assert offer.generation.startswith("sha256:")
+    assert lease.account_binding_digest == "account-from-adapter"
+
+
+def test_allocator_rejects_invalid_missing_or_offer_mismatched_decisions() -> None:
+    module = _allocator_module()
+    offer, decision = _real_resolution_contract()
+    base_ticket = module.ValidatedAllocationTicket(
+        ticket_id="ticket-A",
+        resolution_decision=decision,
+        selection_offer=offer,
+        resolver_offer_generation=offer.generation,
+        policy_generation=11,
+        capability_binding_digest="capability-A",
+        ledger_revision=3,
+        phase="OFFER_VALIDATED",
+        fencing_token="fence-A",
+    )
+    evidence = _unselected_capacity_evidence(
+        module,
+        resolver_offer_generation=offer.generation,
+    )
+    invalid_tickets = (
+        dataclasses.replace(
+            base_ticket,
+            resolution_decision=dataclasses.replace(decision, class_id=""),
+        ),
+        dataclasses.replace(
+            base_ticket,
+            resolution_decision=dataclasses.replace(decision, model=1),
+        ),
+        dataclasses.replace(
+            base_ticket,
+            resolution_decision=SimpleNamespace(
+                class_id=decision.class_id,
+                lifecycle=decision.lifecycle,
+                model=decision.model,
+            ),
+        ),
+        dataclasses.replace(
+            base_ticket,
+            resolution_decision=dataclasses.replace(
+                decision, model="gpt-5.6-not-offered"
+            ),
+        ),
+        dataclasses.replace(base_ticket, selection_offer=object()),
+        dataclasses.replace(
+            base_ticket,
+            selection_offer=dataclasses.replace(offer, options=()),
+        ),
+        dataclasses.replace(base_ticket, resolver_offer_generation=7),
+        dataclasses.replace(base_ticket, resolver_offer_generation="sha256:mismatch"),
+    )
+
+    for ticket in invalid_tickets:
+        adapter = _AtomicAdapter(module)
+        _assert_sparse_denial(
+            module,
+            lambda ticket=ticket, adapter=adapter: module.RuntimeAccountAllocator(
+                adapter
+            ).allocate(ticket, evidence),
+        )
+        assert adapter.reserve_calls == 0
 
 
 def test_parallel_capacity_one_is_fenced_to_one_lease() -> None:
@@ -269,6 +413,95 @@ def test_revoked_account_rejects_replayed_evidence_and_lease_revisions() -> None
         "reservation-1",
         "reservation-2",
     ]
+
+
+def test_revoke_release_exception_stays_pending_and_retries_idempotently() -> None:
+    module = _allocator_module()
+    adapter = _ReleaseProofAdapter(module, RuntimeError("release-secret"), True, True)
+    allocator = module.RuntimeAccountAllocator(adapter)
+    capacity_one = _unselected_capacity_evidence(
+        module,
+        capacity_units=1,
+        quota_units=1,
+        cost_units=1,
+        resource_units=1,
+    )
+    lease = allocator.allocate(_central_ticket(module), capacity_one)
+
+    allocator.revoke(lease, "completed")
+
+    assert adapter.outstanding_reservation_ids == {"reservation-1"}
+    assert allocator._records[lease.lease_id].state.value == "release_pending"
+    _assert_sparse_denial(
+        module,
+        lambda: allocator.allocate(
+            _central_ticket(module),
+            dataclasses.replace(capacity_one, evidence_revision=2),
+        ),
+    )
+    assert adapter.outstanding_reservation_ids == {"reservation-1"}
+
+    allocator.revoke(lease, "retry")
+    allocator.revoke(lease, "already-released")
+
+    assert adapter.outstanding_reservation_ids == set()
+    assert adapter.release_calls == [
+        "reservation-1",
+        "reservation-2",
+        "reservation-1",
+    ]
+    assert allocator._records[lease.lease_id].state is module.LeaseState.REVOKED
+
+
+def test_rejected_reservation_false_release_is_bound_until_recovery() -> None:
+    module = _allocator_module()
+    adapter = _ReleaseProofAdapter(module, False, True)
+    allocator = module.RuntimeAccountAllocator(adapter)
+    evidence = _unselected_capacity_evidence(
+        module,
+        capacity_units=1,
+        quota_units=1,
+        cost_units=1,
+        resource_units=1,
+    )
+    allocator.allocate(_central_ticket(module), evidence)
+
+    _assert_sparse_denial(
+        module,
+        lambda: allocator.allocate(
+            _central_ticket(module),
+            dataclasses.replace(evidence, evidence_revision=2),
+        ),
+    )
+
+    assert adapter.outstanding_reservation_ids == {
+        "reservation-1",
+        "reservation-2",
+    }
+    assert allocator.recover_pending_releases() == 0
+    assert allocator.recover_pending_releases() == 0
+    assert adapter.outstanding_reservation_ids == {"reservation-1"}
+    assert adapter.release_calls == ["reservation-2", "reservation-2"]
+
+
+def test_malformed_release_proof_requires_phase_bound_recovery() -> None:
+    module = _allocator_module()
+    adapter = _ReleaseProofAdapter(module, "released", True)
+    allocator = module.RuntimeAccountAllocator(adapter)
+    lease = allocator.allocate(
+        _central_ticket(module), _unselected_capacity_evidence(module)
+    )
+
+    allocator.revoke(lease, "completed")
+    pending_evidence = _bound_transaction_evidence(
+        module, lease, phase="RELEASE_PENDING"
+    )
+
+    assert allocator._records[lease.lease_id].state is module.LeaseState.RELEASE_PENDING
+    assert adapter.outstanding_reservation_ids == {"reservation-1"}
+    assert allocator.recover(lease, pending_evidence) is module.LeaseState.REVOKED
+    assert adapter.outstanding_reservation_ids == set()
+    assert adapter.release_calls == ["reservation-1", "reservation-1"]
 
 
 def _bound_transaction_evidence(module, lease, **changes):
@@ -492,7 +725,9 @@ def test_malformed_bool_stale_and_mismatched_evidence_fail_closed() -> None:
             module, expires_at_utc=datetime(2000, 1, 1, tzinfo=UTC)
         ),
         _unselected_capacity_evidence(module, ticket_id="wrong"),
-        _unselected_capacity_evidence(module, resolver_offer_generation=8),
+        _unselected_capacity_evidence(
+            module, resolver_offer_generation="sha256:mismatch"
+        ),
         _unselected_capacity_evidence(module, policy_generation=12),
         _unselected_capacity_evidence(module, capability_binding_digest="wrong"),
         _unselected_capacity_evidence(module, ledger_revision=4),
@@ -514,13 +749,11 @@ def test_bool_generation_and_ledger_evidence_fail_closed() -> None:
     module = _allocator_module()
     ticket = _central_ticket(
         module,
-        resolver_offer_generation=1,
         policy_generation=1,
         ledger_revision=1,
     )
     evidence = _unselected_capacity_evidence(
         module,
-        resolver_offer_generation=1,
         policy_generation=1,
         ledger_revision=1,
     )
@@ -550,8 +783,34 @@ def test_all_allocator_values_are_redacted_and_not_freely_serializable() -> None
     transaction = _bound_transaction_evidence(module, lease)
     reservation = allocator._records[lease.lease_id].reservation
     record = allocator._records[lease.lease_id]
+    pending_adapter = _ReleaseProofAdapter(module, False)
+    pending_allocator = module.RuntimeAccountAllocator(pending_adapter)
+    capacity_one = _unselected_capacity_evidence(
+        module,
+        capacity_units=1,
+        quota_units=1,
+        cost_units=1,
+        resource_units=1,
+    )
+    pending_allocator.allocate(_central_ticket(module), capacity_one)
+    _assert_sparse_denial(
+        module,
+        lambda: pending_allocator.allocate(
+            _central_ticket(module),
+            dataclasses.replace(capacity_one, evidence_revision=2),
+        ),
+    )
+    pending_release = next(iter(pending_allocator._pending_releases.values()))
 
-    for value in (ticket, evidence, transaction, reservation, lease, record):
+    for value in (
+        ticket,
+        evidence,
+        transaction,
+        reservation,
+        lease,
+        record,
+        pending_release,
+    ):
         assert "ticket-A" not in repr(value)
         assert "account-from-adapter" not in repr(value)
         assert "fence-A" not in str(value)
@@ -745,7 +1004,7 @@ def test_provider_adapter_is_capability_based_not_class_based() -> None:
             )
 
         def release_reservation(self, reservation):
-            self._delegate.release_reservation(reservation)
+            return self._delegate.release_reservation(reservation)
 
     lease = module.RuntimeAccountAllocator(CapabilityOnlyAdapter()).allocate(
         _central_ticket(module), _unselected_capacity_evidence(module)
