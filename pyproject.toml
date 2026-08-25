@@ -7,7 +7,7 @@ name = "codex-master"
 version = "0.10.5"
 description = "Local MCP wrapper for controlling a sleeping Codex Agentinnen pool via tmux"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["PyYAML>=6.0"]
 
 [project.scripts]
 codex-master-mcp = "codex_master.server:main"
