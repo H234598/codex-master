@@ -1,97 +1,36 @@
-"""Pure, fail-closed consumer for the account-usage-v1 snapshot contract."""
+"""Read-only, fail-closed consumer for attested account-usage schema 2."""
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import math
 import os
+import pwd
 import re
-import selectors
-import signal
 import stat
-import subprocess
-import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, TypeAlias
+from typing import Literal
 
 
-_MAX_ACTIVE_BYTES = 128 * 1024
-_MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024
-_MAX_STDERR_BYTES = 4096
-_LIVE_MAX_AGE = timedelta(minutes=15)
-_CACHE_MAX_AGE = timedelta(minutes=60)
+_MAX_POINTER_BYTES = 4096
+_MAX_BINDING_BYTES = 32768
+_MAX_PAYLOAD_BYTES = 2 * 1024 * 1024
+_MAX_LOCK_BYTES = 4096
 _MAX_ACCOUNTS = 100
 _MAX_LIMITS = 32
-_MAX_COST_WINDOWS = 64
-_MAX_WINDOW_SECONDS = 2_592_000
-_MAX_LOOKBACK_SECONDS = 86_400
-_MAX_SAMPLE_COUNT = 10_000
-_STAT_ID = tuple[int, int, int]
-_ACCOUNT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
-_ASCII_TOKEN_RE = re.compile(r"^[!-~]{1,128}$")
-_SCHEMA_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
-_SECRET_NAMES = frozenset(
-    {
-        "token",
-        "accesstoken",
-        "refreshtoken",
-        "idtoken",
-        "apikey",
-        "secret",
-        "clientsecret",
-        "password",
-        "passphrase",
-        "authorization",
-        "cookie",
-        "cookies",
-        "session",
-        "sessionid",
-        "csrf",
-        "devicecode",
-        "auth",
-        "authjson",
-        "privatekey",
-        "credential",
-        "credentials",
-        "credentialfingerprint",
-        "email",
-        "emailaddress",
-        "responsebody",
-        "raw",
-        "rawoutput",
-        "headers",
-        "profile",
-        "profilepath",
-        "authjsonpath",
-        "sourceurls",
-        "backenduserid",
-        "backendaccountid",
-    }
-)
-_SECRET_SUFFIXES = ("token", "secret", "key", "cookie", "password", "path", "url", "header")
-_JWT_RE = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
-_PEM_RE = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
-
-
-@dataclass(frozen=True, slots=True)
-class LauncherSpec:
-    launcher_path: Path
-
-    def __repr__(self) -> str:
-        return "LauncherSpec(launcher_path=<redacted>)"
-
-
-@dataclass(frozen=True, slots=True)
-class ProcessResult:
-    exit_code: int
-    stdout: bytes
-    stderr: bytes
-
-    def __repr__(self) -> str:
-        return "ProcessResult(exit_code=<redacted>, stdout=<redacted>, stderr=<redacted>)"
+_MAX_TRENDS = 32
+_MAX_TOTAL_TRENDS = 3200
+_WINDOWS = frozenset({18000, 604800, 2592000})
+_GENERATION_RE = re.compile(r"^[0-9a-f]{32}$")
+_ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_POOL_RE = re.compile(r"^(?:main|spark)$")
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
+_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,245 +78,352 @@ class UsageSnapshot:
     warnings: tuple[str, ...]
 
 
-class UsageSnapshotUnavailable(Exception):
-    """Redacted signal for an unusable active pointer or usage document."""
-
-    def __repr__(self) -> str:
-        return "UsageSnapshotUnavailable()"
+ReaderStatus = Literal["complete", "stale", "partial", "busy", "unavailable", "invalid"]
 
 
-ActiveReleaseReader: TypeAlias = Callable[[], LauncherSpec]
-SnapshotRunner: TypeAlias = Callable[[tuple[str, ...], float, int, int], ProcessResult]
-CacheReader: TypeAlias = Callable[[int], bytes]
+@dataclass(frozen=True, slots=True)
+class UsageLimitV2:
+    pool: Literal["main", "spark"]
+    window_seconds: int
+    reset_generation: str
+    used_percent: float
+    remaining_percent: float
+    reset_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class UsageTrendV2:
+    pool: Literal["main", "spark"]
+    window_seconds: int
+    reset_generation: str
+    coverage: Literal["complete", "partial", "insufficient"]
+    last_sample_at: datetime
+    projected_exhaustion_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class TrackerEvidenceV2:
+    pool: Literal["main", "spark"]
+    window_seconds: int
+    reset_generation: str
+    coverage: Literal["complete", "partial", "insufficient"]
+    last_sample_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AccountUsageEvidenceV2:
+    account_id: str
+    limits: tuple[UsageLimitV2, ...]
+    trends: tuple[UsageTrendV2, ...]
+    tracker_evidence: tuple[TrackerEvidenceV2, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class UsageEvidenceV2:
+    accounts: tuple[AccountUsageEvidenceV2, ...]
+    status: ReaderStatus
+    captured_at: datetime | None
+    generated_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ActiveManifest:
+    digest: str
+    producer_version: str
+    release_id: str
+    source_manifest_sha256: str
 
 
 class _Invalid(Exception):
     pass
 
 
-def _unavailable() -> None:
-    raise UsageSnapshotUnavailable() from None
+class _Unavailable(Exception):
+    pass
 
 
-def _directory_identity(path: Path) -> _STAT_ID:
-    item = path.lstat()
+class _Busy(Exception):
+    pass
+
+
+_Metadata = tuple[int, int, int, int, int, int, int, int]
+
+
+def _metadata(item: os.stat_result) -> _Metadata:
+    return (
+        item.st_dev,
+        item.st_ino,
+        stat.S_IMODE(item.st_mode),
+        item.st_uid,
+        item.st_nlink,
+        item.st_size,
+        item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+
+
+def _same(item: os.stat_result, expected: _Metadata) -> bool:
+    return _metadata(item) == expected
+
+
+def _check_directory(item: os.stat_result) -> None:
     if (
         not stat.S_ISDIR(item.st_mode)
-        or item.st_uid != os.getuid()
+        or item.st_uid != os.geteuid()
         or stat.S_IMODE(item.st_mode) != 0o700
     ):
         raise _Invalid()
-    return item.st_dev, item.st_ino, stat.S_IMODE(item.st_mode)
 
 
-def _file_identity(path: Path) -> _STAT_ID:
-    item = path.lstat()
+def _check_regular(item: os.stat_result, *, minimum: int, maximum: int) -> None:
     if (
         not stat.S_ISREG(item.st_mode)
-        or item.st_uid != os.getuid()
+        or item.st_uid != os.geteuid()
         or stat.S_IMODE(item.st_mode) != 0o600
         or item.st_nlink != 1
+        or not minimum <= item.st_size <= maximum
     ):
         raise _Invalid()
-    return item.st_dev, item.st_ino, stat.S_IMODE(item.st_mode)
 
 
-def _launcher_identity(path: Path) -> _STAT_ID:
-    item = path.lstat()
-    if (
-        not stat.S_ISREG(item.st_mode)
-        or item.st_uid != os.getuid()
-        or stat.S_IMODE(item.st_mode) != 0o700
-        or item.st_nlink != 1
-    ):
-        raise _Invalid()
-    return item.st_dev, item.st_ino, stat.S_IMODE(item.st_mode)
+class _FdGuard:
+    def __init__(self) -> None:
+        self._directories: list[tuple[int, int | None, str | None, _Metadata]] = []
+        self._files: list[tuple[int, str, _Metadata]] = []
+        self._close: list[int] = []
 
-
-def _reject_symlink_ancestors(path: Path) -> None:
-    if not path.is_absolute():
-        raise _Invalid()
-    current = Path(path.anchor)
-    for component in path.parts[1:]:
-        current /= component
-        if stat.S_ISLNK(current.lstat().st_mode):
-            raise _Invalid()
-
-
-def _capture_active_layout(state_home: Path) -> tuple[tuple[Path, _STAT_ID], ...]:
-    if not isinstance(state_home, Path) or not state_home.is_absolute():
-        raise _Invalid()
-    integration = state_home / "codex-usage" / "integration"
-    active = integration / "active.json"
-    directories = (state_home, state_home / "codex-usage", integration)
-    _reject_symlink_ancestors(active)
-    identities: list[tuple[Path, _STAT_ID]] = [
-        (directory, _directory_identity(directory)) for directory in directories
-    ]
-    active_item = active.lstat()
-    if active_item.st_size > _MAX_ACTIVE_BYTES:
-        raise _Invalid()
-    identities.append((active, _file_identity(active)))
-    return tuple(identities)
-
-
-def _capture_cache_layout(state_home: Path) -> tuple[tuple[Path, _STAT_ID], ...]:
-    if not isinstance(state_home, Path) or not state_home.is_absolute():
-        raise _Invalid()
-    integration = state_home / "codex-usage" / "integration"
-    cache = integration / "account-usage-v1.json"
-    directories = (state_home, state_home / "codex-usage", integration)
-    _reject_symlink_ancestors(cache)
-    identities: list[tuple[Path, _STAT_ID]] = [
-        (directory, _directory_identity(directory)) for directory in directories
-    ]
-    identities.append((cache, _file_identity(cache)))
-    return tuple(identities)
-
-
-def _revalidate_layout(layout: tuple[tuple[Path, _STAT_ID], ...]) -> None:
-    for path, identity in layout:
-        item = path.lstat()
-        if stat.S_ISDIR(item.st_mode):
-            if _directory_identity(path) != identity:
+    def _open_directory(
+        self, parent_fd: int, name: str, *, controlled: bool = True
+    ) -> int:
+        try:
+            before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if controlled:
+                _check_directory(before)
+            elif not stat.S_ISDIR(before.st_mode):
                 raise _Invalid()
-        elif identity[2] == 0o700:
-            if _launcher_identity(path) != identity:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError as exc:
+            raise _Unavailable() from exc
+        except OSError as exc:
+            raise _Invalid() from exc
+        try:
+            opened = os.fstat(descriptor)
+            after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if controlled:
+                _check_directory(opened)
+            elif not stat.S_ISDIR(opened.st_mode):
                 raise _Invalid()
-        elif _file_identity(path) != identity:
-            raise _Invalid()
+            if not _same(before, _metadata(opened)) or not _same(
+                after, _metadata(opened)
+            ):
+                raise _Invalid()
+        except Exception:
+            os.close(descriptor)
+            raise
+        self._directories.append((descriptor, parent_fd, name, _metadata(opened)))
+        self._close.append(descriptor)
+        return descriptor
 
-
-def _read_bounded_bytes(
-    path: Path, maximum: int, expected_identity: _STAT_ID | None = None
-) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
-    try:
-        item = os.fstat(descriptor)
-        identity = (item.st_dev, item.st_ino, stat.S_IMODE(item.st_mode))
-        if expected_identity is not None and identity != expected_identity:
-            raise _Invalid()
+    def absolute_directory(self, path: Path) -> int:
         if (
-            not stat.S_ISREG(item.st_mode)
-            or item.st_uid != os.getuid()
-            or stat.S_IMODE(item.st_mode) != 0o600
-            or item.st_nlink != 1
+            not isinstance(path, Path)
+            or not path.is_absolute()
+            or any(part in {"", ".", ".."} for part in path.parts[1:])
         ):
             raise _Invalid()
-        chunks: list[bytes] = []
-        size = 0
-        while size <= maximum:
-            chunk = os.read(descriptor, min(64 * 1024, maximum + 1 - size))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            size += len(chunk)
-        if size > maximum:
+        try:
+            descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        except OSError as exc:
+            raise _Unavailable() from exc
+        self._directories.append(
+            (descriptor, None, None, _metadata(os.fstat(descriptor)))
+        )
+        self._close.append(descriptor)
+        components = path.parts[1:]
+        for index, component in enumerate(components):
+            descriptor = self._open_directory(
+                descriptor,
+                component,
+                controlled=index == len(components) - 1,
+            )
+        return descriptor
+
+    def directory(self, parent_fd: int, name: str) -> int:
+        if name in {"", ".", ".."} or "/" in name:
             raise _Invalid()
-        return b"".join(chunks)
-    finally:
-        os.close(descriptor)
+        return self._open_directory(parent_fd, name)
+
+    def _open_regular(
+        self, parent_fd: int, name: str, *, minimum: int, maximum: int
+    ) -> int:
+        if name in {"", ".", ".."} or "/" in name:
+            raise _Invalid()
+        try:
+            before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            _check_regular(before, minimum=minimum, maximum=maximum)
+            descriptor = os.open(
+                name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd
+            )
+        except FileNotFoundError as exc:
+            raise _Unavailable() from exc
+        except OSError as exc:
+            raise _Invalid() from exc
+        try:
+            opened = os.fstat(descriptor)
+            after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            _check_regular(opened, minimum=minimum, maximum=maximum)
+            if not _same(before, _metadata(opened)) or not _same(
+                after, _metadata(opened)
+            ):
+                raise _Invalid()
+        except Exception:
+            os.close(descriptor)
+            raise
+        self._files.append((parent_fd, name, _metadata(opened)))
+        self._close.append(descriptor)
+        return descriptor
+
+    def lock(self, parent_fd: int, name: str) -> int:
+        return self._open_regular(parent_fd, name, minimum=0, maximum=_MAX_LOCK_BYTES)
+
+    def read_file(self, parent_fd: int, name: str, maximum: int) -> bytes:
+        descriptor = self._open_regular(parent_fd, name, minimum=1, maximum=maximum)
+        chunks: list[bytes] = []
+        total = 0
+        try:
+            while total <= maximum:
+                block = os.read(descriptor, min(65536, maximum + 1 - total))
+                if not block:
+                    break
+                chunks.append(block)
+                total += len(block)
+            if not 1 <= total <= maximum:
+                raise _Invalid()
+            expected = next(
+                metadata
+                for _parent, file_name, metadata in self._files
+                if file_name == name
+            )
+            if not _same(os.fstat(descriptor), expected) or not _same(
+                os.stat(name, dir_fd=parent_fd, follow_symlinks=False), expected
+            ):
+                raise _Invalid()
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+            self._close.remove(descriptor)
+
+    def revalidate(self) -> None:
+        for descriptor, parent_fd, name, expected in self._directories:
+            if not _same(os.fstat(descriptor), expected):
+                raise _Invalid()
+            if (
+                parent_fd is not None
+                and name is not None
+                and not _same(
+                    os.stat(name, dir_fd=parent_fd, follow_symlinks=False), expected
+                )
+            ):
+                raise _Invalid()
+        for parent_fd, name, expected in self._files:
+            if not _same(
+                os.stat(name, dir_fd=parent_fd, follow_symlinks=False), expected
+            ):
+                raise _Invalid()
+
+    def close(self) -> None:
+        while self._close:
+            os.close(self._close.pop())
 
 
-def _canonical_path(value: object) -> Path:
-    if not isinstance(value, str) or not value or "\x00" in value:
+def _canonical_json(payload: bytes, maximum: int) -> dict[str, object]:
+    if not isinstance(payload, bytes) or not 1 <= len(payload) <= maximum:
         raise _Invalid()
-    path = Path(value)
-    if not path.is_absolute() or str(path) != value or any(
-        component in {".", ".."} for component in path.parts
-    ):
-        raise _Invalid()
-    return path
 
-
-def _strict_json(payload: bytes, maximum: int) -> object:
-    if not isinstance(payload, bytes) or not payload or len(payload) > maximum:
-        raise _Invalid()
-
-    def reject_constant(_value: str) -> None:
-        raise _Invalid()
-
-    def reject_duplicate(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
         result: dict[str, object] = {}
-        for key, value in pairs:
-            if key in result:
+        for key, value in items:
+            if not isinstance(key, str) or key in result:
                 raise _Invalid()
             result[key] = value
         return result
 
     try:
-        return json.loads(
+        value = json.loads(
             payload.decode("utf-8"),
-            object_pairs_hook=reject_duplicate,
-            parse_constant=reject_constant,
+            object_pairs_hook=pairs,
+            parse_constant=lambda _value: (_ for _ in ()).throw(_Invalid()),
         )
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, _Invalid):
+        canonical = json.dumps(
+            value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        TypeError,
+        ValueError,
+        _Invalid,
+    ):
         raise _Invalid() from None
-
-
-def _secret_key(value: str) -> bool:
-    normalized = "".join(character for character in value.casefold() if character.isalnum())
-    return normalized in _SECRET_NAMES or normalized.endswith(_SECRET_SUFFIXES)
-
-
-def _scan_secrets(value: object, depth: int = 0) -> None:
-    if depth > 64:
+    if not isinstance(value, dict) or payload != canonical:
         raise _Invalid()
-    if isinstance(value, Mapping):
-        for key, nested in value.items():
-            if not isinstance(key, str) or not _SCHEMA_KEY_RE.fullmatch(key):
-                raise _Invalid()
-            if _secret_key(key):
-                raise _Invalid()
-            _scan_secrets(nested, depth + 1)
-        return
-    if isinstance(value, (list, tuple)):
-        for nested in value:
-            _scan_secrets(nested, depth + 1)
-        return
-    if isinstance(value, str):
-        if value.startswith("Bearer ") or _JWT_RE.fullmatch(value) or _PEM_RE.search(value):
-            raise _Invalid()
-        return
-    if value is None or isinstance(value, (bool, int, float)):
-        return
-    raise _Invalid()
+    return value
 
 
-def _timestamp(value: object) -> datetime:
-    if not isinstance(value, str) or "T" not in value:
+def _exact(value: Mapping[str, object], names: set[str]) -> None:
+    if set(value) != names:
         raise _Invalid()
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        offset = parsed.utcoffset()
-    except (TypeError, ValueError, OverflowError):
-        raise _Invalid() from None
-    if parsed.tzinfo is None or offset is None or offset != timedelta(0):
+
+
+def _hex(value: object) -> str:
+    if not isinstance(value, str) or _HEX_RE.fullmatch(value) is None:
         raise _Invalid()
-    try:
-        return parsed.astimezone(UTC)
-    except (TypeError, ValueError, OverflowError):
-        raise _Invalid() from None
+    return value
 
 
 def _token(value: object, maximum: int) -> str:
     if (
         not isinstance(value, str)
-        or len(value) < 1
-        or len(value) > maximum
-        or not value.isascii()
-        or not _ASCII_TOKEN_RE.fullmatch(value)
+        or not 1 <= len(value) <= maximum
+        or _TOKEN_RE.fullmatch(value) is None
     ):
         raise _Invalid()
     return value
 
 
-def _integer(value: object, maximum: int, *, allow_zero: bool = False) -> int:
-    minimum = 0 if allow_zero else 1
-    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+def _timestamp(value: object) -> datetime:
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= 64
+        or not value.endswith("Z")
+    ):
         raise _Invalid()
-    return value
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except (TypeError, ValueError, OverflowError):
+        raise _Invalid() from None
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise _Invalid()
+    return parsed.astimezone(UTC)
+
+
+def _clock(clock: Callable[[], datetime]) -> datetime:
+    try:
+        value = clock()
+    except Exception as exc:
+        raise _Invalid() from exc
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() != timedelta(0)
+    ):
+        raise _Invalid()
+    return value.astimezone(UTC)
 
 
 def _percent(value: object) -> float:
@@ -389,464 +435,523 @@ def _percent(value: object) -> float:
     return result
 
 
-def _canonical_limit(value: object) -> dict[str, object]:
-    if not isinstance(value, Mapping) or "pool" not in value or "window_seconds" not in value:
-        raise _Invalid()
-    result: dict[str, object] = {
-        "pool": _token(value["pool"], 64),
-        "window_seconds": _integer(value["window_seconds"], _MAX_WINDOW_SECONDS),
-    }
-    for name in ("used_percent", "remaining_percent"):
-        if name in value:
-            result[name] = _percent(value[name])
-    if "reset_at" in value:
-        result["reset_at"] = _timestamp(value["reset_at"])
-    return result
-
-
-def _canonical_cost_window(value: object) -> dict[str, object]:
-    required = (
-        "lookback_seconds",
-        "pool",
-        "limit_window_seconds",
-        "consumed_percentage_points",
-        "coverage",
-        "sample_count",
+def _active_manifest(payload: bytes) -> _ActiveManifest:
+    value = _canonical_json(payload, _MAX_BINDING_BYTES)
+    _exact(
+        value,
+        {
+            "active_manifest_schema_version",
+            "entry_point",
+            "launcher_sha256",
+            "producer_version",
+            "record_sha256",
+            "release_id",
+            "release_tree_sha256",
+            "source_manifest_sha256",
+            "wheel_sha256",
+        },
     )
-    if not isinstance(value, Mapping) or any(name not in value for name in required):
+    if (
+        value["active_manifest_schema_version"] != 2
+        or _token(value["producer_version"], 64) != "0.6.536"
+    ):
         raise _Invalid()
-    coverage = value["coverage"]
-    if coverage not in {"complete", "partial", "unknown"}:
+    if value["entry_point"] != "codex_usage.cli:main":
         raise _Invalid()
-    return {
-        "lookback_seconds": _integer(value["lookback_seconds"], _MAX_LOOKBACK_SECONDS),
-        "pool": _token(value["pool"], 64),
-        "limit_window_seconds": _integer(value["limit_window_seconds"], _MAX_WINDOW_SECONDS),
-        "consumed_percentage_points": _percent(value["consumed_percentage_points"]),
-        "coverage": coverage,
-        "sample_count": _integer(value["sample_count"], _MAX_SAMPLE_COUNT, allow_zero=True),
-    }
-
-
-def _canonical_document(value: object) -> dict[str, object]:
-    _scan_secrets(value)
-    if not isinstance(value, Mapping):
-        raise _Invalid()
-    schema_version = value.get("schema_version")
-    if type(schema_version) is not int or schema_version != 1:
-        raise _Invalid()
-    generated_at = _timestamp(value.get("generated_at"))
-    accounts_value = value.get("accounts")
-    if not isinstance(accounts_value, list) or len(accounts_value) > _MAX_ACCOUNTS:
-        raise _Invalid()
-    accounts: list[dict[str, object]] = []
-    seen: set[str] = set()
-    for raw_account in accounts_value:
-        if not isinstance(raw_account, Mapping):
-            raise _Invalid()
-        if not all(name in raw_account for name in ("account_id", "status", "freshness")):
-            raise _Invalid()
-        account_id = _token(raw_account["account_id"], 64)
-        if not _ACCOUNT_ID_RE.fullmatch(account_id) or account_id in seen:
-            raise _Invalid()
-        status = raw_account["status"]
-        if not isinstance(status, str) or status not in {
-            "ok",
-            "partial",
-            "error",
-            "login_required",
-            "unknown",
-        }:
-            raise _Invalid()
-        freshness = raw_account["freshness"]
-        if not isinstance(freshness, Mapping):
-            raise _Invalid()
-        captured_at = _timestamp(freshness.get("captured_at"))
-        stale = freshness.get("stale")
-        if not isinstance(stale, bool):
-            raise _Invalid()
-        raw_limits = raw_account.get("limits", [])
-        if not isinstance(raw_limits, list) or len(raw_limits) > _MAX_LIMITS:
-            raise _Invalid()
-        limits = [_canonical_limit(item) for item in raw_limits]
-        identities = {
-            (item["pool"], item["window_seconds"], item.get("reset_at")) for item in limits
-        }
-        if len(identities) != len(limits):
-            raise _Invalid()
-        limits.sort(
-            key=lambda item: (
-                item["pool"],
-                item["window_seconds"],
-                item.get("reset_at") is not None,
-                item.get("reset_at") or datetime.min.replace(tzinfo=UTC),
-            )
-        )
-        raw_cost_windows = raw_account.get("cost_windows", [])
-        if not isinstance(raw_cost_windows, list) or len(raw_cost_windows) > _MAX_COST_WINDOWS:
-            raise _Invalid()
-        cost_windows = [_canonical_cost_window(item) for item in raw_cost_windows]
-        cost_windows.sort(
-            key=lambda item: (item["pool"], item["lookback_seconds"], item["limit_window_seconds"])
-        )
-        raw_resets = raw_account.get("usage_resets")
-        resets: dict[str, object] | None = None
-        if "usage_resets" in raw_account:
-            if not isinstance(raw_resets, Mapping) or not all(
-                name in raw_resets for name in ("available", "known", "redeem_capability")
-            ):
-                raise _Invalid()
-            available = _integer(raw_resets["available"], 10_000, allow_zero=True)
-            known = raw_resets["known"]
-            redeem_capability = raw_resets["redeem_capability"]
-            if not isinstance(known, bool) or not isinstance(redeem_capability, bool):
-                raise _Invalid()
-            resets = {
-                "available": available,
-                "known": known,
-                "redeem_capability": redeem_capability,
-            }
-        accounts.append(
-            {
-                "account_id": account_id,
-                "status": status,
-                "captured_at": captured_at,
-                "stale": stale,
-                "limits": tuple(limits),
-                "cost_windows": tuple(cost_windows),
-                "usage_resets": resets,
-            }
-        )
-        seen.add(account_id)
-    if "source_commit" in value:
-        _token(value["source_commit"], 128)
-    accounts.sort(key=lambda account: account["account_id"])
-    return {"generated_at": generated_at, "accounts": tuple(accounts)}
-
-
-def _build_snapshot(
-    document: dict[str, object], *, source: Literal["live", "cache"], stale: bool, known: frozenset[str]
-) -> UsageSnapshot:
-    accounts: list[AccountUsage] = []
-    for raw in document["accounts"]:
-        if raw["account_id"] not in known:
-            continue
-        if source == "live" and raw["stale"]:
-            continue
-        limits = tuple(
-            UsageLimit(
-                pool=item["pool"],
-                window_seconds=item["window_seconds"],
-                used_percent=item.get("used_percent"),
-                remaining_percent=item.get("remaining_percent"),
-                reset_at=item.get("reset_at"),
-            )
-            for item in raw["limits"]
-        )
-        cost_windows = tuple(UsageCostWindow(**item) for item in raw["cost_windows"])
-        raw_reset = raw["usage_resets"]
-        resets = () if raw_reset is None else (UsageReset(**raw_reset),)
-        accounts.append(
-            AccountUsage(
-                account_id=raw["account_id"],
-                status=raw["status"],
-                captured_at=raw["captured_at"],
-                stale=True if source == "cache" else raw["stale"],
-                limits=limits,
-                cost_windows=cost_windows,
-                usage_resets=resets,
-            )
-        )
-    return UsageSnapshot(tuple(accounts), source, stale, ())
-
-
-def _clock_utc(clock: Callable[[], datetime]) -> datetime:
-    value = clock()
-    if not isinstance(value, datetime):
-        raise _Invalid()
-    try:
-        offset = value.utcoffset()
-    except Exception:
-        raise _Invalid() from None
-    if value.tzinfo is None or offset is None:
-        raise _Invalid()
-    try:
-        return value.astimezone(UTC)
-    except (TypeError, ValueError, OverflowError):
-        raise _Invalid() from None
-
-
-def _validate_live_result(result: object) -> bytes:
-    if not isinstance(result, ProcessResult):
-        raise _Invalid()
-    if type(result.exit_code) is not int or result.exit_code != 0:
-        raise _Invalid()
-    if not isinstance(result.stdout, bytes) or len(result.stdout) > _MAX_SNAPSHOT_BYTES:
-        raise _Invalid()
-    if not isinstance(result.stderr, bytes) or len(result.stderr) > _MAX_STDERR_BYTES:
-        raise _Invalid()
-    if result.stderr:
-        raise _Invalid()
-    return result.stdout
-
-
-def _valid_age(now: datetime, generated_at: datetime, maximum: timedelta) -> bool:
-    age = now - generated_at
-    return timedelta(0) <= age <= maximum
-
-
-def _terminate_process_group(process: object) -> None:
-    pid = getattr(process, "pid", None)
-    if not isinstance(pid, int):
-        raise _Invalid()
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except OSError:
-        killer = getattr(process, "kill", None)
-        if not callable(killer):
-            raise _Invalid()
-        killer()
-
-
-def _bounded_process_exchange(
-    process: object, *, timeout: float, stdout_limit: int, stderr_limit: int
-) -> tuple[bytes, bytes]:
-    stdout = getattr(process, "stdout", None)
-    stderr = getattr(process, "stderr", None)
-    if stdout is None or stderr is None:
-        raise _Invalid()
-    streams = {stdout: stdout_limit, stderr: stderr_limit}
-    buffers: dict[object, bytearray] = {stdout: bytearray(), stderr: bytearray()}
-    selector = selectors.DefaultSelector()
-    terminated = False
-
-    def register_stream(stream: object) -> None:
-        fileno = getattr(stream, "fileno", None)
-        if not callable(fileno):
-            raise _Invalid()
-        descriptor = fileno()
-        os.set_blocking(descriptor, False)
-        selector.register(stream, selectors.EVENT_READ)
-
-    def drain_streams(deadline: float) -> None:
-        while selector.get_map() and time.monotonic() < deadline:
-            events = selector.select(max(0.0, deadline - time.monotonic()))
-            if not events:
-                break
-            for key, _ in events:
-                stream = key.fileobj
-                data = os.read(stream.fileno(), 64 * 1024)
-                if not data:
-                    selector.unregister(stream)
-
-    def stop_process() -> None:
-        nonlocal terminated
-        if terminated:
-            return
-        terminated = True
-        try:
-            _terminate_process_group(process)
-        except Exception:
-            pass
-        try:
-            drain_streams(time.monotonic() + 1.0)
-        except Exception:
-            pass
-
-    try:
-        register_stream(stdout)
-        register_stream(stderr)
-        deadline = time.monotonic() + timeout
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                stop_process()
-                raise TimeoutError()
-            for key, _ in selector.select(remaining):
-                stream = key.fileobj
-                read_size = min(64 * 1024, streams[stream] + 1 - len(buffers[stream]))
-                data = os.read(stream.fileno(), read_size)
-                if not data:
-                    selector.unregister(stream)
-                    continue
-                buffer = buffers[stream]
-                buffer.extend(data)
-                if len(buffer) > streams[stream]:
-                    stop_process()
-                    raise _Invalid()
-        waiter = getattr(process, "wait", None)
-        if not callable(waiter):
-            raise _Invalid()
-        waiter(timeout=max(0.0, deadline - time.monotonic()))
-        return bytes(buffers[stdout]), bytes(buffers[stderr])
-    except Exception:
-        stop_process()
-        raise
-    finally:
-        if terminated:
-            waiter = getattr(process, "wait", None)
-            if callable(waiter):
-                try:
-                    waiter(timeout=1.0)
-                except Exception:
-                    pass
-        selector.close()
-        for stream in (stdout, stderr):
-            try:
-                stream.close()
-            except Exception:
-                pass
-
-
-def _default_runner(
-    argv: tuple[str, ...], timeout: float, stdout_limit: int, stderr_limit: int
-) -> ProcessResult:
-    process = subprocess.Popen(
-        argv,
-        shell=False,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        close_fds=True,
-        start_new_session=True,
-        env={"LANG": "C.UTF-8", "TZ": "UTC"},
+    for name in (
+        "launcher_sha256",
+        "record_sha256",
+        "release_tree_sha256",
+        "source_manifest_sha256",
+        "wheel_sha256",
+    ):
+        _hex(value[name])
+    return _ActiveManifest(
+        digest=hashlib.sha256(payload).hexdigest(),
+        producer_version="0.6.536",
+        release_id=_token(value["release_id"], 64),
+        source_manifest_sha256=_hex(value["source_manifest_sha256"]),
     )
-    stdout, stderr = _bounded_process_exchange(
-        process,
-        timeout=timeout,
-        stdout_limit=stdout_limit,
-        stderr_limit=stderr_limit,
+
+
+def _pointer(value: dict[str, object]) -> tuple[str, str]:
+    _exact(
+        value,
+        {
+            "pointer_schema_version",
+            "current_generation_id",
+            "current_binding_sha256",
+            "previous_generation_id",
+            "previous_binding_sha256",
+        },
     )
-    return ProcessResult(process.returncode, stdout, stderr)
-
-
-default_runner = _default_runner
-
-
-def read_active_launcher_v1(*, state_home: Path) -> LauncherSpec:
-    try:
-        layout = _capture_active_layout(state_home)
-        active = state_home / "codex-usage" / "integration" / "active.json"
-        payload = _read_bounded_bytes(active, _MAX_ACTIVE_BYTES, layout[-1][1])
-        _revalidate_layout(layout)
-        manifest = _strict_json(payload, _MAX_ACTIVE_BYTES)
-        if not isinstance(manifest, Mapping) or type(manifest.get("schema_version")) is not int:
-            raise _Invalid()
-        if manifest["schema_version"] != 1:
-            raise _Invalid()
-        release_dir = _canonical_path(manifest.get("release_dir"))
-        launcher_path = _canonical_path(manifest.get("launcher_path"))
-        integration = state_home / "codex-usage" / "integration"
-        releases = integration / "releases"
-        if release_dir.parent != releases:
-            raise _Invalid()
-        expected_launcher = release_dir / "venv" / "bin" / "codex-usage"
-        if launcher_path != expected_launcher:
-            raise _Invalid()
-        _reject_symlink_ancestors(expected_launcher)
-        target_layout = tuple(
-            (directory, _directory_identity(directory))
-            for directory in (
-                releases,
-                release_dir,
-                release_dir / "venv",
-                release_dir / "venv" / "bin",
-            )
-        ) + ((expected_launcher, _launcher_identity(expected_launcher)),)
-        _revalidate_layout(layout + target_layout)
-        return LauncherSpec(expected_launcher)
-    except UsageSnapshotUnavailable:
-        raise
-    except Exception:
-        raise UsageSnapshotUnavailable() from None
-
-
-def read_account_usage_cache_v1(maximum: int, *, state_home: Path) -> bytes:
-    try:
-        if type(maximum) is not int or not 0 < maximum <= _MAX_SNAPSHOT_BYTES:
-            raise _Invalid()
-        layout = _capture_cache_layout(state_home)
-        cache = state_home / "codex-usage" / "integration" / "account-usage-v1.json"
-        payload = _read_bounded_bytes(cache, maximum, layout[-1][1])
-        _revalidate_layout(layout)
-        return payload
-    except Exception:
-        raise UsageSnapshotUnavailable() from None
-
-
-def _live_document(
-    active_release_reader: ActiveReleaseReader,
-    runner: SnapshotRunner,
-) -> dict[str, object] | None:
-    try:
-        spec = active_release_reader()
-        if not isinstance(spec, LauncherSpec) or not isinstance(spec.launcher_path, Path):
-            raise _Invalid()
-        launcher_path = str(spec.launcher_path)
-        if not spec.launcher_path.is_absolute() or "\x00" in launcher_path:
-            raise _Invalid()
-        argv = (launcher_path, "integration-snapshot", "--schema", "1", "--format", "json")
-        payload = _validate_live_result(runner(argv, 5.0, _MAX_SNAPSHOT_BYTES, _MAX_STDERR_BYTES))
-        return _canonical_document(_strict_json(payload, _MAX_SNAPSHOT_BYTES))
-    except Exception:
-        return None
-
-
-def _cache_document(cache_reader: CacheReader) -> dict[str, object] | None:
-    try:
-        payload = cache_reader(_MAX_SNAPSHOT_BYTES)
-        return _canonical_document(_strict_json(payload, _MAX_SNAPSHOT_BYTES))
-    except Exception:
-        return None
-
-
-def load_account_usage_v1(
-    *,
-    active_release_reader: ActiveReleaseReader,
-    runner: SnapshotRunner,
-    cache_reader: CacheReader,
-    known_account_ids: frozenset[str],
-    clock: Callable[[], datetime],
-) -> UsageSnapshot:
-    try:
-        if not isinstance(known_account_ids, frozenset) or any(
-            not isinstance(account_id, str) for account_id in known_account_ids
+    if value["pointer_schema_version"] != 2:
+        raise _Invalid()
+    generation = value["current_generation_id"]
+    if not isinstance(generation, str) or _GENERATION_RE.fullmatch(generation) is None:
+        raise _Invalid()
+    current_digest = _hex(value["current_binding_sha256"])
+    previous_generation = value["previous_generation_id"]
+    previous_digest = value["previous_binding_sha256"]
+    if (previous_generation is None) != (previous_digest is None):
+        raise _Invalid()
+    if previous_generation is not None:
+        if (
+            not isinstance(previous_generation, str)
+            or _GENERATION_RE.fullmatch(previous_generation) is None
+            or previous_generation == generation
+            or _hex(previous_digest) == current_digest
         ):
             raise _Invalid()
-        live = _live_document(active_release_reader, runner)
-        if live is not None:
-            now = _clock_utc(clock)
-            if _valid_age(now, live["generated_at"], _LIVE_MAX_AGE):
-                return _build_snapshot(live, source="live", stale=False, known=known_account_ids)
-            cache = _cache_document(cache_reader)
-            if cache is not None and _valid_age(now, cache["generated_at"], _CACHE_MAX_AGE):
-                return _build_snapshot(cache, source="cache", stale=True, known=known_account_ids)
-            return UsageSnapshot((), "unavailable", True, ("usage_unavailable",))
-        cache = _cache_document(cache_reader)
-        if cache is None:
+    return generation, current_digest
+
+
+def _binding(
+    value: dict[str, object],
+    active: _ActiveManifest,
+    generation: str,
+    pointer_digest: str,
+    payload: bytes,
+    now: datetime,
+) -> None:
+    _exact(
+        value,
+        {
+            "active_manifest_sha256",
+            "binding_schema_version",
+            "generation_id",
+            "payload_filename",
+            "payload_sha256",
+            "payload_size_bytes",
+            "published_at",
+            "producer_version",
+            "release_id",
+            "source_manifest_sha256",
+        },
+    )
+    if (
+        value["binding_schema_version"] != 2
+        or value["generation_id"] != generation
+        or value["payload_filename"] != "account-usage-v2.json"
+        or value["active_manifest_sha256"] != active.digest
+        or value["producer_version"] != active.producer_version
+        or value["release_id"] != active.release_id
+        or value["source_manifest_sha256"] != active.source_manifest_sha256
+        or value["payload_sha256"] != hashlib.sha256(payload).hexdigest()
+        or value["payload_size_bytes"] != len(payload)
+    ):
+        raise _Invalid()
+    if (
+        hashlib.sha256(
+            json.dumps(
+                value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            ).encode("utf-8")
+        ).hexdigest()
+        != pointer_digest
+    ):
+        raise _Invalid()
+    if _timestamp(value["published_at"]) > now:
+        raise _Invalid()
+
+
+def _coverage(value: object) -> Literal["complete", "partial", "insufficient"]:
+    if value not in {"complete", "partial", "insufficient"}:
+        raise _Invalid()
+    return value
+
+
+def _pool(value: object) -> Literal["main", "spark"]:
+    if not isinstance(value, str) or _POOL_RE.fullmatch(value) is None:
+        raise _Invalid()
+    return value
+
+
+def _window(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value not in _WINDOWS:
+        raise _Invalid()
+    return value
+
+
+def _reset_generation(value: object) -> str:
+    return _token(value, 128)
+
+
+def _payload(
+    value: dict[str, object], now: datetime
+) -> tuple[tuple[AccountUsageEvidenceV2, ...], ReaderStatus, datetime, datetime]:
+    _exact(
+        value,
+        {
+            "accounts",
+            "captured_at",
+            "fresh_until",
+            "generated_at",
+            "schema_version",
+            "status",
+        },
+    )
+    if value["schema_version"] != 2 or value["status"] not in {"complete", "partial"}:
+        raise _Invalid()
+    captured_at = _timestamp(value["captured_at"])
+    generated_at = _timestamp(value["generated_at"])
+    fresh_until = _timestamp(value["fresh_until"])
+    if (
+        captured_at > generated_at
+        or fresh_until != captured_at + timedelta(seconds=900)
+        or generated_at > now
+    ):
+        raise _Invalid()
+    raw_accounts = value["accounts"]
+    if not isinstance(raw_accounts, list) or len(raw_accounts) > _MAX_ACCOUNTS:
+        raise _Invalid()
+    accounts: list[AccountUsageEvidenceV2] = []
+    account_ids: set[str] = set()
+    total_trends = 0
+    stale = now > fresh_until
+    for raw_account in raw_accounts:
+        if not isinstance(raw_account, dict):
             raise _Invalid()
-        now = _clock_utc(clock)
-        if not _valid_age(now, cache["generated_at"], _CACHE_MAX_AGE):
+        _exact(raw_account, {"account_id", "limits", "tracker_evidence", "trends"})
+        account_id = raw_account["account_id"]
+        if (
+            not isinstance(account_id, str)
+            or _ACCOUNT_RE.fullmatch(account_id) is None
+            or account_id in account_ids
+        ):
             raise _Invalid()
-        return _build_snapshot(cache, source="cache", stale=True, known=known_account_ids)
+        account_ids.add(account_id)
+        raw_limits = raw_account["limits"]
+        raw_trends = raw_account["trends"]
+        raw_evidence = raw_account["tracker_evidence"]
+        if (
+            not isinstance(raw_limits, list)
+            or not isinstance(raw_trends, list)
+            or not isinstance(raw_evidence, list)
+            or len(raw_limits) > _MAX_LIMITS
+            or len(raw_trends) > _MAX_TRENDS
+            or len(raw_evidence) > _MAX_TRENDS
+        ):
+            raise _Invalid()
+        limits: list[UsageLimitV2] = []
+        limit_keys: set[tuple[str, int, str]] = set()
+        for raw_limit in raw_limits:
+            if not isinstance(raw_limit, dict):
+                raise _Invalid()
+            _exact(
+                raw_limit,
+                {
+                    "pool",
+                    "remaining_percent",
+                    "reset_at",
+                    "reset_generation",
+                    "used_percent",
+                    "window_seconds",
+                },
+            )
+            pool = _pool(raw_limit["pool"])
+            window = _window(raw_limit["window_seconds"])
+            reset_generation = _reset_generation(raw_limit["reset_generation"])
+            used = _percent(raw_limit["used_percent"])
+            remaining = _percent(raw_limit["remaining_percent"])
+            reset_at = _timestamp(raw_limit["reset_at"])
+            key = (pool, window, reset_generation)
+            if (
+                key in limit_keys
+                or abs(used + remaining - 100) > 1e-9
+                or reset_at <= generated_at
+            ):
+                raise _Invalid()
+            limit_keys.add(key)
+            limits.append(
+                UsageLimitV2(pool, window, reset_generation, used, remaining, reset_at)
+            )
+        trends: list[UsageTrendV2] = []
+        trend_keys: set[tuple[str, int, str]] = set()
+        for raw_trend in raw_trends:
+            if not isinstance(raw_trend, dict):
+                raise _Invalid()
+            _exact(
+                raw_trend,
+                {
+                    "coverage",
+                    "last_sample_at",
+                    "pool",
+                    "projected_exhaustion_at",
+                    "reset_generation",
+                    "window_seconds",
+                },
+            )
+            pool = _pool(raw_trend["pool"])
+            window = _window(raw_trend["window_seconds"])
+            reset_generation = _reset_generation(raw_trend["reset_generation"])
+            key = (pool, window, reset_generation)
+            last_sample_at = _timestamp(raw_trend["last_sample_at"])
+            projected = _timestamp(raw_trend["projected_exhaustion_at"])
+            if (
+                key not in limit_keys
+                or key in trend_keys
+                or last_sample_at > generated_at
+                or projected <= generated_at
+            ):
+                raise _Invalid()
+            if generated_at - last_sample_at > timedelta(seconds=900):
+                stale = True
+            trend_keys.add(key)
+            trends.append(
+                UsageTrendV2(
+                    pool,
+                    window,
+                    reset_generation,
+                    _coverage(raw_trend["coverage"]),
+                    last_sample_at,
+                    projected,
+                )
+            )
+        evidence: list[TrackerEvidenceV2] = []
+        evidence_keys: set[tuple[str, int, str]] = set()
+        for raw_item in raw_evidence:
+            if not isinstance(raw_item, dict):
+                raise _Invalid()
+            _exact(
+                raw_item,
+                {
+                    "coverage",
+                    "last_sample_at",
+                    "pool",
+                    "reset_generation",
+                    "window_seconds",
+                },
+            )
+            pool = _pool(raw_item["pool"])
+            window = _window(raw_item["window_seconds"])
+            reset_generation = _reset_generation(raw_item["reset_generation"])
+            key = (pool, window, reset_generation)
+            last_sample_at = _timestamp(raw_item["last_sample_at"])
+            if (
+                key not in limit_keys
+                or key in evidence_keys
+                or last_sample_at > generated_at
+            ):
+                raise _Invalid()
+            if generated_at - last_sample_at > timedelta(seconds=900):
+                stale = True
+            evidence_keys.add(key)
+            evidence.append(
+                TrackerEvidenceV2(
+                    pool,
+                    window,
+                    reset_generation,
+                    _coverage(raw_item["coverage"]),
+                    last_sample_at,
+                )
+            )
+        total_trends += len(trends)
+        if total_trends > _MAX_TOTAL_TRENDS:
+            raise _Invalid()
+        accounts.append(
+            AccountUsageEvidenceV2(
+                account_id,
+                tuple(
+                    sorted(
+                        limits,
+                        key=lambda item: (
+                            item.pool,
+                            item.window_seconds,
+                            item.reset_generation,
+                        ),
+                    )
+                ),
+                tuple(
+                    sorted(
+                        trends,
+                        key=lambda item: (
+                            item.pool,
+                            item.window_seconds,
+                            item.reset_generation,
+                        ),
+                    )
+                ),
+                tuple(
+                    sorted(
+                        evidence,
+                        key=lambda item: (
+                            item.pool,
+                            item.window_seconds,
+                            item.reset_generation,
+                        ),
+                    )
+                ),
+            )
+        )
+    status: ReaderStatus = "stale" if stale else value["status"]
+    return (
+        tuple(sorted(accounts, key=lambda item: item.account_id)),
+        status,
+        captured_at,
+        generated_at,
+    )
+
+
+def _lock_root() -> Path:
+    try:
+        home = pwd.getpwuid(os.geteuid()).pw_dir
+    except Exception as exc:
+        raise _Unavailable() from exc
+    if not isinstance(home, str):
+        raise _Invalid()
+    return Path(home) / ".local" / "state" / "codex-usage" / "locks"
+
+
+def _default_state_home() -> Path:
+    try:
+        home = pwd.getpwuid(os.geteuid()).pw_dir
+    except Exception as exc:
+        raise _Unavailable() from exc
+    if not isinstance(home, str):
+        raise _Invalid()
+    return Path(home) / ".local" / "state"
+
+
+def _acquire_shared(descriptor: int) -> None:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        raise _Busy() from exc
+    except OSError as exc:
+        raise _Invalid() from exc
+
+
+def _read_chain(
+    state_home: Path, now: datetime
+) -> tuple[tuple[AccountUsageEvidenceV2, ...], ReaderStatus, datetime, datetime]:
+    guard = _FdGuard()
+    locked: list[int] = []
+    try:
+        lock_fd = guard.absolute_directory(_lock_root())
+        for name in ("release.lock", "current.lock"):
+            descriptor = guard.lock(lock_fd, name)
+            _acquire_shared(descriptor)
+            locked.append(descriptor)
+        state_fd = guard.absolute_directory(state_home)
+        usage_fd = guard.directory(state_fd, "codex-usage")
+        integration_fd = guard.directory(usage_fd, "integration")
+        generations_fd = guard.directory(integration_fd, "generations")
+        staging_fd = guard.directory(integration_fd, "staging")
+        try:
+            generation_names = os.listdir(generations_fd)
+            staging_names = os.listdir(staging_fd)
+        except OSError as exc:
+            raise _Invalid() from exc
+        if (
+            len(generation_names) > 257
+            or len(staging_names) > 16
+            or any(_GENERATION_RE.fullmatch(name) is None for name in generation_names)
+            or any(_GENERATION_RE.fullmatch(name) is None for name in staging_names)
+        ):
+            raise _Invalid()
+        active = _active_manifest(
+            guard.read_file(integration_fd, "active.json", _MAX_BINDING_BYTES)
+        )
+        generation, pointer_digest = _pointer(
+            _canonical_json(
+                guard.read_file(integration_fd, "current.json", _MAX_POINTER_BYTES),
+                _MAX_POINTER_BYTES,
+            )
+        )
+        if generation not in generation_names:
+            raise _Unavailable()
+        generation_fd = guard.directory(generations_fd, generation)
+        payload = guard.read_file(
+            generation_fd, "account-usage-v2.json", _MAX_PAYLOAD_BYTES
+        )
+        binding = _canonical_json(
+            guard.read_file(
+                generation_fd, "account-usage-v2.binding.json", _MAX_BINDING_BYTES
+            ),
+            _MAX_BINDING_BYTES,
+        )
+        _binding(binding, active, generation, pointer_digest, payload, now)
+        result = _payload(_canonical_json(payload, _MAX_PAYLOAD_BYTES), now)
+        guard.revalidate()
+        return result
+    finally:
+        for descriptor in reversed(locked):
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except Exception:
+                pass
+        guard.close()
+
+
+def read_usage_evidence_v2(
+    *, state_home: Path | None = None, clock: Callable[[], datetime] | None = None
+) -> UsageEvidenceV2:
+    """Read one V2 generation; no retry, fallback, cache, process, or mutation."""
+    try:
+        now = _clock(clock or (lambda: datetime.now(UTC)))
+        accounts, status, captured_at, generated_at = _read_chain(
+            state_home or _default_state_home(), now
+        )
+        return UsageEvidenceV2(accounts, status, captured_at, generated_at)
+    except _Busy:
+        return UsageEvidenceV2((), "busy", None, None)
+    except _Unavailable:
+        return UsageEvidenceV2((), "unavailable", None, None)
     except Exception:
+        return UsageEvidenceV2((), "invalid", None, None)
+
+
+def display_snapshot_from_evidence(
+    evidence: UsageEvidenceV2, *, known_account_ids: frozenset[str]
+) -> UsageSnapshot:
+    """One-way, side-effect-free display projection from verified V2 evidence."""
+    if (
+        type(evidence) is not UsageEvidenceV2
+        or evidence.status != "complete"
+        or evidence.captured_at is None
+    ):
         return UsageSnapshot((), "unavailable", True, ("usage_unavailable",))
+    if not isinstance(known_account_ids, frozenset) or any(
+        type(item) is not str for item in known_account_ids
+    ):
+        return UsageSnapshot((), "unavailable", True, ("usage_unavailable",))
+    accounts = tuple(
+        AccountUsage(
+            account_id=account.account_id,
+            status="ok",
+            captured_at=evidence.captured_at,
+            stale=False,
+            limits=tuple(
+                UsageLimit(
+                    limit.pool,
+                    limit.window_seconds,
+                    limit.used_percent,
+                    limit.remaining_percent,
+                    limit.reset_at,
+                )
+                for limit in account.limits
+            ),
+            cost_windows=(),
+            usage_resets=(),
+        )
+        for account in evidence.accounts
+        if account.account_id in known_account_ids
+    )
+    return UsageSnapshot(accounts, "live", False, ())
 
 
 __all__ = [
     "AccountUsage",
-    "ActiveReleaseReader",
-    "CacheReader",
-    "LauncherSpec",
-    "ProcessResult",
-    "SnapshotRunner",
+    "AccountUsageEvidenceV2",
+    "ReaderStatus",
+    "TrackerEvidenceV2",
     "UsageCostWindow",
+    "UsageEvidenceV2",
     "UsageLimit",
+    "UsageLimitV2",
     "UsageReset",
     "UsageSnapshot",
-    "UsageSnapshotUnavailable",
-    "default_runner",
-    "load_account_usage_v1",
-    "read_account_usage_cache_v1",
-    "read_active_launcher_v1",
+    "UsageTrendV2",
+    "display_snapshot_from_evidence",
+    "read_usage_evidence_v2",
 ]
