@@ -114,13 +114,12 @@ from codex_master.resource_cgroup import (
     start_released_scope,
 )
 from codex_master.resource_monitor import (
-    ResourceGateFacts,
-    ResourceOperatorStatus,
+    ResourceEvidenceStateV2,
+    ResourceEvidenceV2,
+    ResourceMeasurementsV2,
     ResourceSnapshotError,
-    build_resource_operator_status,
     read_current_resource_boot_id,
-    read_resource_gate_facts,
-    read_resource_snapshot,
+    read_resource_evidence_v2,
     run_resource_monitor as run_resource_monitor_loop,
 )
 from codex_master.fleet_snapshot import (
@@ -505,6 +504,7 @@ RESOURCE_REASON_CODES = frozenset(
         "spawn_warmup_active",
         "temperature_pressure_high",
         "temperature_monitor_unavailable",
+        "resource_monitor_warming",
         "resource_monitor_unavailable",
         "resource_snapshot_invalid",
         "resource_snapshot_generation_mismatch",
@@ -1018,6 +1018,31 @@ class ResourceGateRuntime:
     h2_ready: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class ResourceEvidenceOperatorViewV2:
+    state: ResourceEvidenceStateV2
+    generation: int
+    boot_id: str
+    observed_at_utc: _dt.datetime
+    reason_codes: tuple[str, ...]
+    measurements: ResourceMeasurementsV2 | None
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceEvidenceGateFactsV2:
+    state: ResourceEvidenceStateV2
+    generation: int
+    reason_codes: tuple[str, ...]
+    measurements: ResourceMeasurementsV2 | None
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceEvidenceProjectionV2:
+    evidence: ResourceEvidenceV2
+    operator_status: ResourceEvidenceOperatorViewV2
+    gate_facts: ResourceEvidenceGateFactsV2
+
+
 _RESOURCE_GATE_RUNTIME: contextvars.ContextVar[ResourceGateRuntime | None] = contextvars.ContextVar(
     "codex_master_resource_gate_runtime",
     default=None,
@@ -1138,55 +1163,114 @@ def _call_with_resource_gate_composer(callback: Any) -> Any:
         return callback()
 
 
-def _read_resource_operator_status() -> ResourceOperatorStatus:
-    """Read one authorized snapshot and return its bounded operator projection."""
+def _read_resource_evidence_projection_v2(
+    runtime: ResourceGateRuntime,
+) -> ResourceEvidenceProjectionV2:
+    if not isinstance(runtime, ResourceGateRuntime) or not isinstance(runtime.state, HiveStateStore):
+        raise ResourceSnapshotError("resource_snapshot_invalid")
+    now_utc = runtime.now_utc()
+    if (
+        not isinstance(now_utc, _dt.datetime)
+        or now_utc.tzinfo is None
+        or now_utc.utcoffset() != _dt.timedelta(0)
+    ):
+        raise ResourceSnapshotError("resource_snapshot_invalid")
+    evidence = read_resource_evidence_v2(
+        runtime.state,
+        now_utc=now_utc,
+        expected_boot_id=runtime.expected_boot_id,
+    )
+    if not isinstance(evidence, ResourceEvidenceV2):
+        raise ResourceSnapshotError("resource_snapshot_invalid")
+    if evidence.state in {
+        ResourceEvidenceStateV2.WARMING,
+        ResourceEvidenceStateV2.UNAVAILABLE,
+    }:
+        if evidence.measurements is not None:
+            raise ResourceSnapshotError("resource_snapshot_invalid")
+    elif evidence.state in {
+        ResourceEvidenceStateV2.READY,
+        ResourceEvidenceStateV2.PRESSURE,
+    }:
+        if not isinstance(evidence.measurements, ResourceMeasurementsV2):
+            raise ResourceSnapshotError("resource_snapshot_invalid")
+        if evidence.state is ResourceEvidenceStateV2.READY:
+            if evidence.reason_codes != ("resource_ready",):
+                raise ResourceSnapshotError("resource_snapshot_invalid")
+        elif not evidence.reason_codes or any(
+            reason not in {"temperature_monitor_unavailable", "temperature_pressure_high"}
+            for reason in evidence.reason_codes
+        ):
+            raise ResourceSnapshotError("resource_snapshot_invalid")
+    else:
+        raise ResourceSnapshotError("resource_snapshot_invalid")
+    operator_status = ResourceEvidenceOperatorViewV2(
+        state=evidence.state,
+        generation=evidence.generation,
+        boot_id=evidence.boot_id,
+        observed_at_utc=evidence.observed_at_utc,
+        reason_codes=evidence.reason_codes,
+        measurements=evidence.measurements,
+    )
+    gate_facts = ResourceEvidenceGateFactsV2(
+        state=evidence.state,
+        generation=evidence.generation,
+        reason_codes=evidence.reason_codes,
+        measurements=evidence.measurements,
+    )
+    return ResourceEvidenceProjectionV2(
+        evidence=evidence,
+        operator_status=operator_status,
+        gate_facts=gate_facts,
+    )
+
+
+def _read_resource_operator_status() -> ResourceEvidenceOperatorViewV2:
+    """Read one authorized V2 evidence document and return its operator view."""
 
     with _resource_gate_composer_scope():
         runtime = _RESOURCE_GATE_RUNTIME.get()
         if runtime is None or not isinstance(runtime.state, HiveStateStore):
             raise AgentError("resource_status_unavailable")
         try:
-            now_utc = runtime.now_utc()
-            if (
-                not isinstance(now_utc, _dt.datetime)
-                or now_utc.tzinfo is None
-                or now_utc.utcoffset() != _dt.timedelta(0)
-            ):
-                raise ValueError
-            snapshot = read_resource_snapshot(
-                runtime.state,
-                now_utc=now_utc,
-                expected_boot_id=runtime.expected_boot_id,
-            )
-            status = build_resource_operator_status(snapshot)
-            if not isinstance(status, ResourceOperatorStatus):
-                raise ValueError
-            return status
+            return _read_resource_evidence_projection_v2(runtime).operator_status
         except (ResourceSnapshotError, TypeError, ValueError, AttributeError, OverflowError):
             raise AgentError("resource_status_unavailable") from None
 
 
-def _resource_operator_document(status: ResourceOperatorStatus) -> dict[str, Any]:
-    if not isinstance(status, ResourceOperatorStatus):
+def _resource_operator_document(status: ResourceEvidenceOperatorViewV2) -> dict[str, Any]:
+    if not isinstance(status, ResourceEvidenceOperatorViewV2):
         raise AgentError("resource_status_unavailable")
-    if any(reason != "resource_ready" and reason not in RESOURCE_REASON_CODES for reason in status.reason_codes):
+    if any(
+        reason != "resource_ready" and reason not in RESOURCE_REASON_CODES
+        for reason in status.reason_codes
+    ):
         raise AgentError("resource_status_unavailable")
-    return {
-        "schema_version": status.schema_version,
+    document: dict[str, Any] = {
+        "schema_version": 2,
+        "boot_id": status.boot_id,
         "generation": status.generation,
-        "state": status.state,
-        "bottleneck": status.bottleneck,
-        "current": dict(status.current),
-        "mean_1m": dict(status.mean_1m),
-        "mean_10m": dict(status.mean_10m),
-        "peak_10m": dict(status.peak_10m),
-        "trend": dict(status.trend),
-        "confidence": status.confidence,
-        "preferred_profiles": list(status.preferred_profiles),
-        "avoid_profiles": list(status.avoid_profiles),
+        "observed_at_utc": status.observed_at_utc.isoformat().replace("+00:00", "Z"),
+        "state": status.state.value,
         "reason_codes": list(status.reason_codes),
         "raw_output": "not_returned",
     }
+    measurements = status.measurements
+    if measurements is not None:
+        document.update(
+            {
+                "bottleneck": measurements.bottleneck,
+                "current": dict(measurements.current),
+                "mean_1m": dict(measurements.mean_1m),
+                "mean_10m": dict(measurements.mean_10m),
+                "peak_10m": dict(measurements.peak_10m),
+                "trend": dict(measurements.trend),
+                "confidence": measurements.confidence,
+                "preferred_profiles": list(measurements.preferred_profiles),
+                "avoid_profiles": list(measurements.avoid_profiles),
+            }
+        )
+    return document
 
 
 def run_resource_monitor() -> None:
@@ -6049,7 +6133,7 @@ def _total_running_agent_count(*, managed_ids: frozenset[str] | None = None) -> 
 
 
 def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> dict[str, Any]:
-    """Project exactly one authorized GateFacts read; never read host metrics here."""
+    """Project exactly one authorized V2 evidence read; never read host metrics here."""
 
     runtime = _RESOURCE_GATE_RUNTIME.get()
     if running_agents_override is None:
@@ -6072,21 +6156,31 @@ def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> di
             "raw_output": "not_returned",
         }
     try:
-        now_utc = runtime.now_utc()
-        if (
-            not isinstance(now_utc, _dt.datetime)
-            or now_utc.tzinfo is None
-            or now_utc.utcoffset() != _dt.timedelta(0)
-        ):
+        facts = _read_resource_evidence_projection_v2(runtime).gate_facts
+        if facts.state is ResourceEvidenceStateV2.WARMING:
+            reasons.append("resource_monitor_warming")
+            return {
+                "ok": False,
+                "_typed_hive_io_pressure": False,
+                "_g5_facts": True,
+                "running_agents": running_agents,
+                "reason_codes": list(dict.fromkeys(reasons)),
+                "raw_output": "not_returned",
+            }
+        if facts.state is ResourceEvidenceStateV2.UNAVAILABLE:
+            reasons.append("resource_monitor_unavailable")
+            return {
+                "ok": False,
+                "_typed_hive_io_pressure": False,
+                "_g5_facts": True,
+                "running_agents": running_agents,
+                "reason_codes": list(dict.fromkeys(reasons)),
+                "raw_output": "not_returned",
+            }
+        measurements = facts.measurements
+        if not isinstance(measurements, ResourceMeasurementsV2):
             raise ValueError
-        facts = read_resource_gate_facts(
-            runtime.state,
-            now_utc=now_utc,
-            expected_boot_id=runtime.expected_boot_id,
-        )
-        if not isinstance(facts, ResourceGateFacts):
-            raise ValueError
-        legacy = facts.legacy_pressure
+        legacy = measurements.legacy_pressure
         adapter = runtime.cgroup_adapter
         typed_hive_io_pressure = type(adapter) is SystemdUserCgroupAdapter
         io_psi = None
@@ -6098,40 +6192,38 @@ def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> di
                 legacy.cpu_busy_percent,
                 legacy.io_wait_percent,
                 legacy.available_memory_percent,
-                facts.available_memory_mib,
+                measurements.available_memory_mib,
             )
         else:
             values = (
                 legacy.load_per_cpu,
                 legacy.cpu_busy_percent,
                 legacy.available_memory_percent,
-                facts.available_memory_mib,
+                measurements.available_memory_mib,
             )
         if any(not _finite_resource_number(value) for value in values):
             raise ValueError
-        if facts.gate_state not in {"ready", "blocked"}:
+        if facts.state is ResourceEvidenceStateV2.READY:
+            declared: list[str] = []
+        elif facts.state is ResourceEvidenceStateV2.PRESSURE:
+            declared = list(facts.reason_codes)
+            if not declared or any(
+                reason not in {"temperature_monitor_unavailable", "temperature_pressure_high"}
+                for reason in declared
+            ):
+                raise ValueError
+        else:
             raise ValueError
     except (ResourceSnapshotError, TypeError, ValueError, AttributeError, OverflowError):
-        reasons.append("resource_snapshot_invalid")
         return {
             "ok": False,
             "_typed_hive_io_pressure": False,
             "_g5_facts": True,
             "running_agents": running_agents,
-            "reason_codes": list(dict.fromkeys(reasons)),
+            "reason_codes": ["resource_snapshot_invalid"],
             "raw_output": "not_returned",
         }
 
-    # G3 records cgroup as unavailable until G5's separately injected typed preflight.
-    declared = [
-        reason
-        for reason in facts.reason_codes
-        if reason in RESOURCE_REASON_CODES and reason != "cgroup_preflight_failed"
-    ]
-    if facts.thermal_state in {"warming_up", "monitor_unavailable"}:
-        declared.append("temperature_monitor_unavailable")
-    if facts.gate_state == "blocked" and not declared and set(facts.reason_codes) != {"cgroup_preflight_failed"}:
-        reasons.append("resource_snapshot_invalid")
     reasons.extend(declared)
     return {
         "ok": not [reason for reason in reasons if reason != "session_metrics_unavailable"],
@@ -6142,7 +6234,7 @@ def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> di
         "io_wait_percent": legacy.io_wait_percent,
         "io_psi_percent": io_psi,
         "available_memory_percent": legacy.available_memory_percent,
-        "available_memory_mib": facts.available_memory_mib,
+        "available_memory_mib": measurements.available_memory_mib,
         "running_agents": running_agents,
         "reason_codes": list(dict.fromkeys(reasons)),
         "raw_output": "not_returned",
@@ -6195,6 +6287,18 @@ def spawn_error_details(
     """Translate stable admission codes into data-sparse operator errors."""
 
     configured = {
+        "resource_monitor_warming": (
+            "Ressourcenmonitor waermt auf",
+            "Vollstaendige V2-Ressourcenevidenz ist noch nicht verfuegbar.",
+            "Mindestens zehn gueltige Samples sind fuer belastbare Messwerte erforderlich.",
+            "Nach Abschluss des Messfensters erneut versuchen.",
+        ),
+        "resource_monitor_unavailable": (
+            "Ressourcenmonitor nicht verfuegbar",
+            "Der Ressourcenmonitor konnte keine gueltige V2-Evidenz bereitstellen.",
+            "Ohne frische V2-Evidenz bleibt Spawn fail-closed.",
+            "Monitorstatus pruefen und nach Wiederherstellung erneut versuchen.",
+        ),
         "cpu_metrics_unavailable": (
             "CPU-Messung nicht verfuegbar",
             "CPU-/Load-Werte konnten nicht verlaesslich ermittelt werden.",
@@ -20578,9 +20682,13 @@ def resource_monitor_status(
     try:
         operator_status = _read_resource_operator_status()
         snapshot = {
-            "valid": isinstance(operator_status, ResourceOperatorStatus),
-            "fresh": isinstance(operator_status, ResourceOperatorStatus),
-            "generation": operator_status.generation if isinstance(operator_status, ResourceOperatorStatus) else None,
+            "valid": isinstance(operator_status, ResourceEvidenceOperatorViewV2),
+            "fresh": isinstance(operator_status, ResourceEvidenceOperatorViewV2),
+            "generation": (
+                operator_status.generation
+                if isinstance(operator_status, ResourceEvidenceOperatorViewV2)
+                else None
+            ),
         }
     except Exception:
         pass
@@ -33279,7 +33387,7 @@ def _fleet_overview_cli(argv: list[str]) -> int:
         return 1
 
 
-def _render_resource_operator_status(status: ResourceOperatorStatus, *, format: str) -> str:
+def _render_resource_operator_status(status: ResourceEvidenceOperatorViewV2, *, format: str) -> str:
     if format not in {"compact", "json", "markdown"}:
         raise AgentError("resource_status_unavailable")
     document = _resource_operator_document(status)
