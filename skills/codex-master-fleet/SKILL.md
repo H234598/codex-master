@@ -1,421 +1,57 @@
 ---
 name: codex-master-fleet
-description: Use when managing the local codex-master-mcp Masterjet, Codex Agentinnen pool, Bienen, Arbeitsbienen, Exploriererinnen, fleet variables, plugin status, or persistent feminine agent delegation rules.
+description: Use when coordinating codex-master Masterjet work as a Queen or Teamleiterin, delegating Bienen, attesting fleet state, or handling assignment-bound reports.
 metadata:
-  short-description: Manage codex-master-mcp and the local Agentinnen fleet
+  short-description: Route Queen and TL Masterjet coordination safely
 ---
 
 # Codex Master Fleet
 
-Use this skill in the Teamleiterin/main Codex instance when the user refers to
-the Masterjet, `codex-master`, `codex-master-mcp`, the Agentinnen pool, Bienen,
-Arbeitsbienen, Exploriererinnen, fleet rules, plugin status, telint imports, or
-the persisted delegation templates.
+Dieser Skill ist der kurze kanonische Repositoryrouter für Queen und
+Teamleiterin. Er ist keine zweite Hive-Policy-Wahrheit und kein Worker-Skill.
 
-This skill is for the controlling instance. Do not install it into managed
-Agentinnen unless the intent is to make that instance a Teamleiterin.
+## Autoritätsgrenze
 
-`codex-master-mcp` Agentinnen are fremde Bienen: they are controlled through an
-MCP/plugin boundary. Eigene Bienen are native Subagentinnen spawned without MCP;
-manage those with the `subagent-fleet` / `multi_agent_v1` workflow instead.
-Teamleiterinnen may directly spawn or reserve fremde Bienen with
-`agent_start`, `agent_claim`, and structured `agent_assign*` tools; leases,
-auth checks, and write scopes are the safety boundary.
-Fremde-Eigene Bienen are fremde Bienen whose lease is currently held by the
-Teamleiterin/current controlling instance; coordinate them as leased external
-Bienen, not as native Subagentinnen.
-For eigene Bienen, the requested model may be selected through a hidden
-`multi_agent_v1.spawn_agent` `model` parameter even when the visible schema does
-not show it; test the user's model IDs instead of assuming they are unavailable.
+Autorität kommt in dieser Reihenfolge aus Common Policy und kanonischen
+Masterjet-Teilplänen, materialisierter Rolle/Klasse, Principal, Lease und
+Scope, dann aus der aktuell attestierten Masterjet-/MCP-Generation.
+Die aktuell attestierte Masterjet-/MCP-Generation ist für volatile Auswahl
+allein maßgeblich.
+Repositorycode ist Ist-Evidenz, nie Policy. Fehlende oder widersprüchliche
+Attestation bedeutet fail-closed: keine Auswahl, kein Spawn, kein Retry.
 
-## Model Policy
+Keine statische Modell-, Provider-, Klassen-, Preis-, Limit- oder Toolliste
+pflegen. Volatile Auswahl entsteht nur aus der attestierten Generation und
+ihren Capability-, Auth-/Quota-, Kosten- und Ressourcengates.
 
-- Treat `codex-agent-classes.json` and `codex-model-policy.json` as authoritative.
-  Before the first start or assignment for a series, request
-  `agent_selection_options`; cache its `generation` and refresh when
-  `options_changed` is true. Do not reconstruct or force a stale model list.
-- Send an offered class/lifecycle/model/reasoning tuple when possible. Omitted
-  fields are resolved once by the shared start/assignment resolver: simple
-  ephemeral write defaults to Spark/low; read-only ephemeral defaults to
-  Luna/medium; medium or complex work rejects Spark as below task capability
-  and selects at least Luna; binding defaults to Luna/high; persistent workers
-  default to Luna/xhigh.
-- Compatible explicit choices win. For a worker, an explicitly unknown or
-  unavailable model falls back to Luna, never Spark; preserve a compatible
-  explicit effort or clamp it to replacement-model and class/lifecycle bounds.
-  Spark is only the no-model default for a simple write. Class-incompatible or
-  too-weak choices still fall back inside hard bounds. Always report requested
-  and effective values plus `reason_codes` immediately; the requesting model
-  may stop or choose another offered tuple. Goettin, Gottbiene, and Koenigin
-  stay Sol-bound; Teamleiterin is a separate exact Terra policy.
-- Class and lifecycle minima remain hard. Workers may move Spark -> Luna ->
-  Terra -> Sol only inside offered class, lifecycle, model-effort, and class
-  bounds. Persistent workers require `xhigh`; only Goettin and Gottbiene use
-  `max`; `ultra` is forbidden.
-- Leadership classes are always persistent. Goettin and Gottbiene use Sol/max;
-  Koenigin uses Sol/xhigh. The current Sol default is `gpt-5.6-sol`, but any
-  offered Sol-family ID with the exact class effort is valid. Missing Sol or
-  required effort fails closed; never fall back to Terra, Luna, or Spark.
-  Teamleiterin uses exactly `gpt-5.6-terra`/`xhigh`, with
-  `xhigh` as both minimum and maximum effort; never downgrade her to Spark,
-  Luna, Sol, or another effort.
-- The first `agent_selection_options` offer must visibly include Teamleiterin
-  with only `class=teamleiterin`, `lifecycle=persistent`,
-  `model=gpt-5.6-terra`, and `reasoning=xhigh`. Policy still fixes `xhigh` as
-  both minimum and maximum effort. A required unavailable model or effort is a
-  hard error: `required_model_unavailable:gpt-5.6-terra` or
-  `required_model_effort_unavailable:gpt-5.6-terra:xhigh`; do not apply a
-  fallback, especially for Teamleiterin.
+Workerinnen erhalten diesen Leitungsskill nicht. Ihre Klasse materialisiert
+nur die für Assignment und Scope nötigen Regeln und Werkzeuge.
 
-## Fleet Policy
+## Rolle bestimmen und routen
 
-- Use feminine wording: `Agentin`, `Biene`, `Arbeitsbiene`,
-  `Exploriererin`, `Teamleiterin`.
-- If masculine agent wording appears, briefly note the mismatch and continue
-  with the feminine term.
-- Give Agentinnen modern female names unless the user requests a fixed name.
-- The main instance is the Teamleiterin. It may inspect and integrate, but
-  should mainly coordinate, test, commit, push, and release.
-- Only the Koenigin may restart or reload Masterjet, install it, or synchronize
-  its plugin cache. Other roles may inspect status and provide verification or
-  a reload recommendation, but must not perform these lifecycle actions.
-- Temporary global cap is 10 Bienen total across running Masterjet sessions and
-  active or unconfirmed native Subagentinnen. At 10, spawn no further Biene.
-  Existing CPU, load, I/O-wait, RAM, host-pressure, and Ollama two-agent
-  thresholds remain configured and are enforced; they are additional admission
-  gates below the global cap. In addition, fremde Bienen may be spawned
-  directly through MCP/plugin control surfaces, with leases, auth checks, and
-  write scopes as the safety boundary.
-- Exploriererinnen read, analyze, and report concise context packages only.
-- Arbeitsbienen may write only in assigned files or isolated workspaces.
-- Before assigning writes, inspect `git status --short` and avoid overlapping
-  write scopes.
-- Security is more important than performance; still keep performance in mind.
-- Version all coding steps. Commit after 10 successful fixes, push after 10
-  commits, release after 10 pushes. Push/release only with green tests and no
-  known critical findings.
-- Managed Agentinnen may start native Subagentinnen only when the assignment explicitly
-  allows it. Nested Subagentinnen must stay inside the assigned scope and write
-  paths. They must not use `codex-master-mcp` to control the fleet.
-- Use codex-master-mcp for fremde Bienen and native `multi_agent_v1`
-  Subagentinnen for eigene Bienen. Keep their ownership, scopes, and reporting
-  separate so the Teamleiterin can integrate safely.
-- Do not manually start a managed Agentin with the same `CODEX_HOME` while the
-  Masterjet manages them. Use `doctor` if a terminal looks stuck; `start`
-  blocks when an Agentin home is already used externally, including when a
-  Masterjet tmux session already exists. Agentin runners must be regular
-  executable files, not symlinks.
-- A stopped Agentin is a normal informational `doctor` session state, not a
-  failed health check.
+1. Rolle, Auftrag, `repo_id`, Principal, Lease, Scope und Lifecycle ermitteln.
+2. Immer [gemeinsame Invarianten](references/common-invariants.md) lesen.
+3. Queen liest genau eine Rollenreferenz:
+   [Queen-Bedienung](references/queen-operations.md).
+4. Teamleiterin liest genau eine Rollenreferenz:
+   [TL- und Workerführung](references/tl-worker-operations.md).
+5. Bei Diagnose, Refresh, Retry, Bericht oder Topicresume zusätzlich
+   [Diagnose und Wiederaufnahme](references/diagnostics-retry-reporting.md)
+   laden.
 
-## MCP Visibility
+Nur Queen und Teamleiterin erreichen diesen Router. Eine Workerin fragt bei
+falscher Materialisierung ihre Parent-TL; sie lädt keine Leitungsreferenz.
 
-In `/mcp`, the main Codex instance should show `codex-master-mcp`. Managed
-Agentinnen intentionally should not show the Masterjet MCP tools. If a standard
-instance says that Master MCP Tools are none, then either that instance is not
-the Teamleiterin, or `codex-master-mcp` is not installed/configured there.
+## Sicherer Standardablauf
 
-## Agentinnen Pool
+1. Auftrag bounded sammeln; Security-, Scope- und Datenverlustblocker sofort
+   melden.
+2. Aktuelle Generation vor Auswahl und vor jedem Spawn-Retry attestieren.
+3. Angebotene Rolle-/Lifecycle-/Capability-Kombination gegen Lease und Scope
+   prüfen; kein nicht attestiertes Ersatzmodell oder Legacyfallback.
+4. Entscheidung, Blocker, Handoff und Risiko über den typisierten zuständigen
+   Kommunikationspfad berichten.
+5. Nach kohärentem Slice gezielt testen und getrennte Review- und
+   Integrationsrollen übergeben.
 
-- Homes live under `~/.codex-agents/<id>`.
-- Concrete ids are `a1..a100`, `b1..b100`, and `c1..c100`.
-- Legacy aliases `a` and `b` resolve to `a1` and `b1`; `both` resolves to
-  `a1,b1`.
-- Series selectors are `a-series`, `b-series`, `c-series`; `all` covers all
-  300 Agentinnen.
-- `a1` and `b1` preserve the authenticated original homes. Additional homes are
-  sleeping/slim by default and must not receive copied auth material without an
-  explicit user instruction.
-- Prefer symlinks for read-mostly large content such as skills, plugins, and
-  model caches. Keep runtime state, wrappers, config, tmux sessions, leases, and
-  metadata per Agentin.
-
-## Masterjet Control
-
-Prefer structured tools over raw `send`:
-
-```sh
-cd /home/teladi/codex-master
-./bin/codex-master-mcp doctor
-./bin/codex-master-mcp status
-./bin/codex-master-mcp lease-status all --agents-limit 30
-./bin/codex-master-mcp claim b1 --forever --poll-interval-seconds 30
-./bin/codex-master-mcp claim b1 --no-wait
-./bin/codex-master-mcp claim b1 --no-recover-stopped
-./bin/codex-master-mcp wait a1 --timeout-seconds 120 --poll-interval-seconds 30
-./bin/codex-master-mcp watchdog all --idle-seconds 60 --poll-interval-seconds 15 --report-grace-seconds 15 --action stop --manage-unclaimed --quiet
-./bin/codex-master-mcp start both --cwd /home/teladi/codex-master
-./bin/codex-master-mcp capabilities all --agents-limit 30
-./bin/codex-master-mcp skills all --agents-limit 30
-./bin/codex-master-mcp skills a1 --include-names --limit 20 --names-offset 20 --plugins-offset 20 --plugins-limit 20
-./bin/codex-master-mcp skill-match all codex-security:security-scan --agents-limit 30
-./bin/codex-master-mcp scope-check --scope src --write-path src/codex_master/server.py
-./bin/codex-master-mcp assign-readonly a1 --skill codex-security:security-scan --scope src/codex_master/server.py --task "Pruefe nur lesend und berichte knapp."
-./bin/codex-master-mcp assign-live-data a1 --task "Wie ist das Wetter gerade in Berlin?" --live-data-topic "Wetter Berlin heute"
-./bin/codex-master-mcp assign-write b1 --skill github:gh-fix-ci --scope .github/workflows --write-path .github/workflows/ci.yml --task "Haerte nur die CI-Datei."
-./bin/codex-master-mcp assignments all --limit 20
-./bin/codex-master-mcp last-assignment a1
-./bin/codex-master-mcp report-request a1
-./bin/codex-master-mcp integration-status
-./bin/codex-master-mcp commit-ready-check
-./bin/codex-master-mcp app-bridge-status
-./bin/codex-master-mcp plugin-status
-./bin/codex-master-mcp namespace-status
-./bin/codex-master-mcp release-status
-./bin/codex-master-mcp watchdog-status
-./bin/codex-master-mcp timeout-policy
-./bin/codex-master-mcp release b1
-```
-
-Data minimization:
-
-- `status`, `wait`, `watchdog`, `start`, `send`, `assign-*`, `doctor`,
-  `skills`, `capabilities`, `app-bridge-status`, `plugin-status`,
-  `namespace-status`, `release-status`, `watchdog-status`, and
-  `timeout-policy` do not return Agentin terminal output.
-- Broad read-only selectors on `status`, `lease-status`, `skills`,
-  `skill-match`, and `capabilities` are paged with `--agents-limit` and
-  `--agents-offset`; the default page size is 30 Agentinnen and the maximum is
-  100.
-- Broad mutating `start`/`stop` selectors that resolve to more than 6
-  Agentinnen require `--allow-broad-selector`; use this only after checking
-  leases and scope.
-- For weather, news, prices, schedules, and other current-data tasks, prefer
-  `assign-live-data` over raw `send`. It is a read-only assignment that tells
-  the Agentin to use current search sources or report a tooling/access limit
-  instead of guessing. Public responses and assignment audit records still omit
-  prompt text and Agentin output.
-- `send`, `assign-*`, and `report-request` wait briefly for a visible Codex TUI
-  input prompt marker in the current visible pane tail before pasting. If an
-  Agentin is still in startup warnings or only starter text is visible, the
-  mutation should fail closed with retryable `agent_input_not_ready`,
-  `paste_attempted: false`, and no raw output instead of silently losing the
-  prompt.
-- `watchdog` is data-sparse and two-phased. When an Agentin is idle, it first
-  requests a concise report and stores only a metadata marker. It waits the
-  report grace period, default 15 seconds, before `interrupt`, `stop`, or
-  `release`. The default watchdog idle threshold is 60 seconds; the systemd
-  timer poll interval is 15 seconds. The installed systemd supervisor uses
-  `--action stop`, so unused Agentinnen are put back to sleep after the report
-  grace period. By default it only mutates Agentinnen held by the current
-  server. The systemd supervisor may additionally manage unclaimed or expired
-  leases via `--manage-unclaimed --quiet`; it must still skip active leases held
-  by other clients.
-- The watchdog user service should keep conservative systemd hardening:
-  empty `CapabilityBoundingSet`, private keyring/tmp/devices, kernel and clock
-  protections, `ProtectSystem=strict`, `ReadWritePaths` for managed state plus
-  user runtime, no IP sockets, no namespaces, `NoNewPrivileges`,
-  `MemoryDenyWriteExecute`, native syscall architecture, and `UMask=0077`. Do
-  not add `ProtectHome` or similar home-blocking settings unless the service is
-  redesigned around explicit read/write paths, because it needs Codex config,
-  tmux IPC, and managed state.
-- `watchdog-status` is diagnostic and data-sparse. It may return systemd timer
-  and service health metadata, installed-unit match booleans, required
-  hardening directive booleans, watchdog flag booleans, and the aggregate
-  `systemd-analyze security` exposure score/level. It must not return local
-  unit paths or raw `systemctl`/`systemd-analyze` output.
-- `timeout-policy` is diagnostic and data-sparse. It must show that `claim`
-  retries forever by default for busy fremde Bienen, that finite claim waits
-  have no 600-second maximum, that the claim poll interval defaults to
-  30 seconds and is capped at 900 seconds, that `wait` remains a bounded
-  Agentin-activity wait capped at 10 minutes, that `send`/`assign-*`/
-  `report-request` wait up to 15 seconds for a visible TUI input prompt before
-  failing closed without paste, that explicit `claim` can recover stopped
-  foreign leases only after its grace period, and whether the hidden lease owner
-  identity is stable across CLI invocations. The identity itself must not be
-  returned.
-- `status`, `doctor`, `skills`, `capabilities`, `app-bridge-status`,
-  `plugin-status`, `namespace-status`, and integration metadata must not return
-  local Agentin home, runner, repo, manifest, installed symlink, or
-  working-directory paths. Use state/category fields such as `path_state`,
-  `home_kind`, `cwd_state`, and target-state markers instead. Raw-log retention
-  diagnostics may return counts and byte totals, but not managed raw-log
-  directory paths.
-- `namespace-status` is the local diagnostic for whether `codex-master-mcp` is
-  registered, starts, and exposes its MCP `tools/list` to new clients.
-  `tool_search` is not authoritative for the local stdio MCP namespace.
-- `plugin-status` and `namespace-status` report whether the repo plugin
-  manifest version is installed in the local plugin cache, without returning
-  cache paths.
-- `namespace-status.ok` must mean the MCP server, local plugin cache, active
-  Codex client config, and active `CODEX_HOME` context are ready. Keep
-  `mcp_server_ready`, `plugin_cache_ready`, `client_config_ready`, and
-  `active_home_ready` separate so server startup can be distinguished from
-  stale client/plugin state, mismatched config, or a managed Agentin home.
-- `running_process_summary.namespace_visibility` must return only aggregate
-  client-home categories. Use it to distinguish custom homes that need their
-  own MCP config from managed Agentin homes that are expected not to expose
-  Master MCP tools.
-- `doctor` must report the active `CODEX_HOME` category and the
-  `codex-master-mcp` `startup_timeout_sec` health without returning the active
-  home path.
-- `status` must classify known Codex TUI starter/placeholder context as
-  metadata-only `tui_context` and must not return pane text.
-- `status` may classify bounded pane/log text into metadata-only response and
-  limit states, but it must not return the classified text. Daily, weekly,
-  token, quota, and rate limits must keep default Agentinnen-model limits
-  separate from Spark write-model limits, including separate session,
-  assignment, and inferred-limit model metadata.
-- `wait` may poll status for bounded time, defaulting to 120 seconds and
-  currently capped at 10 minutes, and return activity/stop/limit metadata, but
-  it must not return Agentin output. The default poll interval is 30 seconds;
-  the maximum poll interval is 900 seconds.
-- Mutating tools must use a per-Agentin lease so two Codex-CLI clients cannot
-  silently send assignments or text into the same Agentin. Lease conflicts must
-  be structured and retryable with `error_code`, `retryable`,
-  `retry_after_seconds`, and remaining lease seconds, but without returning
-  client identity, prompt text, Agentin output, or state paths. `claim` retries
-  forever by default for busy fremde Bienen, may also accept explicit finite
-  waits without a 600-second cap, and must sleep between retries without holding
-  the Agentin lifecycle lock. Explicit `claim` may recover a foreign held lease
-  only when the Agentin is not running, no process is using that managed
-  Agentin home, and local idle evidence is at least the stopped-grace threshold
-  old, default 120 seconds. This stopped-orphan recovery must not apply to
-  implicit send/report/interrupt mutations and must never override a running
-  foreign Agentin. Short-lived CLI invocations should derive a stable hidden
-  owner from `CODEX_THREAD_ID` when available; use `CODEX_MASTER_MCP_INSTANCE_ID`
-  only as an explicit override for controlled sessions.
-- Fresh `start` leases are transient and must be released after a successful
-  launch, so short-lived local CLI commands do not block the next command. A
-  pre-existing same-client claim must be preserved; use `claim` explicitly when
-  a connected Codex-CLI instance should reserve an Agentin after startup.
-- `capabilities` returns a bounded first plugin page plus counts/truncation
-  flags, not a complete broad plugin inventory.
-- `skills` returns bounded plugin/name pages plus total counts, offsets, limits,
-  and truncation flags so callers can deliberately enumerate more pages without
-  broad dumping. Symlinked skill roots and symlinked `SKILL.md` files are
-  ignored instead of being followed.
-- `assignments` and `last-assignment` return only assignment metadata. They
-  must not return prompt text, Agentin responses, local audit file paths, or
-  absolute local paths from historical `scope`/`write_paths` metadata.
-  `agent_assignment_report` is the explicit exception: after a known
-  assignment, it returns only a capped, ANSI-stripped, redacted terminal
-  excerpt.
-- Assignment audit retention is bounded to the newest 500 valid metadata
-  records in a local `0600` JSONL file. Assignment-log reads require regular
-  files, are capped, and use generic errors. Private state appends refuse
-  symlink paths, and private state file/directory errors must not expose local
-  state paths. Agentin metadata is written atomically, and nonce-suffixed
-  temporary replace files are created with no-follow exclusive semantics. Agentin metadata reads
-  reject symlinked and oversized files, and metadata presence checks do not
-  follow symlinks. Metadata read errors and legacy source markers must not
-  expose local file paths. Managed state directories and their parent chains
-  must be real directories, not symlinks or regular files.
-- Raw logs are local debug artifacts. New raw logs are bounded to 5 MiB per
-  file, managed raw-log directories retain at most 20 files by default, and
-  log-tail metadata paths must stay inside managed raw-log state. Prepared
-  raw-log files are created with no-follow exclusive semantics, and raw-log
-  symlinks are not followed. The direct raw-log writer rejects `--max-bytes`
-  values outside the active raw-log policy before touching state or paths,
-  verifies real managed state directories before accepting log input, and
-  symlinked legacy raw-log directories are ignored. Safe-tail log reads only
-  regular raw-log files.
-  Tmux control errors are redacted and bounded before they are returned or
-  raised. Public tool responses expose raw-log presence without returning local
-  raw-log paths. Failed starts must remove prepared raw-log files. External
-  `tmux`, `git`, and `codex mcp` subprocess calls must be timeout-bounded.
-  MCP registration checks must compare the exact `command:` field reported by
-  `codex mcp get`, not substring-match broad command output.
-  Agentin lifecycle operations that mutate or send into tmux sessions must be
-  serialized per Agentin with private no-follow lock files. Failed
-  `tmux new-session` attempts must not kill an already-existing session unless
-  this process first created the session and is cleaning up a later start step.
-- Assignment inputs are bounded before tmux interaction: sends/start prompts
-  12,000 chars, tasks 4,000 chars, names 80 chars, skill refs 300 chars,
-  path-like fields 1,000 chars, and assignment lists 50 items. MCP boolean and
-  integer arguments are type-checked; stringified values are rejected instead of
-  being coerced. Incoming MCP frames are capped at 1 MiB before JSON parsing.
-  Tool and RPC error texts are ANSI-stripped, redacted, and length-bounded
-  before they are returned. `tools/call` validates tool names, object-shaped
-  params and arguments, unknown argument names, required fields, value types,
-  enums, and declared bounds before dispatch. Local CLI tool commands must pass
-  through the same schema validation, with omitted optional arguments removed
-  before validation. Multiline sends and assignments must use bracketed paste
-  before tmux paste so the Codex TUI receives one prompt, not separate submitted
-  lines.
-- Worktree creation must reject existing targets, including broken symlinks,
-  and require every target parent directory to be a real directory. Worktree
-  creation and status must stay repo-scoped: relative escapes and absolute
-  targets outside the repo are rejected before running `git`, and create
-  responses return at most repo-relative paths, never absolute local paths.
-- Worktree status must reject symlinks and non-directory targets before running
-  `git status`, and public worktree status responses must not return local
-  worktree paths or absolute paths in git worktree excerpts.
-- Install and uninstall symlink operations must require the install-path parent
-  chain to be real directories. Install, uninstall, and doctor must resolve
-  install symlinks defensively: broken, looping, or unreadable symlinks are
-  non-matching, and doctor reports an unreadable target marker instead of
-  crashing. Install must persist `startup_timeout_sec = 120` for the active MCP
-  registration and refuse Master MCP registration from a managed Agentinnen
-  `CODEX_HOME`. Install must sync the personal `codex-master` plugin cache from
-  a runtime allowlist and exclude `.git`, tests, bytecode, test caches, hidden
-  files, editor swap files, and backup/patch leftovers. Plugin-cache sync must
-  copy regular files through no-follow file descriptors, verify source identity
-  after opening, reject hardlinked source files, and retain only the current
-  plus recent valid cached versions without pruning invalid, symlinked, or
-  pre-existing temp cache entries it did not create. Install
-  symlink creation/replacement must use an atomic same-directory temporary
-  symlink rename bound to a verified parent directory fd. Uninstall symlink
-  removal must also be bound to the verified parent directory fd so parent-swap
-  races cannot redirect the unlink. Public install responses must not return
-  plugin-cache paths.
-  Registering installs must data-sparse self-test both the repo
-  wrapper and the installed command path before registration. Public install
-  responses must not return the install path or repo-wrapper target path; return
-  state/kind fields instead. `doctor` must run the same data-sparse startup
-  self-test, tolerate unavailable commands without raw error output, and warn
-  without returning changed file names when the installed MCP points at a dirty
-  repo worktree.
-- The App Bridge identity lives in `.app.json`, declared from
-  `.codex-plugin/plugin.json` via `apps: "./.app.json"`. `app-bridge-status`
-  may return the connector ID because it is not secret, but it must not return
-  local manifest paths or raw file contents. ChatGPT Developer Mode connector
-  creation/refresh is still an external ChatGPT settings action against a
-  reachable HTTPS `/mcp` endpoint; the local stdio MCP is not published by the
-  App Bridge manifest alone.
-- `release-status` must remain diagnostic and data-sparse: it may return
-  public version/tag names, release drift counts, and blocker/warning codes, but
-  not local repo paths or raw `git`/`gh` command output. It should make stale
-  GitHub releases and local tags without GitHub releases visible without
-  forcing a release.
-- Use `tail` only for an explicit capped, ANSI-stripped, redacted excerpt. It
-  must refuse active leases held by another MCP client before reading pane or
-  log output.
-- Do not read raw tmux logs directly unless the user explicitly requests it and
-  the privacy impact is acceptable.
-
-## Delegation Templates
-
-Exploriererin:
-
-```text
-[EXPLORER_BEE_TASK]
-Name: {moderner weiblicher Name}
-Rolle: Exploriererin
-Auswahl: {aktuelle agent_selection_options generation plus angebotenes Tupel}
-Lifecycle: ephemeral
-Komplexitaet: {simple/medium/complex}
-Scope: {Dateien/Ordner/Webthema}
-Darf schreiben: nein
-Darf eigene Subagentinnen starten: {ja/nein, nur lesend im Scope}
-Aufgabe: {konkrete Frage}
-Rueckgabe: knappe Fakten, relevante Dateien/Zeilen, Empfehlung
-```
-
-Arbeitsbiene:
-
-```text
-[WORK_BEE_TASK]
-Name: {moderner weiblicher Name}
-Rolle: Arbeitsbiene
-Auswahl: {aktuelle agent_selection_options generation plus angebotenes Tupel}
-Lifecycle: {ephemeral/binding/persistent}
-Komplexitaet: {simple/medium/complex}
-Scope: {Dateien/Ordner}
-Darf schreiben: ja, nur {genaue Pfade}
-Darf eigene Subagentinnen starten: {ja/nein, nur innerhalb Scope und Schreibpfaden}
-Stabiler Kontext: {max. 8 Stichpunkte}
-Aktuelle Aufgabe: {konkreter Fix}
-Grenzen: {was nicht anfassen}
-Rueckgabe: Root Cause, Aenderung, Tests, offene Risiken
-```
+Die Referenzen werden nur für die jeweilige Rolle oder Diagnose geladen.
