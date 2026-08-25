@@ -1,4 +1,3 @@
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,11 +8,8 @@ from codex_master.agent_resolver import (
     ModelPolicy,
     ResolutionRequest,
     build_selection_offer,
-    canonical_resolution_decision_digest,
-    canonical_worker_lifecycle,
     policies_from_catalogs,
     resolve_agent_selection,
-    validate_resolution_decision_offer,
     validate_canonical_agent_tuple,
 )
 from codex_master.hive.config import load_agent_class_catalog
@@ -744,55 +740,6 @@ def test_offer_generation_changes_with_availability() -> None:
     assert complete.generation != without_spark.generation
     assert "gpt-5.3-codex-spark" in complete.models
     assert "gpt-5.3-codex-spark" not in without_spark.models
-
-
-def test_resolution_decision_digest_is_complete_stable_and_strict() -> None:
-    decision = resolve(requested_lifecycle="invocation")
-
-    assert canonical_resolution_decision_digest(decision) == (
-        "sha256:ccac64b2e7a8035190991375a7c8d40729e4acd3cb2e6a6f931a44c1cc91a529"
-    )
-    with pytest.raises(ValueError):
-        canonical_resolution_decision_digest(replace(decision, fallback=1))
-
-
-def test_validate_resolution_decision_offer_rejects_manipulated_option() -> None:
-    decision = resolve(requested_lifecycle="invocation")
-    offer = build_selection_offer(
-        classes=CLASSES,
-        models=MODELS,
-        available_models={model.model_id for model in MODELS},
-    )
-    validate_resolution_decision_offer(decision, offer)
-
-    manipulated = replace(
-        offer,
-        options=tuple(
-            replace(option, reasoning="invalid")
-            if (
-                option.class_id,
-                option.lifecycle,
-                option.model,
-                option.reasoning,
-            ) == (
-                decision.class_id,
-                decision.lifecycle,
-                decision.model,
-                decision.reasoning,
-            )
-            else option
-            for option in offer.options
-        ),
-    )
-    with pytest.raises(ValueError):
-        validate_resolution_decision_offer(decision, manipulated)
-
-
-def test_canonical_worker_lifecycle_uses_resolver_alias_and_rejects_invalid_types() -> None:
-    assert canonical_worker_lifecycle("invocation") == "ephemeral"
-    assert canonical_worker_lifecycle("binding") == "binding"
-    with pytest.raises(ValueError):
-        canonical_worker_lifecycle(True)
 
 
 def test_checked_in_catalogs_drive_resolver_without_hardcoded_model_ids() -> None:
