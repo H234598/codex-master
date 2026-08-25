@@ -97,7 +97,35 @@
         "enabled": {"type": "boolean"}
       }
     },
+    "dynamic_worker_principal": {
+      "type": "object",
+      "required": [
+        "principal_id", "ticket_id", "ticket_ledger_revision", "ticket_fence_epoch",
+        "ticket_resolution_generation", "ticket_policy_digest", "ticket_policy_generation",
+        "capability_binding_digest", "resolution_decision_digest", "resolver_offer_generation",
+        "lease_binding_digest", "class_id", "lifecycle", "model", "reasoning", "enabled"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "principal_id": {"type": "string", "pattern": "^dw-[0-9a-f]{32}$"},
+        "ticket_id": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"},
+        "ticket_ledger_revision": {"type": "integer", "minimum": 0},
+        "ticket_fence_epoch": {"type": "integer", "minimum": 0},
+        "ticket_resolution_generation": {"type": "integer", "minimum": 0},
+        "ticket_policy_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "ticket_policy_generation": {"type": "integer", "minimum": 0},
+        "capability_binding_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "resolution_decision_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "resolver_offer_generation": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "lease_binding_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "class_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"},
+        "lifecycle": {"type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"},
+        "model": {"type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"},
+        "reasoning": {"type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"},
+        "enabled": {"type": "boolean"}
+      }
+    },
     "v1": {"type": "object", "required": ["schema_version", "generation", "accounts", "series"], "additionalProperties": false, "properties": {"schema_version": {"const": 1}, "generation": {"type": "integer", "minimum": 0}, "accounts": {"type": "array", "maxItems": 64, "items": {"allOf": [{"$ref": "#/$defs/account"}, {"not": {"required": ["credential_binding_id"]}}]}}, "series": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/v1_series"}}}},
-    "v2": {"type": "object", "required": ["schema_version", "generation", "accounts", "series", "runtime_principals"], "additionalProperties": false, "properties": {"schema_version": {"const": 2}, "generation": {"type": "integer", "minimum": 0}, "accounts": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/v2_account"}}, "series": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/v2_series"}}, "runtime_principals": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/runtime_principal"}}}}
+    "v2": {"type": "object", "required": ["schema_version", "generation", "accounts", "series", "runtime_principals"], "additionalProperties": false, "properties": {"schema_version": {"const": 2}, "generation": {"type": "integer", "minimum": 0}, "accounts": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/v2_account"}}, "series": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/v2_series"}}, "runtime_principals": {"type": "array", "maxItems": 64, "items": {"oneOf": [{"$ref": "#/$defs/runtime_principal"}, {"$ref": "#/$defs/dynamic_worker_principal"}]}}}}
   }
 }

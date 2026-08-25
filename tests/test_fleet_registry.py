@@ -9,6 +9,15 @@ from pathlib import Path
 
 import pytest
 
+import codex_master.fleet_registry as fleet_registry
+from codex_master.agent_resolver import (
+    AgentClassPolicy,
+    ModelPolicy,
+    ResolutionRequest,
+    build_selection_offer,
+    canonical_resolution_decision_digest,
+    resolve_agent_selection,
+)
 from codex_master.fleet_registry import (
     AuthKind,
     FleetAccount,
@@ -37,6 +46,19 @@ from codex_master.fleet_registry import (
     public_fleet_snapshot,
     _next,
 )
+from codex_master.worker_resolution_carrier import (
+    WorkerResolutionEvidenceV2,
+    build_worker_registry_reservation,
+    build_worker_resolution_carrier,
+)
+from codex_master.worker_resume import WorkerLifecycle
+from codex_master.worker_spawn_ledger import (
+    FenceEpoch,
+    Generation,
+    LedgerRevision,
+    SpawnPhase,
+    WorkerSpawnTicketV2,
+)
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -52,6 +74,92 @@ def valid_runtime_principal_document() -> dict[str, object]:
 
 def runtime_principal_dict(document: dict[str, object]) -> dict[str, object]:
     return deepcopy(document["runtime_principals"][0])  # type: ignore[index]
+
+
+def _digest(char: str) -> str:
+    return "sha256:" + char * 64
+
+
+def worker_registry_reservation(
+    *, principal_id: str = "dw-" + "7" * 32, ticket_id: str = "ticket:worker-7"
+) -> object:
+    classes = (
+        AgentClassPolicy(
+            "arbeitsbiene",
+            "ephemeral",
+            ("ephemeral", "binding", "persistent"),
+            ("luna",),
+            "low",
+            "xhigh",
+            ("read", "write"),
+        ),
+    )
+    models = (
+        ModelPolicy(
+            "gpt-5.6-luna",
+            "luna",
+            20,
+            ("low", "medium", "high", "xhigh"),
+            ("read", "write"),
+        ),
+    )
+    request = ResolutionRequest(
+        "read",
+        "simple",
+        requested_class="arbeitsbiene",
+        requested_lifecycle="invocation",
+    )
+    decision = resolve_agent_selection(
+        request, classes=classes, models=models, available_models={"gpt-5.6-luna"}
+    )
+    offer = build_selection_offer(
+        classes=classes, models=models, available_models={"gpt-5.6-luna"}
+    )
+    ticket = WorkerSpawnTicketV2(
+        ticket_id=ticket_id,
+        request_id=ticket_id.removeprefix("ticket:"),
+        requester_principal_id="worker-11",
+        requester_authority_digest=_digest("a"),
+        work_package_id="work-package-8",
+        topic_digest=_digest("b"),
+        target_class_id=decision.class_id,
+        authorized_teamlead_id="teamlead-2",
+        authorized_teamlead_authority_digest=_digest("c"),
+        resolution_decision_digest=canonical_resolution_decision_digest(decision),
+        resolution_generation=Generation(4),
+        policy_digest=_digest("d"),
+        policy_generation=Generation(9),
+        lifecycle=WorkerLifecycle.INVOCATION,
+        resume_requirement=False,
+        fence_epoch=FenceEpoch(6),
+        ledger_revision=LedgerRevision(1),
+        phase=SpawnPhase.REQUESTED,
+    )
+    evidence = WorkerResolutionEvidenceV2(
+        decision=decision,
+        offer=offer,
+        offer_generation=offer.generation,
+        capability_binding_digest=_digest("e"),
+        resolution_generation=ticket.resolution_generation,
+        policy_digest=ticket.policy_digest,
+        policy_generation=ticket.policy_generation,
+        ticket_fence_epoch=ticket.fence_epoch,
+    )
+    carrier = build_worker_resolution_carrier(ticket, evidence)
+    return build_worker_registry_reservation(
+        resolution=carrier,
+        principal_id=principal_id,
+        ticket_ledger_revision=ticket.ledger_revision,
+        ticket_fence_epoch=ticket.fence_epoch,
+    )
+
+
+def empty_worker_snapshot() -> FleetSnapshotV2:
+    document = load_fixture("fleet-registry-v2.json")
+    document["runtime_principals"] = []
+    snapshot = normalize_fleet_document(document)
+    assert isinstance(snapshot, FleetSnapshotV2)
+    return snapshot
 
 
 def test_v1_fixture_expands_deterministically_without_final_member_ids() -> None:
@@ -149,6 +257,15 @@ def test_v2_rejects_invalid_runtime_principal_fields(field: str, value: object) 
     document["runtime_principals"][0][field] = value  # type: ignore[index]
     with pytest.raises(FleetValidationError) as caught:
         normalize_fleet_document(document)
+    assert caught.value.code == "invalid_runtime_principal"
+
+    teamlead = runtime_principal_dict(load_fixture("fleet-registry-v2.json"))
+    teamlead["principal_id"] = "dw-" + "8" * 32
+    with pytest.raises(FleetValidationError) as caught:
+        normalize_fleet_document({
+            **load_fixture("fleet-registry-v2.json"),
+            "runtime_principals": [teamlead],
+        })
     assert caught.value.code == "invalid_runtime_principal"
 
 
@@ -288,6 +405,240 @@ def test_v2_runtime_principal_planners_apply_cas_and_disable_before_delete() -> 
     )
     assert deleted.generation == disabled.generation + 1
     assert deleted.runtime_principals == ()
+
+
+def test_dynamic_worker_principal_round_trips_complete_resolution_carrier() -> None:
+    snapshot = empty_worker_snapshot()
+    reservation = worker_registry_reservation()
+    lease_binding_digest = _digest("f")
+
+    reserved = fleet_registry.plan_dynamic_worker_principal_reserve(
+        snapshot,
+        reservation,
+        lease_binding_digest=lease_binding_digest,
+        expected_generation=snapshot.generation,
+    )
+    principal = reserved.runtime_principals[0]
+
+    assert isinstance(principal, fleet_registry.FleetDynamicWorkerPrincipalV2)
+    assert principal.principal_id == "dw-" + "7" * 32
+    assert principal.ticket_id == "ticket:worker-7"
+    assert principal.lease_binding_digest == lease_binding_digest
+    assert principal.class_id == "arbeitsbiene"
+    assert principal.lifecycle == "ephemeral"
+    assert principal.model == "gpt-5.6-luna"
+    assert principal.reasoning == "medium"
+    assert principal.ticket_ledger_revision == 1
+    assert principal.ticket_fence_epoch == 6
+    assert principal.ticket_resolution_generation == 4
+    assert principal.ticket_policy_generation == 9
+    assert principal.ticket_policy_digest == _digest("d")
+    assert principal.capability_binding_digest == _digest("e")
+    assert normalize_fleet_document(fleet_document(reserved)) == reserved
+
+
+def test_dynamic_worker_reserve_rejects_bad_or_leadership_carrier() -> None:
+    snapshot = empty_worker_snapshot()
+
+    with pytest.raises(FleetValidationError) as caught:
+        fleet_registry.plan_dynamic_worker_principal_reserve(
+            snapshot,
+            object(),
+            lease_binding_digest=_digest("f"),
+            expected_generation=snapshot.generation,
+        )
+    assert caught.value.code == "invalid_worker_registry_reservation"
+
+    with pytest.raises(FleetValidationError) as caught:
+        fleet_registry.plan_dynamic_worker_principal_reserve(
+            snapshot,
+            worker_registry_reservation(principal_id="tl-" + "8" * 32),
+            lease_binding_digest=_digest("f"),
+            expected_generation=snapshot.generation,
+        )
+    assert caught.value.code == "invalid_runtime_principal"
+
+
+def test_dynamic_worker_principal_ids_separate_teamlead_and_worker() -> None:
+    document = fleet_document(
+        fleet_registry.plan_dynamic_worker_principal_reserve(
+            empty_worker_snapshot(),
+            worker_registry_reservation(),
+            lease_binding_digest=_digest("f"),
+            expected_generation=5,
+        )
+    )
+    worker = document["runtime_principals"][0]  # type: ignore[index]
+    worker["principal_id"] = "tl-" + "7" * 32  # type: ignore[index]
+    worker["class_id"] = "teamleiterin"  # type: ignore[index]
+    with pytest.raises(FleetValidationError) as caught:
+        normalize_fleet_document(document)
+    assert caught.value.code == "invalid_runtime_principal"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("principal_id", "dw-not-hex"),
+        ("ticket_id", ""),
+        ("lease_binding_digest", "sha256:short"),
+        ("ticket_policy_digest", "sha256:short"),
+        ("capability_binding_digest", "sha256:short"),
+        ("resolution_decision_digest", "sha256:short"),
+        ("resolver_offer_generation", "sha256:short"),
+        ("class_id", ""),
+        ("enabled", "true"),
+    ],
+)
+def test_dynamic_worker_principal_rejects_malformed_structural_fields(
+    field: str, value: object
+) -> None:
+    reserved = fleet_registry.plan_dynamic_worker_principal_reserve(
+        empty_worker_snapshot(),
+        worker_registry_reservation(),
+        lease_binding_digest=_digest("f"),
+        expected_generation=5,
+    )
+    document = fleet_document(reserved)
+    document["runtime_principals"][0][field] = value  # type: ignore[index]
+    with pytest.raises(FleetValidationError) as caught:
+        normalize_fleet_document(document)
+    assert caught.value.code == "invalid_runtime_principal"
+
+
+def test_dynamic_worker_principal_accepts_structural_policy_values() -> None:
+    reserved = fleet_registry.plan_dynamic_worker_principal_reserve(
+        empty_worker_snapshot(),
+        worker_registry_reservation(),
+        lease_binding_digest=_digest("f"),
+        expected_generation=5,
+    )
+    document = fleet_document(reserved)
+    document["runtime_principals"][0].update(  # type: ignore[index]
+        class_id="locally-unknown-class",
+        lifecycle="locally-unknown-lifecycle",
+        model="locally-unknown-model",
+        reasoning="locally-unknown-reasoning",
+    )
+    normalized = normalize_fleet_document(document)
+    assert normalized.runtime_principals[0].class_id == "locally-unknown-class"
+
+
+def test_dynamic_worker_reserve_is_generation_bound_and_never_upserts() -> None:
+    snapshot = empty_worker_snapshot()
+    reservation = worker_registry_reservation()
+
+    with pytest.raises(FleetValidationError, match="generation_conflict"):
+        fleet_registry.plan_dynamic_worker_principal_reserve(
+            snapshot,
+            reservation,
+            lease_binding_digest=_digest("f"),
+            expected_generation=snapshot.generation + 1,
+        )
+
+    reserved = fleet_registry.plan_dynamic_worker_principal_reserve(
+        snapshot,
+        reservation,
+        lease_binding_digest=_digest("f"),
+        expected_generation=snapshot.generation,
+    )
+    with pytest.raises(FleetValidationError, match="worker_principal_collision"):
+        fleet_registry.plan_dynamic_worker_principal_reserve(
+            reserved,
+            reservation,
+            lease_binding_digest=_digest("f"),
+            expected_generation=reserved.generation,
+        )
+    assert reserved.generation == snapshot.generation + 1
+    assert snapshot.runtime_principals == ()
+
+    with pytest.raises(FleetValidationError, match="worker_ticket_collision"):
+        fleet_registry.plan_dynamic_worker_principal_reserve(
+            reserved,
+            worker_registry_reservation(principal_id="dw-" + "8" * 32),
+            lease_binding_digest=_digest("e"),
+            expected_generation=reserved.generation,
+        )
+
+    with pytest.raises(FleetValidationError, match="worker_lease_collision"):
+        fleet_registry.plan_dynamic_worker_principal_reserve(
+            reserved,
+            worker_registry_reservation(
+                principal_id="dw-" + "8" * 32, ticket_id="ticket:worker-8"
+            ),
+            lease_binding_digest=_digest("f"),
+            expected_generation=reserved.generation,
+        )
+
+
+def test_dynamic_worker_release_requires_exact_reservation() -> None:
+    snapshot = empty_worker_snapshot()
+    reservation = worker_registry_reservation()
+    reserved = fleet_registry.plan_dynamic_worker_principal_reserve(
+        snapshot,
+        reservation,
+        lease_binding_digest=_digest("f"),
+        expected_generation=snapshot.generation,
+    )
+
+    with pytest.raises(FleetValidationError, match="worker_reservation_mismatch"):
+        fleet_registry.plan_dynamic_worker_principal_release(
+            reserved,
+            worker_registry_reservation(ticket_id="ticket:worker-drift"),
+            lease_binding_digest=_digest("f"),
+            expected_generation=reserved.generation,
+        )
+
+    released = fleet_registry.plan_dynamic_worker_principal_release(
+        reserved,
+        reservation,
+        lease_binding_digest=_digest("f"),
+        expected_generation=reserved.generation,
+    )
+    assert released.generation == reserved.generation + 1
+    assert released.runtime_principals == ()
+    assert reserved.runtime_principals != ()
+
+
+def test_public_snapshot_excludes_all_dynamic_worker_private_markers() -> None:
+    reserved = fleet_registry.plan_dynamic_worker_principal_reserve(
+        empty_worker_snapshot(),
+        worker_registry_reservation(),
+        lease_binding_digest=_digest("f"),
+        expected_generation=5,
+    )
+    rendered = json.dumps(public_fleet_snapshot(reserved))
+    for marker in (
+        "dw-" + "7" * 32,
+        "ticket:worker-7",
+        _digest("f"),
+        "arbeitsbiene",
+        "ephemeral",
+        "gpt-5.6-luna",
+        "ticket_id",
+        "lease_binding_digest",
+        "capability_binding_digest",
+        "policy_digest",
+        "home",
+        "path",
+    ):
+        assert marker not in rendered
+
+
+def test_registry_schema_discriminates_teamlead_and_dynamic_worker_principals() -> None:
+    schema = json.loads(
+        (
+            Path(__file__).parents[1] / "schemas" / "codex-fleet-registry.schema.json"
+        ).read_text()
+    )
+    items = schema["$defs"]["v2"]["properties"]["runtime_principals"]["items"]
+    assert {item["$ref"] for item in items["oneOf"]} == {
+        "#/$defs/runtime_principal",
+        "#/$defs/dynamic_worker_principal",
+    }
+    worker = schema["$defs"]["dynamic_worker_principal"]
+    assert worker["properties"]["principal_id"]["pattern"] == "^dw-[0-9a-f]{32}$"
+    assert worker["additionalProperties"] is False
 
 
 @pytest.mark.parametrize("member_id", [None, "v1:g:1", "11111111-1111-1111-8111-111111111111",

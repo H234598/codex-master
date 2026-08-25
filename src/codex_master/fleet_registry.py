@@ -12,6 +12,11 @@ from types import MappingProxyType
 from typing import Any
 from unicodedata import category
 
+from codex_master.agent_resolver import LEADERSHIP_CLASS_IDS
+from codex_master.worker_resolution_carrier import (
+    WorkerRegistryReservationV2,
+    WorkerResolutionCarrierV2,
+)
 
 MAX_DOCUMENT_BYTES = 1024 * 1024
 MAX_ACCOUNTS = 64
@@ -25,6 +30,8 @@ _LIMIT_REASON_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _PROFILE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _CREDENTIAL_BINDING_HMAC_RE = re.compile(r"hmac-sha256:[0-9a-f]{64}\Z")
 _RUNTIME_PRINCIPAL_ID_RE = re.compile(r"tl-[0-9a-f]{32}\Z")
+_DYNAMIC_WORKER_PRINCIPAL_ID_RE = re.compile(r"dw-[0-9a-f]{32}\Z")
+_SHA256_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _RFC3339_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})\Z"
 )
@@ -212,12 +219,40 @@ class FleetRuntimePrincipalV2:
 
 
 @dataclass(frozen=True, slots=True)
+class FleetDynamicWorkerPrincipalV2:
+    principal_id: str
+    ticket_id: str
+    ticket_ledger_revision: int
+    ticket_fence_epoch: int
+    ticket_resolution_generation: int
+    ticket_policy_digest: str
+    ticket_policy_generation: int
+    capability_binding_digest: str
+    resolution_decision_digest: str
+    resolver_offer_generation: str
+    lease_binding_digest: str
+    class_id: str
+    lifecycle: str
+    model: str
+    reasoning: str
+    enabled: bool
+
+    def __repr__(self) -> str:
+        return "FleetDynamicWorkerPrincipalV2(<redacted>)"
+
+    def __str__(self) -> str:
+        return repr(self)
+
+
+@dataclass(frozen=True, slots=True)
 class FleetSnapshotV2:
     schema_version: int
     generation: int
     accounts: tuple[FleetAccountV2, ...]
     series: tuple[FleetSeriesV2, ...]
-    runtime_principals: tuple[FleetRuntimePrincipalV2, ...]
+    runtime_principals: tuple[
+        FleetRuntimePrincipalV2 | FleetDynamicWorkerPrincipalV2, ...
+    ]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "accounts", tuple(self.accounts))
@@ -307,6 +342,26 @@ _RUNTIME_PRINCIPAL_FIELDS = frozenset({
     "principal_id", "account_id", "profile_id", "credential_binding_id", "class_id",
     "lifecycle", "provider", "runner", "model", "reasoning", "enabled",
 })
+_DYNAMIC_WORKER_PRINCIPAL_FIELDS = frozenset(
+    {
+        "principal_id",
+        "ticket_id",
+        "ticket_ledger_revision",
+        "ticket_fence_epoch",
+        "ticket_resolution_generation",
+        "ticket_policy_digest",
+        "ticket_policy_generation",
+        "capability_binding_digest",
+        "resolution_decision_digest",
+        "resolver_offer_generation",
+        "lease_binding_digest",
+        "class_id",
+        "lifecycle",
+        "model",
+        "reasoning",
+        "enabled",
+    }
+)
 
 
 def _fail(code: str) -> None:
@@ -521,9 +576,77 @@ def _series_v2(value: object) -> FleetSeriesV2:
     )
 
 
-def _runtime_principal(value: object) -> FleetRuntimePrincipalV2:
+def _dynamic_worker_principal(
+    value: Mapping[str, object],
+) -> FleetDynamicWorkerPrincipalV2:
+    code = "invalid_runtime_principal"
+    if set(
+        value
+    ) - _DYNAMIC_WORKER_PRINCIPAL_FIELDS or _DYNAMIC_WORKER_PRINCIPAL_FIELDS - set(
+        value
+    ):
+        _fail(code)
+    principal_id = _text(value["principal_id"], minimum=35, maximum=35, code=code)
+    if not _DYNAMIC_WORKER_PRINCIPAL_ID_RE.fullmatch(principal_id):
+        _fail(code)
+    ticket_id = _text(value["ticket_id"], minimum=1, maximum=256, code=code)
+    digest_fields = (
+        "ticket_policy_digest",
+        "capability_binding_digest",
+        "resolution_decision_digest",
+        "resolver_offer_generation",
+        "lease_binding_digest",
+    )
+    digests: dict[str, str] = {}
+    for field in digest_fields:
+        digest = _text(value[field], minimum=71, maximum=71, code=code)
+        if not _SHA256_DIGEST_RE.fullmatch(digest):
+            _fail(code)
+        digests[field] = digest
+    counter_fields = (
+        "ticket_ledger_revision", "ticket_fence_epoch", "ticket_resolution_generation",
+        "ticket_policy_generation",
+    )
+    counters: dict[str, int] = {}
+    for field in counter_fields:
+        counter = value[field]
+        if (
+            isinstance(counter, bool)
+            or not isinstance(counter, int)
+            or not 0 <= counter <= MAX_GENERATION
+        ):
+            _fail(code)
+        counters[field] = counter
+    return FleetDynamicWorkerPrincipalV2(
+        principal_id=principal_id,
+        ticket_id=ticket_id,
+        ticket_ledger_revision=counters["ticket_ledger_revision"],
+        ticket_fence_epoch=counters["ticket_fence_epoch"],
+        ticket_resolution_generation=counters["ticket_resolution_generation"],
+        ticket_policy_digest=digests["ticket_policy_digest"],
+        ticket_policy_generation=counters["ticket_policy_generation"],
+        capability_binding_digest=digests["capability_binding_digest"],
+        resolution_decision_digest=digests["resolution_decision_digest"],
+        resolver_offer_generation=digests["resolver_offer_generation"],
+        lease_binding_digest=digests["lease_binding_digest"],
+        class_id=_text(value["class_id"], minimum=1, maximum=128, code=code),
+        lifecycle=_text(value["lifecycle"], minimum=1, maximum=32, code=code),
+        model=_text(value["model"], minimum=1, maximum=200, code=code),
+        reasoning=_text(value["reasoning"], minimum=1, maximum=32, code=code),
+        enabled=_boolean(value["enabled"], code),
+    )
+
+
+def _runtime_principal(
+    value: object,
+) -> FleetRuntimePrincipalV2 | FleetDynamicWorkerPrincipalV2:
     code = "invalid_runtime_principal"
     raw = _mapping(value, code)
+    principal_id = raw.get("principal_id")
+    if isinstance(principal_id, str) and _DYNAMIC_WORKER_PRINCIPAL_ID_RE.fullmatch(
+        principal_id
+    ):
+        return _dynamic_worker_principal(raw)
     if set(raw) - _RUNTIME_PRINCIPAL_FIELDS or _RUNTIME_PRINCIPAL_FIELDS - set(raw):
         _fail(code)
     principal_id = _text(raw["principal_id"], minimum=1, maximum=35, code=code)
@@ -644,6 +767,8 @@ def normalize_fleet_document(raw: object) -> FleetSnapshot | FleetSnapshotV2:
         if len(bindings) != len(set(bindings)):
             _fail("duplicate_credential_binding")
         for principal in runtime_principals:
+            if isinstance(principal, FleetDynamicWorkerPrincipalV2):
+                continue
             account = accounts_by_id.get(principal.account_id)
             if (
                 account is None
@@ -698,11 +823,40 @@ def fleet_document(snapshot: FleetSnapshot | FleetSnapshotV2 | FleetMigrationSna
                 for item in snapshot.series
             ],
             "runtime_principals": [
-                {"principal_id": item.principal_id, "account_id": item.account_id,
-                 "profile_id": item.profile_id, "credential_binding_id": item.credential_binding_id,
-                 "class_id": item.class_id, "lifecycle": item.lifecycle,
-                 "provider": item.provider.value, "runner": item.runner.value,
-                 "model": item.model, "reasoning": item.reasoning, "enabled": item.enabled}
+                (
+                    {
+                        "principal_id": item.principal_id,
+                        "account_id": item.account_id,
+                        "profile_id": item.profile_id,
+                        "credential_binding_id": item.credential_binding_id,
+                        "class_id": item.class_id,
+                        "lifecycle": item.lifecycle,
+                        "provider": item.provider.value,
+                        "runner": item.runner.value,
+                        "model": item.model,
+                        "reasoning": item.reasoning,
+                        "enabled": item.enabled,
+                    }
+                    if isinstance(item, FleetRuntimePrincipalV2)
+                    else {
+                        "principal_id": item.principal_id,
+                        "ticket_id": item.ticket_id,
+                        "ticket_ledger_revision": item.ticket_ledger_revision,
+                        "ticket_fence_epoch": item.ticket_fence_epoch,
+                        "ticket_resolution_generation": item.ticket_resolution_generation,
+                        "ticket_policy_digest": item.ticket_policy_digest,
+                        "ticket_policy_generation": item.ticket_policy_generation,
+                        "capability_binding_digest": item.capability_binding_digest,
+                        "resolution_decision_digest": item.resolution_decision_digest,
+                        "resolver_offer_generation": item.resolver_offer_generation,
+                        "lease_binding_digest": item.lease_binding_digest,
+                        "class_id": item.class_id,
+                        "lifecycle": item.lifecycle,
+                        "model": item.model,
+                        "reasoning": item.reasoning,
+                        "enabled": item.enabled,
+                    }
+                )
                 for item in snapshot.runtime_principals
             ],
         }
@@ -840,10 +994,16 @@ def _generation(snapshot: FleetSnapshot | FleetSnapshotV2, expected_generation: 
         _fail("generation_conflict")
 
 
-def _next(snapshot: FleetSnapshot | FleetSnapshotV2, *,
-          accounts: Iterable[FleetAccount] | Iterable[FleetAccountV2] | None = None,
-          series: Iterable[FleetSeries] | Iterable[FleetSeriesV2] | None = None,
-          runtime_principals: Iterable[FleetRuntimePrincipalV2] | None = None) -> FleetSnapshot | FleetSnapshotV2:
+def _next(
+    snapshot: FleetSnapshot | FleetSnapshotV2,
+    *,
+    accounts: Iterable[FleetAccount] | Iterable[FleetAccountV2] | None = None,
+    series: Iterable[FleetSeries] | Iterable[FleetSeriesV2] | None = None,
+    runtime_principals: Iterable[
+        FleetRuntimePrincipalV2 | FleetDynamicWorkerPrincipalV2
+    ]
+    | None = None,
+) -> FleetSnapshot | FleetSnapshotV2:
     if snapshot.generation >= MAX_GENERATION:
         _fail("invalid_document")
     if isinstance(snapshot, FleetSnapshotV2):
@@ -875,6 +1035,100 @@ def plan_account_upsert(
         _fail("invalid_account")
     accounts = [item for item in snapshot.accounts if item.account_id != account.account_id] + [account]
     return _next(snapshot, accounts=accounts)
+
+
+def _dynamic_worker_from_reservation(
+    reservation: object, lease_binding_digest: object
+) -> FleetDynamicWorkerPrincipalV2:
+    if type(reservation) is not WorkerRegistryReservationV2:
+        _fail("invalid_worker_registry_reservation")
+    resolution = reservation.resolution
+    if type(resolution) is not WorkerResolutionCarrierV2:
+        _fail("invalid_worker_registry_reservation")
+    if reservation.ticket_fence_epoch != resolution.ticket_fence_epoch:
+        _fail("invalid_worker_registry_reservation")
+    if resolution.decision.class_id in LEADERSHIP_CLASS_IDS:
+        _fail("invalid_runtime_principal")
+    return _dynamic_worker_principal(
+        {
+            "principal_id": reservation.principal_id,
+            "ticket_id": resolution.ticket_id,
+            "ticket_ledger_revision": reservation.ticket_ledger_revision.value,
+            "ticket_fence_epoch": reservation.ticket_fence_epoch.value,
+            "ticket_resolution_generation": resolution.ticket_resolution_generation.value,
+            "ticket_policy_digest": resolution.ticket_policy_digest,
+            "ticket_policy_generation": resolution.ticket_policy_generation.value,
+            "capability_binding_digest": resolution.capability_binding_digest,
+            "resolution_decision_digest": resolution.resolution_decision_digest,
+            "resolver_offer_generation": resolution.resolver_offer_generation,
+            "lease_binding_digest": lease_binding_digest,
+            "class_id": resolution.decision.class_id,
+            "lifecycle": resolution.decision.lifecycle,
+            "model": resolution.decision.model,
+            "reasoning": resolution.decision.reasoning,
+            "enabled": True,
+        }
+    )
+
+
+def plan_dynamic_worker_principal_reserve(
+    snapshot: FleetSnapshotV2,
+    reservation: WorkerRegistryReservationV2,
+    *,
+    lease_binding_digest: object,
+    expected_generation: int,
+) -> FleetSnapshotV2:
+    if not isinstance(snapshot, FleetSnapshotV2):
+        _fail("invalid_document")
+    _generation(snapshot, expected_generation)
+    principal = _dynamic_worker_from_reservation(reservation, lease_binding_digest)
+    workers = [
+        item
+        for item in snapshot.runtime_principals
+        if isinstance(item, FleetDynamicWorkerPrincipalV2)
+    ]
+    if any(item.principal_id == principal.principal_id for item in workers):
+        _fail("worker_principal_collision")
+    if any(item.ticket_id == principal.ticket_id for item in workers):
+        _fail("worker_ticket_collision")
+    if any(
+        item.lease_binding_digest == principal.lease_binding_digest for item in workers
+    ):
+        _fail("worker_lease_collision")
+    return _next(
+        snapshot,
+        runtime_principals=[*snapshot.runtime_principals, principal],
+    )  # type: ignore[return-value]
+
+
+def plan_dynamic_worker_principal_release(
+    snapshot: FleetSnapshotV2,
+    reservation: WorkerRegistryReservationV2,
+    *,
+    lease_binding_digest: object,
+    expected_generation: int,
+) -> FleetSnapshotV2:
+    if not isinstance(snapshot, FleetSnapshotV2):
+        _fail("invalid_document")
+    _generation(snapshot, expected_generation)
+    expected = _dynamic_worker_from_reservation(reservation, lease_binding_digest)
+    existing = next(
+        (
+            item
+            for item in snapshot.runtime_principals
+            if isinstance(item, FleetDynamicWorkerPrincipalV2)
+            and item.principal_id == expected.principal_id
+        ),
+        None,
+    )
+    if existing != expected:
+        _fail("worker_reservation_mismatch")
+    return _next(
+        snapshot,
+        runtime_principals=[
+            item for item in snapshot.runtime_principals if item != expected
+        ],
+    )  # type: ignore[return-value]
 
 
 def plan_runtime_principal_upsert(
