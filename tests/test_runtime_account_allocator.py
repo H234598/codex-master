@@ -137,6 +137,7 @@ class _AtomicAdapter:
             account_binding_digest="account-from-adapter",
             profile_binding_digest="profile-from-adapter",
             provider_adapter_id=self.adapter_id,
+            capacity_evidence=capacity_evidence,
             lease_revision=reservation_number,
             evidence_revision=capacity_evidence.evidence_revision,
             fencing_token=capacity_evidence.fencing_token,
@@ -274,6 +275,55 @@ def test_allocator_rejects_invalid_missing_or_offer_mismatched_decisions() -> No
         assert adapter.reserve_calls == 0
 
 
+def test_allocator_rejects_malformed_generation_even_when_all_copies_match() -> None:
+    module = _allocator_module()
+    adapter = _AtomicAdapter(module)
+    offer, _decision = _real_resolution_contract()
+    malformed_generation = "generation-without-central-content-digest"
+    ticket = _central_ticket(
+        module,
+        selection_offer=dataclasses.replace(
+            offer,
+            generation=malformed_generation,
+        ),
+        resolver_offer_generation=malformed_generation,
+    )
+    evidence = _unselected_capacity_evidence(
+        module,
+        resolver_offer_generation=malformed_generation,
+    )
+
+    _assert_sparse_denial(
+        module,
+        lambda: module.RuntimeAccountAllocator(adapter).allocate(ticket, evidence),
+    )
+
+    assert adapter.reserve_calls == 0
+
+
+def test_allocator_rejects_offer_with_unchanged_generation_and_extra_option() -> None:
+    module = _allocator_module()
+    adapter = _AtomicAdapter(module)
+    offer, _decision = _real_resolution_contract()
+    ticket = _central_ticket(
+        module,
+        selection_offer=dataclasses.replace(
+            offer,
+            options=(*offer.options, object()),
+        ),
+    )
+
+    _assert_sparse_denial(
+        module,
+        lambda: module.RuntimeAccountAllocator(adapter).allocate(
+            ticket,
+            _unselected_capacity_evidence(module),
+        ),
+    )
+
+    assert adapter.reserve_calls == 0
+
+
 def test_parallel_capacity_one_is_fenced_to_one_lease() -> None:
     module = _allocator_module()
     adapter = _AtomicAdapter(module)
@@ -368,6 +418,55 @@ def test_duplicate_lease_revision_is_rejected_and_compensated() -> None:
     )
 
     assert adapter.released_reservation_ids == ["reservation-2"]
+
+
+def test_active_reservation_replay_never_releases_existing_lease_owner() -> None:
+    module = _allocator_module()
+
+    class ReplayAdapter(_AtomicAdapter):
+        def __init__(self, allocator_module) -> None:
+            super().__init__(allocator_module)
+            self.replayed_reservation = None
+            self.external_active = False
+
+        def reserve_capability_atomically(
+            self, capability_binding_digest, capacity_evidence
+        ):
+            if self.replayed_reservation is None:
+                self.replayed_reservation = super().reserve_capability_atomically(
+                    capability_binding_digest,
+                    capacity_evidence,
+                )
+                self.external_active = True
+            else:
+                self.reserve_calls += 1
+            return self.replayed_reservation
+
+        def release_reservation(self, reservation) -> bool:
+            self.released_reservation_ids.append(reservation.reservation_id)
+            self.external_active = False
+            return True
+
+    adapter = ReplayAdapter(module)
+    allocator = module.RuntimeAccountAllocator(adapter)
+    evidence = _unselected_capacity_evidence(module)
+    lease = allocator.allocate(_central_ticket(module), evidence)
+
+    _assert_sparse_denial(
+        module,
+        lambda: allocator.allocate(
+            _central_ticket(module),
+            dataclasses.replace(evidence, evidence_revision=2),
+        ),
+    )
+
+    assert adapter.external_active is True
+    assert adapter.released_reservation_ids == []
+    assert allocator._records[lease.lease_id].state is module.LeaseState.RESERVED
+    owner = next(iter(allocator._reservation_owners.values()))
+    assert owner.owner_id == lease.lease_id
+    assert owner.fencing_token == "fence-A"
+    assert owner.phase is module.LeaseState.RESERVED
 
 
 def test_revoked_account_rejects_replayed_evidence_and_lease_revisions() -> None:
@@ -502,6 +601,44 @@ def test_malformed_release_proof_requires_phase_bound_recovery() -> None:
     assert allocator.recover(lease, pending_evidence) is module.LeaseState.REVOKED
     assert adapter.outstanding_reservation_ids == set()
     assert adapter.release_calls == ["reservation-1", "reservation-1"]
+
+
+def test_malformed_reservation_release_reply_keeps_same_retry_reference() -> None:
+    module = _allocator_module()
+
+    class MalformedReservationAdapter(_ReleaseProofAdapter):
+        def reserve_capability_atomically(
+            self, capability_binding_digest, capacity_evidence
+        ):
+            reservation = super().reserve_capability_atomically(
+                capability_binding_digest,
+                capacity_evidence,
+            )
+            return dataclasses.replace(reservation, account_binding_digest="")
+
+    adapter = MalformedReservationAdapter(module, "released", True)
+    allocator = module.RuntimeAccountAllocator(adapter)
+
+    _assert_sparse_denial(
+        module,
+        lambda: allocator.allocate(
+            _central_ticket(module),
+            _unselected_capacity_evidence(module),
+        ),
+    )
+
+    assert len(allocator._pending_releases) == 1
+    pending = next(iter(allocator._pending_releases.values()))
+    pending_id = pending.pending_release_id
+    reservation = pending.reservation
+    owner = allocator._reservation_owners[pending.reservation_key]
+    assert owner.owner_id == pending_id
+    assert owner.fencing_token == "fence-A"
+    assert owner.phase is module.LeaseState.RELEASE_PENDING
+    assert allocator.recover_pending_releases() == 0
+    assert adapter.release_calls == ["reservation-1", "reservation-1"]
+    assert reservation.reservation_id == "reservation-1"
+    assert pending_id not in allocator._pending_releases
 
 
 def _bound_transaction_evidence(module, lease, **changes):
@@ -745,6 +882,53 @@ def test_malformed_bool_stale_and_mismatched_evidence_fail_closed() -> None:
         assert adapter.reserve_calls == 0
 
 
+def test_adapter_reply_that_becomes_stale_before_publish_is_released() -> None:
+    module = _allocator_module()
+    initial_now = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
+
+    class ControlledDatetime(datetime):
+        current = initial_now
+
+        @classmethod
+        def now(cls, tz=None):
+            del tz
+            return cls.current
+
+    observed_at = ControlledDatetime(2026, 8, 25, 11, 59, tzinfo=UTC)
+    expires_at = ControlledDatetime(2026, 8, 25, 12, 1, tzinfo=UTC)
+    module.datetime = ControlledDatetime
+
+    class StalingAdapter(_AtomicAdapter):
+        def reserve_capability_atomically(
+            self, capability_binding_digest, capacity_evidence
+        ):
+            reservation = super().reserve_capability_atomically(
+                capability_binding_digest,
+                capacity_evidence,
+            )
+            ControlledDatetime.current = ControlledDatetime(
+                2026, 8, 25, 12, 2, tzinfo=UTC
+            )
+            return reservation
+
+    adapter = StalingAdapter(module)
+    allocator = module.RuntimeAccountAllocator(adapter)
+    evidence = _unselected_capacity_evidence(
+        module,
+        observed_at_utc=observed_at,
+        expires_at_utc=expires_at,
+    )
+
+    _assert_sparse_denial(
+        module,
+        lambda: allocator.allocate(_central_ticket(module), evidence),
+    )
+
+    assert adapter.released_reservation_ids == ["reservation-1"]
+    assert allocator._records == {}
+    assert allocator._reservation_owners == {}
+
+
 def test_bool_generation_and_ledger_evidence_fail_closed() -> None:
     module = _allocator_module()
     ticket = _central_ticket(
@@ -783,6 +967,7 @@ def test_all_allocator_values_are_redacted_and_not_freely_serializable() -> None
     transaction = _bound_transaction_evidence(module, lease)
     reservation = allocator._records[lease.lease_id].reservation
     record = allocator._records[lease.lease_id]
+    reservation_owner = next(iter(allocator._reservation_owners.values()))
     pending_adapter = _ReleaseProofAdapter(module, False)
     pending_allocator = module.RuntimeAccountAllocator(pending_adapter)
     capacity_one = _unselected_capacity_evidence(
@@ -809,6 +994,7 @@ def test_all_allocator_values_are_redacted_and_not_freely_serializable() -> None
         reservation,
         lease,
         record,
+        reservation_owner,
         pending_release,
     ):
         assert "ticket-A" not in repr(value)

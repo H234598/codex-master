@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum
@@ -127,6 +129,7 @@ class AccountReservation(_RedactedNonSerializable):
     account_binding_digest: str
     profile_binding_digest: str
     provider_adapter_id: str
+    capacity_evidence: CapacityEvidence
     lease_revision: int
     evidence_revision: int
     fencing_token: str
@@ -186,6 +189,7 @@ class _LeaseRecord(_RedactedNonSerializable):
     fencing_token: str
     phase: str
     evidence_revision: int
+    reservation_key: str
     state: LeaseState
     pending_release_id: str | None
 
@@ -195,6 +199,7 @@ class _LeaseRecord(_RedactedNonSerializable):
             "capability_binding_digest",
             "fencing_token",
             "phase",
+            "reservation_key",
             "pending_release_id",
         )
 
@@ -202,12 +207,40 @@ class _LeaseRecord(_RedactedNonSerializable):
 @dataclass(frozen=True, slots=True, repr=False)
 class _PendingRelease(_RedactedNonSerializable):
     pending_release_id: str
+    reservation_key: str
     reservation: AccountReservation
-    active_key: str
+    active_account_key: str | None
+    active_key: str | None
+    fencing_token: str
     lease_id: str | None
 
     def __post_init__(self) -> None:
-        self._redact_text_fields("pending_release_id", "active_key", "lease_id")
+        self._redact_text_fields(
+            "pending_release_id",
+            "reservation_key",
+            "active_account_key",
+            "active_key",
+            "fencing_token",
+            "lease_id",
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ReservationOwner(_RedactedNonSerializable):
+    reservation_key: str
+    owner_id: str
+    reservation: AccountReservation
+    fencing_token: str
+    phase: LeaseState
+    lease_id: str | None
+
+    def __post_init__(self) -> None:
+        self._redact_text_fields(
+            "reservation_key",
+            "owner_id",
+            "fencing_token",
+            "lease_id",
+        )
 
 
 class RuntimeAccountAllocator:
@@ -219,6 +252,7 @@ class RuntimeAccountAllocator:
         "_provider_adapter",
         "_records",
         "_release_lock",
+        "_reservation_owners",
     )
 
     def __init__(self, provider_adapter: CapabilityProviderAdapter) -> None:
@@ -229,11 +263,10 @@ class RuntimeAccountAllocator:
         self._pending_releases: dict[str, _PendingRelease] = {}
         self._records: dict[str, _LeaseRecord] = {}
         self._release_lock = Lock()
+        self._reservation_owners: dict[str, _ReservationOwner] = {}
 
     def allocate(self, ticket: object, capacity_evidence: object) -> CredentialLease:
-        if not self._ticket_is_valid(ticket) or not self._evidence_is_valid(
-            ticket, capacity_evidence
-        ):
+        if not self._allocation_binding_invariant(ticket, capacity_evidence):
             raise AllocationDenied("runtime account allocation denied")
 
         try:
@@ -254,71 +287,18 @@ class RuntimeAccountAllocator:
             )
         except Exception:
             raise AllocationDenied("runtime account allocation denied") from None
-        if not self._reservation_matches_evidence(reservation, capacity_evidence):
-            if self._reservation_is_well_formed(reservation):
-                pending_release_id = self._queue_pending_release(reservation)
-                self._retry_pending_release(pending_release_id)
-            elif type(reservation) is AccountReservation:
-                self._release_reservation(reservation)
-            raise AllocationDenied("runtime account allocation denied") from None
 
-        rejected = False
-        pending_release_id = None
         with self._lock:
-            active = self._active_by_account.get(reservation.account_binding_digest, {})
-            latest = self._latest_by_account.get(reservation.account_binding_digest)
-            if (
-                latest is not None
-                and (
-                    capacity_evidence.evidence_revision <= latest[0]
-                    or reservation.lease_revision <= latest[1]
-                )
-            ) or (
-                active
-                and min(
-                    capacity_evidence.capacity_units,
-                    capacity_evidence.quota_units,
-                    capacity_evidence.cost_units,
-                    capacity_evidence.resource_units,
-                )
-                <= len(active)
-            ):
-                rejected = True
-                pending_release_id = self._queue_pending_release_locked(reservation)
-            else:
-                lease = CredentialLease(
-                    lease_id=token_urlsafe(18),
-                    account_binding_digest=reservation.account_binding_digest,
-                    profile_binding_digest=reservation.profile_binding_digest,
-                    provider_adapter_id=adapter_id,
-                    lease_revision=reservation.lease_revision,
-                    expires_at_utc=reservation.expires_at_utc,
-                )
-                self._records[lease.lease_id] = _LeaseRecord(
-                    lease=lease,
-                    reservation=reservation,
-                    ticket_id=ticket.ticket_id,
-                    ledger_revision=ticket.ledger_revision,
-                    capability_binding_digest=ticket.capability_binding_digest,
-                    fencing_token=ticket.fencing_token,
-                    phase="LEASE_RESERVED",
-                    evidence_revision=capacity_evidence.evidence_revision,
-                    state=LeaseState.RESERVED,
-                    pending_release_id=None,
-                )
-                self._active_by_account.setdefault(
-                    reservation.account_binding_digest, {}
-                )[lease.lease_id] = (
-                    capacity_evidence.evidence_revision,
-                    reservation.lease_revision,
-                )
-                self._latest_by_account[reservation.account_binding_digest] = (
-                    capacity_evidence.evidence_revision,
-                    reservation.lease_revision,
-                )
+            lease, pending_release_id = self._bind_reservation_locked(
+                ticket,
+                capacity_evidence,
+                adapter_id,
+                reservation,
+            )
 
-        if rejected:
+        if pending_release_id is not None:
             self._retry_pending_release(pending_release_id)
+        if lease is None:
             raise AllocationDenied("runtime account allocation denied") from None
         return lease
 
@@ -334,17 +314,7 @@ class RuntimeAccountAllocator:
             if record.state is LeaseState.REVOKED:
                 return
             if record.state is LeaseState.RESERVED:
-                pending_release_id = self._queue_pending_release_locked(
-                    record.reservation,
-                    lease_id=lease.lease_id,
-                    active_key=lease.lease_id,
-                )
-                self._records[lease.lease_id] = replace(
-                    record,
-                    state=LeaseState.RELEASE_PENDING,
-                    phase="RELEASE_PENDING",
-                    pending_release_id=pending_release_id,
-                )
+                pending_release_id = self._transition_lease_release_locked(record)
             elif record.state is LeaseState.RELEASE_PENDING:
                 pending_release_id = record.pending_release_id
         if pending_release_id is not None:
@@ -408,50 +378,39 @@ class RuntimeAccountAllocator:
             return len(self._pending_releases)
 
     @staticmethod
-    def _ticket_is_valid(ticket: object) -> bool:
-        if type(ticket) is not ValidatedAllocationTicket:
-            return False
-        return (
-            RuntimeAccountAllocator._resolution_is_bound(ticket)
-            and ticket.phase == "OFFER_VALIDATED"
-            and all(
-                type(value) is int and value > 0
-                for value in (
-                    ticket.policy_generation,
-                    ticket.ledger_revision,
-                )
-            )
-            and all(
-                type(value) is _OpaqueText and bool(value)
-                for value in (
-                    ticket.ticket_id,
-                    ticket.resolver_offer_generation,
-                    ticket.capability_binding_digest,
-                    ticket.fencing_token,
-                )
-            )
-        )
-
-    @staticmethod
-    def _evidence_is_valid(
-        ticket: ValidatedAllocationTicket, capacity_evidence: object
+    def _allocation_binding_invariant(
+        ticket: object, capacity_evidence: object
     ) -> bool:
-        if type(capacity_evidence) is not CapacityEvidence:
+        if (
+            type(ticket) is not ValidatedAllocationTicket
+            or type(capacity_evidence) is not CapacityEvidence
+            or not RuntimeAccountAllocator._central_resolution_offer_invariant(ticket)
+            or ticket.phase != "OFFER_VALIDATED"
+        ):
             return False
-        numeric_evidence = (
-            capacity_evidence.policy_generation,
-            capacity_evidence.ledger_revision,
-            capacity_evidence.capacity_units,
-            capacity_evidence.quota_units,
-            capacity_evidence.cost_units,
-            capacity_evidence.resource_units,
-            capacity_evidence.evidence_revision,
-        )
-        if any(type(value) is not int or value <= 0 for value in numeric_evidence):
+        if any(
+            type(value) is not int or value <= 0
+            for value in (
+                ticket.policy_generation,
+                ticket.ledger_revision,
+                capacity_evidence.policy_generation,
+                capacity_evidence.ledger_revision,
+                capacity_evidence.capacity_units,
+                capacity_evidence.quota_units,
+                capacity_evidence.cost_units,
+                capacity_evidence.resource_units,
+                capacity_evidence.evidence_revision,
+            )
+        ):
             return False
         if not all(
             type(value) is _OpaqueText and bool(value)
             for value in (
+                ticket.ticket_id,
+                ticket.resolver_offer_generation,
+                ticket.capability_binding_digest,
+                ticket.phase,
+                ticket.fencing_token,
                 capacity_evidence.ticket_id,
                 capacity_evidence.resolver_offer_generation,
                 capacity_evidence.capability_binding_digest,
@@ -477,18 +436,25 @@ class RuntimeAccountAllocator:
         except Exception:
             return False
         return fresh and (
-            capacity_evidence.ticket_id == ticket.ticket_id
-            and capacity_evidence.resolver_offer_generation
-            == ticket.resolver_offer_generation
-            and capacity_evidence.policy_generation == ticket.policy_generation
-            and capacity_evidence.capability_binding_digest
-            == ticket.capability_binding_digest
-            and capacity_evidence.ledger_revision == ticket.ledger_revision
-            and capacity_evidence.fencing_token == ticket.fencing_token
+            capacity_evidence.ticket_id,
+            capacity_evidence.resolver_offer_generation,
+            capacity_evidence.policy_generation,
+            capacity_evidence.capability_binding_digest,
+            capacity_evidence.ledger_revision,
+            capacity_evidence.fencing_token,
+        ) == (
+            ticket.ticket_id,
+            ticket.resolver_offer_generation,
+            ticket.policy_generation,
+            ticket.capability_binding_digest,
+            ticket.ledger_revision,
+            ticket.fencing_token,
         )
 
     @staticmethod
-    def _resolution_is_bound(ticket: ValidatedAllocationTicket) -> bool:
+    def _central_resolution_offer_invariant(
+        ticket: ValidatedAllocationTicket,
+    ) -> bool:
         decision = ticket.resolution_decision
         offer = ticket.selection_offer
         if (
@@ -521,39 +487,52 @@ class RuntimeAccountAllocator:
             )
         ):
             return False
-        if (
-            type(offer.generation) is not str
-            or not offer.generation
-            or ticket.resolver_offer_generation != offer.generation
+        if type(offer.options) is not tuple or any(
+            type(option) is not SelectionOption
             or any(
-                type(values) is not tuple
-                or any(type(value) is not str or not value for value in values)
-                for values in (
-                    offer.classes,
-                    offer.lifecycles,
-                    offer.models,
-                    offer.reasoning_levels,
-                )
-            )
-            or type(offer.options) is not tuple
-        ):
-            return False
-        return (
-            decision.class_id in offer.classes
-            and decision.lifecycle in offer.lifecycles
-            and decision.model in offer.models
-            and decision.reasoning in offer.reasoning_levels
-            and any(
-                type(option) is SelectionOption
-                and (
+                type(value) is not str or not value
+                for value in (
                     option.class_id,
                     option.lifecycle,
                     option.model,
                     option.reasoning,
                 )
-                == decision_fields
-                for option in offer.options
             )
+            for option in offer.options
+        ):
+            return False
+        option_rows = tuple(
+            (option.class_id, option.lifecycle, option.model, option.reasoning)
+            for option in offer.options
+        )
+        canonical_generation = (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    list(option_rows),
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+        derived_offer = (
+            tuple(dict.fromkeys(row[0] for row in option_rows)),
+            tuple(dict.fromkeys(row[1] for row in option_rows)),
+            tuple(dict.fromkeys(row[2] for row in option_rows)),
+            tuple(dict.fromkeys(row[3] for row in option_rows)),
+        )
+        return (
+            type(offer.generation) is str
+            and offer.generation == canonical_generation
+            and ticket.resolver_offer_generation == canonical_generation
+            and (
+                offer.classes,
+                offer.lifecycles,
+                offer.models,
+                offer.reasoning_levels,
+            )
+            == derived_offer
+            and decision_fields in option_rows
         )
 
     @staticmethod
@@ -581,6 +560,106 @@ class RuntimeAccountAllocator:
             )
         )
 
+    def _bind_reservation_locked(
+        self,
+        ticket: ValidatedAllocationTicket,
+        capacity_evidence: CapacityEvidence,
+        adapter_id: str,
+        reservation: object,
+    ) -> tuple[CredentialLease | None, str | None]:
+        if type(reservation) is not AccountReservation:
+            return None, None
+        reservation_key = self._reservation_key(reservation)
+        if reservation_key in self._reservation_owners:
+            return None, None
+        if not (
+            self._allocation_binding_invariant(ticket, capacity_evidence)
+            and adapter_id == capacity_evidence.provider_adapter_id
+            and self._reservation_matches_evidence(
+                reservation,
+                capacity_evidence,
+            )
+        ):
+            return None, self._queue_new_pending_release_locked(
+                reservation,
+                reservation_key,
+                ticket.fencing_token,
+            )
+
+        active = self._active_by_account.get(reservation.account_binding_digest, {})
+        latest = self._latest_by_account.get(reservation.account_binding_digest)
+        if (
+            latest is not None
+            and (
+                capacity_evidence.evidence_revision <= latest[0]
+                or reservation.lease_revision <= latest[1]
+            )
+        ) or (
+            active
+            and min(
+                capacity_evidence.capacity_units,
+                capacity_evidence.quota_units,
+                capacity_evidence.cost_units,
+                capacity_evidence.resource_units,
+            )
+            <= len(active)
+        ):
+            return None, self._queue_new_pending_release_locked(
+                reservation,
+                reservation_key,
+                ticket.fencing_token,
+            )
+
+        lease = CredentialLease(
+            lease_id=token_urlsafe(18),
+            account_binding_digest=reservation.account_binding_digest,
+            profile_binding_digest=reservation.profile_binding_digest,
+            provider_adapter_id=adapter_id,
+            lease_revision=reservation.lease_revision,
+            expires_at_utc=reservation.expires_at_utc,
+        )
+        self._records[lease.lease_id] = _LeaseRecord(
+            lease=lease,
+            reservation=reservation,
+            ticket_id=ticket.ticket_id,
+            ledger_revision=ticket.ledger_revision,
+            capability_binding_digest=ticket.capability_binding_digest,
+            fencing_token=ticket.fencing_token,
+            phase="LEASE_RESERVED",
+            evidence_revision=capacity_evidence.evidence_revision,
+            reservation_key=reservation_key,
+            state=LeaseState.RESERVED,
+            pending_release_id=None,
+        )
+        self._reservation_owners[reservation_key] = _ReservationOwner(
+            reservation_key=reservation_key,
+            owner_id=lease.lease_id,
+            reservation=reservation,
+            fencing_token=ticket.fencing_token,
+            phase=LeaseState.RESERVED,
+            lease_id=lease.lease_id,
+        )
+        self._active_by_account.setdefault(reservation.account_binding_digest, {})[
+            lease.lease_id
+        ] = (
+            capacity_evidence.evidence_revision,
+            reservation.lease_revision,
+        )
+        self._latest_by_account[reservation.account_binding_digest] = (
+            capacity_evidence.evidence_revision,
+            reservation.lease_revision,
+        )
+        return lease, None
+
+    @staticmethod
+    def _reservation_key(reservation: AccountReservation) -> str:
+        reservation_id = reservation.reservation_id
+        if type(reservation_id) is _OpaqueText and reservation_id:
+            key_material = reservation_id.encode("utf-8")
+        else:
+            key_material = f"reply-object:{id(reservation)}".encode("ascii")
+        return _OpaqueText("sha256:" + hashlib.sha256(key_material).hexdigest())
+
     @staticmethod
     def _reservation_matches_evidence(
         reservation: object, capacity_evidence: CapacityEvidence
@@ -589,7 +668,9 @@ class RuntimeAccountAllocator:
             return RuntimeAccountAllocator._reservation_is_well_formed(
                 reservation
             ) and (
-                reservation.provider_adapter_id == capacity_evidence.provider_adapter_id
+                reservation.capacity_evidence is capacity_evidence
+                and reservation.provider_adapter_id
+                == capacity_evidence.provider_adapter_id
                 and reservation.evidence_revision == capacity_evidence.evidence_revision
                 and reservation.fencing_token == capacity_evidence.fencing_token
                 and reservation.expires_at_utc == capacity_evidence.expires_at_utc
@@ -610,6 +691,7 @@ class RuntimeAccountAllocator:
                     reservation.fencing_token,
                 )
             )
+            and type(reservation.capacity_evidence) is CapacityEvidence
             and type(reservation.lease_revision) is int
             and reservation.lease_revision > 0
             and type(reservation.evidence_revision) is int
@@ -618,62 +700,131 @@ class RuntimeAccountAllocator:
             and reservation.expires_at_utc.tzinfo is not None
         )
 
-    def _queue_pending_release(
+    def _queue_new_pending_release_locked(
         self,
         reservation: AccountReservation,
-        *,
-        lease_id: str | None = None,
-        active_key: str | None = None,
+        reservation_key: str,
+        fencing_token: str,
     ) -> str:
-        with self._lock:
-            return self._queue_pending_release_locked(
-                reservation,
-                lease_id=lease_id,
-                active_key=active_key,
+        pending_release_id = token_urlsafe(18)
+        well_formed = self._reservation_is_well_formed(reservation)
+        active_account_key = reservation.account_binding_digest if well_formed else None
+        active_key = pending_release_id if well_formed else None
+        pending = _PendingRelease(
+            pending_release_id=pending_release_id,
+            reservation_key=reservation_key,
+            reservation=reservation,
+            active_account_key=active_account_key,
+            active_key=active_key,
+            fencing_token=fencing_token,
+            lease_id=None,
+        )
+        self._pending_releases[pending.pending_release_id] = pending
+        self._reservation_owners[reservation_key] = _ReservationOwner(
+            reservation_key=reservation_key,
+            owner_id=pending_release_id,
+            reservation=reservation,
+            fencing_token=fencing_token,
+            phase=LeaseState.RELEASE_PENDING,
+            lease_id=None,
+        )
+        if active_account_key is not None and active_key is not None:
+            self._active_by_account.setdefault(active_account_key, {})[active_key] = (
+                reservation.evidence_revision,
+                reservation.lease_revision,
             )
+        return pending.pending_release_id
 
-    def _queue_pending_release_locked(
-        self,
-        reservation: AccountReservation,
-        *,
-        lease_id: str | None = None,
-        active_key: str | None = None,
-    ) -> str:
+    def _transition_lease_release_locked(self, record: _LeaseRecord) -> str | None:
+        owner = self._reservation_owners.get(record.reservation_key)
+        if not self._reservation_owner_invariant(
+            owner,
+            reservation_key=record.reservation_key,
+            owner_id=record.lease.lease_id,
+            reservation=record.reservation,
+            fencing_token=record.fencing_token,
+            phase=LeaseState.RESERVED,
+            lease_id=record.lease.lease_id,
+        ):
+            return None
         pending_release_id = token_urlsafe(18)
         pending = _PendingRelease(
             pending_release_id=pending_release_id,
-            reservation=reservation,
-            active_key=active_key or pending_release_id,
-            lease_id=lease_id,
+            reservation_key=record.reservation_key,
+            reservation=record.reservation,
+            active_account_key=record.lease.account_binding_digest,
+            active_key=record.lease.lease_id,
+            fencing_token=record.fencing_token,
+            lease_id=record.lease.lease_id,
         )
-        self._pending_releases[pending.pending_release_id] = pending
-        self._active_by_account.setdefault(reservation.account_binding_digest, {})[
-            pending.active_key
-        ] = (reservation.evidence_revision, reservation.lease_revision)
-        return pending.pending_release_id
+        self._pending_releases[pending_release_id] = pending
+        self._reservation_owners[record.reservation_key] = replace(
+            owner,
+            owner_id=pending_release_id,
+            phase=LeaseState.RELEASE_PENDING,
+        )
+        self._records[record.lease.lease_id] = replace(
+            record,
+            state=LeaseState.RELEASE_PENDING,
+            phase="RELEASE_PENDING",
+            pending_release_id=pending_release_id,
+        )
+        return pending_release_id
 
     def _retry_pending_release(self, pending_release_id: str) -> bool:
         with self._release_lock:
             with self._lock:
                 pending = self._pending_releases.get(pending_release_id)
+                owner = (
+                    None
+                    if pending is None
+                    else self._reservation_owners.get(pending.reservation_key)
+                )
             if pending is None:
                 return True
+            if not self._reservation_owner_invariant(
+                owner,
+                reservation_key=pending.reservation_key,
+                owner_id=pending.pending_release_id,
+                reservation=pending.reservation,
+                fencing_token=pending.fencing_token,
+                phase=LeaseState.RELEASE_PENDING,
+                lease_id=pending.lease_id,
+            ):
+                return False
             if not self._release_reservation(pending.reservation):
                 return False
             with self._lock:
-                if self._pending_releases.get(pending_release_id) is not pending:
-                    return pending_release_id not in self._pending_releases
+                owner = self._reservation_owners.get(pending.reservation_key)
+                if self._pending_releases.get(
+                    pending_release_id
+                ) is not pending or not self._reservation_owner_invariant(
+                    owner,
+                    reservation_key=pending.reservation_key,
+                    owner_id=pending.pending_release_id,
+                    reservation=pending.reservation,
+                    fencing_token=pending.fencing_token,
+                    phase=LeaseState.RELEASE_PENDING,
+                    lease_id=pending.lease_id,
+                ):
+                    return False
                 self._pending_releases.pop(pending_release_id)
-                active = self._active_by_account.get(
-                    pending.reservation.account_binding_digest
-                )
-                if active is not None:
+                self._reservation_owners.pop(pending.reservation_key)
+                if (
+                    pending.active_account_key is not None
+                    and pending.active_key is not None
+                ):
+                    active = self._active_by_account.get(pending.active_account_key)
+                else:
+                    active = None
+                if active is not None and pending.active_key is not None:
                     active.pop(pending.active_key, None)
                 if pending.lease_id is not None:
                     record = self._records.get(pending.lease_id)
                     if (
                         record is not None
                         and record.reservation is pending.reservation
+                        and record.reservation_key == pending.reservation_key
                         and record.pending_release_id == pending_release_id
                     ):
                         self._records[pending.lease_id] = replace(
@@ -683,6 +834,27 @@ class RuntimeAccountAllocator:
                             pending_release_id=None,
                         )
             return True
+
+    @staticmethod
+    def _reservation_owner_invariant(
+        owner: _ReservationOwner | None,
+        *,
+        reservation_key: str,
+        owner_id: str,
+        reservation: AccountReservation,
+        fencing_token: str,
+        phase: LeaseState,
+        lease_id: str | None,
+    ) -> bool:
+        return (
+            owner is not None
+            and owner.reservation_key == reservation_key
+            and owner.owner_id == owner_id
+            and owner.reservation is reservation
+            and owner.fencing_token == fencing_token
+            and owner.phase is phase
+            and owner.lease_id == lease_id
+        )
 
     def _release_reservation(self, reservation: AccountReservation) -> bool:
         try:
