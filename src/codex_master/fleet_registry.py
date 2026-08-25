@@ -12,11 +12,20 @@ from types import MappingProxyType
 from typing import Any
 from unicodedata import category
 
-from codex_master.agent_resolver import LEADERSHIP_CLASS_IDS
+from codex_master.agent_resolver import (
+    LEADERSHIP_CLASS_IDS,
+    ResolutionDecision,
+    SelectionOffer,
+    SelectionOption,
+    canonical_resolution_decision_digest,
+    validate_resolution_decision_offer,
+)
 from codex_master.worker_resolution_carrier import (
     WorkerRegistryReservationV2,
     WorkerResolutionCarrierV2,
+    WorkerResolutionEvidenceV2,
 )
+from codex_master.worker_spawn_ledger import FenceEpoch, Generation
 
 MAX_DOCUMENT_BYTES = 1024 * 1024
 MAX_ACCOUNTS = 64
@@ -236,6 +245,10 @@ class FleetDynamicWorkerPrincipalV2:
     model: str
     reasoning: str
     enabled: bool
+    resolution_evidence: WorkerResolutionEvidenceV2
+    reservation_lease_binding_digest: str | None
+    reservation_account_binding_digest: str | None
+    reservation_profile_binding_digest: str | None
 
     def __repr__(self) -> str:
         return "FleetDynamicWorkerPrincipalV2(<redacted>)"
@@ -360,7 +373,50 @@ _DYNAMIC_WORKER_PRINCIPAL_FIELDS = frozenset(
         "model",
         "reasoning",
         "enabled",
+        "resolution_evidence",
+        "reservation_lease_binding_digest",
+        "reservation_account_binding_digest",
+        "reservation_profile_binding_digest",
     }
+)
+_WORKER_RESOLUTION_EVIDENCE_FIELDS = frozenset(
+    {
+        "decision",
+        "offer",
+        "offer_generation",
+        "capability_binding_digest",
+        "resolution_generation",
+        "policy_digest",
+        "policy_generation",
+        "ticket_fence_epoch",
+    }
+)
+_RESOLUTION_DECISION_FIELDS = frozenset(
+    {
+        "class_id",
+        "lifecycle",
+        "model",
+        "reasoning",
+        "reason_codes",
+        "fallback",
+        "requested_class",
+        "requested_lifecycle",
+        "requested_model",
+        "requested_reasoning",
+    }
+)
+_SELECTION_OFFER_FIELDS = frozenset(
+    {
+        "generation",
+        "classes",
+        "lifecycles",
+        "models",
+        "reasoning_levels",
+        "options",
+    }
+)
+_SELECTION_OPTION_FIELDS = frozenset(
+    {"class_id", "lifecycle", "model", "reasoning"}
 )
 
 
@@ -395,6 +451,114 @@ def _boolean(value: object, code: str) -> bool:
     if not isinstance(value, bool):
         _fail(code)
     return value
+
+
+def _worker_counter(value: object, code: str) -> int:
+    if type(value) is not int or not 0 <= value <= MAX_GENERATION:
+        _fail(code)
+    return value
+
+
+def _sha256_digest(value: object, code: str) -> str:
+    digest = _text(value, minimum=71, maximum=71, code=code)
+    if not _SHA256_DIGEST_RE.fullmatch(digest):
+        _fail(code)
+    return digest
+
+
+def _optional_sha256_digest(value: object, code: str) -> str | None:
+    if value is None:
+        return None
+    return _sha256_digest(value, code)
+
+
+def _resolution_decision(value: object, code: str) -> ResolutionDecision:
+    raw = _mapping(value, code)
+    if set(raw) != _RESOLUTION_DECISION_FIELDS:
+        _fail(code)
+    reason_codes = raw["reason_codes"]
+    if not isinstance(reason_codes, list):
+        _fail(code)
+    return ResolutionDecision(
+        class_id=raw["class_id"],  # type: ignore[arg-type]
+        lifecycle=raw["lifecycle"],  # type: ignore[arg-type]
+        model=raw["model"],  # type: ignore[arg-type]
+        reasoning=raw["reasoning"],  # type: ignore[arg-type]
+        reason_codes=tuple(reason_codes),
+        fallback=raw["fallback"],  # type: ignore[arg-type]
+        requested_class=raw["requested_class"],  # type: ignore[arg-type]
+        requested_lifecycle=raw["requested_lifecycle"],  # type: ignore[arg-type]
+        requested_model=raw["requested_model"],  # type: ignore[arg-type]
+        requested_reasoning=raw["requested_reasoning"],  # type: ignore[arg-type]
+    )
+
+
+def _selection_offer(value: object, code: str) -> SelectionOffer:
+    raw = _mapping(value, code)
+    if set(raw) != _SELECTION_OFFER_FIELDS:
+        _fail(code)
+    sequence_fields = ("classes", "lifecycles", "models", "reasoning_levels")
+    if any(not isinstance(raw[field], list) for field in sequence_fields):
+        _fail(code)
+    options_raw = raw["options"]
+    if not isinstance(options_raw, list):
+        _fail(code)
+    options: list[SelectionOption] = []
+    for value in options_raw:
+        option = _mapping(value, code)
+        if set(option) != _SELECTION_OPTION_FIELDS:
+            _fail(code)
+        options.append(
+            SelectionOption(
+                class_id=option["class_id"],  # type: ignore[arg-type]
+                lifecycle=option["lifecycle"],  # type: ignore[arg-type]
+                model=option["model"],  # type: ignore[arg-type]
+                reasoning=option["reasoning"],  # type: ignore[arg-type]
+            )
+        )
+    return SelectionOffer(
+        generation=raw["generation"],  # type: ignore[arg-type]
+        classes=tuple(raw["classes"]),  # type: ignore[arg-type]
+        lifecycles=tuple(raw["lifecycles"]),  # type: ignore[arg-type]
+        models=tuple(raw["models"]),  # type: ignore[arg-type]
+        reasoning_levels=tuple(raw["reasoning_levels"]),  # type: ignore[arg-type]
+        options=tuple(options),
+    )
+
+
+def _worker_resolution_evidence(
+    value: object, code: str
+) -> WorkerResolutionEvidenceV2:
+    raw = _mapping(value, code)
+    if set(raw) != _WORKER_RESOLUTION_EVIDENCE_FIELDS:
+        _fail(code)
+    decision = _resolution_decision(raw["decision"], code)
+    offer = _selection_offer(raw["offer"], code)
+    offer_generation = _sha256_digest(raw["offer_generation"], code)
+    try:
+        validate_resolution_decision_offer(decision, offer)
+    except ValueError:
+        _fail(code)
+    if offer_generation != offer.generation:
+        _fail(code)
+    return WorkerResolutionEvidenceV2(
+        decision=decision,
+        offer=offer,
+        offer_generation=offer_generation,
+        capability_binding_digest=_sha256_digest(
+            raw["capability_binding_digest"], code
+        ),
+        resolution_generation=Generation(
+            _worker_counter(raw["resolution_generation"], code)
+        ),
+        policy_digest=_sha256_digest(raw["policy_digest"], code),
+        policy_generation=Generation(
+            _worker_counter(raw["policy_generation"], code)
+        ),
+        ticket_fence_epoch=FenceEpoch(
+            _worker_counter(raw["ticket_fence_epoch"], code)
+        ),
+    )
 
 
 def _time(value: object, code: str) -> str | None:
@@ -599,24 +763,45 @@ def _dynamic_worker_principal(
     )
     digests: dict[str, str] = {}
     for field in digest_fields:
-        digest = _text(value[field], minimum=71, maximum=71, code=code)
-        if not _SHA256_DIGEST_RE.fullmatch(digest):
-            _fail(code)
-        digests[field] = digest
+        digests[field] = _sha256_digest(value[field], code)
     counter_fields = (
         "ticket_ledger_revision", "ticket_fence_epoch", "ticket_resolution_generation",
         "ticket_policy_generation",
     )
     counters: dict[str, int] = {}
     for field in counter_fields:
-        counter = value[field]
-        if (
-            isinstance(counter, bool)
-            or not isinstance(counter, int)
-            or not 0 <= counter <= MAX_GENERATION
-        ):
-            _fail(code)
-        counters[field] = counter
+        counters[field] = _worker_counter(value[field], code)
+    evidence = _worker_resolution_evidence(value["resolution_evidence"], code)
+    class_id = _text(value["class_id"], minimum=1, maximum=128, code=code)
+    lifecycle = _text(value["lifecycle"], minimum=1, maximum=32, code=code)
+    model = _text(value["model"], minimum=1, maximum=200, code=code)
+    reasoning = _text(value["reasoning"], minimum=1, maximum=32, code=code)
+    if (
+        canonical_resolution_decision_digest(evidence.decision)
+        != digests["resolution_decision_digest"]
+        or evidence.capability_binding_digest
+        != digests["capability_binding_digest"]
+        or evidence.resolution_generation.value
+        != counters["ticket_resolution_generation"]
+        or evidence.policy_digest != digests["ticket_policy_digest"]
+        or evidence.policy_generation.value != counters["ticket_policy_generation"]
+        or evidence.ticket_fence_epoch.value != counters["ticket_fence_epoch"]
+        or evidence.offer_generation != digests["resolver_offer_generation"]
+        or (
+            class_id,
+            lifecycle,
+            model,
+            reasoning,
+        )
+        != (
+            evidence.decision.class_id,
+            evidence.decision.lifecycle,
+            evidence.decision.model,
+            evidence.decision.reasoning,
+        )
+        or evidence.decision.class_id in LEADERSHIP_CLASS_IDS
+    ):
+        _fail(code)
     return FleetDynamicWorkerPrincipalV2(
         principal_id=principal_id,
         ticket_id=ticket_id,
@@ -629,11 +814,21 @@ def _dynamic_worker_principal(
         resolution_decision_digest=digests["resolution_decision_digest"],
         resolver_offer_generation=digests["resolver_offer_generation"],
         lease_binding_digest=digests["lease_binding_digest"],
-        class_id=_text(value["class_id"], minimum=1, maximum=128, code=code),
-        lifecycle=_text(value["lifecycle"], minimum=1, maximum=32, code=code),
-        model=_text(value["model"], minimum=1, maximum=200, code=code),
-        reasoning=_text(value["reasoning"], minimum=1, maximum=32, code=code),
+        class_id=class_id,
+        lifecycle=lifecycle,
+        model=model,
+        reasoning=reasoning,
         enabled=_boolean(value["enabled"], code),
+        resolution_evidence=evidence,
+        reservation_lease_binding_digest=_optional_sha256_digest(
+            value["reservation_lease_binding_digest"], code
+        ),
+        reservation_account_binding_digest=_optional_sha256_digest(
+            value["reservation_account_binding_digest"], code
+        ),
+        reservation_profile_binding_digest=_optional_sha256_digest(
+            value["reservation_profile_binding_digest"], code
+        ),
     )
 
 
@@ -789,6 +984,47 @@ def normalize_fleet_document(raw: object) -> FleetSnapshot | FleetSnapshotV2:
     return FleetSnapshot(1, generation, accounts, series)
 
 
+def _resolution_evidence_document(
+    evidence: WorkerResolutionEvidenceV2,
+) -> dict[str, object]:
+    return {
+        "decision": {
+            "class_id": evidence.decision.class_id,
+            "lifecycle": evidence.decision.lifecycle,
+            "model": evidence.decision.model,
+            "reasoning": evidence.decision.reasoning,
+            "reason_codes": list(evidence.decision.reason_codes),
+            "fallback": evidence.decision.fallback,
+            "requested_class": evidence.decision.requested_class,
+            "requested_lifecycle": evidence.decision.requested_lifecycle,
+            "requested_model": evidence.decision.requested_model,
+            "requested_reasoning": evidence.decision.requested_reasoning,
+        },
+        "offer": {
+            "generation": evidence.offer.generation,
+            "classes": list(evidence.offer.classes),
+            "lifecycles": list(evidence.offer.lifecycles),
+            "models": list(evidence.offer.models),
+            "reasoning_levels": list(evidence.offer.reasoning_levels),
+            "options": [
+                {
+                    "class_id": option.class_id,
+                    "lifecycle": option.lifecycle,
+                    "model": option.model,
+                    "reasoning": option.reasoning,
+                }
+                for option in evidence.offer.options
+            ],
+        },
+        "offer_generation": evidence.offer_generation,
+        "capability_binding_digest": evidence.capability_binding_digest,
+        "resolution_generation": evidence.resolution_generation.value,
+        "policy_digest": evidence.policy_digest,
+        "policy_generation": evidence.policy_generation.value,
+        "ticket_fence_epoch": evidence.ticket_fence_epoch.value,
+    }
+
+
 def fleet_document(snapshot: FleetSnapshot | FleetSnapshotV2 | FleetMigrationSnapshot) -> dict[str, object]:
     if isinstance(snapshot, FleetMigrationSnapshot):
         _fail("final_member_id_required")
@@ -855,6 +1091,18 @@ def fleet_document(snapshot: FleetSnapshot | FleetSnapshotV2 | FleetMigrationSna
                         "model": item.model,
                         "reasoning": item.reasoning,
                         "enabled": item.enabled,
+                        "resolution_evidence": _resolution_evidence_document(
+                            item.resolution_evidence
+                        ),
+                        "reservation_lease_binding_digest": (
+                            item.reservation_lease_binding_digest
+                        ),
+                        "reservation_account_binding_digest": (
+                            item.reservation_account_binding_digest
+                        ),
+                        "reservation_profile_binding_digest": (
+                            item.reservation_profile_binding_digest
+                        ),
                     }
                 )
                 for item in snapshot.runtime_principals
@@ -1049,6 +1297,16 @@ def _dynamic_worker_from_reservation(
         _fail("invalid_worker_registry_reservation")
     if resolution.decision.class_id in LEADERSHIP_CLASS_IDS:
         _fail("invalid_runtime_principal")
+    evidence = WorkerResolutionEvidenceV2(
+        decision=resolution.decision,
+        offer=resolution.offer,
+        offer_generation=resolution.resolver_offer_generation,
+        capability_binding_digest=resolution.capability_binding_digest,
+        resolution_generation=resolution.ticket_resolution_generation,
+        policy_digest=resolution.ticket_policy_digest,
+        policy_generation=resolution.ticket_policy_generation,
+        ticket_fence_epoch=resolution.ticket_fence_epoch,
+    )
     return _dynamic_worker_principal(
         {
             "principal_id": reservation.principal_id,
@@ -1067,6 +1325,10 @@ def _dynamic_worker_from_reservation(
             "model": resolution.decision.model,
             "reasoning": resolution.decision.reasoning,
             "enabled": True,
+            "resolution_evidence": _resolution_evidence_document(evidence),
+            "reservation_lease_binding_digest": reservation.lease_binding_digest,
+            "reservation_account_binding_digest": reservation.account_binding_digest,
+            "reservation_profile_binding_digest": reservation.profile_binding_digest,
         }
     )
 
@@ -1157,7 +1419,15 @@ def plan_runtime_principal_disable(
     if not isinstance(snapshot, FleetSnapshotV2):
         _fail("invalid_document")
     _generation(snapshot, expected_generation)
-    if not any(item.principal_id == principal_id for item in snapshot.runtime_principals):
+    existing = next(
+        (
+            item
+            for item in snapshot.runtime_principals
+            if item.principal_id == principal_id
+        ),
+        None,
+    )
+    if not isinstance(existing, FleetRuntimePrincipalV2):
         _fail("invalid_runtime_principal")
     runtime_principals = [
         replace(item, enabled=False) if item.principal_id == principal_id else item
@@ -1176,7 +1446,7 @@ def plan_runtime_principal_delete(
         _fail("invalid_document")
     _generation(snapshot, expected_generation)
     existing = next((item for item in snapshot.runtime_principals if item.principal_id == principal_id), None)
-    if existing is None:
+    if not isinstance(existing, FleetRuntimePrincipalV2):
         _fail("invalid_runtime_principal")
     if existing.enabled:
         _fail("runtime_principal_must_be_disabled")

@@ -81,11 +81,16 @@ def _digest(char: str) -> str:
 
 
 def worker_registry_reservation(
-    *, principal_id: str = "dw-" + "7" * 32, ticket_id: str = "ticket:worker-7"
+    *,
+    principal_id: str = "dw-" + "7" * 32,
+    ticket_id: str = "ticket:worker-7",
+    fallback: bool = False,
+    class_id: str = "arbeitsbiene",
+    model: str = "gpt-5.6-luna",
 ) -> object:
     classes = (
         AgentClassPolicy(
-            "arbeitsbiene",
+            class_id,
             "ephemeral",
             ("ephemeral", "binding", "persistent"),
             ("luna",),
@@ -96,7 +101,7 @@ def worker_registry_reservation(
     )
     models = (
         ModelPolicy(
-            "gpt-5.6-luna",
+            model,
             "luna",
             20,
             ("low", "medium", "high", "xhigh"),
@@ -106,14 +111,15 @@ def worker_registry_reservation(
     request = ResolutionRequest(
         "read",
         "simple",
-        requested_class="arbeitsbiene",
+        requested_class=class_id,
         requested_lifecycle="invocation",
     )
     decision = resolve_agent_selection(
-        request, classes=classes, models=models, available_models={"gpt-5.6-luna"}
+        request, classes=classes, models=models, available_models={model}
     )
+    decision = replace(decision, fallback=fallback)
     offer = build_selection_offer(
-        classes=classes, models=models, available_models={"gpt-5.6-luna"}
+        classes=classes, models=models, available_models={model}
     )
     ticket = WorkerSpawnTicketV2(
         ticket_id=ticket_id,
@@ -409,7 +415,7 @@ def test_v2_runtime_principal_planners_apply_cas_and_disable_before_delete() -> 
 
 def test_dynamic_worker_principal_round_trips_complete_resolution_carrier() -> None:
     snapshot = empty_worker_snapshot()
-    reservation = worker_registry_reservation()
+    reservation = worker_registry_reservation(fallback=True)
     lease_binding_digest = _digest("f")
 
     reserved = fleet_registry.plan_dynamic_worker_principal_reserve(
@@ -434,7 +440,115 @@ def test_dynamic_worker_principal_round_trips_complete_resolution_carrier() -> N
     assert principal.ticket_policy_generation == 9
     assert principal.ticket_policy_digest == _digest("d")
     assert principal.capability_binding_digest == _digest("e")
-    assert normalize_fleet_document(fleet_document(reserved)) == reserved
+    assert principal.resolution_evidence.decision == reservation.resolution.decision
+    assert principal.resolution_evidence.offer == reservation.resolution.offer
+    assert principal.resolution_evidence.decision.reason_codes
+    assert principal.resolution_evidence.decision.fallback is True
+    assert principal.resolution_evidence.decision.requested_class == "arbeitsbiene"
+    assert principal.resolution_evidence.offer.options
+    assert principal.reservation_lease_binding_digest is None
+    assert principal.reservation_account_binding_digest is None
+    assert principal.reservation_profile_binding_digest is None
+
+    document = fleet_document(reserved)
+    schema = json.loads(
+        (
+            Path(__file__).parents[1] / "schemas" / "codex-fleet-registry.schema.json"
+        ).read_text()
+    )
+    from jsonschema import Draft202012Validator
+
+    assert not list(Draft202012Validator(schema).iter_errors(document))
+    round_tripped = normalize_fleet_document(document)
+    assert round_tripped == reserved
+
+    with pytest.raises(FleetValidationError, match="worker_reservation_mismatch"):
+        fleet_registry.plan_dynamic_worker_principal_release(
+            round_tripped,
+            worker_registry_reservation(fallback=False),
+            lease_binding_digest=lease_binding_digest,
+            expected_generation=round_tripped.generation,
+        )
+    released = fleet_registry.plan_dynamic_worker_principal_release(
+        round_tripped,
+        reservation,
+        lease_binding_digest=lease_binding_digest,
+        expected_generation=round_tripped.generation,
+    )
+    assert released.runtime_principals == ()
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("resolution_decision_digest",), _digest("0")),
+        (("ticket_policy_digest",), _digest("0")),
+        (("class_id",), "forged-worker"),
+        (("resolution_evidence", "decision", "reason_codes"), ["forged"]),
+        (("resolution_evidence", "decision", "fallback"), False),
+        (("resolution_evidence", "decision", "requested_model"), "forged-model"),
+        (("resolution_evidence", "offer", "classes"), ["forged-worker"]),
+        (
+            ("resolution_evidence", "offer", "options", 0, "model"),
+            "forged-model",
+        ),
+        (("resolver_offer_generation",), _digest("0")),
+        (("resolution_evidence", "offer", "generation"), _digest("0")),
+        (("resolution_evidence", "offer_generation"), _digest("0")),
+        (("resolution_evidence", "policy_digest"), _digest("0")),
+    ],
+)
+def test_dynamic_worker_principal_rejects_forged_resolution_evidence(
+    path: tuple[str | int, ...], value: object
+) -> None:
+    reserved = fleet_registry.plan_dynamic_worker_principal_reserve(
+        empty_worker_snapshot(),
+        worker_registry_reservation(fallback=True),
+        lease_binding_digest=_digest("f"),
+        expected_generation=5,
+    )
+    document = fleet_document(reserved)
+    target: object = document["runtime_principals"][0]  # type: ignore[index]
+    for key in path[:-1]:
+        target = target[key]  # type: ignore[index]
+    target[path[-1]] = value  # type: ignore[index]
+
+    with pytest.raises(FleetValidationError, match="invalid_runtime_principal"):
+        normalize_fleet_document(document)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "lease_binding_digest",
+        "reservation_lease_binding_digest",
+        "reservation_account_binding_digest",
+        "reservation_profile_binding_digest",
+    ],
+)
+def test_dynamic_worker_release_rejects_forged_reservation_bindings(
+    field: str,
+) -> None:
+    reservation = worker_registry_reservation(fallback=True)
+    lease_binding_digest = _digest("f")
+    reserved = fleet_registry.plan_dynamic_worker_principal_reserve(
+        empty_worker_snapshot(),
+        reservation,
+        lease_binding_digest=lease_binding_digest,
+        expected_generation=5,
+    )
+    document = fleet_document(reserved)
+    document["runtime_principals"][0][field] = _digest("0")  # type: ignore[index]
+    forged = normalize_fleet_document(document)
+
+    with pytest.raises(FleetValidationError, match="worker_reservation_mismatch"):
+        fleet_registry.plan_dynamic_worker_principal_release(
+            forged,
+            reservation,
+            lease_binding_digest=lease_binding_digest,
+            expected_generation=forged.generation,
+        )
+    assert forged.generation == reserved.generation
 
 
 def test_dynamic_worker_reserve_rejects_bad_or_leadership_carrier() -> None:
@@ -507,21 +621,18 @@ def test_dynamic_worker_principal_rejects_malformed_structural_fields(
 
 
 def test_dynamic_worker_principal_accepts_structural_policy_values() -> None:
+    reservation = worker_registry_reservation(
+        class_id="locally-unknown-class", model="locally-unknown-model"
+    )
     reserved = fleet_registry.plan_dynamic_worker_principal_reserve(
         empty_worker_snapshot(),
-        worker_registry_reservation(),
+        reservation,
         lease_binding_digest=_digest("f"),
         expected_generation=5,
     )
-    document = fleet_document(reserved)
-    document["runtime_principals"][0].update(  # type: ignore[index]
-        class_id="locally-unknown-class",
-        lifecycle="locally-unknown-lifecycle",
-        model="locally-unknown-model",
-        reasoning="locally-unknown-reasoning",
-    )
-    normalized = normalize_fleet_document(document)
-    assert normalized.runtime_principals[0].class_id == "locally-unknown-class"
+    principal = reserved.runtime_principals[0]
+    assert principal.class_id == "locally-unknown-class"
+    assert principal.model == "locally-unknown-model"
 
 
 def test_dynamic_worker_reserve_is_generation_bound_and_never_upserts() -> None:
@@ -600,6 +711,40 @@ def test_dynamic_worker_release_requires_exact_reservation() -> None:
     assert reserved.runtime_principals != ()
 
 
+def test_teamlead_runtime_planners_reject_dynamic_worker_principals() -> None:
+    reserved = fleet_registry.plan_dynamic_worker_principal_reserve(
+        empty_worker_snapshot(),
+        worker_registry_reservation(),
+        lease_binding_digest=_digest("f"),
+        expected_generation=5,
+    )
+    principal = reserved.runtime_principals[0]
+
+    with pytest.raises(FleetValidationError) as caught:
+        plan_runtime_principal_disable(
+            reserved,
+            principal.principal_id,
+            expected_generation=reserved.generation,
+        )
+    assert caught.value.code == "invalid_runtime_principal"
+    assert reserved.runtime_principals[0].enabled is True
+    assert reserved.generation == 6
+
+    disabled = replace(
+        reserved,
+        runtime_principals=(replace(principal, enabled=False),),
+    )
+    with pytest.raises(FleetValidationError) as caught:
+        plan_runtime_principal_delete(
+            disabled,
+            principal.principal_id,
+            expected_generation=disabled.generation,
+        )
+    assert caught.value.code == "invalid_runtime_principal"
+    assert disabled.runtime_principals == (replace(principal, enabled=False),)
+    assert disabled.generation == reserved.generation
+
+
 def test_public_snapshot_excludes_all_dynamic_worker_private_markers() -> None:
     reserved = fleet_registry.plan_dynamic_worker_principal_reserve(
         empty_worker_snapshot(),
@@ -639,6 +784,57 @@ def test_registry_schema_discriminates_teamlead_and_dynamic_worker_principals() 
     worker = schema["$defs"]["dynamic_worker_principal"]
     assert worker["properties"]["principal_id"]["pattern"] == "^dw-[0-9a-f]{32}$"
     assert worker["additionalProperties"] is False
+
+
+@pytest.mark.parametrize(
+    ("field", "evidence_field"),
+    [
+        ("ticket_ledger_revision", None),
+        ("ticket_fence_epoch", "ticket_fence_epoch"),
+        ("ticket_resolution_generation", "resolution_generation"),
+        ("ticket_policy_generation", "policy_generation"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("value", "accepted"),
+    [
+        (9223372036854775807, True),
+        (9223372036854775808, False),
+        (True, False),
+    ],
+)
+def test_dynamic_worker_counters_share_schema_and_parser_boundary(
+    field: str, evidence_field: str | None, value: object, accepted: bool
+) -> None:
+    from jsonschema import Draft202012Validator
+
+    schema = json.loads(
+        (
+            Path(__file__).parents[1] / "schemas" / "codex-fleet-registry.schema.json"
+        ).read_text()
+    )
+    document = fleet_document(
+        fleet_registry.plan_dynamic_worker_principal_reserve(
+            empty_worker_snapshot(),
+            worker_registry_reservation(),
+            lease_binding_digest=_digest("f"),
+            expected_generation=5,
+        )
+    )
+    worker = document["runtime_principals"][0]  # type: ignore[index]
+    worker[field] = value  # type: ignore[index]
+    if accepted and evidence_field is not None:
+        worker["resolution_evidence"][evidence_field] = value  # type: ignore[index]
+
+    schema_errors = list(Draft202012Validator(schema).iter_errors(document))
+    if accepted:
+        assert schema_errors == []
+        normalized = normalize_fleet_document(document)
+        assert getattr(normalized.runtime_principals[0], field) == value
+    else:
+        assert schema_errors
+        with pytest.raises(FleetValidationError, match="invalid_runtime_principal"):
+            normalize_fleet_document(document)
 
 
 @pytest.mark.parametrize("member_id", [None, "v1:g:1", "11111111-1111-1111-8111-111111111111",
