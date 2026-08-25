@@ -168,6 +168,29 @@ def empty_worker_snapshot() -> FleetSnapshotV2:
     return snapshot
 
 
+def reserve_two_unique_dynamic_workers(
+    snapshot: FleetSnapshotV2,
+) -> tuple[FleetSnapshotV2, object, object]:
+    first = worker_registry_reservation()
+    reserved = fleet_registry.plan_dynamic_worker_principal_reserve(
+        snapshot,
+        first,
+        lease_binding_digest=_digest("f"),
+        expected_generation=snapshot.generation,
+    )
+    second = worker_registry_reservation(
+        principal_id="dw-" + "8" * 32,
+        ticket_id="ticket:worker-8",
+    )
+    reserved = fleet_registry.plan_dynamic_worker_principal_reserve(
+        reserved,
+        second,
+        lease_binding_digest=_digest("0"),
+        expected_generation=reserved.generation,
+    )
+    return reserved, first, second
+
+
 def test_v1_fixture_expands_deterministically_without_final_member_ids() -> None:
     snapshot = normalize_fleet_document(load_fixture("fleet-registry-v1.json"))
     first = expand_v1_for_migration(snapshot)
@@ -709,6 +732,97 @@ def test_dynamic_worker_release_requires_exact_reservation() -> None:
     assert released.generation == reserved.generation + 1
     assert released.runtime_principals == ()
     assert reserved.runtime_principals != ()
+
+
+def test_normalize_rejects_dynamic_worker_document_alias_without_mutation() -> None:
+    reservation = worker_registry_reservation()
+    source = fleet_registry.plan_dynamic_worker_principal_reserve(
+        empty_worker_snapshot(),
+        reservation,
+        lease_binding_digest=_digest("f"),
+        expected_generation=5,
+    )
+    source_generation = source.generation
+    source_principals = source.runtime_principals
+    document = fleet_document(source)
+    alias = deepcopy(document["runtime_principals"][0])  # type: ignore[index]
+    alias["principal_id"] = "dw-" + "8" * 32
+    document["runtime_principals"].append(alias)  # type: ignore[union-attr]
+    attacked_document = deepcopy(document)
+
+    with pytest.raises(FleetValidationError) as caught:
+        normalize_fleet_document(document)
+    assert caught.value.code == "invalid_runtime_principal"
+    assert source.generation == source_generation
+    assert source.runtime_principals == source_principals
+    assert document == attacked_document
+
+
+@pytest.mark.parametrize(
+    ("duplicate_field", "distinct_field"),
+    [
+        ("ticket_id", "lease_binding_digest"),
+        ("lease_binding_digest", "ticket_id"),
+    ],
+)
+def test_normalize_rejects_duplicate_dynamic_worker_reservation_key_without_mutation(
+    duplicate_field: str, distinct_field: str
+) -> None:
+    source, _, _ = reserve_two_unique_dynamic_workers(empty_worker_snapshot())
+    source_generation = source.generation
+    source_principals = source.runtime_principals
+    document = fleet_document(source)
+    first, second = document["runtime_principals"]  # type: ignore[misc]
+    assert first[distinct_field] != second[distinct_field]
+    second[duplicate_field] = first[duplicate_field]
+    attacked_document = deepcopy(document)
+
+    with pytest.raises(FleetValidationError) as caught:
+        normalize_fleet_document(document)
+    assert caught.value.code == "invalid_runtime_principal"
+    assert source.generation == source_generation
+    assert source.runtime_principals == source_principals
+    assert document == attacked_document
+
+
+def test_normalize_preserves_dynamic_worker_principal_id_duplicate_defense() -> None:
+    source, _, _ = reserve_two_unique_dynamic_workers(empty_worker_snapshot())
+    document = fleet_document(source)
+    first, second = document["runtime_principals"]  # type: ignore[misc]
+    second["principal_id"] = first["principal_id"]
+    attacked_document = deepcopy(document)
+
+    with pytest.raises(FleetValidationError, match="invalid_runtime_principal"):
+        normalize_fleet_document(document)
+    assert source.generation == 7
+    assert document == attacked_document
+
+
+def test_unique_dynamic_workers_normalize_with_teamlead_and_exact_release() -> None:
+    base = normalize_fleet_document(load_fixture("fleet-registry-v2.json"))
+    assert isinstance(base, FleetSnapshotV2)
+    reserved, first, _ = reserve_two_unique_dynamic_workers(base)
+
+    normalized = normalize_fleet_document(fleet_document(reserved))
+    assert normalized == reserved
+    assert normalized.generation == base.generation + 2
+    assert [item.principal_id for item in normalized.runtime_principals] == [
+        "dw-" + "7" * 32,
+        "dw-" + "8" * 32,
+        "tl-11111111111111111111111111111111",
+    ]
+
+    released = fleet_registry.plan_dynamic_worker_principal_release(
+        normalized,
+        first,
+        lease_binding_digest=_digest("f"),
+        expected_generation=normalized.generation,
+    )
+    assert released.generation == normalized.generation + 1
+    assert [item.principal_id for item in released.runtime_principals] == [
+        "dw-" + "8" * 32,
+        "tl-11111111111111111111111111111111",
+    ]
 
 
 def test_teamlead_runtime_planners_reject_dynamic_worker_principals() -> None:

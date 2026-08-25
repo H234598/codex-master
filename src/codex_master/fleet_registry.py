@@ -954,6 +954,18 @@ def normalize_fleet_document(raw: object) -> FleetSnapshot | FleetSnapshotV2:
     if is_v2:
         if len({item.principal_id for item in runtime_principals}) != len(runtime_principals):
             _fail("invalid_runtime_principal")
+        dynamic_workers = tuple(
+            item
+            for item in runtime_principals
+            if isinstance(item, FleetDynamicWorkerPrincipalV2)
+        )
+        if (
+            len({item.ticket_id for item in dynamic_workers})
+            != len(dynamic_workers)
+            or len({item.lease_binding_digest for item in dynamic_workers})
+            != len(dynamic_workers)
+        ):
+            _fail("invalid_runtime_principal")
         bindings = [
             account.credential_binding_id
             for account in accounts
