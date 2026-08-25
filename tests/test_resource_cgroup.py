@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import io
 import inspect
 import os
 import runpy
+import socket
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -23,13 +24,49 @@ from codex_master.resource_cgroup import (
     derive_cgroup_profile,
     parse_cpu_topology,
     require_cgroup_preflight,
-    start_verified_scope,
+    confirm_verified_scope,
+    start_released_scope,
 )
 
 
 GIB = 1024**3
 GATE = Path(__file__).parents[1] / "bin" / "codex-master-resource-scope-gate"
 REQUIRED_CONTROLLERS = frozenset({"cpu", "cpuset", "memory", "pids", "io"})
+
+
+class _FakeGateConnection:
+    def __init__(
+        self,
+        *,
+        attestation_commit: str | None = None,
+        session_id: str = "$0",
+        tmux_pid: int | None = None,
+        pane_pid: int | None = None,
+    ) -> None:
+        self.sent: list[bytes] = []
+        self.closed = False
+        self._attestation_commit = attestation_commit
+        self._session_id = session_id
+        self._tmux_pid = os.getpid() if tmux_pid is None else tmux_pid
+        self._pane_pid = self._tmux_pid if pane_pid is None else pane_pid
+        self._incoming = b""
+
+    def sendall(self, payload: bytes) -> None:
+        self.sent.append(payload)
+        fields = payload.decode("ascii").strip().split(" ")
+        if len(fields) == 3 and fields[0] == "ATTEST":
+            commit = fields[2] if self._attestation_commit is None else self._attestation_commit
+            self._incoming = (
+                f"ATTEST {fields[1]} {commit} {self._session_id} "
+                f"{self._tmux_pid} {self._pane_pid}\n"
+            ).encode("ascii")
+
+    def recv(self, size: int) -> bytes:
+        payload, self._incoming = self._incoming[:size], self._incoming[size:]
+        return payload
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeCgroupAdapter:
@@ -72,9 +109,15 @@ class FakeCgroupAdapter:
             raise CgroupPreflightError("cgroup_preflight_failed")
         return self.preflight
 
-    def start_held_scope(
-        self, *, profile: CgroupProfileV1, socket_name: str, session_name: str
+    def start_released_scope(
+        self,
+        *,
+        profile: CgroupProfileV1,
+        socket_name: str,
+        session_name: str,
+        runner_target: resource_cgroup.RunnerExecutionTargetV1,
     ) -> PreparedAgentScope:
+        del runner_target
         self.events.append("start")
         if self.fail_at == "start":
             raise CgroupPreflightError("cgroup_preflight_failed")
@@ -92,16 +135,11 @@ class FakeCgroupAdapter:
         if self.fail_at == "verify_scope":
             raise CgroupPreflightError("cgroup_preflight_failed")
 
-    def release_scope(self, scope: PreparedAgentScope) -> int:
-        self.events.append("release")
-        if self.fail_at == "release":
+    def confirm_scope(self, scope: PreparedAgentScope) -> int:
+        self.events.append("confirm")
+        if self.fail_at == "confirm":
             raise CgroupPreflightError("cgroup_preflight_failed")
         return 4242
-
-    def verify_tmux_membership_and_inheritance(self, scope: PreparedAgentScope, tmux_pid: int) -> None:
-        self.events.append("verify_tmux")
-        if tmux_pid != 4242 or self.fail_at == "verify_tmux":
-            raise CgroupPreflightError("cgroup_preflight_failed")
 
     def cleanup_new_scope(self, scope: PreparedAgentScope) -> None:
         self.events.append("cleanup")
@@ -117,6 +155,33 @@ class FakeCgroupAdapter:
             )
         except Exception:
             return None
+
+
+def _start_released_for_test(
+    adapter: object,
+    *,
+    profile: CgroupProfileV1,
+    socket_name: str,
+    session_name: str,
+) -> PreparedAgentScope:
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        metadata = os.fstat(descriptor)
+        target = resource_cgroup.RunnerExecutionTargetV1(
+            owner_pid=os.getpid(),
+            fd=descriptor,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+        )
+        return start_released_scope(
+            adapter,
+            profile=profile,
+            socket_name=socket_name,
+            session_name=session_name,
+            runner_target=target,
+        )
+    finally:
+        os.close(descriptor)
 
 
 def _preflight(
@@ -243,11 +308,10 @@ def test_resource_cgroup_is_the_only_sys_cpu_topology_cpuset_and_cgroup_parser_o
     "method_name",
     (
         "inspect_preflight",
-        "start_held_scope",
-        "verify_scope",
-        "release_scope",
-        "verify_tmux_membership_and_inheritance",
-        "cleanup_new_scope",
+            "start_released_scope",
+            "verify_scope",
+            "confirm_scope",
+            "cleanup_new_scope",
     ),
 )
 def test_systemd_user_cgroup_adapter_disallows_instance_method_shadowing(
@@ -635,24 +699,25 @@ def test_profile_rejects_two_physical_core_hybrid_before_efficiency_branch() -> 
         derive_cgroup_profile(two_core_hybrid, approved_cpuset=(1,), mem_total_bytes=16 * GIB)
 
 
-def test_scope_runner_uses_held_scope_before_tmux_and_readbacks_every_required_property() -> None:
+def test_scope_runner_releases_then_confirms_after_dispatch_and_readbacks_every_required_property() -> None:
     adapter = FakeCgroupAdapter()
-    scope = start_verified_scope(
+    scope = _start_released_for_test(
         adapter,
         profile=_profile(),
         socket_name="scope_socket-1",
         session_name="scope-session.1",
     )
+    confirm_verified_scope(adapter, scope)
 
     assert scope.unit_name == "codex-master-test.scope"
-    assert adapter.events == ["inspect", "start", "verify_scope", "release", "verify_tmux"]
+    assert adapter.events == ["inspect", "start", "verify_scope", "confirm"]
     assert adapter.cleaned == []
 
 
 def test_scope_runner_never_uses_shell_sudo_taskset_or_move_existing_pid() -> None:
     adapter = FakeCgroupAdapter()
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
-        start_verified_scope(
+        _start_released_for_test(
             adapter,
             profile=_profile(),
             socket_name="../scope",
@@ -664,7 +729,7 @@ def test_scope_runner_never_uses_shell_sudo_taskset_or_move_existing_pid() -> No
 def test_scope_failure_before_publication_cleans_only_new_scope_and_never_touches_existing_pid() -> None:
     adapter = FakeCgroupAdapter(fail_at="verify_scope")
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
-        start_verified_scope(
+        _start_released_for_test(
             adapter,
             profile=_profile(),
             socket_name="scope_socket-1",
@@ -674,16 +739,17 @@ def test_scope_failure_before_publication_cleans_only_new_scope_and_never_touche
     assert [scope.unit_name for scope in adapter.cleaned] == ["codex-master-test.scope"]
 
 
-def test_scope_runner_checks_tmux_pid_cgroup_and_child_inheritance_before_success() -> None:
-    adapter = FakeCgroupAdapter(fail_at="verify_tmux")
-    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
-        start_verified_scope(
-            adapter,
-            profile=_profile(),
-            socket_name="scope_socket-1",
-            session_name="scope-session.1",
-        )
-    assert adapter.events == ["inspect", "start", "verify_scope", "release", "verify_tmux", "cleanup"]
+def test_scope_runner_never_reruns_failure_capable_tmux_attestation_after_ack() -> None:
+    adapter = FakeCgroupAdapter()
+    scope = _start_released_for_test(
+        adapter,
+        profile=_profile(),
+        socket_name="scope_socket-1",
+        session_name="scope-session.1",
+    )
+    confirm_verified_scope(adapter, scope)
+    assert adapter.events == ["inspect", "start", "verify_scope", "confirm"]
+    assert adapter.cleaned == []
 
 
 def test_io_weight_is_not_reported_as_proven_physical_isolation_without_evidence() -> None:
@@ -699,7 +765,7 @@ def test_io_weight_is_not_reported_as_proven_physical_isolation_without_evidence
         )
 
 
-def test_scope_gate_rejects_general_launcher_token_and_extra_argv_before_exec() -> None:
+def test_scope_gate_rejects_legacy_and_general_launcher_argv_before_exec() -> None:
     token = "a" * 64
     rejected = (
         (token, "/usr/bin/printf", "general-launcher"),
@@ -721,114 +787,10 @@ def test_scope_gate_rejects_general_launcher_token_and_extra_argv_before_exec() 
         assert result.stdout == b""
         assert result.stderr == b""
 
-
-class _GateExecveCalled(Exception):
-    pass
-
-
-class _GateExited(Exception):
-    pass
-
-
-class _GateStdout:
-    def __init__(self) -> None:
-        self.buffer = io.BytesIO()
-
-    def flush(self) -> None:
-        return None
-
-
-def test_scope_gate_generates_internal_challenge_and_executes_only_fixed_tmux_argv(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    challenge = "c" * 64
-    called: dict[str, object] = {}
-
-    def _execve(path: str, argv: list[str], env: dict[str, str]) -> None:
-        called.update(path=path, argv=argv, env=env)
-        raise _GateExecveCalled
-
-    def _exit(_status: int) -> None:
-        raise _GateExited
-
-    stdout = _GateStdout()
-    monkeypatch.setattr(sys, "argv", [str(GATE), "scope_socket-1", "scope-session.1"])
-    monkeypatch.setattr(sys, "stdin", type("GateStdin", (), {"buffer": io.BytesIO(f"{challenge}\n".encode())})())
-    monkeypatch.setattr(sys, "stdout", stdout)
-    monkeypatch.setattr(os, "execve", _execve)
-    monkeypatch.setattr(os, "_exit", _exit)
-    import secrets
-
-    monkeypatch.setattr(secrets, "token_hex", lambda size: challenge if size == 32 else "")
-
-    with pytest.raises(_GateExecveCalled):
-        runpy.run_path(str(GATE), run_name="__main__")
-
-    assert stdout.buffer.getvalue() == f"{challenge}\n".encode()
-    assert called == {
-        "path": "/usr/bin/tmux",
-        "argv": [
-            "/usr/bin/tmux",
-            "-L",
-            "scope_socket-1",
-            "new-session",
-            "-d",
-            "-s",
-            "scope-session.1",
-        ],
-        "env": {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
-    }
-
-
-def test_scope_gate_rejects_wrong_or_replayed_challenge_without_exec() -> None:
-    process = subprocess.Popen(
-        [sys.executable, str(GATE), "scope_socket-1", "scope-session.1"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    assert process.stdin is not None
-    assert process.stdout is not None
-    challenge = process.stdout.readline()
-    assert len(challenge) == 65
-    assert challenge.endswith(b"\n")
-    process.stdin.write(b"0" * 64 + b"\n")
-    process.stdin.close()
-    assert process.wait(timeout=5) != 0
-    assert process.stdout.read() == b""
-    assert process.stderr.read() == b""
-
-
 def test_systemd_user_adapter_is_concrete_and_uses_internal_unit_owner() -> None:
     adapter_type = getattr(resource_cgroup, "SystemdUserCgroupAdapter", None)
 
     assert adapter_type is not None, "missing concrete SystemdUserCgroupAdapter"
-
-
-class _FakeHeldGate:
-    def __init__(self, *, challenge: bytes = b"c" * 64 + b"\n") -> None:
-        self.challenge = challenge
-        self.releases: list[bytes] = []
-
-    def read_stdout(self, *, max_bytes: int, timeout_seconds: float) -> bytes:
-        assert max_bytes == 65
-        assert timeout_seconds > 0
-        return self.challenge
-
-    def release_once(self, payload: bytes, *, timeout_seconds: float) -> None:
-        assert timeout_seconds > 0
-        self.releases.append(payload)
-
-    def finish(
-        self, *, timeout_seconds: float, max_stdout_bytes: int, max_stderr_bytes: int
-    ) -> object:
-        assert timeout_seconds > 0
-        assert max_stdout_bytes > 0
-        assert max_stderr_bytes > 0
-        return resource_cgroup.CommandResultV1(returncode=0, stdout=b"", stderr=b"")
-
-    def terminate(self) -> None:
-        return None
 
 
 class _FakeSystemdRunner:
@@ -855,8 +817,10 @@ class _FakeSystemdRunner:
         self.calls: list[tuple[str, ...]] = []
         self.started: list[tuple[str, ...]] = []
         self.stopped: list[str] = []
-        self.gate = _FakeHeldGate()
         self.unit_name = ""
+        self.tmux_pid = 4242
+        self.tmux_session_id = "$0"
+        self.scope_main_pid = 4241
 
     def _result(self, *, returncode: int, stdout: bytes = b"", stderr: bytes = b"") -> object:
         return resource_cgroup.CommandResultV1(
@@ -879,6 +843,14 @@ class _FakeSystemdRunner:
         self.calls.append(argv)
         if self.timeout:
             raise TimeoutError("bounded")
+        if argv[0] == "/usr/bin/systemd-run":
+            self.started.append(argv)
+            self.unit_name = next(
+                argument.split("=", 1)[1]
+                for argument in argv
+                if argument.startswith("--unit=")
+            )
+            return self._result(returncode=0)
         if argv[0] == "/usr/bin/systemctl" and argv[3] == "show" and "--property=Id" in argv:
             return self._result(
                 returncode=0 if self.collision else 4,
@@ -899,7 +871,7 @@ class _FakeSystemdRunner:
             control_group = self.control_group or f"{self.target_slice_control_group}/{self.unit_name}"
             values = {
                 "ControlGroup": control_group,
-                "MainPID": "4241",
+                "MainPID": str(self.scope_main_pid),
                 "DelegateControllers": self.scope_delegate_controllers,
             }
             properties = tuple(
@@ -918,24 +890,10 @@ class _FakeSystemdRunner:
             self.stopped.append(argv[4])
             return self._result(returncode=0)
         if argv[0] == "/usr/bin/tmux":
-            return self._result(returncode=0, stdout=b"4242\n")
+            if argv[-1] == "#{session_id}":
+                return self._result(returncode=0, stdout=f"{self.tmux_session_id}\n".encode())
+            return self._result(returncode=0, stdout=f"{self.tmux_pid}\n".encode())
         raise AssertionError(f"unexpected command {argv!r}")
-
-    def start_held(
-        self,
-        argv: tuple[str, ...],
-        *,
-        timeout_seconds: float,
-        max_stdout_bytes: int,
-        max_stderr_bytes: int,
-    ) -> _FakeHeldGate:
-        assert timeout_seconds > 0
-        assert max_stdout_bytes == 65
-        assert max_stderr_bytes > 0
-        self.started.append(argv)
-        self.unit_name = next(argument.split("=", 1)[1] for argument in argv if argument.startswith("--unit="))
-        return self.gate
-
 
 def _write_cgroup_documents(
     root: Path,
@@ -988,17 +946,39 @@ def _systemd_adapter(
     )
     monkeypatch.setattr(resource_cgroup, "CGROUP_ROOT", root)
     monkeypatch.setattr(resource_cgroup.secrets, "token_hex", lambda size: "d" * (size * 2))
+    monkeypatch.setattr(
+        resource_cgroup,
+        "_accept_gate_handoff",
+        lambda *_args, **_kwargs: resource_cgroup._GateHandoff(
+            commit="e" * 32,
+            session_id=runner.tmux_session_id,
+            tmux_pid=runner.tmux_pid,
+            pane_pid=runner.tmux_pid,
+            connection=_FakeGateConnection(
+                session_id=runner.tmux_session_id,
+                tmux_pid=runner.tmux_pid,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        resource_cgroup,
+        "_process_identity",
+        lambda pid: resource_cgroup._ProcessIdentity(pid=pid, start_ticks=pid),
+    )
+    monkeypatch.setattr(
+        resource_cgroup.SystemdUserCgroupAdapter,
+        "_read_tmux_children",
+        lambda _self, _tmux_pid: (),
+    )
     return resource_cgroup.SystemdUserCgroupAdapter(runner=runner)
 
 
-def test_systemd_adapter_uses_fixed_argv_internal_unit_and_one_internal_gate_release(
+def test_systemd_adapter_uses_fixed_argv_internal_unit_and_authenticated_gate_ready(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     runner = _FakeSystemdRunner()
     adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
-    monkeypatch.setattr(resource_cgroup, "PROC_ROOT", _write_tmux_children_fact(tmp_path))
-
-    scope = start_verified_scope(
+    scope = _start_released_for_test(
         adapter,
         profile=_profile(),
         socket_name="scope_socket-1",
@@ -1006,31 +986,34 @@ def test_systemd_adapter_uses_fixed_argv_internal_unit_and_one_internal_gate_rel
     )
 
     assert scope.unit_name == "codex-master-resource-" + "d" * 32 + ".scope"
-    assert scope.challenge == "c" * 64
-    assert runner.started == [
-        (
-            "/usr/bin/systemd-run",
-            "--user",
-            "--scope",
-            "--pipe",
-            "--quiet",
-            "--collect",
-            f"--unit={scope.unit_name}",
-            "--slice=codex-master.slice",
-            "--property=Delegate=cpu cpuset memory pids io",
-            "--property=AllowedCPUs=4-11",
-            "--property=CPUQuota=750%",
-            "--property=CPUWeight=50",
-            f"--property=MemoryHigh={9 * GIB}",
-            f"--property=MemoryMax={12 * GIB}",
-            f"--property=MemorySwapMax={8 * GIB}",
-            "--property=IOWeight=50",
-            "/usr/libexec/codex-master-resource-scope-gate",
-            "scope_socket-1",
-            "scope-session.1",
-        )
-    ]
-    assert runner.gate.releases == [b"c" * 64 + b"\n"]
+    assert len(runner.started) == 1
+    argv = runner.started[0]
+    assert argv[:6] == (
+        "/usr/bin/systemd-run",
+        "--user",
+        "--scope",
+        "--no-block",
+        "--quiet",
+        "--collect",
+    )
+    assert "--pipe" not in argv
+    assert argv[-15:] == (
+        "/usr/libexec/codex-master-resource-scope-gate",
+        "--socket",
+        "scope_socket-1",
+        "--session",
+        "scope-session.1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--runner-fd",
+        argv[-7],
+        "--device",
+        argv[-5],
+        "--inode",
+        argv[-3],
+        "--challenge",
+        scope.challenge,
+    )
     assert (
         "/usr/bin/systemctl",
         "--user",
@@ -1041,16 +1024,7 @@ def test_systemd_adapter_uses_fixed_argv_internal_unit_and_one_internal_gate_rel
         "--property=MainPID",
         "--property=DelegateControllers",
     ) in runner.calls
-    assert (
-        "/usr/bin/tmux",
-        "-L",
-        "scope_socket-1",
-        "display-message",
-        "-p",
-        "-t",
-        "scope-session.1",
-        "#{pid}",
-    ) in runner.calls
+    assert not any(argv[0] == "/usr/bin/tmux" for argv in runner.calls)
 
 
 def test_systemd_adapter_binds_preflight_and_new_scope_to_codex_master_slice(
@@ -1058,9 +1032,7 @@ def test_systemd_adapter_binds_preflight_and_new_scope_to_codex_master_slice(
 ) -> None:
     runner = _FakeSystemdRunner()
     adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
-    monkeypatch.setattr(resource_cgroup, "PROC_ROOT", _write_tmux_children_fact(tmp_path))
-
-    start_verified_scope(
+    _start_released_for_test(
         adapter,
         profile=_profile(),
         socket_name="scope_socket-1",
@@ -1109,13 +1081,12 @@ def test_systemd_adapter_denies_missing_wrong_or_non_delegated_target_slice_befo
             slice_controllers=controllers,
         )
         with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
-            start_verified_scope(
+            _start_released_for_test(
                 adapter,
                 profile=_profile(),
                 socket_name="scope_socket-1",
                 session_name="scope-session.1",
             )
-        assert runner.gate.releases == []
         if number == 1:
             assert runner.stopped == ["codex-master-resource-" + "d" * 32 + ".scope"]
         else:
@@ -1131,7 +1102,7 @@ def test_systemd_adapter_rejects_scope_delegate_controller_superset_before_relea
     adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
 
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
-        start_verified_scope(
+        _start_released_for_test(
             adapter,
             profile=_profile(),
             socket_name="scope_socket-1",
@@ -1139,7 +1110,6 @@ def test_systemd_adapter_rejects_scope_delegate_controller_superset_before_relea
         )
 
     assert len(runner.started) == 1
-    assert runner.gate.releases == []
     assert runner.stopped == ["codex-master-resource-" + "d" * 32 + ".scope"]
 
 
@@ -1154,9 +1124,7 @@ def test_systemd_adapter_allows_parent_controller_supersets(
         slice_controllers=b"cpu cpuset memory pids io hugetlb\n",
         slice_subtree=b"cpu cpuset memory pids io hugetlb\n",
     )
-    monkeypatch.setattr(resource_cgroup, "PROC_ROOT", _write_tmux_children_fact(tmp_path))
-
-    scope = start_verified_scope(
+    scope = _start_released_for_test(
         adapter,
         profile=_profile(),
         socket_name="scope_socket-1",
@@ -1186,7 +1154,7 @@ def test_systemd_adapter_rejects_duplicate_target_slice_controller_evidence_befo
     )
 
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
-        start_verified_scope(
+        _start_released_for_test(
             adapter,
             profile=_profile(),
             socket_name="scope_socket-1",
@@ -1194,7 +1162,6 @@ def test_systemd_adapter_rejects_duplicate_target_slice_controller_evidence_befo
         )
 
     assert runner.started == []
-    assert runner.gate.releases == []
 
 
 def test_integration_precondition_classifier_skips_only_clean_absence_and_fails_readback(
@@ -1269,13 +1236,12 @@ def test_systemd_adapter_denies_collision_timeout_overflow_and_path_traversal_be
     ):
         adapter = _systemd_adapter(monkeypatch, tmp_path / str(number), runner)
         with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
-            start_verified_scope(
+            _start_released_for_test(
                 adapter,
                 profile=_profile(),
                 socket_name="scope_socket-1",
                 session_name="scope-session.1",
             )
-        assert runner.gate.releases == []
         if number < 3:
             assert runner.started == []
         else:
@@ -1290,14 +1256,13 @@ def test_systemd_adapter_never_releases_on_readback_failure_and_cleans_only_own_
     adapter = _systemd_adapter(monkeypatch, tmp_path, runner, cpu_max=b"1 1\n")
 
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
-        start_verified_scope(
+        _start_released_for_test(
             adapter,
             profile=_profile(),
             socket_name="scope_socket-1",
             session_name="scope-session.1",
         )
 
-    assert runner.gate.releases == []
     assert runner.stopped == ["codex-master-resource-" + "d" * 32 + ".scope"]
 
 
@@ -1307,7 +1272,8 @@ def test_systemd_adapter_rejects_nonregular_readback_targets_before_release(
 ) -> None:
     runner = _FakeSystemdRunner()
     adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
-    scope = adapter.start_held_scope(
+    scope = _start_released_for_test(
+        adapter,
         profile=_profile(),
         socket_name="scope_socket-1",
         session_name="scope-session.1",
@@ -1323,8 +1289,6 @@ def test_systemd_adapter_rejects_nonregular_readback_targets_before_release(
 
     with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
         adapter.verify_scope(scope, _profile())
-
-    assert runner.gate.releases == []
     adapter.cleanup_new_scope(scope)
 
 
@@ -1341,56 +1305,1632 @@ def test_systemd_adapter_rejects_cgroup_root_generation_replacement(
         adapter.inspect_preflight()
 
 
-def test_systemd_user_cgroup_integration_contract_requires_double_opt_in() -> None:
-    if os.environ.get("CODEX_MASTER_CGROUP_IT") != "1":
-        pytest.skip("cgroup_it_disabled")
-    if os.environ.get("CODEX_MASTER_SYSTEMD_USER_IT") != "1":
-        pytest.skip("systemd_user_it_disabled")
-    if sys.platform != "linux":
-        pytest.skip("requires_linux")
-    cgroup_controllers = Path("/sys/fs/cgroup/cgroup.controllers")
-    try:
-        metadata = cgroup_controllers.lstat()
-    except FileNotFoundError:
-        pytest.skip("requires_cgroup_v2")
-    except OSError as exc:
-        pytest.fail(f"cgroup_v2_readback_failed:{type(exc).__name__}")
-    if not stat.S_ISREG(metadata.st_mode):
-        pytest.fail("cgroup_v2_readback_failed:not_regular")
-    approved_text = os.environ.get("CODEX_MASTER_CGROUP_IT_CPUSET")
-    if not isinstance(approved_text, str):
-        pytest.skip("requires_approved_cpuset")
+class _G5ContractAdapter:
+    def __init__(self) -> None:
+        self.events: list[str] = []
+        self.cleaned: list[PreparedAgentScope] = []
 
-    adapter = resource_cgroup.SystemdUserCgroupAdapter()
-    try:
-        reason = adapter.integration_precondition_reason()
-    except CgroupPreflightError as exc:
-        pytest.fail(f"integration_preflight_readback_failed:{type(exc).__name__}")
-    if reason is not None:
-        pytest.skip(reason)
-    try:
-        approved = resource_cgroup._parse_cpu_set(approved_text)
-    except CgroupPreflightError as exc:
-        pytest.fail(f"approved_cpuset_invalid:{type(exc).__name__}")
-    preflight = adapter.inspect_preflight()
-    topology = parse_cpu_topology(adapter)
-    profile = derive_cgroup_profile(
-        topology,
-        approved_cpuset=approved,
-        mem_total_bytes=os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"),
-    )
-    if not set(profile.cpuset_cpus).issubset(preflight.parent_effective_cpuset):
-        pytest.skip("requires_approved_cpuset")
+    def inspect_preflight(self) -> CgroupPreflightV1:
+        self.events.append("preflight")
+        return _preflight()
 
-    scope: PreparedAgentScope | None = None
-    try:
-        scope = start_verified_scope(
-            adapter,
-            profile=profile,
-            socket_name=f"g4-it-{os.getpid()}",
-            session_name=f"g4-it-{os.getpid()}",
+    def start_released_scope(
+        self,
+        *,
+        profile: CgroupProfileV1,
+        socket_name: str,
+        session_name: str,
+        runner_target: object,
+    ) -> PreparedAgentScope:
+        del profile, runner_target
+        self.events.append("scope-ready")
+        return PreparedAgentScope(
+            unit_name="codex-master-g5.scope",
+            socket_name=socket_name,
+            session_name=session_name,
+            control_group="user.slice/codex-master-g5.scope",
+            gate_pid=4241,
+            challenge="a" * 64,
         )
-        assert scope.gate_pid > 0
+
+    def verify_scope(self, scope: PreparedAgentScope, profile: CgroupProfileV1) -> None:
+        del scope, profile
+        self.events.append("readback")
+
+    def confirm_scope(self, scope: PreparedAgentScope) -> int:
+        del scope
+        self.events.append("gate-confirm")
+        return 4242
+
+    def cleanup_new_scope(self, scope: PreparedAgentScope) -> None:
+        self.events.append("cleanup")
+        self.cleaned.append(scope)
+
+
+def test_g5_exports_release_then_confirm_only_after_dispatch_boundary() -> None:
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        metadata = os.fstat(descriptor)
+        target = resource_cgroup.RunnerExecutionTargetV1(
+            owner_pid=os.getpid(),
+            fd=descriptor,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+        )
+        adapter = _G5ContractAdapter()
+
+        scope = resource_cgroup.start_released_scope(
+            adapter,
+            profile=_profile(),
+            socket_name="g5-socket-1",
+            session_name="g5-session-1",
+            runner_target=target,
+        )
+
+        assert adapter.events == ["preflight", "scope-ready", "readback"]
+        assert adapter.cleaned == []
+
+        resource_cgroup.confirm_verified_scope(adapter, scope)
+
+        assert adapter.events == [
+            "preflight",
+            "scope-ready",
+            "readback",
+            "gate-confirm",
+        ]
+        assert adapter.cleaned == []
     finally:
-        if scope is not None:
-            adapter.cleanup_new_scope(scope)
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"owner_pid": True},
+        {"fd": True},
+        {"device": True},
+        {"inode": True},
+        {"owner_pid": 0},
+        {"fd": 0},
+        {"fd": -1},
+        {"device": 0},
+        {"device": -1},
+        {"inode": 0},
+        {"owner_pid": os.getpid() + 1},
+    ),
+)
+def test_runner_execution_target_rejects_invalid_owner_or_numeric_identity(
+    tmp_path: Path, overrides: dict[str, object]
+) -> None:
+    runner = tmp_path / "runner"
+    runner.write_bytes(b"runner")
+    descriptor = os.open(runner, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        metadata = os.fstat(descriptor)
+        values: dict[str, object] = {
+            "owner_pid": os.getpid(),
+            "fd": descriptor,
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+        }
+        values.update(overrides)
+
+        with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+            resource_cgroup.RunnerExecutionTargetV1(**values)  # type: ignore[arg-type]
+    finally:
+        os.close(descriptor)
+
+
+def test_runner_execution_target_rejects_closed_nonregular_hardlinked_or_mismatched_fd(
+    tmp_path: Path,
+) -> None:
+    runner = tmp_path / "runner"
+    runner.write_bytes(b"runner")
+    descriptor = os.open(runner, os.O_RDONLY | os.O_CLOEXEC)
+    metadata = os.fstat(descriptor)
+    os.close(descriptor)
+
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        resource_cgroup.RunnerExecutionTargetV1(
+            owner_pid=os.getpid(),
+            fd=descriptor,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+        )
+
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        directory_stat = os.fstat(directory_fd)
+        with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+            resource_cgroup.RunnerExecutionTargetV1(
+                owner_pid=os.getpid(),
+                fd=directory_fd,
+                device=directory_stat.st_dev,
+                inode=directory_stat.st_ino,
+            )
+    finally:
+        os.close(directory_fd)
+
+    os.link(runner, tmp_path / "runner-link")
+    descriptor = os.open(runner, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        metadata = os.fstat(descriptor)
+        with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+            resource_cgroup.RunnerExecutionTargetV1(
+                owner_pid=os.getpid(),
+                fd=descriptor,
+                device=metadata.st_dev,
+                inode=metadata.st_ino,
+            )
+    finally:
+        os.close(descriptor)
+
+    single_link = tmp_path / "single-link"
+    single_link.write_bytes(b"single-link")
+    descriptor = os.open(single_link, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        metadata = os.fstat(descriptor)
+        with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+            resource_cgroup.RunnerExecutionTargetV1(
+                owner_pid=os.getpid(),
+                fd=descriptor,
+                device=metadata.st_dev,
+                inode=metadata.st_ino + 1,
+            )
+    finally:
+        os.close(descriptor)
+
+
+def test_runner_execution_target_rejects_source_path_replacement_before_scope_start(
+    tmp_path: Path,
+) -> None:
+    runner = tmp_path / "runner"
+    replacement = tmp_path / "replacement"
+    runner.write_bytes(b"original")
+    replacement.write_bytes(b"replacement")
+    descriptor = os.open(runner, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        metadata = os.fstat(descriptor)
+        target = resource_cgroup.RunnerExecutionTargetV1(
+            owner_pid=os.getpid(),
+            fd=descriptor,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+        )
+        os.replace(replacement, runner)
+
+        with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+            target.verify_for_scope_start()
+    finally:
+        os.close(descriptor)
+
+
+def test_scope_gate_reopens_only_pinned_parent_runner_fd() -> None:
+    gate_module = runpy.run_path(str(GATE))
+    reopen = gate_module["_open_pinned_parent_runner_fd"]
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        metadata = os.fstat(descriptor)
+        gate_fd = reopen(
+            owner_pid=os.getpid(),
+            parent_fd=descriptor,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+        )
+        try:
+            opened = os.fstat(gate_fd)
+            assert (opened.st_dev, opened.st_ino) == (metadata.st_dev, metadata.st_ino)
+            assert os.pread(gate_fd, 4, 0) == b"\x7fELF"
+        finally:
+            os.close(gate_fd)
+    finally:
+        os.close(descriptor)
+
+
+def test_scope_gate_uses_fixed_argv_and_rejects_wrong_release_challenge() -> None:
+    socket_name = "g5-socket-1"
+    challenge = "a" * 64
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(f"\0codex-master-g5-{socket_name}")
+    listener.listen(1)
+    listener.settimeout(1)
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        metadata = os.fstat(descriptor)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(GATE),
+                "--socket",
+                socket_name,
+                "--session",
+                "g5-session-1",
+                "--owner-pid",
+                str(os.getpid()),
+                "--runner-fd",
+                str(descriptor),
+                "--device",
+                str(metadata.st_dev),
+                "--inode",
+                str(metadata.st_ino),
+                "--challenge",
+                challenge,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        connection, _address = listener.accept()
+        with connection:
+            assert connection.recv(128) == f"READY {challenge}\n".encode("ascii")
+            connection.sendall(f"RELEASE {'b' * 64}\n".encode("ascii"))
+        assert process.wait(timeout=1) == 64
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=1)
+        os.close(descriptor)
+        listener.close()
+
+
+def test_scope_gate_reports_detached_tmux_server_and_pane_handoff() -> None:
+    if not Path("/usr/bin/tmux").is_file():
+        pytest.skip("requires_tmux")
+    socket_name = f"g5-handoff-{os.getpid()}"
+    session_name = f"g5-handoff-{os.getpid()}"
+    challenge = "e" * 64
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(f"\0codex-master-g5-{socket_name}")
+    listener.listen(1)
+    listener.settimeout(2)
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        metadata = os.fstat(descriptor)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(GATE),
+                "--socket",
+                socket_name,
+                "--session",
+                session_name,
+                "--owner-pid",
+                str(os.getpid()),
+                "--runner-fd",
+                str(descriptor),
+                "--device",
+                str(metadata.st_dev),
+                "--inode",
+                str(metadata.st_ino),
+                "--challenge",
+                challenge,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        connection, _address = listener.accept()
+        with connection:
+            connection.settimeout(2)
+            assert connection.recv(128) == f"READY {challenge}\n".encode("ascii")
+            connection.sendall(f"RELEASE {challenge}\n".encode("ascii"))
+            handoff = connection.recv(160)
+            fields = handoff.decode("ascii").strip().split(" ")
+            assert fields[:2] == ["HANDOFF", challenge]
+            assert len(fields) == 6
+            commit = fields[2]
+            assert len(commit) == 32
+            assert fields[3].startswith("$")
+            assert fields[3][1:].isdecimal()
+            session_identity = subprocess.run(
+                [
+                    "/usr/bin/tmux",
+                    "-L",
+                    socket_name,
+                    "display-message",
+                    "-p",
+                    "-t",
+                    fields[3],
+                    "#{session_id}",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+                timeout=2,
+            )
+            assert session_identity.stdout == f"{fields[3]}\n".encode("ascii")
+            assert session_identity.stderr == b""
+            tmux_pid, pane_pid = (int(fields[4]), int(fields[5]))
+            assert tmux_pid > 0
+            assert pane_pid > 0
+            assert tmux_pid != process.pid
+            environment = (Path(f"/proc/{tmux_pid}/environ")).read_bytes().split(b"\0")
+            runner_path = next(
+                entry.split(b"=", 1)[1].decode("ascii")
+                for entry in environment
+                if entry.startswith(b"CODEX_MASTER_RUNNER_EXEC_PATH=")
+            )
+            runner_fd = int(runner_path.removeprefix("/proc/self/fd/"))
+            inherited = os.open(f"/proc/{tmux_pid}/fd/{runner_fd}", os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                assert os.pread(inherited, 4, 0) == b"\x7fELF"
+            finally:
+                os.close(inherited)
+            connection.sendall(f"ATTEST {challenge} {commit}\n".encode("ascii"))
+            attestation = connection.recv(160).decode("ascii").strip().split(" ")
+            assert attestation == [
+                "ATTEST",
+                challenge,
+                commit,
+                fields[3],
+                fields[4],
+                fields[5],
+            ]
+            connection.sendall(f"ACK {challenge} {commit}\n".encode("ascii"))
+        assert process.wait(timeout=2) == 0
+    finally:
+        subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "kill-server"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=1)
+        os.close(descriptor)
+        listener.close()
+
+
+def test_scope_gate_reads_handoff_facts_only_through_bound_control_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not Path("/usr/bin/tmux").is_file():
+        pytest.skip("requires_tmux")
+    socket_name = f"g5-one-control-{os.getpid()}"
+    session_name = f"g5-one-control-{os.getpid()}"
+    gate = runpy.run_path(str(GATE))
+    gate_globals = gate["_start_tmux_and_read_handoff"].__globals__
+    original_popen = gate_globals["subprocess"].Popen
+    tmux_argvs: list[tuple[str, ...]] = []
+    enforce_bound_client = True
+
+    def guard_tmux_popen(argv: object, *args: object, **kwargs: object) -> object:
+        if isinstance(argv, tuple) and argv and argv[0] == "/usr/bin/tmux":
+            tmux_argvs.append(argv)
+            if enforce_bound_client and "-C" not in argv:
+                raise AssertionError("unbound tmux client after control start")
+        return original_popen(argv, *args, **kwargs)
+
+    monkeypatch.setattr(gate_globals["subprocess"], "Popen", guard_tmux_popen)
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    control: object | None = None
+    try:
+        session_id, tmux_pid, pane_pid, control = gate["_start_tmux_and_read_handoff"](
+            descriptor, socket_name, session_name
+        )
+        assert session_id.startswith("$")
+        assert tmux_pid > 0 and pane_pid > 0
+        assert len(tmux_argvs) == 1
+        assert "-C" in tmux_argvs[0]
+    finally:
+        enforce_bound_client = False
+        if control is not None:
+            gate["_cleanup_new_tmux_session"](control)
+            gate["_close_tmux_control"](control)
+        subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "kill-server"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        os.close(descriptor)
+
+
+def test_scope_gate_cleans_new_session_when_parent_closes_before_commit() -> None:
+    if not Path("/usr/bin/tmux").is_file():
+        pytest.skip("requires_tmux")
+    socket_name = f"g5-ack-eof-{os.getpid()}"
+    session_name = f"g5-ack-eof-{os.getpid()}"
+    challenge = "f" * 64
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(f"\0codex-master-g5-{socket_name}")
+    listener.listen(1)
+    listener.settimeout(2)
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        metadata = os.fstat(descriptor)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(GATE),
+                "--socket",
+                socket_name,
+                "--session",
+                session_name,
+                "--owner-pid",
+                str(os.getpid()),
+                "--runner-fd",
+                str(descriptor),
+                "--device",
+                str(metadata.st_dev),
+                "--inode",
+                str(metadata.st_ino),
+                "--challenge",
+                challenge,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        connection, _address = listener.accept()
+        with connection:
+            connection.settimeout(2)
+            assert connection.recv(128) == f"READY {challenge}\n".encode("ascii")
+            connection.sendall(f"RELEASE {challenge}\n".encode("ascii"))
+            assert connection.recv(128).startswith(f"HANDOFF {challenge} ".encode("ascii"))
+        assert process.wait(timeout=2) == 64
+        absent = subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "has-session", "-t", session_name],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        assert absent.returncode != 0
+    finally:
+        subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "kill-server"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=1)
+        os.close(descriptor)
+        listener.close()
+
+
+def test_scope_gate_cleanup_preserves_foreign_session_on_same_tmux_server() -> None:
+    if not Path("/usr/bin/tmux").is_file():
+        pytest.skip("requires_tmux")
+    socket_name = f"g5-ack-foreign-{os.getpid()}"
+    session_name = f"g5-ack-own-{os.getpid()}"
+    foreign_session = f"g5-ack-foreign-{os.getpid()}"
+    challenge = "e" * 64
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(f"\0codex-master-g5-{socket_name}")
+    listener.listen(1)
+    listener.settimeout(2)
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "new-session", "-d", "-s", foreign_session],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=2,
+        )
+        metadata = os.fstat(descriptor)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(GATE),
+                "--socket",
+                socket_name,
+                "--session",
+                session_name,
+                "--owner-pid",
+                str(os.getpid()),
+                "--runner-fd",
+                str(descriptor),
+                "--device",
+                str(metadata.st_dev),
+                "--inode",
+                str(metadata.st_ino),
+                "--challenge",
+                challenge,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        connection, _address = listener.accept()
+        with connection:
+            connection.settimeout(2)
+            assert connection.recv(128) == f"READY {challenge}\n".encode("ascii")
+            connection.sendall(f"RELEASE {challenge}\n".encode("ascii"))
+            assert connection.recv(160).startswith(f"HANDOFF {challenge} ".encode("ascii"))
+        assert process.wait(timeout=2) == 64
+        own = subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "has-session", "-t", session_name],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        foreign = subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "has-session", "-t", foreign_session],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        assert own.returncode != 0
+        assert foreign.returncode == 0
+    finally:
+        subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "kill-server"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=1)
+        os.close(descriptor)
+        listener.close()
+
+
+def test_scope_gate_cleans_renamed_own_session_without_commit() -> None:
+    if not Path("/usr/bin/tmux").is_file():
+        pytest.skip("requires_tmux")
+    socket_name = f"g5-ack-rename-{os.getpid()}"
+    session_name = f"g5-ack-own-{os.getpid()}"
+    renamed_session = f"g5-ack-renamed-{os.getpid()}"
+    foreign_session = f"g5-ack-foreign-{os.getpid()}"
+    challenge = "d" * 64
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(f"\0codex-master-g5-{socket_name}")
+    listener.listen(1)
+    listener.settimeout(2)
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "new-session", "-d", "-s", foreign_session],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=2,
+        )
+        metadata = os.fstat(descriptor)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(GATE),
+                "--socket",
+                socket_name,
+                "--session",
+                session_name,
+                "--owner-pid",
+                str(os.getpid()),
+                "--runner-fd",
+                str(descriptor),
+                "--device",
+                str(metadata.st_dev),
+                "--inode",
+                str(metadata.st_ino),
+                "--challenge",
+                challenge,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        connection, _address = listener.accept()
+        with connection:
+            connection.settimeout(2)
+            assert connection.recv(128) == f"READY {challenge}\n".encode("ascii")
+            connection.sendall(f"RELEASE {challenge}\n".encode("ascii"))
+            assert connection.recv(160).startswith(f"HANDOFF {challenge} ".encode("ascii"))
+            subprocess.run(
+                [
+                    "/usr/bin/tmux",
+                    "-L",
+                    socket_name,
+                    "rename-session",
+                    "-t",
+                    session_name,
+                    renamed_session,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+                timeout=2,
+            )
+        assert process.wait(timeout=2) == 64
+        own = subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "has-session", "-t", renamed_session],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        foreign = subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "has-session", "-t", foreign_session],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        assert own.returncode != 0
+        assert foreign.returncode == 0
+    finally:
+        subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "kill-server"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=1)
+        os.close(descriptor)
+        listener.close()
+
+
+def test_scope_gate_server_restart_never_cleans_reused_foreign_session_before_ack() -> None:
+    if not Path("/usr/bin/tmux").is_file():
+        pytest.skip("requires_tmux")
+    socket_name = f"g5-ack-restart-{os.getpid()}"
+    session_name = f"g5-ack-own-{os.getpid()}"
+    foreign_session = f"g5-ack-foreign-{os.getpid()}"
+    challenge = "b" * 64
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(f"\0codex-master-g5-{socket_name}")
+    listener.listen(1)
+    listener.settimeout(2)
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        metadata = os.fstat(descriptor)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(GATE),
+                "--socket",
+                socket_name,
+                "--session",
+                session_name,
+                "--owner-pid",
+                str(os.getpid()),
+                "--runner-fd",
+                str(descriptor),
+                "--device",
+                str(metadata.st_dev),
+                "--inode",
+                str(metadata.st_ino),
+                "--challenge",
+                challenge,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        connection, _address = listener.accept()
+        with connection:
+            connection.settimeout(2)
+            assert connection.recv(128) == f"READY {challenge}\n".encode("ascii")
+            connection.sendall(f"RELEASE {challenge}\n".encode("ascii"))
+            fields = connection.recv(160).decode("ascii").strip().split(" ")
+            assert fields[:2] == ["HANDOFF", challenge]
+            assert len(fields) == 6
+            original_session_id = fields[3]
+            subprocess.run(
+                ["/usr/bin/tmux", "-L", socket_name, "kill-server"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+                timeout=2,
+            )
+            replacement = subprocess.run(
+                [
+                    "/usr/bin/tmux",
+                    "-L",
+                    socket_name,
+                    "new-session",
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{session_id}",
+                    "-s",
+                    foreign_session,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+                timeout=2,
+            )
+            assert replacement.stdout == f"{original_session_id}\n".encode("ascii")
+            assert replacement.stderr == b""
+        assert process.wait(timeout=2) == 64
+        foreign = subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "has-session", "-t", original_session_id],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        assert foreign.returncode == 0
+    finally:
+        subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "kill-server"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=1)
+        os.close(descriptor)
+        listener.close()
+
+
+@pytest.mark.parametrize("ack_kind", ("wrong_challenge", "replayed_commit"))
+def test_scope_gate_rejects_nonfresh_commit_and_cleans_new_session(ack_kind: str) -> None:
+    if not Path("/usr/bin/tmux").is_file():
+        pytest.skip("requires_tmux")
+    socket_name = f"g5-ack-{ack_kind}-{os.getpid()}"
+    session_name = f"g5-ack-{ack_kind}-{os.getpid()}"
+    challenge = "a" * 64
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(f"\0codex-master-g5-{socket_name}")
+    listener.listen(1)
+    listener.settimeout(2)
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        metadata = os.fstat(descriptor)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(GATE),
+                "--socket",
+                socket_name,
+                "--session",
+                session_name,
+                "--owner-pid",
+                str(os.getpid()),
+                "--runner-fd",
+                str(descriptor),
+                "--device",
+                str(metadata.st_dev),
+                "--inode",
+                str(metadata.st_ino),
+                "--challenge",
+                challenge,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        connection, _address = listener.accept()
+        with connection:
+            connection.settimeout(2)
+            assert connection.recv(128) == f"READY {challenge}\n".encode("ascii")
+            connection.sendall(f"RELEASE {challenge}\n".encode("ascii"))
+            fields = connection.recv(160).decode("ascii").strip().split(" ")
+            assert fields[:2] == ["HANDOFF", challenge]
+            assert len(fields) == 6
+            commit = fields[2]
+            assert len(commit) == 32
+            if ack_kind == "wrong_challenge":
+                acknowledgment = f"ACK {'b' * 64} {commit}\n"
+            else:
+                acknowledgment = f"ACK {challenge} {'0' * 32}\n"
+            connection.sendall(acknowledgment.encode("ascii"))
+        assert process.wait(timeout=2) == 64
+        absent = subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "has-session", "-t", session_name],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        assert absent.returncode != 0
+    finally:
+        subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "kill-server"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=1)
+        os.close(descriptor)
+        listener.close()
+
+
+def test_scope_gate_cleans_new_session_after_commit_timeout() -> None:
+    if not Path("/usr/bin/tmux").is_file():
+        pytest.skip("requires_tmux")
+    socket_name = f"g5-ack-timeout-{os.getpid()}"
+    session_name = f"g5-ack-timeout-{os.getpid()}"
+    challenge = "c" * 64
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(f"\0codex-master-g5-{socket_name}")
+    listener.listen(1)
+    listener.settimeout(2)
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        metadata = os.fstat(descriptor)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(GATE),
+                "--socket",
+                socket_name,
+                "--session",
+                session_name,
+                "--owner-pid",
+                str(os.getpid()),
+                "--runner-fd",
+                str(descriptor),
+                "--device",
+                str(metadata.st_dev),
+                "--inode",
+                str(metadata.st_ino),
+                "--challenge",
+                challenge,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        connection, _address = listener.accept()
+        with connection:
+            connection.settimeout(2)
+            assert connection.recv(128) == f"READY {challenge}\n".encode("ascii")
+            connection.sendall(f"RELEASE {challenge}\n".encode("ascii"))
+            assert connection.recv(160).startswith(f"HANDOFF {challenge} ".encode("ascii"))
+            assert process.wait(timeout=7) == 64
+        absent = subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "has-session", "-t", session_name],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        assert absent.returncode != 0
+    finally:
+        subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "kill-server"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=1)
+        os.close(descriptor)
+        listener.close()
+
+
+def test_scope_gate_cleans_owned_session_when_bound_attestation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not Path("/usr/bin/tmux").is_file():
+        pytest.skip("requires_tmux")
+    socket_name = f"g5-control-generation-{os.getpid()}"
+    session_name = f"g5-control-generation-{os.getpid()}"
+    gate = runpy.run_path(str(GATE))
+    gate_globals = gate["_start_tmux_and_read_handoff"].__globals__
+    def failing_attestation(*_args: object) -> object:
+        raise ValueError("generation changed")
+
+    monkeypatch.setitem(gate_globals, "_read_bound_attestation", failing_attestation)
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        with pytest.raises(ValueError, match="generation changed"):
+            gate["_start_tmux_and_read_handoff"](descriptor, socket_name, session_name)
+        own = subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "has-session", "-t", session_name],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        assert own.returncode != 0
+    finally:
+        subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "kill-server"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        os.close(descriptor)
+
+
+def test_scope_gate_control_overflow_before_session_id_uses_bound_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not Path("/usr/bin/tmux").is_file():
+        pytest.skip("requires_tmux")
+    socket_name = f"g5-control-overflow-{os.getpid()}"
+    session_name = f"g5-control-overflow-{os.getpid()}"
+    gate = runpy.run_path(str(GATE))
+    gate_globals = gate["_start_tmux_and_read_handoff"].__globals__
+    monkeypatch.setitem(gate_globals, "_MAX_CONTROL_OUTPUT_BYTES", 1)
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        with pytest.raises(ValueError, match="tmux control failed"):
+            gate["_start_tmux_and_read_handoff"](descriptor, socket_name, session_name)
+        own = subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "has-session", "-t", session_name],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        assert own.returncode != 0
+    finally:
+        subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "kill-server"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        os.close(descriptor)
+
+
+def test_scope_gate_control_spawn_failure_cannot_create_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not Path("/usr/bin/tmux").is_file():
+        pytest.skip("requires_tmux")
+    socket_name = f"g5-control-spawn-{os.getpid()}"
+    session_name = f"g5-control-spawn-{os.getpid()}"
+    gate = runpy.run_path(str(GATE))
+    gate_globals = gate["_start_tmux_and_read_handoff"].__globals__
+    monkeypatch.setitem(gate_globals, "_TMUX_PATH", "/nonexistent/codex-master-tmux")
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        with pytest.raises(ValueError, match="tmux control failed"):
+            gate["_start_tmux_and_read_handoff"](descriptor, socket_name, session_name)
+        own = subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "has-session", "-t", session_name],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        assert own.returncode != 0
+    finally:
+        subprocess.run(
+            ["/usr/bin/tmux", "-L", socket_name, "kill-server"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize("stream", (1, 2))
+def test_parent_runner_aborts_each_output_overflow_before_timeout(stream: int) -> None:
+    runner = resource_cgroup._SubprocessSystemdUserRunner()
+    script = f"import os, time; os.write({stream}, b'x' * (1024 * 1024)); time.sleep(5)"
+    started = time.monotonic()
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        runner.run(
+            (sys.executable, "-c", script),
+            timeout_seconds=2.0,
+            max_stdout_bytes=128,
+            max_stderr_bytes=128,
+        )
+    assert time.monotonic() - started < 1.0
+
+
+def test_parent_runner_aborts_neverending_dual_stream_output_before_timeout() -> None:
+    runner = resource_cgroup._SubprocessSystemdUserRunner()
+    script = (
+        "import os, time\n"
+        "while True:\n"
+        "    os.write(1, b'x' * 16)\n"
+        "    os.write(2, b'y' * 16)\n"
+        "    time.sleep(0.001)\n"
+    )
+    started = time.monotonic()
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        runner.run(
+            (sys.executable, "-c", script),
+            timeout_seconds=2.0,
+            max_stdout_bytes=128,
+            max_stderr_bytes=128,
+        )
+    assert time.monotonic() - started < 1.0
+
+
+def test_gate_handoff_accepts_only_one_authenticated_peer_and_closes_replay_path() -> None:
+    import threading
+
+    socket_name = "g5-ready-1"
+    listener = resource_cgroup._create_gate_listener(socket_name)
+    challenge = "c" * 64
+    commit = "d" * 32
+    replies: list[bytes] = []
+    acknowledgment_received = threading.Event()
+
+    def first_gate() -> None:
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            connection.connect(resource_cgroup._gate_socket_address(socket_name))
+            connection.sendall(f"READY {challenge}\n".encode("ascii"))
+            replies.append(connection.recv(128))
+            connection.sendall(
+                f"HANDOFF {challenge} {commit} $0 {os.getpid()} {os.getpid()}\n".encode("ascii")
+            )
+            replies.append(connection.recv(128))
+            acknowledgment_received.set()
+        finally:
+            connection.close()
+
+    worker = threading.Thread(target=first_gate)
+    worker.start()
+    handoff = resource_cgroup._accept_gate_handoff(
+        listener,
+        gate_pid=os.getpid(),
+        owner_pid=os.getpid(),
+        challenge=challenge,
+    )
+    assert replies == [f"RELEASE {challenge}\n".encode("ascii")]
+    assert handoff.session_id == "$0"
+    assert (handoff.tmux_pid, handoff.pane_pid) == (os.getpid(), os.getpid())
+    assert not acknowledgment_received.wait(timeout=0.2)
+    resource_cgroup._commit_gate_handoff(handoff, challenge=challenge)
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert acknowledgment_received.is_set()
+    assert replies == [
+        f"RELEASE {challenge}\n".encode("ascii"),
+        f"ACK {challenge} {commit}\n".encode("ascii"),
+    ]
+    assert listener.fileno() == -1
+
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        resource_cgroup._accept_gate_handoff(
+            listener,
+            gate_pid=os.getpid(),
+            owner_pid=os.getpid(),
+            challenge=challenge,
+        )
+
+
+def test_gate_handoff_rejects_foreign_peer_pid() -> None:
+    socket_name = "g5-peer-1"
+    listener = resource_cgroup._create_gate_listener(socket_name)
+    challenge = "d" * 64
+
+    def foreign_gate() -> None:
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            connection.connect(resource_cgroup._gate_socket_address(socket_name))
+            try:
+                connection.sendall(f"READY {challenge}\n".encode("ascii"))
+            except BrokenPipeError:
+                pass
+        finally:
+            connection.close()
+
+    import threading
+
+    worker = threading.Thread(target=foreign_gate)
+    worker.start()
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        resource_cgroup._accept_gate_handoff(
+            listener,
+            gate_pid=os.getpid() + 1,
+            owner_pid=os.getpid(),
+            challenge=challenge,
+        )
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+
+
+def test_gate_attestation_rejects_replayed_commit_before_ack() -> None:
+    challenge = "c" * 64
+    handoff = resource_cgroup._GateHandoff(
+        commit="d" * 32,
+        session_id="$0",
+        tmux_pid=os.getpid(),
+        pane_pid=os.getpid(),
+        connection=_FakeGateConnection(attestation_commit="e" * 32),
+    )
+
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        resource_cgroup._attest_gate_handoff(handoff, challenge=challenge)
+    assert handoff.connection is not None
+    assert handoff.connection.sent == [f"ATTEST {challenge} {'d' * 32}\n".encode()]
+    resource_cgroup._close_gate_handoff(handoff)
+
+
+def test_confirm_scope_attests_pane_elf_and_is_exactly_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = _FakeSystemdRunner()
+    adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
+    runner.tmux_pid = os.getpid()
+    (tmp_path / "cgroup" / "user.slice" / "codex-master.slice" / (
+        "codex-master-resource-" + "d" * 32 + ".scope"
+    ) / "cgroup.procs").write_bytes(f"4241\n{os.getpid()}\n".encode())
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        metadata = os.fstat(descriptor)
+        target = resource_cgroup.RunnerExecutionTargetV1(
+            owner_pid=os.getpid(),
+            fd=descriptor,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+        )
+        scope = start_released_scope(
+            adapter,
+            profile=_profile(),
+            socket_name="g5-confirm-1",
+            session_name="g5-confirm-1",
+            runner_target=target,
+        )
+    finally:
+        os.close(descriptor)
+    (tmp_path / "cgroup" / scope.control_group / "cgroup.procs").write_bytes(
+        f"4241\n{os.getpid()}\n".encode()
+    )
+
+    assert adapter.confirm_scope(scope) == os.getpid()
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        adapter.confirm_scope(scope)
+
+
+def test_parent_commits_gate_handoff_only_after_pane_elf_attestation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = _FakeSystemdRunner()
+    adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
+    runner.tmux_pid = os.getpid()
+    cgroup_procs = tmp_path / "cgroup" / "user.slice" / "codex-master.slice" / (
+        "codex-master-resource-" + "d" * 32 + ".scope"
+    ) / "cgroup.procs"
+    cgroup_procs.write_bytes(f"4241\n{os.getpid()}\n".encode())
+    connection = _FakeGateConnection()
+    monkeypatch.setattr(
+        resource_cgroup,
+        "_accept_gate_handoff",
+        lambda *_args, **_kwargs: resource_cgroup._GateHandoff(
+            commit="e" * 32,
+            session_id=runner.tmux_session_id,
+            tmux_pid=os.getpid(),
+            pane_pid=os.getpid(),
+            connection=connection,
+        ),
+    )
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        metadata = os.fstat(descriptor)
+        target = resource_cgroup.RunnerExecutionTargetV1(
+            owner_pid=os.getpid(),
+            fd=descriptor,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+        )
+        scope = start_released_scope(
+            adapter,
+            profile=_profile(),
+            socket_name="g5-commit-order-1",
+            session_name="g5-commit-order-1",
+            runner_target=target,
+        )
+    finally:
+        os.close(descriptor)
+
+    assert connection.sent == []
+    assert not connection.closed
+    assert adapter.confirm_scope(scope) == os.getpid()
+    assert connection.sent == [
+        f"ATTEST {scope.challenge} {'e' * 32}\n".encode(),
+        f"ACK {scope.challenge} {'e' * 32}\n".encode(),
+    ]
+    assert connection.closed
+
+
+def test_parent_closes_uncommitted_handoff_when_tmux_attestation_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = _FakeSystemdRunner()
+    adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
+    runner.tmux_pid = os.getpid()
+    cgroup_procs = tmp_path / "cgroup" / "user.slice" / "codex-master.slice" / (
+        "codex-master-resource-" + "d" * 32 + ".scope"
+    ) / "cgroup.procs"
+    cgroup_procs.write_bytes(f"4241\n{os.getpid()}\n".encode())
+    connection = _FakeGateConnection(tmux_pid=os.getpid() + 1)
+    monkeypatch.setattr(
+        resource_cgroup,
+        "_accept_gate_handoff",
+        lambda *_args, **_kwargs: resource_cgroup._GateHandoff(
+            commit="e" * 32,
+            session_id=runner.tmux_session_id,
+            tmux_pid=os.getpid(),
+            pane_pid=os.getpid(),
+            connection=connection,
+        ),
+    )
+    scope = _start_released_for_test(
+        adapter,
+        profile=_profile(),
+        socket_name="g5-commit-fail-1",
+        session_name="g5-commit-fail-1",
+    )
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        confirm_verified_scope(adapter, scope)
+    assert connection.sent == [f"ATTEST {scope.challenge} {'e' * 32}\n".encode()]
+    assert connection.closed
+    assert runner.stopped == [scope.unit_name]
+
+
+def test_parent_rejects_tmux_child_outside_scope_before_gate_commit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = _FakeSystemdRunner()
+    adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
+    runner.tmux_pid = os.getpid()
+    cgroup_procs = tmp_path / "cgroup" / "user.slice" / "codex-master.slice" / (
+        "codex-master-resource-" + "d" * 32 + ".scope"
+    ) / "cgroup.procs"
+    cgroup_procs.write_bytes(f"4241\n{os.getpid()}\n".encode())
+    monkeypatch.setattr(
+        resource_cgroup.SystemdUserCgroupAdapter,
+        "_read_tmux_children",
+        lambda _self, _tmux_pid: (os.getpid() + 1,),
+    )
+    connection = _FakeGateConnection()
+    monkeypatch.setattr(
+        resource_cgroup,
+        "_accept_gate_handoff",
+        lambda *_args, **_kwargs: resource_cgroup._GateHandoff(
+            commit="e" * 32,
+            session_id=runner.tmux_session_id,
+            tmux_pid=os.getpid(),
+            pane_pid=os.getpid(),
+            connection=connection,
+        ),
+    )
+    scope = _start_released_for_test(
+        adapter,
+        profile=_profile(),
+        socket_name="g5-child-outside-1",
+        session_name="g5-child-outside-1",
+    )
+
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        confirm_verified_scope(adapter, scope)
+    assert connection.sent == [f"ATTEST {scope.challenge} {'e' * 32}\n".encode()]
+    assert connection.closed
+    assert runner.stopped == [scope.unit_name]
+
+
+def test_confirm_scope_accepts_attested_tmux_server_after_gate_pid_handoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = _FakeSystemdRunner()
+    adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
+    runner.tmux_pid = os.getpid()
+    monkeypatch.setattr(
+        resource_cgroup,
+        "_accept_gate_handoff",
+        lambda *_args, **_kwargs: resource_cgroup._GateHandoff(
+            commit="e" * 32,
+            session_id=runner.tmux_session_id,
+            tmux_pid=os.getpid(),
+            pane_pid=os.getpid(),
+            connection=_FakeGateConnection(),
+        ),
+        raising=False,
+    )
+    cgroup_procs = tmp_path / "cgroup" / "user.slice" / "codex-master.slice" / (
+        "codex-master-resource-" + "d" * 32 + ".scope"
+    ) / "cgroup.procs"
+    cgroup_procs.write_bytes(f"4241\n{os.getpid()}\n".encode())
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        metadata = os.fstat(descriptor)
+        target = resource_cgroup.RunnerExecutionTargetV1(
+            owner_pid=os.getpid(),
+            fd=descriptor,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+        )
+        scope = start_released_scope(
+            adapter,
+            profile=_profile(),
+            socket_name="g5-handoff-1",
+            session_name="g5-handoff-1",
+            runner_target=target,
+        )
+    finally:
+        os.close(descriptor)
+
+    runner.scope_main_pid = os.getpid()
+    assert adapter.confirm_scope(scope) == os.getpid()
+
+
+def test_released_scope_rejects_gate_claimed_tmux_pid_that_tmux_does_not_confirm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = _FakeSystemdRunner()
+    adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
+    runner.tmux_pid = os.getpid()
+    monkeypatch.setattr(
+        resource_cgroup,
+        "_accept_gate_handoff",
+        lambda *_args, **_kwargs: resource_cgroup._GateHandoff(
+            commit="e" * 32,
+            session_id=runner.tmux_session_id,
+            tmux_pid=os.getpid() + 1,
+            pane_pid=os.getpid(),
+            connection=_FakeGateConnection(),
+        ),
+    )
+    cgroup_procs = tmp_path / "cgroup" / "user.slice" / "codex-master.slice" / (
+        "codex-master-resource-" + "d" * 32 + ".scope"
+    ) / "cgroup.procs"
+    cgroup_procs.write_bytes(f"4241\n{os.getpid()}\n".encode())
+
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        _start_released_for_test(
+            adapter,
+            profile=_profile(),
+            socket_name="g5-untrusted-handoff-1",
+            session_name="g5-untrusted-handoff-1",
+        )
+    assert runner.stopped == ["codex-master-resource-" + "d" * 32 + ".scope"]
+
+
+def test_confirm_scope_rejects_tmux_or_pane_switch_after_handoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = _FakeSystemdRunner()
+    adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
+    runner.tmux_pid = os.getpid()
+    cgroup_procs = tmp_path / "cgroup" / "user.slice" / "codex-master.slice" / (
+        "codex-master-resource-" + "d" * 32 + ".scope"
+    ) / "cgroup.procs"
+    cgroup_procs.write_bytes(f"4241\n{os.getpid()}\n".encode())
+    scope = _start_released_for_test(
+        adapter,
+        profile=_profile(),
+        socket_name="g5-switch-1",
+        session_name="g5-switch-1",
+    )
+    owned = adapter._owned_scope(scope)
+    assert owned.handoff is not None
+    connection = owned.handoff.connection
+    assert isinstance(connection, _FakeGateConnection)
+    connection._tmux_pid = os.getpid() + 1
+
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        confirm_verified_scope(adapter, scope)
+    assert runner.stopped == [scope.unit_name]
+
+
+def test_confirm_scope_rejects_pid_reuse_after_handoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = _FakeSystemdRunner()
+    adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
+    runner.tmux_pid = os.getpid()
+    cgroup_procs = tmp_path / "cgroup" / "user.slice" / "codex-master.slice" / (
+        "codex-master-resource-" + "d" * 32 + ".scope"
+    ) / "cgroup.procs"
+    cgroup_procs.write_bytes(f"4241\n{os.getpid()}\n".encode())
+    identities = iter((101, 102, 201, 202))
+    monkeypatch.setattr(
+        resource_cgroup,
+        "_process_identity",
+        lambda pid: resource_cgroup._ProcessIdentity(pid=pid, start_ticks=next(identities)),
+    )
+    scope = _start_released_for_test(
+        adapter,
+        profile=_profile(),
+        socket_name="g5-reuse-1",
+        session_name="g5-reuse-1",
+    )
+
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        confirm_verified_scope(adapter, scope)
+    assert runner.stopped == [scope.unit_name]
+
+
+def test_confirm_scope_rejects_wrong_pane_elf_and_cleans_only_new_scope(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = _FakeSystemdRunner()
+    adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
+    runner.tmux_pid = os.getpid()
+    (tmp_path / "cgroup" / "user.slice" / "codex-master.slice" / (
+        "codex-master-resource-" + "d" * 32 + ".scope"
+    ) / "cgroup.procs").write_bytes(f"4241\n{os.getpid()}\n".encode())
+    runner_path = tmp_path / "not-the-pane"
+    runner_path.write_bytes(b"not-an-elf")
+    descriptor = os.open(runner_path, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        metadata = os.fstat(descriptor)
+        target = resource_cgroup.RunnerExecutionTargetV1(
+            owner_pid=os.getpid(),
+            fd=descriptor,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+        )
+        scope = start_released_scope(
+            adapter,
+            profile=_profile(),
+            socket_name="g5-wrong-elf-1",
+            session_name="g5-wrong-elf-1",
+            runner_target=target,
+        )
+    finally:
+        os.close(descriptor)
+    (tmp_path / "cgroup" / scope.control_group / "cgroup.procs").write_bytes(
+        f"4241\n{os.getpid()}\n".encode()
+    )
+
+    with pytest.raises(CgroupPreflightError, match="^cgroup_preflight_failed$"):
+        confirm_verified_scope(adapter, scope)
+    assert runner.stopped == [scope.unit_name]
+
+
+def test_released_scope_argv_is_fixed_and_never_uses_pipe_shell_or_unpinned_path() -> None:
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        metadata = os.fstat(descriptor)
+        target = resource_cgroup.RunnerExecutionTargetV1(
+            owner_pid=os.getpid(),
+            fd=descriptor,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+        )
+        argv = resource_cgroup._released_scope_argv(
+            profile=_profile(),
+            unit_name="codex-master-resource-" + "a" * 32 + ".scope",
+            socket_name="g5-socket-1",
+            session_name="g5-session-1",
+            runner_target=target,
+            challenge="b" * 64,
+        )
+    finally:
+        os.close(descriptor)
+
+    assert argv[:6] == (
+        "/usr/bin/systemd-run",
+        "--user",
+        "--scope",
+        "--no-block",
+        "--quiet",
+        "--collect",
+    )
+    assert "--pipe" not in argv
+    assert not {"sh", "bash", "sudo", "taskset"} & set(argv)
+    assert argv[-15:] == (
+        "/usr/libexec/codex-master-resource-scope-gate",
+        "--socket",
+        "g5-socket-1",
+        "--session",
+        "g5-session-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--runner-fd",
+        str(target.fd),
+        "--device",
+        str(target.device),
+        "--inode",
+        str(target.inode),
+        "--challenge",
+        "b" * 64,
+    )
+
+
+def test_systemd_adapter_releases_only_after_readback_and_authenticated_gate_handoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = _FakeSystemdRunner()
+    adapter = _systemd_adapter(monkeypatch, tmp_path, runner)
+    gate_handoff: list[tuple[int, int, str]] = []
+
+    def accept_gate(
+        _listener: socket.socket, *, gate_pid: int, owner_pid: int, challenge: str
+    ) -> resource_cgroup._GateHandoff:
+        gate_handoff.append((gate_pid, owner_pid, challenge))
+        return resource_cgroup._GateHandoff(
+            commit="e" * 32,
+            session_id=runner.tmux_session_id,
+            tmux_pid=runner.tmux_pid,
+            pane_pid=runner.tmux_pid,
+            connection=_FakeGateConnection(),
+        )
+
+    monkeypatch.setattr(resource_cgroup, "_accept_gate_handoff", accept_gate)
+    descriptor = os.open(sys.executable, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        metadata = os.fstat(descriptor)
+        target = resource_cgroup.RunnerExecutionTargetV1(
+            owner_pid=os.getpid(),
+            fd=descriptor,
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+        )
+        scope = resource_cgroup.start_released_scope(
+            adapter,
+            profile=_profile(),
+            socket_name="g5-socket-1",
+            session_name="g5-session-1",
+            runner_target=target,
+        )
+    finally:
+        os.close(descriptor)
+
+    assert gate_handoff == [(4241, os.getpid(), scope.challenge)]
+    assert runner.started[0][0] == "/usr/bin/systemd-run"
+    assert "--pipe" not in runner.started[0]
+    assert runner.started[0][-15:] == (
+        "/usr/libexec/codex-master-resource-scope-gate",
+        "--socket",
+        "g5-socket-1",
+        "--session",
+        "g5-session-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--runner-fd",
+        str(target.fd),
+        "--device",
+        str(target.device),
+        "--inode",
+        str(target.inode),
+        "--challenge",
+        scope.challenge,
+    )
