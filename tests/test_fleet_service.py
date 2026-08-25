@@ -271,6 +271,7 @@ def test_registry_snapshot_v2_never_calls_clock_sidecar_lock_or_write_callbacks(
                 "11111111-1111-4111-8111-111111111111", 1, "g-account", True,
             ),),
         ),),
+        (),
     )
     from codex_master.fleet_service import FleetPaths, FleetPrivateIO, FleetService
 
