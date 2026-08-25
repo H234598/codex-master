@@ -87,6 +87,7 @@ from codex_master.goddess_supervisor import (
 )
 from codex_master.vault_output import write_hourly_report
 from codex_master.usage_snapshot import (
+    UsageEvidenceV2,
     UsageSnapshot,
     display_snapshot_from_evidence,
     read_usage_evidence_v2,
@@ -207,15 +208,12 @@ from codex_master.selection import (
     AdmissionMode,
     AdmissionPolicy,
     FairnessLedger,
-    MAX_USAGE_QUANTITY,
     ModelRole,
     SelectionCandidate,
     SelectionError,
     SelectionPolicy,
     TaskKind,
     UsageObservation,
-    normalize_usage_v2,
-    usage_windows_usable_for_sp1,
 )
 from codex_master.selection.config import SelectionConfigError, load_selection_policy
 from codex_master.admission import (
@@ -762,7 +760,7 @@ DEFAULT_AGENTIN_BASE_NAMES = (
     "Tara",
 )
 DEFAULT_AGENTIN_NAMES = {"a1": "Mila", "b1": "Nora"}
-CODEX_USAGE_BLOCK_METADATA_KEY = "codex_usage_watchdog"
+Q_WEEKLY_THRESHOLD_PERCENT = 10.0
 CODEX_USAGE_DECISION_TIMEOUT_SECONDS = 8
 CODEX_USAGE_SPARK_HEALTH_STATES = {"healthy", "failed"}
 CODEX_USAGE_DECISIONS = {"spark", "main", "credits", "blocked", "unchanged"}
@@ -919,29 +917,6 @@ def env_text_value(primary: str, fallback: str | None, default: str) -> str:
     if value is None and fallback:
         value = os.environ.get(fallback)
     return value if value is not None else default
-
-
-def codex_usage_state_root() -> Path:
-    override = os.environ.get("CODEX_USAGE_STATE_ROOT")
-    if override:
-        return Path(override).expanduser()
-    data_home = os.environ.get("XDG_DATA_HOME")
-    root = (
-        Path(data_home).expanduser() if data_home else Path.home() / ".local" / "share"
-    )
-    return root / "codex-usage"
-
-
-def codex_usage_snapshot_path(account: str) -> Path:
-    if not isinstance(account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(account):
-        raise AgentError("codex-usage snapshot account is invalid")
-    return codex_usage_state_root() / "current" / f"{account}.json"
-
-
-def codex_usage_legacy_snapshot_path(account: str) -> Path:
-    if not isinstance(account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(account):
-        raise AgentError("codex-usage snapshot account is invalid")
-    return codex_usage_state_root() / "snapshots" / f"{account}.json"
 
 
 def codex_usage_executable() -> str:
@@ -3361,70 +3336,66 @@ def _selection_series_value(
 def _selection_usage_details(
     account: str,
     series_prefix: str,
-    cache: dict[
-        tuple[str, str], tuple[bool, bool, UsageObservation | None, bool, bool]
-    ],
+    evidence: UsageEvidenceV2,
     *,
     now: _dt.datetime,
 ) -> tuple[bool, bool, UsageObservation | None, bool, bool]:
-    """Return SP1/SP0-safe usage facts without exposing the source payload."""
+    """Derive selection facts from one attested V2 evidence value."""
 
-    cache_key = (account, series_prefix)
-    if cache_key in cache:
-        return cache[cache_key]
-    details = (False, False, None, False, False)
-    try:
-        snapshot = read_codex_usage_snapshot(account)
-        if snapshot:
-            identity = snapshot.get("account", snapshot.get("agent"))
-            if identity != account:
-                raise AgentError("could_not_read_codex_usage_snapshot")
-            state = _codex_usage_watchdog_state_from_snapshot(
-                snapshot, now=now.timestamp(), series_prefix=series_prefix
+    if type(evidence) is not UsageEvidenceV2 or evidence.status != "complete":
+        return False, False, None, False, False
+    account_evidence = next(
+        (item for item in evidence.accounts if item.account_id == account), None
+    )
+    if account_evidence is None:
+        return False, False, None, False, False
+    decisions = {
+        (item.pool, item.window_seconds, item.reset_generation): item
+        for item in derive_limit_decisions(evidence, now=now)
+        if item.account_id == account
+    }
+    eligible_limits = [
+        item
+        for item in account_evidence.limits
+        if decisions.get((item.pool, item.window_seconds, item.reset_generation))
+        and decisions[(item.pool, item.window_seconds, item.reset_generation)].automatic
+    ]
+    blocked_limits = [
+        item
+        for item in eligible_limits
+        if item.remaining_percent <= 0 and item.reset_at > now
+    ]
+    q_weekly_denied = any(
+        item.pool == "main"
+        and item.window_seconds == 604800
+        and item.remaining_percent < Q_WEEKLY_THRESHOLD_PERCENT
+        and item.reset_at > now
+        for item in eligible_limits
+    )
+    observation: UsageObservation | None = None
+    if eligible_limits and evidence.captured_at is not None:
+        item = eligible_limits[0]
+        try:
+            observation = UsageObservation(
+                "remaining",
+                "percent",
+                item.remaining_percent,
+                "fixed"
+                if item.window_seconds in {604800, 2592000}
+                else "rolling_anchored",
+                "verified",
+                evidence.captured_at.isoformat(),
             )
-            payload = state.get("usage_v2")
-            windows = normalize_usage_v2(payload) if payload is not None else None
-            eligibility = state.get("usage_eligibility", {})
-            if windows is not None and isinstance(eligibility, Mapping):
-                sp1a = usage_windows_usable_for_sp1(windows, now) and eligibility.get(
-                    "eligible", True
-                )
-                observation: UsageObservation | None = None
-                for window in windows:
-                    reset_kind = {
-                        "unanchored": "rolling_unanchored",
-                        "rolling": "rolling_anchored",
-                        "fixed": "fixed",
-                    }.get(window.reset_kind or "")
-                    if reset_kind is None:
-                        continue
-                    try:
-                        observation = UsageObservation(
-                            window.quantity_semantics,
-                            window.quantity_unit,
-                            window.quantity_value,
-                            reset_kind,
-                            window.confidence,
-                            window.observed_at_utc,
-                        )
-                    except SelectionError:
-                        continue
-                    if observation.is_passive_sp0_due(now):
-                        break
-                    observation = None
-                details = (
-                    sp1a,
-                    bool(state.get("blocked")) or not eligibility.get("eligible", True),
-                    observation,
-                    True,
-                    eligibility.get("reason_code")
-                    == "q_weekly_remaining_below_threshold",
-                )
-    except (AgentError, SelectionError, TypeError, ValueError):
-        # A malformed or unavailable usage source may not activate SP0/SP1.
-        details = (False, False, None, False, False)
-    cache[cache_key] = details
-    return details
+        except SelectionError:
+            observation = None
+    blocked = bool(blocked_limits) or (series_prefix == "q" and q_weekly_denied)
+    return (
+        bool(eligible_limits) and not blocked,
+        blocked,
+        observation,
+        True,
+        q_weekly_denied,
+    )
 
 
 def fleet_selection_preview(
@@ -3475,9 +3446,7 @@ def fleet_selection_preview(
     except (AgentError, FleetValidationError, ValueError) as exc:
         raise AgentError("selection_state_unavailable") from exc
     now = _dt.datetime.now(_dt.timezone.utc)
-    usage_cache: dict[
-        tuple[str, str], tuple[bool, bool, UsageObservation | None, bool, bool]
-    ] = {}
+    usage_evidence = read_usage_evidence_v2(clock=lambda: now)
     candidates: list[SelectionCandidate] = []
     usage_accounts: set[str] = set()
     usage_observed_accounts: set[str] = set()
@@ -3522,7 +3491,7 @@ def fleet_selection_preview(
             ) = _selection_usage_details(
                 descriptor.account_id,
                 descriptor.series_prefix,
-                usage_cache,
+                usage_evidence,
                 now=now,
             )
             if usage_known:
@@ -4610,92 +4579,6 @@ def read_json_file(path: Path) -> dict[str, Any]:
     except (UnicodeDecodeError, json.JSONDecodeError):
         return error
     return payload if isinstance(payload, dict) else error
-
-
-def _read_codex_usage_snapshot_path(path: Path) -> tuple[bool, dict[str, Any]]:
-    snapshot_dir = path.parent
-    if not snapshot_dir.is_absolute():
-        snapshot_dir = Path.cwd() / snapshot_dir
-    path = snapshot_dir / path.name
-    try:
-        snapshot_dir_stat = snapshot_dir.lstat()
-    except FileNotFoundError:
-        return False, {}
-    except OSError as exc:
-        raise AgentError("could_not_read_codex_usage_snapshot") from exc
-    if (
-        stat_module.S_ISLNK(snapshot_dir_stat.st_mode)
-        or not stat_module.S_ISDIR(snapshot_dir_stat.st_mode)
-        or not directory_chain_is_real_no_symlink(snapshot_dir)
-    ):
-        raise AgentError("could_not_read_codex_usage_snapshot")
-    snapshot_fd = -1
-    fd = -1
-    try:
-        snapshot_fd = open_directory_chain_no_follow_matching(
-            snapshot_dir,
-            snapshot_dir_stat,
-            error_text="could_not_read_codex_usage_snapshot",
-            changed_text="could_not_read_codex_usage_snapshot",
-        )
-        try:
-            current_stat = os.stat(path.name, dir_fd=snapshot_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return False, {}
-        except OSError as exc:
-            raise AgentError("could_not_read_codex_usage_snapshot") from exc
-        if (
-            not stat_module.S_ISREG(current_stat.st_mode)
-            or getattr(current_stat, "st_nlink", 1) > 1
-            or current_stat.st_size > MAX_CODEX_USAGE_SNAPSHOT_BYTES
-        ):
-            raise AgentError("could_not_read_codex_usage_snapshot")
-
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(path.name, flags, dir_fd=snapshot_fd)
-        opened_stat = os.fstat(fd)
-        if (
-            not source_identity_matches(opened_stat, current_stat)
-            or not stat_module.S_ISREG(opened_stat.st_mode)
-            or getattr(opened_stat, "st_nlink", 1) > 1
-            or opened_stat.st_size > MAX_CODEX_USAGE_SNAPSHOT_BYTES
-        ):
-            raise AgentError("could_not_read_codex_usage_snapshot")
-        with os.fdopen(fd, "rb") as fh:
-            fd = -1
-            raw = fh.read(MAX_CODEX_USAGE_SNAPSHOT_BYTES + 1)
-    except OSError as exc:
-        raise AgentError("could_not_read_codex_usage_snapshot") from exc
-    finally:
-        if fd >= 0:
-            os.close(fd)
-        if snapshot_fd >= 0:
-            os.close(snapshot_fd)
-
-    if len(raw) > MAX_CODEX_USAGE_SNAPSHOT_BYTES:
-        raise AgentError("could_not_read_codex_usage_snapshot")
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise AgentError("could_not_read_codex_usage_snapshot") from exc
-    if not isinstance(payload, dict):
-        raise AgentError("could_not_read_codex_usage_snapshot")
-    return True, payload
-
-
-def read_codex_usage_snapshot(account: str) -> dict[str, Any]:
-    if not isinstance(account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(account):
-        raise AgentError("codex-usage snapshot account is invalid")
-    for path in (
-        codex_usage_snapshot_path(account),
-        codex_usage_legacy_snapshot_path(account),
-    ):
-        found, payload = _read_codex_usage_snapshot_path(path)
-        if found:
-            return payload
-    return {}
 
 
 def path_present_no_follow(path: Path) -> bool:
@@ -14233,103 +14116,6 @@ def latest_assignment_summary(
     }
 
 
-def codex_usage_snapshot_accounts(
-    agent: str,
-    meta: dict[str, Any],
-    *,
-    include_assignment_history: bool = True,
-) -> list[str]:
-    accounts: list[str] = []
-
-    def add_account(value: Any) -> None:
-        if value is None:
-            return
-        if not isinstance(value, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(value):
-            raise AgentError("codex-usage snapshot account is invalid")
-        if value not in accounts:
-            accounts.append(value)
-
-    if include_assignment_history:
-        records = list_assignments(agent, 1, strict_routing=True).get("records", [])
-    else:
-        records = []
-    record = records[-1] if records and isinstance(records[-1], dict) else {}
-    assignment_routing = record.get("routing") if isinstance(record, dict) else None
-    if "routing" in record and not isinstance(assignment_routing, dict):
-        raise AgentError("codex-usage assignment routing metadata is invalid")
-    if "routing" in record and (
-        "account" not in assignment_routing or assignment_routing.get("account") is None
-    ):
-        raise AgentError("codex-usage assignment routing metadata is invalid")
-    if (
-        "routing" in record
-        and "decision" in assignment_routing
-        and (
-            not isinstance(assignment_routing["decision"], str)
-            or assignment_routing["decision"] not in CODEX_USAGE_DECISIONS
-        )
-    ):
-        raise AgentError("codex-usage assignment routing metadata is invalid")
-    routing = meta.get("routing")
-    if "routing" in meta and not isinstance(routing, dict):
-        raise AgentError("codex-usage routing metadata is invalid")
-    if (
-        "routing" in meta
-        and isinstance(routing, dict)
-        and "decision" in routing
-        and (
-            "account" not in routing
-            or routing.get("account") is None
-            or not isinstance(routing["decision"], str)
-            or routing["decision"] not in CODEX_USAGE_DECISIONS
-        )
-    ):
-        raise AgentError("codex-usage routing metadata is invalid")
-    assignment_account = (
-        assignment_routing.get("account")
-        if isinstance(assignment_routing, dict)
-        else None
-    )
-    meta_account = routing.get("account") if isinstance(routing, dict) else None
-    if (
-        "routing" in meta
-        and isinstance(routing, dict)
-        and "account" in routing
-        and meta_account is None
-    ):
-        raise AgentError("codex-usage snapshot account is invalid")
-    if meta_account is not None and (
-        not isinstance(meta_account, str)
-        or not CODEX_USAGE_ACCOUNT_RE.fullmatch(meta_account)
-    ):
-        raise AgentError("codex-usage snapshot account is invalid")
-    if assignment_account is not None and (
-        not isinstance(assignment_account, str)
-        or not CODEX_USAGE_ACCOUNT_RE.fullmatch(assignment_account)
-    ):
-        raise AgentError("codex-usage snapshot account is invalid")
-    assignment_created = (
-        parse_utc_timestamp(record.get("created_at_utc"))
-        if isinstance(record, dict)
-        else None
-    )
-    session_timestamp_present = "started_at_utc" in meta
-    session_started = parse_utc_timestamp(meta.get("started_at_utc"))
-    current_time = time.time()
-    assignment_is_current = (
-        assignment_account is not None
-        and assignment_created is not None
-        and assignment_created <= current_time
-        and (
-            not session_timestamp_present
-            or (session_started is not None and assignment_created >= session_started)
-        )
-    )
-    selected_account = assignment_account if assignment_is_current else meta_account
-    add_account(selected_account if selected_account is not None else agent)
-    return accounts
-
-
 def agent_spark_routing(agent: str) -> dict[str, Any] | None:
     agent = canonical_agent_id(agent)
     meta = read_meta(agent)
@@ -15238,9 +15024,7 @@ def status_agent(
             "raw_output": "not_returned",
         }
     else:
-        usage_watchdog = codex_usage_watchdog_status(
-            agent, include_assignment_history=initialize_state
-        )
+        usage_watchdog = codex_usage_watchdog_status(agent)
     response_state = agent_response_state(
         running, limit_state, raw_log_info, tui_context
     )
@@ -15667,220 +15451,102 @@ def update_watchdog_marker(agent: str, marker: dict[str, Any] | None) -> None:
     write_meta(agent, meta)
 
 
-def codex_usage_watchdog_marker(meta: dict[str, Any]) -> dict[str, Any]:
-    if CODEX_USAGE_BLOCK_METADATA_KEY not in meta:
-        return {}
-    value = meta[CODEX_USAGE_BLOCK_METADATA_KEY]
-    if not isinstance(value, dict):
-        raise AgentError("could_not_read_codex_usage_watchdog_marker")
-    return value
-
-
-def update_codex_usage_watchdog_marker(
-    agent: str, marker: dict[str, Any] | None
-) -> None:
-    meta = read_meta(agent)
-    if meta.get("meta_error"):
-        raise AgentError("could_not_update_codex_usage_watchdog_metadata")
-    if marker is None:
-        meta.pop(CODEX_USAGE_BLOCK_METADATA_KEY, None)
-    else:
-        meta[CODEX_USAGE_BLOCK_METADATA_KEY] = marker
-    write_meta(agent, meta)
-
-
-def codex_usage_watchdog_status(
+def _attested_usage_watchdog_state(
     agent: str,
+    account: str | None,
+    series_prefix: str | None,
+    evidence: UsageEvidenceV2,
     *,
-    snapshot_account: str | None = None,
-    include_assignment_history: bool = True,
+    now: _dt.datetime,
 ) -> dict[str, Any]:
-    agent = canonical_agent_id(agent)
-    descriptor = current_agent_inventory().agents.get(agent)
-    series_prefix = getattr(descriptor, "series_prefix", None)
-    meta = read_meta(agent)
-    if meta.get("meta_error"):
-        raise AgentError("could_not_read_codex_usage_watchdog_metadata")
-    marker = codex_usage_watchdog_marker(meta)
-    if snapshot_account is not None and (
-        not isinstance(snapshot_account, str)
-        or not CODEX_USAGE_ACCOUNT_RE.fullmatch(snapshot_account)
-    ):
-        raise AgentError("codex-usage snapshot account is invalid")
-    accounts = (
-        [snapshot_account]
-        if snapshot_account is not None
-        else codex_usage_snapshot_accounts(
-            agent,
-            meta,
-            include_assignment_history=include_assignment_history,
-        )
-    )
-    current_account = accounts[0] if accounts else None
-    routing = meta.get("routing")
-    routing_account = routing.get("account") if isinstance(routing, dict) else None
-    account_mapping = (
-        "override"
-        if snapshot_account is not None
-        else "routing"
-        if routing_account == current_account
-        else "fallback"
-    )
-    now = time.time()
-
-    if marker:
-        marker_agent = marker.get("agent")
-        if not isinstance(
-            marker_agent, str
-        ) or marker_agent not in agent_record_aliases(agent):
-            raise AgentError("could_not_read_codex_usage_watchdog_marker")
-        marker_account = marker.get("account")
-        if marker_account is not None and (
-            not isinstance(marker_account, str)
-            or not CODEX_USAGE_ACCOUNT_RE.fullmatch(marker_account)
-        ):
-            raise AgentError("could_not_read_codex_usage_watchdog_marker")
-        if parse_utc_timestamp(marker.get("blocked_until_utc")) is None:
-            raise AgentError("could_not_read_codex_usage_watchdog_marker")
-        marker_is_current = marker_account == current_account or (
-            marker_account is None and current_account == agent
-        )
-        if marker_is_current:
-            state = _codex_usage_watchdog_state_from_marker(marker, now=now)
-            state["account_mapping"] = account_mapping
-            if state["state"] == "blocked":
-                return state
-        else:
-            marker = {}
-
-    snapshot = {}
-    snapshot_account = None
-    for account in accounts:
-        snapshot = read_codex_usage_snapshot(account)
-        if snapshot:
-            snapshot_account = account
-            break
-    if snapshot:
-        snapshot_identity = (
-            snapshot["account"] if "account" in snapshot else snapshot.get("agent")
-        )
-        if snapshot_identity != snapshot_account:
-            raise AgentError("could_not_read_codex_usage_snapshot")
-        state = _codex_usage_watchdog_state_from_snapshot(
-            snapshot, now=now, series_prefix=series_prefix
-        )
-        state["account"] = snapshot_account
-        state["account_mapping"] = account_mapping
-        if state["state"] == "blocked":
-            return state
-        if marker:
-            return {
-                **state,
-                "marker_state": state["state"],
-                "state": "released",
-                "source": "snapshot",
-            }
-        return state
-
-    if marker:
-        return {
-            **_codex_usage_watchdog_state_from_marker(marker, now=now),
-            "source": "marker",
-        }
-
-    return {
+    base = {
         "agent": agent,
-        "account": current_account,
-        "account_mapping": account_mapping,
-        "state": "missing",
-        "blocked": False,
+        "account": account,
+        "account_mapping": "inventory",
+        "usage_status": evidence.status,
         "blocked_until_utc": None,
         "reason": None,
-        "source": "snapshot",
+        "source": "v2",
         "raw_output": "not_returned",
     }
-
-
-def safe_codex_usage_reason(value: Any) -> str | None:
-    if not isinstance(value, str) or not value:
-        return None
-    return safe_error_text(value, max_chars=300)
-
-
-def codex_usage_status_with_routing(
-    agent: str,
-    status: dict[str, Any],
-    *,
-    persist_account: bool = True,
-    include_assignment_history: bool = True,
-    force_policy_check: bool = False,
-    routing_timeout_seconds: float | None = None,
-) -> dict[str, Any]:
-    needs_routing_check = (
-        status.get("usage_status") in {"login_required", "partial", "error"}
-        or status.get("account_mapping") == "fallback"
+    if evidence.status != "complete" or account is None:
+        return {**base, "state": "missing", "blocked": False}
+    account_evidence = next(
+        (item for item in evidence.accounts if item.account_id == account), None
     )
-    needs_routing_check = needs_routing_check or (
-        not status.get("blocked") and status.get("state") == "missing"
+    if account_evidence is None:
+        return {**base, "state": "missing", "blocked": False}
+    automatic = {
+        (item.pool, item.window_seconds, item.reset_generation)
+        for item in derive_limit_decisions(evidence, now=now)
+        if item.account_id == account and item.automatic
+    }
+    limits = [
+        item
+        for item in account_evidence.limits
+        if (item.pool, item.window_seconds, item.reset_generation) in automatic
+    ]
+    if not limits:
+        return {**base, "state": "missing", "blocked": False}
+    exhausted = [
+        item for item in limits if item.remaining_percent <= 0 and item.reset_at > now
+    ]
+    q_weekly = next(
+        (
+            item
+            for item in limits
+            if series_prefix == "q"
+            and item.pool == "main"
+            and item.window_seconds == 604800
+            and item.remaining_percent < Q_WEEKLY_THRESHOLD_PERCENT
+            and item.reset_at > now
+        ),
+        None,
     )
-    needs_routing_check = needs_routing_check or (
-        force_policy_check
-        and isinstance(status.get("account"), str)
-        and not status.get("blocked")
+    if q_weekly is not None:
+        return {
+            **base,
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": q_weekly.reset_at.isoformat(),
+            "reason": "verified q-series weekly remaining below threshold",
+            "reason_code": "q_weekly_remaining_below_threshold",
+            "remaining_percent": q_weekly.remaining_percent,
+            "threshold_percent": Q_WEEKLY_THRESHOLD_PERCENT,
+            "fallback_hint": "use a non-q series or wait for the verified q-series weekly reset",
+        }
+    if exhausted:
+        reset_at = min(item.reset_at for item in exhausted)
+        return {
+            **base,
+            "state": "blocked",
+            "blocked": True,
+            "blocked_until_utc": reset_at.isoformat(),
+            "reason": "codex usage window exhausted",
+        }
+    return {**base, "state": "clear", "blocked": False}
+
+
+def codex_usage_watchdog_status(agent: str) -> dict[str, Any]:
+    """Evaluate one attested V2 evidence value without legacy state or fallback."""
+
+    agent = canonical_agent_id(agent)
+    descriptor = current_agent_inventory().agents.get(agent)
+    account = getattr(descriptor, "account_id", None)
+    series_prefix = getattr(descriptor, "series_prefix", None)
+    now = _dt.datetime.now(_dt.timezone.utc)
+    evidence = read_usage_evidence_v2(clock=lambda: now)
+    return _attested_usage_watchdog_state(
+        agent,
+        account if isinstance(account, str) else None,
+        series_prefix if isinstance(series_prefix, str) else None,
+        evidence,
+        now=now,
     )
-    if needs_routing_check:
-        auth = agent_auth_status(agent)
-        if auth.get("authenticated") or (
-            force_policy_check and auth.get("auth_state") == "access_token_expired"
-        ):
-            if routing_timeout_seconds is None:
-                routing = codex_usage_routing_decision(agent, role="arbeitsbiene")
-            else:
-                routing = codex_usage_routing_decision(
-                    agent,
-                    role="arbeitsbiene",
-                    timeout_seconds=routing_timeout_seconds,
-                )
-            if persist_account:
-                remember_agent_usage_account(agent, routing.get("account"))
-            if routing.get("decision") == "blocked":
-                blocked = {
-                    **status,
-                    "agent": canonical_agent_id(agent),
-                    "account": routing.get("account"),
-                    "account_mapping": "routing",
-                    "state": "blocked",
-                    "blocked": True,
-                    "blocked_until_utc": routing.get("blocked_until_utc"),
-                    "reason": routing.get("reason") or "codex usage limit reached",
-                    "source": "routing_policy",
-                    "raw_output": "not_returned",
-                }
-                for field in ("remaining_percent", "threshold_percent"):
-                    if field in routing:
-                        blocked[field] = routing[field]
-                return blocked
-            if persist_account:
-                status = codex_usage_watchdog_status(
-                    agent,
-                    snapshot_account=routing.get("account"),
-                    include_assignment_history=include_assignment_history,
-                )
-            else:
-                status = codex_usage_watchdog_status(
-                    agent,
-                    snapshot_account=routing.get("account"),
-                    include_assignment_history=include_assignment_history,
-                )
-    return status
 
 
 def ensure_agent_not_blocked_by_codex_usage(agent: str) -> dict[str, Any]:
-    status = codex_usage_status_with_routing(
-        agent,
-        codex_usage_watchdog_status(agent),
-        force_policy_check=True,
-    )
+    status = codex_usage_watchdog_status(agent)
     if status.get("blocked"):
         blocked_until = status.get("blocked_until_utc")
         reason = status.get("reason") or "codex usage limit reached"
@@ -15901,401 +15567,6 @@ def ensure_agent_not_blocked_by_codex_usage(agent: str) -> dict[str, Any]:
             payload,
         )
     return status
-
-
-def _codex_usage_watchdog_state_from_marker(
-    marker: dict[str, Any], *, now: float
-) -> dict[str, Any]:
-    agent = str(marker.get("agent") or "")
-    account = marker.get("account")
-    reason = safe_codex_usage_reason(marker.get("reason"))
-    blocked_until_ts = parse_utc_timestamp(marker.get("blocked_until_utc"))
-    if blocked_until_ts is None:
-        raise AgentError("could_not_read_codex_usage_watchdog_marker")
-    if blocked_until_ts > now:
-        state = {
-            "agent": agent or "unknown",
-            "account": account,
-            "state": "blocked",
-            "blocked": True,
-            "blocked_until_utc": _dt.datetime.fromtimestamp(
-                blocked_until_ts, _dt.timezone.utc
-            ).isoformat(),
-            "reason": reason,
-            "source": "marker",
-            "raw_output": "not_returned",
-        }
-        for field in (
-            "reason_code",
-            "remaining_percent",
-            "threshold_percent",
-            "fallback_hint",
-        ):
-            if field in marker:
-                state[field] = marker[field]
-        return state
-    return {
-        "agent": agent or "unknown",
-        "account": account,
-        "state": "released",
-        "blocked": False,
-        "blocked_until_utc": _dt.datetime.fromtimestamp(
-            blocked_until_ts, _dt.timezone.utc
-        ).isoformat(),
-        "reason": reason,
-        "source": "marker",
-        "raw_output": "not_returned",
-    }
-
-
-def _codex_usage_integer(
-    value: Any, *, maximum: int, required: bool = False
-) -> int | None:
-    if value is None and not required:
-        return None
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-    ):
-        raise AgentError("could_not_read_codex_usage_snapshot")
-    if int(value) != value or not 0 <= int(value) <= maximum:
-        raise AgentError("could_not_read_codex_usage_snapshot")
-    return int(value)
-
-
-def _codex_usage_timestamp(value: Any, *, required: bool = False) -> str | None:
-    if value is None and not required:
-        return None
-    timestamp = parse_utc_timestamp(value)
-    if timestamp is None:
-        raise AgentError("could_not_read_codex_usage_snapshot")
-    return _dt.datetime.fromtimestamp(timestamp, _dt.timezone.utc).isoformat()
-
-
-Q_WEEKLY_THRESHOLD_PERCENT = 10.0
-
-
-def codex_usage_eligibility(
-    windows: Iterable[Mapping[str, Any]],
-    *,
-    series_prefix: str | None,
-    now: float,
-) -> dict[str, Any]:
-    """Make the single q-series weekly eligibility decision for all consumers."""
-
-    result: dict[str, Any] = {
-        "eligible": True,
-        "reason_code": None,
-        "remaining_percent": None,
-        "threshold_percent": Q_WEEKLY_THRESHOLD_PERCENT,
-        "blocked_until_utc": None,
-        "fallback_hint": "use a non-q series or wait for the verified q-series weekly reset",
-    }
-    if series_prefix != "q":
-        return result
-    for window in windows:
-        if (
-            window.get("window_kind") != "fixed"
-            or window.get("budget_key") != "codex_usage_weekly"
-            or window.get("confidence") != "verified"
-        ):
-            continue
-        remaining = window.get("quantity_value")
-        reset_at = window.get("reset_at_utc")
-        reset_ts = parse_utc_timestamp(reset_at) if reset_at is not None else None
-        if (
-            isinstance(remaining, (int, float))
-            and not isinstance(remaining, bool)
-            and remaining < Q_WEEKLY_THRESHOLD_PERCENT
-            and reset_ts is not None
-            and reset_ts > now
-        ):
-            result.update(
-                eligible=False,
-                reason_code="q_weekly_remaining_below_threshold",
-                remaining_percent=float(remaining),
-                blocked_until_utc=(
-                    _dt.datetime.fromtimestamp(reset_ts, _dt.timezone.utc).isoformat()
-                    if reset_ts
-                    else None
-                ),
-            )
-            return result
-    return result
-
-
-def _codex_usage_v2_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any] | None:
-    """Normalize the current codex-usage window shape without copying secrets."""
-
-    modern_keys = {
-        "main",
-        "five_hour",
-        "weekly",
-        "spark",
-        "monthly",
-        "30d",
-        "thirty_day",
-    }
-    if not any(key in snapshot for key in modern_keys):
-        return None
-
-    status = snapshot.get("status", "")
-    if not isinstance(status, str) or status not in {
-        "",
-        "ok",
-        "login_required",
-        "partial",
-        "error",
-        "blocked",
-    }:
-        raise AgentError("could_not_read_codex_usage_snapshot")
-    observed_value = snapshot.get("values_captured_at") or snapshot.get("captured_at")
-    observed_at = _codex_usage_timestamp(observed_value, required=True)
-    stale = snapshot.get("stale", False)
-    if not isinstance(stale, bool):
-        raise AgentError("could_not_read_codex_usage_snapshot")
-    backend = snapshot.get("backend_used")
-    if backend is not None and (not isinstance(backend, str) or len(backend) > 64):
-        raise AgentError("could_not_read_codex_usage_snapshot")
-
-    main = snapshot.get("main")
-    if main is not None and not isinstance(main, dict):
-        raise AgentError("could_not_read_codex_usage_snapshot")
-    raw_windows = main.get("windows") if isinstance(main, dict) else None
-    if raw_windows is not None and not isinstance(raw_windows, list):
-        raise AgentError("could_not_read_codex_usage_snapshot")
-    if not raw_windows:
-        raw_windows = []
-        for key in ("five_hour", "weekly", "spark", "monthly", "30d", "thirty_day"):
-            if key in snapshot:
-                value = snapshot[key]
-                if not isinstance(value, dict):
-                    raise AgentError("could_not_read_codex_usage_snapshot")
-                nested = value.get("windows")
-                if nested is not None:
-                    if not isinstance(nested, list):
-                        raise AgentError("could_not_read_codex_usage_snapshot")
-                    if any(not isinstance(item, dict) for item in nested):
-                        raise AgentError("could_not_read_codex_usage_snapshot")
-                    raw_windows.extend(
-                        item | {"name": item.get("name", key)} for item in nested
-                    )
-                else:
-                    raw_windows.append(value | {"name": value.get("name", key)})
-    if len(raw_windows) > 64:
-        raise AgentError("could_not_read_codex_usage_snapshot")
-
-    main_exhausted = False
-    if isinstance(main, dict):
-        for key in ("exhausted", "limit_reached"):
-            value = main.get(key)
-            if value is not None and not isinstance(value, bool):
-                raise AgentError("could_not_read_codex_usage_snapshot")
-            main_exhausted = main_exhausted or value is True
-    blocked_until = parse_utc_timestamp(snapshot.get("blocked_until"))
-    if (
-        "blocked_until" in snapshot
-        and snapshot["blocked_until"] is not None
-        and blocked_until is None
-    ):
-        raise AgentError("could_not_read_codex_usage_snapshot")
-    active_global_block = (
-        status == "blocked"
-        and blocked_until is not None
-        and blocked_until > time.time()
-    )
-    source = "codex-usage-app-server" if backend == "app-server" else "codex-usage"
-    confidence = (
-        "verified"
-        if status == "ok" and not stale and backend == "app-server"
-        else "observed"
-    )
-    windows: list[dict[str, Any]] = []
-    for index, raw in enumerate(raw_windows):
-        if not isinstance(raw, dict):
-            raise AgentError("could_not_read_codex_usage_snapshot")
-        name = raw.get("name")
-        if (
-            not isinstance(name, str)
-            or not 1 <= len(name) <= 64
-            or any(ord(char) < 32 for char in name)
-        ):
-            raise AgentError("could_not_read_codex_usage_snapshot")
-        duration = _codex_usage_integer(raw.get("duration_seconds"), maximum=31_536_000)
-        remaining = _codex_usage_integer(
-            raw.get("remaining"), maximum=MAX_USAGE_QUANTITY
-        )
-        limit = _codex_usage_integer(raw.get("limit"), maximum=MAX_USAGE_QUANTITY)
-        percent = _codex_usage_integer(raw.get("percent"), maximum=100)
-        if percent is None:
-            if remaining is None or limit in {None, 0}:
-                raise AgentError("could_not_read_codex_usage_snapshot")
-            percent = int(round(remaining * 100 / limit))
-            if not 0 <= percent <= 100:
-                raise AgentError("could_not_read_codex_usage_snapshot")
-        if remaining is None:
-            remaining = percent
-        reset_at = _codex_usage_timestamp(raw.get("reset_at"))
-        normalized_name = name.lower()
-        if duration == 18_000 or normalized_name in {"5h", "five_hour"}:
-            window_kind = "rolling_5h"
-            reset_kind = "rolling"
-        elif duration in {604_800, 2_592_000} or normalized_name in {"weekly", "30d"}:
-            window_kind = "fixed"
-            reset_kind = "fixed"
-        else:
-            window_kind = "rolling_unanchored"
-            reset_kind = "unanchored"
-        exhausted = remaining <= 0 or percent <= 0 or main_exhausted
-        windows.append(
-            {
-                "window_id": f"codex_usage_{index}_{normalized_name}",
-                "budget_key": f"codex_usage_{normalized_name}",
-                "applies_to_model_ids": [],
-                "applies_to_model_roles": [],
-                "quantity_semantics": "remaining",
-                "quantity_unit": "percent",
-                "quantity_value": percent,
-                "capacity": limit if limit is not None else 100,
-                "absolute_remaining": remaining,
-                "window_kind": window_kind,
-                "constraint_relation": "conjunctive",
-                "reset_at_utc": reset_at,
-                "reset_kind": reset_kind,
-                "observed_at_utc": observed_at,
-                "source": source,
-                "confidence": confidence,
-                "includes_inflight_usage": False,
-                "blocked": active_global_block or exhausted,
-                "exhausted": exhausted,
-            }
-        )
-    payload = {"schema_version": 2, "limit_windows": windows}
-    try:
-        normalize_usage_v2(payload)
-    except SelectionError as exc:
-        raise AgentError("could_not_read_codex_usage_snapshot") from exc
-    return payload
-
-
-def _codex_usage_watchdog_state_from_snapshot(
-    snapshot: dict[str, Any], *, now: float, series_prefix: str | None = None
-) -> dict[str, Any]:
-    identity = snapshot["account"] if "account" in snapshot else snapshot.get("agent")
-    agent = str(identity or "")
-    blocked_until_ts = parse_utc_timestamp(snapshot.get("blocked_until"))
-    blocked_reason = safe_codex_usage_reason(snapshot.get("blocked_reason"))
-    status_present = "status" in snapshot
-    status = snapshot["status"] if status_present else ""
-    if not isinstance(status, str):
-        raise AgentError("could_not_read_codex_usage_snapshot")
-    if status not in {"", "ok", "login_required", "partial", "error", "blocked"}:
-        raise AgentError("could_not_read_codex_usage_snapshot")
-    if (
-        "blocked_until" in snapshot
-        and snapshot["blocked_until"] is not None
-        and blocked_until_ts is None
-    ):
-        raise AgentError("could_not_read_codex_usage_snapshot")
-    if not status_present and blocked_until_ts is not None:
-        raise AgentError("could_not_read_codex_usage_snapshot")
-    if status == "blocked" and blocked_until_ts is None:
-        raise AgentError("could_not_read_codex_usage_snapshot")
-    usage_v2 = _codex_usage_v2_from_snapshot(snapshot)
-    eligibility = codex_usage_eligibility(
-        usage_v2["limit_windows"] if usage_v2 is not None else (),
-        series_prefix=series_prefix,
-        now=now,
-    )
-    if status == "blocked" and blocked_until_ts is not None and blocked_until_ts > now:
-        state = {
-            "agent": agent or "unknown",
-            "account": agent or None,
-            "usage_status": status,
-            "state": "blocked",
-            "blocked": True,
-            "blocked_until_utc": _dt.datetime.fromtimestamp(
-                blocked_until_ts, _dt.timezone.utc
-            ).isoformat(),
-            "reason": blocked_reason,
-            "source": "snapshot",
-            "raw_output": "not_returned",
-        }
-        if usage_v2 is not None:
-            state["usage_v2"] = usage_v2
-        state["usage_eligibility"] = eligibility
-        return state
-    if usage_v2 is not None and not eligibility["eligible"]:
-        return {
-            "agent": agent or "unknown",
-            "account": agent or None,
-            "usage_status": status,
-            "state": "blocked",
-            "blocked": True,
-            "blocked_until_utc": eligibility["blocked_until_utc"],
-            "reason": "verified q-series weekly remaining below threshold",
-            "reason_code": eligibility["reason_code"],
-            "remaining_percent": eligibility["remaining_percent"],
-            "threshold_percent": eligibility["threshold_percent"],
-            "fallback_hint": eligibility["fallback_hint"],
-            "source": "snapshot",
-            "raw_output": "not_returned",
-            "usage_v2": usage_v2,
-            "usage_eligibility": eligibility,
-        }
-    if usage_v2 is not None:
-        exhausted = [
-            window for window in usage_v2["limit_windows"] if window["exhausted"]
-        ]
-        parsed_resets = [
-            parse_utc_timestamp(window.get("reset_at_utc")) for window in exhausted
-        ]
-        if exhausted:
-            if any(parsed is None for parsed in parsed_resets):
-                raise AgentError("could_not_read_codex_usage_snapshot")
-            reset_timestamps = [
-                parsed
-                for parsed in parsed_resets
-                if parsed is not None and parsed > now
-            ]
-            if reset_timestamps:
-                blocked_until_ts = min(reset_timestamps)
-                state = {
-                    "agent": agent or "unknown",
-                    "account": agent or None,
-                    "usage_status": status,
-                    "state": "blocked",
-                    "blocked": True,
-                    "blocked_until_utc": _dt.datetime.fromtimestamp(
-                        blocked_until_ts, _dt.timezone.utc
-                    ).isoformat(),
-                    "reason": blocked_reason or "codex usage window exhausted",
-                    "source": "snapshot",
-                    "raw_output": "not_returned",
-                    "usage_v2": usage_v2,
-                    "usage_eligibility": eligibility,
-                }
-                return state
-    state = {
-        "agent": agent or "unknown",
-        "account": agent or None,
-        "usage_status": status,
-        "state": "released" if status == "blocked" else "clear",
-        "blocked": False,
-        "blocked_until_utc": (
-            _dt.datetime.fromtimestamp(blocked_until_ts, _dt.timezone.utc).isoformat()
-            if blocked_until_ts is not None
-            else None
-        ),
-        "reason": blocked_reason,
-        "source": "snapshot",
-        "raw_output": "not_returned",
-    }
-    if usage_v2 is not None:
-        state["usage_v2"] = usage_v2
-        state["usage_eligibility"] = eligibility
-    return state
 
 
 def watchdog_effective_idle(
@@ -16936,47 +16207,20 @@ def _usage_watchdog_agent_unlocked(agent: str, *, dry_run: bool) -> dict[str, An
         )
         if not identity_guard["ok"]:
             base["identity_guard"] = identity_guard
-            base["usage_watchdog"] = codex_usage_watchdog_status(
-                agent,
-                include_assignment_history=not dry_run,
-            )
+            base["usage_watchdog"] = codex_usage_watchdog_status(agent)
             return {
                 **base,
                 "usage_watchdog_state": "skipped_identity_unverified",
                 "action_taken": "none",
             }
-    usage_watchdog = codex_usage_status_with_routing(
-        agent,
-        codex_usage_watchdog_status(agent, include_assignment_history=not dry_run),
-        persist_account=not dry_run,
-        include_assignment_history=not dry_run,
-        force_policy_check=True,
-    )
+    usage_watchdog = codex_usage_watchdog_status(agent)
     base["usage_watchdog"] = usage_watchdog
 
     if usage_watchdog.get("blocked"):
-        marker = {
-            "agent": agent,
-            "blocked_until_utc": usage_watchdog.get("blocked_until_utc"),
-            "reason": usage_watchdog.get("reason"),
-            "source": usage_watchdog.get("source"),
-        }
-        for field in (
-            "reason_code",
-            "remaining_percent",
-            "threshold_percent",
-            "fallback_hint",
-        ):
-            if field in usage_watchdog:
-                marker[field] = usage_watchdog[field]
-        if isinstance(usage_watchdog.get("account"), str):
-            marker["account"] = usage_watchdog["account"]
         if not running:
-            if not dry_run:
-                update_codex_usage_watchdog_marker(agent, marker)
             return {
                 **base,
-                "usage_watchdog_state": "would_mark" if dry_run else "blocked_marked",
+                "usage_watchdog_state": "blocked",
                 "action_taken": "none",
             }
         if lease.get("state") == "unreadable":
@@ -17008,7 +16252,6 @@ def _usage_watchdog_agent_unlocked(agent: str, *, dry_run: bool) -> dict[str, An
             base["lease_state"] = lease.get("state")
             base["held_by_this_server"] = bool(lease.get("held_by_this_server"))
         try:
-            update_codex_usage_watchdog_marker(agent, marker)
             result = stop_agent(agent, force=False)
         except Exception:
             if claimed_for_watchdog:
@@ -17034,15 +16277,6 @@ def _usage_watchdog_agent_unlocked(agent: str, *, dry_run: bool) -> dict[str, An
             "usage_watchdog_state": "stopped",
             "action_taken": "stop",
             "action_result": public_watchdog_action_result(result),
-        }
-
-    if codex_usage_watchdog_marker(read_meta(agent)):
-        if not dry_run:
-            update_codex_usage_watchdog_marker(agent, None)
-        return {
-            **base,
-            "usage_watchdog_state": "would_release" if dry_run else "released",
-            "action_taken": "none",
         }
 
     return {**base, "usage_watchdog_state": "clear", "action_taken": "none"}
@@ -33938,21 +33172,7 @@ def applet_action_rows(
         meta = read_meta(row["agent"])
         run_marker = meta.get("run_id") if not meta.get("meta_error") else None
         try:
-            usage = codex_usage_watchdog_status(
-                row["agent"],
-                include_assignment_history=False,
-            )
-            routing_timeout_seconds = deadline - time.monotonic()
-            if routing_timeout_seconds <= 0:
-                raise AgentError("applet status deadline exceeded")
-            usage = codex_usage_status_with_routing(
-                row["agent"],
-                usage,
-                persist_account=False,
-                include_assignment_history=False,
-                force_policy_check=True,
-                routing_timeout_seconds=routing_timeout_seconds,
-            )
+            usage = codex_usage_watchdog_status(row["agent"])
         except AgentError:
             usage = None
         action = "none"
@@ -34177,18 +33397,7 @@ def applet_action(action: Any, agent: Any, context_token: Any) -> dict[str, Any]
         deadline = time.monotonic() + APPLET_STATUS_TIMEOUT_SECONDS
         row = applet_agent_observation(agent, deadline=deadline)
         try:
-            usage = codex_usage_watchdog_status(agent, include_assignment_history=False)
-            routing_timeout_seconds = deadline - time.monotonic()
-            if routing_timeout_seconds <= 0:
-                raise AgentError("applet action deadline exceeded")
-            usage = codex_usage_status_with_routing(
-                agent,
-                usage,
-                persist_account=False,
-                include_assignment_history=False,
-                force_policy_check=True,
-                routing_timeout_seconds=routing_timeout_seconds,
-            )
+            usage = codex_usage_watchdog_status(agent)
         except AgentError:
             usage = None
         admission = None

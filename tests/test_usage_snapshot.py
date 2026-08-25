@@ -203,13 +203,25 @@ def test_v2_chain_returns_fresh_reset_consistent_evidence(
     assert result.accounts[0].tracker_evidence[0].window_seconds == 18000
 
 
-def test_missing_current_pointer_is_unavailable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("target", "expected_status"),
+    [
+        ("pointer", "unavailable"),
+        ("active", "invalid"),
+        ("binding", "invalid"),
+        ("payload", "invalid"),
+    ],
+)
+def test_missing_chain_file_has_fail_closed_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    expected_status: str,
 ) -> None:
     state_home, paths = write_chain(tmp_path, monkeypatch)
-    paths["pointer"].unlink()
+    paths[target].unlink()
 
-    assert read(state_home).status == "unavailable"
+    assert read(state_home).status == expected_status
 
 
 def test_contended_lock_is_busy(

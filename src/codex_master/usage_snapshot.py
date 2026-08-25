@@ -258,7 +258,13 @@ class _FdGuard:
         return self._open_directory(parent_fd, name)
 
     def _open_regular(
-        self, parent_fd: int, name: str, *, minimum: int, maximum: int
+        self,
+        parent_fd: int,
+        name: str,
+        *,
+        minimum: int,
+        maximum: int,
+        missing_is_unavailable: bool = False,
     ) -> int:
         if name in {"", ".", ".."} or "/" in name:
             raise _Invalid()
@@ -269,7 +275,9 @@ class _FdGuard:
                 name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd
             )
         except FileNotFoundError as exc:
-            raise _Unavailable() from exc
+            if missing_is_unavailable:
+                raise _Unavailable() from exc
+            raise _Invalid() from exc
         except OSError as exc:
             raise _Invalid() from exc
         try:
@@ -288,10 +296,29 @@ class _FdGuard:
         return descriptor
 
     def lock(self, parent_fd: int, name: str) -> int:
-        return self._open_regular(parent_fd, name, minimum=0, maximum=_MAX_LOCK_BYTES)
+        return self._open_regular(
+            parent_fd,
+            name,
+            minimum=0,
+            maximum=_MAX_LOCK_BYTES,
+            missing_is_unavailable=True,
+        )
 
-    def read_file(self, parent_fd: int, name: str, maximum: int) -> bytes:
-        descriptor = self._open_regular(parent_fd, name, minimum=1, maximum=maximum)
+    def read_file(
+        self,
+        parent_fd: int,
+        name: str,
+        maximum: int,
+        *,
+        missing_is_unavailable: bool = False,
+    ) -> bytes:
+        descriptor = self._open_regular(
+            parent_fd,
+            name,
+            minimum=1,
+            maximum=maximum,
+            missing_is_unavailable=missing_is_unavailable,
+        )
         chunks: list[bytes] = []
         total = 0
         try:
@@ -854,7 +881,12 @@ def _read_chain(
         )
         generation, pointer_digest = _pointer(
             _canonical_json(
-                guard.read_file(integration_fd, "current.json", _MAX_POINTER_BYTES),
+                guard.read_file(
+                    integration_fd,
+                    "current.json",
+                    _MAX_POINTER_BYTES,
+                    missing_is_unavailable=True,
+                ),
                 _MAX_POINTER_BYTES,
             )
         )
