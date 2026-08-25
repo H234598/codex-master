@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import json
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,10 +11,19 @@ from types import MappingProxyType
 
 import pytest
 
+from codex_master.agent_resolver import (
+    AgentClassPolicy,
+    ModelPolicy,
+    ResolutionRequest,
+    build_selection_offer,
+    canonical_resolution_decision_digest,
+    resolve_agent_selection,
+)
 from codex_master.fleet_registry import (
     AuthKind,
     FleetAccount,
     FleetAccountV2,
+    FleetDynamicWorkerPrincipalV2,
     FleetSeries,
     FleetSeriesMember,
     FleetSeriesV2,
@@ -25,9 +34,24 @@ from codex_master.fleet_registry import (
     RunnerKind,
     SecretState,
     fleet_document,
+    normalize_fleet_document,
+    plan_dynamic_worker_principal_reserve,
 )
 from codex_master.fleet_runners import ProviderError, ProviderErrorQuotaObservation, ProbeResult
 from codex_master.fleet_service import FleetRateLimitError
+from codex_master.worker_resolution_carrier import (
+    WorkerResolutionEvidenceV2,
+    build_worker_registry_reservation,
+    build_worker_resolution_carrier,
+)
+from codex_master.worker_resume import WorkerLifecycle
+from codex_master.worker_spawn_ledger import (
+    FenceEpoch,
+    Generation,
+    LedgerRevision,
+    SpawnPhase,
+    WorkerSpawnTicketV2,
+)
 
 
 def test_fleet_paths_keep_registry_and_secrets_separate(tmp_path: Path) -> None:
@@ -82,8 +106,125 @@ def _service(tmp_path: Path, snapshot: FleetSnapshot | None = None):
     return service, paths
 
 
+def _r3_service(tmp_path: Path, snapshot: FleetSnapshotV2):
+    from codex_master.fleet_service import FleetPaths, FleetPrivateIO, FleetService
+
+    paths = FleetPaths.from_state_root(tmp_path)
+
+    def read_text(path: Path, _maximum: int, _error: str) -> str | None:
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+
+    def replace_text(path: Path, text: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def read_bytes(path: Path, _maximum: int, _error: str) -> bytes | None:
+        try:
+            return path.read_bytes()
+        except FileNotFoundError:
+            return None
+
+    def replace_bytes(path: Path, value: bytes, mode: int) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(value)
+        path.chmod(mode)
+
+    io = FleetPrivateIO(
+        ensure_dir=lambda path: path.mkdir(parents=True, exist_ok=True),
+        read_text=read_text,
+        replace_text=replace_text,
+        read_bytes=read_bytes,
+        replace_bytes=replace_bytes,
+        lock=lambda: nullcontext(),
+        utc_now=lambda: datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc),
+    )
+    service = FleetService(paths, io, pool_root=tmp_path / "pool")
+    service.commit_snapshot(snapshot, expected_generation=1)
+    return service, paths
+
+
 def _configured_snapshot(*, generation: int = 2) -> FleetSnapshot:
     return FleetSnapshot(1, generation, (_account(secret_state=SecretState.CONFIGURED),), (_series(),))
+
+
+def _digest(char: str) -> str:
+    return "sha256:" + char * 64
+
+
+def _empty_worker_snapshot() -> FleetSnapshotV2:
+    document = json.loads(
+        (Path(__file__).parent / "fixtures" / "fleet-registry-v2.json").read_text(encoding="utf-8")
+    )
+    document["runtime_principals"] = []
+    snapshot = normalize_fleet_document(document)
+    assert isinstance(snapshot, FleetSnapshotV2)
+    return replace(snapshot, generation=2)
+
+
+def _worker_registry_reservation():
+    classes = (
+        AgentClassPolicy(
+            "arbeitsbiene",
+            "ephemeral",
+            ("ephemeral", "binding", "persistent"),
+            ("luna",),
+            "low",
+            "xhigh",
+            ("read", "write"),
+        ),
+    )
+    model = "gpt-5.6-luna"
+    models = (
+        ModelPolicy(model, "luna", 20, ("low", "medium", "high", "xhigh"), ("read", "write")),
+    )
+    request = ResolutionRequest(
+        "read",
+        "simple",
+        requested_class="arbeitsbiene",
+        requested_lifecycle="invocation",
+    )
+    decision = resolve_agent_selection(request, classes=classes, models=models, available_models={model})
+    offer = build_selection_offer(classes=classes, models=models, available_models={model})
+    ticket = WorkerSpawnTicketV2(
+        ticket_id="ticket:worker-7",
+        request_id="worker-7",
+        requester_principal_id="worker-11",
+        requester_authority_digest=_digest("a"),
+        work_package_id="work-package-8",
+        topic_digest=_digest("b"),
+        target_class_id=decision.class_id,
+        authorized_teamlead_id="teamlead-2",
+        authorized_teamlead_authority_digest=_digest("c"),
+        resolution_decision_digest=canonical_resolution_decision_digest(decision),
+        resolution_generation=Generation(4),
+        policy_digest=_digest("d"),
+        policy_generation=Generation(9),
+        lifecycle=WorkerLifecycle.INVOCATION,
+        resume_requirement=False,
+        fence_epoch=FenceEpoch(6),
+        ledger_revision=LedgerRevision(1),
+        phase=SpawnPhase.REQUESTED,
+    )
+    evidence = WorkerResolutionEvidenceV2(
+        decision=decision,
+        offer=offer,
+        offer_generation=offer.generation,
+        capability_binding_digest=_digest("e"),
+        resolution_generation=ticket.resolution_generation,
+        policy_digest=ticket.policy_digest,
+        policy_generation=ticket.policy_generation,
+        ticket_fence_epoch=ticket.fence_epoch,
+    )
+    carrier = build_worker_resolution_carrier(ticket, evidence)
+    return build_worker_registry_reservation(
+        resolution=carrier,
+        principal_id="dw-" + "7" * 32,
+        ticket_ledger_revision=ticket.ledger_revision,
+        ticket_fence_epoch=ticket.fence_epoch,
+    )
 
 
 def test_registry_snapshot_reads_registry_only_without_clock_or_limits(tmp_path: Path) -> None:
@@ -399,6 +540,89 @@ def test_commit_rejects_stale_generation(tmp_path: Path) -> None:
 
     with pytest.raises(FleetConflictError):
         service.commit_snapshot(next_snapshot, expected_generation=current.generation)
+
+
+def test_fleet_service_persists_reloads_worker_evidence_and_redacts_public_snapshot(tmp_path: Path) -> None:
+    service, paths = _r3_service(tmp_path, _empty_worker_snapshot())
+    current = service.registry_snapshot()
+    reservation = _worker_registry_reservation()
+    candidate = plan_dynamic_worker_principal_reserve(
+        current,
+        reservation,
+        lease_binding_digest=_digest("f"),
+        expected_generation=current.generation,
+    )
+
+    committed = service.commit_snapshot(candidate, expected_generation=current.generation)
+    reloaded = type(service)(paths, service._io, pool_root=tmp_path / "pool")
+    loaded = reloaded.registry_snapshot()
+
+    assert loaded == committed
+    assert loaded.generation == 3
+    principal = next(item for item in loaded.runtime_principals if isinstance(item, FleetDynamicWorkerPrincipalV2))
+    assert principal.resolution_evidence == WorkerResolutionEvidenceV2(
+        decision=reservation.resolution.decision,
+        offer=reservation.resolution.offer,
+        offer_generation=reservation.resolution.resolver_offer_generation,
+        capability_binding_digest=reservation.resolution.capability_binding_digest,
+        resolution_generation=reservation.resolution.ticket_resolution_generation,
+        policy_digest=reservation.resolution.ticket_policy_digest,
+        policy_generation=reservation.resolution.ticket_policy_generation,
+        ticket_fence_epoch=reservation.resolution.ticket_fence_epoch,
+    )
+    private = json.loads(paths.registry.read_text(encoding="utf-8"))
+    private_worker = next(
+        item for item in private["runtime_principals"] if item["principal_id"] == reservation.principal_id
+    )
+    assert set(private_worker["resolution_evidence"]) == {
+        "decision",
+        "offer",
+        "offer_generation",
+        "capability_binding_digest",
+        "resolution_generation",
+        "policy_digest",
+        "policy_generation",
+        "ticket_fence_epoch",
+    }
+
+    public = json.dumps(reloaded.public_snapshot(), sort_keys=True)
+    for marker in (
+        "principal_id",
+        "ticket_id",
+        "lease_binding_digest",
+        "policy_digest",
+        "capability_binding_digest",
+        "credential_binding_id",
+        "resolution_evidence",
+        reservation.principal_id,
+        reservation.resolution.ticket_id,
+        reservation.resolution.ticket_policy_digest,
+        reservation.resolution.capability_binding_digest,
+        str(paths.root),
+    ):
+        assert marker not in public
+
+
+def test_fleet_service_stale_worker_commit_is_strict_no_write(tmp_path: Path) -> None:
+    from codex_master.fleet_service import FleetConflictError
+
+    service, paths = _r3_service(tmp_path, _empty_worker_snapshot())
+    current = service.registry_snapshot()
+    reservation = _worker_registry_reservation()
+    candidate = plan_dynamic_worker_principal_reserve(
+        current,
+        reservation,
+        lease_binding_digest=_digest("f"),
+        expected_generation=current.generation,
+    )
+    service.commit_snapshot(candidate, expected_generation=current.generation)
+    before = paths.registry.read_bytes()
+
+    with pytest.raises(FleetConflictError, match="generation_conflict"):
+        service.commit_snapshot(candidate, expected_generation=current.generation)
+
+    assert paths.registry.read_bytes() == before
+    assert service.registry_snapshot() == candidate
 
 
 def test_mark_limited_overlays_shared_account_gate(tmp_path: Path) -> None:

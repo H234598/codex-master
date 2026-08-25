@@ -109,6 +109,20 @@ def test_prepare_accepts_only_bound_v2_terra_xhigh_teamlead() -> None:
     assert plan.lifecycle == "persistent"
 
 
+def test_prepare_keeps_teamlead_plan_when_foreign_worker_is_present() -> None:
+    expected_principal = principal()
+    baseline = prepare_dynamic_teamlead(
+        snapshot(runtime_principals=(expected_principal,)), request(), binding()
+    )
+    foreign_worker = SimpleNamespace(principal_id="dw-" + "a" * 32, enabled=True)
+
+    with_worker = prepare_dynamic_teamlead(
+        snapshot(runtime_principals=(foreign_worker, expected_principal)), request(), binding()
+    )
+
+    assert with_worker == baseline
+
+
 def test_prepare_rejects_missing_runtime_principal() -> None:
     with pytest.raises(DynamicTeamleadError) as caught:
         prepare_dynamic_teamlead(snapshot(runtime_principals=()), request(), binding())
