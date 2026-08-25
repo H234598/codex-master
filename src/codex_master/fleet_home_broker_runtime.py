@@ -55,6 +55,27 @@ class CredentialProjection:
     fds: tuple[int, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class BrokerReleaseSpec:
+    joint_release_version: int
+    release_id: str
+    server_digest: str
+    broker_manifest_digest: str
+    chpb_abi: str
+    policy_abi: str
+    provider_abi: str
+    unit_digest: str
+    selinux_digest: str
+    socket_unit: str
+    service_unit: str
+    system_bus_name: str
+    system_bus_path: str
+    system_bus_interface: str
+    broker_domain: str
+    gateway_domain: str
+    socket_type: str
+
+
 class _StartGrantCarrier:
     __slots__ = ("_grant_state",)
 
@@ -79,6 +100,7 @@ class StartGrant(_StartGrantCarrier):
     generation: int
     provider: str
     projection: CredentialProjection
+    release: BrokerReleaseSpec
 
 
 class RuntimePeerOperations(Protocol):
@@ -126,7 +148,7 @@ class _StartGrantState:
             return True
 
     def projection(self) -> object:
-        return self._binding[-1]
+        return self._binding[-2]
 
 
 def _fail(message: str) -> None:
@@ -168,6 +190,45 @@ def _validate_runtime_binding(
         _fail("broker identity is invalid")
     if generation != identity.policy_generation:
         _fail("generation is not bound to broker identity")
+
+
+def _validate_release_spec(value: object) -> BrokerReleaseSpec:
+    if type(value) is not BrokerReleaseSpec:
+        _fail("broker release is invalid")
+    if (
+        type(value.joint_release_version) is not int
+        or value.joint_release_version != 1
+        or value.release_id != "0.11.0"
+        or value.chpb_abi != "CHPB/2"
+        or value.socket_unit != "codex-master-home-broker.socket"
+        or value.service_unit != "codex-master-home-broker.service"
+        or value.system_bus_name != "org.codex_master.HomeBrokerControl"
+        or value.system_bus_path != "/org/codex_master/HomeBrokerControl"
+        or value.system_bus_interface != "org.codex_master.HomeBrokerControl1"
+        or value.broker_domain != "codex_master_home_broker_t"
+        or value.gateway_domain != "codex_master_control_t"
+        or value.socket_type != "codex_master_home_broker_runtime_t"
+    ):
+        _fail("broker release is invalid")
+    digests = (
+        value.server_digest,
+        value.broker_manifest_digest,
+        value.unit_digest,
+        value.selinux_digest,
+    )
+    if any(
+        type(digest) is not str
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        for digest in digests
+    ):
+        _fail("broker release is invalid")
+    try:
+        _text(value.policy_abi, "policy ABI")
+        _text(value.provider_abi, "provider ABI")
+    except RuntimeBoundaryError:
+        _fail("broker release is invalid")
+    return value
 
 
 def _validate_peer(peer: object) -> BrokerPeer:
@@ -270,6 +331,7 @@ def _start_grant_binding(grant: StartGrant) -> tuple[object, ...]:
         grant.generation,
         grant.provider,
         grant.projection,
+        grant.release,
     )
 
 
@@ -343,6 +405,7 @@ def _read_rechecked_evidence(
 def attest_kernel_peer(
     peer: BrokerPeer,
     identity: BrokerIdentity,
+    release: BrokerReleaseSpec,
     profile_id: str,
     binding_id: str,
     generation: int,
@@ -355,8 +418,6 @@ def attest_kernel_peer(
     """Return one bound start grant after root-gateway kernel attestation."""
 
     peer = _validate_peer(peer)
-    if not callable(getattr(peer_operations, "is_root_system_bus_gateway", None)):
-        _fail("root system bus gateway required")
     try:
         root_gateway = peer_operations.is_root_system_bus_gateway()
     except Exception:
@@ -364,10 +425,7 @@ def attest_kernel_peer(
     if root_gateway is not True:
         _fail("root system bus gateway required")
     _validate_runtime_binding(profile_id, binding_id, generation, provider, identity)
-    if not callable(getattr(principal_resolver, "resolve_principal", None)):
-        _fail("principal resolution failed")
-    if not callable(getattr(projection_provider, "project", None)):
-        _fail("credential projection failed")
+    release = _validate_release_spec(release)
 
     first_evidence = _read_evidence(peer_operations, peer)
     try:
@@ -410,6 +468,7 @@ def attest_kernel_peer(
             generation,
             provider,
             projection,
+            release,
         )
         return _issue_start_grant(binding)
     except RuntimeBoundaryError:
@@ -426,8 +485,6 @@ class OneShotGrantConsumer:
     def __init__(self, grant: StartGrant, operations: RuntimePeerOperations):
         if type(grant) is not StartGrant:
             _fail("start grant is invalid")
-        if not callable(getattr(operations, "close", None)):
-            _fail("runtime peer operations are incomplete")
         _start_grant_state(grant)
         self._grant = grant
         self._operations = operations
@@ -486,6 +543,7 @@ class OneShotGrantConsumer:
 
 
 __all__ = (
+    "BrokerReleaseSpec",
     "CredentialProjection",
     "CredentialProjectionProvider",
     "KernelPeerEvidence",

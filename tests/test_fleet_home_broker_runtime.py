@@ -16,6 +16,7 @@ from codex_master.fleet_home_broker_identity import BrokerIdentity
 from codex_master.fleet_home_broker_linux import FdStat, PidfdIdentity
 from codex_master.fleet_home_broker_protocol import PrincipalBinding
 from codex_master.fleet_home_broker_runtime import (
+    BrokerReleaseSpec,
     CredentialProjection,
     CredentialProjectionProvider,
     KernelPeerEvidence,
@@ -38,6 +39,33 @@ PROFILE_ID = "profile.one"
 BINDING_ID = "hmac-sha256:" + "a" * 64
 PROVIDER = "openai_chatgpt"
 GENERATION = 9
+
+
+def release_spec(**changes):
+    values = {
+        "joint_release_version": 1,
+        "release_id": "0.11.0",
+        "server_digest": "d" * 64,
+        "broker_manifest_digest": "e" * 64,
+        "chpb_abi": "CHPB/2",
+        "policy_abi": "policy-v1",
+        "provider_abi": "provider-v1",
+        "unit_digest": "f" * 64,
+        "selinux_digest": "0" * 64,
+        "socket_unit": "codex-master-home-broker.socket",
+        "service_unit": "codex-master-home-broker.service",
+        "system_bus_name": "org.codex_master.HomeBrokerControl",
+        "system_bus_path": "/org/codex_master/HomeBrokerControl",
+        "system_bus_interface": "org.codex_master.HomeBrokerControl1",
+        "broker_domain": "codex_master_home_broker_t",
+        "gateway_domain": "codex_master_control_t",
+        "socket_type": "codex_master_home_broker_runtime_t",
+    }
+    values.update(changes)
+    return BrokerReleaseSpec(**values)
+
+
+RELEASE = release_spec()
 
 
 def principal(**changes):
@@ -244,7 +272,8 @@ def _attest(
 ):
     return attest_kernel_peer(
         peer=PEER,
-        identity=IDENTITY,
+        identity=values.pop("identity", IDENTITY),
+        release=values.pop("release", RELEASE),
         profile_id=values.pop("profile_id", PROFILE_ID),
         binding_id=values.pop("binding_id", BINDING_ID),
         generation=values.pop("generation", GENERATION),
@@ -296,7 +325,101 @@ def test_public_types_are_frozen_slotted_and_protocols_are_narrow():
     )
 
 
-def test_start_grant_dataclass_surface_has_only_nine_public_fields():
+def test_release_spec_is_frozen_slotted_and_has_only_root_release_fields():
+    expected_fields = (
+        "joint_release_version",
+        "release_id",
+        "server_digest",
+        "broker_manifest_digest",
+        "chpb_abi",
+        "policy_abi",
+        "provider_abi",
+        "unit_digest",
+        "selinux_digest",
+        "socket_unit",
+        "service_unit",
+        "system_bus_name",
+        "system_bus_path",
+        "system_bus_interface",
+        "broker_domain",
+        "gateway_domain",
+        "socket_type",
+    )
+
+    assert dataclasses.is_dataclass(BrokerReleaseSpec)
+    assert BrokerReleaseSpec.__dataclass_params__.frozen
+    assert hasattr(BrokerReleaseSpec, "__slots__")
+    assert tuple(field.name for field in dataclasses.fields(RELEASE)) == expected_fields
+    assert "mcs_pair" not in expected_fields
+    assert "enforcing" not in expected_fields
+    with pytest.raises(FrozenInstanceError):
+        RELEASE.release_id = "0.10.5"
+
+
+def test_attestation_has_one_explicit_trusted_release_input_and_no_payload_input():
+    parameters = inspect.signature(attest_kernel_peer).parameters
+
+    assert tuple(parameters) == (
+        "peer",
+        "identity",
+        "release",
+        "profile_id",
+        "binding_id",
+        "generation",
+        "provider",
+        "peer_operations",
+        "linux_operations",
+        "principal_resolver",
+        "projection_provider",
+    )
+    assert parameters["release"].annotation == "BrokerReleaseSpec"
+    assert parameters["release"].default is inspect.Parameter.empty
+    assert {"request", "payload", "module", "callable"}.isdisjoint(parameters)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("joint_release_version", True),
+        ("joint_release_version", 2),
+        ("release_id", "0.10.5"),
+        ("server_digest", "D" * 64),
+        ("broker_manifest_digest", "short"),
+        ("chpb_abi", "CHPB/1"),
+        ("policy_abi", ""),
+        ("provider_abi", ""),
+        ("unit_digest", "g" * 64),
+        ("selinux_digest", object()),
+        ("socket_unit", "untrusted.socket"),
+        ("service_unit", "untrusted.service"),
+        ("system_bus_name", "org.example.Untrusted"),
+        ("system_bus_path", "/org/example/Untrusted"),
+        ("system_bus_interface", "org.example.Untrusted1"),
+        ("broker_domain", "untrusted_broker_t"),
+        ("gateway_domain", "untrusted_control_t"),
+        ("socket_type", "untrusted_runtime_t"),
+    ],
+)
+def test_release_drift_is_rejected_before_projection(field, value):
+    provider = FakeProvider()
+
+    with pytest.raises(RuntimeBoundaryError, match="broker release is invalid"):
+        _attest(release=release_spec(**{field: value}), provider=provider)
+
+    assert provider.calls == []
+
+
+@pytest.mark.parametrize("release", [None, object()])
+def test_non_release_object_is_rejected_before_projection(release):
+    provider = FakeProvider()
+
+    with pytest.raises(RuntimeBoundaryError, match="broker release is invalid"):
+        _attest(release=release, provider=provider)
+
+    assert provider.calls == []
+
+
+def test_start_grant_dataclass_surface_has_exactly_ten_public_fields():
     public_fields = (
         "peer",
         "evidence",
@@ -307,6 +430,7 @@ def test_start_grant_dataclass_surface_has_only_nine_public_fields():
         "generation",
         "provider",
         "projection",
+        "release",
     )
     grant = _attest()
     public_clone = StartGrant(*(getattr(grant, name) for name in public_fields))
@@ -319,6 +443,8 @@ def test_start_grant_dataclass_surface_has_only_nine_public_fields():
     assert "grant_state" not in repr(grant)
     assert grant == public_clone
     assert hash(grant) == hash(public_clone)
+    with pytest.raises(TypeError, match="missing 1 required positional argument"):
+        StartGrant(*(getattr(grant, name) for name in public_fields[:-1]))
 
 
 def test_attestation_reconstructs_root_side_principal_and_returns_bound_opaque_grant():
@@ -334,6 +460,7 @@ def test_attestation_reconstructs_root_side_principal_and_returns_bound_opaque_g
     assert grant.principal == PRINCIPAL
     assert grant.identity == IDENTITY
     assert grant.projection == provider.value
+    assert grant.release == RELEASE
     assert resolver.calls == [EVIDENCE]
     assert provider.calls == [(PROFILE_ID, BINDING_ID, GENERATION, PROVIDER)]
     assert runtime.closed == []
@@ -395,6 +522,32 @@ def test_unknown_or_drifted_resolved_principal_denies(resolved):
 
     with pytest.raises(RuntimeBoundaryError, match="principal resolution failed"):
         _attest(resolver=resolver, provider=provider)
+
+    assert provider.calls == []
+
+
+@pytest.mark.parametrize(
+    "runtime,resolver,identity",
+    [
+        (
+            FakeRuntimeOperations(evidence_values=(evidence(mcs_pair="c0,c2"),)),
+            None,
+            IDENTITY,
+        ),
+        (None, FakeResolver(principal(mcs_pair="c0,c2")), IDENTITY),
+        (None, None, dataclasses.replace(IDENTITY, mcs_pair="c0,c2")),
+    ],
+)
+def test_mcs_must_match_evidence_principal_and_identity(runtime, resolver, identity):
+    provider = FakeProvider()
+
+    with pytest.raises(RuntimeBoundaryError, match="principal resolution failed"):
+        _attest(
+            runtime=runtime,
+            resolver=resolver,
+            identity=identity,
+            provider=provider,
+        )
 
     assert provider.calls == []
 
@@ -597,6 +750,7 @@ def test_public_field_reconstruction_is_not_an_issuer_grant():
         grant.generation,
         grant.provider,
         grant.projection,
+        grant.release,
     )
     consumer = OneShotGrantConsumer(grant, runtime)
 
@@ -626,6 +780,7 @@ def test_start_grant_constructor_rejects_private_state_injection():
             "generation",
             "provider",
             "projection",
+            "release",
         )
     )
 
@@ -655,6 +810,19 @@ def test_coherently_rebound_clone_cannot_escape_issuer_binding():
         OneShotGrantConsumer(grant, runtime).consume(
             PEER, dataclasses.replace(EVIDENCE, mcs_pair="c0,c2"), PRINCIPAL, IDENTITY
         )
+    assert runtime.closed == [101, 102]
+
+
+def test_issued_release_field_drift_is_detected_by_ten_field_carrier():
+    runtime = FakeRuntimeOperations()
+    grant = _attest(runtime=runtime)
+    object.__setattr__(grant, "release", release_spec(policy_abi="policy-v2"))
+
+    with pytest.raises(RuntimeBoundaryError, match="start grant binding drifted"):
+        OneShotGrantConsumer(grant, runtime).consume(
+            PEER, EVIDENCE, PRINCIPAL, IDENTITY
+        )
+
     assert runtime.closed == [101, 102]
 
 
@@ -870,6 +1038,20 @@ def test_internal_grant_issuer_is_only_called_by_attestation_and_not_exported():
     assert "_START_GRANT_ISSUER" not in assigned_names
 
 
+def test_trusted_operations_are_called_without_getattr_preprobes():
+    import codex_master.fleet_home_broker_runtime as runtime
+
+    tree = ast.parse(Path(runtime.__file__).read_text())
+
+    assert [
+        node.lineno
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "getattr"
+    ] == []
+
+
 def test_runtime_module_imports_only_offline_contracts():
     source = (
         Path(__file__).resolve().parents[1]
@@ -918,6 +1100,7 @@ def test_runtime_api_exports_only_a3a_surface():
     import codex_master.fleet_home_broker_runtime as runtime
 
     assert runtime.__all__ == (
+        "BrokerReleaseSpec",
         "CredentialProjection",
         "CredentialProjectionProvider",
         "KernelPeerEvidence",
