@@ -123,6 +123,7 @@ _READ_ONLY_TOOLS = {
 _MUTATING_TOOLS = {
     "agent_claim",
     "agent_release",
+    "dynamic_teamlead_start",
     "agent_send",
     "agent_interrupt",
     "agent_assign",

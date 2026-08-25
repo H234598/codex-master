@@ -206,6 +206,7 @@ from codex_master.fleet_runners import (
     probe_provider_models,
     validate_gemini_probe_model,
 )
+from codex_master.dynamic_teamlead_start import dynamic_teamlead_start
 from codex_master.selection import (
     AdmissionMode,
     AdmissionPolicy,
@@ -22770,6 +22771,8 @@ def call_tool(
         )
     if name == "agent_spawn_offers":
         return agent_spawn_offers(int_arg(args, "required_slots", 1))
+    if name == "dynamic_teamlead_start":
+        return dynamic_teamlead_start()
     if name == "agent_start":
         selected = agent_ids(str(args.get("agent", "both")))
         allow_unauthenticated = bool_arg(args, "allow_unauthenticated", False)
@@ -31686,6 +31689,15 @@ TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "required_slots": {"type": "integer", "minimum": 1, "maximum": 10, "default": 1}
             },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "dynamic_teamlead_start",
+        "description": "Request an A3-backed dynamic Teamleiterin start. Returns only data-sparse status.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
             "additionalProperties": False,
         },
     },
