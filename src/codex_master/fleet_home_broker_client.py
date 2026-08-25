@@ -8,10 +8,17 @@ from codex_master.fleet_home_broker_protocol import (
     AttestHomeRequest,
     BrokerReply,
     BrokerResultCode,
+    BrokerRequest,
     CANONICAL_AGENT_HOME,
     ChpbMessageKind,
+    DeprovisionHomeRequest,
+    GetTerminalResultRequest,
     HomeAttestation,
+    PolicyBinding,
     PrincipalBinding,
+    ProvisionHomeRequest,
+    QueryTransactionRequest,
+    ReplaceHomeRequest,
     TransactionStatus,
     decode_chpb_message,
     validate_chpb_message,
@@ -37,14 +44,28 @@ class AttestedHome:
 
 
 class BrokerClientOperations(Protocol):
-    def receive_frame(self, request: AttestHomeRequest) -> ScmFrame: ...
+    def receive_frame(self, request: BrokerRequest) -> ScmFrame: ...
 
     def fstat(self, fd: int) -> FdStat: ...
 
     def close(self, fd: int) -> None: ...
 
 
-def _close_all(operations: BrokerClientOperations, fds: tuple[int, ...]) -> None:
+def _frame_fds(value: object) -> tuple[int, ...]:
+    try:
+        fds = getattr(value, "fds")
+    except Exception:
+        return ()
+    if type(fds) not in (tuple, list):
+        return ()
+    result = []
+    for fd in fds:
+        if type(fd) is int and fd >= 0 and fd not in result:
+            result.append(fd)
+    return tuple(result)
+
+
+def _close_all(operations: BrokerClientOperations, fds: object) -> None:
     for fd in fds:
         try:
             operations.close(fd)
@@ -117,6 +138,120 @@ def _validate_reply(
     return attestation
 
 
+_TRANSACTION_REQUEST_TYPES = (
+    QueryTransactionRequest,
+    GetTerminalResultRequest,
+    ProvisionHomeRequest,
+    ReplaceHomeRequest,
+    DeprovisionHomeRequest,
+)
+
+
+def _validate_transaction_request(
+    request: object, expected_principal: PrincipalBinding
+) -> None:
+    if type(request) not in _TRANSACTION_REQUEST_TYPES:
+        raise BrokerClientError("request is not transactional")
+    try:
+        validate_chpb_message(request)
+        validate_principal_binding(expected_principal)
+    except Exception as exc:
+        raise BrokerClientError("invalid request binding") from exc
+
+    expected = request.expected
+    if (
+        expected.agent_id != expected_principal.agent_id
+        or expected.manifest_generation != expected_principal.manifest_generation
+        or expected.unit_generation != expected_principal.unit_generation
+        or expected.fencing_epoch != expected_principal.fencing_epoch
+    ):
+        raise BrokerClientError("request principal expectation drifted")
+
+
+def _validate_transaction_reply(
+    request: QueryTransactionRequest
+    | GetTerminalResultRequest
+    | ProvisionHomeRequest
+    | ReplaceHomeRequest
+    | DeprovisionHomeRequest,
+    expected_principal: PrincipalBinding,
+    reply: object,
+) -> BrokerReply:
+    if type(reply) is not BrokerReply:
+        raise BrokerClientError("broker reply has wrong type")
+    try:
+        validate_chpb_message(reply)
+    except Exception as exc:
+        raise BrokerClientError("broker reply is not canonical") from exc
+    if reply.request_id != request.request_id:
+        raise BrokerClientError("broker reply has wrong request id")
+    if reply.result is BrokerResultCode.OK:
+        raise BrokerClientError("transaction reply is successful")
+    if reply.attestation is not None:
+        raise BrokerClientError("transaction reply has attestation")
+
+    transaction = reply.transaction
+    if transaction is None:
+        return reply
+
+    binding = transaction.binding
+    expected_policy = PolicyBinding(
+        request.expected.policy_generation,
+        request.expected.projection_digest,
+    )
+    if binding.transaction_id != request.transaction_id:
+        raise BrokerClientError("transaction binding drifted")
+    if binding.principal != expected_principal:
+        raise BrokerClientError("principal binding drifted")
+    if binding.policy != expected_policy:
+        raise BrokerClientError("policy binding drifted")
+    if (
+        type(request)
+        in (
+            ProvisionHomeRequest,
+            ReplaceHomeRequest,
+            DeprovisionHomeRequest,
+        )
+        and binding != request.binding
+    ):
+        raise BrokerClientError("request binding drifted")
+    return reply
+
+
+def receive_transaction_reply(
+    request: QueryTransactionRequest
+    | GetTerminalResultRequest
+    | ProvisionHomeRequest
+    | ReplaceHomeRequest
+    | DeprovisionHomeRequest,
+    expected_principal: PrincipalBinding,
+    operations: BrokerClientOperations,
+) -> BrokerReply:
+    _validate_transaction_request(request, expected_principal)
+
+    try:
+        frame = operations.receive_frame(request)
+    except Exception as exc:
+        raise BrokerClientError("frame receive failed") from exc
+
+    cleanup_fds = _frame_fds(frame)
+    try:
+        if type(frame) is not ScmFrame:
+            raise BrokerClientError("received frame has wrong type")
+        if type(frame.payload) is not bytes or type(frame.fds) is not tuple:
+            raise BrokerClientError("received frame is invalid")
+        if frame.fds != ():
+            raise BrokerClientError("transaction reply contains fds")
+
+        reply = decode_chpb_message(frame.payload)
+        return _validate_transaction_reply(request, expected_principal, reply)
+    except Exception as exc:
+        _close_all(operations, cleanup_fds)
+        if isinstance(exc, BrokerClientError):
+            raise
+        raise BrokerClientError("invalid broker frame") from exc
+
+
 def receive_attested_home(
     request: AttestHomeRequest,
     expected_principal: PrincipalBinding,
@@ -129,8 +264,7 @@ def receive_attested_home(
     except Exception as exc:
         raise BrokerClientError("frame receive failed") from exc
 
-    received_fds = getattr(frame, "fds", ())
-    cleanup_fds = tuple(received_fds) if type(received_fds) in (tuple, list) else ()
+    cleanup_fds = _frame_fds(frame)
     try:
         if type(frame) is not ScmFrame:
             raise BrokerClientError("received frame has wrong type")
@@ -166,4 +300,5 @@ __all__ = [
     "BrokerClientOperations",
     "ScmFrame",
     "receive_attested_home",
+    "receive_transaction_reply",
 ]

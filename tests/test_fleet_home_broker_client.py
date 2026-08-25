@@ -3,6 +3,8 @@ from dataclasses import fields, replace
 import importlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from typing import get_type_hints
 
 import pytest
 
@@ -17,15 +19,20 @@ from codex_master.fleet_home_broker_protocol import (
     BrokerRegistryState,
     BrokerReply,
     BrokerResultCode,
+    BrokerRequest,
     CANONICAL_AGENT_HOME,
     CHPB_PROTOCOL,
     ChpbMessageKind,
     ChpbTransactionOperation,
+    DeprovisionHomeRequest,
     DirectoryIdentity,
+    GetTerminalResultRequest,
     HomeAttestation,
     PolicyBinding,
     PrincipalBinding,
+    ProvisionHomeRequest,
     QueryTransactionRequest,
+    ReplaceHomeRequest,
     TransactionBinding,
     TransactionStatus,
     encode_chpb_message,
@@ -81,15 +88,70 @@ REQUEST = AttestHomeRequest(
 )
 EXPECTED_STAT = FdStat(DIRECTORY.dev, DIRECTORY.ino, DIRECTORY.mode, 0, 0)
 
+REPLACE_BINDING = replace(BINDING, operation=ChpbTransactionOperation.REPLACE)
+DEPROVISION_BINDING = replace(BINDING, operation=ChpbTransactionOperation.DEPROVISION)
+REPLACE_TRANSACTION = replace(TRANSACTION, binding=REPLACE_BINDING)
+DEPROVISION_TRANSACTION = replace(
+    TRANSACTION,
+    binding=DEPROVISION_BINDING,
+    b2a_phase=B2aRecoveryPhase.DEPROVISIONED,
+    checkpoint=BrokerCheckpoint.DEPROVISIONED,
+)
+QUERY_REQUEST = QueryTransactionRequest(
+    CHPB_PROTOCOL,
+    ChpbMessageKind.QUERY_TRANSACTION,
+    REQUEST_ID,
+    TRANSACTION_ID,
+    EXPECTED,
+)
+TERMINAL_REQUEST = GetTerminalResultRequest(
+    CHPB_PROTOCOL,
+    ChpbMessageKind.GET_TERMINAL_RESULT,
+    REQUEST_ID,
+    TRANSACTION_ID,
+    EXPECTED,
+)
+PROVISION_REQUEST = ProvisionHomeRequest(
+    CHPB_PROTOCOL,
+    ChpbMessageKind.PROVISION_HOME,
+    REQUEST_ID,
+    TRANSACTION_ID,
+    EXPECTED,
+    BINDING,
+)
+REPLACE_REQUEST = ReplaceHomeRequest(
+    CHPB_PROTOCOL,
+    ChpbMessageKind.REPLACE_HOME,
+    REQUEST_ID,
+    TRANSACTION_ID,
+    EXPECTED,
+    REPLACE_BINDING,
+)
+DEPROVISION_REQUEST = DeprovisionHomeRequest(
+    CHPB_PROTOCOL,
+    ChpbMessageKind.DEPROVISION_HOME,
+    REQUEST_ID,
+    TRANSACTION_ID,
+    EXPECTED,
+    DEPROVISION_BINDING,
+)
+
 
 class FakeOperations:
     def __init__(
-        self, frame, *, stat=EXPECTED_STAT, receive_error=None, fstat_error=None
+        self,
+        frame,
+        *,
+        stat=EXPECTED_STAT,
+        receive_error=None,
+        fstat_error=None,
+        close_error=None,
     ):
         self.frame = frame
         self.stat = stat
         self.receive_error = receive_error
         self.fstat_error = fstat_error
+        self.close_error = close_error
         self.received = []
         self.fstat_calls = []
         self.closed = []
@@ -108,6 +170,8 @@ class FakeOperations:
 
     def close(self, fd):
         self.closed.append(fd)
+        if self.close_error is not None:
+            raise self.close_error
 
 
 def frame(reply=REPLY, fds=(0,)):
@@ -149,6 +213,36 @@ def reply_for(*, binding=BINDING, attestation=ATTESTATION, result=BrokerResultCo
     )
 
 
+def transaction_reply(request, transaction=TRANSACTION, result=None):
+    return BrokerReply(
+        CHPB_PROTOCOL,
+        ChpbMessageKind.REPLY,
+        request.request_id,
+        transaction.terminal_result if result is None else result,
+        transaction,
+        None,
+    )
+
+
+def transaction_frame(reply, fds=()):
+    return client.ScmFrame(encode_chpb_message(reply), fds)
+
+
+def run_transaction(frame_, *, request=QUERY_REQUEST, expected_principal=PRINCIPAL):
+    operations = FakeOperations(frame_)
+    result = client.receive_transaction_reply(request, expected_principal, operations)
+    return result, operations
+
+
+def assert_transaction_rejected(
+    frame_, *, request=QUERY_REQUEST, expected_principal=PRINCIPAL, operations=None
+):
+    operations = FakeOperations(frame_) if operations is None else operations
+    with pytest.raises(client.BrokerClientError):
+        client.receive_transaction_reply(request, expected_principal, operations)
+    return operations
+
+
 def test_public_api_types_are_frozen_and_slotted():
     for type_ in (client.ScmFrame, client.AttestedHome):
         assert getattr(type_, "__dataclass_params__").frozen
@@ -166,6 +260,262 @@ def test_public_error_and_operations_protocol_are_minimal():
     assert {"receive_frame", "fstat", "close"} <= set(
         client.BrokerClientOperations.__dict__
     )
+    assert get_type_hints(client.BrokerClientOperations.receive_frame)["request"] == (
+        BrokerRequest
+    )
+
+
+@pytest.mark.parametrize(
+    ("request_", "transaction"),
+    (
+        (QUERY_REQUEST, TRANSACTION),
+        (TERMINAL_REQUEST, TRANSACTION),
+        (PROVISION_REQUEST, TRANSACTION),
+        (REPLACE_REQUEST, REPLACE_TRANSACTION),
+        (DEPROVISION_REQUEST, DEPROVISION_TRANSACTION),
+    ),
+)
+def test_receive_transaction_reply_accepts_all_transaction_request_types(
+    request_, transaction
+):
+    reply = transaction_reply(request_, transaction)
+
+    result, operations = run_transaction(transaction_frame(reply), request=request_)
+
+    assert result == reply
+    assert operations.received == [request_]
+    assert operations.fstat_calls == []
+    assert operations.closed == []
+
+
+def test_receive_transaction_reply_rejects_attestation_request_before_receive():
+    operations = FakeOperations(transaction_frame(transaction_reply(QUERY_REQUEST)))
+
+    with pytest.raises(client.BrokerClientError):
+        client.receive_transaction_reply(REQUEST, PRINCIPAL, operations)
+
+    assert operations.received == []
+    assert operations.closed == []
+
+
+@pytest.mark.parametrize(
+    ("request_", "expected_principal"),
+    (
+        (replace(QUERY_REQUEST, kind=ChpbMessageKind.REPLY), PRINCIPAL),
+        (QUERY_REQUEST, replace(PRINCIPAL, cgroup_ino=0)),
+    ),
+)
+def test_transaction_request_and_principal_are_validated_before_receive(
+    request_, expected_principal
+):
+    operations = FakeOperations(transaction_frame(transaction_reply(QUERY_REQUEST)))
+
+    with pytest.raises(client.BrokerClientError):
+        client.receive_transaction_reply(request_, expected_principal, operations)
+
+    assert operations.received == []
+    assert operations.closed == []
+
+
+@pytest.mark.parametrize(
+    ("received_frame", "closed"),
+    (
+        (
+            SimpleNamespace(
+                payload=encode_chpb_message(transaction_reply(QUERY_REQUEST)),
+                fds=(0, 2),
+            ),
+            [0, 2],
+        ),
+        (client.ScmFrame("not-bytes", ()), []),
+        (
+            client.ScmFrame(encode_chpb_message(transaction_reply(QUERY_REQUEST)), []),
+            [],
+        ),
+        (
+            client.ScmFrame(
+                encode_chpb_message(transaction_reply(QUERY_REQUEST)), (0,)
+            ),
+            [0],
+        ),
+    ),
+)
+def test_transaction_frame_requires_exact_bytes_payload_and_empty_tuple_fds(
+    received_frame, closed
+):
+    operations = assert_transaction_rejected(received_frame)
+
+    assert operations.closed == closed
+    assert operations.fstat_calls == []
+
+
+def test_transaction_frame_cleanup_deduplicates_real_nonnegative_fds_and_masks_close_errors():
+    received_frame = client.ScmFrame(
+        encode_chpb_message(transaction_reply(QUERY_REQUEST)),
+        (0, 0, -1, True, "fd", 3),
+    )
+    operations = FakeOperations(
+        received_frame, close_error=RuntimeError("close failed")
+    )
+
+    with pytest.raises(client.BrokerClientError):
+        client.receive_transaction_reply(QUERY_REQUEST, PRINCIPAL, operations)
+
+    assert operations.closed == [0, 3]
+    assert operations.fstat_calls == []
+
+
+def test_transaction_receive_failure_does_not_close_unreceived_fds():
+    operations = FakeOperations(
+        transaction_frame(transaction_reply(QUERY_REQUEST)),
+        receive_error=OSError("not received"),
+    )
+
+    with pytest.raises(client.BrokerClientError):
+        client.receive_transaction_reply(QUERY_REQUEST, PRINCIPAL, operations)
+
+    assert operations.received == [QUERY_REQUEST]
+    assert operations.closed == []
+    assert operations.fstat_calls == []
+
+
+def test_transaction_payload_must_decode_to_exact_canonical_broker_reply():
+    raw_request = encode_chpb_message(QUERY_REQUEST)
+    operations = assert_transaction_rejected(client.ScmFrame(raw_request, ()))
+
+    assert operations.closed == []
+
+
+def test_transaction_reply_request_id_must_match():
+    reply = replace(transaction_reply(QUERY_REQUEST), request_id=OTHER_ID)
+    operations = assert_transaction_rejected(transaction_frame(reply))
+
+    assert operations.closed == []
+
+
+def test_transaction_reply_rejects_ok_and_attestation():
+    operations = assert_transaction_rejected(
+        client.ScmFrame(encode_chpb_message(REPLY), ())
+    )
+
+    assert operations.closed == []
+
+
+def test_transaction_reply_rejects_attestation_even_on_error(monkeypatch):
+    invalid_reply = BrokerReply(
+        CHPB_PROTOCOL,
+        ChpbMessageKind.REPLY,
+        REQUEST_ID,
+        BrokerResultCode.INVALID_MESSAGE,
+        None,
+        ATTESTATION,
+    )
+    monkeypatch.setattr(client, "decode_chpb_message", lambda _payload: invalid_reply)
+    operations = assert_transaction_rejected(client.ScmFrame(b"ignored", ()))
+
+    assert operations.closed == []
+
+
+@pytest.mark.parametrize(
+    "request_", (QUERY_REQUEST, TERMINAL_REQUEST, PROVISION_REQUEST)
+)
+def test_canonical_error_without_transaction_is_passed_through(request_):
+    reply = BrokerReply(
+        CHPB_PROTOCOL,
+        ChpbMessageKind.REPLY,
+        request_.request_id,
+        BrokerResultCode.INVALID_MESSAGE,
+        None,
+        None,
+    )
+
+    result, operations = run_transaction(transaction_frame(reply), request=request_)
+
+    assert result == reply
+    assert operations.closed == []
+    assert operations.fstat_calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("transaction_id", OTHER_ID),
+        ("agent_id", "other_agent"),
+        ("manifest_generation", 8),
+        ("unit_generation", 10),
+        ("cgroup_dev", 18),
+        ("cgroup_ino", 30),
+        ("invocation_id", "2" * 32),
+        ("mcs_pair", "c2,c3"),
+        ("fencing_epoch", 12),
+        ("policy_generation", 14),
+        ("projection_digest", "2" * 64),
+    ),
+)
+def test_transaction_reply_binds_transaction_id_full_principal_and_policy(field, value):
+    binding = BINDING
+    if field == "transaction_id":
+        binding = replace(binding, transaction_id=value)
+    elif field in {
+        "agent_id",
+        "manifest_generation",
+        "unit_generation",
+        "cgroup_dev",
+        "cgroup_ino",
+        "invocation_id",
+        "mcs_pair",
+        "fencing_epoch",
+    }:
+        binding = replace(binding, principal=replace(PRINCIPAL, **{field: value}))
+    else:
+        binding = replace(binding, policy=replace(POLICY, **{field: value}))
+    reply = transaction_reply(QUERY_REQUEST, replace(TRANSACTION, binding=binding))
+
+    operations = assert_transaction_rejected(transaction_frame(reply))
+
+    assert operations.closed == []
+
+
+def test_query_reply_does_not_require_unknown_mutation_operation_or_store_uuid():
+    binding = replace(
+        BINDING,
+        operation=ChpbTransactionOperation.REPLACE,
+        store_uuid=OTHER_ID,
+    )
+    reply = transaction_reply(QUERY_REQUEST, replace(TRANSACTION, binding=binding))
+
+    result, operations = run_transaction(transaction_frame(reply))
+
+    assert result == reply
+    assert operations.closed == []
+
+
+@pytest.mark.parametrize(
+    ("request_", "transaction", "binding"),
+    (
+        (
+            PROVISION_REQUEST,
+            TRANSACTION,
+            replace(BINDING, operation=ChpbTransactionOperation.REPLACE),
+        ),
+        (
+            REPLACE_REQUEST,
+            REPLACE_TRANSACTION,
+            replace(REPLACE_BINDING, operation=ChpbTransactionOperation.PROVISION),
+        ),
+        (
+            DEPROVISION_REQUEST,
+            DEPROVISION_TRANSACTION,
+            replace(DEPROVISION_BINDING, store_uuid=OTHER_ID),
+        ),
+    ),
+)
+def test_mutation_reply_requires_full_request_binding(request_, transaction, binding):
+    reply = transaction_reply(request_, replace(transaction, binding=binding))
+
+    operations = assert_transaction_rejected(transaction_frame(reply), request=request_)
+
+    assert operations.closed == []
 
 
 @pytest.mark.parametrize(
@@ -218,6 +568,12 @@ def test_zero_or_multiple_received_fds_close_all_and_fail(fds):
 
     assert operations.closed == list(fds)
     assert operations.fstat_calls == []
+
+
+def test_attested_error_closes_each_unique_real_nonnegative_fd_once():
+    operations = assert_rejected(frame(fds=(0, 0, -1, True, 2)))
+
+    assert operations.closed == [0, 2]
 
 
 def test_receive_failure_does_not_close_unreceived_fds():
