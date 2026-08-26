@@ -193,6 +193,22 @@ class LeaseBindingReceiptV1(_RedactedNonSerializable):
         raise TypeError("lease binding receipts are allocator-issued only")
 
 
+@dataclass(frozen=True, slots=True, repr=False, init=False, eq=False)
+class LeaseBindingVerificationV1(_RedactedNonSerializable):
+    _serialization_marker: _OpaqueText
+
+    def __new__(cls) -> LeaseBindingVerificationV1:
+        raise TypeError("lease binding verifications are allocator-issued only")
+
+
+@dataclass(frozen=True, slots=True, repr=False, init=False)
+class LeaseBindingReferenceV1(_RedactedNonSerializable):
+    _digest: _OpaqueText
+
+    def __new__(cls) -> LeaseBindingReferenceV1:
+        raise TypeError("lease binding references use the private document codec")
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class _LeaseRecord(_RedactedNonSerializable):
     lease: CredentialLease
@@ -253,6 +269,42 @@ class _LeaseRecord(_RedactedNonSerializable):
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class _LeaseBindingVerificationRecord(_RedactedNonSerializable):
+    verification: LeaseBindingVerificationV1
+    lease_record: _LeaseRecord
+    receipt: LeaseBindingReceiptV1
+    lease: CredentialLease
+    ticket: ValidatedAllocationTicket
+    capacity_evidence: CapacityEvidence
+    binding_reference: LeaseBindingReferenceV1
+
+
+def _lease_binding_reference_to_document(reference: object) -> str:
+    if type(reference) is not LeaseBindingReferenceV1 or not _is_binding_digest(
+        reference._digest
+    ):
+        raise AllocationDenied("runtime account allocation denied")
+    return str(reference._digest)
+
+
+def _lease_binding_reference_from_document(value: object) -> LeaseBindingReferenceV1:
+    if type(value) is not str or not _is_binding_digest(_OpaqueText(value)):
+        raise AllocationDenied("runtime account allocation denied")
+    reference = object.__new__(LeaseBindingReferenceV1)
+    object.__setattr__(reference, "_digest", _OpaqueText(value))
+    return reference
+
+
+def _is_binding_digest(value: object) -> bool:
+    return (
+        type(value) is _OpaqueText
+        and len(value) == 71
+        and value.startswith("sha256:")
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class _PendingRelease(_RedactedNonSerializable):
     pending_release_id: str
     reservation_key: str
@@ -294,6 +346,8 @@ class _ReservationOwner(_RedactedNonSerializable):
 class RuntimeAccountAllocator:
     __slots__ = (
         "_active_by_account",
+        "_active_lease_binding_verifications",
+        "_deferred_lease_binding_revokes",
         "_latest_by_account",
         "_lock",
         "_pending_releases",
@@ -306,6 +360,10 @@ class RuntimeAccountAllocator:
     def __init__(self, provider_adapter: CapabilityProviderAdapter) -> None:
         self._provider_adapter = provider_adapter
         self._active_by_account: dict[str, dict[str, tuple[int, int]]] = {}
+        self._active_lease_binding_verifications: dict[
+            LeaseBindingVerificationV1, _LeaseBindingVerificationRecord
+        ] = {}
+        self._deferred_lease_binding_revokes: dict[str, _LeaseRecord] = {}
         self._latest_by_account: dict[str, tuple[int, int]] = {}
         self._lock = Lock()
         self._pending_releases: dict[str, _PendingRelease] = {}
@@ -362,7 +420,14 @@ class RuntimeAccountAllocator:
             if record.state is LeaseState.REVOKED:
                 return
             if record.state is LeaseState.RESERVED:
-                pending_release_id = self._transition_lease_release_locked(record)
+                if self._has_active_lease_binding_verification(record):
+                    deferred = self._deferred_lease_binding_revokes.get(record.lease_id)
+                    if deferred is None:
+                        self._deferred_lease_binding_revokes[record.lease_id] = record
+                    elif deferred is not record:
+                        return
+                else:
+                    pending_release_id = self._transition_lease_release_locked(record)
             elif record.state is LeaseState.RELEASE_PENDING:
                 pending_release_id = record.pending_release_id
         if pending_release_id is not None:
@@ -455,6 +520,153 @@ class RuntimeAccountAllocator:
             object.__setattr__(receipt, "_lease_binding_digest", lease_binding_digest)
             self._records[record.lease_id] = replace(record, receipt=receipt)
             return receipt
+
+    def verify_lease_binding_receipt(
+        self,
+        receipt: object,
+        *,
+        expected_lease: object,
+        expected_ticket: object,
+        expected_capacity_evidence: object,
+    ) -> LeaseBindingVerificationV1:
+        if (
+            type(receipt) is not LeaseBindingReceiptV1
+            or type(expected_lease) is not CredentialLease
+            or type(expected_ticket) is not ValidatedAllocationTicket
+            or type(expected_capacity_evidence) is not CapacityEvidence
+        ):
+            raise AllocationDenied("runtime account allocation denied")
+        try:
+            with self._lock:
+                record = self._records.get(expected_lease.lease_id)
+                if (
+                    type(record) is not _LeaseRecord
+                    or record.receipt is not receipt
+                    or not self._receipt_binding_invariant(
+                        record,
+                        expected_lease,
+                        expected_ticket,
+                        expected_capacity_evidence,
+                    )
+                    or record.state is not LeaseState.RESERVED
+                    or record.pending_release_id is not None
+                    or self._has_active_lease_binding_verification(record)
+                ):
+                    raise AllocationDenied("runtime account allocation denied")
+                verification = object.__new__(LeaseBindingVerificationV1)
+                object.__setattr__(
+                    verification,
+                    "_serialization_marker",
+                    _OpaqueText("redacted"),
+                )
+                binding_reference = self._lease_binding_reference_for_record(record)
+                active = _LeaseBindingVerificationRecord(
+                    verification=verification,
+                    lease_record=record,
+                    receipt=receipt,
+                    lease=expected_lease,
+                    ticket=expected_ticket,
+                    capacity_evidence=expected_capacity_evidence,
+                    binding_reference=binding_reference,
+                )
+                self._active_lease_binding_verifications[verification] = active
+                return verification
+        except AllocationDenied:
+            raise
+        except Exception:
+            raise AllocationDenied("runtime account allocation denied") from None
+
+    def lease_binding_reference_for(
+        self, verification: object
+    ) -> LeaseBindingReferenceV1:
+        try:
+            with self._lock:
+                active = self._active_lease_binding_verifications.get(verification)
+                if not self._active_lease_binding_verification_invariant(active):
+                    raise AllocationDenied("runtime account allocation denied")
+                return active.binding_reference
+        except AllocationDenied:
+            raise
+        except Exception:
+            raise AllocationDenied("runtime account allocation denied") from None
+
+    def close_lease_binding_verification(self, verification: object) -> None:
+        pending_release_id = None
+        close_denied = False
+        try:
+            with self._lock:
+                active = self._active_lease_binding_verifications.get(verification)
+                if (
+                    type(verification) is not LeaseBindingVerificationV1
+                    or type(active) is not _LeaseBindingVerificationRecord
+                    or active.verification is not verification
+                ):
+                    close_denied = True
+                else:
+                    record = active.lease_record
+                    deferred = self._deferred_lease_binding_revokes.get(record.lease_id)
+                    active_is_current = (
+                        self._active_lease_binding_verification_invariant(active)
+                    )
+                    self._active_lease_binding_verifications.pop(verification)
+                    if not active_is_current:
+                        if deferred is record:
+                            self._deferred_lease_binding_revokes.pop(record.lease_id)
+                        close_denied = True
+                    elif deferred is record:
+                        self._deferred_lease_binding_revokes.pop(record.lease_id)
+                        pending_release_id = self._transition_lease_release_locked(
+                            record
+                        )
+        except Exception:
+            raise AllocationDenied("runtime account allocation denied") from None
+        if close_denied:
+            raise AllocationDenied("runtime account allocation denied")
+        if pending_release_id is not None:
+            self._retry_pending_release(pending_release_id)
+
+    def _has_active_lease_binding_verification(self, record: _LeaseRecord) -> bool:
+        return any(
+            type(active) is _LeaseBindingVerificationRecord
+            and active.lease_record is record
+            for active in self._active_lease_binding_verifications.values()
+        )
+
+    def _active_lease_binding_verification_invariant(self, active: object) -> bool:
+        if type(active) is not _LeaseBindingVerificationRecord:
+            return False
+        record = active.lease_record
+        try:
+            return (
+                type(active.verification) is LeaseBindingVerificationV1
+                and self._active_lease_binding_verifications.get(active.verification)
+                is active
+                and self._records.get(record.lease_id) is record
+                and record.receipt is active.receipt
+                and record.lease is active.lease
+                and record.ticket is active.ticket
+                and record.capacity_evidence is active.capacity_evidence
+                and self._receipt_binding_invariant(
+                    record,
+                    active.lease,
+                    active.ticket,
+                    active.capacity_evidence,
+                )
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _lease_binding_reference_for_record(
+        record: _LeaseRecord,
+    ) -> LeaseBindingReferenceV1:
+        digest = _OpaqueText(
+            "sha256:"
+            + hashlib.sha256(
+                RuntimeAccountAllocator._lease_binding_canonical_json(record)
+            ).hexdigest()
+        )
+        return _lease_binding_reference_from_document(str(digest))
 
     @staticmethod
     def _allocation_binding_invariant(

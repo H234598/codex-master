@@ -1610,3 +1610,552 @@ def test_lease_binding_receipt_uses_allocation_adapter_snapshot_without_reread()
         "sha256:801052b31d6fee240e9407844c23651c5c690a311728e206ed310b5f8e7abbb0"
     )
     assert adapter.adapter_id_reads == 1
+
+
+def test_lease_binding_verifier_registers_exact_live_binding_guard() -> None:
+    module = _allocator_module()
+    allocator, _adapter, lease, ticket, capacity_evidence, _reservation = (
+        _receipt_binding(module)
+    )
+    receipt = allocator.issue_lease_binding_receipt(lease, ticket, capacity_evidence)
+
+    verification = allocator.verify_lease_binding_receipt(
+        receipt,
+        expected_lease=lease,
+        expected_ticket=ticket,
+        expected_capacity_evidence=capacity_evidence,
+    )
+
+    assert type(verification) is module.LeaseBindingVerificationV1
+    assert verification in allocator._active_lease_binding_verifications
+
+
+def _verification_binding(module, adapter_type=_ReceiptAdapter):
+    allocator, adapter, lease, ticket, capacity_evidence, reservation = (
+        _receipt_binding(module, adapter_type)
+    )
+    receipt = allocator.issue_lease_binding_receipt(lease, ticket, capacity_evidence)
+    return allocator, adapter, receipt, lease, ticket, capacity_evidence, reservation
+
+
+def _verify_lease_binding(allocator, receipt, lease, ticket, capacity_evidence):
+    return allocator.verify_lease_binding_receipt(
+        receipt,
+        expected_lease=lease,
+        expected_ticket=ticket,
+        expected_capacity_evidence=capacity_evidence,
+    )
+
+
+def _forged_receipt(module, digest):
+    forged = object.__new__(module.LeaseBindingReceiptV1)
+    object.__setattr__(forged, "_lease_binding_digest", module._OpaqueText(digest))
+    return forged
+
+
+def test_lease_binding_verifier_denies_exact_opaque_text_forge_and_cross_objects() -> (
+    None
+):
+    module = _allocator_module()
+    allocator, _adapter, receipt, lease, ticket, capacity_evidence, _reservation = (
+        _verification_binding(module)
+    )
+    forged = _forged_receipt(module, receipt._lease_binding_digest)
+    other = _verification_binding(module)
+
+    for attempted_receipt, attempted_lease, attempted_ticket, attempted_evidence in (
+        ("sha256:" + "f" * 64, lease, ticket, capacity_evidence),
+        (forged, lease, ticket, capacity_evidence),
+        (receipt, dataclasses.replace(lease), ticket, capacity_evidence),
+        (receipt, lease, dataclasses.replace(ticket), capacity_evidence),
+        (receipt, lease, ticket, dataclasses.replace(capacity_evidence)),
+        (other[2], other[3], other[4], other[5]),
+    ):
+        _assert_sparse_denial(
+            module,
+            lambda attempted_receipt=attempted_receipt, attempted_lease=attempted_lease, attempted_ticket=attempted_ticket, attempted_evidence=attempted_evidence: (
+                _verify_lease_binding(
+                    allocator,
+                    attempted_receipt,
+                    attempted_lease,
+                    attempted_ticket,
+                    attempted_evidence,
+                )
+            ),
+        )
+    assert allocator._active_lease_binding_verifications == {}
+
+
+@pytest.mark.parametrize(
+    ("target_name", "field_name", "replacement"),
+    (
+        ("ticket", "ticket_id", "ticket-drift"),
+        ("ticket", "resolver_offer_generation", "sha256:" + "f" * 64),
+        ("ticket", "policy_generation", 12),
+        ("ticket", "policy_digest", "sha256:" + "e" * 64),
+        ("ticket", "capability_binding_digest", "sha256:" + "e" * 64),
+        ("ticket", "ledger_revision", 4),
+        ("ticket", "fencing_token", "fence-drift"),
+        ("ticket", "fence_epoch", 18),
+        ("capacity_evidence", "provider_adapter_id", "adapter-drift"),
+        ("capacity_evidence", "evidence_revision", 8),
+        ("lease", "account_binding_digest", "sha256:" + "e" * 64),
+        ("lease", "profile_binding_digest", "sha256:" + "e" * 64),
+        ("lease", "lease_id", "lease-drift"),
+        ("lease", "lease_revision", 2),
+        ("lease", "expires_at_utc", datetime(2099, 1, 2, 3, 4, 6, tzinfo=UTC)),
+        ("reservation", "reservation_id", "reservation-drift"),
+    ),
+)
+def test_lease_binding_verifier_denies_each_live_binding_field_drift(
+    target_name, field_name, replacement
+) -> None:
+    module = _allocator_module()
+    allocator, _adapter, receipt, lease, ticket, capacity_evidence, reservation = (
+        _verification_binding(module)
+    )
+    target = {
+        "ticket": ticket,
+        "capacity_evidence": capacity_evidence,
+        "lease": lease,
+        "reservation": reservation,
+    }[target_name]
+    original = getattr(target, field_name)
+    object.__setattr__(target, field_name, replacement)
+    try:
+        _assert_sparse_denial(
+            module,
+            lambda: _verify_lease_binding(
+                allocator, receipt, lease, ticket, capacity_evidence
+            ),
+        )
+        assert allocator._active_lease_binding_verifications == {}
+    finally:
+        object.__setattr__(target, field_name, original)
+
+
+@pytest.mark.parametrize(
+    "mutations",
+    (
+        (
+            ("lease", "account_binding_digest", "sha256:" + "e" * 64),
+            ("reservation", "account_binding_digest", "sha256:" + "e" * 64),
+        ),
+        (
+            ("ticket", "policy_generation", 12),
+            ("capacity_evidence", "policy_generation", 12),
+        ),
+        (
+            ("ticket", "fencing_token", "fence-drift"),
+            ("capacity_evidence", "fencing_token", "fence-drift"),
+            ("reservation", "fencing_token", "fence-drift"),
+        ),
+        (
+            ("lease", "expires_at_utc", datetime(2099, 1, 2, 3, 4, 6, tzinfo=UTC)),
+            (
+                "capacity_evidence",
+                "expires_at_utc",
+                datetime(2099, 1, 2, 3, 4, 6, tzinfo=UTC),
+            ),
+            (
+                "reservation",
+                "expires_at_utc",
+                datetime(2099, 1, 2, 3, 4, 6, tzinfo=UTC),
+            ),
+        ),
+    ),
+)
+def test_lease_binding_verifier_denies_correlated_drift(mutations) -> None:
+    module = _allocator_module()
+    allocator, _adapter, receipt, lease, ticket, capacity_evidence, reservation = (
+        _verification_binding(module)
+    )
+    targets = {
+        "ticket": ticket,
+        "capacity_evidence": capacity_evidence,
+        "lease": lease,
+        "reservation": reservation,
+    }
+    originals = tuple(
+        (targets[target_name], field_name, getattr(targets[target_name], field_name))
+        for target_name, field_name, _replacement in mutations
+    )
+    for target_name, field_name, replacement in mutations:
+        object.__setattr__(targets[target_name], field_name, replacement)
+    try:
+        _assert_sparse_denial(
+            module,
+            lambda: _verify_lease_binding(
+                allocator, receipt, lease, ticket, capacity_evidence
+            ),
+        )
+    finally:
+        for target, field_name, original in originals:
+            object.__setattr__(target, field_name, original)
+
+
+def test_lease_binding_verifier_denies_pending_or_revoked_record() -> None:
+    module = _allocator_module()
+
+    class PendingReleaseAdapter(_ReceiptAdapter):
+        def release_reservation(self, reservation) -> bool:
+            return False
+
+    allocator, _adapter, receipt, lease, ticket, capacity_evidence, _reservation = (
+        _verification_binding(module, PendingReleaseAdapter)
+    )
+    allocator.revoke(lease, "pending")
+
+    _assert_sparse_denial(
+        module,
+        lambda: _verify_lease_binding(
+            allocator, receipt, lease, ticket, capacity_evidence
+        ),
+    )
+    assert allocator._records[lease.lease_id].state is module.LeaseState.RELEASE_PENDING
+
+    (
+        revoked_allocator,
+        _revoked_adapter,
+        revoked_receipt,
+        revoked_lease,
+        revoked_ticket,
+        revoked_evidence,
+        _revoked_reservation,
+    ) = _verification_binding(module)
+    revoked_allocator.revoke(revoked_lease, "revoked")
+    _assert_sparse_denial(
+        module,
+        lambda: _verify_lease_binding(
+            revoked_allocator,
+            revoked_receipt,
+            revoked_lease,
+            revoked_ticket,
+            revoked_evidence,
+        ),
+    )
+    assert (
+        revoked_allocator._records[revoked_lease.lease_id].state
+        is module.LeaseState.REVOKED
+    )
+
+
+def test_lease_binding_verifier_denies_receipt_owner_and_resolution_drift() -> None:
+    module = _allocator_module()
+    allocator, _adapter, receipt, lease, ticket, capacity_evidence, _reservation = (
+        _verification_binding(module)
+    )
+    record = allocator._records[lease.lease_id]
+    allocator._records[lease.lease_id] = dataclasses.replace(record, receipt=None)
+    _assert_sparse_denial(
+        module,
+        lambda: _verify_lease_binding(
+            allocator, receipt, lease, ticket, capacity_evidence
+        ),
+    )
+
+    allocator._records[lease.lease_id] = record
+    owner = allocator._reservation_owners[record.reservation_key]
+    allocator._reservation_owners[record.reservation_key] = dataclasses.replace(
+        owner, owner_id="foreign-owner"
+    )
+    _assert_sparse_denial(
+        module,
+        lambda: _verify_lease_binding(
+            allocator, receipt, lease, ticket, capacity_evidence
+        ),
+    )
+
+    allocator._reservation_owners[record.reservation_key] = owner
+    original_model = ticket.resolution_decision.model
+    object.__setattr__(ticket.resolution_decision, "model", "gpt-5.6-drift")
+    try:
+        _assert_sparse_denial(
+            module,
+            lambda: _verify_lease_binding(
+                allocator, receipt, lease, ticket, capacity_evidence
+            ),
+        )
+    finally:
+        object.__setattr__(ticket.resolution_decision, "model", original_model)
+
+
+def test_lease_binding_guard_is_single_use_bound_and_reference_is_inert() -> None:
+    module = _allocator_module()
+    allocator, _adapter, receipt, lease, ticket, capacity_evidence, _reservation = (
+        _verification_binding(module)
+    )
+    verification = _verify_lease_binding(
+        allocator, receipt, lease, ticket, capacity_evidence
+    )
+    reference = allocator.lease_binding_reference_for(verification)
+    reference_clone = object.__new__(module.LeaseBindingReferenceV1)
+    object.__setattr__(reference_clone, "_digest", reference._digest)
+    forged = object.__new__(module.LeaseBindingVerificationV1)
+    other = _verification_binding(module)
+    other_verification = _verify_lease_binding(
+        other[0], other[2], other[3], other[4], other[5]
+    )
+
+    assert reference_clone == reference
+    assert hash(reference_clone) == hash(reference)
+    for attempted_guard in (
+        forged,
+        other_verification,
+        reference_clone,
+        str(reference),
+    ):
+        _assert_sparse_denial(
+            module,
+            lambda attempted_guard=attempted_guard: (
+                allocator.close_lease_binding_verification(attempted_guard)
+            ),
+        )
+    for attempted_guard in (reference_clone, str(reference)):
+        _assert_sparse_denial(
+            module,
+            lambda attempted_guard=attempted_guard: (
+                allocator.lease_binding_reference_for(attempted_guard)
+            ),
+        )
+    _assert_sparse_denial(
+        module,
+        lambda: _verify_lease_binding(
+            allocator, receipt, lease, ticket, capacity_evidence
+        ),
+    )
+    assert verification in allocator._active_lease_binding_verifications
+    allocator.close_lease_binding_verification(verification)
+    _assert_sparse_denial(
+        module,
+        lambda: allocator.close_lease_binding_verification(verification),
+    )
+    other[0].close_lease_binding_verification(other_verification)
+
+
+def test_lease_binding_reference_codec_is_redacted_and_cannot_cross_process() -> None:
+    module = _allocator_module()
+    allocator, _adapter, receipt, lease, ticket, capacity_evidence, _reservation = (
+        _verification_binding(module)
+    )
+    verification = _verify_lease_binding(
+        allocator, receipt, lease, ticket, capacity_evidence
+    )
+    reference = allocator.lease_binding_reference_for(verification)
+    document_value = module._lease_binding_reference_to_document(reference)
+    decoded = module._lease_binding_reference_from_document(document_value)
+    replacement_allocator = module.RuntimeAccountAllocator(_ReceiptAdapter(module))
+
+    assert document_value == receipt._lease_binding_digest
+    assert decoded == reference
+    assert repr(reference) == "<LeaseBindingReferenceV1 redacted>"
+    assert str(reference) == repr(reference)
+    for value in (verification, reference, decoded):
+        for serialize in (
+            lambda value=value: copy.copy(value),
+            lambda value=value: copy.deepcopy(value),
+            lambda value=value: pickle.dumps(value),
+            lambda value=value: dataclasses.asdict(value),
+            lambda value=value: dataclasses.replace(value),
+            lambda value=value: json.dumps(value),
+        ):
+            with pytest.raises(TypeError):
+                serialize()
+    _assert_sparse_denial(
+        module,
+        lambda: replacement_allocator.lease_binding_reference_for(verification),
+    )
+    _assert_sparse_denial(
+        module,
+        lambda: _verify_lease_binding(
+            replacement_allocator, receipt, lease, ticket, capacity_evidence
+        ),
+    )
+    _assert_sparse_denial(
+        module,
+        lambda: _verify_lease_binding(
+            replacement_allocator, reference, lease, ticket, capacity_evidence
+        ),
+    )
+    allocator.close_lease_binding_verification(verification)
+
+
+def test_lease_binding_guard_defers_exact_revoke_until_close_outside_lock() -> None:
+    module = _allocator_module()
+
+    class TrackingAdapter(_ReceiptAdapter):
+        def __init__(self, allocator_module) -> None:
+            super().__init__(allocator_module)
+            self.release_calls = []
+            self.lock_observations = []
+            self.allocator = None
+
+        def release_reservation(self, reservation) -> bool:
+            self.release_calls.append(reservation.reservation_id)
+            self.lock_observations.append(self.allocator._lock.locked())
+            return reservation is self.last_reservation
+
+    allocator, adapter, receipt, lease, ticket, capacity_evidence, reservation = (
+        _verification_binding(module, TrackingAdapter)
+    )
+    adapter.allocator = allocator
+    verification = _verify_lease_binding(
+        allocator, receipt, lease, ticket, capacity_evidence
+    )
+
+    allocator.revoke(lease, "between-verify-and-close")
+
+    assert adapter.release_calls == []
+    assert allocator._records[lease.lease_id].state is module.LeaseState.RESERVED
+    (
+        foreign_allocator,
+        foreign_adapter,
+        foreign_receipt,
+        foreign_lease,
+        foreign_ticket,
+        foreign_evidence,
+        _,
+    ) = _verification_binding(module, TrackingAdapter)
+    foreign_adapter.allocator = foreign_allocator
+    foreign_verification = _verify_lease_binding(
+        foreign_allocator,
+        foreign_receipt,
+        foreign_lease,
+        foreign_ticket,
+        foreign_evidence,
+    )
+    _assert_sparse_denial(
+        module,
+        lambda: allocator.close_lease_binding_verification(foreign_verification),
+    )
+    assert adapter.release_calls == []
+    assert foreign_adapter.release_calls == []
+    foreign_allocator.close_lease_binding_verification(foreign_verification)
+    allocator.close_lease_binding_verification(verification)
+    assert adapter.release_calls == [reservation.reservation_id]
+    assert adapter.lock_observations == [False]
+    assert allocator._records[lease.lease_id].state is module.LeaseState.REVOKED
+
+
+def test_lease_binding_drifted_guard_closes_without_release_and_signals_quarantine() -> (
+    None
+):
+    module = _allocator_module()
+
+    class TrackingAdapter(_ReceiptAdapter):
+        def __init__(self, allocator_module) -> None:
+            super().__init__(allocator_module)
+            self.release_calls = []
+
+        def release_reservation(self, reservation) -> bool:
+            self.release_calls.append(reservation.reservation_id)
+            return True
+
+    allocator, adapter, receipt, lease, ticket, capacity_evidence, _reservation = (
+        _verification_binding(module, TrackingAdapter)
+    )
+    verification = _verify_lease_binding(
+        allocator, receipt, lease, ticket, capacity_evidence
+    )
+    original = lease.account_binding_digest
+    object.__setattr__(lease, "account_binding_digest", "sha256:" + "e" * 64)
+    try:
+        allocator.revoke(lease, "defer-drifted-record")
+        _assert_sparse_denial(
+            module,
+            lambda: allocator.close_lease_binding_verification(verification),
+        )
+        assert allocator._active_lease_binding_verifications == {}
+        assert allocator._deferred_lease_binding_revokes == {}
+        assert adapter.release_calls == []
+    finally:
+        object.__setattr__(lease, "account_binding_digest", original)
+
+
+def test_lease_binding_reference_is_stable_per_record_but_guard_is_fresh() -> None:
+    module = _allocator_module()
+    allocator, _adapter, receipt, lease, ticket, capacity_evidence, _reservation = (
+        _verification_binding(module)
+    )
+    first = _verify_lease_binding(allocator, receipt, lease, ticket, capacity_evidence)
+    first_reference = allocator.lease_binding_reference_for(first)
+    allocator.close_lease_binding_verification(first)
+    second = _verify_lease_binding(allocator, receipt, lease, ticket, capacity_evidence)
+    second_reference = allocator.lease_binding_reference_for(second)
+
+    assert second is not first
+    assert second_reference == first_reference
+    allocator.close_lease_binding_verification(second)
+
+
+def test_lease_binding_revoke_after_closed_verify_releases_once() -> None:
+    module = _allocator_module()
+
+    class TrackingAdapter(_ReceiptAdapter):
+        def __init__(self, allocator_module) -> None:
+            super().__init__(allocator_module)
+            self.release_calls = []
+
+        def release_reservation(self, reservation) -> bool:
+            self.release_calls.append(reservation.reservation_id)
+            return reservation is self.last_reservation
+
+    allocator, adapter, receipt, lease, ticket, capacity_evidence, reservation = (
+        _verification_binding(module, TrackingAdapter)
+    )
+    verification = _verify_lease_binding(
+        allocator, receipt, lease, ticket, capacity_evidence
+    )
+    allocator.close_lease_binding_verification(verification)
+
+    allocator.revoke(lease, "after-close")
+
+    assert adapter.release_calls == [reservation.reservation_id]
+    assert allocator._records[lease.lease_id].state is module.LeaseState.REVOKED
+
+
+def test_lease_binding_verify_revoke_race_has_only_two_linearized_results() -> None:
+    module = _allocator_module()
+
+    class TrackingAdapter(_ReceiptAdapter):
+        def __init__(self, allocator_module) -> None:
+            super().__init__(allocator_module)
+            self.release_calls = []
+
+        def release_reservation(self, reservation) -> bool:
+            self.release_calls.append(reservation.reservation_id)
+            return reservation is self.last_reservation
+
+    allocator, adapter, receipt, lease, ticket, capacity_evidence, reservation = (
+        _verification_binding(module, TrackingAdapter)
+    )
+    start = Barrier(3)
+
+    def verify_once():
+        start.wait()
+        try:
+            return _verify_lease_binding(
+                allocator, receipt, lease, ticket, capacity_evidence
+            )
+        except module.AllocationDenied:
+            return None
+
+    def revoke_once() -> None:
+        start.wait()
+        allocator.revoke(lease, "race")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        verification_result = executor.submit(verify_once)
+        revoke_result = executor.submit(revoke_once)
+        start.wait()
+        verification = verification_result.result()
+        revoke_result.result()
+
+    if verification is None:
+        assert allocator._records[lease.lease_id].state is module.LeaseState.REVOKED
+        assert adapter.release_calls == [reservation.reservation_id]
+    else:
+        assert allocator._records[lease.lease_id].state is module.LeaseState.RESERVED
+        assert adapter.release_calls == []
+        allocator.close_lease_binding_verification(verification)
+        assert adapter.release_calls == [reservation.reservation_id]
