@@ -1,9 +1,10 @@
 import ast
+import copy
 import dataclasses
-from datetime import UTC, datetime, timedelta
-from enum import Enum
 import importlib
 import pickle
+from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from threading import Barrier, Lock, Thread
 
@@ -1105,3 +1106,503 @@ def test_ledger_close_deny_without_primary_is_hard_and_does_not_retry() -> None:
         )
     assert backend.cas_calls == cas_before + 1
     assert ledger._allocator._active_lease_binding_verifications == {}
+
+
+def _record_failure(module, ledger, ticket, **overrides):
+    payload = {
+        "primary_failure_code": module.WorkerFailureCodeV1.PRE_A3_FAILURE,
+        "primary_failure_origin": module.WorkerFailureOriginV1.PRE_A3,
+        "compensation_status": module.CompensationStatusV1.REGISTRY_RELEASE_PENDING,
+        "expected_revision": ticket.ledger_revision,
+        "expected_fence_epoch": ticket.fence_epoch,
+        "teamlead": _teamlead(module),
+    }
+    payload.update(overrides)
+    return ledger.record_failure(ticket, **payload)
+
+
+def _lease_reserved_ticket(module, ledger, *, request_id: str):
+    requested = _publish(module, ledger, request_id=request_id)
+    claimed = ledger.claim(
+        requested.request_id,
+        teamlead=_teamlead(module),
+        expected_revision=requested.ledger_revision,
+    )
+    offered = _append(module, ledger, claimed, module.SpawnPhase.OFFER_VALIDATED)
+    return _append(
+        module,
+        ledger,
+        offered,
+        module.SpawnPhase.LEASE_RESERVED,
+        lease_binding=_lease_binding(module, ledger, offered),
+    )
+
+
+def test_p2_failure_enums_and_journals_require_exact_nominal_values() -> None:
+    module = _ledger_module()
+
+    assert {member.value for member in module.WorkerFailureCodeV1} == {
+        "PRE_A3_FAILURE",
+        "A3_EXECUTION_FAILED_OR_UNKNOWN",
+        "START_STATE_UNKNOWN",
+    }
+    assert {member.value for member in module.WorkerFailureOriginV1} == {
+        "PRE_A3",
+        "A3_ENTERED",
+        "RECOVERY_UNKNOWN",
+    }
+    assert {member.value for member in module.CompensationStatusV1} == {
+        "NONE",
+        "REGISTRY_RELEASE_PENDING",
+        "REGISTRY_RELEASED",
+        "HOME_RELEASE_FAILED",
+        "LEASE_RELEASE_FAILED",
+        "COMPENSATED",
+        "QUARANTINED",
+    }
+    with pytest.raises(ValueError):
+        module.WorkerFailureCodeV1("PRE_A3_FAILURE ")
+    with pytest.raises(ValueError):
+        module.WorkerFailureOriginV1("PRE_A3 ")
+    with pytest.raises(ValueError):
+        module.CompensationStatusV1("QUARANTINED ")
+
+    class _ForeignCode(str, Enum):
+        PRE_A3_FAILURE = "PRE_A3_FAILURE"
+
+    with pytest.raises(module.SpawnDenied):
+        module.WorkerFailureJournalV1(
+            primary_failure_code=_ForeignCode.PRE_A3_FAILURE,
+            primary_failure_origin=module.WorkerFailureOriginV1.PRE_A3,
+            compensation_status=module.CompensationStatusV1.REGISTRY_RELEASE_PENDING,
+            ticket_id="ticket:7",
+            ledger_revision=module.LedgerRevision(1),
+            fence_epoch=module.FenceEpoch(6),
+        )
+    with pytest.raises(module.SpawnDenied):
+        module.WorkerFailureJournalV1(
+            primary_failure_code="PRE_A3_FAILURE",
+            primary_failure_origin=module.WorkerFailureOriginV1.PRE_A3,
+            compensation_status=module.CompensationStatusV1.REGISTRY_RELEASE_PENDING,
+            ticket_id="ticket:7",
+            ledger_revision=module.LedgerRevision(1),
+            fence_epoch=module.FenceEpoch(6),
+        )
+    with pytest.raises(module.SpawnDenied):
+        module.WorkerRegistryIntentV1(
+            ticket_id="ticket:7",
+            ledger_revision=module.LedgerRevision(1),
+            fence_epoch=True,
+        )
+    with pytest.raises(TypeError):
+        module.WorkerFailureJournalV1(
+            primary_failure_code=module.WorkerFailureCodeV1.PRE_A3_FAILURE,
+            primary_failure_origin=module.WorkerFailureOriginV1.PRE_A3,
+            compensation_status=module.CompensationStatusV1.REGISTRY_RELEASE_PENDING,
+            ticket_id="ticket:7",
+            ledger_revision=module.LedgerRevision(1),
+        )
+
+    state = module.SpawnLedgerStateV2.empty()
+    intent = module.WorkerRegistryIntentV1(
+        ticket_id="ticket:7",
+        ledger_revision=module.LedgerRevision(1),
+        fence_epoch=module.FenceEpoch(6),
+    )
+    journal = module.WorkerFailureJournalV1(
+        primary_failure_code=module.WorkerFailureCodeV1.PRE_A3_FAILURE,
+        primary_failure_origin=module.WorkerFailureOriginV1.PRE_A3,
+        compensation_status=module.CompensationStatusV1.REGISTRY_RELEASE_PENDING,
+        ticket_id="ticket:7",
+        ledger_revision=module.LedgerRevision(1),
+        fence_epoch=module.FenceEpoch(6),
+    )
+    with pytest.raises(module.SpawnDenied):
+        dataclasses.replace(state, registry_intents=(intent, intent))
+    with pytest.raises(module.SpawnDenied):
+        dataclasses.replace(state, failure_journals=(journal, journal))
+    with pytest.raises(module.SpawnDenied):
+        dataclasses.replace(state, registry_intents=(journal,))
+    with pytest.raises(module.SpawnDenied):
+        dataclasses.replace(state, failure_journals=(intent,))
+
+
+def test_p2_journal_values_are_frozen_slotted_redacted_and_not_serializable() -> None:
+    module = _ledger_module()
+    intent = module.WorkerRegistryIntentV1(
+        ticket_id="ticket:7",
+        ledger_revision=module.LedgerRevision(1),
+        fence_epoch=module.FenceEpoch(6),
+    )
+    journal = module.WorkerFailureJournalV1(
+        primary_failure_code=module.WorkerFailureCodeV1.PRE_A3_FAILURE,
+        primary_failure_origin=module.WorkerFailureOriginV1.PRE_A3,
+        compensation_status=module.CompensationStatusV1.REGISTRY_RELEASE_PENDING,
+        ticket_id="ticket:7",
+        ledger_revision=module.LedgerRevision(1),
+        fence_epoch=module.FenceEpoch(6),
+    )
+
+    for value, name in (
+        (intent, "WorkerRegistryIntentV1"),
+        (journal, "WorkerFailureJournalV1"),
+    ):
+        assert dataclasses.is_dataclass(value)
+        assert hasattr(type(value), "__slots__")
+        assert repr(value) == f"<{name} redacted>"
+        assert str(value) == repr(value)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            value.ticket_id = "secret:/home/credential"  # type: ignore[misc]
+        for operation in (copy.copy, copy.deepcopy, pickle.dumps):
+            with pytest.raises(TypeError):
+                operation(value)
+
+    class _SecretTicketId:
+        def __repr__(self) -> str:
+            return "secret:/home/credential Exception('token')"
+
+    with pytest.raises(module.SpawnDenied) as error:
+        module.WorkerFailureJournalV1(
+            primary_failure_code=module.WorkerFailureCodeV1.PRE_A3_FAILURE,
+            primary_failure_origin=module.WorkerFailureOriginV1.PRE_A3,
+            compensation_status=module.CompensationStatusV1.REGISTRY_RELEASE_PENDING,
+            ticket_id=_SecretTicketId(),
+            ledger_revision=module.LedgerRevision(1),
+            fence_epoch=module.FenceEpoch(6),
+        )
+    assert "secret:/home/credential" not in str(error.value)
+    assert "Exception('token')" not in str(error.value)
+
+
+def test_p2_registry_intent_is_owner_bound_single_cas_and_phase_stable() -> None:
+    module = _ledger_module()
+    backend = _backend(module)
+    ledger = _ledger(module, backend)
+    requested = _publish(module, ledger, request_id="intent")
+    claimed = ledger.claim(
+        requested.request_id,
+        teamlead=_teamlead(module),
+        expected_revision=requested.ledger_revision,
+    )
+    cas_before = backend.cas_calls
+
+    recorded = ledger.record_registry_intent(
+        claimed,
+        expected_revision=claimed.ledger_revision,
+        expected_fence_epoch=claimed.fence_epoch,
+        teamlead=_teamlead(module),
+    )
+
+    assert recorded.phase is claimed.phase
+    assert recorded.ledger_revision == module.LedgerRevision(
+        claimed.ledger_revision.value + 1
+    )
+    assert backend.cas_calls == cas_before + 1
+    state = backend.read()
+    assert len(state.registry_intents) == 1
+    assert state.registry_intents[0].ticket_id == recorded.ticket_id
+    assert state.registry_intents[0].ledger_revision == recorded.ledger_revision
+    assert state.registry_intents[0].fence_epoch == recorded.fence_epoch
+
+    for kwargs in (
+        {
+            "teamlead": _teamlead(module, principal_id="teamlead-other"),
+            "expected_revision": recorded.ledger_revision,
+            "expected_fence_epoch": recorded.fence_epoch,
+        },
+        {
+            "teamlead": _teamlead(module),
+            "expected_revision": recorded.ledger_revision,
+            "expected_fence_epoch": module.FenceEpoch(recorded.fence_epoch.value + 1),
+        },
+        {
+            "teamlead": _teamlead(module),
+            "expected_revision": module.LedgerRevision(
+                recorded.ledger_revision.value - 1
+            ),
+            "expected_fence_epoch": recorded.fence_epoch,
+        },
+    ):
+        with pytest.raises(module.SpawnDenied):
+            ledger.record_registry_intent(recorded, **kwargs)
+    cas_after_first = backend.cas_calls
+    with pytest.raises(module.SpawnDenied, match="intent replay"):
+        ledger.record_registry_intent(
+            recorded,
+            expected_revision=recorded.ledger_revision,
+            expected_fence_epoch=recorded.fence_epoch,
+            teamlead=_teamlead(module),
+        )
+    assert backend.cas_calls == cas_after_first
+
+
+def test_p2_failure_record_binds_current_ticket_and_never_retries_cas() -> None:
+    module = _ledger_module()
+    backend = _backend(module)
+    ledger = _ledger(module, backend)
+    requested = _publish(module, ledger, request_id="failure")
+    claimed = ledger.claim(
+        requested.request_id,
+        teamlead=_teamlead(module),
+        expected_revision=requested.ledger_revision,
+    )
+
+    for kwargs in (
+        {
+            "teamlead": _teamlead(module, principal_id="teamlead-other"),
+            "expected_revision": claimed.ledger_revision,
+            "expected_fence_epoch": claimed.fence_epoch,
+        },
+        {
+            "teamlead": _teamlead(module),
+            "expected_revision": claimed.ledger_revision,
+            "expected_fence_epoch": module.FenceEpoch(claimed.fence_epoch.value + 1),
+        },
+        {
+            "teamlead": _teamlead(module),
+            "expected_revision": module.LedgerRevision(
+                claimed.ledger_revision.value + 1
+            ),
+            "expected_fence_epoch": claimed.fence_epoch,
+        },
+    ):
+        with pytest.raises(module.SpawnDenied):
+            _record_failure(module, ledger, claimed, **kwargs)
+    assert backend.cas_calls == 2
+
+    recorded = _record_failure(module, ledger, claimed)
+    assert recorded.phase is claimed.phase
+    assert recorded.ledger_revision == module.LedgerRevision(
+        claimed.ledger_revision.value + 1
+    )
+    assert backend.cas_calls == 3
+    state = backend.read()
+    assert len(state.failure_journals) == 1
+    assert state.failure_journals[0].ticket_id == recorded.ticket_id
+    assert state.failure_journals[0].ledger_revision == recorded.ledger_revision
+
+    with pytest.raises(module.SpawnDenied, match="failure journal replay"):
+        _record_failure(module, ledger, recorded)
+    assert backend.cas_calls == 3
+    assert ledger.read(recorded.request_id) == recorded
+
+    foreign_ledger = _ledger(module)
+    foreign = _publish(module, foreign_ledger, request_id="foreign")
+    with pytest.raises(module.SpawnDenied):
+        _record_failure(module, ledger, foreign)
+    assert backend.cas_calls == 3
+
+    armed = [False]
+    holder = []
+
+    def conflict_before_cas() -> None:
+        if not armed[0]:
+            return
+        current = holder[0]._state
+        holder[0]._state = dataclasses.replace(
+            current,
+            state_revision=module.LedgerRevision(current.state_revision.value + 1),
+        )
+
+    conflict_backend = _backend(module, before_cas=conflict_before_cas)
+    holder.append(conflict_backend)
+    conflict_ledger = _ledger(module, conflict_backend)
+    conflict_ticket = _publish(module, conflict_ledger, request_id="cas-conflict")
+    armed[0] = True
+    cas_before = conflict_backend.cas_calls
+    with pytest.raises(module.SpawnDenied, match="ledger CAS conflict"):
+        _record_failure(module, conflict_ledger, conflict_ticket)
+    assert conflict_backend.cas_calls == cas_before + 1
+    assert conflict_backend.read().failure_journals == ()
+
+
+def test_p2_failure_primary_fields_are_immutable_and_status_is_monotone() -> None:
+    module = _ledger_module()
+    backend = _backend(module)
+    ledger = _ledger(module, backend)
+    ticket = _publish(module, ledger, request_id="status")
+    failed = _record_failure(module, ledger, ticket)
+    initial = backend.read().failure_journals[0]
+
+    released = ledger.advance_compensation_status(
+        failed,
+        compensation_status=module.CompensationStatusV1.REGISTRY_RELEASED,
+        expected_revision=failed.ledger_revision,
+        expected_fence_epoch=failed.fence_epoch,
+        teamlead=_teamlead(module),
+    )
+    compensated = ledger.advance_compensation_status(
+        released,
+        compensation_status=module.CompensationStatusV1.COMPENSATED,
+        expected_revision=released.ledger_revision,
+        expected_fence_epoch=released.fence_epoch,
+        teamlead=_teamlead(module),
+    )
+    final = backend.read().failure_journals[0]
+    assert final.primary_failure_code is initial.primary_failure_code
+    assert final.primary_failure_origin is initial.primary_failure_origin
+    assert final.compensation_status is module.CompensationStatusV1.COMPENSATED
+    assert final.ticket_id == compensated.ticket_id
+    assert final.ledger_revision == compensated.ledger_revision
+    assert final.fence_epoch == compensated.fence_epoch
+    assert compensated.phase is ticket.phase
+
+    with pytest.raises(module.SpawnDenied, match="illegal compensation transition"):
+        ledger.advance_compensation_status(
+            compensated,
+            compensation_status=module.CompensationStatusV1.QUARANTINED,
+            expected_revision=compensated.ledger_revision,
+            expected_fence_epoch=compensated.fence_epoch,
+            teamlead=_teamlead(module),
+        )
+    bad_ledger = _ledger(module)
+    bad_ticket = _publish(module, bad_ledger, request_id="bad-code")
+    with pytest.raises(module.SpawnDenied):
+        _record_failure(
+            module,
+            bad_ledger,
+            bad_ticket,
+            primary_failure_code=module.WorkerFailureCodeV1.A3_EXECUTION_FAILED_OR_UNKNOWN,
+            primary_failure_origin=module.WorkerFailureOriginV1.PRE_A3,
+        )
+
+
+@pytest.mark.parametrize(
+    "statuses",
+    (
+        ("QUARANTINED",),
+        ("REGISTRY_RELEASED", "COMPENSATED"),
+        ("REGISTRY_RELEASED", "HOME_RELEASE_FAILED", "QUARANTINED"),
+        ("REGISTRY_RELEASED", "LEASE_RELEASE_FAILED", "QUARANTINED"),
+    ),
+)
+def test_p2_compensation_matrix_accepts_only_forward_paths(statuses) -> None:
+    module = _ledger_module()
+    ledger = _ledger(module)
+    ticket = _publish(module, ledger, request_id="matrix-" + "-".join(statuses))
+    current = _record_failure(module, ledger, ticket)
+
+    for status in statuses:
+        current = ledger.advance_compensation_status(
+            current,
+            compensation_status=module.CompensationStatusV1(status),
+            expected_revision=current.ledger_revision,
+            expected_fence_epoch=current.fence_epoch,
+            teamlead=_teamlead(module),
+        )
+
+    with pytest.raises(module.SpawnDenied, match="illegal compensation transition"):
+        ledger.advance_compensation_status(
+            current,
+            compensation_status=module.CompensationStatusV1.REGISTRY_RELEASE_PENDING,
+            expected_revision=current.ledger_revision,
+            expected_fence_epoch=current.fence_epoch,
+            teamlead=_teamlead(module),
+        )
+
+    fresh_ledger = _ledger(module)
+    fresh = _publish(module, fresh_ledger, request_id="invalid-initial-" + statuses[0])
+    with pytest.raises(module.SpawnDenied):
+        _record_failure(
+            module,
+            fresh_ledger,
+            fresh,
+            compensation_status=module.CompensationStatusV1.NONE,
+        )
+
+
+def test_p2_rollback_requires_compensated_pre_a3_journal() -> None:
+    module = _ledger_module()
+    backend = _backend(module)
+    ledger = _ledger(module, backend)
+    reserved = _lease_reserved_ticket(module, ledger, request_id="rollback-journal")
+    failed = _record_failure(module, ledger, reserved)
+    bound = ledger.bind_resume_capsule(
+        failed,
+        _capsule(failed),
+        expected_revision=failed.ledger_revision,
+        expected_fence_epoch=failed.fence_epoch,
+        teamlead=_teamlead(module),
+    )
+
+    with pytest.raises(module.SpawnDenied):
+        _append(module, ledger, bound, module.SpawnPhase.ROLLED_BACK)
+
+    released = ledger.advance_compensation_status(
+        bound,
+        compensation_status=module.CompensationStatusV1.REGISTRY_RELEASED,
+        expected_revision=bound.ledger_revision,
+        expected_fence_epoch=bound.fence_epoch,
+        teamlead=_teamlead(module),
+    )
+    compensated = ledger.advance_compensation_status(
+        released,
+        compensation_status=module.CompensationStatusV1.COMPENSATED,
+        expected_revision=released.ledger_revision,
+        expected_fence_epoch=released.fence_epoch,
+        teamlead=_teamlead(module),
+    )
+    rolled_back = _append(module, ledger, compensated, module.SpawnPhase.ROLLED_BACK)
+    assert rolled_back.phase is module.SpawnPhase.ROLLED_BACK
+    assert backend.read().failure_journals[0].primary_failure_origin is (
+        module.WorkerFailureOriginV1.PRE_A3
+    )
+
+
+def test_p2_a3_and_recovery_unknown_failures_quarantine_without_rollback() -> None:
+    module = _ledger_module()
+    cases = (
+        (
+            module.WorkerFailureCodeV1.A3_EXECUTION_FAILED_OR_UNKNOWN,
+            module.WorkerFailureOriginV1.A3_ENTERED,
+        ),
+        (
+            module.WorkerFailureCodeV1.START_STATE_UNKNOWN,
+            module.WorkerFailureOriginV1.RECOVERY_UNKNOWN,
+        ),
+    )
+    for index, (code, origin) in enumerate(cases):
+        backend = _backend(module)
+        ledger = _ledger(module, backend)
+        reserved = _lease_reserved_ticket(
+            module, ledger, request_id=f"quarantine-{index}"
+        )
+        failed = _record_failure(
+            module,
+            ledger,
+            reserved,
+            primary_failure_code=code,
+            primary_failure_origin=origin,
+            compensation_status=module.CompensationStatusV1.QUARANTINED,
+        )
+        with pytest.raises(module.SpawnDenied):
+            _append(module, ledger, failed, module.SpawnPhase.ROLLED_BACK)
+        quarantined = _append(module, ledger, failed, module.SpawnPhase.QUARANTINED)
+        assert quarantined.phase is module.SpawnPhase.QUARANTINED
+        assert backend.read().failure_journals[0].compensation_status is (
+            module.CompensationStatusV1.QUARANTINED
+        )
+        assert ledger._allocator._active_lease_binding_verifications == {}
+
+
+def test_p2_journal_state_keeps_h4_phase_graph_and_internal_exports() -> None:
+    module = _ledger_module()
+    assert set(module.SpawnPhase.__members__) == {
+        "REQUESTED",
+        "CLAIMED",
+        "OFFER_VALIDATED",
+        "LEASE_RESERVED",
+        "PROJECTED",
+        "HOME_COMMITTED",
+        "REGISTRY_RESERVED",
+        "START_GRANTED",
+        "RUNNING",
+        "DRAINING",
+        "CHECKPOINTED",
+        "STOPPED",
+        "DENIED",
+        "ROLLED_BACK",
+        "QUARANTINED",
+    }
+    assert "WorkerRegistryIntentV1" not in module.__all__
+    assert "WorkerFailureJournalV1" not in module.__all__

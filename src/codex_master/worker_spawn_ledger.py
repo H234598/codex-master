@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from enum import Enum
-import re
 from typing import Final
 
 from codex_master.agent_resolver import canonical_resolution_decision_digest
@@ -28,7 +28,6 @@ from codex_master.worker_resume import (
     WorkerResumeRequestV2,
     require_terminal_capsule,
 )
-
 
 _DIGEST_RE: Final = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -72,6 +71,28 @@ class PrincipalRole(str, Enum):
     NON_LEADERSHIP = "non_leadership"
     TEAMLEADER = "teamleader"
     QUEEN = "queen"
+
+
+class WorkerFailureCodeV1(str, Enum):
+    PRE_A3_FAILURE = "PRE_A3_FAILURE"
+    A3_EXECUTION_FAILED_OR_UNKNOWN = "A3_EXECUTION_FAILED_OR_UNKNOWN"
+    START_STATE_UNKNOWN = "START_STATE_UNKNOWN"
+
+
+class WorkerFailureOriginV1(str, Enum):
+    PRE_A3 = "PRE_A3"
+    A3_ENTERED = "A3_ENTERED"
+    RECOVERY_UNKNOWN = "RECOVERY_UNKNOWN"
+
+
+class CompensationStatusV1(str, Enum):
+    NONE = "NONE"
+    REGISTRY_RELEASE_PENDING = "REGISTRY_RELEASE_PENDING"
+    REGISTRY_RELEASED = "REGISTRY_RELEASED"
+    HOME_RELEASE_FAILED = "HOME_RELEASE_FAILED"
+    LEASE_RELEASE_FAILED = "LEASE_RELEASE_FAILED"
+    COMPENSATED = "COMPENSATED"
+    QUARANTINED = "QUARANTINED"
 
 
 class SpawnPhase(str, Enum):
@@ -153,6 +174,43 @@ class FenceEpoch(_RedactedNonSerializable):
 
     def __post_init__(self) -> None:
         _require_counter(self.value, "fence epoch")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class WorkerRegistryIntentV1(_RedactedNonSerializable):
+    ticket_id: str
+    ledger_revision: LedgerRevision
+    fence_epoch: FenceEpoch
+
+    def __post_init__(self) -> None:
+        _require_text(self.ticket_id, "ticket_id")
+        if type(self.ledger_revision) is not LedgerRevision:
+            raise SpawnDenied("invalid ledger revision")
+        if type(self.fence_epoch) is not FenceEpoch:
+            raise SpawnDenied("invalid fence epoch")
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class WorkerFailureJournalV1(_RedactedNonSerializable):
+    primary_failure_code: WorkerFailureCodeV1
+    primary_failure_origin: WorkerFailureOriginV1
+    compensation_status: CompensationStatusV1
+    ticket_id: str
+    ledger_revision: LedgerRevision
+    fence_epoch: FenceEpoch
+
+    def __post_init__(self) -> None:
+        if type(self.primary_failure_code) is not WorkerFailureCodeV1:
+            raise SpawnDenied("invalid primary failure code")
+        if type(self.primary_failure_origin) is not WorkerFailureOriginV1:
+            raise SpawnDenied("invalid primary failure origin")
+        if type(self.compensation_status) is not CompensationStatusV1:
+            raise SpawnDenied("invalid compensation status")
+        _require_text(self.ticket_id, "ticket_id")
+        if type(self.ledger_revision) is not LedgerRevision:
+            raise SpawnDenied("invalid ledger revision")
+        if type(self.fence_epoch) is not FenceEpoch:
+            raise SpawnDenied("invalid fence epoch")
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -325,6 +383,8 @@ class SpawnLedgerStateV2(_RedactedNonSerializable):
     tickets: tuple[WorkerSpawnTicketV2, ...]
     consumed_capsule_digests: tuple[str, ...]
     used_lease_binding_references: tuple[LeaseBindingReferenceV1, ...]
+    registry_intents: tuple[WorkerRegistryIntentV1, ...] = ()
+    failure_journals: tuple[WorkerFailureJournalV1, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.state_revision) is not LedgerRevision:
@@ -340,6 +400,16 @@ class SpawnLedgerStateV2(_RedactedNonSerializable):
         )
         self._validate_reference_tuple(
             self.used_lease_binding_references, "used lease binding references"
+        )
+        self._validate_record_tuple(
+            self.registry_intents,
+            WorkerRegistryIntentV1,
+            "registry intents",
+        )
+        self._validate_record_tuple(
+            self.failure_journals,
+            WorkerFailureJournalV1,
+            "failure journals",
         )
 
     @staticmethod
@@ -361,6 +431,18 @@ class SpawnLedgerStateV2(_RedactedNonSerializable):
         if len(set(values)) != len(values):
             raise SpawnDenied(f"duplicate {field}")
 
+    @staticmethod
+    def _validate_record_tuple(
+        values: object, record_type: type[object], field: str
+    ) -> None:
+        if type(values) is not tuple or any(
+            type(value) is not record_type for value in values
+        ):
+            raise SpawnDenied(f"invalid {field}")
+        ticket_ids = tuple(value.ticket_id for value in values)
+        if len(set(ticket_ids)) != len(ticket_ids):
+            raise SpawnDenied(f"duplicate {field}")
+
     @classmethod
     def empty(cls) -> SpawnLedgerStateV2:
         return cls(
@@ -368,6 +450,8 @@ class SpawnLedgerStateV2(_RedactedNonSerializable):
             tickets=(),
             consumed_capsule_digests=(),
             used_lease_binding_references=(),
+            registry_intents=(),
+            failure_journals=(),
         )
 
 
@@ -517,6 +601,181 @@ class WorkerSpawnLedger(ResumeTransactionPort):
         self._commit(state, tickets=self._replace_ticket(state, claimed))
         return claimed
 
+    def record_registry_intent(
+        self,
+        ticket: object,
+        *,
+        expected_revision: object,
+        expected_fence_epoch: object,
+        teamlead: object,
+    ) -> WorkerSpawnTicketV2:
+        ticket = self._require_ticket_value(ticket)
+        if type(expected_revision) is not LedgerRevision:
+            raise SpawnDenied("invalid expected revision")
+        if type(expected_fence_epoch) is not FenceEpoch:
+            raise SpawnDenied("invalid expected fence")
+        teamlead = self._require_principal(
+            teamlead, PrincipalRole.TEAMLEADER, "teamlead"
+        )
+        state = self._read_state()
+        current = self._require_current_ticket(state, ticket)
+        self._require_revision(current, expected_revision)
+        self._require_fence(current, expected_fence_epoch)
+        self._require_teamlead(current, teamlead)
+        if self._find_registry_intent(state, current.ticket_id) is not None:
+            raise SpawnDenied("intent replay")
+
+        advanced = self._advance_ticket(current)
+        intent = WorkerRegistryIntentV1(
+            ticket_id=advanced.ticket_id,
+            ledger_revision=advanced.ledger_revision,
+            fence_epoch=advanced.fence_epoch,
+        )
+        self._commit(
+            state,
+            tickets=self._replace_ticket(state, advanced),
+            registry_intents=state.registry_intents + (intent,),
+        )
+        return advanced
+
+    def record_failure(
+        self,
+        ticket: object,
+        *,
+        primary_failure_code: object,
+        primary_failure_origin: object,
+        compensation_status: object,
+        expected_revision: object,
+        expected_fence_epoch: object,
+        teamlead: object,
+    ) -> WorkerSpawnTicketV2:
+        ticket = self._require_ticket_value(ticket)
+        if type(primary_failure_code) is not WorkerFailureCodeV1:
+            raise SpawnDenied("invalid primary failure code")
+        if type(primary_failure_origin) is not WorkerFailureOriginV1:
+            raise SpawnDenied("invalid primary failure origin")
+        if type(compensation_status) is not CompensationStatusV1:
+            raise SpawnDenied("invalid compensation status")
+        if type(expected_revision) is not LedgerRevision:
+            raise SpawnDenied("invalid expected revision")
+        if type(expected_fence_epoch) is not FenceEpoch:
+            raise SpawnDenied("invalid expected fence")
+        teamlead = self._require_principal(
+            teamlead, PrincipalRole.TEAMLEADER, "teamlead"
+        )
+        state = self._read_state()
+        current = self._require_current_ticket(state, ticket)
+        self._require_revision(current, expected_revision)
+        self._require_fence(current, expected_fence_epoch)
+        self._require_teamlead(current, teamlead)
+        if self._find_failure_journal(state, current.ticket_id) is not None:
+            raise SpawnDenied("failure journal replay")
+
+        expected_origin = {
+            WorkerFailureCodeV1.PRE_A3_FAILURE: WorkerFailureOriginV1.PRE_A3,
+            WorkerFailureCodeV1.A3_EXECUTION_FAILED_OR_UNKNOWN: (
+                WorkerFailureOriginV1.A3_ENTERED
+            ),
+            WorkerFailureCodeV1.START_STATE_UNKNOWN: (
+                WorkerFailureOriginV1.RECOVERY_UNKNOWN
+            ),
+        }[primary_failure_code]
+        if primary_failure_origin is not expected_origin:
+            raise SpawnDenied("primary failure binding denied")
+        if primary_failure_origin is WorkerFailureOriginV1.PRE_A3:
+            if compensation_status is not CompensationStatusV1.REGISTRY_RELEASE_PENDING:
+                raise SpawnDenied("invalid initial compensation status")
+        elif compensation_status is not CompensationStatusV1.QUARANTINED:
+            raise SpawnDenied("invalid initial compensation status")
+
+        advanced = self._advance_ticket(current)
+        journal = WorkerFailureJournalV1(
+            primary_failure_code=primary_failure_code,
+            primary_failure_origin=primary_failure_origin,
+            compensation_status=compensation_status,
+            ticket_id=advanced.ticket_id,
+            ledger_revision=advanced.ledger_revision,
+            fence_epoch=advanced.fence_epoch,
+        )
+        self._commit(
+            state,
+            tickets=self._replace_ticket(state, advanced),
+            failure_journals=state.failure_journals + (journal,),
+        )
+        return advanced
+
+    def advance_compensation_status(
+        self,
+        ticket: object,
+        *,
+        compensation_status: object,
+        expected_revision: object,
+        expected_fence_epoch: object,
+        teamlead: object,
+    ) -> WorkerSpawnTicketV2:
+        ticket = self._require_ticket_value(ticket)
+        if type(compensation_status) is not CompensationStatusV1:
+            raise SpawnDenied("invalid compensation status")
+        if type(expected_revision) is not LedgerRevision:
+            raise SpawnDenied("invalid expected revision")
+        if type(expected_fence_epoch) is not FenceEpoch:
+            raise SpawnDenied("invalid expected fence")
+        teamlead = self._require_principal(
+            teamlead, PrincipalRole.TEAMLEADER, "teamlead"
+        )
+        state = self._read_state()
+        current = self._require_current_ticket(state, ticket)
+        self._require_revision(current, expected_revision)
+        self._require_fence(current, expected_fence_epoch)
+        self._require_teamlead(current, teamlead)
+        journal = self._find_failure_journal(state, current.ticket_id)
+        if journal is None:
+            raise SpawnDenied("failure journal required")
+        if (
+            journal.fence_epoch != current.fence_epoch
+            or journal.ledger_revision.value > current.ledger_revision.value
+        ):
+            raise SpawnDenied("failure journal drift")
+
+        allowed_statuses = {
+            CompensationStatusV1.REGISTRY_RELEASE_PENDING: frozenset(
+                {
+                    CompensationStatusV1.REGISTRY_RELEASED,
+                    CompensationStatusV1.QUARANTINED,
+                }
+            ),
+            CompensationStatusV1.REGISTRY_RELEASED: frozenset(
+                {
+                    CompensationStatusV1.COMPENSATED,
+                    CompensationStatusV1.HOME_RELEASE_FAILED,
+                    CompensationStatusV1.LEASE_RELEASE_FAILED,
+                    CompensationStatusV1.QUARANTINED,
+                }
+            ),
+            CompensationStatusV1.HOME_RELEASE_FAILED: frozenset(
+                {CompensationStatusV1.QUARANTINED}
+            ),
+            CompensationStatusV1.LEASE_RELEASE_FAILED: frozenset(
+                {CompensationStatusV1.QUARANTINED}
+            ),
+        }.get(journal.compensation_status, frozenset())
+        if compensation_status not in allowed_statuses:
+            raise SpawnDenied("illegal compensation transition")
+
+        advanced = self._advance_ticket(current)
+        replacement = replace(
+            journal,
+            compensation_status=compensation_status,
+            ledger_revision=advanced.ledger_revision,
+            fence_epoch=advanced.fence_epoch,
+        )
+        self._commit(
+            state,
+            tickets=self._replace_ticket(state, advanced),
+            failure_journals=self._replace_failure_journal(state, replacement),
+        )
+        return advanced
+
     def append_phase(
         self,
         ticket: object,
@@ -544,6 +803,31 @@ class WorkerSpawnLedger(ResumeTransactionPort):
         self._require_teamlead(current, teamlead)
         if phase not in _NEXT_PHASES.get(current.phase, frozenset()):
             raise SpawnDenied("illegal phase transition")
+        failure_journal = self._find_failure_journal(state, current.ticket_id)
+        if (
+            phase is SpawnPhase.ROLLED_BACK
+            and failure_journal is not None
+            and (
+                failure_journal.ledger_revision != current.ledger_revision
+                or failure_journal.fence_epoch != current.fence_epoch
+                or failure_journal.primary_failure_origin
+                is not WorkerFailureOriginV1.PRE_A3
+                or failure_journal.compensation_status
+                is not CompensationStatusV1.COMPENSATED
+            )
+        ):
+            raise SpawnDenied("rollback failure journal denied")
+        if (
+            phase is SpawnPhase.QUARANTINED
+            and failure_journal is not None
+            and (
+                failure_journal.ledger_revision != current.ledger_revision
+                or failure_journal.fence_epoch != current.fence_epoch
+                or failure_journal.compensation_status
+                is not CompensationStatusV1.QUARANTINED
+            )
+        ):
+            raise SpawnDenied("quarantine failure journal denied")
 
         used_references = state.used_lease_binding_references
         changes: dict[str, object] = {"phase": phase}
@@ -786,6 +1070,8 @@ class WorkerSpawnLedger(ResumeTransactionPort):
         consumed_capsule_digests: tuple[str, ...] | None = None,
         used_lease_binding_references: tuple[LeaseBindingReferenceV1, ...]
         | None = None,
+        registry_intents: tuple[WorkerRegistryIntentV1, ...] | None = None,
+        failure_journals: tuple[WorkerFailureJournalV1, ...] | None = None,
     ) -> None:
         replacement = SpawnLedgerStateV2(
             state_revision=LedgerRevision(state.state_revision.value + 1),
@@ -799,6 +1085,12 @@ class WorkerSpawnLedger(ResumeTransactionPort):
                 state.used_lease_binding_references
                 if used_lease_binding_references is None
                 else used_lease_binding_references
+            ),
+            registry_intents=(
+                state.registry_intents if registry_intents is None else registry_intents
+            ),
+            failure_journals=(
+                state.failure_journals if failure_journals is None else failure_journals
             ),
         )
         try:
@@ -816,6 +1108,32 @@ class WorkerSpawnLedger(ResumeTransactionPort):
     ) -> WorkerSpawnTicketV2 | None:
         return next(
             (ticket for ticket in state.tickets if ticket.request_id == request_id),
+            None,
+        )
+
+    @staticmethod
+    def _find_registry_intent(
+        state: SpawnLedgerStateV2, ticket_id: str
+    ) -> WorkerRegistryIntentV1 | None:
+        return next(
+            (
+                intent
+                for intent in state.registry_intents
+                if intent.ticket_id == ticket_id
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _find_failure_journal(
+        state: SpawnLedgerStateV2, ticket_id: str
+    ) -> WorkerFailureJournalV1 | None:
+        return next(
+            (
+                journal
+                for journal in state.failure_journals
+                if journal.ticket_id == ticket_id
+            ),
             None,
         )
 
@@ -885,6 +1203,15 @@ class WorkerSpawnLedger(ResumeTransactionPort):
         return tuple(
             replacement if ticket.request_id == replacement.request_id else ticket
             for ticket in state.tickets
+        )
+
+    @staticmethod
+    def _replace_failure_journal(
+        state: SpawnLedgerStateV2, replacement: WorkerFailureJournalV1
+    ) -> tuple[WorkerFailureJournalV1, ...]:
+        return tuple(
+            replacement if journal.ticket_id == replacement.ticket_id else journal
+            for journal in state.failure_journals
         )
 
     @staticmethod
