@@ -1,6 +1,8 @@
 import importlib.util
 import sys
 from pathlib import Path
+from queue import Queue
+from threading import Barrier, Event, Thread
 
 import pytest
 
@@ -471,3 +473,81 @@ def test_replay_or_duplicate_never_regrants_or_reexecutes_a3() -> None:
         harness.a3_calls,
         harness.running_calls,
     ) == (1, 1, 1, 1)
+
+
+def test_parallel_duplicate_claims_start_exactly_once() -> None:
+    harness = _StartHarness(_start_module())
+    receipt_line = next(
+        line_number
+        for line_number, line in enumerate(
+            MODULE_PATH.read_text(encoding="utf-8").splitlines(),
+            start=1,
+        )
+        if line.strip() == "receipt = b5_port.receipt"
+    )
+    start_barrier = Barrier(3)
+    release_receipt_line = Event()
+    signals: Queue[tuple[str, int, object]] = Queue()
+
+    def invoke(index: int) -> None:
+        paused = False
+
+        def trace(frame, event: str, _argument):
+            nonlocal paused
+            if (
+                not paused
+                and frame.f_code is harness.module.dynamic_worker_start.__code__
+                and event == "line"
+                and frame.f_lineno == receipt_line
+            ):
+                paused = True
+                signals.put(("receipt", index, None))
+                if not release_receipt_line.wait(timeout=2):
+                    raise TimeoutError("parallel receipt-line release timed out")
+            return trace
+
+        sys.settrace(trace)
+        try:
+            start_barrier.wait(timeout=2)
+            signals.put(("result", index, harness.start()))
+        except BaseException as error:
+            signals.put(("error", index, error))
+        finally:
+            sys.settrace(None)
+
+    threads = [Thread(target=invoke, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    start_barrier.wait(timeout=2)
+    observed = []
+    try:
+        observed.append(signals.get(timeout=2))
+        observed.append(signals.get(timeout=2))
+    finally:
+        release_receipt_line.set()
+    for thread in threads:
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+    while not signals.empty():
+        observed.append(signals.get_nowait())
+
+    assert not [signal for signal in observed if signal[0] == "error"]
+    results = [signal[2] for signal in observed if signal[0] == "result"]
+    assert sorted(results, key=lambda result: result["status"]) == [
+        {
+            "status": "quarantined",
+            "reason": "dynamic_worker_start_replay_denied",
+        },
+        {
+            "status": "started",
+            "reason": "dynamic_worker_started",
+        },
+    ]
+    assert (
+        harness.prepare_calls,
+        harness.start_granted_calls,
+        harness.a3_calls,
+        harness.running_calls,
+        harness.compensation_calls,
+        harness.quarantine_calls,
+    ) == (1, 1, 1, 1, 0, 0)

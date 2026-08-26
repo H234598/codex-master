@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from threading import Lock
 
 from codex_master.dynamic_worker_coordinator import (
     DynamicWorkerPreStartPortV1,
@@ -38,6 +39,12 @@ class _DynamicWorkerStartB5Port(_RedactedNonSerializable):
     )
     _seal: _RedactedNonSerializable = field(
         default_factory=_RedactedNonSerializable,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _claim_lock: Lock = field(
+        default_factory=Lock,
         init=False,
         repr=False,
         compare=False,
@@ -88,14 +95,22 @@ def dynamic_worker_start(
             reason="dynamic_worker_start_port_denied",
         ).to_public()
 
-    if b5_port._state:
+    if not b5_port._claim_lock.acquire(blocking=False):
         return _DynamicWorkerStartResult(
             status="quarantined",
             reason="dynamic_worker_start_replay_denied",
         ).to_public()
+    try:
+        if b5_port._state:
+            return _DynamicWorkerStartResult(
+                status="quarantined",
+                reason="dynamic_worker_start_replay_denied",
+            ).to_public()
+        b5_port._state.add("entered")
+    finally:
+        b5_port._claim_lock.release()
 
     receipt = b5_port.receipt
-    b5_port._state.add("entered")
     b5_port._state.add("prepare_attempted")
     try:
         prepared = b5_port.prepare(receipt)
