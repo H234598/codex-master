@@ -1,5 +1,7 @@
 import ast
+import copy
 import dataclasses
+import hashlib
 import importlib.util
 import inspect
 import json
@@ -84,10 +86,12 @@ def _central_ticket(module, **changes):
         "selection_offer": offer,
         "resolver_offer_generation": offer.generation,
         "policy_generation": 11,
+        "policy_digest": "sha256:" + "a" * 64,
         "capability_binding_digest": "capability-A",
         "ledger_revision": 3,
         "phase": "OFFER_VALIDATED",
         "fencing_token": "fence-A",
+        "fence_epoch": 1,
     }
     values.update(changes)
     return module.ValidatedAllocationTicket(**values)
@@ -103,6 +107,7 @@ def _unselected_capacity_evidence(module, **changes):
         "capability_binding_digest": "capability-A",
         "ledger_revision": 3,
         "fencing_token": "fence-A",
+        "fence_epoch": 1,
         "provider_adapter_id": "adapter-A",
         "capacity_units": 2,
         "quota_units": 2,
@@ -141,6 +146,7 @@ class _AtomicAdapter:
             lease_revision=reservation_number,
             evidence_revision=capacity_evidence.evidence_revision,
             fencing_token=capacity_evidence.fencing_token,
+            fence_epoch=capacity_evidence.fence_epoch,
             expires_at_utc=capacity_evidence.expires_at_utc,
         )
 
@@ -198,10 +204,12 @@ def test_allocator_accepts_real_resolution_and_string_offer_generation() -> None
         selection_offer=offer,
         resolver_offer_generation=offer.generation,
         policy_generation=11,
+        policy_digest="sha256:" + "a" * 64,
         capability_binding_digest="capability-A",
         ledger_revision=3,
         phase="OFFER_VALIDATED",
         fencing_token="fence-A",
+        fence_epoch=1,
     )
     evidence = _unselected_capacity_evidence(
         module,
@@ -223,10 +231,12 @@ def test_allocator_rejects_invalid_missing_or_offer_mismatched_decisions() -> No
         selection_offer=offer,
         resolver_offer_generation=offer.generation,
         policy_generation=11,
+        policy_digest="sha256:" + "a" * 64,
         capability_binding_digest="capability-A",
         ledger_revision=3,
         phase="OFFER_VALIDATED",
         fencing_token="fence-A",
+        fence_epoch=1,
     )
     evidence = _unselected_capacity_evidence(
         module,
@@ -1197,3 +1207,406 @@ def test_provider_adapter_is_capability_based_not_class_based() -> None:
     )
 
     assert lease.provider_adapter_id == "adapter-A"
+
+
+def _receipt_ticket(module, **changes):
+    offer, decision = _real_resolution_contract()
+    values = {
+        "ticket_id": "ticket-vector",
+        "resolution_decision": decision,
+        "selection_offer": offer,
+        "resolver_offer_generation": offer.generation,
+        "policy_generation": 11,
+        "policy_digest": "sha256:" + "d" * 64,
+        "capability_binding_digest": "sha256:" + "c" * 64,
+        "ledger_revision": 3,
+        "phase": "OFFER_VALIDATED",
+        "fencing_token": "fence-vector",
+        "fence_epoch": 17,
+    }
+    values.update(changes)
+    return module.ValidatedAllocationTicket(**values)
+
+
+def _receipt_capacity_evidence(module, **changes):
+    values = {
+        "ticket_id": "ticket-vector",
+        "resolver_offer_generation": (
+            "sha256:017d00ee7993e52d69ea3ab1a99eff095072514bdf32c531aa2a0e9ffec647c4"
+        ),
+        "policy_generation": 11,
+        "capability_binding_digest": "sha256:" + "c" * 64,
+        "ledger_revision": 3,
+        "fencing_token": "fence-vector",
+        "fence_epoch": 17,
+        "provider_adapter_id": "adapter-vector",
+        "capacity_units": 1,
+        "quota_units": 1,
+        "cost_units": 1,
+        "resource_units": 1,
+        "evidence_revision": 7,
+        "observed_at_utc": datetime(2000, 1, 1, tzinfo=UTC),
+        "expires_at_utc": datetime(2099, 1, 2, 3, 4, 5, 678901, tzinfo=UTC),
+    }
+    values.update(changes)
+    return module.CapacityEvidence(**values)
+
+
+class _ReceiptAdapter:
+    adapter_id = "adapter-vector"
+
+    def __init__(self, module) -> None:
+        self._module = module
+        self.last_reservation = None
+
+    def reserve_capability_atomically(
+        self, capability_binding_digest, capacity_evidence
+    ):
+        assert capability_binding_digest == "sha256:" + "c" * 64
+        self.last_reservation = self._module.AccountReservation(
+            reservation_id="reservation-vector",
+            account_binding_digest="sha256:" + "a" * 64,
+            profile_binding_digest="sha256:" + "b" * 64,
+            provider_adapter_id="adapter-vector",
+            capacity_evidence=capacity_evidence,
+            lease_revision=1,
+            evidence_revision=capacity_evidence.evidence_revision,
+            fencing_token=capacity_evidence.fencing_token,
+            fence_epoch=capacity_evidence.fence_epoch,
+            expires_at_utc=capacity_evidence.expires_at_utc,
+        )
+        return self.last_reservation
+
+    def release_reservation(self, reservation) -> bool:
+        return reservation is self.last_reservation
+
+
+def _receipt_binding(module, adapter_type=_ReceiptAdapter):
+    adapter = adapter_type(module)
+    allocator = module.RuntimeAccountAllocator(adapter)
+    ticket = _receipt_ticket(module)
+    capacity_evidence = _receipt_capacity_evidence(module)
+    module.token_urlsafe = lambda _length: "lease-vector"
+    lease = allocator.allocate(ticket, capacity_evidence)
+    return (
+        allocator,
+        adapter,
+        lease,
+        ticket,
+        capacity_evidence,
+        adapter.last_reservation,
+    )
+
+
+def test_allocator_issues_memoized_receipt_with_fixed_canonical_json_vector() -> None:
+    module = _allocator_module()
+    (
+        allocator,
+        _adapter,
+        lease,
+        ticket,
+        capacity_evidence,
+        _reservation,
+    ) = _receipt_binding(module)
+
+    receipt = allocator.issue_lease_binding_receipt(lease, ticket, capacity_evidence)
+
+    assert receipt is allocator.issue_lease_binding_receipt(
+        lease, ticket, capacity_evidence
+    )
+    assert type(receipt) is module.LeaseBindingReceiptV1
+    expected_json = (
+        b'{"account_binding_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        b'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","adapter_id":"adapter-vector",'
+        b'"binding_schema":"codex-master/lease-binding/v1",'
+        b'"capability_binding_digest":"sha256:cccccccccccccccccccccccccccccccc'
+        b'cccccccccccccccccccccccccccccccc","capacity_evidence_revision":7,'
+        b'"fence_epoch":17,"fencing_token":"fence-vector",'
+        b'"lease_expires_at_utc":"2099-01-02T03:04:05.678901Z",'
+        b'"lease_id":"lease-vector","lease_revision":1,"ledger_revision":3,'
+        b'"policy_digest":"sha256:dddddddddddddddddddddddddddddddddddddddd'
+        b'dddddddddddddddddddddddd","policy_generation":11,'
+        b'"profile_binding_digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+        b'bbbbbbbbbbbbbbbbbbbbbbbb","reservation_id":"reservation-vector",'
+        b'"resolution_decision_digest":"sha256:7c8b18c9aea0fad9c453cc0bad974801'
+        b'3157286276cc1cdcff3f3c2d5000d625","resolver_offer_generation":'
+        b'"sha256:017d00ee7993e52d69ea3ab1a99eff095072514bdf32c531aa2a0e9ffec647c4",'
+        b'"ticket_id":"ticket-vector"}'
+    )
+    expected_digest = (
+        "sha256:801052b31d6fee240e9407844c23651c5c690a311728e206ed310b5f8e7abbb0"
+    )
+
+    assert "sha256:" + hashlib.sha256(expected_json).hexdigest() == expected_digest
+    assert receipt._lease_binding_digest == expected_digest
+    assert tuple(
+        inspect.signature(
+            module.RuntimeAccountAllocator.issue_lease_binding_receipt
+        ).parameters
+    ) == ("self", "lease", "ticket", "capacity_evidence")
+
+
+def test_lease_binding_receipt_has_no_forgeable_issuer_or_serialization_path() -> None:
+    module = _allocator_module()
+    allocator, _adapter, lease, ticket, capacity_evidence, _reservation = (
+        _receipt_binding(module)
+    )
+    receipt = allocator.issue_lease_binding_receipt(lease, ticket, capacity_evidence)
+
+    assert repr(receipt) == "<LeaseBindingReceiptV1 redacted>"
+    assert str(receipt) == repr(receipt)
+    assert type(receipt).__eq__ is object.__eq__
+    assert not hasattr(receipt, "__dict__")
+    assert not any("issuer" in name.lower() for name in vars(module))
+    assert "_RECEIPT_ISSUERS" not in vars(module)
+    assert not any("issuer" in slot.lower() for slot in allocator.__slots__)
+    for value in vars(module).values():
+        if callable(value):
+            try:
+                parameters = inspect.signature(value).parameters
+            except (TypeError, ValueError):
+                continue
+            assert "lease_binding_digest" not in parameters
+    with pytest.raises(TypeError):
+        module.LeaseBindingReceiptV1()
+    with pytest.raises(TypeError):
+        module.LeaseBindingReceiptV1(lease_binding_digest="sha256:" + "f" * 64)
+    for serialize in (
+        lambda: copy.copy(receipt),
+        lambda: copy.deepcopy(receipt),
+        lambda: pickle.dumps(receipt),
+        lambda: dataclasses.asdict(receipt),
+        lambda: dataclasses.replace(receipt),
+        lambda: json.dumps(receipt),
+    ):
+        with pytest.raises(TypeError):
+            serialize()
+
+
+def test_lease_binding_receipt_accepts_only_exact_live_binding_objects() -> None:
+    module = _allocator_module()
+    allocator, _adapter, lease, ticket, capacity_evidence, _reservation = (
+        _receipt_binding(module)
+    )
+
+    for binding in (
+        (dataclasses.replace(lease), ticket, capacity_evidence),
+        (lease, dataclasses.replace(ticket), capacity_evidence),
+        (lease, ticket, dataclasses.replace(capacity_evidence)),
+        (lease, object(), capacity_evidence),
+    ):
+        _assert_sparse_denial(
+            module,
+            lambda binding=binding: allocator.issue_lease_binding_receipt(*binding),
+        )
+
+    allocator.revoke(lease, "done")
+    _assert_sparse_denial(
+        module,
+        lambda: allocator.issue_lease_binding_receipt(lease, ticket, capacity_evidence),
+    )
+
+
+@pytest.mark.parametrize(
+    ("target_name", "field_name", "replacement"),
+    (
+        ("ticket", "ticket_id", "ticket-drift"),
+        ("ticket", "resolver_offer_generation", "sha256:" + "f" * 64),
+        ("ticket", "policy_generation", 12),
+        ("ticket", "policy_digest", "sha256:" + "e" * 64),
+        ("ticket", "capability_binding_digest", "sha256:" + "e" * 64),
+        ("ticket", "ledger_revision", 4),
+        ("ticket", "fencing_token", "fence-drift"),
+        ("ticket", "fence_epoch", 18),
+        ("capacity_evidence", "provider_adapter_id", "adapter-drift"),
+        ("capacity_evidence", "evidence_revision", 8),
+        ("lease", "account_binding_digest", "sha256:" + "e" * 64),
+        ("lease", "profile_binding_digest", "sha256:" + "e" * 64),
+        ("lease", "lease_id", "lease-drift"),
+        ("lease", "lease_revision", 2),
+        ("lease", "expires_at_utc", datetime(2099, 1, 2, 3, 4, 6, tzinfo=UTC)),
+        ("reservation", "reservation_id", "reservation-drift"),
+    ),
+)
+def test_lease_binding_receipt_denies_each_canonical_snapshot_drift(
+    target_name, field_name, replacement
+) -> None:
+    module = _allocator_module()
+    allocator, _adapter, lease, ticket, capacity_evidence, reservation = (
+        _receipt_binding(module)
+    )
+    target = {
+        "ticket": ticket,
+        "capacity_evidence": capacity_evidence,
+        "lease": lease,
+        "reservation": reservation,
+    }[target_name]
+    original = getattr(target, field_name)
+    object.__setattr__(target, field_name, replacement)
+    try:
+        _assert_sparse_denial(
+            module,
+            lambda: allocator.issue_lease_binding_receipt(
+                lease, ticket, capacity_evidence
+            ),
+        )
+    finally:
+        object.__setattr__(target, field_name, original)
+
+
+def test_lease_binding_receipt_denies_resolution_decision_digest_drift() -> None:
+    module = _allocator_module()
+    allocator, _adapter, lease, ticket, capacity_evidence, _reservation = (
+        _receipt_binding(module)
+    )
+    original = ticket.resolution_decision.model
+    object.__setattr__(ticket.resolution_decision, "model", "gpt-5.6-drift")
+    try:
+        _assert_sparse_denial(
+            module,
+            lambda: allocator.issue_lease_binding_receipt(
+                lease, ticket, capacity_evidence
+            ),
+        )
+    finally:
+        object.__setattr__(ticket.resolution_decision, "model", original)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement"),
+    (
+        ("account_binding_digest", "sha256:" + "a" * 64),
+        ("lease_revision", True),
+    ),
+)
+def test_lease_binding_receipt_denies_equal_lease_representation_drift(
+    field_name, replacement
+) -> None:
+    module = _allocator_module()
+    allocator, _adapter, lease, ticket, capacity_evidence, _reservation = (
+        _receipt_binding(module)
+    )
+    original = getattr(lease, field_name)
+    object.__setattr__(lease, field_name, replacement)
+    try:
+        _assert_sparse_denial(
+            module,
+            lambda: allocator.issue_lease_binding_receipt(
+                lease, ticket, capacity_evidence
+            ),
+        )
+    finally:
+        object.__setattr__(lease, field_name, original)
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "account",
+        "profile",
+        "adapter",
+        "reservation_id",
+        "lease_revision",
+        "evidence_revision",
+        "fence",
+        "ticket",
+        "expiry",
+    ),
+)
+def test_lease_binding_receipt_never_reuses_cache_after_correlated_drift(case) -> None:
+    module = _allocator_module()
+    allocator, _adapter, lease, ticket, capacity_evidence, reservation = (
+        _receipt_binding(module)
+    )
+    receipt = allocator.issue_lease_binding_receipt(lease, ticket, capacity_evidence)
+    expiry = datetime(2099, 1, 2, 3, 4, 6, tzinfo=UTC)
+    mutations = {
+        "account": (
+            (lease, "account_binding_digest", "sha256:" + "e" * 64),
+            (reservation, "account_binding_digest", "sha256:" + "e" * 64),
+        ),
+        "profile": (
+            (lease, "profile_binding_digest", "sha256:" + "e" * 64),
+            (reservation, "profile_binding_digest", "sha256:" + "e" * 64),
+        ),
+        "adapter": (
+            (lease, "provider_adapter_id", "adapter-drift"),
+            (capacity_evidence, "provider_adapter_id", "adapter-drift"),
+            (reservation, "provider_adapter_id", "adapter-drift"),
+        ),
+        "reservation_id": ((reservation, "reservation_id", "reservation-drift"),),
+        "lease_revision": (
+            (lease, "lease_revision", 2),
+            (reservation, "lease_revision", 2),
+        ),
+        "evidence_revision": (
+            (capacity_evidence, "evidence_revision", 8),
+            (reservation, "evidence_revision", 8),
+        ),
+        "fence": (
+            (ticket, "fencing_token", "fence-drift"),
+            (capacity_evidence, "fencing_token", "fence-drift"),
+            (reservation, "fencing_token", "fence-drift"),
+            (ticket, "fence_epoch", 18),
+            (capacity_evidence, "fence_epoch", 18),
+            (reservation, "fence_epoch", 18),
+        ),
+        "ticket": (
+            (ticket, "ticket_id", "ticket-drift"),
+            (capacity_evidence, "ticket_id", "ticket-drift"),
+        ),
+        "expiry": (
+            (lease, "expires_at_utc", expiry),
+            (capacity_evidence, "expires_at_utc", expiry),
+            (reservation, "expires_at_utc", expiry),
+        ),
+    }[case]
+    originals = tuple(
+        (target, field_name, getattr(target, field_name))
+        for target, field_name, _replacement in mutations
+    )
+    for target, field_name, replacement in mutations:
+        object.__setattr__(target, field_name, replacement)
+    try:
+        _assert_sparse_denial(
+            module,
+            lambda: allocator.issue_lease_binding_receipt(
+                lease, ticket, capacity_evidence
+            ),
+        )
+        assert receipt is not None
+    finally:
+        for target, field_name, original in originals:
+            object.__setattr__(target, field_name, original)
+
+
+def test_lease_binding_receipt_uses_allocation_adapter_snapshot_without_reread() -> (
+    None
+):
+    module = _allocator_module()
+
+    class SwitchingAdapter(_ReceiptAdapter):
+        def __init__(self, allocator_module) -> None:
+            super().__init__(allocator_module)
+            self.adapter_id_reads = 0
+
+        @property
+        def adapter_id(self):
+            self.adapter_id_reads += 1
+            if self.adapter_id_reads == 1:
+                return "adapter-vector"
+            return "adapter-drift"
+
+    allocator, adapter, lease, ticket, capacity_evidence, _reservation = (
+        _receipt_binding(module, SwitchingAdapter)
+    )
+
+    receipt = allocator.issue_lease_binding_receipt(lease, ticket, capacity_evidence)
+
+    assert receipt is allocator.issue_lease_binding_receipt(
+        lease, ticket, capacity_evidence
+    )
+    assert receipt._lease_binding_digest == (
+        "sha256:801052b31d6fee240e9407844c23651c5c690a311728e206ed310b5f8e7abbb0"
+    )
+    assert adapter.adapter_id_reads == 1
