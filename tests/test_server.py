@@ -3832,7 +3832,9 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(result["status"], "started")
         self.assertEqual(observed, [None])
 
-    def test_ollama_assign_uses_central_spawn_admission_without_context_reuse(self) -> None:
+    def test_ollama_assign_uses_central_spawn_admission_without_context_reuse(
+        self,
+    ) -> None:
         descriptor = SimpleNamespace(
             enabled=True,
             provider=server_module.Provider.OLLAMA_LOCAL,
@@ -3854,21 +3856,34 @@ class ServerHelpersTest(unittest.TestCase):
             observed.append(server_module._RESOURCE_ADMISSION_CONTEXT.get())
             return {"status": "unchanged"}
 
-        with patch("codex_master.server.require_fleet_recovery_ready"), patch(
-            "codex_master.server.current_agent_inventory", return_value=inventory
-        ), patch("codex_master.server._ollama_descriptor", return_value=descriptor), patch(
-            "codex_master.server._resource_admission_decision",
-            side_effect=AssertionError("assignment must use spawn admission owner"),
-        ), patch(
-            "codex_master.server.spawn_admission_decision", return_value=admission
-        ) as compose, patch("codex_master.server.scope_check", return_value={"allowed": True}), patch(
-            "codex_master.server.resolver_class_for_agent", return_value="arbeitsbiene"
-        ), patch(
-            "codex_master.server.claim_for_agent_mutation", return_value=({"state": "held"}, False)
-        ), patch("codex_master.server.ensure_assignment_session_model", side_effect=fake_ensure), patch(
-            "codex_master.server.send_agent", return_value={"status": "sent"}
-        ), patch(
-            "codex_master.server.record_assignment"
+        with (
+            patch("codex_master.server.require_fleet_recovery_ready"),
+            patch(
+                "codex_master.server.current_agent_inventory", return_value=inventory
+            ),
+            patch("codex_master.server._ollama_descriptor", return_value=descriptor),
+            patch(
+                "codex_master.server._resource_admission_decision",
+                side_effect=AssertionError("assignment must use spawn admission owner"),
+            ),
+            patch(
+                "codex_master.server.spawn_admission_decision", return_value=admission
+            ) as compose,
+            patch("codex_master.server.scope_check", return_value={"allowed": True}),
+            patch(
+                "codex_master.server.resolver_class_for_agent",
+                return_value="arbeitsbiene",
+            ),
+            patch(
+                "codex_master.server.claim_for_agent_mutation",
+                return_value=({"state": "held"}, False),
+            ),
+            patch(
+                "codex_master.server.ensure_assignment_session_model",
+                side_effect=fake_ensure,
+            ),
+            patch("codex_master.server.send_agent", return_value={"status": "sent"}),
+            patch("codex_master.server.record_assignment"),
         ):
             result = server_module._assign_agent_unlocked(
                 "o1",
@@ -17903,22 +17918,34 @@ google_accounts:
         )
 
     def test_start_without_fix_evidence_never_selects_spark(self) -> None:
-        auth_gate = {"authenticated": True, "provider": "openai", "state": "authenticated"}
+        auth_gate = {
+            "authenticated": True,
+            "provider": "openai",
+            "state": "authenticated",
+        }
         lease = {"state": "held", "holder": "test", "held_by_this_server": True}
         evidence = UsageEvidenceV2((), "unavailable", None, None)
-        with patch("codex_master.server.require_fleet_recovery_ready"), patch(
-            "codex_master.server._headless_descriptor", return_value=None
-        ), patch("codex_master.server._ollama_descriptor", return_value=None), patch(
-            "codex_master.server.require_authenticated_agent_for_mutation", return_value=auth_gate
-        ), patch(
-            "codex_master.server.read_usage_evidence_v2", return_value=evidence
-        ) as read_evidence, patch(
-            "codex_master.server.derive_limit_decisions"
-        ) as tracker, patch(
-            "codex_master.server.claim_agent", return_value={"status": "existing", "lease": lease}
-        ), patch("codex_master.server.tmux_alive", return_value=False), patch(
-            "codex_master.server.start_agent", return_value={"status": "started"}
-        ) as start:
+        with (
+            patch("codex_master.server.require_fleet_recovery_ready"),
+            patch("codex_master.server._headless_descriptor", return_value=None),
+            patch("codex_master.server._ollama_descriptor", return_value=None),
+            patch(
+                "codex_master.server.require_authenticated_agent_for_mutation",
+                return_value=auth_gate,
+            ),
+            patch(
+                "codex_master.server.read_usage_evidence_v2", return_value=evidence
+            ) as read_evidence,
+            patch("codex_master.server.derive_limit_decisions") as tracker,
+            patch(
+                "codex_master.server.claim_agent",
+                return_value={"status": "existing", "lease": lease},
+            ),
+            patch("codex_master.server.tmux_alive", return_value=False),
+            patch(
+                "codex_master.server.start_agent", return_value={"status": "started"}
+            ) as start,
+        ):
             result = server_module._start_agent_with_lease_unlocked(
                 "a1",
                 allow_unauthenticated=True,
@@ -17931,15 +17958,37 @@ google_accounts:
         tracker.assert_not_called()
 
     def test_confirmed_assign_write_can_select_spark_and_audit_profile(self) -> None:
-        auth_gate = {"authenticated": True, "provider": "openai", "state": "authenticated"}
+        auth_gate = {
+            "authenticated": True,
+            "provider": "openai",
+            "state": "authenticated",
+        }
         lease = {"state": "held", "holder": "test", "held_by_this_server": True}
         now = datetime.now(timezone.utc)
         evidence = UsageEvidenceV2(
             (
                 AccountUsageEvidenceV2(
                     "account-a1",
-                    (UsageLimitV2("main", 18000, "reset-1", 100.0, 0.0, now + timedelta(hours=1)),),
-                    (UsageTrendV2("main", 18000, "reset-1", "complete", now, now + timedelta(hours=1)),),
+                    (
+                        UsageLimitV2(
+                            "main",
+                            18000,
+                            "reset-1",
+                            100.0,
+                            0.0,
+                            now + timedelta(hours=1),
+                        ),
+                    ),
+                    (
+                        UsageTrendV2(
+                            "main",
+                            18000,
+                            "reset-1",
+                            "complete",
+                            now,
+                            now + timedelta(hours=1),
+                        ),
+                    ),
                     (TrackerEvidenceV2("main", 18000, "reset-1", "complete", now),),
                 ),
             ),
@@ -17947,24 +17996,45 @@ google_accounts:
             now,
             now,
         )
-        with patch("codex_master.server.require_fleet_recovery_ready"), patch(
-            "codex_master.server._headless_descriptor", return_value=None
-        ), patch("codex_master.server._ollama_descriptor", return_value=None), patch(
-            "codex_master.server.require_authenticated_agent_for_mutation", return_value=auth_gate
-        ), patch("codex_master.server.require_ollama_admission"), patch(
-            "codex_master.server.read_usage_evidence_v2", return_value=evidence
-        ) as read_evidence, patch(
-            "codex_master.server.derive_limit_decisions", return_value=()
-        ) as tracker, patch("codex_master.server.scope_check", return_value={"allowed": True}), patch(
-            "codex_master.server.current_agent_inventory",
-            return_value=SimpleNamespace(
-                agents={"a1": SimpleNamespace(account_id="account-a1", series_prefix="a", skill_profile="arbeitsbiene")}
+        with (
+            patch("codex_master.server.require_fleet_recovery_ready"),
+            patch("codex_master.server._headless_descriptor", return_value=None),
+            patch("codex_master.server._ollama_descriptor", return_value=None),
+            patch(
+                "codex_master.server.require_authenticated_agent_for_mutation",
+                return_value=auth_gate,
             ),
-        ), patch("codex_master.server.claim_for_agent_mutation", return_value=(lease, False)), patch(
-            "codex_master.server.ensure_assignment_session_model", return_value={"status": "unchanged"}
-        ), patch("codex_master.server.send_agent", return_value={"status": "sent"}), patch(
-            "codex_master.server.record_assignment"
-        ) as record:
+            patch("codex_master.server.require_ollama_admission"),
+            patch(
+                "codex_master.server.read_usage_evidence_v2", return_value=evidence
+            ) as read_evidence,
+            patch(
+                "codex_master.server.derive_limit_decisions", return_value=()
+            ) as tracker,
+            patch("codex_master.server.scope_check", return_value={"allowed": True}),
+            patch(
+                "codex_master.server.current_agent_inventory",
+                return_value=SimpleNamespace(
+                    agents={
+                        "a1": SimpleNamespace(
+                            account_id="account-a1",
+                            series_prefix="a",
+                            skill_profile="arbeitsbiene",
+                        )
+                    }
+                ),
+            ),
+            patch(
+                "codex_master.server.claim_for_agent_mutation",
+                return_value=(lease, False),
+            ),
+            patch(
+                "codex_master.server.ensure_assignment_session_model",
+                return_value={"status": "unchanged"},
+            ),
+            patch("codex_master.server.send_agent", return_value={"status": "sent"}),
+            patch("codex_master.server.record_assignment") as record,
+        ):
             result = server_module._assign_agent_unlocked(
                 "a1",
                 role="arbeitsbiene",
@@ -17981,7 +18051,9 @@ google_accounts:
 
         self.assertEqual(result["model"], "gpt-5.3-codex-spark")
         self.assertTrue(result["task_profile"]["spark_eligible"])
-        self.assertEqual(record.call_args.args[0]["task_profile"], result["task_profile"])
+        self.assertEqual(
+            record.call_args.args[0]["task_profile"], result["task_profile"]
+        )
         read_evidence.assert_called_once()
         tracker.assert_called_once()
 
@@ -18119,25 +18191,31 @@ google_accounts:
                 "held_by_this_server": True,
                 "expires_at_utc": None,
             }
-            with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
-                "codex_master.server.require_fleet_recovery_ready"
-            ), patch(
-                "codex_master.server._ollama_descriptor", return_value=None
-            ), patch(
-                "codex_master.server.require_authenticated_agent_for_mutation",
-                return_value={"authenticated": True},
-            ), patch(
-                "codex_master.server.ensure_agent_not_blocked_by_codex_usage"
-            ), patch(
-                "codex_master.server.require_ollama_admission",
-                return_value={"allowed": True},
-            ), patch(
-                "codex_master.server.ensure_assignment_session_model",
-                return_value={"status": "unchanged"},
-            ), patch(
-                "codex_master.server.send_agent",
-                return_value={"agent": descriptor.agent_id, "status": "sent"},
-            ), patch("codex_master.server.record_assignment"
+            with (
+                patch(
+                    "codex_master.server.current_agent_inventory",
+                    return_value=inventory,
+                ),
+                patch("codex_master.server.require_fleet_recovery_ready"),
+                patch("codex_master.server._ollama_descriptor", return_value=None),
+                patch(
+                    "codex_master.server.require_authenticated_agent_for_mutation",
+                    return_value={"authenticated": True},
+                ),
+                patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"),
+                patch(
+                    "codex_master.server.require_ollama_admission",
+                    return_value={"allowed": True},
+                ),
+                patch(
+                    "codex_master.server.ensure_assignment_session_model",
+                    return_value={"status": "unchanged"},
+                ),
+                patch(
+                    "codex_master.server.send_agent",
+                    return_value={"agent": descriptor.agent_id, "status": "sent"},
+                ),
+                patch("codex_master.server.record_assignment"),
             ):
                 return server_module._assign_agent_unlocked(
                     descriptor.agent_id,
@@ -18317,23 +18395,34 @@ google_accounts:
         self.assertEqual(payload["error"], f"timeout_seconds must be <= {MAX_WAIT_SECONDS}")
 
     def test_unauthenticated_assignment_skips_usage_routing(self) -> None:
-        lease = {"state": "held", "held_by_this_server": True, "raw_output": "not_returned"}
-        with patch(
-            "codex_master.server.agent_auth_status",
-            return_value={"authenticated": False, "auth_state": "missing"},
-        ), patch(
-            "codex_master.server.read_usage_evidence_v2",
-            return_value=UsageEvidenceV2((), "unavailable", None, None),
-        ) as read_evidence, patch(
-            "codex_master.server.claim_for_agent_mutation",
-            return_value=(lease, True),
-        ), patch(
-            "codex_master.server.ensure_assignment_session_model",
-            return_value={"status": "unchanged", "raw_output": "not_returned"},
-        ), patch(
-            "codex_master.server.send_agent",
-            return_value={"status": "sent", "raw_output": "not_returned"},
-        ), patch("codex_master.server.record_assignment") as record:
+        lease = {
+            "state": "held",
+            "held_by_this_server": True,
+            "raw_output": "not_returned",
+        }
+        with (
+            patch(
+                "codex_master.server.agent_auth_status",
+                return_value={"authenticated": False, "auth_state": "missing"},
+            ),
+            patch(
+                "codex_master.server.read_usage_evidence_v2",
+                return_value=UsageEvidenceV2((), "unavailable", None, None),
+            ) as read_evidence,
+            patch(
+                "codex_master.server.claim_for_agent_mutation",
+                return_value=(lease, True),
+            ),
+            patch(
+                "codex_master.server.ensure_assignment_session_model",
+                return_value={"status": "unchanged", "raw_output": "not_returned"},
+            ),
+            patch(
+                "codex_master.server.send_agent",
+                return_value={"status": "sent", "raw_output": "not_returned"},
+            ),
+            patch("codex_master.server.record_assignment") as record,
+        ):
             result = assign_agent(
                 "a",
                 role="exploriererin",
@@ -19050,29 +19139,42 @@ google_accounts:
         self.assertEqual(result, 0)
         self.assertIs(call.call_args.args[1]["confirm_home_refresh"], True)
 
-    def test_subagent_admission_deny_still_sends_and_audits_effective_permission(self) -> None:
+    def test_subagent_admission_deny_still_sends_and_audits_effective_permission(
+        self,
+    ) -> None:
         decision = {
             "allowed": False,
             "reason_codes": ["memory_pressure_high", "private_snapshot=1024"],
             "available_memory_mib": 1024,
         }
-        lease = {"state": "held", "held_by_this_server": True, "raw_output": "not_returned"}
-        with patch(
-            "codex_master.server.agent_auth_status",
-            return_value={"authenticated": False, "auth_state": "missing"},
-        ), patch(
-            "codex_master.server.ensure_agent_not_blocked_by_codex_usage"
-        ), patch(
-            "codex_master.server.spawn_admission_decision", return_value=decision
-        ) as admission, patch(
-            "codex_master.server.claim_for_agent_mutation", return_value=(lease, True)
-        ), patch(
-            "codex_master.server.ensure_assignment_session_model",
-            return_value={"status": "unchanged", "raw_output": "not_returned"},
-        ), patch(
-            "codex_master.server.send_agent",
-            return_value={"status": "sent", "raw_output": "not_returned"},
-        ) as send, patch("codex_master.server.record_assignment") as record:
+        lease = {
+            "state": "held",
+            "held_by_this_server": True,
+            "raw_output": "not_returned",
+        }
+        with (
+            patch(
+                "codex_master.server.agent_auth_status",
+                return_value={"authenticated": False, "auth_state": "missing"},
+            ),
+            patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"),
+            patch(
+                "codex_master.server.spawn_admission_decision", return_value=decision
+            ) as admission,
+            patch(
+                "codex_master.server.claim_for_agent_mutation",
+                return_value=(lease, True),
+            ),
+            patch(
+                "codex_master.server.ensure_assignment_session_model",
+                return_value={"status": "unchanged", "raw_output": "not_returned"},
+            ),
+            patch(
+                "codex_master.server.send_agent",
+                return_value={"status": "sent", "raw_output": "not_returned"},
+            ) as send,
+            patch("codex_master.server.record_assignment") as record,
+        ):
             result = assign_agent(
                 "a",
                 role="exploriererin",
@@ -20771,7 +20873,9 @@ google_accounts:
         self.assertEqual(wait_terminal_status(current, initial), "identity_unverified")
 
     @patch("codex_master.server.status_agent")
-    def test_wait_agent_prefers_not_running_over_stale_limit(self, mock_status_agent) -> None:
+    def test_wait_agent_prefers_not_running_over_stale_limit(
+        self, mock_status_agent
+    ) -> None:
         mock_status_agent.return_value = {
             "agent": "a",
             "running": False,
@@ -21150,17 +21254,26 @@ google_accounts:
         self.assertIsNone(mock_action.call_args.kwargs.get("release_lease_id"))
         mock_marker.assert_called_once_with("a1", None)
 
-    def test_fleet_watchdog_does_not_update_spark_health_after_lease_expiry(self) -> None:
+    def test_fleet_watchdog_does_not_update_spark_health_after_lease_expiry(
+        self,
+    ) -> None:
         status = {
             "agent": "a",
             "running": True,
-            "lease": {"state": "expired", "held_by_this_server": False, "raw_output": "not_returned"},
+            "lease": {
+                "state": "expired",
+                "held_by_this_server": False,
+                "raw_output": "not_returned",
+            },
             "response_state": {"state": "running_idle"},
             "raw_log_idle_seconds": 600,
             "raw_log_bytes": 0,
             "raw_log_updated_at_utc": "1970-01-01T00:15:00+00:00",
             "started_at_utc": "2026-06-07T09:00:00+00:00",
-            "last_assignment": {"assignment_id": "assign-1", "created_at_utc": "2026-06-07T09:58:00+00:00"},
+            "last_assignment": {
+                "assignment_id": "assign-1",
+                "created_at_utc": "2026-06-07T09:58:00+00:00",
+            },
         }
         lease = {
             "state": "held",
@@ -21179,15 +21292,31 @@ google_accounts:
                 "response_output": "not_returned",
             },
         )
-        with patch("codex_master.server.call_agent_lifecycle", side_effect=lambda _agent, fn: fn()), patch(
-            "codex_master.server.status_agent", return_value=status
-        ), patch("codex_master.server.read_meta", return_value={}), patch(
-            "codex_master.server.claim_agent", return_value={"status": "claimed_expired", "lease": lease}
-        ), patch("codex_master.server.request_agent_report", side_effect=report_error), patch(
-            "codex_master.server.agent_lease_status",
-            return_value={"state": "expired", "held_by_this_server": False, "lease_id": lease["lease_id"]},
-        ), patch("codex_master.server.watchdog_action", return_value={"status": "stopped"}), patch(
-            "codex_master.server.update_watchdog_marker"
+        with (
+            patch(
+                "codex_master.server.call_agent_lifecycle",
+                side_effect=lambda _agent, fn: fn(),
+            ),
+            patch("codex_master.server.status_agent", return_value=status),
+            patch("codex_master.server.read_meta", return_value={}),
+            patch(
+                "codex_master.server.claim_agent",
+                return_value={"status": "claimed_expired", "lease": lease},
+            ),
+            patch("codex_master.server.request_agent_report", side_effect=report_error),
+            patch(
+                "codex_master.server.agent_lease_status",
+                return_value={
+                    "state": "expired",
+                    "held_by_this_server": False,
+                    "lease_id": lease["lease_id"],
+                },
+            ),
+            patch(
+                "codex_master.server.watchdog_action",
+                return_value={"status": "stopped"},
+            ),
+            patch("codex_master.server.update_watchdog_marker"),
         ):
             result = fleet_watchdog("a", action="stop", manage_unclaimed=True)
 
@@ -21934,17 +22063,25 @@ google_accounts:
                     pending.append(callee)
         self.assertFalse(reachable & legacy)
 
-    def test_codex_usage_watchdog_status_fails_closed_on_unreadable_metadata(self) -> None:
+    def test_codex_usage_watchdog_status_fails_closed_on_unreadable_metadata(
+        self,
+    ) -> None:
         inventory = SimpleNamespace(
             agents={"a1": SimpleNamespace(account_id="account-a1", series_prefix="a")},
             agent_ids=("a1",),
         )
-        with patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
-            "codex_master.server.read_usage_evidence_v2",
-            return_value=UsageEvidenceV2((), "unavailable", None, None),
-        ) as read_evidence, patch(
-            "codex_master.server.read_meta",
-            side_effect=AssertionError("watchdog must not read metadata"),
+        with (
+            patch(
+                "codex_master.server.current_agent_inventory", return_value=inventory
+            ),
+            patch(
+                "codex_master.server.read_usage_evidence_v2",
+                return_value=UsageEvidenceV2((), "unavailable", None, None),
+            ) as read_evidence,
+            patch(
+                "codex_master.server.read_meta",
+                side_effect=AssertionError("watchdog must not read metadata"),
+            ),
         ):
             status = codex_usage_watchdog_status("a")
 
@@ -24867,11 +25004,17 @@ google_accounts:
     def test_start_agent_with_lease_rejects_running_model_mismatch(
         self, _mock_alive, mock_claim, mock_start_agent
     ) -> None:
-        mock_claim.return_value = {"status": "renewed", "lease": {"held_by_this_server": True}}
+        mock_claim.return_value = {
+            "status": "renewed",
+            "lease": {"held_by_this_server": True},
+        }
         mock_start_agent.return_value = {
             "agent": "a",
             "status": "already_running",
-            "meta": {"model": WRITE_AGENT_MODEL, "model_reasoning_effort": WRITE_AGENT_MODEL_EFFORT},
+            "meta": {
+                "model": WRITE_AGENT_MODEL,
+                "model_reasoning_effort": WRITE_AGENT_MODEL_EFFORT,
+            },
             "raw_output": "not_returned",
         }
 
@@ -24879,7 +25022,9 @@ google_accounts:
             "codex_master.server.agent_auth_status",
             return_value={"authenticated": True, "auth_state": "present_regular"},
         ):
-            with self.assertRaisesRegex(AgentError, "routed model or class differs from active session"):
+            with self.assertRaisesRegex(
+                AgentError, "routed model or class differs from active session"
+            ):
                 start_agent_with_lease("a")
 
 
@@ -24898,15 +25043,23 @@ google_accounts:
         _mock_processes,
         mock_release,
     ) -> None:
-        mock_claim.return_value = {"status": "claimed", "lease": {"held_by_this_server": True}}
+        mock_claim.return_value = {
+            "status": "claimed",
+            "lease": {"held_by_this_server": True},
+        }
         mock_start_agent.return_value = {
             "agent": "a",
             "status": "already_running",
-            "meta": {"model": WRITE_AGENT_MODEL, "model_reasoning_effort": WRITE_AGENT_MODEL_EFFORT},
+            "meta": {
+                "model": WRITE_AGENT_MODEL,
+                "model_reasoning_effort": WRITE_AGENT_MODEL_EFFORT,
+            },
             "raw_output": "not_returned",
         }
 
-        with self.assertRaisesRegex(AgentError, "routed model or class differs from active session"):
+        with self.assertRaisesRegex(
+            AgentError, "routed model or class differs from active session"
+        ):
             start_agent_with_lease("a", allow_unauthenticated=True)
 
         mock_release.assert_called_once_with("a1", force=True)
@@ -24917,19 +25070,30 @@ google_accounts:
     def test_start_agent_with_lease_rechecks_raced_running_session_model(
         self, _mock_alive, mock_claim, mock_start_agent
     ) -> None:
-        mock_claim.return_value = {"status": "claimed", "lease": {"held_by_this_server": True}}
+        mock_claim.return_value = {
+            "status": "claimed",
+            "lease": {"held_by_this_server": True},
+        }
         mock_start_agent.return_value = {
             "agent": "a",
             "status": "already_running",
-            "meta": {"model": WRITE_AGENT_MODEL, "model_reasoning_effort": WRITE_AGENT_MODEL_EFFORT},
+            "meta": {
+                "model": WRITE_AGENT_MODEL,
+                "model_reasoning_effort": WRITE_AGENT_MODEL_EFFORT,
+            },
             "raw_output": "not_returned",
         }
 
-        with patch(
-            "codex_master.server.agent_lease_status",
-            return_value={"held_by_this_server": True},
-        ), patch("codex_master.server.release_agent") as mock_release:
-            with self.assertRaisesRegex(AgentError, "routed model or class differs from active session"):
+        with (
+            patch(
+                "codex_master.server.agent_lease_status",
+                return_value={"held_by_this_server": True},
+            ),
+            patch("codex_master.server.release_agent") as mock_release,
+        ):
+            with self.assertRaisesRegex(
+                AgentError, "routed model or class differs from active session"
+            ):
                 start_agent_with_lease("a", allow_unauthenticated=True)
             mock_release.assert_called_once_with("a1", force=True)
 
@@ -24940,7 +25104,10 @@ google_accounts:
     def test_start_agent_with_lease_rejects_running_reasoning_effort_mismatch(
         self, _mock_alive, mock_claim, mock_start_agent
     ) -> None:
-        mock_claim.return_value = {"status": "renewed", "lease": {"held_by_this_server": True}}
+        mock_claim.return_value = {
+            "status": "renewed",
+            "lease": {"held_by_this_server": True},
+        }
         mock_start_agent.return_value = {
             "agent": "a",
             "status": "already_running",
@@ -24951,8 +25118,13 @@ google_accounts:
             "raw_output": "not_returned",
         }
 
-        with patch("codex_master.server.agent_auth_status", return_value={"authenticated": True}):
-            with self.assertRaisesRegex(AgentError, "routed model or class differs from active session"):
+        with patch(
+            "codex_master.server.agent_auth_status",
+            return_value={"authenticated": True},
+        ):
+            with self.assertRaisesRegex(
+                AgentError, "routed model or class differs from active session"
+            ):
                 start_agent_with_lease("a", allow_unauthenticated=True)
 
 
@@ -30669,25 +30841,45 @@ google_accounts:
         self.assertEqual(start.call_args.kwargs["model"], DEFAULT_AGENT_MODEL)
         self.assertEqual(start.call_args.kwargs["model_reasoning_effort"], DEFAULT_AGENT_MODEL_EFFORT)
 
-    def test_agent_assign_keeps_fresh_lease_when_model_switch_leaves_home_process(self) -> None:
-        with patch.dict(
-            "codex_master.server.AGENTS",
-            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
-            clear=True,
-        ), patch(
-            "codex_master.server.agent_auth_status", return_value={"authenticated": False, "auth_state": "empty"}
-        ), patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"), patch(
-            "codex_master.server.claim_for_agent_mutation",
-            return_value=({"state": "held", "held_by_this_server": True}, True),
-        ), patch(
-            "codex_master.server.ensure_assignment_session_model",
-            side_effect=AgentError("orphaned process"),
-        ) as mock_model, patch(
-            "codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}
-        ), patch(
-            "codex_master.server.agent_home_process_summary",
-            return_value={"process_count": 1},
-        ), patch("codex_master.server.release_agent") as mock_release:
+    def test_agent_assign_keeps_fresh_lease_when_model_switch_leaves_home_process(
+        self,
+    ) -> None:
+        with (
+            patch.dict(
+                "codex_master.server.AGENTS",
+                {
+                    "a1": {
+                        "label": "A1",
+                        "runner": Path("/tmp/codex"),
+                        "home": Path("/tmp/home"),
+                        "session": "session-a1",
+                    }
+                },
+                clear=True,
+            ),
+            patch(
+                "codex_master.server.agent_auth_status",
+                return_value={"authenticated": False, "auth_state": "empty"},
+            ),
+            patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"),
+            patch(
+                "codex_master.server.claim_for_agent_mutation",
+                return_value=({"state": "held", "held_by_this_server": True}, True),
+            ),
+            patch(
+                "codex_master.server.ensure_assignment_session_model",
+                side_effect=AgentError("orphaned process"),
+            ) as mock_model,
+            patch(
+                "codex_master.server.agent_lease_status",
+                return_value={"held_by_this_server": True},
+            ),
+            patch(
+                "codex_master.server.agent_home_process_summary",
+                return_value={"process_count": 1},
+            ),
+            patch("codex_master.server.release_agent") as mock_release,
+        ):
             with self.assertRaisesRegex(AgentError, "orphaned process"):
                 assign_agent(
                     "a1",
@@ -30700,7 +30892,9 @@ google_accounts:
         self.assertTrue(mock_model.call_args.kwargs["release_lease_on_failure"])
         mock_release.assert_not_called()
 
-    def test_bound_teamleader_assign_uses_ensure_unchanged_without_restart_or_spawn(self) -> None:
+    def test_bound_teamleader_assign_uses_ensure_unchanged_without_restart_or_spawn(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
             descriptor = SimpleNamespace(
@@ -30714,35 +30908,56 @@ google_accounts:
                 skill_profile="teamleiterin",
             )
             inventory = SimpleNamespace(agents={"q1": descriptor}, agent_ids=("q1",))
-            with patch(
-                "codex_master.server.ensure_assignment_session_model",
-                return_value={"status": "unchanged"},
-            ) as ensure_model, patch("codex_master.server.current_agent_inventory", return_value=inventory), patch(
-                "codex_master.server.agent_config",
-                return_value={"session": "q1-tmux", "home": home, "label": "Q1"},
-            ), patch(
-                "codex_master.server._headless_descriptor", return_value=None
-            ), patch("codex_master.server._ollama_descriptor", return_value=None), patch(
-                "codex_master.server.require_ollama_admission", return_value={"allowed": True}
-            ), patch(
-                "codex_master.server.require_authenticated_agent_for_mutation",
-                return_value={"authenticated": True},
-            ), patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"), patch(
-                "codex_master.server.tmux_alive", return_value=True
-            ), patch("codex_master.server.require_managed_tmux_session", return_value={"ok": True}), patch(
-                "codex_master.server.read_meta",
-                return_value={
-                    "agent_class": "arbeitsbiene",
-                    "model": "gpt-5.6-luna",
-                    "model_reasoning_effort": "medium",
-                },
-            ), patch("codex_master.server.claim_for_agent_mutation", return_value=({"state": "held"}, False)), patch(
-                "codex_master.server.send_agent", return_value={"agent": "q1", "status": "sent"}
-            ), patch("codex_master.server.record_assignment"), patch(
-                "codex_master.server.run_tmux"
-            ) as run_tmux, patch("codex_master.server.start_agent") as start_agent, patch(
-                "codex_master.server.require_spawn_capacity"
-            ) as require_capacity:
+            with (
+                patch(
+                    "codex_master.server.ensure_assignment_session_model",
+                    return_value={"status": "unchanged"},
+                ) as ensure_model,
+                patch(
+                    "codex_master.server.current_agent_inventory",
+                    return_value=inventory,
+                ),
+                patch(
+                    "codex_master.server.agent_config",
+                    return_value={"session": "q1-tmux", "home": home, "label": "Q1"},
+                ),
+                patch("codex_master.server._headless_descriptor", return_value=None),
+                patch("codex_master.server._ollama_descriptor", return_value=None),
+                patch(
+                    "codex_master.server.require_ollama_admission",
+                    return_value={"allowed": True},
+                ),
+                patch(
+                    "codex_master.server.require_authenticated_agent_for_mutation",
+                    return_value={"authenticated": True},
+                ),
+                patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"),
+                patch("codex_master.server.tmux_alive", return_value=True),
+                patch(
+                    "codex_master.server.require_managed_tmux_session",
+                    return_value={"ok": True},
+                ),
+                patch(
+                    "codex_master.server.read_meta",
+                    return_value={
+                        "agent_class": "arbeitsbiene",
+                        "model": "gpt-5.6-luna",
+                        "model_reasoning_effort": "medium",
+                    },
+                ),
+                patch(
+                    "codex_master.server.claim_for_agent_mutation",
+                    return_value=({"state": "held"}, False),
+                ),
+                patch(
+                    "codex_master.server.send_agent",
+                    return_value={"agent": "q1", "status": "sent"},
+                ),
+                patch("codex_master.server.record_assignment"),
+                patch("codex_master.server.run_tmux") as run_tmux,
+                patch("codex_master.server.start_agent") as start_agent,
+                patch("codex_master.server.require_spawn_capacity") as require_capacity,
+            ):
                 result = assign_agent(
                     "q1",
                     role="exploriererin",
@@ -30753,7 +30968,11 @@ google_accounts:
                 )
 
         self.assertEqual(
-            (result["model"], result["model_reasoning_effort"], result["model_switch"]["status"]),
+            (
+                result["model"],
+                result["model_reasoning_effort"],
+                result["model_switch"]["status"],
+            ),
             ("gpt-5.6-luna", "medium", "unchanged"),
         )
         ensure_model.assert_called_once()
@@ -30762,25 +30981,48 @@ google_accounts:
         start_agent.assert_not_called()
         require_capacity.assert_not_called()
 
-    def test_agent_assign_keeps_fresh_lease_when_send_fails_after_model_switch(self) -> None:
-        with patch.dict(
-            "codex_master.server.AGENTS",
-            {"a1": {"label": "A1", "runner": Path("/tmp/codex"), "home": Path("/tmp/home"), "session": "session-a1"}},
-            clear=True,
-        ), patch(
-            "codex_master.server.agent_auth_status", return_value={"authenticated": False, "auth_state": "empty"}
-        ), patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"), patch(
-            "codex_master.server.claim_for_agent_mutation",
-            return_value=({"state": "held", "held_by_this_server": True}, True),
-        ), patch(
-            "codex_master.server.ensure_assignment_session_model",
-            return_value={"status": "restarted"},
-        ), patch("codex_master.server.send_agent", side_effect=AgentError("send failed")
-        ), patch(
-            "codex_master.server.agent_lease_status", return_value={"held_by_this_server": True}
-        ), patch(
-            "codex_master.server.agent_home_process_summary", return_value={"process_count": 1}
-        ), patch("codex_master.server.release_agent") as mock_release:
+    def test_agent_assign_keeps_fresh_lease_when_send_fails_after_model_switch(
+        self,
+    ) -> None:
+        with (
+            patch.dict(
+                "codex_master.server.AGENTS",
+                {
+                    "a1": {
+                        "label": "A1",
+                        "runner": Path("/tmp/codex"),
+                        "home": Path("/tmp/home"),
+                        "session": "session-a1",
+                    }
+                },
+                clear=True,
+            ),
+            patch(
+                "codex_master.server.agent_auth_status",
+                return_value={"authenticated": False, "auth_state": "empty"},
+            ),
+            patch("codex_master.server.ensure_agent_not_blocked_by_codex_usage"),
+            patch(
+                "codex_master.server.claim_for_agent_mutation",
+                return_value=({"state": "held", "held_by_this_server": True}, True),
+            ),
+            patch(
+                "codex_master.server.ensure_assignment_session_model",
+                return_value={"status": "restarted"},
+            ),
+            patch(
+                "codex_master.server.send_agent", side_effect=AgentError("send failed")
+            ),
+            patch(
+                "codex_master.server.agent_lease_status",
+                return_value={"held_by_this_server": True},
+            ),
+            patch(
+                "codex_master.server.agent_home_process_summary",
+                return_value={"process_count": 1},
+            ),
+            patch("codex_master.server.release_agent") as mock_release,
+        ):
             with self.assertRaisesRegex(AgentError, "send failed"):
                 assign_agent(
                     "a1",
