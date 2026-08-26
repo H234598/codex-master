@@ -300,7 +300,6 @@ DEFAULT_AGENT_MODEL = "gpt-5.6-luna"
 DEFAULT_AGENT_MODEL_EFFORT = "medium"
 WRITE_AGENT_MODEL = "gpt-5.3-codex-spark"
 WRITE_AGENT_MODEL_EFFORT = "low"
-CODEX_USAGE_LEGACY_MAIN_MODEL = "gpt-5.4-mini"
 BASE_ARGS = [
     "--model",
     DEFAULT_AGENT_MODEL,
@@ -500,8 +499,6 @@ RESOURCE_REASON_CODES = frozenset(
     }
 )
 MAX_CODEX_USAGE_SNAPSHOT_BYTES = 64 * 1024
-MAX_CODEX_USAGE_DECISION_BYTES = 64 * 1024
-MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID = 512
 MAX_OLLAMA_RESPONSE_BYTES = 256 * 1024
 MAX_CODEX_CONFIG_BYTES = 1024 * 1024
 MAX_PLUGIN_MANIFEST_BYTES = 64 * 1024
@@ -533,7 +530,6 @@ TEAMLEADER_TOOL_NAMES = frozenset(
         "agent_capabilities",
         "agent_scope_check",
         "agent_selection_options",
-        "agent_routing_decision",
         "agent_assign",
         "agent_assign_readonly",
         "agent_assign_live_data",
@@ -761,9 +757,6 @@ DEFAULT_AGENTIN_BASE_NAMES = (
 )
 DEFAULT_AGENTIN_NAMES = {"a1": "Mila", "b1": "Nora"}
 Q_WEEKLY_THRESHOLD_PERCENT = 10.0
-CODEX_USAGE_DECISION_TIMEOUT_SECONDS = 8
-CODEX_USAGE_SPARK_HEALTH_STATES = {"healthy", "failed"}
-CODEX_USAGE_DECISIONS = {"spark", "main", "credits", "blocked", "unchanged"}
 WATCHDOG_SERVICE_NAME = "codex-master-watchdog.service"
 WATCHDOG_TIMER_NAME = "codex-master-watchdog.timer"
 RESOURCE_MONITOR_SERVICE_NAME = "codex-master-resource-monitor.service"
@@ -917,21 +910,6 @@ def env_text_value(primary: str, fallback: str | None, default: str) -> str:
     if value is None and fallback:
         value = os.environ.get(fallback)
     return value if value is not None else default
-
-
-def codex_usage_executable() -> str:
-    configured = os.environ.get("CODEX_USAGE_BIN", "codex-usage").strip()
-    if not configured or "\x00" in configured:
-        raise AgentError("CODEX_USAGE_BIN is invalid")
-    if "/" in configured:
-        path = Path(configured).expanduser()
-        if not is_regular_executable_no_symlink(path):
-            raise AgentError("codex-usage executable is unavailable")
-        return str(path)
-    resolved = shutil.which(configured)
-    if not resolved:
-        raise AgentError("codex-usage executable is unavailable")
-    return resolved
 
 
 def default_agentin_name(agent: str) -> str:
@@ -9577,67 +9555,6 @@ def is_regular_file_no_symlink(path: Path) -> bool:
     return stat_module.S_ISREG(current.st_mode) and getattr(current, "st_nlink", 1) == 1
 
 
-def open_agent_auth_fd(agent: str) -> int:
-    agent = canonical_agent_id(agent)
-    auth_file = agent_config(agent)["home"] / "auth.json"
-    try:
-        auth_stat = auth_file.lstat()
-        parent_stat = auth_file.parent.lstat()
-    except OSError as exc:
-        raise AgentError(
-            "codex-usage routing requires regular per-Agentin auth.json"
-        ) from exc
-    if (
-        not stat_module.S_ISREG(auth_stat.st_mode)
-        or getattr(auth_stat, "st_nlink", 1) > 1
-        or auth_stat.st_size > MAX_CODEX_CONFIG_BYTES
-    ):
-        raise AgentError("codex-usage routing requires regular per-Agentin auth.json")
-
-    parent_fd = -1
-    auth_fd = -1
-    try:
-        parent_fd = open_directory_no_follow_matching(
-            auth_file.parent,
-            parent_stat,
-            error_text="auth file parent is unavailable",
-            changed_text="auth file parent changed unexpectedly",
-        )
-        current_stat = os.stat(auth_file.name, dir_fd=parent_fd, follow_symlinks=False)
-        if (
-            not source_identity_matches(current_stat, auth_stat)
-            or not stat_module.S_ISREG(current_stat.st_mode)
-            or getattr(current_stat, "st_nlink", 1) > 1
-            or current_stat.st_size > MAX_CODEX_CONFIG_BYTES
-        ):
-            raise AgentError("auth file changed unexpectedly")
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        auth_fd = os.open(auth_file.name, flags, dir_fd=parent_fd)
-        opened_stat = os.fstat(auth_fd)
-        if (
-            not source_identity_matches(opened_stat, auth_stat)
-            or not source_identity_matches(opened_stat, current_stat)
-            or not stat_module.S_ISREG(opened_stat.st_mode)
-            or getattr(opened_stat, "st_nlink", 1) > 1
-            or opened_stat.st_size > MAX_CODEX_CONFIG_BYTES
-        ):
-            raise AgentError("auth file changed unexpectedly")
-        result = auth_fd
-        auth_fd = -1
-        return result
-    except AgentError:
-        raise
-    except OSError as exc:
-        raise AgentError("auth file changed unexpectedly") from exc
-    finally:
-        if parent_fd >= 0:
-            os.close(parent_fd)
-        if auth_fd >= 0:
-            os.close(auth_fd)
-
-
 def auth_access_token_state(value: Any) -> str:
     if not isinstance(value, str) or not value:
         return "missing"
@@ -9802,142 +9719,6 @@ def require_authenticated_agent_for_mutation(
     }
 
 
-def codex_usage_routing_decision(
-    agent: str,
-    *,
-    role: str,
-    group_id: str | None = None,
-    job_id: str | None = None,
-    timeout_seconds: float | None = None,
-) -> dict[str, Any]:
-    agent = canonical_agent_id(agent)
-    group_id = normalize_routing_context_id(group_id, field="group_id")
-    job_id = normalize_routing_context_id(job_id, field="job_id")
-    if timeout_seconds is None:
-        command_timeout = float(CODEX_USAGE_DECISION_TIMEOUT_SECONDS)
-    elif (
-        isinstance(timeout_seconds, bool)
-        or not isinstance(timeout_seconds, (int, float))
-        or not math.isfinite(float(timeout_seconds))
-        or timeout_seconds <= 0
-    ):
-        raise AgentError("codex-usage routing timeout is invalid")
-    else:
-        command_timeout = min(
-            float(timeout_seconds), CODEX_USAGE_DECISION_TIMEOUT_SECONDS
-        )
-    auth_fd = open_agent_auth_fd(agent)
-    try:
-        command = [codex_usage_executable()]
-        config_path = os.environ.get("CODEX_USAGE_CONFIG", "").strip()
-        if config_path:
-            if "\x00" in config_path:
-                raise AgentError("CODEX_USAGE_CONFIG is invalid")
-            command.extend(["--config", str(Path(config_path).expanduser())])
-        command.extend(
-            [
-                "policy",
-                "evaluate",
-                "--auth-json",
-                f"/proc/self/fd/{auth_fd}",
-                "--role",
-                role,
-                "--agent",
-                agent,
-                "--format",
-                "json",
-            ]
-        )
-        if group_id:
-            command.extend(["--group", group_id])
-        if job_id:
-            command.extend(["--job", job_id])
-        cp = run_command(
-            command,
-            timeout=command_timeout,
-            pass_fds=(auth_fd,),
-        )
-    finally:
-        os.close(auth_fd)
-    combined_size = len(cp.stdout.encode("utf-8")) + len(cp.stderr.encode("utf-8"))
-    if combined_size > MAX_CODEX_USAGE_DECISION_BYTES:
-        raise AgentError("codex-usage routing output exceeded size limit")
-    try:
-        payload = json.loads(cp.stdout)
-    except json.JSONDecodeError as exc:
-        if cp.returncode != 0:
-            detail, _changed = redact(trim_chars(cp.stderr.strip(), 300))
-            suffix = f": {detail}" if detail else ""
-            raise AgentError(
-                f"codex-usage routing failed with exit {cp.returncode}{suffix}"
-            ) from None
-        raise AgentError("codex-usage routing returned invalid JSON") from exc
-    decision = validate_codex_usage_routing_decision(payload, agent=agent, role=role)
-    if cp.returncode != 0 and decision["decision"] != "blocked":
-        detail, _changed = redact(trim_chars(cp.stderr.strip(), 300))
-        suffix = f": {detail}" if detail else ""
-        raise AgentError(
-            f"codex-usage routing failed with exit {cp.returncode}{suffix}"
-        )
-    return decision
-
-
-def codex_usage_spark_health_update(
-    backend_account_id: str,
-    *,
-    state: str,
-    reason: str,
-) -> dict[str, Any]:
-    backend_account_id = (
-        bounded_text(
-            backend_account_id,
-            field="backend_account_id",
-            max_chars=MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID,
-            required=True,
-        )
-        or ""
-    )
-    if not isinstance(state, str) or state not in CODEX_USAGE_SPARK_HEALTH_STATES:
-        raise AgentError("spark health state is invalid")
-    reason = (
-        bounded_text(reason, field="spark health reason", max_chars=120, required=True)
-        or ""
-    )
-    command = [codex_usage_executable()]
-    config_path = os.environ.get("CODEX_USAGE_CONFIG", "").strip()
-    if config_path:
-        if "\x00" in config_path:
-            raise AgentError("CODEX_USAGE_CONFIG is invalid")
-        command.extend(["--config", str(Path(config_path).expanduser())])
-    command.extend(
-        [
-            "spark-health",
-            "--backend-account-id",
-            backend_account_id,
-            "--state",
-            state,
-            "--reason",
-            reason,
-        ]
-    )
-    cp = run_command(command, timeout=CODEX_USAGE_DECISION_TIMEOUT_SECONDS)
-    combined_size = len(cp.stdout.encode("utf-8")) + len(cp.stderr.encode("utf-8"))
-    if combined_size > MAX_CODEX_USAGE_DECISION_BYTES:
-        raise AgentError("codex-usage spark health output exceeded size limit")
-    if cp.returncode != 0:
-        detail, _changed = redact(trim_chars(cp.stderr.strip(), 300))
-        suffix = f": {detail}" if detail else ""
-        raise AgentError(
-            f"codex-usage spark health update failed with exit {cp.returncode}{suffix}"
-        )
-    return {
-        "state": state,
-        "reason": reason,
-        "updated": True,
-        "raw_output": "not_returned",
-    }
-
-
 def normalize_routing_context_id(value: Any, *, field: str) -> str | None:
     if value is None:
         return None
@@ -9945,137 +9726,6 @@ def normalize_routing_context_id(value: Any, *, field: str) -> str | None:
     if not ROUTING_CONTEXT_ID_RE.fullmatch(text):
         raise AgentError(f"{field} contains unsupported characters")
     return text
-
-
-def validate_codex_usage_routing_decision(
-    payload: Any,
-    *,
-    agent: str,
-    role: str,
-) -> dict[str, Any]:
-    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
-        raise AgentError("codex-usage routing schema is unsupported")
-    decision = payload.get("decision")
-    model = payload.get("model")
-    if (
-        not isinstance(decision, str)
-        or decision not in CODEX_USAGE_DECISIONS
-        or payload.get("role") != role
-    ):
-        raise AgentError("codex-usage routing decision is invalid")
-    if not isinstance(
-        payload.get("account"), str
-    ) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(payload["account"]):
-        raise AgentError("codex-usage routing account is invalid")
-    backend_account_id = bounded_text(
-        payload.get("backend_account_id"),
-        field="codex-usage routing backend account id",
-        max_chars=MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID,
-        required=decision != "blocked",
-    )
-    expected_models = {
-        "spark": {WRITE_AGENT_MODEL},
-        "main": {DEFAULT_AGENT_MODEL, CODEX_USAGE_LEGACY_MAIN_MODEL},
-        "credits": {DEFAULT_AGENT_MODEL, CODEX_USAGE_LEGACY_MAIN_MODEL},
-        "blocked": {None},
-        "unchanged": {None},
-    }[decision]
-    if model not in expected_models:
-        raise AgentError("codex-usage routing model does not match decision")
-    selected_model = (
-        DEFAULT_AGENT_MODEL if model == CODEX_USAGE_LEGACY_MAIN_MODEL else model
-    )
-    if decision == "credits" and payload.get("paid_overage_allowed") is not True:
-        raise AgentError("codex-usage credits decision lacks explicit paid policy")
-    if not isinstance(payload.get("paid_overage_allowed"), bool):
-        raise AgentError("codex-usage paid policy is invalid")
-    result = {
-        "schema_version": 1,
-        "account": payload["account"],
-        "backend_account_id": backend_account_id,
-        "role": role,
-        "decision": decision,
-        "model": selected_model,
-        "reason": bounded_text(
-            payload.get("reason"), field="routing reason", max_chars=120
-        ),
-        "usage_state": bounded_text(
-            payload.get("usage_state"), field="routing usage_state", max_chars=32
-        ),
-        "paid_overage_allowed": payload["paid_overage_allowed"],
-        "policy_source": bounded_text(
-            payload.get("policy_source"), field="routing policy_source", max_chars=160
-        ),
-        "raw_output": "not_returned",
-    }
-    if model == CODEX_USAGE_LEGACY_MAIN_MODEL:
-        result["model_fallback"] = {
-            "requested": model,
-            "selected": selected_model,
-            "reason": "legacy_main_model_replaced",
-        }
-    threshold = payload.get("threshold_percent")
-    if threshold is not None:
-        if (
-            isinstance(threshold, bool)
-            or not isinstance(threshold, (int, float))
-            or not math.isfinite(float(threshold))
-            or not 0 <= float(threshold) <= 100
-        ):
-            raise AgentError("codex-usage routing threshold is invalid")
-        result["threshold_percent"] = float(threshold)
-
-    remaining = payload.get("remaining")
-    normalized_remaining: dict[str, float] = {}
-    if remaining is not None:
-        if not isinstance(remaining, dict) or len(remaining) > 16:
-            raise AgentError("codex-usage routing remaining values are invalid")
-        for window, value in remaining.items():
-            if (
-                not isinstance(window, str)
-                or not window
-                or len(window) > 32
-                or isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                or not 0 <= float(value) <= 100
-            ):
-                raise AgentError("codex-usage routing remaining values are invalid")
-            normalized_remaining[window] = float(value)
-        if normalized_remaining:
-            result["remaining_percent"] = min(normalized_remaining.values())
-
-    resets = payload.get("resets")
-    normalized_resets: dict[str, tuple[float, str]] = {}
-    if resets is not None:
-        if not isinstance(resets, dict) or len(resets) > 16:
-            raise AgentError("codex-usage routing resets are invalid")
-        for window, value in resets.items():
-            parsed = parse_utc_timestamp(value)
-            if (
-                not isinstance(window, str)
-                or not window
-                or len(window) > 32
-                or parsed is None
-            ):
-                raise AgentError("codex-usage routing resets are invalid")
-            normalized_resets[window] = (parsed, value)
-    if decision == "blocked" and normalized_resets:
-        blocked_windows = set(normalized_resets)
-        if normalized_remaining and threshold is not None:
-            blocked_windows = {
-                window
-                for window, value in normalized_remaining.items()
-                if value <= float(threshold)
-            }
-        blocked_resets = [
-            normalized_resets[window]
-            for window in blocked_windows
-            if window in normalized_resets
-        ]
-        if blocked_resets:
-            result["blocked_until_utc"] = max(blocked_resets)[1]
-    return result
 
 
 def resolve_runtime_agent_selection(
@@ -10300,13 +9950,8 @@ def agent_selection_options(
     ):
         allowed_class_ids.add("teamleiterin")
     classes = tuple(item for item in classes if item.class_id in allowed_class_ids)
-    routing = codex_usage_routing_decision(agent, role="arbeitsbiene")
-    if routing.get("decision") == "blocked" or routing.get("model") is None:
-        raise AgentError(
-            "codex-usage blocked selection offer: "
-            f"reason={routing.get('reason') or 'unknown'}"
-        )
-    available_models = available_model_ids_for_routing(models, routing)
+    ensure_agent_not_blocked_by_codex_usage(agent)
+    available_models = available_model_ids_for_routing(models, None)
     try:
         offer = build_selection_offer(
             classes=classes,
@@ -10344,7 +9989,6 @@ def agent_selection_options(
             }
             for item in offer.options
         ],
-        "availability_reason": routing.get("reason"),
         "raw_output": "not_returned",
     }
 
@@ -13737,7 +13381,6 @@ def _start_agent_with_lease_unlocked(
             "state": "not_applicable",
             "raw_output": "not_returned",
         }
-        routing = None
         selected_model = ollama_descriptor.model
         selected_effort = None
     else:
@@ -13747,16 +13390,6 @@ def _start_agent_with_lease_unlocked(
             allow_unauthenticated=allow_unauthenticated,
         )
         ensure_agent_not_blocked_by_codex_usage(agent)
-        routing = (
-            None
-            if allow_unauthenticated
-            else codex_usage_routing_decision(
-                agent,
-                role="arbeitsbiene",
-            )
-        )
-        if routing is not None and routing["model"] is None:
-            raise AgentError("codex-usage blocked Agentin start before model launch")
         requested_target_class, resolver_authority = _resolver_target_selection_inputs(
             agent,
             agent_class,
@@ -13764,7 +13397,7 @@ def _start_agent_with_lease_unlocked(
         )
         selection = resolve_runtime_agent_selection(
             role="arbeitsbiene",
-            routing=routing,
+            routing=None,
             task_profile=task_profile,
             requested_class=requested_target_class,
             requested_lifecycle=lifecycle,
@@ -13829,7 +13462,6 @@ def _start_agent_with_lease_unlocked(
         try:
             result = invoke_start()
             validate_existing_session(result)
-            remember_agent_routing(agent, routing)
         except Exception:
             if isinstance(result, dict) and result.get("status") == "started":
                 raw_log = read_meta(agent).get("raw_log")
@@ -13863,7 +13495,6 @@ def _start_agent_with_lease_unlocked(
             release = release_agent(agent, force=True)
             result["lease"] = release["lease"]
         result["auth_gate"] = auth_gate
-        result["routing"] = routing
         result["selection"] = public_resolution_decision(selection)
         return result
     try:
@@ -13879,7 +13510,6 @@ def _start_agent_with_lease_unlocked(
         raise
     try:
         validate_existing_session(result)
-        remember_agent_routing(agent, routing)
     except Exception:
         if isinstance(result, dict) and result.get("status") == "started":
             raw_log = read_meta(agent).get("raw_log")
@@ -13901,7 +13531,6 @@ def _start_agent_with_lease_unlocked(
         release = release_agent(agent, force=True)
         result["lease"] = release["lease"]
     result["auth_gate"] = auth_gate
-    result["routing"] = routing
     result["selection"] = public_resolution_decision(selection)
     return result
 
@@ -14114,197 +13743,6 @@ def latest_assignment_summary(
         "model": record.get("model"),
         "raw_output": "not_returned",
     }
-
-
-def agent_spark_routing(agent: str) -> dict[str, Any] | None:
-    agent = canonical_agent_id(agent)
-    meta = read_meta(agent)
-    if meta.get("model") != WRITE_AGENT_MODEL:
-        return None
-    if "routing" in meta and not isinstance(meta.get("routing"), dict):
-        return None
-    route = meta.get("routing")
-    account_only_route = (
-        isinstance(route, dict)
-        and isinstance(route.get("account"), str)
-        and route.get("decision") is None
-    )
-    spark_metadata_route = (
-        isinstance(route, dict)
-        and route.get("decision") == "spark"
-        and isinstance(route.get("account"), str)
-    )
-    if not isinstance(route, dict) or account_only_route or spark_metadata_route:
-        meta_account = route.get("account") if isinstance(route, dict) else None
-        try:
-            records = list_assignments(agent, 1).get("records", [])
-        except AgentError:
-            records = []
-        record = records[-1] if records and isinstance(records[-1], dict) else {}
-        assignment_route = record.get("routing") if isinstance(record, dict) else None
-        assignment_account = (
-            assignment_route.get("account")
-            if isinstance(assignment_route, dict)
-            else None
-        )
-        if spark_metadata_route and (
-            not isinstance(assignment_route, dict) or assignment_account is None
-        ):
-            return None
-        if meta_account is not None and assignment_account != meta_account:
-            return None
-        assignment_created = (
-            parse_utc_timestamp(record.get("created_at_utc"))
-            if isinstance(record, dict)
-            else None
-        )
-        session_started = parse_utc_timestamp(meta.get("started_at_utc"))
-        if assignment_created is not None and assignment_created > time.time():
-            return None
-        if "started_at_utc" in meta and (
-            session_started is None
-            or assignment_created is None
-            or assignment_created < session_started
-        ):
-            return None
-        if account_only_route or spark_metadata_route:
-            route = assignment_route
-    if not isinstance(route, dict) or route.get("decision") != "spark":
-        return None
-    route_account = route.get("account")
-    if not isinstance(route_account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(
-        route_account
-    ):
-        return None
-    backend_account_id = route.get("backend_account_id")
-    if (
-        not isinstance(backend_account_id, str)
-        or not backend_account_id.strip()
-        or len(backend_account_id) > MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID
-    ):
-        return None
-    return {
-        "backend_account_id": backend_account_id,
-        "model": WRITE_AGENT_MODEL,
-        "decision": "spark",
-    }
-
-
-def remember_agent_routing(agent: str, routing: dict[str, Any] | None) -> None:
-    agent = canonical_agent_id(agent)
-    if not isinstance(routing, dict):
-        return
-    account = routing.get("account")
-    backend_account_id = routing.get("backend_account_id")
-    decision = routing.get("decision")
-    model = routing.get("model")
-    if not isinstance(account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(account):
-        return
-    meta = read_meta(agent)
-    remembered = {"account": account, "decision": decision, "model": model}
-    if (
-        isinstance(backend_account_id, str)
-        and backend_account_id.strip()
-        and len(backend_account_id) <= MAX_CODEX_USAGE_BACKEND_ACCOUNT_ID
-    ):
-        remembered["backend_account_id"] = backend_account_id
-    meta["routing"] = remembered
-    write_meta(agent, meta)
-
-
-def remember_agent_usage_account(agent: str, account: Any) -> None:
-    agent = canonical_agent_id(agent)
-    if not isinstance(account, str) or not CODEX_USAGE_ACCOUNT_RE.fullmatch(account):
-        return
-    with agent_lifecycle_lock(agent):
-        meta = read_meta(agent)
-        routing = meta.get("routing")
-        if not isinstance(routing, dict):
-            routing = {}
-        elif routing.get("account") != account:
-            routing = {}
-        routing["account"] = account
-        meta["routing"] = routing
-        write_meta(agent, meta)
-
-
-def update_agent_spark_health(agent: str, *, state: str, reason: str) -> dict[str, Any]:
-    route = agent_spark_routing(agent)
-    if route is None:
-        return {
-            "state": "not_applicable",
-            "updated": False,
-            "raw_output": "not_returned",
-        }
-    try:
-        result = codex_usage_spark_health_update(
-            route["backend_account_id"],
-            state=state,
-            reason=reason,
-        )
-    except AgentError:
-        return {
-            "state": "update_failed",
-            "updated": False,
-            "raw_output": "not_returned",
-        }
-    return {**result, "account_state": "spark_routed", "raw_output": "not_returned"}
-
-
-def update_agent_spark_health_if_lease_current(
-    agent: str,
-    lease: Any,
-    *,
-    state: str,
-    reason: str,
-) -> dict[str, Any]:
-    if not isinstance(lease, dict) or lease.get("held_by_this_server") is not True:
-        return {
-            "state": "not_checked",
-            "updated": False,
-            "reason": "lease_not_held_by_this_server",
-            "raw_output": "not_returned",
-        }
-    lease_id = lease.get("lease_id")
-    if not isinstance(lease_id, str) or not LEASE_ID_RE.fullmatch(lease_id):
-        return {
-            "state": "not_checked",
-            "updated": False,
-            "reason": "lease_identity_unavailable",
-            "raw_output": "not_returned",
-        }
-    with agent_lifecycle_lock(agent):
-        fresh_lease = agent_lease_status(agent)
-        if fresh_lease.get("held_by_this_server") is not True:
-            return {
-                "state": "not_checked",
-                "updated": False,
-                "reason": "lease_not_held_by_this_server",
-                "raw_output": "not_returned",
-            }
-        if fresh_lease.get("lease_id") != lease_id:
-            return {
-                "state": "not_checked",
-                "updated": False,
-                "reason": "lease_changed",
-                "raw_output": "not_returned",
-            }
-        return update_agent_spark_health(agent, state=state, reason=reason)
-
-
-def update_wait_agent_spark_health(
-    agent: str,
-    status: dict[str, Any],
-    *,
-    state: str,
-    reason: str,
-) -> dict[str, Any]:
-    return update_agent_spark_health_if_lease_current(
-        agent,
-        status.get("lease"),
-        state=state,
-        reason=reason,
-    )
 
 
 def limit_model_pool(model: Any) -> str:
@@ -14717,7 +14155,6 @@ def wait_agent(
             "elapsed_seconds": max(0, int(time.monotonic() - started)),
             "initial": initial,
             "current": current,
-            "spark_health": {"state": "not_applicable", "raw_output": "not_returned"},
             "raw_output": "not_returned",
             "response_output": "not_returned",
         }
@@ -14739,26 +14176,6 @@ def wait_agent(
             status = wait_terminal_visible_input_status(agent, current, initial)
     if status is None:
         status = "timeout"
-    if status == "activity_observed":
-        spark_health = update_wait_agent_spark_health(
-            agent,
-            current,
-            state="healthy",
-            reason="spark_turn_activity_observed",
-        )
-    elif status in {"timeout", "blocked_by_limit"}:
-        spark_health = update_wait_agent_spark_health(
-            agent,
-            current,
-            state="failed",
-            reason=f"spark_turn_{status}",
-        )
-    else:
-        spark_health = {
-            "state": "not_checked",
-            "updated": False,
-            "raw_output": "not_returned",
-        }
     latest_assignment = (
         current.get("last_assignment")
         if isinstance(current.get("last_assignment"), dict)
@@ -14778,7 +14195,6 @@ def wait_agent(
         "elapsed_seconds": max(0, int(time.monotonic() - started)),
         "initial": initial,
         "current": current,
-        "spark_health": spark_health,
         "raw_output": "not_returned",
         "response_output": "not_returned",
     }
@@ -16061,12 +15477,6 @@ def _watchdog_agent_unlocked(
                 )
             if isinstance(exc, AgentInputNotReadyError):
                 report_error = public_error_payload(exc)
-                spark_health = update_agent_spark_health_if_lease_current(
-                    agent,
-                    lease,
-                    state="failed",
-                    reason="spark_turn_watchdog_report_unavailable",
-                )
                 release_after_interrupt = action == "interrupt" and (
                     (manage_unclaimed and unclaimed_or_expired)
                     or release_watchdog_lease
@@ -16098,7 +15508,6 @@ def _watchdog_agent_unlocked(
                     else "no_action",
                     "action_taken": action,
                     "report_error": report_error,
-                    "spark_health": spark_health,
                     "action_result": public_watchdog_action_result(action_result),
                 }
             raise
@@ -16141,16 +15550,6 @@ def _watchdog_agent_unlocked(
             base["held_by_this_server"] = bool(
                 released_lease.get("held_by_this_server")
             )
-    spark_health = (
-        update_agent_spark_health_if_lease_current(
-            agent,
-            lease,
-            state="failed",
-            reason="spark_turn_watchdog_timeout",
-        )
-        if action != "none"
-        else {"state": "not_checked", "updated": False, "raw_output": "not_returned"}
-    )
     release_after_interrupt = action == "interrupt" and (
         (manage_unclaimed and unclaimed_or_expired) or release_watchdog_lease
     )
@@ -16165,7 +15564,6 @@ def _watchdog_agent_unlocked(
         **base,
         "watchdog_state": "action_sent" if action != "none" else "no_action",
         "action_taken": action,
-        "spark_health": spark_health,
         "action_result": public_watchdog_action_result(result),
     }
 
@@ -17132,30 +16530,10 @@ def _assign_agent_unlocked(
 
     selection: ResolutionDecision | None = None
     if ollama_descriptor is not None:
-        routing = None
         model = ollama_descriptor.model
         reasoning_effort = None
     else:
-        if allow_unauthenticated:
-            ensure_agent_not_blocked_by_codex_usage(agent)
-        routing = (
-            None
-            if allow_unauthenticated
-            else codex_usage_routing_decision(
-                agent,
-                role=role,
-                group_id=group_id,
-                job_id=job_id,
-            )
-        )
-        if routing is not None and (
-            routing["decision"] == "blocked" or routing["model"] is None
-        ):
-            raise AgentError(
-                "codex-usage blocked assignment before prompt send: "
-                f"reason={routing.get('reason') or 'unknown'}; "
-                f"policy_source={routing.get('policy_source') or 'unknown'}"
-            )
+        ensure_agent_not_blocked_by_codex_usage(agent)
         requested_target_class, resolver_authority = _resolver_target_selection_inputs(
             agent,
             agent_class,
@@ -17163,7 +16541,7 @@ def _assign_agent_unlocked(
         )
         selection = resolve_runtime_agent_selection(
             role=role,
-            routing=routing,
+            routing=None,
             task_profile=task_profile,
             requested_class=requested_target_class,
             requested_lifecycle=lifecycle,
@@ -17253,7 +16631,6 @@ def _assign_agent_unlocked(
                     **name_args,
                 )
         sent = send_agent(agent, prompt, enter, operation=operation)
-        remember_agent_routing(agent, routing)
     except Exception:
         if release_on_failure and not (
             isinstance(sent, dict) and sent.get("status") == "sent"
@@ -17311,8 +16688,6 @@ def _assign_agent_unlocked(
         "prompt_output": "not_returned",
         "response_output": "not_returned",
     }
-    if routing is not None:
-        assignment_record["routing"] = routing
     try:
         record_assignment(assignment_record)
     except Exception:
@@ -17332,7 +16707,6 @@ def _assign_agent_unlocked(
         "model_switch": model_switch,
         "selection": public_resolution_decision(selection),
         "task_profile": public_task_profile(task_profile),
-        "routing": routing,
         "group_id": group_id,
         "job_id": job_id,
         "skill": {
@@ -17723,7 +17097,6 @@ def list_assignments(
     agent: str = "all",
     limit: int = 20,
     *,
-    strict_routing: bool = False,
     initialize_state: bool = True,
 ) -> dict[str, Any]:
     if initialize_state:
@@ -17768,23 +17141,6 @@ def list_assignments(
             continue
         record_agent = record.get("agent")
         if isinstance(record_agent, str) and record_agent in selected_records:
-            if strict_routing and "routing" in record:
-                routing = record["routing"]
-                if (
-                    not isinstance(routing, dict)
-                    or "account" not in routing
-                    or routing.get("account") is None
-                ):
-                    raise AgentError(
-                        "codex-usage assignment routing metadata is invalid"
-                    )
-                if "decision" in routing and (
-                    not isinstance(routing["decision"], str)
-                    or routing["decision"] not in CODEX_USAGE_DECISIONS
-                ):
-                    raise AgentError(
-                        "codex-usage assignment routing metadata is invalid"
-                    )
             records.append(sanitize_assignment_record(record))
     return {
         "agent": agent,
@@ -17838,97 +17194,6 @@ def _is_assignment_report_output_meaningful(output: str, *, running: bool) -> bo
         if not any(pattern.search(line) for pattern in ASSIGNMENT_REPORT_NOISE_TEXT_RE):
             return True
     return False
-
-
-def _spark_health_from_assignment_report(
-    agent: str,
-    assignment: dict[str, Any],
-    status: dict[str, Any],
-    *,
-    output: str,
-    has_fresh_output: bool,
-) -> dict[str, Any]:
-    if not has_fresh_output or not _is_assignment_report_output_meaningful(
-        output, running=bool(status.get("running"))
-    ):
-        return {
-            "state": "not_checked",
-            "updated": False,
-            "raw_output": "not_returned",
-        }
-    lease = status.get("lease") if isinstance(status.get("lease"), dict) else None
-    if not isinstance(lease, dict):
-        return {
-            "state": "not_checked",
-            "updated": False,
-            "reason": "lease_not_available",
-            "raw_output": "not_returned",
-        }
-    lease_id = lease.get("lease_id")
-    if not isinstance(lease_id, str) or not LEASE_ID_RE.fullmatch(lease_id):
-        return {
-            "state": "not_checked",
-            "updated": False,
-            "reason": "lease_identity_unavailable",
-            "raw_output": "not_returned",
-        }
-    assignment_lease = assignment.get("lease")
-    if not isinstance(assignment_lease, dict):
-        return {
-            "state": "not_checked",
-            "updated": False,
-            "reason": "assignment_lease_unavailable",
-            "raw_output": "not_returned",
-        }
-    assignment_lease_id = assignment_lease.get("lease_id")
-    if (
-        not isinstance(assignment_lease_id, str)
-        or not LEASE_ID_RE.fullmatch(assignment_lease_id)
-        or assignment_lease_id != lease_id
-    ):
-        return {
-            "state": "not_checked",
-            "updated": False,
-            "reason": "assignment_lease_unbound",
-            "raw_output": "not_returned",
-        }
-    current_assignment = status.get("last_assignment")
-    if not isinstance(current_assignment, dict):
-        return {
-            "state": "not_checked",
-            "updated": False,
-            "reason": "current_assignment_unknown",
-            "raw_output": "not_returned",
-        }
-    if current_assignment.get("assignment_id") != assignment.get("assignment_id"):
-        return {
-            "state": "not_checked",
-            "updated": False,
-            "reason": "assignment_not_current",
-            "raw_output": "not_returned",
-        }
-    if parse_utc_timestamp(current_assignment.get("created_at_utc")) is None:
-        return {
-            "state": "not_checked",
-            "updated": False,
-            "reason": "current_assignment_timestamp_missing",
-            "raw_output": "not_returned",
-        }
-    if parse_utc_timestamp(
-        current_assignment.get("created_at_utc")
-    ) != parse_utc_timestamp(assignment.get("created_at_utc")):
-        return {
-            "state": "not_checked",
-            "updated": False,
-            "reason": "assignment_timestamp_mismatch",
-            "raw_output": "not_returned",
-        }
-    return update_agent_spark_health_if_lease_current(
-        agent,
-        lease,
-        state="healthy",
-        reason="spark_turn_assignment_report_output",
-    )
 
 
 def assignment_report(
@@ -18038,11 +17303,6 @@ def assignment_report(
         return {
             **base_result,
             "report_status": "no_output",
-            "spark_health": {
-                "state": "not_checked",
-                "updated": False,
-                "raw_output": "not_returned",
-            },
             "redaction_applied": False,
             "output_chars": 0,
             "output_lines": 0,
@@ -18056,11 +17316,6 @@ def assignment_report(
             **base_result,
             "report_status": newer_assignment_output_boundary["status"],
             "report_status_detail": newer_assignment_output_boundary["detail"],
-            "spark_health": {
-                "state": "not_checked",
-                "updated": False,
-                "raw_output": "not_returned",
-            },
             "redaction_applied": False,
             "output_chars": 0,
             "output_lines": 0,
@@ -18081,11 +17336,6 @@ def assignment_report(
         return {
             **base_result,
             "report_status": "no_output",
-            "spark_health": {
-                "state": "not_checked",
-                "updated": False,
-                "raw_output": "not_returned",
-            },
             "redaction_applied": False,
             "output_chars": 0,
             "output_lines": 0,
@@ -18112,11 +17362,6 @@ def assignment_report(
             return {
                 **base_result,
                 "report_status": "pending",
-                "spark_health": {
-                    "state": "not_checked",
-                    "updated": False,
-                    "raw_output": "not_returned",
-                },
                 "redaction_applied": False,
                 "output_chars": 0,
                 "output_lines": 0,
@@ -18127,13 +17372,6 @@ def assignment_report(
             }
     excerpt = safe_tail(agent, lines, chars, source)
     output = excerpt.get("output") if isinstance(excerpt.get("output"), str) else ""
-    spark_health = _spark_health_from_assignment_report(
-        agent,
-        assignment,
-        status,
-        output=output,
-        has_fresh_output=has_fresh_output,
-    )
     return {
         **base_result,
         "report_status": "excerpt_available"
@@ -18149,7 +17387,6 @@ def assignment_report(
         "output_truncated_by_lines": excerpt.get("output_truncated_by_lines"),
         "output_truncated_by_chars": excerpt.get("output_truncated_by_chars"),
         "output": output,
-        "spark_health": spark_health,
         "lease": excerpt.get("lease"),
     }
 
@@ -24145,21 +23382,6 @@ def call_tool(
             selected_agent,
             principal_class=authority_class,
             known_generation=known_generation,
-        )
-    if name == "agent_routing_decision":
-        selected_agent = single_agent_id(
-            str(args.get("agent", "")), "agent_routing_decision"
-        )
-        role = str(args.get("role", "arbeitsbiene"))
-        if role not in {"exploriererin", "arbeitsbiene"}:
-            raise AgentError("role must be 'exploriererin' or 'arbeitsbiene'")
-        return codex_usage_routing_decision(
-            selected_agent,
-            role=role,
-            group_id=args.get("group_id")
-            if isinstance(args.get("group_id"), str)
-            else None,
-            job_id=args.get("job_id") if isinstance(args.get("job_id"), str) else None,
         )
     if name == "agent_scope_check":
         return scope_check(
@@ -33977,25 +33199,6 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "agent_routing_decision",
-        "description": "Dry-run der codex-usage Modell- und Credit-Entscheidung fuer eine Agentin; sendet keinen Prompt.",
-        "inputSchema": {
-            "type": "object",
-            "required": ["agent"],
-            "properties": {
-                "agent": agent_selector_schema(single=True),
-                "role": {
-                    "type": "string",
-                    "enum": ["exploriererin", "arbeitsbiene"],
-                    "default": "arbeitsbiene",
-                },
-                "group_id": text_schema(128),
-                "job_id": text_schema(128),
-            },
-            "additionalProperties": False,
-        },
-    },
-    {
         "name": "agent_assign",
         "description": "Send a structured, skill-aware assignment to one Agentin with explicit scope, write boundaries, and model policy. Does not return the prompt or response output; use agent_assignment_report with the returned assignment_id after activity.",
         "inputSchema": {
@@ -36468,16 +35671,6 @@ def _main_cli_impl(argv: list[str]) -> int:
     )
     p_scope_check.add_argument("--cwd")
 
-    p_routing_decision = sub.add_parser("routing-decision")
-    p_routing_decision.add_argument("agent")
-    p_routing_decision.add_argument(
-        "--role",
-        choices=["exploriererin", "arbeitsbiene"],
-        default="arbeitsbiene",
-    )
-    p_routing_decision.add_argument("--group-id")
-    p_routing_decision.add_argument("--job-id")
-
     def add_task_evidence_options(parser_obj: argparse.ArgumentParser) -> None:
         parser_obj.add_argument(
             "--complexity",
@@ -37199,18 +36392,6 @@ def _main_cli_impl(argv: list[str]) -> int:
                         "scope": args.scope,
                         "write_paths": args.write_paths,
                         "cwd": args.cwd,
-                    },
-                )
-            )
-        if args.command == "routing-decision":
-            return print_json(
-                call_validated_tool(
-                    "agent_routing_decision",
-                    {
-                        "agent": args.agent,
-                        "role": args.role,
-                        "group_id": args.group_id,
-                        "job_id": args.job_id,
                     },
                 )
             )
