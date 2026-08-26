@@ -1,4 +1,6 @@
 from dataclasses import asdict, replace
+from datetime import UTC, datetime, timedelta
+import importlib
 import json
 import pickle
 
@@ -17,13 +19,14 @@ from codex_master.agent_resolver import (
 from codex_master.worker_resolution_carrier import (
     WorkerResolutionCarrierDenied,
     WorkerResolutionEvidenceV2,
-    build_worker_registry_reservation,
+    WorkerRegistryReservationIssuerV2,
     build_worker_resolution_carrier,
 )
 from codex_master.worker_resume import WorkerLifecycle
 from codex_master.worker_spawn_ledger import (
     FenceEpoch,
     Generation,
+    LeaseBindingConsumerInputV1,
     LedgerRevision,
     SpawnPhase,
     WorkerSpawnTicketV2,
@@ -140,6 +143,94 @@ def _carrier():
     ticket = _ticket(decision)
     evidence = _evidence(ticket, decision, offer)
     return ticket, evidence, build_worker_resolution_carrier(ticket, evidence)
+
+
+def _bound_reservation(*, principal_id: str = "dw-" + "7" * 32):
+    allocator_module = importlib.import_module("codex_master.runtime_account_allocator")
+
+    class _Adapter:
+        adapter_id = "adapter-carrier"
+
+        def reserve_capability_atomically(self, _capability, evidence):
+            return allocator_module.AccountReservation(
+                reservation_id="reservation-carrier",
+                account_binding_digest=_digest("a"),
+                profile_binding_digest=_digest("b"),
+                provider_adapter_id=self.adapter_id,
+                capacity_evidence=evidence,
+                lease_revision=1,
+                evidence_revision=evidence.evidence_revision,
+                fencing_token=evidence.fencing_token,
+                fence_epoch=evidence.fence_epoch,
+                expires_at_utc=evidence.expires_at_utc,
+            )
+
+        def release_reservation(self, _reservation):
+            return True
+
+    allocator = allocator_module.RuntimeAccountAllocator(_Adapter())
+    ticket, _evidence_value, carrier = _carrier()
+    p0_ticket = allocator_module.ValidatedAllocationTicket(
+        ticket_id=ticket.ticket_id,
+        resolution_decision=carrier.decision,
+        selection_offer=carrier.offer,
+        resolver_offer_generation=carrier.resolver_offer_generation,
+        policy_generation=ticket.policy_generation.value,
+        policy_digest=ticket.policy_digest,
+        capability_binding_digest=carrier.capability_binding_digest,
+        ledger_revision=1,
+        phase="OFFER_VALIDATED",
+        fencing_token="fence-carrier",
+        fence_epoch=ticket.fence_epoch.value,
+    )
+    now = datetime.now(UTC)
+    capacity_evidence = allocator_module.CapacityEvidence(
+        ticket_id=p0_ticket.ticket_id,
+        resolver_offer_generation=p0_ticket.resolver_offer_generation,
+        policy_generation=p0_ticket.policy_generation,
+        capability_binding_digest=p0_ticket.capability_binding_digest,
+        ledger_revision=p0_ticket.ledger_revision,
+        fencing_token=p0_ticket.fencing_token,
+        fence_epoch=p0_ticket.fence_epoch,
+        provider_adapter_id="adapter-carrier",
+        capacity_units=2,
+        quota_units=2,
+        cost_units=2,
+        resource_units=2,
+        evidence_revision=1,
+        observed_at_utc=now - timedelta(seconds=1),
+        expires_at_utc=now + timedelta(minutes=5),
+    )
+    lease = allocator.allocate(p0_ticket, capacity_evidence)
+    receipt = allocator.issue_lease_binding_receipt(lease, p0_ticket, capacity_evidence)
+    verification = allocator.verify_lease_binding_receipt(
+        receipt,
+        expected_lease=lease,
+        expected_ticket=p0_ticket,
+        expected_capacity_evidence=capacity_evidence,
+    )
+    reference = allocator.lease_binding_reference_for(verification)
+    allocator.close_lease_binding_verification(verification)
+    binding = LeaseBindingConsumerInputV1(
+        receipt=receipt,
+        lease=lease,
+        allocation_ticket=p0_ticket,
+        capacity_evidence=capacity_evidence,
+    )
+    current_ticket = replace(
+        ticket,
+        phase=SpawnPhase.LEASE_RESERVED,
+        ledger_revision=LedgerRevision(2),
+        lease_binding_reference=reference,
+        account_binding_digest=str(lease.account_binding_digest),
+    )
+    reservation = WorkerRegistryReservationIssuerV2(allocator).issue(
+        resolution=carrier,
+        current_ticket=current_ticket,
+        principal_id=principal_id,
+        lease_binding=binding,
+    )
+    return allocator, ticket, current_ticket, carrier, binding, reservation
 
 
 def test_resolution_decision_digest_is_complete_stable_and_strict() -> None:
@@ -293,17 +384,13 @@ def test_carrier_normalizes_invocation_only_via_central_alias() -> None:
 
 
 def test_carriers_redact_and_refuse_serialization_or_runtime_data() -> None:
-    ticket, _evidence_value, carrier = _carrier()
-    reservation = build_worker_registry_reservation(
-        resolution=carrier,
-        principal_id="dw-worker-7",
-        ticket_ledger_revision=ticket.ledger_revision,
-        ticket_fence_epoch=ticket.fence_epoch,
+    _allocator_value, _ticket, _current_ticket, carrier, _binding, reservation = (
+        _bound_reservation()
     )
 
-    assert reservation.lease_binding_digest is None
-    assert reservation.account_binding_digest is None
-    assert reservation.profile_binding_digest is None
+    assert not hasattr(reservation, "lease_binding_digest")
+    assert not hasattr(reservation, "account_binding_digest")
+    assert not hasattr(reservation, "profile_binding_digest")
     for value in (carrier, reservation):
         assert repr(value) == f"<{type(value).__name__} redacted>"
         assert str(value) == repr(value)
@@ -317,54 +404,49 @@ def test_carriers_redact_and_refuse_serialization_or_runtime_data() -> None:
 
 
 @pytest.mark.parametrize(
-    "invalid_input",
-    (
-        "resolution",
-        "principal_bool",
-        "principal_empty",
-        "revision_bool",
-        "revision_zero",
-        "fence_bool",
-        "fence_drift",
-    ),
+    "drift", ("phase", "principal", "account", "binding", "allocator")
 )
-def test_reservation_rejects_malformed_or_drifting_bindings(invalid_input: str) -> None:
-    ticket, _evidence_value, carrier = _carrier()
-    values = {
-        "resolution": carrier,
-        "principal_id": "dw-worker-7",
-        "ticket_ledger_revision": ticket.ledger_revision,
-        "ticket_fence_epoch": ticket.fence_epoch,
-    }
-    if invalid_input == "resolution":
-        values["resolution"] = object()
-    elif invalid_input == "principal_bool":
-        values["principal_id"] = True
-    elif invalid_input == "principal_empty":
-        values["principal_id"] = ""
-    elif invalid_input == "revision_bool":
-        values["ticket_ledger_revision"] = True
-    elif invalid_input == "revision_zero":
-        values["ticket_ledger_revision"] = LedgerRevision(0)
-    elif invalid_input == "fence_bool":
-        values["ticket_fence_epoch"] = False
+def test_reservation_issuer_rejects_malformed_or_drifting_bindings(drift: str) -> None:
+    allocator, _ticket, current_ticket, carrier, binding, _reservation = (
+        _bound_reservation()
+    )
+    if drift == "phase":
+        current_ticket = replace(current_ticket, phase=SpawnPhase.OFFER_VALIDATED)
+    elif drift == "account":
+        current_ticket = replace(current_ticket, account_binding_digest=_digest("0"))
+    elif drift == "principal":
+        principal_id = "dw-not-hex"
     else:
-        values["ticket_fence_epoch"] = FenceEpoch(7)
-
+        principal_id = "dw-" + "7" * 32
+    if drift == "binding":
+        binding = object()
+    elif drift != "principal":
+        principal_id = "dw-" + "7" * 32
+    issuer = WorkerRegistryReservationIssuerV2(allocator)
+    if drift == "allocator":
+        foreign_allocator = importlib.import_module(
+            "codex_master.runtime_account_allocator"
+        ).RuntimeAccountAllocator(object())
+        issuer = WorkerRegistryReservationIssuerV2(foreign_allocator)
     with pytest.raises(WorkerResolutionCarrierDenied):
-        build_worker_registry_reservation(**values)
+        issuer.issue(
+            resolution=carrier,
+            current_ticket=current_ticket,
+            principal_id=principal_id,
+            lease_binding=binding,
+        )
 
 
 def test_reservation_rejects_premature_lease_binding() -> None:
-    ticket, _evidence_value, carrier = _carrier()
-
-    with pytest.raises(TypeError):
-        build_worker_registry_reservation(
+    allocator, ticket, _current_ticket, carrier, _binding, _reservation = (
+        _bound_reservation()
+    )
+    with pytest.raises(WorkerResolutionCarrierDenied):
+        WorkerRegistryReservationIssuerV2(allocator).issue(
             resolution=carrier,
-            principal_id="dw-worker-7",
-            ticket_ledger_revision=ticket.ledger_revision,
-            ticket_fence_epoch=ticket.fence_epoch,
-            lease_binding_digest=_digest("f"),
+            current_ticket=ticket,
+            principal_id="dw-" + "7" * 32,
+            lease_binding=object(),
         )
 
 
@@ -387,3 +469,126 @@ def test_carrier_rejects_bool_as_fence_epoch() -> None:
             ticket,
             replace(_evidence(ticket, decision, offer), ticket_fence_epoch=True),
         )
+
+
+def test_bound_reservation_issuer_rejects_fake_allocator() -> None:
+    import codex_master.worker_resolution_carrier as carrier_module
+
+    with pytest.raises(
+        WorkerResolutionCarrierDenied, match="runtime account allocator"
+    ):
+        carrier_module.WorkerRegistryReservationIssuerV2(object())
+
+
+def test_reservation_issuer_rejects_opaque_receipt_forge_and_foreign_binding() -> None:
+    allocator, _ticket, current_ticket, carrier, binding, _reservation = (
+        _bound_reservation()
+    )
+    runtime = importlib.import_module("codex_master.runtime_account_allocator")
+    forged_receipt = object.__new__(runtime.LeaseBindingReceiptV1)
+    object.__setattr__(
+        forged_receipt,
+        "_lease_binding_digest",
+        runtime._OpaqueText(str(binding.receipt._lease_binding_digest)),
+    )
+    forged = replace(binding, receipt=forged_receipt)
+    issuer = WorkerRegistryReservationIssuerV2(allocator)
+
+    with pytest.raises(
+        WorkerResolutionCarrierDenied, match="lease binding verification denied"
+    ):
+        issuer.issue(
+            resolution=carrier,
+            current_ticket=current_ticket,
+            principal_id="dw-" + "7" * 32,
+            lease_binding=forged,
+        )
+    assert allocator._active_lease_binding_verifications == {}
+
+    (
+        foreign_allocator,
+        _foreign_ticket,
+        _foreign_current,
+        _foreign_carrier,
+        foreign_binding,
+        _foreign_reservation,
+    ) = _bound_reservation()
+    with pytest.raises(
+        WorkerResolutionCarrierDenied, match="lease binding verification denied"
+    ):
+        issuer.issue(
+            resolution=carrier,
+            current_ticket=current_ticket,
+            principal_id="dw-" + "7" * 32,
+            lease_binding=foreign_binding,
+        )
+    assert allocator._active_lease_binding_verifications == {}
+    assert foreign_allocator._active_lease_binding_verifications == {}
+
+
+def test_carrier_primary_error_survives_real_guard_close_deny(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allocator, _ticket, current_ticket, carrier, binding, _reservation = (
+        _bound_reservation()
+    )
+    runtime = importlib.import_module("codex_master.runtime_account_allocator")
+    original = runtime.RuntimeAccountAllocator.lease_binding_reference_for
+    primary = RuntimeError("carrier-primary-error")
+
+    def fail_after_real_reference(self, verification):
+        original(self, verification)
+        object.__setattr__(binding.lease, "profile_binding_digest", _digest("0"))
+        raise primary
+
+    monkeypatch.setattr(
+        runtime.RuntimeAccountAllocator,
+        "lease_binding_reference_for",
+        fail_after_real_reference,
+    )
+
+    with pytest.raises(RuntimeError, match="carrier-primary-error") as caught:
+        WorkerRegistryReservationIssuerV2(allocator).issue(
+            resolution=carrier,
+            current_ticket=current_ticket,
+            principal_id="dw-" + "7" * 32,
+            lease_binding=binding,
+        )
+    assert caught.value is primary
+    assert caught.value.__notes__ == [
+        "lease binding guard close denied; quarantine required"
+    ]
+    assert allocator._active_lease_binding_verifications == {}
+
+
+def test_carrier_guard_close_deny_without_primary_is_hard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allocator, _ticket, current_ticket, carrier, binding, _reservation = (
+        _bound_reservation()
+    )
+    runtime = importlib.import_module("codex_master.runtime_account_allocator")
+    original = runtime.RuntimeAccountAllocator.lease_binding_reference_for
+
+    def drift_after_real_reference(self, verification):
+        reference = original(self, verification)
+        object.__setattr__(binding.lease, "profile_binding_digest", _digest("0"))
+        return reference
+
+    monkeypatch.setattr(
+        runtime.RuntimeAccountAllocator,
+        "lease_binding_reference_for",
+        drift_after_real_reference,
+    )
+
+    with pytest.raises(
+        WorkerResolutionCarrierDenied, match="lease binding verification denied"
+    ) as caught:
+        WorkerRegistryReservationIssuerV2(allocator).issue(
+            resolution=carrier,
+            current_ticket=current_ticket,
+            principal_id="dw-" + "7" * 32,
+            lease_binding=binding,
+        )
+    assert type(caught.value.__cause__) is runtime.AllocationDenied
+    assert allocator._active_lease_binding_verifications == {}

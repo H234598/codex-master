@@ -8,6 +8,16 @@ from enum import Enum
 import re
 from typing import Final
 
+from codex_master.agent_resolver import canonical_resolution_decision_digest
+from codex_master.runtime_account_allocator import (
+    AllocationDenied,
+    CapacityEvidence,
+    CredentialLease,
+    LeaseBindingReceiptV1,
+    LeaseBindingReferenceV1,
+    RuntimeAccountAllocator,
+    ValidatedAllocationTicket,
+)
 from codex_master.worker_resume import (
     CapsuleGeneration,
     ResumeDenied,
@@ -167,13 +177,29 @@ class VerifiedPrincipalV2(_RedactedNonSerializable):
 
 
 @dataclass(frozen=True, slots=True, repr=False)
-class LeaseReservationEvidenceV2(_RedactedNonSerializable):
-    lease_binding_digest: str
-    account_binding_digest: str
+class LeaseBindingConsumerInputV1(_RedactedNonSerializable):
+    """Exact P0 objects transported to one bound lease consumer."""
+
+    receipt: LeaseBindingReceiptV1
+    lease: CredentialLease
+    allocation_ticket: ValidatedAllocationTicket
+    capacity_evidence: CapacityEvidence
 
     def __post_init__(self) -> None:
-        _require_digest(self.lease_binding_digest, "lease_binding_digest")
-        _require_digest(self.account_binding_digest, "account_binding_digest")
+        if type(self.receipt) is not LeaseBindingReceiptV1:
+            raise SpawnDenied("lease binding verification denied")
+        if type(self.lease) is not CredentialLease:
+            raise SpawnDenied("lease binding verification denied")
+        if type(self.allocation_ticket) is not ValidatedAllocationTicket:
+            raise SpawnDenied("lease binding verification denied")
+        if type(self.capacity_evidence) is not CapacityEvidence:
+            raise SpawnDenied("lease binding verification denied")
+
+    def __copy__(self) -> object:
+        raise TypeError("worker spawn ledger internals are not serializable")
+
+    def __deepcopy__(self, _memo: object) -> object:
+        raise TypeError("worker spawn ledger internals are not serializable")
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -197,7 +223,7 @@ class WorkerSpawnTicketV2(_RedactedNonSerializable):
     ledger_revision: LedgerRevision
     phase: SpawnPhase
     claimed_by_principal_id: str | None = None
-    lease_binding_digest: str | None = None
+    lease_binding_reference: LeaseBindingReferenceV1 | None = None
     account_binding_digest: str | None = None
     source_resume_capsule_digest: str | None = None
     source_resume_capsule_generation: CapsuleGeneration | None = None
@@ -242,7 +268,7 @@ class WorkerSpawnTicketV2(_RedactedNonSerializable):
         if self.claimed_by_principal_id is not None:
             _require_text(self.claimed_by_principal_id, "claimed_by_principal_id")
         self._validate_optional_binding_pair(
-            self.lease_binding_digest,
+            self.lease_binding_reference,
             self.account_binding_digest,
             "lease",
         )
@@ -279,16 +305,17 @@ class WorkerSpawnTicketV2(_RedactedNonSerializable):
 
     @staticmethod
     def _validate_optional_binding_pair(
-        digest: object | None, generation_or_digest: object | None, field: str
+        reference: object | None, account_binding: object | None, field: str
     ) -> None:
-        if (digest is None) != (generation_or_digest is None):
+        if (reference is None) != (account_binding is None):
             raise SpawnDenied(f"incomplete {field} binding")
-        if digest is None:
+        if reference is None:
             return
-        _require_digest(digest, f"{field} digest")
         if field == "lease":
-            _require_digest(generation_or_digest, "account_binding_digest")
-        elif type(generation_or_digest) is not CapsuleGeneration:
+            if type(reference) is not LeaseBindingReferenceV1:
+                raise SpawnDenied("invalid lease binding reference")
+            _require_digest(account_binding, "account_binding_digest")
+        elif type(account_binding) is not CapsuleGeneration:
             raise SpawnDenied("invalid capsule generation")
 
 
@@ -297,7 +324,7 @@ class SpawnLedgerStateV2(_RedactedNonSerializable):
     state_revision: LedgerRevision
     tickets: tuple[WorkerSpawnTicketV2, ...]
     consumed_capsule_digests: tuple[str, ...]
-    used_lease_binding_digests: tuple[str, ...]
+    used_lease_binding_references: tuple[LeaseBindingReferenceV1, ...]
 
     def __post_init__(self) -> None:
         if type(self.state_revision) is not LedgerRevision:
@@ -311,8 +338,8 @@ class SpawnLedgerStateV2(_RedactedNonSerializable):
         self._validate_digest_tuple(
             self.consumed_capsule_digests, "consumed capsule digests"
         )
-        self._validate_digest_tuple(
-            self.used_lease_binding_digests, "used lease digests"
+        self._validate_reference_tuple(
+            self.used_lease_binding_references, "used lease binding references"
         )
 
     @staticmethod
@@ -324,13 +351,23 @@ class SpawnLedgerStateV2(_RedactedNonSerializable):
         if len(set(values)) != len(values):
             raise SpawnDenied(f"duplicate {field}")
 
+    @staticmethod
+    def _validate_reference_tuple(values: object, field: str) -> None:
+        if type(values) is not tuple:
+            raise SpawnDenied(f"invalid {field}")
+        for value in values:
+            if type(value) is not LeaseBindingReferenceV1:
+                raise SpawnDenied(f"invalid {field}")
+        if len(set(values)) != len(values):
+            raise SpawnDenied(f"duplicate {field}")
+
     @classmethod
     def empty(cls) -> SpawnLedgerStateV2:
         return cls(
             state_revision=LedgerRevision(0),
             tickets=(),
             consumed_capsule_digests=(),
-            used_lease_binding_digests=(),
+            used_lease_binding_references=(),
         )
 
 
@@ -353,13 +390,14 @@ class SpawnLedgerStatePort(ABC):
 class WorkerSpawnLedger(ResumeTransactionPort):
     """Fail-closed spawn state machine with no storage or runtime I/O."""
 
-    __slots__ = ("_delegable_class_ids", "_state_port")
+    __slots__ = ("_allocator", "_delegable_class_ids", "_state_port")
 
     def __init__(
         self,
         *,
         state_port: SpawnLedgerStatePort,
         delegable_nonleadership_class_ids: frozenset[str],
+        allocator: RuntimeAccountAllocator,
     ) -> None:
         if not isinstance(state_port, SpawnLedgerStatePort):
             raise SpawnDenied("nominal spawn ledger state port required")
@@ -372,6 +410,9 @@ class WorkerSpawnLedger(ResumeTransactionPort):
             for class_id in delegable_nonleadership_class_ids
         ):
             raise SpawnDenied("invalid delegable class set")
+        if type(allocator) is not RuntimeAccountAllocator:
+            raise SpawnDenied("runtime account allocator required")
+        self._allocator = allocator
         self._state_port = state_port
         self._delegable_class_ids = delegable_nonleadership_class_ids
 
@@ -484,7 +525,7 @@ class WorkerSpawnLedger(ResumeTransactionPort):
         expected_revision: object,
         expected_fence_epoch: object,
         teamlead: object,
-        lease_evidence: object | None = None,
+        lease_binding: object | None = None,
     ) -> WorkerSpawnTicketV2:
         ticket = self._require_ticket_value(ticket)
         if type(phase) is not SpawnPhase:
@@ -504,35 +545,70 @@ class WorkerSpawnLedger(ResumeTransactionPort):
         if phase not in _NEXT_PHASES.get(current.phase, frozenset()):
             raise SpawnDenied("illegal phase transition")
 
-        used_leases = state.used_lease_binding_digests
+        used_references = state.used_lease_binding_references
         changes: dict[str, object] = {"phase": phase}
-        if phase is SpawnPhase.LEASE_RESERVED:
-            if type(lease_evidence) is not LeaseReservationEvidenceV2:
-                raise SpawnDenied("lease reservation evidence required")
-            if lease_evidence.lease_binding_digest in used_leases:
-                raise SpawnDenied("lease binding replay")
-            changes.update(
-                lease_binding_digest=lease_evidence.lease_binding_digest,
-                account_binding_digest=lease_evidence.account_binding_digest,
+        verification = None
+        primary: BaseException | None = None
+        try:
+            if phase is SpawnPhase.LEASE_RESERVED:
+                if type(lease_binding) is not LeaseBindingConsumerInputV1:
+                    raise SpawnDenied("lease binding verification denied")
+                self._require_allocation_ticket(current, lease_binding)
+                try:
+                    verification = self._allocator.verify_lease_binding_receipt(
+                        lease_binding.receipt,
+                        expected_lease=lease_binding.lease,
+                        expected_ticket=lease_binding.allocation_ticket,
+                        expected_capacity_evidence=lease_binding.capacity_evidence,
+                    )
+                    reference = self._allocator.lease_binding_reference_for(
+                        verification
+                    )
+                except AllocationDenied as exc:
+                    raise SpawnDenied("lease binding verification denied") from exc
+                if type(reference) is not LeaseBindingReferenceV1:
+                    raise SpawnDenied("lease binding verification denied")
+                if reference in used_references:
+                    raise SpawnDenied("lease binding replay")
+                changes.update(
+                    lease_binding_reference=reference,
+                    account_binding_digest=str(
+                        lease_binding.lease.account_binding_digest
+                    ),
+                )
+                used_references += (reference,)
+            elif lease_binding is not None:
+                raise SpawnDenied("unexpected lease binding")
+
+            if phase in {
+                SpawnPhase.ROLLED_BACK,
+                SpawnPhase.CHECKPOINTED,
+                SpawnPhase.STOPPED,
+            }:
+                self._require_terminal_binding(current)
+
+            advanced = self._advance_ticket(current, **changes)
+            self._commit(
+                state,
+                tickets=self._replace_ticket(state, advanced),
+                used_lease_binding_references=used_references,
             )
-            used_leases += (lease_evidence.lease_binding_digest,)
-        elif lease_evidence is not None:
-            raise SpawnDenied("unexpected lease evidence")
-
-        if phase in {
-            SpawnPhase.ROLLED_BACK,
-            SpawnPhase.CHECKPOINTED,
-            SpawnPhase.STOPPED,
-        }:
-            self._require_terminal_binding(current)
-
-        advanced = self._advance_ticket(current, **changes)
-        self._commit(
-            state,
-            tickets=self._replace_ticket(state, advanced),
-            used_lease_binding_digests=used_leases,
-        )
-        return advanced
+            return advanced
+        except BaseException as exc:
+            primary = exc
+            raise
+        finally:
+            if verification is not None:
+                try:
+                    self._allocator.close_lease_binding_verification(verification)
+                except AllocationDenied as close_error:
+                    if primary is None:
+                        raise SpawnDenied(
+                            "lease binding verification denied"
+                        ) from close_error
+                    primary.add_note(
+                        "lease binding guard close denied; quarantine required"
+                    )
 
     def bind_resume_capsule(
         self,
@@ -708,7 +784,8 @@ class WorkerSpawnLedger(ResumeTransactionPort):
         *,
         tickets: tuple[WorkerSpawnTicketV2, ...] | None = None,
         consumed_capsule_digests: tuple[str, ...] | None = None,
-        used_lease_binding_digests: tuple[str, ...] | None = None,
+        used_lease_binding_references: tuple[LeaseBindingReferenceV1, ...]
+        | None = None,
     ) -> None:
         replacement = SpawnLedgerStateV2(
             state_revision=LedgerRevision(state.state_revision.value + 1),
@@ -718,10 +795,10 @@ class WorkerSpawnLedger(ResumeTransactionPort):
                 if consumed_capsule_digests is None
                 else consumed_capsule_digests
             ),
-            used_lease_binding_digests=(
-                state.used_lease_binding_digests
-                if used_lease_binding_digests is None
-                else used_lease_binding_digests
+            used_lease_binding_references=(
+                state.used_lease_binding_references
+                if used_lease_binding_references is None
+                else used_lease_binding_references
             ),
         )
         try:
@@ -832,11 +909,44 @@ class WorkerSpawnLedger(ResumeTransactionPort):
         ):
             raise SpawnDenied("terminal capsule binding required")
 
+    @staticmethod
+    def _require_allocation_ticket(
+        current: WorkerSpawnTicketV2,
+        binding: LeaseBindingConsumerInputV1,
+    ) -> None:
+        allocation_ticket = binding.allocation_ticket
+        try:
+            decision_digest = canonical_resolution_decision_digest(
+                allocation_ticket.resolution_decision
+            )
+        except ValueError as exc:
+            raise SpawnDenied("lease binding verification denied") from exc
+        if (
+            current.phase is not SpawnPhase.OFFER_VALIDATED
+            or allocation_ticket.phase != "OFFER_VALIDATED"
+            or allocation_ticket.ticket_id != current.ticket_id
+            or allocation_ticket.ledger_revision != current.ledger_revision.value
+            or allocation_ticket.fence_epoch != current.fence_epoch.value
+            or decision_digest != current.resolution_decision_digest
+            or allocation_ticket.resolver_offer_generation
+            != allocation_ticket.selection_offer.generation
+            or allocation_ticket.resolution_decision.class_id != current.target_class_id
+            or allocation_ticket.resolver_offer_generation
+            != allocation_ticket.selection_offer.generation
+            or allocation_ticket.policy_generation != current.policy_generation.value
+            or allocation_ticket.policy_digest != current.policy_digest
+            or binding.capacity_evidence.ticket_id != allocation_ticket.ticket_id
+            or binding.capacity_evidence.ledger_revision
+            != allocation_ticket.ledger_revision
+            or binding.capacity_evidence.fence_epoch != allocation_ticket.fence_epoch
+        ):
+            raise SpawnDenied("lease binding verification denied")
+
 
 __all__ = [
     "FenceEpoch",
     "Generation",
-    "LeaseReservationEvidenceV2",
+    "LeaseBindingConsumerInputV1",
     "LedgerRevision",
     "PrincipalRole",
     "SpawnDenied",

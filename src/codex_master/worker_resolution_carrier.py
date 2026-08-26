@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 from codex_master.agent_resolver import (
     LEADERSHIP_CLASS_IDS,
@@ -15,8 +16,16 @@ from codex_master.agent_resolver import (
 from codex_master.worker_spawn_ledger import (
     FenceEpoch,
     Generation,
+    LeaseBindingConsumerInputV1,
     LedgerRevision,
+    SpawnPhase,
     WorkerSpawnTicketV2,
+)
+from codex_master.runtime_account_allocator import (
+    AllocationDenied,
+    LeaseBindingReferenceV1,
+    RuntimeAccountAllocator,
+    ValidatedAllocationTicket,
 )
 
 
@@ -98,9 +107,8 @@ class _ReservationPayload:
         "resolution",
         "ticket_ledger_revision",
         "ticket_fence_epoch",
-        "lease_binding_digest",
-        "account_binding_digest",
-        "profile_binding_digest",
+        "binding_input",
+        "binding_reference",
     )
 
     def __init__(
@@ -110,17 +118,15 @@ class _ReservationPayload:
         resolution: WorkerResolutionCarrierV2,
         ticket_ledger_revision: LedgerRevision,
         ticket_fence_epoch: FenceEpoch,
-        lease_binding_digest: None,
-        account_binding_digest: None,
-        profile_binding_digest: None,
+        binding_input: LeaseBindingConsumerInputV1,
+        binding_reference: LeaseBindingReferenceV1,
     ) -> None:
         object.__setattr__(self, "principal_id", principal_id)
         object.__setattr__(self, "resolution", resolution)
         object.__setattr__(self, "ticket_ledger_revision", ticket_ledger_revision)
         object.__setattr__(self, "ticket_fence_epoch", ticket_fence_epoch)
-        object.__setattr__(self, "lease_binding_digest", lease_binding_digest)
-        object.__setattr__(self, "account_binding_digest", account_binding_digest)
-        object.__setattr__(self, "profile_binding_digest", profile_binding_digest)
+        object.__setattr__(self, "binding_input", binding_input)
+        object.__setattr__(self, "binding_reference", binding_reference)
 
     def __setattr__(self, _name: str, _value: object) -> None:
         raise AttributeError("worker registry reservation payload is immutable")
@@ -230,17 +236,11 @@ class WorkerRegistryReservationV2(_RedactedNonSerializable):
     def ticket_fence_epoch(self) -> FenceEpoch:
         return object.__getattribute__(self, "_payload").ticket_fence_epoch
 
-    @property
-    def lease_binding_digest(self) -> None:
-        return object.__getattribute__(self, "_payload").lease_binding_digest
+    def _binding_input(self) -> LeaseBindingConsumerInputV1:
+        return object.__getattribute__(self, "_payload").binding_input
 
-    @property
-    def account_binding_digest(self) -> None:
-        return object.__getattribute__(self, "_payload").account_binding_digest
-
-    @property
-    def profile_binding_digest(self) -> None:
-        return object.__getattribute__(self, "_payload").profile_binding_digest
+    def _binding_reference(self) -> LeaseBindingReferenceV1:
+        return object.__getattribute__(self, "_payload").binding_reference
 
 
 def build_worker_resolution_carrier(
@@ -320,34 +320,116 @@ def build_worker_resolution_carrier(
     )
 
 
-def build_worker_registry_reservation(
-    *,
-    resolution: object,
-    principal_id: object,
-    ticket_ledger_revision: object,
-    ticket_fence_epoch: object,
-) -> WorkerRegistryReservationV2:
-    """Issue an unbound R1 reservation carrier; lease bindings arrive in a later slice."""
+_DYNAMIC_WORKER_PRINCIPAL_ID_RE = re.compile(r"dw-[0-9a-f]{32}\Z")
 
-    if (
-        type(resolution) is not WorkerResolutionCarrierV2
-        or type(principal_id) is not str
-        or not principal_id
-        or len(principal_id) > 256
-        or type(ticket_ledger_revision) is not LedgerRevision
-        or ticket_ledger_revision.value < 1
-        or type(ticket_fence_epoch) is not FenceEpoch
-        or ticket_fence_epoch != resolution.ticket_fence_epoch
-    ):
-        raise WorkerResolutionCarrierDenied("invalid worker registry reservation")
-    return WorkerRegistryReservationV2._issue(
-        _ReservationPayload(
-            principal_id=principal_id,
-            resolution=resolution,
-            ticket_ledger_revision=ticket_ledger_revision,
-            ticket_fence_epoch=ticket_fence_epoch,
-            lease_binding_digest=None,
-            account_binding_digest=None,
-            profile_binding_digest=None,
-        )
-    )
+
+class WorkerRegistryReservationIssuerV2:
+    """Allocator-bound issuer for one exact LEASE_RESERVED ticket."""
+
+    __slots__ = ("_allocator",)
+
+    def __init__(self, allocator: RuntimeAccountAllocator) -> None:
+        if type(allocator) is not RuntimeAccountAllocator:
+            raise WorkerResolutionCarrierDenied("runtime account allocator required")
+        self._allocator = allocator
+
+    def issue(
+        self,
+        *,
+        resolution: object,
+        current_ticket: object,
+        principal_id: object,
+        lease_binding: object,
+    ) -> WorkerRegistryReservationV2:
+        if (
+            type(resolution) is not WorkerResolutionCarrierV2
+            or type(current_ticket) is not WorkerSpawnTicketV2
+            or current_ticket.phase is not SpawnPhase.LEASE_RESERVED
+            or type(principal_id) is not str
+            or _DYNAMIC_WORKER_PRINCIPAL_ID_RE.fullmatch(principal_id) is None
+            or type(lease_binding) is not LeaseBindingConsumerInputV1
+        ):
+            raise WorkerResolutionCarrierDenied("lease binding verification denied")
+        allocation_ticket = lease_binding.allocation_ticket
+        if (
+            type(allocation_ticket) is not ValidatedAllocationTicket
+            or allocation_ticket.phase != "OFFER_VALIDATED"
+            or allocation_ticket.ticket_id != current_ticket.ticket_id
+            or allocation_ticket.ledger_revision + 1
+            != current_ticket.ledger_revision.value
+            or allocation_ticket.fence_epoch != current_ticket.fence_epoch.value
+            or allocation_ticket.resolution_decision is not resolution.decision
+            or allocation_ticket.selection_offer is not resolution.offer
+            or allocation_ticket.resolver_offer_generation
+            != resolution.resolver_offer_generation
+            or allocation_ticket.policy_generation
+            != current_ticket.policy_generation.value
+            or allocation_ticket.policy_digest != current_ticket.policy_digest
+            or allocation_ticket.capability_binding_digest
+            != resolution.capability_binding_digest
+            or current_ticket.resolution_generation
+            != resolution.ticket_resolution_generation
+            or current_ticket.resolution_decision_digest
+            != resolution.resolution_decision_digest
+            or current_ticket.target_class_id != resolution.decision.class_id
+            or current_ticket.lease_binding_reference is None
+            or current_ticket.account_binding_digest
+            != str(lease_binding.lease.account_binding_digest)
+        ):
+            raise WorkerResolutionCarrierDenied("lease binding verification denied")
+
+        verification = None
+        primary: BaseException | None = None
+        try:
+            try:
+                verification = self._allocator.verify_lease_binding_receipt(
+                    lease_binding.receipt,
+                    expected_lease=lease_binding.lease,
+                    expected_ticket=allocation_ticket,
+                    expected_capacity_evidence=lease_binding.capacity_evidence,
+                )
+                reference = self._allocator.lease_binding_reference_for(verification)
+            except AllocationDenied as exc:
+                raise WorkerResolutionCarrierDenied(
+                    "lease binding verification denied"
+                ) from exc
+            if (
+                type(reference) is not LeaseBindingReferenceV1
+                or reference != current_ticket.lease_binding_reference
+            ):
+                raise WorkerResolutionCarrierDenied("lease binding verification denied")
+            return WorkerRegistryReservationV2._issue(
+                _ReservationPayload(
+                    principal_id=principal_id,
+                    resolution=resolution,
+                    ticket_ledger_revision=current_ticket.ledger_revision,
+                    ticket_fence_epoch=current_ticket.fence_epoch,
+                    binding_input=lease_binding,
+                    binding_reference=reference,
+                )
+            )
+        except BaseException as exc:
+            primary = exc
+            raise
+        finally:
+            if verification is not None:
+                try:
+                    self._allocator.close_lease_binding_verification(verification)
+                except AllocationDenied as close_error:
+                    if primary is None:
+                        raise WorkerResolutionCarrierDenied(
+                            "lease binding verification denied"
+                        ) from close_error
+                    primary.add_note(
+                        "lease binding guard close denied; quarantine required"
+                    )
+
+
+__all__ = [
+    "WorkerRegistryReservationIssuerV2",
+    "WorkerRegistryReservationV2",
+    "WorkerResolutionCarrierDenied",
+    "WorkerResolutionCarrierV2",
+    "WorkerResolutionEvidenceV2",
+    "build_worker_resolution_carrier",
+]

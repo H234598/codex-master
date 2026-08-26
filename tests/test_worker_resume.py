@@ -1,5 +1,6 @@
 import ast
 import dataclasses
+from datetime import UTC, datetime, timedelta
 import importlib
 import pickle
 from pathlib import Path
@@ -7,6 +8,14 @@ from threading import Barrier, Lock, Thread
 
 import pytest
 
+from codex_master.agent_resolver import (
+    AgentClassPolicy,
+    ModelPolicy,
+    ResolutionRequest,
+    build_selection_offer,
+    canonical_resolution_decision_digest,
+    resolve_agent_selection,
+)
 from codex_master.spark_retry import ResumeCapsuleV1
 
 
@@ -45,6 +54,68 @@ def _backend(spawn):
     return _SharedFakeBackend()
 
 
+def _central_contract():
+    classes = (
+        AgentClassPolicy(
+            "worker.research",
+            "persistent",
+            ("persistent",),
+            ("luna",),
+            "low",
+            "xhigh",
+            ("read", "write"),
+        ),
+    )
+    models = (
+        ModelPolicy("gpt-5.6-luna", "luna", 20, ("low", "medium", "high", "xhigh")),
+    )
+    request = ResolutionRequest(
+        "read",
+        "simple",
+        requested_class="worker.research",
+        requested_lifecycle="persistent",
+        requested_model="gpt-5.6-luna",
+        requested_reasoning="xhigh",
+    )
+    decision = resolve_agent_selection(
+        request, classes=classes, models=models, available_models={models[0].model_id}
+    )
+    offer = build_selection_offer(
+        classes=classes, models=models, available_models={models[0].model_id}
+    )
+    return decision, offer
+
+
+def _allocator():
+    allocator_module = importlib.import_module("codex_master.runtime_account_allocator")
+
+    class _Adapter:
+        adapter_id = "adapter-resume"
+
+        def __init__(self) -> None:
+            self.number = 0
+
+        def reserve_capability_atomically(self, _capability, evidence):
+            self.number += 1
+            return allocator_module.AccountReservation(
+                reservation_id=f"reservation-{self.number}",
+                account_binding_digest=_digest("e"),
+                profile_binding_digest=_digest("f"),
+                provider_adapter_id=self.adapter_id,
+                capacity_evidence=evidence,
+                lease_revision=self.number,
+                evidence_revision=evidence.evidence_revision,
+                fencing_token=evidence.fencing_token,
+                fence_epoch=evidence.fence_epoch,
+                expires_at_utc=evidence.expires_at_utc,
+            )
+
+        def release_reservation(self, _reservation):
+            return True
+
+    return allocator_module.RuntimeAccountAllocator(_Adapter())
+
+
 def _teamlead(spawn):
     return spawn.VerifiedPrincipalV2(
         principal_id="teamlead-2",
@@ -65,10 +136,12 @@ def _ledger(spawn, backend=None):
     return spawn.WorkerSpawnLedger(
         state_port=backend or _backend(spawn),
         delegable_nonleadership_class_ids=frozenset({"worker.research"}),
+        allocator=_allocator(),
     )
 
 
 def _publish(spawn, ledger, *, request_id: str = "request-7"):
+    decision, _offer = _central_contract()
     return ledger.publish_requested(
         request_id=request_id,
         requester=_requester(spawn),
@@ -76,7 +149,7 @@ def _publish(spawn, ledger, *, request_id: str = "request-7"):
         topic_digest=_digest("c"),
         target_class_id="worker.research",
         authorized_teamlead=_teamlead(spawn),
-        resolution_decision_digest=_digest("a"),
+        resolution_decision_digest=canonical_resolution_decision_digest(decision),
         resolution_generation=spawn.Generation(4),
         policy_digest=_digest("d"),
         policy_generation=spawn.Generation(9),
@@ -86,14 +159,14 @@ def _publish(spawn, ledger, *, request_id: str = "request-7"):
     )
 
 
-def _append(spawn, ledger, ticket, phase, *, lease_evidence=None):
+def _append(spawn, ledger, ticket, phase, *, lease_binding=None):
     return ledger.append_phase(
         ticket,
         phase,
         expected_revision=ticket.ledger_revision,
         expected_fence_epoch=ticket.fence_epoch,
         teamlead=_teamlead(spawn),
-        lease_evidence=lease_evidence,
+        lease_binding=lease_binding,
     )
 
 
@@ -109,6 +182,51 @@ def _capsule(resume, ticket, *, digest: str = "2", generation: int = 2):
     )
 
 
+def _lease_binding(ledger, ticket):
+    spawn = _spawn_module()
+    allocator_module = importlib.import_module("codex_master.runtime_account_allocator")
+    decision, offer = _central_contract()
+    p0_ticket = allocator_module.ValidatedAllocationTicket(
+        ticket_id=ticket.ticket_id,
+        resolution_decision=decision,
+        selection_offer=offer,
+        resolver_offer_generation=offer.generation,
+        policy_generation=ticket.policy_generation.value,
+        policy_digest=ticket.policy_digest,
+        capability_binding_digest=_digest("e"),
+        ledger_revision=ticket.ledger_revision.value,
+        phase="OFFER_VALIDATED",
+        fencing_token="fence-resume",
+        fence_epoch=ticket.fence_epoch.value,
+    )
+    now = datetime.now(UTC)
+    evidence = allocator_module.CapacityEvidence(
+        ticket_id=p0_ticket.ticket_id,
+        resolver_offer_generation=offer.generation,
+        policy_generation=p0_ticket.policy_generation,
+        capability_binding_digest=p0_ticket.capability_binding_digest,
+        ledger_revision=p0_ticket.ledger_revision,
+        fencing_token=p0_ticket.fencing_token,
+        fence_epoch=p0_ticket.fence_epoch,
+        provider_adapter_id="adapter-resume",
+        capacity_units=2,
+        quota_units=2,
+        cost_units=2,
+        resource_units=2,
+        evidence_revision=ledger._allocator._provider_adapter.number + 1,
+        observed_at_utc=now - timedelta(seconds=1),
+        expires_at_utc=now + timedelta(minutes=5),
+    )
+    lease = ledger._allocator.allocate(p0_ticket, evidence)
+    receipt = ledger._allocator.issue_lease_binding_receipt(lease, p0_ticket, evidence)
+    return spawn.LeaseBindingConsumerInputV1(
+        receipt=receipt,
+        lease=lease,
+        allocation_ticket=p0_ticket,
+        capacity_evidence=evidence,
+    )
+
+
 def _checkpointed(*, backend=None):
     resume = _resume_module()
     spawn = _spawn_module()
@@ -121,16 +239,13 @@ def _checkpointed(*, backend=None):
         expected_revision=ticket.ledger_revision,
     )
     ticket = _append(spawn, ledger, ticket, spawn.SpawnPhase.OFFER_VALIDATED)
-    lease = spawn.LeaseReservationEvidenceV2(
-        lease_binding_digest=_digest("1"),
-        account_binding_digest=_digest("e"),
-    )
+    lease = _lease_binding(ledger, ticket)
     ticket = _append(
         spawn,
         ledger,
         ticket,
         spawn.SpawnPhase.LEASE_RESERVED,
-        lease_evidence=lease,
+        lease_binding=lease,
     )
     for phase in (
         spawn.SpawnPhase.PROJECTED,
@@ -318,7 +433,7 @@ def test_resume_starts_new_requested_transaction_and_requires_new_lease() -> Non
     assert request.allows_in_place_credential_rotation is False
     assert new_ticket.phase is spawn.SpawnPhase.REQUESTED
     assert new_ticket.ledger_revision == spawn.LedgerRevision(1)
-    assert new_ticket.lease_binding_digest is None
+    assert new_ticket.lease_binding_reference is None
     assert new_ticket.account_binding_digest is None
 
 
@@ -499,18 +614,15 @@ def test_resume_cannot_reuse_old_lease_binding() -> None:
             ledger,
             new_ticket,
             spawn.SpawnPhase.LEASE_RESERVED,
-            lease_evidence=old_lease,
+            lease_binding=old_lease,
         )
 
-    new_lease = spawn.LeaseReservationEvidenceV2(
-        lease_binding_digest=_digest("3"),
-        account_binding_digest=_digest("e"),
-    )
+    new_lease = _lease_binding(ledger, new_ticket)
     reserved = _append(
         spawn,
         ledger,
         new_ticket,
         spawn.SpawnPhase.LEASE_RESERVED,
-        lease_evidence=new_lease,
+        lease_binding=new_lease,
     )
-    assert reserved.lease_binding_digest == new_lease.lease_binding_digest
+    assert reserved.lease_binding_reference != ticket.lease_binding_reference

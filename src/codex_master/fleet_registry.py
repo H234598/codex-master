@@ -25,7 +25,18 @@ from codex_master.worker_resolution_carrier import (
     WorkerResolutionCarrierV2,
     WorkerResolutionEvidenceV2,
 )
-from codex_master.worker_spawn_ledger import FenceEpoch, Generation
+from codex_master.runtime_account_allocator import (
+    AllocationDenied,
+    LeaseBindingReferenceV1,
+    RuntimeAccountAllocator,
+    _lease_binding_reference_from_document,
+    _lease_binding_reference_to_document,
+)
+from codex_master.worker_spawn_ledger import (
+    FenceEpoch,
+    Generation,
+    LeaseBindingConsumerInputV1,
+)
 
 MAX_DOCUMENT_BYTES = 1024 * 1024
 MAX_ACCOUNTS = 64
@@ -239,14 +250,14 @@ class FleetDynamicWorkerPrincipalV2:
     capability_binding_digest: str
     resolution_decision_digest: str
     resolver_offer_generation: str
-    lease_binding_digest: str
+    lease_binding_reference: LeaseBindingReferenceV1
     class_id: str
     lifecycle: str
     model: str
     reasoning: str
     enabled: bool
     resolution_evidence: WorkerResolutionEvidenceV2
-    reservation_lease_binding_digest: str | None
+    reservation_lease_binding_reference: LeaseBindingReferenceV1 | None
     reservation_account_binding_digest: str | None
     reservation_profile_binding_digest: str | None
 
@@ -320,7 +331,13 @@ class InventorySnapshot:
     def __post_init__(self) -> None:
         object.__setattr__(self, "agent_ids", tuple(self.agent_ids))
         object.__setattr__(self, "agents", MappingProxyType(dict(self.agents)))
-        object.__setattr__(self, "by_series", MappingProxyType({key: tuple(value) for key, value in self.by_series.items()}))
+        object.__setattr__(
+            self,
+            "by_series",
+            MappingProxyType(
+                {key: tuple(value) for key, value in self.by_series.items()}
+            ),
+        )
         object.__setattr__(self, "positions", MappingProxyType(dict(self.positions)))
         object.__setattr__(self, "series_prefixes", tuple(self.series_prefixes))
 
@@ -333,28 +350,78 @@ _PROVIDER_RULES = {
     Provider.HUGGINGFACE_INFERENCE: (RunnerKind.CODEX_CLI, AuthKind.API_KEY, True),
 }
 _V1_ROOT_FIELDS = frozenset({"schema_version", "generation", "accounts", "series"})
-_V2_ROOT_FIELDS = frozenset({"schema_version", "generation", "accounts", "series", "runtime_principals"})
-_ACCOUNT_FIELDS = frozenset({
-    "account_id", "label", "provider", "auth_kind", "secret_state", "limit_state",
-    "enabled", "reset_at_utc", "last_probe_at_utc", "limit_reason", "billing_group",
-    "credential_binding_id",
-})
-_SERIES_FIELDS = frozenset({
-    "prefix", "display_name", "count", "runner", "provider", "model", "account_id", "enabled",
-    "skill_profile", "task_profile",
-})
-_V2_SERIES_FIELDS = frozenset({
-    "prefix", "display_name", "runner", "provider", "model", "enabled",
-    "skill_profile", "task_profile", "members",
-})
-_MEMBER_FIELDS = frozenset({
-    "member_id", "ordinal", "account_id", "enabled", "model_override",
-    "skill_profile_override", "task_profile_override",
-})
-_RUNTIME_PRINCIPAL_FIELDS = frozenset({
-    "principal_id", "account_id", "profile_id", "credential_binding_id", "class_id",
-    "lifecycle", "provider", "runner", "model", "reasoning", "enabled",
-})
+_V2_ROOT_FIELDS = frozenset(
+    {"schema_version", "generation", "accounts", "series", "runtime_principals"}
+)
+_ACCOUNT_FIELDS = frozenset(
+    {
+        "account_id",
+        "label",
+        "provider",
+        "auth_kind",
+        "secret_state",
+        "limit_state",
+        "enabled",
+        "reset_at_utc",
+        "last_probe_at_utc",
+        "limit_reason",
+        "billing_group",
+        "credential_binding_id",
+    }
+)
+_SERIES_FIELDS = frozenset(
+    {
+        "prefix",
+        "display_name",
+        "count",
+        "runner",
+        "provider",
+        "model",
+        "account_id",
+        "enabled",
+        "skill_profile",
+        "task_profile",
+    }
+)
+_V2_SERIES_FIELDS = frozenset(
+    {
+        "prefix",
+        "display_name",
+        "runner",
+        "provider",
+        "model",
+        "enabled",
+        "skill_profile",
+        "task_profile",
+        "members",
+    }
+)
+_MEMBER_FIELDS = frozenset(
+    {
+        "member_id",
+        "ordinal",
+        "account_id",
+        "enabled",
+        "model_override",
+        "skill_profile_override",
+        "task_profile_override",
+    }
+)
+_RUNTIME_PRINCIPAL_FIELDS = frozenset(
+    {
+        "principal_id",
+        "account_id",
+        "profile_id",
+        "credential_binding_id",
+        "class_id",
+        "lifecycle",
+        "provider",
+        "runner",
+        "model",
+        "reasoning",
+        "enabled",
+    }
+)
 _DYNAMIC_WORKER_PRINCIPAL_FIELDS = frozenset(
     {
         "principal_id",
@@ -415,9 +482,7 @@ _SELECTION_OFFER_FIELDS = frozenset(
         "options",
     }
 )
-_SELECTION_OPTION_FIELDS = frozenset(
-    {"class_id", "lifecycle", "model", "reasoning"}
-)
+_SELECTION_OPTION_FIELDS = frozenset({"class_id", "lifecycle", "model", "reasoning"})
 
 
 def _fail(code: str) -> None:
@@ -470,6 +535,24 @@ def _optional_sha256_digest(value: object, code: str) -> str | None:
     if value is None:
         return None
     return _sha256_digest(value, code)
+
+
+def _binding_reference(value: object, code: str) -> LeaseBindingReferenceV1:
+    try:
+        reference = _lease_binding_reference_from_document(value)
+    except AllocationDenied:
+        _fail(code)
+    if type(reference) is not LeaseBindingReferenceV1:
+        _fail(code)
+    return reference
+
+
+def _optional_binding_reference(
+    value: object, code: str
+) -> LeaseBindingReferenceV1 | None:
+    if value is None:
+        return None
+    return _binding_reference(value, code)
 
 
 def _resolution_decision(value: object, code: str) -> ResolutionDecision:
@@ -526,9 +609,7 @@ def _selection_offer(value: object, code: str) -> SelectionOffer:
     )
 
 
-def _worker_resolution_evidence(
-    value: object, code: str
-) -> WorkerResolutionEvidenceV2:
+def _worker_resolution_evidence(value: object, code: str) -> WorkerResolutionEvidenceV2:
     raw = _mapping(value, code)
     if set(raw) != _WORKER_RESOLUTION_EVIDENCE_FIELDS:
         _fail(code)
@@ -552,12 +633,8 @@ def _worker_resolution_evidence(
             _worker_counter(raw["resolution_generation"], code)
         ),
         policy_digest=_sha256_digest(raw["policy_digest"], code),
-        policy_generation=Generation(
-            _worker_counter(raw["policy_generation"], code)
-        ),
-        ticket_fence_epoch=FenceEpoch(
-            _worker_counter(raw["ticket_fence_epoch"], code)
-        ),
+        policy_generation=Generation(_worker_counter(raw["policy_generation"], code)),
+        ticket_fence_epoch=FenceEpoch(_worker_counter(raw["ticket_fence_epoch"], code)),
     )
 
 
@@ -610,8 +687,12 @@ def _account(value: object, *, v2: bool = False) -> FleetAccount | FleetAccountV
     rule = _PROVIDER_RULES[provider]
     if not rule[2] or auth_kind is not rule[1]:
         _fail(code)
-    secret_default = SecretState.NOT_REQUIRED if auth_kind is AuthKind.NONE else SecretState.MISSING
-    secret_state = _enum(SecretState, raw.get("secret_state", secret_default.value), code)
+    secret_default = (
+        SecretState.NOT_REQUIRED if auth_kind is AuthKind.NONE else SecretState.MISSING
+    )
+    secret_state = _enum(
+        SecretState, raw.get("secret_state", secret_default.value), code
+    )
     if (auth_kind is AuthKind.NONE) is not (secret_state is SecretState.NOT_REQUIRED):
         _fail(code)
     billing_group = raw.get("billing_group")
@@ -626,25 +707,47 @@ def _account(value: object, *, v2: bool = False) -> FleetAccount | FleetAccountV
     )
     if v2:
         return FleetAccountV2(
-            account_id, _text(raw["label"], minimum=1, maximum=120, code=code), provider, auth_kind,
-            secret_state, _enum(LimitState, raw.get("limit_state", "unknown"), code),
-            _boolean(raw["enabled"], code), _time(raw.get("reset_at_utc"), code),
-            _time(raw.get("last_probe_at_utc"), code), _optional_reason(raw.get("limit_reason"), code),
-            billing_group, credential_binding_id,
+            account_id,
+            _text(raw["label"], minimum=1, maximum=120, code=code),
+            provider,
+            auth_kind,
+            secret_state,
+            _enum(LimitState, raw.get("limit_state", "unknown"), code),
+            _boolean(raw["enabled"], code),
+            _time(raw.get("reset_at_utc"), code),
+            _time(raw.get("last_probe_at_utc"), code),
+            _optional_reason(raw.get("limit_reason"), code),
+            billing_group,
+            credential_binding_id,
         )
     return FleetAccount(
-        account_id, _text(raw["label"], minimum=1, maximum=120, code=code), provider, auth_kind,
-        secret_state, _enum(LimitState, raw.get("limit_state", "unknown"), code),
-        _boolean(raw["enabled"], code), _time(raw.get("reset_at_utc"), code),
-        _time(raw.get("last_probe_at_utc"), code), _optional_reason(raw.get("limit_reason"), code),
-        billing_group
+        account_id,
+        _text(raw["label"], minimum=1, maximum=120, code=code),
+        provider,
+        auth_kind,
+        secret_state,
+        _enum(LimitState, raw.get("limit_state", "unknown"), code),
+        _boolean(raw["enabled"], code),
+        _time(raw.get("reset_at_utc"), code),
+        _time(raw.get("last_probe_at_utc"), code),
+        _optional_reason(raw.get("limit_reason"), code),
+        billing_group,
     )
 
 
 def _series(value: object) -> FleetSeries:
     code = "invalid_series"
     raw = _mapping(value, code)
-    required = {"prefix", "display_name", "count", "runner", "provider", "model", "account_id", "enabled"}
+    required = {
+        "prefix",
+        "display_name",
+        "count",
+        "runner",
+        "provider",
+        "model",
+        "account_id",
+        "enabled",
+    }
     if set(raw) - _SERIES_FIELDS or not required.issubset(raw):
         _fail(code)
     prefix = _text(raw["prefix"], minimum=1, maximum=16, code=code)
@@ -653,7 +756,11 @@ def _series(value: object) -> FleetSeries:
     if not re.fullmatch(r"[a-z](?:[a-z0-9_-]*[-_][a-z0-9_-]*)?", prefix):
         _fail(code)
     count = raw["count"]
-    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= MAX_SERIES_COUNT:
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or not 1 <= count <= MAX_SERIES_COUNT
+    ):
         _fail(code)
     provider = _enum(Provider, raw["provider"], code)
     runner = _enum(RunnerKind, raw["runner"], code)
@@ -667,8 +774,13 @@ def _series(value: object) -> FleetSeries:
     if _PROVIDER_RULES[provider][2] is (account_id is None):
         _fail(code)
     return FleetSeries(
-        prefix, _text(raw["display_name"], minimum=1, maximum=120, code=code), count, runner,
-        provider, _text(raw["model"], minimum=1, maximum=200, code=code), account_id,
+        prefix,
+        _text(raw["display_name"], minimum=1, maximum=120, code=code),
+        count,
+        runner,
+        provider,
+        _text(raw["model"], minimum=1, maximum=200, code=code),
+        account_id,
         _boolean(raw["enabled"], code),
         _text(raw.get("skill_profile", "generic"), minimum=1, maximum=64, code=code),
         _text(raw.get("task_profile", "standard"), minimum=1, maximum=64, code=code),
@@ -684,7 +796,12 @@ def _optional_override(value: object, code: str) -> str | None:
 def _member(value: object) -> FleetSeriesMember:
     code = "invalid_member"
     raw = _mapping(value, code)
-    if set(raw) - _MEMBER_FIELDS or not {"member_id", "ordinal", "account_id", "enabled"}.issubset(raw):
+    if set(raw) - _MEMBER_FIELDS or not {
+        "member_id",
+        "ordinal",
+        "account_id",
+        "enabled",
+    }.issubset(raw):
         _fail(code)
     member_id = raw["member_id"]
     if not isinstance(member_id, str):
@@ -704,7 +821,10 @@ def _member(value: object) -> FleetSeriesMember:
         if not _ACCOUNT_ID_RE.fullmatch(account_id):
             _fail(code)
     return FleetSeriesMember(
-        member_id, ordinal, account_id, _boolean(raw["enabled"], code),
+        member_id,
+        ordinal,
+        account_id,
+        _boolean(raw["enabled"], code),
         _optional_override(raw.get("model_override"), code),
         _optional_override(raw.get("skill_profile_override"), code),
         _optional_override(raw.get("task_profile_override"), code),
@@ -714,7 +834,15 @@ def _member(value: object) -> FleetSeriesMember:
 def _series_v2(value: object) -> FleetSeriesV2:
     code = "invalid_series"
     raw = _mapping(value, code)
-    required = {"prefix", "display_name", "runner", "provider", "model", "enabled", "members"}
+    required = {
+        "prefix",
+        "display_name",
+        "runner",
+        "provider",
+        "model",
+        "enabled",
+        "members",
+    }
     if set(raw) - _V2_SERIES_FIELDS or not required.issubset(raw):
         _fail(code)
     prefix = _text(raw["prefix"], minimum=1, maximum=16, code=code)
@@ -729,14 +857,27 @@ def _series_v2(value: object) -> FleetSeriesV2:
     if prefix == "g" and provider is not Provider.GEMINI_API:
         _fail(code)
     members_raw = raw["members"]
-    if not isinstance(members_raw, list) or not members_raw or len(members_raw) > MAX_SERIES_COUNT:
+    if (
+        not isinstance(members_raw, list)
+        or not members_raw
+        or len(members_raw) > MAX_SERIES_COUNT
+    ):
         _fail(code)
-    members = tuple(sorted((_member(item) for item in members_raw), key=lambda member: member.ordinal))
+    members = tuple(
+        sorted(
+            (_member(item) for item in members_raw), key=lambda member: member.ordinal
+        )
+    )
     return FleetSeriesV2(
-        prefix, _text(raw["display_name"], minimum=1, maximum=120, code=code), runner, provider,
-        _text(raw["model"], minimum=1, maximum=200, code=code), _boolean(raw["enabled"], code),
+        prefix,
+        _text(raw["display_name"], minimum=1, maximum=120, code=code),
+        runner,
+        provider,
+        _text(raw["model"], minimum=1, maximum=200, code=code),
+        _boolean(raw["enabled"], code),
         _text(raw.get("skill_profile", "generic"), minimum=1, maximum=64, code=code),
-        _text(raw.get("task_profile", "standard"), minimum=1, maximum=64, code=code), members,
+        _text(raw.get("task_profile", "standard"), minimum=1, maximum=64, code=code),
+        members,
     )
 
 
@@ -759,13 +900,25 @@ def _dynamic_worker_principal(
         "capability_binding_digest",
         "resolution_decision_digest",
         "resolver_offer_generation",
-        "lease_binding_digest",
     )
     digests: dict[str, str] = {}
     for field in digest_fields:
         digests[field] = _sha256_digest(value[field], code)
+    lease_binding_reference = _binding_reference(value["lease_binding_digest"], code)
+    reservation_lease_binding_reference = _optional_binding_reference(
+        value["reservation_lease_binding_digest"], code
+    )
+    if reservation_lease_binding_reference != lease_binding_reference:
+        _fail(code)
+    if (
+        value["reservation_account_binding_digest"] is not None
+        or value["reservation_profile_binding_digest"] is not None
+    ):
+        _fail(code)
     counter_fields = (
-        "ticket_ledger_revision", "ticket_fence_epoch", "ticket_resolution_generation",
+        "ticket_ledger_revision",
+        "ticket_fence_epoch",
+        "ticket_resolution_generation",
         "ticket_policy_generation",
     )
     counters: dict[str, int] = {}
@@ -779,8 +932,7 @@ def _dynamic_worker_principal(
     if (
         canonical_resolution_decision_digest(evidence.decision)
         != digests["resolution_decision_digest"]
-        or evidence.capability_binding_digest
-        != digests["capability_binding_digest"]
+        or evidence.capability_binding_digest != digests["capability_binding_digest"]
         or evidence.resolution_generation.value
         != counters["ticket_resolution_generation"]
         or evidence.policy_digest != digests["ticket_policy_digest"]
@@ -813,22 +965,16 @@ def _dynamic_worker_principal(
         capability_binding_digest=digests["capability_binding_digest"],
         resolution_decision_digest=digests["resolution_decision_digest"],
         resolver_offer_generation=digests["resolver_offer_generation"],
-        lease_binding_digest=digests["lease_binding_digest"],
+        lease_binding_reference=lease_binding_reference,
         class_id=class_id,
         lifecycle=lifecycle,
         model=model,
         reasoning=reasoning,
         enabled=_boolean(value["enabled"], code),
         resolution_evidence=evidence,
-        reservation_lease_binding_digest=_optional_sha256_digest(
-            value["reservation_lease_binding_digest"], code
-        ),
-        reservation_account_binding_digest=_optional_sha256_digest(
-            value["reservation_account_binding_digest"], code
-        ),
-        reservation_profile_binding_digest=_optional_sha256_digest(
-            value["reservation_profile_binding_digest"], code
-        ),
+        reservation_lease_binding_reference=reservation_lease_binding_reference,
+        reservation_account_binding_digest=None,
+        reservation_profile_binding_digest=None,
     )
 
 
@@ -853,7 +999,9 @@ def _runtime_principal(
     profile_id = _text(raw["profile_id"], minimum=1, maximum=128, code=code)
     if not _PROFILE_ID_RE.fullmatch(profile_id):
         _fail(code)
-    credential_binding_id = _binding_id(raw["credential_binding_id"], code=code, require_hmac=True)
+    credential_binding_id = _binding_id(
+        raw["credential_binding_id"], code=code, require_hmac=True
+    )
     if credential_binding_id is None:
         _fail(code)
     return FleetRuntimePrincipalV2(
@@ -863,8 +1011,12 @@ def _runtime_principal(
         credential_binding_id=credential_binding_id,
         class_id=_exact_text(raw["class_id"], expected="teamleiterin", code=code),
         lifecycle=_exact_text(raw["lifecycle"], expected="persistent", code=code),
-        provider=_exact_enum(Provider, raw["provider"], expected=Provider.OPENAI_CHATGPT, code=code),
-        runner=_exact_enum(RunnerKind, raw["runner"], expected=RunnerKind.CODEX_CLI, code=code),
+        provider=_exact_enum(
+            Provider, raw["provider"], expected=Provider.OPENAI_CHATGPT, code=code
+        ),
+        runner=_exact_enum(
+            RunnerKind, raw["runner"], expected=RunnerKind.CODEX_CLI, code=code
+        ),
         model=_exact_text(raw["model"], expected="gpt-5.6-terra", code=code),
         reasoning=_exact_text(raw["reasoning"], expected="xhigh", code=code),
         enabled=_boolean(raw["enabled"], code),
@@ -887,7 +1039,9 @@ def _exact_enum(enum: type[Enum], value: object, *, expected: Enum, code: str) -
 
 def normalize_fleet_document(raw: object) -> FleetSnapshot | FleetSnapshotV2:
     try:
-        encoded = json.dumps(raw, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        encoded = json.dumps(
+            raw, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        )
         encoded_bytes = encoded.encode("utf-8")
     except (TypeError, UnicodeEncodeError, ValueError):
         _fail("invalid_document")
@@ -912,15 +1066,28 @@ def normalize_fleet_document(raw: object) -> FleetSnapshot | FleetSnapshotV2:
         _fail("invalid_document")
     if len(accounts_raw) > MAX_ACCOUNTS or len(series_raw) > MAX_SERIES:
         _fail("invalid_document")
-    accounts = tuple(sorted((_account(item, v2=is_v2) for item in accounts_raw), key=lambda item: item.account_id))
-    series = tuple(sorted(((_series_v2(item) if is_v2 else _series(item)) for item in series_raw), key=lambda item: item.prefix))
+    accounts = tuple(
+        sorted(
+            (_account(item, v2=is_v2) for item in accounts_raw),
+            key=lambda item: item.account_id,
+        )
+    )
+    series = tuple(
+        sorted(
+            ((_series_v2(item) if is_v2 else _series(item)) for item in series_raw),
+            key=lambda item: item.prefix,
+        )
+    )
     runtime_principals_raw = document.get("runtime_principals", [])
     if not isinstance(runtime_principals_raw, list):
         _fail("invalid_document")
     if len(runtime_principals_raw) > MAX_RUNTIME_PRINCIPALS:
         _fail("invalid_document")
     runtime_principals = tuple(
-        sorted((_runtime_principal(item) for item in runtime_principals_raw), key=lambda item: item.principal_id)
+        sorted(
+            (_runtime_principal(item) for item in runtime_principals_raw),
+            key=lambda item: item.principal_id,
+        )
     )
     if len({item.account_id for item in accounts}) != len(accounts):
         _fail("invalid_account")
@@ -935,35 +1102,46 @@ def normalize_fleet_document(raw: object) -> FleetSnapshot | FleetSnapshotV2:
     for item in series:
         if is_v2:
             member_ids = [member.member_id for member in item.members]
-            if (len(set(member_ids)) != len(member_ids) or all_member_ids.intersection(member_ids)
-                    or [m.ordinal for m in item.members] != list(range(1, item.count + 1))):
+            if (
+                len(set(member_ids)) != len(member_ids)
+                or all_member_ids.intersection(member_ids)
+                or [m.ordinal for m in item.members] != list(range(1, item.count + 1))
+            ):
                 _fail("invalid_member")
             all_member_ids.update(member_ids)
             for member in item.members:
-                account = accounts_by_id.get(member.account_id) if member.account_id is not None else None
+                account = (
+                    accounts_by_id.get(member.account_id)
+                    if member.account_id is not None
+                    else None
+                )
                 requires_account = _PROVIDER_RULES[item.provider][2]
-                if (requires_account and (member.account_id is None or account is None)) or (
-                        account is not None and account.provider is not item.provider):
+                if (
+                    requires_account and (member.account_id is None or account is None)
+                ) or (account is not None and account.provider is not item.provider):
                     _fail("invalid_member")
-                if member.enabled and (not item.enabled or (account is not None and not account.enabled)):
+                if member.enabled and (
+                    not item.enabled or (account is not None and not account.enabled)
+                ):
                     _fail("invalid_member")
         elif item.account_id is not None:
             account = accounts_by_id.get(item.account_id)
             if account is None or account.provider is not item.provider:
                 _fail("invalid_series")
     if is_v2:
-        if len({item.principal_id for item in runtime_principals}) != len(runtime_principals):
+        if len({item.principal_id for item in runtime_principals}) != len(
+            runtime_principals
+        ):
             _fail("invalid_runtime_principal")
         dynamic_workers = tuple(
             item
             for item in runtime_principals
             if isinstance(item, FleetDynamicWorkerPrincipalV2)
         )
-        if (
-            len({item.ticket_id for item in dynamic_workers})
-            != len(dynamic_workers)
-            or len({item.lease_binding_digest for item in dynamic_workers})
-            != len(dynamic_workers)
+        if len({item.ticket_id for item in dynamic_workers}) != len(
+            dynamic_workers
+        ) or len({item.lease_binding_reference for item in dynamic_workers}) != len(
+            dynamic_workers
         ):
             _fail("invalid_runtime_principal")
         bindings = [
@@ -1037,7 +1215,9 @@ def _resolution_evidence_document(
     }
 
 
-def fleet_document(snapshot: FleetSnapshot | FleetSnapshotV2 | FleetMigrationSnapshot) -> dict[str, object]:
+def fleet_document(
+    snapshot: FleetSnapshot | FleetSnapshotV2 | FleetMigrationSnapshot,
+) -> dict[str, object]:
     if isinstance(snapshot, FleetMigrationSnapshot):
         _fail("final_member_id_required")
     if isinstance(snapshot, FleetSnapshotV2):
@@ -1046,28 +1226,48 @@ def fleet_document(snapshot: FleetSnapshot | FleetSnapshotV2 | FleetMigrationSna
                 if not _is_canonical_uuid4(member.member_id):
                     _fail("final_member_id_required")
         return {
-            "schema_version": 2, "generation": snapshot.generation,
+            "schema_version": 2,
+            "generation": snapshot.generation,
             "accounts": [
-                {"account_id": item.account_id, "label": item.label, "provider": item.provider.value,
-                 "auth_kind": item.auth_kind.value, "secret_state": item.secret_state.value,
-                 "limit_state": item.limit_state.value, "enabled": item.enabled,
-                 "reset_at_utc": item.reset_at_utc, "last_probe_at_utc": item.last_probe_at_utc,
-                 "limit_reason": item.limit_reason, "billing_group": item.billing_group,
-                 "credential_binding_id": item.credential_binding_id}
+                {
+                    "account_id": item.account_id,
+                    "label": item.label,
+                    "provider": item.provider.value,
+                    "auth_kind": item.auth_kind.value,
+                    "secret_state": item.secret_state.value,
+                    "limit_state": item.limit_state.value,
+                    "enabled": item.enabled,
+                    "reset_at_utc": item.reset_at_utc,
+                    "last_probe_at_utc": item.last_probe_at_utc,
+                    "limit_reason": item.limit_reason,
+                    "billing_group": item.billing_group,
+                    "credential_binding_id": item.credential_binding_id,
+                }
                 for item in snapshot.accounts
             ],
             "series": [
-                {"prefix": item.prefix, "display_name": item.display_name, "runner": item.runner.value,
-                 "provider": item.provider.value, "model": item.model, "enabled": item.enabled,
-                 "skill_profile": item.skill_profile, "task_profile": item.task_profile,
-                 "members": [
-                     {"member_id": member.member_id, "ordinal": member.ordinal,
-                      "account_id": member.account_id, "enabled": member.enabled,
-                      "model_override": member.model_override,
-                      "skill_profile_override": member.skill_profile_override,
-                      "task_profile_override": member.task_profile_override}
-                     for member in item.members
-                ]}
+                {
+                    "prefix": item.prefix,
+                    "display_name": item.display_name,
+                    "runner": item.runner.value,
+                    "provider": item.provider.value,
+                    "model": item.model,
+                    "enabled": item.enabled,
+                    "skill_profile": item.skill_profile,
+                    "task_profile": item.task_profile,
+                    "members": [
+                        {
+                            "member_id": member.member_id,
+                            "ordinal": member.ordinal,
+                            "account_id": member.account_id,
+                            "enabled": member.enabled,
+                            "model_override": member.model_override,
+                            "skill_profile_override": member.skill_profile_override,
+                            "task_profile_override": member.task_profile_override,
+                        }
+                        for member in item.members
+                    ],
+                }
                 for item in snapshot.series
             ],
             "runtime_principals": [
@@ -1097,7 +1297,9 @@ def fleet_document(snapshot: FleetSnapshot | FleetSnapshotV2 | FleetMigrationSna
                         "capability_binding_digest": item.capability_binding_digest,
                         "resolution_decision_digest": item.resolution_decision_digest,
                         "resolver_offer_generation": item.resolver_offer_generation,
-                        "lease_binding_digest": item.lease_binding_digest,
+                        "lease_binding_digest": _lease_binding_reference_to_document(
+                            item.lease_binding_reference
+                        ),
                         "class_id": item.class_id,
                         "lifecycle": item.lifecycle,
                         "model": item.model,
@@ -1107,14 +1309,14 @@ def fleet_document(snapshot: FleetSnapshot | FleetSnapshotV2 | FleetMigrationSna
                             item.resolution_evidence
                         ),
                         "reservation_lease_binding_digest": (
-                            item.reservation_lease_binding_digest
+                            None
+                            if item.reservation_lease_binding_reference is None
+                            else _lease_binding_reference_to_document(
+                                item.reservation_lease_binding_reference
+                            )
                         ),
-                        "reservation_account_binding_digest": (
-                            item.reservation_account_binding_digest
-                        ),
-                        "reservation_profile_binding_digest": (
-                            item.reservation_profile_binding_digest
-                        ),
+                        "reservation_account_binding_digest": None,
+                        "reservation_profile_binding_digest": None,
                     }
                 )
                 for item in snapshot.runtime_principals
@@ -1125,20 +1327,32 @@ def fleet_document(snapshot: FleetSnapshot | FleetSnapshotV2 | FleetMigrationSna
         "generation": snapshot.generation,
         "accounts": [
             {
-                "account_id": item.account_id, "label": item.label, "provider": item.provider.value,
-                "auth_kind": item.auth_kind.value, "secret_state": item.secret_state.value,
-                "limit_state": item.limit_state.value, "enabled": item.enabled,
-                "reset_at_utc": item.reset_at_utc, "last_probe_at_utc": item.last_probe_at_utc,
-                "limit_reason": item.limit_reason, "billing_group": item.billing_group,
+                "account_id": item.account_id,
+                "label": item.label,
+                "provider": item.provider.value,
+                "auth_kind": item.auth_kind.value,
+                "secret_state": item.secret_state.value,
+                "limit_state": item.limit_state.value,
+                "enabled": item.enabled,
+                "reset_at_utc": item.reset_at_utc,
+                "last_probe_at_utc": item.last_probe_at_utc,
+                "limit_reason": item.limit_reason,
+                "billing_group": item.billing_group,
             }
             for item in snapshot.accounts
         ],
         "series": [
             {
-                "prefix": item.prefix, "display_name": item.display_name, "count": item.count,
-                "runner": item.runner.value, "provider": item.provider.value, "model": item.model,
-                "account_id": item.account_id, "enabled": item.enabled,
-                "skill_profile": item.skill_profile, "task_profile": item.task_profile,
+                "prefix": item.prefix,
+                "display_name": item.display_name,
+                "count": item.count,
+                "runner": item.runner.value,
+                "provider": item.provider.value,
+                "model": item.model,
+                "account_id": item.account_id,
+                "enabled": item.enabled,
+                "skill_profile": item.skill_profile,
+                "task_profile": item.task_profile,
             }
             for item in snapshot.series
         ],
@@ -1155,7 +1369,9 @@ def _is_canonical_uuid4(member_id: object) -> bool:
     return parsed.version == 4 and str(parsed) == member_id
 
 
-def build_inventory(snapshot: FleetSnapshot | FleetSnapshotV2, pool_root: Path) -> InventorySnapshot:
+def build_inventory(
+    snapshot: FleetSnapshot | FleetSnapshotV2, pool_root: Path
+) -> InventorySnapshot:
     accounts = {item.account_id: item for item in snapshot.accounts}
     agents: dict[str, AgentDescriptor] = {}
     by_series: dict[str, tuple[str, ...]] = {}
@@ -1172,62 +1388,133 @@ def build_inventory(snapshot: FleetSnapshot | FleetSnapshotV2, pool_root: Path) 
             series_account = item.account_id
         account = accounts.get(series_account) if series_account is not None else None
         for member_or_ordinal in members:
-            ordinal = member_or_ordinal.ordinal if isinstance(member_or_ordinal, FleetSeriesMember) else member_or_ordinal
-            member_account = member_or_ordinal.account_id if isinstance(member_or_ordinal, FleetSeriesMember) else series_account
-            member_enabled = member_or_ordinal.enabled if isinstance(member_or_ordinal, FleetSeriesMember) else True
-            account = accounts.get(member_account) if member_account is not None else None
+            ordinal = (
+                member_or_ordinal.ordinal
+                if isinstance(member_or_ordinal, FleetSeriesMember)
+                else member_or_ordinal
+            )
+            member_account = (
+                member_or_ordinal.account_id
+                if isinstance(member_or_ordinal, FleetSeriesMember)
+                else series_account
+            )
+            member_enabled = (
+                member_or_ordinal.enabled
+                if isinstance(member_or_ordinal, FleetSeriesMember)
+                else True
+            )
+            account = (
+                accounts.get(member_account) if member_account is not None else None
+            )
             agent_id = f"{item.prefix}{ordinal}"
             ids.append(agent_id)
             agent_ids.append(agent_id)
             positions[agent_id] = len(agent_ids) - 1
             executable = "gemini" if item.runner is RunnerKind.GEMINI_CLI else "codex"
-            model = member_or_ordinal.model_override or item.model if isinstance(member_or_ordinal, FleetSeriesMember) else item.model
-            skill = member_or_ordinal.skill_profile_override or item.skill_profile if isinstance(member_or_ordinal, FleetSeriesMember) else item.skill_profile
-            task = member_or_ordinal.task_profile_override or item.task_profile if isinstance(member_or_ordinal, FleetSeriesMember) else item.task_profile
-            enabled = item.enabled and member_enabled and (account is None or account.enabled)
+            model = (
+                member_or_ordinal.model_override or item.model
+                if isinstance(member_or_ordinal, FleetSeriesMember)
+                else item.model
+            )
+            skill = (
+                member_or_ordinal.skill_profile_override or item.skill_profile
+                if isinstance(member_or_ordinal, FleetSeriesMember)
+                else item.skill_profile
+            )
+            task = (
+                member_or_ordinal.task_profile_override or item.task_profile
+                if isinstance(member_or_ordinal, FleetSeriesMember)
+                else item.task_profile
+            )
+            enabled = (
+                item.enabled and member_enabled and (account is None or account.enabled)
+            )
             agents[agent_id] = AgentDescriptor(
-                agent_id, item.prefix, ordinal, f"{item.display_name} {ordinal}", item.runner,
-                item.provider, model, member_account, root / agent_id,
-                f"codex_agent_{agent_id}_mcp", enabled, root / agent_id / executable,
-                skill, task,
+                agent_id,
+                item.prefix,
+                ordinal,
+                f"{item.display_name} {ordinal}",
+                item.runner,
+                item.provider,
+                model,
+                member_account,
+                root / agent_id,
+                f"codex_agent_{agent_id}_mcp",
+                enabled,
+                root / agent_id / executable,
+                skill,
+                task,
             )
         by_series[f"{item.prefix}-series"] = tuple(ids)
-    return InventorySnapshot(tuple(agent_ids), MappingProxyType(agents), MappingProxyType(by_series),
-                             MappingProxyType(positions), tuple(item.prefix for item in snapshot.series))
+    return InventorySnapshot(
+        tuple(agent_ids),
+        MappingProxyType(agents),
+        MappingProxyType(by_series),
+        MappingProxyType(positions),
+        tuple(item.prefix for item in snapshot.series),
+    )
 
 
-def public_fleet_snapshot(snapshot: FleetSnapshot | FleetSnapshotV2) -> dict[str, object]:
+def public_fleet_snapshot(
+    snapshot: FleetSnapshot | FleetSnapshotV2,
+) -> dict[str, object]:
     if isinstance(snapshot, FleetSnapshotV2):
         return {
-            "generation": snapshot.generation, "account_count": len(snapshot.accounts),
-            "series_count": len(snapshot.series), "agent_count": sum(item.count for item in snapshot.series),
+            "generation": snapshot.generation,
+            "account_count": len(snapshot.accounts),
+            "series_count": len(snapshot.series),
+            "agent_count": sum(item.count for item in snapshot.series),
             "runtime_principal_count": len(snapshot.runtime_principals),
             "accounts": [
-                {"label": item.label, "provider": item.provider.value, "auth_kind": item.auth_kind.value,
-                 "secret_state": item.secret_state.value, "limit_state": item.limit_state.value,
-                 "enabled": item.enabled}
+                {
+                    "label": item.label,
+                    "provider": item.provider.value,
+                    "auth_kind": item.auth_kind.value,
+                    "secret_state": item.secret_state.value,
+                    "limit_state": item.limit_state.value,
+                    "enabled": item.enabled,
+                }
                 for item in snapshot.accounts
             ],
             "series": [
-                {"prefix": item.prefix, "display_name": item.display_name, "count": item.count,
-                 "runner": item.runner.value, "provider": item.provider.value, "model": item.model,
-                 "enabled": item.enabled}
+                {
+                    "prefix": item.prefix,
+                    "display_name": item.display_name,
+                    "count": item.count,
+                    "runner": item.runner.value,
+                    "provider": item.provider.value,
+                    "model": item.model,
+                    "enabled": item.enabled,
+                }
                 for item in snapshot.series
             ],
         }
     return {
-        "generation": snapshot.generation, "account_count": len(snapshot.accounts),
-        "series_count": len(snapshot.series), "agent_count": sum(item.count for item in snapshot.series),
+        "generation": snapshot.generation,
+        "account_count": len(snapshot.accounts),
+        "series_count": len(snapshot.series),
+        "agent_count": sum(item.count for item in snapshot.series),
         "accounts": [
-            {"label": item.label, "provider": item.provider.value, "auth_kind": item.auth_kind.value,
-             "secret_state": item.secret_state.value, "limit_state": item.limit_state.value,
-             "enabled": item.enabled}
+            {
+                "label": item.label,
+                "provider": item.provider.value,
+                "auth_kind": item.auth_kind.value,
+                "secret_state": item.secret_state.value,
+                "limit_state": item.limit_state.value,
+                "enabled": item.enabled,
+            }
             for item in snapshot.accounts
         ],
         "series": [
-            {"prefix": item.prefix, "display_name": item.display_name, "count": item.count,
-             "runner": item.runner.value, "provider": item.provider.value, "model": item.model,
-             "enabled": item.enabled}
+            {
+                "prefix": item.prefix,
+                "display_name": item.display_name,
+                "count": item.count,
+                "runner": item.runner.value,
+                "provider": item.provider.value,
+                "model": item.model,
+                "enabled": item.enabled,
+            }
             for item in snapshot.series
         ],
     }
@@ -1238,19 +1525,34 @@ def expand_v1_for_migration(snapshot: FleetSnapshot) -> FleetMigrationSnapshot:
         _fail("invalid_document")
     series = tuple(
         FleetMigrationSeries(
-            item.prefix, item.display_name, item.runner, item.provider, item.model, item.enabled,
-            item.skill_profile, item.task_profile,
-            tuple(LegacyFleetSeriesMember(f"v1:{item.prefix}:{ordinal}", ordinal, item.account_id, True)
-                  for ordinal in range(1, item.count + 1)),
+            item.prefix,
+            item.display_name,
+            item.runner,
+            item.provider,
+            item.model,
+            item.enabled,
+            item.skill_profile,
+            item.task_profile,
+            tuple(
+                LegacyFleetSeriesMember(
+                    f"v1:{item.prefix}:{ordinal}", ordinal, item.account_id, True
+                )
+                for ordinal in range(1, item.count + 1)
+            ),
         )
         for item in snapshot.series
     )
     return FleetMigrationSnapshot(1, snapshot.generation, snapshot.accounts, series)
 
 
-def _generation(snapshot: FleetSnapshot | FleetSnapshotV2, expected_generation: int) -> None:
-    if (not isinstance(expected_generation, int) or isinstance(expected_generation, bool)
-            or snapshot.generation != expected_generation):
+def _generation(
+    snapshot: FleetSnapshot | FleetSnapshotV2, expected_generation: int
+) -> None:
+    if (
+        not isinstance(expected_generation, int)
+        or isinstance(expected_generation, bool)
+        or snapshot.generation != expected_generation
+    ):
         _fail("generation_conflict")
 
 
@@ -1272,7 +1574,11 @@ def _next(
             snapshot.generation + 1,
             tuple(snapshot.accounts if accounts is None else accounts),
             tuple(snapshot.series if series is None else series),
-            tuple(snapshot.runtime_principals if runtime_principals is None else runtime_principals),
+            tuple(
+                snapshot.runtime_principals
+                if runtime_principals is None
+                else runtime_principals
+            ),
         )
     else:
         candidate = FleetSnapshot(
@@ -1293,14 +1599,26 @@ def plan_account_upsert(
     _generation(snapshot, expected_generation)
     if isinstance(snapshot, FleetSnapshotV2) is not isinstance(account, FleetAccountV2):
         _fail("invalid_account")
-    accounts = [item for item in snapshot.accounts if item.account_id != account.account_id] + [account]
+    accounts = [
+        item for item in snapshot.accounts if item.account_id != account.account_id
+    ] + [account]
     return _next(snapshot, accounts=accounts)
 
 
 def _dynamic_worker_from_reservation(
-    reservation: object, lease_binding_digest: object
+    reservation: object,
 ) -> FleetDynamicWorkerPrincipalV2:
     if type(reservation) is not WorkerRegistryReservationV2:
+        _fail("invalid_worker_registry_reservation")
+    try:
+        binding_input = reservation._binding_input()
+        binding_reference = reservation._binding_reference()
+    except Exception:
+        _fail("invalid_worker_registry_reservation")
+    if (
+        type(binding_reference) is not LeaseBindingReferenceV1
+        or type(binding_input) is not LeaseBindingConsumerInputV1
+    ):
         _fail("invalid_worker_registry_reservation")
     resolution = reservation.resolution
     if type(resolution) is not WorkerResolutionCarrierV2:
@@ -1331,78 +1649,233 @@ def _dynamic_worker_from_reservation(
             "capability_binding_digest": resolution.capability_binding_digest,
             "resolution_decision_digest": resolution.resolution_decision_digest,
             "resolver_offer_generation": resolution.resolver_offer_generation,
-            "lease_binding_digest": lease_binding_digest,
+            "lease_binding_digest": _lease_binding_reference_to_document(
+                binding_reference
+            ),
             "class_id": resolution.decision.class_id,
             "lifecycle": resolution.decision.lifecycle,
             "model": resolution.decision.model,
             "reasoning": resolution.decision.reasoning,
             "enabled": True,
             "resolution_evidence": _resolution_evidence_document(evidence),
-            "reservation_lease_binding_digest": reservation.lease_binding_digest,
-            "reservation_account_binding_digest": reservation.account_binding_digest,
-            "reservation_profile_binding_digest": reservation.profile_binding_digest,
+            "reservation_lease_binding_digest": _lease_binding_reference_to_document(
+                binding_reference
+            ),
+            "reservation_account_binding_digest": None,
+            "reservation_profile_binding_digest": None,
         }
     )
 
 
-def plan_dynamic_worker_principal_reserve(
-    snapshot: FleetSnapshotV2,
-    reservation: WorkerRegistryReservationV2,
-    *,
-    lease_binding_digest: object,
-    expected_generation: int,
-) -> FleetSnapshotV2:
-    if not isinstance(snapshot, FleetSnapshotV2):
-        _fail("invalid_document")
-    _generation(snapshot, expected_generation)
-    principal = _dynamic_worker_from_reservation(reservation, lease_binding_digest)
-    workers = [
-        item
-        for item in snapshot.runtime_principals
-        if isinstance(item, FleetDynamicWorkerPrincipalV2)
-    ]
-    if any(item.principal_id == principal.principal_id for item in workers):
-        _fail("worker_principal_collision")
-    if any(item.ticket_id == principal.ticket_id for item in workers):
-        _fail("worker_ticket_collision")
-    if any(
-        item.lease_binding_digest == principal.lease_binding_digest for item in workers
-    ):
-        _fail("worker_lease_collision")
-    return _next(
-        snapshot,
-        runtime_principals=[*snapshot.runtime_principals, principal],
-    )  # type: ignore[return-value]
-
-
-def plan_dynamic_worker_principal_release(
-    snapshot: FleetSnapshotV2,
-    reservation: WorkerRegistryReservationV2,
-    *,
-    lease_binding_digest: object,
-    expected_generation: int,
-) -> FleetSnapshotV2:
-    if not isinstance(snapshot, FleetSnapshotV2):
-        _fail("invalid_document")
-    _generation(snapshot, expected_generation)
-    expected = _dynamic_worker_from_reservation(reservation, lease_binding_digest)
-    existing = next(
-        (
-            item
-            for item in snapshot.runtime_principals
-            if isinstance(item, FleetDynamicWorkerPrincipalV2)
-            and item.principal_id == expected.principal_id
-        ),
-        None,
+class _DynamicWorkerRegistryOperationV2:
+    __slots__ = (
+        "_allocator",
+        "_candidate",
+        "_mode",
+        "_reservation",
+        "_snapshot",
+        "_state",
+        "_verification",
     )
-    if existing != expected:
-        _fail("worker_reservation_mismatch")
-    return _next(
-        snapshot,
-        runtime_principals=[
-            item for item in snapshot.runtime_principals if item != expected
-        ],
-    )  # type: ignore[return-value]
+
+    def __init__(
+        self,
+        allocator: RuntimeAccountAllocator,
+        snapshot: FleetSnapshotV2,
+        reservation: WorkerRegistryReservationV2,
+        mode: str,
+    ) -> None:
+        self._allocator = allocator
+        self._snapshot = snapshot
+        self._reservation = reservation
+        self._mode = mode
+        self._state = "new"
+        self._verification = None
+        self._candidate = None
+
+    def __repr__(self) -> str:
+        return "<_DynamicWorkerRegistryOperationV2 redacted>"
+
+    __str__ = __repr__
+
+    def __reduce_ex__(self, _protocol: int) -> object:
+        raise TypeError("worker registry operations are not serializable")
+
+    @property
+    def candidate(self) -> FleetSnapshotV2:
+        if self._state != "entered" or self._candidate is None:
+            _fail("worker_lease_binding_denied")
+        return self._candidate
+
+    def __enter__(self) -> FleetSnapshotV2:
+        if self._state != "new":
+            _fail("worker_lease_binding_denied")
+        verification = None
+        primary: BaseException | None = None
+        completed = False
+        try:
+            try:
+                binding_input = self._reservation._binding_input()
+                stored_reference = self._reservation._binding_reference()
+                verification = self._allocator.verify_lease_binding_receipt(
+                    binding_input.receipt,
+                    expected_lease=binding_input.lease,
+                    expected_ticket=binding_input.allocation_ticket,
+                    expected_capacity_evidence=binding_input.capacity_evidence,
+                )
+                reference = self._allocator.lease_binding_reference_for(verification)
+            except AllocationDenied as exc:
+                raise FleetValidationError("worker_lease_binding_denied") from exc
+            except Exception as exc:
+                raise FleetValidationError("worker_lease_binding_denied") from exc
+            if (
+                type(stored_reference) is not LeaseBindingReferenceV1
+                or type(reference) is not LeaseBindingReferenceV1
+                or reference != stored_reference
+            ):
+                _fail("worker_lease_binding_denied")
+            self._verification = verification
+            self._state = "entered"
+            principal = _dynamic_worker_from_reservation(self._reservation)
+            if principal.lease_binding_reference != reference:
+                _fail("worker_lease_binding_denied")
+            workers = [
+                item
+                for item in self._snapshot.runtime_principals
+                if isinstance(item, FleetDynamicWorkerPrincipalV2)
+            ]
+            if self._mode == "reserve":
+                if any(item.principal_id == principal.principal_id for item in workers):
+                    _fail("worker_principal_collision")
+                if any(item.ticket_id == principal.ticket_id for item in workers):
+                    _fail("worker_ticket_collision")
+                if any(
+                    item.lease_binding_reference == principal.lease_binding_reference
+                    for item in workers
+                ):
+                    _fail("worker_lease_collision")
+                self._candidate = _next(
+                    self._snapshot,
+                    runtime_principals=[*self._snapshot.runtime_principals, principal],
+                )
+            else:
+                existing = next(
+                    (
+                        item
+                        for item in workers
+                        if item.principal_id == principal.principal_id
+                    ),
+                    None,
+                )
+                if existing != principal:
+                    _fail("worker_reservation_mismatch")
+                self._candidate = _next(
+                    self._snapshot,
+                    runtime_principals=[
+                        item
+                        for item in self._snapshot.runtime_principals
+                        if item != principal
+                    ],
+                )
+            completed = True
+            return self._candidate
+        except BaseException as exc:
+            primary = exc
+            raise
+        finally:
+            if verification is not None and not completed:
+                self._state = "closed"
+                self._verification = None
+                try:
+                    self._allocator.close_lease_binding_verification(verification)
+                except AllocationDenied:
+                    primary.add_note(
+                        "lease binding guard close denied; quarantine required"
+                    )
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        del traceback
+        if self._state != "entered" or self._verification is None:
+            _fail("worker_lease_binding_denied")
+        verification = self._verification
+        self._state = "closed"
+        self._verification = None
+        try:
+            self._allocator.close_lease_binding_verification(verification)
+        except AllocationDenied as close_error:
+            if exc_value is not None:
+                exc_value.add_note(
+                    "lease binding guard close denied; quarantine required"
+                )
+            else:
+                raise FleetValidationError(
+                    "worker_lease_binding_denied"
+                ) from close_error
+        return False
+
+
+class DynamicWorkerRegistryPlannerV2:
+    """Allocator-bound planner returning one single-use CAS operation."""
+
+    __slots__ = ("_allocator",)
+
+    def __init__(self, allocator: RuntimeAccountAllocator) -> None:
+        if type(allocator) is not RuntimeAccountAllocator:
+            raise FleetValidationError("runtime account allocator required")
+        self._allocator = allocator
+
+    @staticmethod
+    def _validate_inputs(
+        snapshot: object,
+        reservation: object,
+        expected_generation: object,
+    ) -> tuple[FleetSnapshotV2, WorkerRegistryReservationV2]:
+        if type(snapshot) is not FleetSnapshotV2:
+            _fail("invalid_document")
+        if type(reservation) is not WorkerRegistryReservationV2:
+            _fail("invalid_worker_registry_reservation")
+        if type(expected_generation) is not int:
+            _fail("generation_conflict")
+        _generation(snapshot, expected_generation)
+        try:
+            binding_input = reservation._binding_input()
+            binding_reference = reservation._binding_reference()
+        except Exception as exc:
+            raise FleetValidationError("invalid_worker_registry_reservation") from exc
+        if (
+            type(binding_input) is not LeaseBindingConsumerInputV1
+            or type(binding_reference) is not LeaseBindingReferenceV1
+        ):
+            _fail("invalid_worker_registry_reservation")
+        return snapshot, reservation
+
+    def plan_dynamic_worker_principal_reserve(
+        self,
+        snapshot: object,
+        reservation: object,
+        *,
+        expected_generation: object,
+    ) -> _DynamicWorkerRegistryOperationV2:
+        snapshot, reservation = self._validate_inputs(
+            snapshot, reservation, expected_generation
+        )
+        return _DynamicWorkerRegistryOperationV2(
+            self._allocator, snapshot, reservation, "reserve"
+        )
+
+    def plan_dynamic_worker_principal_release(
+        self,
+        snapshot: object,
+        reservation: object,
+        *,
+        expected_generation: object,
+    ) -> _DynamicWorkerRegistryOperationV2:
+        snapshot, reservation = self._validate_inputs(
+            snapshot, reservation, expected_generation
+        )
+        return _DynamicWorkerRegistryOperationV2(
+            self._allocator, snapshot, reservation, "release"
+        )
 
 
 def plan_runtime_principal_upsert(
@@ -1417,7 +1890,9 @@ def plan_runtime_principal_upsert(
         _fail("invalid_runtime_principal")
     _generation(snapshot, expected_generation)
     runtime_principals = [
-        item for item in snapshot.runtime_principals if item.principal_id != principal.principal_id
+        item
+        for item in snapshot.runtime_principals
+        if item.principal_id != principal.principal_id
     ] + [principal]
     return _next(snapshot, runtime_principals=runtime_principals)  # type: ignore[return-value]
 
@@ -1457,24 +1932,42 @@ def plan_runtime_principal_delete(
     if not isinstance(snapshot, FleetSnapshotV2):
         _fail("invalid_document")
     _generation(snapshot, expected_generation)
-    existing = next((item for item in snapshot.runtime_principals if item.principal_id == principal_id), None)
+    existing = next(
+        (
+            item
+            for item in snapshot.runtime_principals
+            if item.principal_id == principal_id
+        ),
+        None,
+    )
     if not isinstance(existing, FleetRuntimePrincipalV2):
         _fail("invalid_runtime_principal")
     if existing.enabled:
         _fail("runtime_principal_must_be_disabled")
-    runtime_principals = [item for item in snapshot.runtime_principals if item.principal_id != principal_id]
+    runtime_principals = [
+        item
+        for item in snapshot.runtime_principals
+        if item.principal_id != principal_id
+    ]
     return _next(snapshot, runtime_principals=runtime_principals)  # type: ignore[return-value]
 
 
-def plan_account_disable(snapshot: FleetSnapshot, account_id: str, *, expected_generation: int) -> FleetSnapshot:
+def plan_account_disable(
+    snapshot: FleetSnapshot, account_id: str, *, expected_generation: int
+) -> FleetSnapshot:
     _generation(snapshot, expected_generation)
     if not any(item.account_id == account_id for item in snapshot.accounts):
         _fail("invalid_account")
-    accounts = [replace(item, enabled=False) if item.account_id == account_id else item for item in snapshot.accounts]
+    accounts = [
+        replace(item, enabled=False) if item.account_id == account_id else item
+        for item in snapshot.accounts
+    ]
     return _next(snapshot, accounts=accounts)
 
 
-def plan_account_delete(snapshot: FleetSnapshot, account_id: str, *, expected_generation: int) -> FleetSnapshot:
+def plan_account_delete(
+    snapshot: FleetSnapshot, account_id: str, *, expected_generation: int
+) -> FleetSnapshot:
     _generation(snapshot, expected_generation)
     if any(item.account_id == account_id for item in snapshot.series):
         _fail("account_in_use")
@@ -1484,44 +1977,80 @@ def plan_account_delete(snapshot: FleetSnapshot, account_id: str, *, expected_ge
     return _next(snapshot, accounts=accounts)
 
 
-def plan_series_apply(snapshot: FleetSnapshot, series: FleetSeries, *, expected_generation: int,
-                      confirmed_remove_ids: Iterable[str] = ()) -> FleetSnapshot:
+def plan_series_apply(
+    snapshot: FleetSnapshot,
+    series: FleetSeries,
+    *,
+    expected_generation: int,
+    confirmed_remove_ids: Iterable[str] = (),
+) -> FleetSnapshot:
     _generation(snapshot, expected_generation)
-    existing = next((item for item in snapshot.series if item.prefix == series.prefix), None)
+    existing = next(
+        (item for item in snapshot.series if item.prefix == series.prefix), None
+    )
     confirmed = tuple(confirmed_remove_ids)
     if existing is not None and series.count < existing.count:
-        expected = frozenset(f"{series.prefix}{number}" for number in range(series.count + 1, existing.count + 1))
+        expected = frozenset(
+            f"{series.prefix}{number}"
+            for number in range(series.count + 1, existing.count + 1)
+        )
         if len(confirmed) != len(expected) or frozenset(confirmed) != expected:
             _fail("remove_confirmation_required")
     elif confirmed:
         _fail("remove_confirmation_required")
-    items = [item for item in snapshot.series if item.prefix != series.prefix] + [series]
+    items = [item for item in snapshot.series if item.prefix != series.prefix] + [
+        series
+    ]
     return _next(snapshot, series=items)
 
 
-def plan_series_disable(snapshot: FleetSnapshot, prefix: str, *, expected_generation: int) -> FleetSnapshot:
+def plan_series_disable(
+    snapshot: FleetSnapshot, prefix: str, *, expected_generation: int
+) -> FleetSnapshot:
     _generation(snapshot, expected_generation)
     if not any(item.prefix == prefix for item in snapshot.series):
         _fail("invalid_series")
-    series = [replace(item, enabled=False) if item.prefix == prefix else item for item in snapshot.series]
+    series = [
+        replace(item, enabled=False) if item.prefix == prefix else item
+        for item in snapshot.series
+    ]
     return _next(snapshot, series=series)
 
 
-def plan_series_delete(snapshot: FleetSnapshot, prefix: str, *, expected_generation: int) -> FleetSnapshot:
+def plan_series_delete(
+    snapshot: FleetSnapshot, prefix: str, *, expected_generation: int
+) -> FleetSnapshot:
     _generation(snapshot, expected_generation)
     existing = next((item for item in snapshot.series if item.prefix == prefix), None)
     if existing is None:
         _fail("invalid_series")
     if existing.enabled:
         _fail("series_must_be_disabled")
-    return _next(snapshot, series=[item for item in snapshot.series if item.prefix != prefix])
+    return _next(
+        snapshot, series=[item for item in snapshot.series if item.prefix != prefix]
+    )
 
 
-def mark_account_limit(snapshot: FleetSnapshot, account_id: str, *, reset_at_utc: str | None,
-                       reason: str, expected_generation: int) -> FleetSnapshot:
+def mark_account_limit(
+    snapshot: FleetSnapshot,
+    account_id: str,
+    *,
+    reset_at_utc: str | None,
+    reason: str,
+    expected_generation: int,
+) -> FleetSnapshot:
     _generation(snapshot, expected_generation)
-    accounts = [replace(item, limit_state=LimitState.LIMITED, reset_at_utc=reset_at_utc, limit_reason=reason)
-                if item.account_id == account_id else item for item in snapshot.accounts]
+    accounts = [
+        replace(
+            item,
+            limit_state=LimitState.LIMITED,
+            reset_at_utc=reset_at_utc,
+            limit_reason=reason,
+        )
+        if item.account_id == account_id
+        else item
+        for item in snapshot.accounts
+    ]
     if accounts == list(snapshot.accounts):
         _fail("invalid_account")
     return _next(snapshot, accounts=accounts)

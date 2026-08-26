@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import os
 import json
+import importlib
 import threading
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
 
@@ -35,19 +36,24 @@ from codex_master.fleet_registry import (
     SecretState,
     fleet_document,
     normalize_fleet_document,
-    plan_dynamic_worker_principal_reserve,
+    DynamicWorkerRegistryPlannerV2,
 )
-from codex_master.fleet_runners import ProviderError, ProviderErrorQuotaObservation, ProbeResult
+from codex_master.fleet_runners import (
+    ProviderError,
+    ProviderErrorQuotaObservation,
+    ProbeResult,
+)
 from codex_master.fleet_service import FleetRateLimitError
 from codex_master.worker_resolution_carrier import (
+    WorkerRegistryReservationIssuerV2,
     WorkerResolutionEvidenceV2,
-    build_worker_registry_reservation,
     build_worker_resolution_carrier,
 )
 from codex_master.worker_resume import WorkerLifecycle
 from codex_master.worker_spawn_ledger import (
     FenceEpoch,
     Generation,
+    LeaseBindingConsumerInputV1,
     LedgerRevision,
     SpawnPhase,
     WorkerSpawnTicketV2,
@@ -75,8 +81,18 @@ def _account(
     secret_state: SecretState = SecretState.MISSING,
     limit_state: LimitState = LimitState.UNKNOWN,
 ) -> FleetAccount:
-    return FleetAccount(account_id, "Shared account", Provider.GEMINI_API, AuthKind.API_KEY,
-                        secret_state, limit_state, enabled, None, None, None)
+    return FleetAccount(
+        account_id,
+        "Shared account",
+        Provider.GEMINI_API,
+        AuthKind.API_KEY,
+        secret_state,
+        limit_state,
+        enabled,
+        None,
+        None,
+        None,
+    )
 
 
 def _series(
@@ -88,7 +104,9 @@ def _series(
 ) -> FleetSeries:
     provider = Provider.OLLAMA_LOCAL if account_id is None else Provider.GEMINI_API
     runner = RunnerKind.CODEX_CLI if account_id is None else RunnerKind.GEMINI_CLI
-    return FleetSeries(prefix, f"Series {prefix}", 1, runner, provider, model, account_id, enabled)
+    return FleetSeries(
+        prefix, f"Series {prefix}", 1, runner, provider, model, account_id, enabled
+    )
 
 
 def _service(tmp_path: Path, snapshot: FleetSnapshot | None = None):
@@ -147,7 +165,9 @@ def _r3_service(tmp_path: Path, snapshot: FleetSnapshotV2):
 
 
 def _configured_snapshot(*, generation: int = 2) -> FleetSnapshot:
-    return FleetSnapshot(1, generation, (_account(secret_state=SecretState.CONFIGURED),), (_series(),))
+    return FleetSnapshot(
+        1, generation, (_account(secret_state=SecretState.CONFIGURED),), (_series(),)
+    )
 
 
 def _digest(char: str) -> str:
@@ -156,7 +176,9 @@ def _digest(char: str) -> str:
 
 def _empty_worker_snapshot() -> FleetSnapshotV2:
     document = json.loads(
-        (Path(__file__).parent / "fixtures" / "fleet-registry-v2.json").read_text(encoding="utf-8")
+        (Path(__file__).parent / "fixtures" / "fleet-registry-v2.json").read_text(
+            encoding="utf-8"
+        )
     )
     document["runtime_principals"] = []
     snapshot = normalize_fleet_document(document)
@@ -178,7 +200,9 @@ def _worker_registry_reservation():
     )
     model = "gpt-5.6-luna"
     models = (
-        ModelPolicy(model, "luna", 20, ("low", "medium", "high", "xhigh"), ("read", "write")),
+        ModelPolicy(
+            model, "luna", 20, ("low", "medium", "high", "xhigh"), ("read", "write")
+        ),
     )
     request = ResolutionRequest(
         "read",
@@ -186,8 +210,12 @@ def _worker_registry_reservation():
         requested_class="arbeitsbiene",
         requested_lifecycle="invocation",
     )
-    decision = resolve_agent_selection(request, classes=classes, models=models, available_models={model})
-    offer = build_selection_offer(classes=classes, models=models, available_models={model})
+    decision = resolve_agent_selection(
+        request, classes=classes, models=models, available_models={model}
+    )
+    offer = build_selection_offer(
+        classes=classes, models=models, available_models={model}
+    )
     ticket = WorkerSpawnTicketV2(
         ticket_id="ticket:worker-7",
         request_id="worker-7",
@@ -219,15 +247,95 @@ def _worker_registry_reservation():
         ticket_fence_epoch=ticket.fence_epoch,
     )
     carrier = build_worker_resolution_carrier(ticket, evidence)
-    return build_worker_registry_reservation(
-        resolution=carrier,
-        principal_id="dw-" + "7" * 32,
-        ticket_ledger_revision=ticket.ledger_revision,
-        ticket_fence_epoch=ticket.fence_epoch,
+    allocator_module = importlib.import_module("codex_master.runtime_account_allocator")
+
+    class _Adapter:
+        adapter_id = "adapter-service"
+
+        def reserve_capability_atomically(self, _capability, capacity_evidence):
+            return allocator_module.AccountReservation(
+                reservation_id="reservation-service",
+                account_binding_digest=_digest("a"),
+                profile_binding_digest=_digest("b"),
+                provider_adapter_id=self.adapter_id,
+                capacity_evidence=capacity_evidence,
+                lease_revision=1,
+                evidence_revision=capacity_evidence.evidence_revision,
+                fencing_token=capacity_evidence.fencing_token,
+                fence_epoch=capacity_evidence.fence_epoch,
+                expires_at_utc=capacity_evidence.expires_at_utc,
+            )
+
+        def release_reservation(self, _reservation):
+            return True
+
+    allocator = allocator_module.RuntimeAccountAllocator(_Adapter())
+    p0_ticket = allocator_module.ValidatedAllocationTicket(
+        ticket_id=ticket.ticket_id,
+        resolution_decision=carrier.decision,
+        selection_offer=carrier.offer,
+        resolver_offer_generation=carrier.resolver_offer_generation,
+        policy_generation=ticket.policy_generation.value,
+        policy_digest=ticket.policy_digest,
+        capability_binding_digest=carrier.capability_binding_digest,
+        ledger_revision=ticket.ledger_revision.value,
+        phase="OFFER_VALIDATED",
+        fencing_token="fence-service",
+        fence_epoch=ticket.fence_epoch.value,
     )
+    now = datetime.now(UTC)
+    evidence = allocator_module.CapacityEvidence(
+        ticket_id=p0_ticket.ticket_id,
+        resolver_offer_generation=p0_ticket.resolver_offer_generation,
+        policy_generation=p0_ticket.policy_generation,
+        capability_binding_digest=p0_ticket.capability_binding_digest,
+        ledger_revision=p0_ticket.ledger_revision,
+        fencing_token=p0_ticket.fencing_token,
+        fence_epoch=p0_ticket.fence_epoch,
+        provider_adapter_id="adapter-service",
+        capacity_units=2,
+        quota_units=2,
+        cost_units=2,
+        resource_units=2,
+        evidence_revision=1,
+        observed_at_utc=now - timedelta(seconds=1),
+        expires_at_utc=now + timedelta(minutes=5),
+    )
+    lease = allocator.allocate(p0_ticket, evidence)
+    receipt = allocator.issue_lease_binding_receipt(lease, p0_ticket, evidence)
+    verification = allocator.verify_lease_binding_receipt(
+        receipt,
+        expected_lease=lease,
+        expected_ticket=p0_ticket,
+        expected_capacity_evidence=evidence,
+    )
+    reference = allocator.lease_binding_reference_for(verification)
+    allocator.close_lease_binding_verification(verification)
+    binding = LeaseBindingConsumerInputV1(
+        receipt=receipt,
+        lease=lease,
+        allocation_ticket=p0_ticket,
+        capacity_evidence=evidence,
+    )
+    current_ticket = replace(
+        ticket,
+        phase=SpawnPhase.LEASE_RESERVED,
+        ledger_revision=LedgerRevision(2),
+        lease_binding_reference=reference,
+        account_binding_digest=str(lease.account_binding_digest),
+    )
+    reservation = WorkerRegistryReservationIssuerV2(allocator).issue(
+        resolution=carrier,
+        current_ticket=current_ticket,
+        principal_id="dw-" + "7" * 32,
+        lease_binding=binding,
+    )
+    return allocator, reservation
 
 
-def test_registry_snapshot_reads_registry_only_without_clock_or_limits(tmp_path: Path) -> None:
+def test_registry_snapshot_reads_registry_only_without_clock_or_limits(
+    tmp_path: Path,
+) -> None:
     from codex_master.fleet_service import FleetPaths, FleetPrivateIO, FleetService
 
     expected = _configured_snapshot(generation=7)
@@ -255,22 +363,48 @@ def test_registry_snapshot_reads_registry_only_without_clock_or_limits(tmp_path:
     assert calls == ["registry"]
 
 
-def test_registry_snapshot_v2_never_calls_clock_sidecar_lock_or_write_callbacks(tmp_path: Path) -> None:
+def test_registry_snapshot_v2_never_calls_clock_sidecar_lock_or_write_callbacks(
+    tmp_path: Path,
+) -> None:
     expected = FleetSnapshotV2(
         2,
         7,
-        (FleetAccountV2(
-            "g-account", "G account", Provider.GEMINI_API, AuthKind.API_KEY,
-            SecretState.CONFIGURED, LimitState.READY, True, None, None, None,
-            None, "hmac-sha256:" + "a" * 64,
-        ),),
-        (FleetSeriesV2(
-            "g", "G series", RunnerKind.GEMINI_CLI, Provider.GEMINI_API,
-            "gemini-test", True, "generic", "standard",
-            (FleetSeriesMember(
-                "11111111-1111-4111-8111-111111111111", 1, "g-account", True,
-            ),),
-        ),),
+        (
+            FleetAccountV2(
+                "g-account",
+                "G account",
+                Provider.GEMINI_API,
+                AuthKind.API_KEY,
+                SecretState.CONFIGURED,
+                LimitState.READY,
+                True,
+                None,
+                None,
+                None,
+                None,
+                "hmac-sha256:" + "a" * 64,
+            ),
+        ),
+        (
+            FleetSeriesV2(
+                "g",
+                "G series",
+                RunnerKind.GEMINI_CLI,
+                Provider.GEMINI_API,
+                "gemini-test",
+                True,
+                "generic",
+                "standard",
+                (
+                    FleetSeriesMember(
+                        "11111111-1111-4111-8111-111111111111",
+                        1,
+                        "g-account",
+                        True,
+                    ),
+                ),
+            ),
+        ),
         (),
     )
     from codex_master.fleet_service import FleetPaths, FleetPrivateIO, FleetService
@@ -313,7 +447,9 @@ def _synthetic_g_binding_state(tmp_path: Path):
     return service, paths
 
 
-def test_g_binding_evidence_never_creates_salt_or_mutates_registry(tmp_path: Path) -> None:
+def test_g_binding_evidence_never_creates_salt_or_mutates_registry(
+    tmp_path: Path,
+) -> None:
     from codex_master.fleet_service import FleetSecretError
 
     service, paths = _service(tmp_path, _configured_snapshot())
@@ -329,11 +465,15 @@ def test_g_binding_evidence_never_creates_salt_or_mutates_registry(tmp_path: Pat
     assert service.load().generation == 2
 
 
-def test_g_binding_evidence_returns_immutable_redacted_hmac_mapping(tmp_path: Path) -> None:
+def test_g_binding_evidence_returns_immutable_redacted_hmac_mapping(
+    tmp_path: Path,
+) -> None:
     service, paths = _synthetic_g_binding_state(tmp_path)
     seen: list[tuple[FleetSnapshot, MappingProxyType]] = []
 
-    def callback(snapshot: FleetSnapshot, bindings: MappingProxyType) -> dict[str, object]:
+    def callback(
+        snapshot: FleetSnapshot, bindings: MappingProxyType
+    ) -> dict[str, object]:
         seen.append((snapshot, bindings))
         with pytest.raises(TypeError):
             bindings["other"] = "not-allowed"  # type: ignore[index]
@@ -389,7 +529,10 @@ def test_g_binding_evidence_rejects_unsafe_salt_without_mutation(
         assert salt_path.is_symlink()
 
 
-@pytest.mark.parametrize("account_ids, expected_generation", [("shared", 2), (("missing",), 2), (("shared",), 1)])
+@pytest.mark.parametrize(
+    "account_ids, expected_generation",
+    [("shared", 2), (("missing",), 2), (("shared",), 1)],
+)
 def test_g_binding_evidence_rejects_invalid_account_or_generation(
     tmp_path: Path, account_ids: object, expected_generation: int
 ) -> None:
@@ -543,24 +686,29 @@ def test_commit_rejects_stale_generation(tmp_path: Path) -> None:
         service.commit_snapshot(next_snapshot, expected_generation=current.generation)
 
 
-def test_fleet_service_persists_reloads_worker_evidence_and_redacts_public_snapshot(tmp_path: Path) -> None:
+def test_fleet_service_persists_reloads_worker_evidence_and_redacts_public_snapshot(
+    tmp_path: Path,
+) -> None:
     service, paths = _r3_service(tmp_path, _empty_worker_snapshot())
     current = service.registry_snapshot()
-    reservation = _worker_registry_reservation()
-    candidate = plan_dynamic_worker_principal_reserve(
-        current,
-        reservation,
-        lease_binding_digest=_digest("f"),
-        expected_generation=current.generation,
-    )
-
-    committed = service.commit_snapshot(candidate, expected_generation=current.generation)
+    allocator, reservation = _worker_registry_reservation()
+    planner = DynamicWorkerRegistryPlannerV2(allocator)
+    with planner.plan_dynamic_worker_principal_reserve(
+        current, reservation, expected_generation=current.generation
+    ) as candidate:
+        committed = service.commit_snapshot(
+            candidate, expected_generation=current.generation
+        )
     reloaded = type(service)(paths, service._io, pool_root=tmp_path / "pool")
     loaded = reloaded.registry_snapshot()
 
     assert loaded == committed
     assert loaded.generation == 3
-    principal = next(item for item in loaded.runtime_principals if isinstance(item, FleetDynamicWorkerPrincipalV2))
+    principal = next(
+        item
+        for item in loaded.runtime_principals
+        if isinstance(item, FleetDynamicWorkerPrincipalV2)
+    )
     assert principal.resolution_evidence == WorkerResolutionEvidenceV2(
         decision=reservation.resolution.decision,
         offer=reservation.resolution.offer,
@@ -573,7 +721,9 @@ def test_fleet_service_persists_reloads_worker_evidence_and_redacts_public_snaps
     )
     private = json.loads(paths.registry.read_text(encoding="utf-8"))
     private_worker = next(
-        item for item in private["runtime_principals"] if item["principal_id"] == reservation.principal_id
+        item
+        for item in private["runtime_principals"]
+        if item["principal_id"] == reservation.principal_id
     )
     assert set(private_worker["resolution_evidence"]) == {
         "decision",
@@ -603,20 +753,27 @@ def test_fleet_service_persists_reloads_worker_evidence_and_redacts_public_snaps
     ):
         assert marker not in public
 
+    with planner.plan_dynamic_worker_principal_release(
+        loaded, reservation, expected_generation=loaded.generation
+    ) as release_candidate:
+        released = reloaded.commit_snapshot(
+            release_candidate, expected_generation=loaded.generation
+        )
+    assert released.runtime_principals == ()
+    assert allocator._active_lease_binding_verifications == {}
+
 
 def test_fleet_service_stale_worker_commit_is_strict_no_write(tmp_path: Path) -> None:
     from codex_master.fleet_service import FleetConflictError
 
     service, paths = _r3_service(tmp_path, _empty_worker_snapshot())
     current = service.registry_snapshot()
-    reservation = _worker_registry_reservation()
-    candidate = plan_dynamic_worker_principal_reserve(
-        current,
-        reservation,
-        lease_binding_digest=_digest("f"),
-        expected_generation=current.generation,
-    )
-    service.commit_snapshot(candidate, expected_generation=current.generation)
+    allocator, reservation = _worker_registry_reservation()
+    planner = DynamicWorkerRegistryPlannerV2(allocator)
+    with planner.plan_dynamic_worker_principal_reserve(
+        current, reservation, expected_generation=current.generation
+    ) as candidate:
+        service.commit_snapshot(candidate, expected_generation=current.generation)
     before = paths.registry.read_bytes()
 
     with pytest.raises(FleetConflictError, match="generation_conflict"):
@@ -626,11 +783,112 @@ def test_fleet_service_stale_worker_commit_is_strict_no_write(tmp_path: Path) ->
     assert service.registry_snapshot() == candidate
 
 
+def test_registry_operation_holds_guard_through_actual_fleet_service_cas(
+    tmp_path: Path,
+) -> None:
+    service, paths = _r3_service(tmp_path, _empty_worker_snapshot())
+    allocator, reservation = _worker_registry_reservation()
+    planner = DynamicWorkerRegistryPlannerV2(allocator)
+    active_during_write: list[bool] = []
+    real_io = service._io
+
+    def replace_text(path: Path, text: str) -> None:
+        if path == paths.registry:
+            active_during_write.append(
+                bool(allocator._active_lease_binding_verifications)
+            )
+        real_io.replace_text(path, text)
+
+    service._io = replace(real_io, replace_text=replace_text)
+    current = service.registry_snapshot()
+    with planner.plan_dynamic_worker_principal_reserve(
+        current, reservation, expected_generation=current.generation
+    ) as candidate:
+        committed = service.commit_snapshot(
+            candidate, expected_generation=current.generation
+        )
+
+    assert committed.generation == current.generation + 1
+    assert active_during_write == [True]
+    assert allocator._active_lease_binding_verifications == {}
+
+
+def test_registry_operation_stale_fleet_service_cas_has_no_write_or_retry(
+    tmp_path: Path,
+) -> None:
+    from codex_master.fleet_service import FleetConflictError
+
+    service, paths = _r3_service(tmp_path, _empty_worker_snapshot())
+    allocator, reservation = _worker_registry_reservation()
+    planner = DynamicWorkerRegistryPlannerV2(allocator)
+    current = service.registry_snapshot()
+    operation = planner.plan_dynamic_worker_principal_reserve(
+        current, reservation, expected_generation=current.generation
+    )
+    external = replace(current, generation=current.generation + 1)
+    service.commit_snapshot(external, expected_generation=current.generation)
+    before = paths.registry.read_bytes()
+    active_during_read: list[bool] = []
+    real_io = service._io
+
+    def read_text(path: Path, maximum: int, error: str) -> str | None:
+        if path == paths.registry:
+            active_during_read.append(
+                bool(allocator._active_lease_binding_verifications)
+            )
+        return real_io.read_text(path, maximum, error)
+
+    service._io = replace(real_io, read_text=read_text)
+    with pytest.raises(FleetConflictError, match="generation_conflict"):
+        with operation as candidate:
+            service.commit_snapshot(candidate, expected_generation=current.generation)
+
+    assert paths.registry.read_bytes() == before
+    assert active_during_read == [True]
+    assert allocator._active_lease_binding_verifications == {}
+
+
+def test_process_loss_denies_foreign_releaser_without_registry_mutation(
+    tmp_path: Path,
+) -> None:
+    from codex_master.fleet_registry import FleetValidationError
+
+    service, paths = _r3_service(tmp_path, _empty_worker_snapshot())
+    allocator, reservation = _worker_registry_reservation()
+    planner = DynamicWorkerRegistryPlannerV2(allocator)
+    current = service.registry_snapshot()
+    with planner.plan_dynamic_worker_principal_reserve(
+        current, reservation, expected_generation=current.generation
+    ) as candidate:
+        service.commit_snapshot(candidate, expected_generation=current.generation)
+    before = paths.registry.read_bytes()
+    loaded = service.registry_snapshot()
+
+    foreign_allocator, foreign_reservation = _worker_registry_reservation()
+    foreign_planner = DynamicWorkerRegistryPlannerV2(foreign_allocator)
+    with pytest.raises(FleetValidationError, match="worker_reservation_mismatch"):
+        with foreign_planner.plan_dynamic_worker_principal_release(
+            loaded,
+            foreign_reservation,
+            expected_generation=loaded.generation,
+        ):
+            pass
+
+    assert paths.registry.read_bytes() == before
+    assert foreign_allocator._active_lease_binding_verifications == {}
+
+
 def test_mark_limited_overlays_shared_account_gate(tmp_path: Path) -> None:
-    snapshot = FleetSnapshot(1, 2, (_account(secret_state=SecretState.CONFIGURED),),
-                             (_series("d"), _series("e"), _series("f", account_id=None)))
+    snapshot = FleetSnapshot(
+        1,
+        2,
+        (_account(secret_state=SecretState.CONFIGURED),),
+        (_series("d"), _series("e"), _series("f", account_id=None)),
+    )
     service, _ = _service(tmp_path, snapshot)
-    service.mark_limited("shared", reset_at_utc="2026-08-04T00:00:00Z", reason="provider_429")
+    service.mark_limited(
+        "shared", reset_at_utc="2026-08-04T00:00:00Z", reason="provider_429"
+    )
     assert service.account_gate("d1").reason == "limit_active"
     assert service.account_gate("e1").reason == "limit_active"
     assert service.account_gate("f1").reason == "ready"
@@ -638,7 +896,9 @@ def test_mark_limited_overlays_shared_account_gate(tmp_path: Path) -> None:
 
 def test_known_reset_time_expires_to_unknown_without_probe(tmp_path: Path) -> None:
     service, _ = _service(tmp_path, _configured_snapshot())
-    service.mark_limited("shared", reset_at_utc="2026-08-03T11:00:00Z", reason="provider_429")
+    service.mark_limited(
+        "shared", reset_at_utc="2026-08-03T11:00:00Z", reason="provider_429"
+    )
     assert service.account_gate("d1").reason == "limit_unknown"
 
 
@@ -652,7 +912,9 @@ def test_invalid_limit_sidecar_is_quarantined_and_fail_closed(tmp_path: Path) ->
     assert "invalid_fleet_limits" in marker.read_text(encoding="utf-8")
 
 
-def test_gemini_rate_reservation_blocks_bursts_across_service_instances(tmp_path: Path) -> None:
+def test_gemini_rate_reservation_blocks_bursts_across_service_instances(
+    tmp_path: Path,
+) -> None:
     from codex_master.fleet_service import FleetRateLimitError
 
     service, paths = _service(tmp_path, _configured_snapshot())
@@ -661,14 +923,18 @@ def test_gemini_rate_reservation_blocks_bursts_across_service_instances(tmp_path
     assert paths.rate_limits.exists()
 
     with pytest.raises(FleetRateLimitError) as raised:
-        type(service)(paths, service._io, pool_root=tmp_path / "pool").reserve_gemini_request("shared")
+        type(service)(
+            paths, service._io, pool_root=tmp_path / "pool"
+        ).reserve_gemini_request("shared")
 
     assert raised.value.reason == "gemini_local_rate_limit"
     assert raised.value.retry_after_seconds >= 60
     assert reservation.reservation_id in paths.rate_limits.read_text(encoding="utf-8")
 
 
-def test_tier1_quota_profile_keeps_provider_quotas_dashboard_driven(tmp_path: Path) -> None:
+def test_tier1_quota_profile_keeps_provider_quotas_dashboard_driven(
+    tmp_path: Path,
+) -> None:
     service, _ = _service(tmp_path, _configured_snapshot())
 
     tier1 = service.gemini_quota_profile("the-hive-1")
@@ -679,7 +945,10 @@ def test_tier1_quota_profile_keeps_provider_quotas_dashboard_driven(tmp_path: Pa
     unknown = service.gemini_quota_profile("the-hive-11")
 
     assert tier1["billing_tier"] == "tier1"
-    assert service.project_limit_identity("the-hive-1")["billing_group"] == "the-hive-account-1"
+    assert (
+        service.project_limit_identity("the-hive-1")["billing_group"]
+        == "the-hive-account-1"
+    )
     assert tier1["rpm_limit"] is None
     assert tier1_lite["rpm_limit"] == 4000
     assert tier1_lite["tpm_limit"] == 4_000_000
@@ -712,14 +981,24 @@ def test_gemini_billing_group_profile_and_registry_override(tmp_path: Path) -> N
         _account("the-hive-1", secret_state=SecretState.CONFIGURED),
         billing_group="registry-billing-account",
     )
-    snapshot = FleetSnapshot(1, 2, (registry_account,), (_series(account_id="the-hive-1"),))
+    snapshot = FleetSnapshot(
+        1, 2, (registry_account,), (_series(account_id="the-hive-1"),)
+    )
     service, _ = _service(tmp_path, snapshot)
 
-    assert service.gemini_quota_profile("the-hive-1")["billing_group"] == "the-hive-account-1"
-    assert service.project_limit_identity("the-hive-1")["billing_group"] == "registry-billing-account"
+    assert (
+        service.gemini_quota_profile("the-hive-1")["billing_group"]
+        == "the-hive-account-1"
+    )
+    assert (
+        service.project_limit_identity("the-hive-1")["billing_group"]
+        == "registry-billing-account"
+    )
 
 
-def test_gemini_usage_status_reports_observations_without_fake_quota_percentages(tmp_path: Path) -> None:
+def test_gemini_usage_status_reports_observations_without_fake_quota_percentages(
+    tmp_path: Path,
+) -> None:
     service, _ = _service(tmp_path, _configured_snapshot())
     service.record_gemini_usage(
         "the-hive-1",
@@ -752,9 +1031,15 @@ def test_gemini_usage_status_reports_observations_without_fake_quota_percentages
     assert status["spend_evaluation"]["state"] == "billing_export_required"
 
 
-def test_model_scoped_usage_observation_blocks_model_only_and_not_account_limits(tmp_path: Path) -> None:
+def test_model_scoped_usage_observation_blocks_model_only_and_not_account_limits(
+    tmp_path: Path,
+) -> None:
     account = replace(
-        _account("the-hive-1", secret_state=SecretState.CONFIGURED, limit_state=LimitState.READY),
+        _account(
+            "the-hive-1",
+            secret_state=SecretState.CONFIGURED,
+            limit_state=LimitState.READY,
+        ),
         last_probe_at_utc="2026-08-03T12:00:00Z",
     )
     service, _ = _service(
@@ -791,13 +1076,17 @@ def test_model_scoped_usage_observation_blocks_model_only_and_not_account_limits
     assert events[-1]["quota_retry_after_seconds"] == 120
     assert events[-1]["gate_code"] == "gemini_model_limited"
 
-    service._io = replace(service._io, utc_now=lambda: datetime(2026, 8, 3, 12, 5, tzinfo=timezone.utc))
+    service._io = replace(
+        service._io, utc_now=lambda: datetime(2026, 8, 3, 12, 5, tzinfo=timezone.utc)
+    )
     decision = service.gemini_headless_gate("d1")
     assert decision.action == "allow"
     assert decision.diagnostic_code == "gemini_ready"
 
 
-def test_gemini_rate_status_exposes_quota_profile_before_first_request(tmp_path: Path) -> None:
+def test_gemini_rate_status_exposes_quota_profile_before_first_request(
+    tmp_path: Path,
+) -> None:
     service, _ = _service(tmp_path, _configured_snapshot())
 
     status = service.gemini_rate_status("the-hive-1")
@@ -807,7 +1096,9 @@ def test_gemini_rate_status_exposes_quota_profile_before_first_request(tmp_path:
     assert status["local_request_interval_seconds"] == 4
 
 
-def test_gemini_rate_reservation_applies_exponential_429_cooldown(tmp_path: Path) -> None:
+def test_gemini_rate_reservation_applies_exponential_429_cooldown(
+    tmp_path: Path,
+) -> None:
     from codex_master.fleet_service import FleetRateLimitError
 
     service, paths = _service(tmp_path, _configured_snapshot())
@@ -825,9 +1116,14 @@ def test_model_scoped_rate_requests_block_only_matching_model(tmp_path: Path) ->
     service, paths = _service(tmp_path, _configured_snapshot())
 
     a = service.reserve_gemini_request("shared", model="gemini-3-flash")
-    reserved = json.loads(paths.rate_limits.read_text(encoding="utf-8"))["accounts"]["shared"]
+    reserved = json.loads(paths.rate_limits.read_text(encoding="utf-8"))["accounts"][
+        "shared"
+    ]
     assert reserved["in_flight"]["reservation_id"] == a.reservation_id
-    assert reserved["models"]["gemini-3-flash"]["in_flight"]["reservation_id"] == a.reservation_id
+    assert (
+        reserved["models"]["gemini-3-flash"]["in_flight"]["reservation_id"]
+        == a.reservation_id
+    )
     service.release_gemini_request(
         a,
         outcome="rate_limited",
@@ -836,7 +1132,10 @@ def test_model_scoped_rate_requests_block_only_matching_model(tmp_path: Path) ->
 
     status_a = service.gemini_rate_status("shared", model="gemini-3-flash")
     assert status_a["allowed"] is False
-    assert service.gemini_rate_status("shared", model="gemini-3.1-flash-lite")["allowed"] is True
+    assert (
+        service.gemini_rate_status("shared", model="gemini-3.1-flash-lite")["allowed"]
+        is True
+    )
 
     service.reserve_gemini_request("shared", model="gemini-3.1-flash-lite")
     with pytest.raises(FleetRateLimitError):
@@ -849,7 +1148,9 @@ def test_model_scoped_rate_requests_block_only_matching_model(tmp_path: Path) ->
     assert "gemini-3-flash" in account_entry["models"]
 
 
-def test_25_flash_lite_rate_state_is_model_bound_with_unknown_dashboard_limits(tmp_path: Path) -> None:
+def test_25_flash_lite_rate_state_is_model_bound_with_unknown_dashboard_limits(
+    tmp_path: Path,
+) -> None:
     service, paths = _service(tmp_path, _configured_snapshot())
     model = "gemini-2.5-flash-lite"
 
@@ -875,7 +1176,9 @@ def test_25_flash_lite_rate_state_is_model_bound_with_unknown_dashboard_limits(t
     )
 
     assert result["model"] == model
-    rate_limits = json.loads(paths.rate_limits.read_text(encoding="utf-8"))["accounts"]["shared"]
+    rate_limits = json.loads(paths.rate_limits.read_text(encoding="utf-8"))["accounts"][
+        "shared"
+    ]
     assert rate_limits["cooldown_until_utc"] is None
     assert rate_limits["consecutive_429"] == 0
     assert rate_limits["models"][model]["in_flight"] is None
@@ -886,7 +1189,9 @@ def test_25_flash_lite_rate_state_is_model_bound_with_unknown_dashboard_limits(t
     assert service.gemini_rate_status("shared", model=model)["quota_model"] == model
 
 
-def test_future_catalog_model_stays_model_bound_with_unknown_quota(tmp_path: Path) -> None:
+def test_future_catalog_model_stays_model_bound_with_unknown_quota(
+    tmp_path: Path,
+) -> None:
     service, paths = _service(tmp_path, _configured_snapshot())
     model = "gemini-9.9-future-preview"
 
@@ -899,7 +1204,9 @@ def test_future_catalog_model_stays_model_bound_with_unknown_quota(tmp_path: Pat
     assert status["rpd_limit"] is None
 
     service.release_gemini_request(reservation, outcome="provider_error")
-    rate_state = json.loads(paths.rate_limits.read_text(encoding="utf-8"))["accounts"]["shared"]
+    rate_state = json.loads(paths.rate_limits.read_text(encoding="utf-8"))["accounts"][
+        "shared"
+    ]
     assert rate_state["in_flight"] is None
     assert rate_state["models"][model]["in_flight"] is None
 
@@ -907,17 +1214,20 @@ def test_future_catalog_model_stays_model_bound_with_unknown_quota(tmp_path: Pat
 def test_model_scoped_gemini_rate_limits_migrate_v1_to_v2(tmp_path: Path) -> None:
     service, paths = _service(tmp_path, _configured_snapshot())
     paths.rate_limits.write_text(
-        json.dumps({
-            "schema_version": 1,
-            "accounts": {
-                "shared": {
-                    "next_allowed_at_utc": "2026-08-03T11:00:00Z",
-                    "cooldown_until_utc": None,
-                    "in_flight": None,
-                    "consecutive_429": 2,
-                }
-            },
-        }) + "\n",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "accounts": {
+                    "shared": {
+                        "next_allowed_at_utc": "2026-08-03T11:00:00Z",
+                        "cooldown_until_utc": None,
+                        "in_flight": None,
+                        "consecutive_429": 2,
+                    }
+                },
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -940,7 +1250,9 @@ def test_invalid_gemini_rate_state_fails_closed(tmp_path: Path) -> None:
     assert marker.exists()
 
 
-def test_v2_rate_limits_reject_unknown_fields_and_invalid_models(tmp_path: Path) -> None:
+def test_v2_rate_limits_reject_unknown_fields_and_invalid_models(
+    tmp_path: Path,
+) -> None:
     service, paths = _service(tmp_path, _configured_snapshot())
     service.reserve_gemini_request("shared", model="gemini-3-flash")
     valid_text = paths.rate_limits.read_text(encoding="utf-8")
@@ -960,7 +1272,9 @@ def test_v2_rate_limits_reject_unknown_fields_and_invalid_models(tmp_path: Path)
 
     paths.rate_limits.write_text(valid_text, encoding="utf-8")
     entries = service._load_rate_limits()
-    entries["shared"]["models"]["invalid-model"] = entries["shared"]["models"].pop("gemini-3-flash")
+    entries["shared"]["models"]["invalid-model"] = entries["shared"]["models"].pop(
+        "gemini-3-flash"
+    )
     with pytest.raises(ValueError, match="invalid_gemini_rate_limits"):
         service._write_rate_limits(entries)
     assert paths.rate_limits.read_text(encoding="utf-8") == valid_text
@@ -969,21 +1283,59 @@ def test_v2_rate_limits_reject_unknown_fields_and_invalid_models(tmp_path: Path)
 @pytest.mark.parametrize(
     ("account", "want"),
     [
-        (_account(enabled=False, secret_state=SecretState.CONFIGURED), "account_disabled"),
+        (
+            _account(enabled=False, secret_state=SecretState.CONFIGURED),
+            "account_disabled",
+        ),
         (_account(), "secret_missing"),
         (_account(secret_state=SecretState.INVALID), "auth_invalid"),
-        (_account(secret_state=SecretState.CONFIGURED, limit_state=LimitState.UNKNOWN), "limit_unknown"),
-        (replace(_account(secret_state=SecretState.CONFIGURED, limit_state=LimitState.READY),
-                 limit_reason="provider_unavailable"), "provider_unavailable"),
-        (replace(_account(secret_state=SecretState.CONFIGURED, limit_state=LimitState.READY),
-                 limit_reason="model_unavailable"), "model_unavailable"),
-        (replace(_account(secret_state=SecretState.CONFIGURED, limit_state=LimitState.READY),
-                 last_probe_at_utc="2026-08-03T11:44:59Z"), "probe_stale"),
-        (replace(_account(secret_state=SecretState.CONFIGURED, limit_state=LimitState.READY),
-                 last_probe_at_utc="2026-08-03T11:45:00Z"), "ready"),
+        (
+            _account(
+                secret_state=SecretState.CONFIGURED, limit_state=LimitState.UNKNOWN
+            ),
+            "limit_unknown",
+        ),
+        (
+            replace(
+                _account(
+                    secret_state=SecretState.CONFIGURED, limit_state=LimitState.READY
+                ),
+                limit_reason="provider_unavailable",
+            ),
+            "provider_unavailable",
+        ),
+        (
+            replace(
+                _account(
+                    secret_state=SecretState.CONFIGURED, limit_state=LimitState.READY
+                ),
+                limit_reason="model_unavailable",
+            ),
+            "model_unavailable",
+        ),
+        (
+            replace(
+                _account(
+                    secret_state=SecretState.CONFIGURED, limit_state=LimitState.READY
+                ),
+                last_probe_at_utc="2026-08-03T11:44:59Z",
+            ),
+            "probe_stale",
+        ),
+        (
+            replace(
+                _account(
+                    secret_state=SecretState.CONFIGURED, limit_state=LimitState.READY
+                ),
+                last_probe_at_utc="2026-08-03T11:45:00Z",
+            ),
+            "ready",
+        ),
     ],
 )
-def test_account_gate_uses_fixed_priority_codes(tmp_path: Path, account: FleetAccount, want: str) -> None:
+def test_account_gate_uses_fixed_priority_codes(
+    tmp_path: Path, account: FleetAccount, want: str
+) -> None:
     service, _ = _service(tmp_path, FleetSnapshot(1, 2, (account,), (_series(),)))
     decision = service.account_gate("d1")
     assert decision.allowed is (want == "ready")
@@ -992,7 +1344,9 @@ def test_account_gate_uses_fixed_priority_codes(tmp_path: Path, account: FleetAc
     assert decision.generation == 2
 
 
-def test_series_gate_allows_accountless_ollama_and_rejects_disabled(tmp_path: Path) -> None:
+def test_series_gate_allows_accountless_ollama_and_rejects_disabled(
+    tmp_path: Path,
+) -> None:
     service, _ = _service(tmp_path)
     ollama = service.series_gate(_series(account_id=None))
     disabled = service.series_gate(_series(account_id=None, enabled=False))
@@ -1017,7 +1371,9 @@ def test_probe_runs_without_registry_lock_and_sets_ready(tmp_path: Path) -> None
         finally:
             held = False
 
-    observed = type(service)(paths, replace(real_io, lock=observed_lock), pool_root=tmp_path / "pool")
+    observed = type(service)(
+        paths, replace(real_io, lock=observed_lock), pool_root=tmp_path / "pool"
+    )
 
     def probe(account: FleetAccount) -> ProbeResult:
         held_during_probe.append(held)
@@ -1035,13 +1391,17 @@ def test_probe_runs_without_registry_lock_and_sets_ready(tmp_path: Path) -> None
     assert observed.account_gate("d1").reason == "ready"
 
 
-def test_probe_rejects_generation_change_while_external_call_runs(tmp_path: Path) -> None:
+def test_probe_rejects_generation_change_while_external_call_runs(
+    tmp_path: Path,
+) -> None:
     from codex_master.fleet_service import FleetConflictError
 
     service, _ = _service(tmp_path, _configured_snapshot())
 
     def probe(account: FleetAccount) -> ProbeResult:
-        service.mark_limited(account.account_id, reset_at_utc=None, reason="provider_429")
+        service.mark_limited(
+            account.account_id, reset_at_utc=None, reason="provider_429"
+        )
         return ProbeResult(account.provider, True, "model", True, None)
 
     with pytest.raises(FleetConflictError):
@@ -1056,14 +1416,25 @@ def test_probe_rejects_generation_change_while_external_call_runs(tmp_path: Path
         ("account_limited", "limit_active", SecretState.CONFIGURED, True, 429),
         ("auth_invalid", "auth_invalid", SecretState.INVALID, True, 429),
         ("secret_missing", "secret_missing", SecretState.MISSING, True, 429),
-        ("provider_unavailable", "provider_unavailable", SecretState.CONFIGURED, True, 429),
+        (
+            "provider_unavailable",
+            "provider_unavailable",
+            SecretState.CONFIGURED,
+            True,
+            429,
+        ),
         ("model_unavailable", "model_unavailable", SecretState.CONFIGURED, True, 429),
         ("runner_failed", "runner_failed", SecretState.CONFIGURED, False, None),
     ],
 )
-def test_probe_errors_become_fixed_gate_reasons(tmp_path: Path, kind: str, want: str,
-                                                secret_state: SecretState, retryable: bool,
-                                                status_code: int | None) -> None:
+def test_probe_errors_become_fixed_gate_reasons(
+    tmp_path: Path,
+    kind: str,
+    want: str,
+    secret_state: SecretState,
+    retryable: bool,
+    status_code: int | None,
+) -> None:
     service, _ = _service(tmp_path, _configured_snapshot())
     diagnostic_code = (
         "gemini_probe_generate_content_http_4xx_contract_rejected"
@@ -1094,7 +1465,10 @@ def test_probe_errors_become_fixed_gate_reasons(tmp_path: Path, kind: str, want:
     assert service.load().accounts[0].secret_state is secret_state
     assert service.account_gate("d1").reason == want
     if kind == "runner_failed":
-        assert result["diagnostic_code"] == "gemini_probe_generate_content_http_4xx_contract_rejected"
+        assert (
+            result["diagnostic_code"]
+            == "gemini_probe_generate_content_http_4xx_contract_rejected"
+        )
         assert result["endpoint_role"] == "generate_content"
         assert result["http_class"] == "4xx"
         gate = service.gemini_headless_gate("d1")
@@ -1118,16 +1492,22 @@ def test_probe_errors_become_fixed_gate_reasons(tmp_path: Path, kind: str, want:
         assert event["reason"] == "runner_failed"
         assert event["gate_code"] == "gemini_runner_failed"
         assert event["gate_action"] == "reject"
-        assert event["diagnostic_code"] == "gemini_probe_generate_content_http_4xx_contract_rejected"
+        assert (
+            event["diagnostic_code"]
+            == "gemini_probe_generate_content_http_4xx_contract_rejected"
+        )
         assert event["endpoint_role"] == "generate_content"
         assert event["http_class"] == "4xx"
 
 
-@pytest.mark.parametrize(("quota_scope", "retry_after_seconds"), [
-    ("model", None),
-    ("account", 120),
-    ("unknown", 120),
-])
+@pytest.mark.parametrize(
+    ("quota_scope", "retry_after_seconds"),
+    [
+        ("model", None),
+        ("account", 120),
+        ("unknown", 120),
+    ],
+)
 def test_probe_model_scope_without_retry_or_accountwide_scopes_fail_closed(
     tmp_path: Path,
     quota_scope: str,
@@ -1147,7 +1527,9 @@ def test_probe_model_scope_without_retry_or_accountwide_scopes_fail_closed(
 
     result = service.probe_account(
         "shared",
-        lambda account: ProbeResult(account.provider, False, "gemini-3.1-flash", False, error),
+        lambda account: ProbeResult(
+            account.provider, False, "gemini-3.1-flash", False, error
+        ),
         expected_generation=2,
     )
 
@@ -1158,7 +1540,10 @@ def test_probe_model_scope_without_retry_or_accountwide_scopes_fail_closed(
     assert events[-1]["quota_scope"] == quota_scope
     assert events[-1]["quota_retry_after_seconds"] == retry_after_seconds
     assert events[-1]["gate_code"] == "gemini_account_limited"
-    assert service._load_limits().get("shared", {}).get("reset_at_utc") == "2026-08-03T12:03:00Z"
+    assert (
+        service._load_limits().get("shared", {}).get("reset_at_utc")
+        == "2026-08-03T12:03:00Z"
+    )
 
 
 def test_record_gemini_event_unknown_diagnostic_code_is_omitted(tmp_path: Path) -> None:
@@ -1193,17 +1578,29 @@ def test_record_gemini_event_unknown_diagnostic_code_is_omitted(tmp_path: Path) 
         assert "http_class" not in events[0]
 
 
-def test_detail_poor_429_binds_account_limit_to_existing_rate_cooldown(tmp_path: Path, monkeypatch) -> None:
+def test_detail_poor_429_binds_account_limit_to_existing_rate_cooldown(
+    tmp_path: Path, monkeypatch
+) -> None:
     service, _ = _service(tmp_path, _configured_snapshot())
     reservation = service.reserve_gemini_request("shared")
-    monkeypatch.setattr(service, "reserve_gemini_request", lambda _account_id, **_kwargs: reservation)
+    monkeypatch.setattr(
+        service, "reserve_gemini_request", lambda _account_id, **_kwargs: reservation
+    )
 
-    assert service.gemini_rate_status("shared").get("defer_until") == "2026-08-03T14:01:00Z"
+    assert (
+        service.gemini_rate_status("shared").get("defer_until")
+        == "2026-08-03T14:01:00Z"
+    )
 
     result = service.probe_account(
         "shared",
-        lambda account: ProbeResult(account.provider, False, "gemini-3.1-flash", False,
-                                   ProviderError("account_limited", True, 429, None)),
+        lambda account: ProbeResult(
+            account.provider,
+            False,
+            "gemini-3.1-flash",
+            False,
+            ProviderError("account_limited", True, 429, None),
+        ),
         expected_generation=2,
     )
 
@@ -1213,9 +1610,14 @@ def test_detail_poor_429_binds_account_limit_to_existing_rate_cooldown(tmp_path:
         "reset_at_utc": "2026-08-03T12:15:00Z",
         "reason": "provider_429",
     }
-    assert service.gemini_rate_status("shared").get("defer_until") == "2026-08-03T12:15:00Z"
+    assert (
+        service.gemini_rate_status("shared").get("defer_until")
+        == "2026-08-03T12:15:00Z"
+    )
 
-    service._io = replace(service._io, utc_now=lambda: datetime(2026, 8, 3, 12, 16, tzinfo=timezone.utc))
+    service._io = replace(
+        service._io, utc_now=lambda: datetime(2026, 8, 3, 12, 16, tzinfo=timezone.utc)
+    )
     assert service.account_gate("d1").reason == "limit_unknown"
 
 
@@ -1235,10 +1637,15 @@ def test_detail_poor_429_without_valid_rate_deadline_remains_unbounded_limited(
 ) -> None:
     service, _ = _service(tmp_path, _configured_snapshot())
     if raise_status:
+
         def _raise_status(_account_id: str) -> dict[str, object]:
             raise RuntimeError("status-unavailable")
     elif inject_invalid_local_deadline:
-        status = {"defer_until": "not-a-time", "allowed": False, "reason": "gemini_local_rate_limit"}
+        status = {
+            "defer_until": "not-a-time",
+            "allowed": False,
+            "reason": "gemini_local_rate_limit",
+        }
     else:
         status = {}
     if raise_status:
@@ -1252,14 +1659,21 @@ def test_detail_poor_429_without_valid_rate_deadline_remains_unbounded_limited(
 
     result = service.probe_account(
         "shared",
-        lambda account: ProbeResult(account.provider, False, "gemini-3.1-flash", False,
-                                   ProviderError("account_limited", True, 429, None)),
+        lambda account: ProbeResult(
+            account.provider,
+            False,
+            "gemini-3.1-flash",
+            False,
+            ProviderError("account_limited", True, 429, None),
+        ),
         expected_generation=2,
     )
 
     assert result["reason"] == "limit_active"
     assert service._load_limits()["shared"]["reset_at_utc"] is None
-    service._io = replace(service._io, utc_now=lambda: datetime(2026, 8, 3, 13, 0, tzinfo=timezone.utc))
+    service._io = replace(
+        service._io, utc_now=lambda: datetime(2026, 8, 3, 13, 0, tzinfo=timezone.utc)
+    )
     assert service.account_gate("d1").reason == "limit_active"
 
 
@@ -1272,17 +1686,20 @@ def test_legacy_usage_events_missing_quota_fields_normalize_to_none(
             {
                 "schema_version": 1,
                 "accounts": {
-                    "shared": [{
-                        "at_utc": "2026-08-03T12:00:00Z",
-                        "model": "gemini-3.1-flash",
-                        "input_tokens": 1,
-                        "output_tokens": 0,
-                        "tool_call_count": 0,
-                        "status": "failed",
-                    }],
+                    "shared": [
+                        {
+                            "at_utc": "2026-08-03T12:00:00Z",
+                            "model": "gemini-3.1-flash",
+                            "input_tokens": 1,
+                            "output_tokens": 0,
+                            "tool_call_count": 0,
+                            "status": "failed",
+                        }
+                    ],
                 },
             },
-        ) + "\n",
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -1296,7 +1713,9 @@ def test_legacy_usage_events_missing_quota_fields_normalize_to_none(
 def test_probe_model_scope_limit_records_model_lock_not_account_limit(
     tmp_path: Path,
 ) -> None:
-    account = _account("shared", secret_state=SecretState.CONFIGURED, limit_state=LimitState.READY)
+    account = _account(
+        "shared", secret_state=SecretState.CONFIGURED, limit_state=LimitState.READY
+    )
     service, _ = _service(
         tmp_path,
         FleetSnapshot(
@@ -1312,12 +1731,16 @@ def test_probe_model_scope_limit_records_model_lock_not_account_limit(
         True,
         429,
         "2026-08-03T12:03:00Z",
-        quota_observation=ProviderErrorQuotaObservation(scope="model", retry_after_seconds=120),
+        quota_observation=ProviderErrorQuotaObservation(
+            scope="model", retry_after_seconds=120
+        ),
     )
 
     result = service.probe_account(
         "shared",
-        lambda account: ProbeResult(account.provider, False, "gemini-3-flash", False, error),
+        lambda account: ProbeResult(
+            account.provider, False, "gemini-3-flash", False, error
+        ),
         expected_generation=2,
     )
     assert result["reason"] == "ready"
@@ -1332,13 +1755,19 @@ def test_probe_model_scope_limit_records_model_lock_not_account_limit(
     rate_limits = service._load_rate_limits()
     assert rate_limits.get("shared", {}).get("cooldown_until_utc") is None
 
-    service._io = replace(service._io, utc_now=lambda: datetime(2026, 8, 3, 12, 2, tzinfo=timezone.utc))
+    service._io = replace(
+        service._io, utc_now=lambda: datetime(2026, 8, 3, 12, 2, tzinfo=timezone.utc)
+    )
     decision = service.gemini_headless_gate("d1")
     assert decision.action == "allow"
 
 
-def test_model_scope_limit_survives_followup_model_usage_without_quota_fields(tmp_path: Path) -> None:
-    account = _account("shared", secret_state=SecretState.CONFIGURED, limit_state=LimitState.READY)
+def test_model_scope_limit_survives_followup_model_usage_without_quota_fields(
+    tmp_path: Path,
+) -> None:
+    account = _account(
+        "shared", secret_state=SecretState.CONFIGURED, limit_state=LimitState.READY
+    )
     service, _ = _service(
         tmp_path,
         FleetSnapshot(
@@ -1368,7 +1797,9 @@ def test_model_scope_limit_survives_followup_model_usage_without_quota_fields(tm
     )
     result = service.probe_account(
         "shared",
-        lambda account: ProbeResult(account.provider, True, "gemini-3-flash", False, None),
+        lambda account: ProbeResult(
+            account.provider, True, "gemini-3-flash", False, None
+        ),
         expected_generation=2,
     )
     assert result["reason"] == "ready"
@@ -1453,8 +1884,16 @@ def test_private_lock_is_reentrant_and_redacts_paths(tmp_path: Path) -> None:
     with io.lock():
         with io.lock():
             assert os.stat(paths.lock).st_mode & 0o777 == 0o600
-    assert all(str(path) not in repr(paths) for path in
-               (paths.root, paths.registry, paths.secrets, paths.limits, paths.lock))
+    assert all(
+        str(path) not in repr(paths)
+        for path in (
+            paths.root,
+            paths.registry,
+            paths.secrets,
+            paths.limits,
+            paths.lock,
+        )
+    )
 
 
 def test_private_lock_serializes_cross_thread_registry_access(tmp_path: Path) -> None:
