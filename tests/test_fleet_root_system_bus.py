@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import dataclasses
 from dataclasses import replace
+import gc
+import inspect
 import os
 from pathlib import Path
 import pickle
@@ -18,7 +20,26 @@ from gi.repository import GLib
 import pytest
 
 import codex_master.fleet_root_system_bus as system_bus
-from codex_master.fleet_home_broker_runtime import BrokerReleaseSpec
+import codex_master.fleet_home_broker_runtime as runtime
+from codex_master.dynamic_teamlead import DynamicTeamleadRequest, ProfileBinding
+from codex_master.fleet_home_broker_identity import BrokerIdentity
+from codex_master.fleet_home_broker_protocol import PrincipalBinding
+from codex_master.fleet_home_broker_runtime import (
+    BrokerReleaseSpec,
+    CredentialProjection,
+    StartGrant,
+    TrustedPrincipalGrantContext,
+)
+from codex_master.fleet_registry import (
+    AuthKind,
+    FleetAccountV2,
+    FleetRuntimePrincipalV2,
+    FleetSnapshotV2,
+    LimitState,
+    Provider,
+    RunnerKind,
+    SecretState,
+)
 from codex_master.fleet_root_runtime_host import (
     FleetRootRuntimeHost,
     FleetRootRuntimeHostError,
@@ -34,6 +55,7 @@ from codex_master.fleet_root_system_bus import (
     HomeBrokerControlService,
     RootSystemBusError,
     RootSystemBusPeerAttestation,
+    TrustedPrincipalGrantConsumer,
     _IssuedAttestation,
     _LinuxPeerOperations,
     _ProcObservation,
@@ -50,6 +72,11 @@ GENERATION = 7
 PEER_LABEL = b"system_u:system_r:codex_master_control_t:s0:c1,c2"
 GATEWAY_LABEL = b"system_u:system_r:codex_master_control_t:s0"
 INVOCATION = bytes.fromhex("11" * 16)
+TL_AGENT_ID = "tl-" + "a" * 32
+PROFILE_ID = "profile.one"
+BINDING_ID = "hmac-sha256:" + "b" * 64
+POLICY_GENERATION = 9
+REGISTRY_GENERATION = 13
 
 
 def release_spec() -> BrokerReleaseSpec:
@@ -83,6 +110,127 @@ def reconciled_host(generation: int = GENERATION) -> FleetRootRuntimeHost:
         )
     )
     return host
+
+
+def expected_principal(**changes: object) -> PrincipalBinding:
+    values = {
+        "agent_id": TL_AGENT_ID,
+        "manifest_generation": 3,
+        "unit_generation": GENERATION,
+        "cgroup_dev": 9,
+        "cgroup_ino": 10,
+        "invocation_id": "11" * 16,
+        "mcs_pair": "c1,c2",
+        "fencing_epoch": 4,
+    }
+    values.update(changes)
+    return PrincipalBinding(**values)
+
+
+def trusted_context(**changes: object) -> TrustedPrincipalGrantContext:
+    principal = changes.pop("expected_principal", expected_principal())
+    account = changes.pop(
+        "account",
+        FleetAccountV2(
+            "account-one",
+            "Account One",
+            Provider.OPENAI_CHATGPT,
+            AuthKind.CHATGPT_SESSION,
+            SecretState.CONFIGURED,
+            LimitState.READY,
+            True,
+            None,
+            None,
+            None,
+            credential_binding_id=BINDING_ID,
+        ),
+    )
+    runtime_principal = changes.pop(
+        "runtime_principal",
+        FleetRuntimePrincipalV2(
+            TL_AGENT_ID,
+            account.account_id,
+            PROFILE_ID,
+            BINDING_ID,
+            "teamleiterin",
+            "persistent",
+            Provider.OPENAI_CHATGPT,
+            RunnerKind.CODEX_CLI,
+            "gpt-5.6-terra",
+            "xhigh",
+            True,
+        ),
+    )
+    values = {
+        "snapshot": FleetSnapshotV2(
+            2,
+            REGISTRY_GENERATION,
+            (account,),
+            (),
+            (runtime_principal,),
+        ),
+        "selection": DynamicTeamleadRequest(
+            TL_AGENT_ID,
+            account.account_id,
+            REGISTRY_GENERATION,
+            "gpt-5.6-terra",
+            "xhigh",
+        ),
+        "profile_binding": ProfileBinding(PROFILE_ID, BINDING_ID),
+        "expected_principal": principal,
+        "identity": BrokerIdentity(
+            TL_AGENT_ID,
+            principal.manifest_generation,
+            principal.mcs_pair,
+            "slot.snapshot.v1",
+            POLICY_GENERATION,
+            "c" * 64,
+            "d" * 64,
+            principal.fencing_epoch,
+        ),
+    }
+    values.update(changes)
+    return TrustedPrincipalGrantContext(**values)
+
+
+class RecordingResolver:
+    def __init__(self, value: object | None = None) -> None:
+        self.value = expected_principal() if value is None else value
+        self.calls: list[object] = []
+
+    def resolve_principal(self, evidence: object) -> object:
+        self.calls.append(evidence)
+        return self.value
+
+
+class RecordingProjectionProvider:
+    def __init__(
+        self, value: object | None = None, error: Exception | None = None
+    ) -> None:
+        self.value = (
+            CredentialProjection(
+                PROFILE_ID,
+                BINDING_ID,
+                POLICY_GENERATION,
+                Provider.OPENAI_CHATGPT.value,
+                (101, 102),
+            )
+            if value is None
+            else value
+        )
+        self.calls: list[tuple[object, ...]] = []
+        self.error = error
+
+    def project(self, *values: object) -> object:
+        self.calls.append(values)
+        if self.error is not None:
+            raise self.error
+        return self.value
+
+
+class ProjectionObject:
+    def __init__(self, fds: object) -> None:
+        self.fds = fds
 
 
 def raw_credentials(
@@ -196,6 +344,135 @@ class ScriptedOperations:
         self.open_fds.remove(fd)
 
 
+class GrantOperations(ScriptedOperations):
+    def __init__(self) -> None:
+        super().__init__()
+        self.projection_fds: set[int] = {101, 102}
+        self.closed_projection: list[int] = []
+        self.fail_projection_close = False
+
+    def close(self, fd: int) -> None:
+        if fd in self.projection_fds:
+            self.projection_fds.remove(fd)
+            self.closed_projection.append(fd)
+            if self.fail_projection_close:
+                self.fail_projection_close = False
+                raise OSError("private close detail")
+            return
+        super().close(fd)
+
+
+def reattest_operations() -> GrantOperations:
+    operations = GrantOperations()
+    operations.alive *= 2
+    operations.proc *= 2
+    operations.stats *= 2
+    operations.units *= 2
+    return operations
+
+
+def _trusted_service(
+    private_bus: PrivateBus,
+    *,
+    context: TrustedPrincipalGrantContext | None = None,
+    resolver: RecordingResolver | None = None,
+    provider: RecordingProjectionProvider | None = None,
+    operations: GrantOperations | None = None,
+    credential_reader: Callable[[str], object] | None = None,
+    sink: Callable[[StartGrant, RootRuntimeActivityOwnership], object] | None = None,
+) -> tuple[
+    FleetRootRuntimeHost,
+    RecordingResolver,
+    RecordingProjectionProvider,
+    GrantOperations,
+    list[tuple[StartGrant, RootRuntimeActivityOwnership]],
+    TrustedPrincipalGrantConsumer,
+    HomeBrokerControlService,
+]:
+    host = reconciled_host()
+    resolver = resolver or RecordingResolver()
+    provider = provider or RecordingProjectionProvider()
+    operations = operations or reattest_operations()
+    sink_calls: list[tuple[StartGrant, RootRuntimeActivityOwnership]] = []
+    effective_sink = sink or (
+        lambda grant, ownership: sink_calls.append((grant, ownership))
+    )
+    consumer = TrustedPrincipalGrantConsumer(
+        context or trusted_context(),
+        resolver,
+        provider,
+        effective_sink,
+        private_bus_address=private_bus.address,
+        _operations=operations,
+        _credential_reader=credential_reader or (lambda _sender: raw_credentials()),
+    )
+    service = HomeBrokerControlService(
+        host,
+        GENERATION,
+        release_spec(),
+        consumer,
+        private_bus_address=private_bus.address,
+        _operations=ScriptedOperations(),
+        _credential_reader=lambda _sender: raw_credentials(),
+    )
+    return host, resolver, provider, operations, sink_calls, consumer, service
+
+
+def mutate_recheck(
+    operations: GrantOperations,
+    credentials: list[dbus.Dictionary],
+    mutation: str,
+    *,
+    post_projection: bool = False,
+) -> None:
+    offset = 2 if post_projection else 0
+    credential_offset = 3 if post_projection else 0
+    if mutation == "exit":
+        operations.alive[13 if post_projection else 0] = False
+    elif mutation in {"pid", "uid", "groups"}:
+        changes = {
+            "pid": {"pid": 1235},
+            "uid": {"uid": 1001},
+            "groups": {"groups": (1000, 1002)},
+        }[mutation]
+        for index in range(credential_offset, credential_offset + 3):
+            credentials[index] = raw_credentials(**changes)
+    elif mutation == "effective_gid":
+        for index in range(offset, offset + 2):
+            operations.proc[index] = replace(operations.proc[index], effective_gid=1001)
+    elif mutation == "start_time":
+        for index in range(offset, offset + 2):
+            operations.proc[index] = replace(operations.proc[index], start_time=445)
+    elif mutation in {"cgroup_device", "cgroup_inode"}:
+        replacement = (11, 10) if mutation == "cgroup_device" else (9, 11)
+        for index in range(offset, offset + 2):
+            operations.stats[index] = replacement
+    elif mutation == "unit_name":
+        for index in range(offset, offset + 2):
+            operations.units[index] = replace(
+                operations.units[index], name="other.scope"
+            )
+    elif mutation == "invocation_id":
+        for index in range(offset, offset + 2):
+            operations.units[index] = replace(
+                operations.units[index], invocation_id=bytes.fromhex("22" * 16)
+            )
+    elif mutation in {"label", "mcs"}:
+        label = (
+            b"system_u:system_r:peer_t:s0:c1,c2"
+            if mutation == "label"
+            else b"system_u:system_r:peer_t:s0:c1,c3"
+        )
+        for index in range(credential_offset, credential_offset + 3):
+            credentials[index] = raw_credentials(label=label)
+        for index in range(offset, offset + 2):
+            operations.proc[index] = replace(
+                operations.proc[index], security_label=label
+            )
+    else:
+        raise AssertionError("unknown test mutation")
+
+
 class CleanupFailingOperations(ScriptedOperations):
     def __init__(self) -> None:
         super().__init__()
@@ -265,6 +542,686 @@ def assert_code(code: str, operation: Callable[[], object]) -> None:
     assert caught.value.code == code
     assert caught.value.args == (code,)
     assert code not in repr(caught.value)
+
+
+def test_trusted_principal_grant_consumer_surface_is_narrow() -> None:
+    assert tuple(inspect.signature(TrustedPrincipalGrantConsumer).parameters) == (
+        "context",
+        "principal_resolver",
+        "projection_provider",
+        "sink",
+        "private_bus_address",
+        "_operations",
+        "_credential_reader",
+    )
+    assert tuple(
+        inspect.signature(TrustedPrincipalGrantConsumer.__call__).parameters
+    ) == (
+        "self",
+        "attestation",
+        "ownership",
+    )
+
+
+def test_trusted_consumer_rechecks_and_sinks_one_bound_grant(
+    private_bus: PrivateBus,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host = reconciled_host()
+    resolver = RecordingResolver()
+    provider = RecordingProjectionProvider()
+    operations = reattest_operations()
+    sink_calls: list[tuple[StartGrant, RootRuntimeActivityOwnership]] = []
+    issuer_calls: list[tuple[object, ...]] = []
+    real_issuer = runtime._issue_start_grant
+
+    def observing_issuer(binding: tuple[object, ...]) -> StartGrant:
+        issuer_calls.append(binding)
+        return real_issuer(binding)
+
+    monkeypatch.setattr(runtime, "_issue_start_grant", observing_issuer)
+    consumer = TrustedPrincipalGrantConsumer(
+        trusted_context(),
+        resolver,
+        provider,
+        lambda grant, ownership: sink_calls.append((grant, ownership)),
+        private_bus_address=private_bus.address,
+        _operations=operations,
+        _credential_reader=lambda _sender: raw_credentials(),
+    )
+    service = HomeBrokerControlService(
+        host,
+        GENERATION,
+        release_spec(),
+        consumer,
+        private_bus_address=private_bus.address,
+        _operations=ScriptedOperations(),
+        _credential_reader=lambda _sender: raw_credentials(),
+    )
+    try:
+        assert service._handle_start(":1.1") is None
+        assert len(resolver.calls) == 1
+        assert provider.calls == [
+            (
+                PROFILE_ID,
+                BINDING_ID,
+                POLICY_GENERATION,
+                Provider.OPENAI_CHATGPT.value,
+            )
+        ]
+        assert len(issuer_calls) == 1
+        assert len(sink_calls) == 1
+        grant, ownership = sink_calls[0]
+        assert type(grant) is StartGrant
+        assert grant.peer.pid == 1234
+        assert grant.evidence.unit_generation == GENERATION
+        assert grant.principal == expected_principal()
+        assert grant.identity == trusted_context().identity
+        assert grant.projection is provider.value
+        assert grant.release == release_spec()
+        assert type(ownership) is RootRuntimeActivityOwnership
+        assert operations.calls.count("pidfd_open") == 2
+        assert operations.open_fds == set()
+        assert host.snapshot().active_principals_or_agents == 1
+        host.end_principal_or_agent(ownership)
+    finally:
+        consumer.close()
+        service.close()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "exit",
+        "pid",
+        "uid",
+        "effective_gid",
+        "groups",
+        "start_time",
+        "cgroup_device",
+        "cgroup_inode",
+        "unit_name",
+        "invocation_id",
+        "label",
+        "mcs",
+    ),
+)
+def test_trusted_consumer_blocks_preprojection_reattestation_drift(
+    private_bus: PrivateBus,
+    mutation: str,
+) -> None:
+    operations = reattest_operations()
+    credentials = [raw_credentials() for _ in range(6)]
+    mutate_recheck(operations, credentials, mutation)
+    reader_calls: list[str] = []
+
+    def reader(sender: str) -> object:
+        reader_calls.append(sender)
+        return credentials.pop(0)
+
+    host, resolver, provider, operations, sink_calls, consumer, service = (
+        _trusted_service(
+            private_bus,
+            operations=operations,
+            credential_reader=reader,
+        )
+    )
+    before = host.snapshot()
+    try:
+        with pytest.raises(RootSystemBusError):
+            service._handle_start(":1.1")
+        assert resolver.calls == []
+        assert provider.calls == []
+        assert sink_calls == []
+        assert operations.closed_projection == []
+        assert operations.open_fds == set()
+        assert len(set(reader_calls)) == 1
+        after = host.snapshot()
+        assert after.active_principals_or_agents == 0
+        assert after.runtime_broker_epoch == before.runtime_broker_epoch + 2
+    finally:
+        consumer.close()
+        service.close()
+
+
+def test_trusted_consumer_binds_original_method_sender_before_recheck(
+    private_bus: PrivateBus,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host, resolver, provider, operations, sink_calls, consumer, service = (
+        _trusted_service(private_bus)
+    )
+    original = HomeBrokerControlService._issue_handoff
+
+    def mutate_attestation_sender(
+        bound_service: HomeBrokerControlService,
+        sender: str,
+        evidence: object,
+        ownership: RootRuntimeActivityOwnership,
+    ) -> tuple[RootSystemBusPeerAttestation, object]:
+        attestation, issued = original(bound_service, sender, evidence, ownership)
+        object.__setattr__(attestation, "bus_unique_name", ":1.999")
+        return attestation, issued
+
+    monkeypatch.setattr(
+        HomeBrokerControlService,
+        "_issue_handoff",
+        mutate_attestation_sender,
+    )
+    try:
+        with pytest.raises(RootSystemBusError) as caught:
+            service._handle_start(":1.1")
+        assert caught.value.code == "handoff_invalid"
+        assert resolver.calls == []
+        assert provider.calls == []
+        assert sink_calls == []
+        assert host.snapshot().active_principals_or_agents == 0
+    finally:
+        consumer.close()
+        service.close()
+
+
+def test_trusted_consumer_binds_service_generation_before_projection(
+    private_bus: PrivateBus,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host, resolver, provider, _operations, sink_calls, consumer, service = (
+        _trusted_service(private_bus)
+    )
+    original = HomeBrokerControlService._issue_handoff
+
+    def mutate_service_generation(
+        bound_service: HomeBrokerControlService,
+        sender: str,
+        evidence: object,
+        ownership: RootRuntimeActivityOwnership,
+    ) -> tuple[RootSystemBusPeerAttestation, object]:
+        attestation, issued = original(bound_service, sender, evidence, ownership)
+        object.__setattr__(attestation, "service_generation", GENERATION + 1)
+        return attestation, issued
+
+    monkeypatch.setattr(
+        HomeBrokerControlService,
+        "_issue_handoff",
+        mutate_service_generation,
+    )
+    try:
+        with pytest.raises(RootSystemBusError):
+            service._handle_start(":1.1")
+        assert resolver.calls == []
+        assert provider.calls == []
+        assert sink_calls == []
+        assert host.snapshot().active_principals_or_agents == 0
+    finally:
+        consumer.close()
+        service.close()
+
+
+def test_postprojection_reattestation_drift_closes_projection_and_ownership(
+    private_bus: PrivateBus,
+) -> None:
+    operations = reattest_operations()
+    credentials = [raw_credentials() for _ in range(6)]
+    mutate_recheck(
+        operations,
+        credentials,
+        "start_time",
+        post_projection=True,
+    )
+    host, resolver, provider, operations, sink_calls, consumer, service = (
+        _trusted_service(
+            private_bus,
+            operations=operations,
+            credential_reader=lambda _sender: credentials.pop(0),
+        )
+    )
+    before = host.snapshot()
+    try:
+        with pytest.raises(RootSystemBusError) as caught:
+            service._handle_start(":1.1")
+        assert caught.value.code == "consumer_failed"
+        assert len(resolver.calls) == 1
+        assert len(provider.calls) == 1
+        assert sink_calls == []
+        assert operations.closed_projection == [101, 102]
+        assert operations.projection_fds == set()
+        assert operations.open_fds == set()
+        after = host.snapshot()
+        assert after.active_principals_or_agents == 0
+        assert after.runtime_broker_epoch == before.runtime_broker_epoch + 2
+    finally:
+        consumer.close()
+        service.close()
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "unknown_resolver",
+        "duplicate_principal",
+        "extra_active_principal",
+        "disabled_principal",
+        "wrong_account",
+        "duplicate_account",
+        "wrong_profile",
+        "wrong_principal_binding",
+        "wrong_account_binding",
+        "wrong_provider",
+        "wrong_class",
+        "wrong_lifecycle",
+        "wrong_model",
+        "wrong_reasoning",
+        "snapshot_generation",
+        "principal_cgroup",
+        "principal_invocation",
+        "principal_mcs",
+        "principal_unit_generation",
+        "identity_agent",
+        "identity_manifest",
+        "identity_mcs",
+        "identity_fencing",
+        "identity_policy_generation",
+    ),
+)
+def test_trusted_principal_registry_and_identity_drift_block_before_projection(
+    private_bus: PrivateBus,
+    case: str,
+) -> None:
+    context = trusted_context()
+    resolver = RecordingResolver()
+    principal = context.snapshot.runtime_principals[0]
+    account = context.snapshot.accounts[0]
+    if case == "unknown_resolver":
+        resolver = RecordingResolver(object())
+    elif case == "duplicate_principal":
+        context = replace(
+            context,
+            snapshot=replace(
+                context.snapshot,
+                runtime_principals=(principal, principal),
+            ),
+        )
+    elif case == "extra_active_principal":
+        context = replace(
+            context,
+            snapshot=replace(
+                context.snapshot,
+                runtime_principals=(
+                    principal,
+                    replace(principal, principal_id="tl-" + "f" * 32),
+                ),
+            ),
+        )
+    elif case == "disabled_principal":
+        context = replace(
+            context,
+            snapshot=replace(
+                context.snapshot,
+                runtime_principals=(replace(principal, enabled=False),),
+            ),
+        )
+    elif case == "wrong_account":
+        context = replace(
+            context,
+            snapshot=replace(
+                context.snapshot,
+                runtime_principals=(replace(principal, account_id="missing"),),
+            ),
+        )
+    elif case == "duplicate_account":
+        context = replace(
+            context,
+            snapshot=replace(context.snapshot, accounts=(account, account)),
+        )
+    elif case == "wrong_profile":
+        context = replace(
+            context,
+            snapshot=replace(
+                context.snapshot,
+                runtime_principals=(replace(principal, profile_id="profile.two"),),
+            ),
+        )
+    elif case == "wrong_principal_binding":
+        context = replace(
+            context,
+            snapshot=replace(
+                context.snapshot,
+                runtime_principals=(
+                    replace(principal, credential_binding_id="hmac-sha256:" + "e" * 64),
+                ),
+            ),
+        )
+    elif case == "wrong_account_binding":
+        context = replace(
+            context,
+            snapshot=replace(
+                context.snapshot,
+                accounts=(
+                    replace(account, credential_binding_id="hmac-sha256:" + "e" * 64),
+                ),
+            ),
+        )
+    elif case in {
+        "wrong_provider",
+        "wrong_class",
+        "wrong_lifecycle",
+        "wrong_model",
+        "wrong_reasoning",
+    }:
+        changes = {
+            "wrong_provider": {"provider": Provider.OPENAI_API},
+            "wrong_class": {"class_id": "workerin"},
+            "wrong_lifecycle": {"lifecycle": "ephemeral"},
+            "wrong_model": {"model": "gpt-5.6"},
+            "wrong_reasoning": {"reasoning": "high"},
+        }[case]
+        context = replace(
+            context,
+            snapshot=replace(
+                context.snapshot,
+                runtime_principals=(replace(principal, **changes),),
+            ),
+        )
+    elif case == "snapshot_generation":
+        context = replace(
+            context,
+            snapshot=replace(context.snapshot, generation=REGISTRY_GENERATION + 1),
+        )
+    elif case.startswith("principal_"):
+        changes = {
+            "principal_cgroup": {"cgroup_ino": 11},
+            "principal_invocation": {"invocation_id": "22" * 16},
+            "principal_mcs": {"mcs_pair": "c1,c3"},
+            "principal_unit_generation": {"unit_generation": GENERATION + 1},
+        }[case]
+        context = replace(
+            context,
+            expected_principal=replace(context.expected_principal, **changes),
+        )
+        resolver = RecordingResolver(context.expected_principal)
+    elif case.startswith("identity_"):
+        changes = {
+            "identity_agent": {"agent_id": "tl-" + "e" * 32},
+            "identity_manifest": {"manifest_generation": 4},
+            "identity_mcs": {"mcs_pair": "c1,c3"},
+            "identity_fencing": {"fencing_epoch": 5},
+        }.get(case)
+        if changes is None:
+            object.__setattr__(context.identity, "policy_generation", 0)
+        else:
+            context = replace(context, identity=replace(context.identity, **changes))
+    else:
+        raise AssertionError("unknown context case")
+
+    host, _resolver, provider, operations, sink_calls, consumer, service = (
+        _trusted_service(
+            private_bus,
+            context=context,
+            resolver=resolver,
+        )
+    )
+    try:
+        with pytest.raises(RootSystemBusError):
+            service._handle_start(":1.1")
+        assert provider.calls == []
+        assert sink_calls == []
+        assert operations.closed_projection == []
+        assert host.snapshot().active_principals_or_agents == 0
+    finally:
+        consumer.close()
+        service.close()
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_closed"),
+    (
+        ("provider_exception", ()),
+        ("wrong_type", (101, 102)),
+        ("empty", ()),
+        ("duplicate", (101,)),
+        ("negative", (101,)),
+        ("profile", (101, 102)),
+        ("binding", (101, 102)),
+        ("generation", (101, 102)),
+        ("provider", (101, 102)),
+    ),
+)
+def test_projection_failures_close_only_returned_valid_fds_once(
+    private_bus: PrivateBus,
+    case: str,
+    expected_closed: tuple[int, ...],
+) -> None:
+    values = {
+        "profile_id": PROFILE_ID,
+        "binding_id": BINDING_ID,
+        "generation": POLICY_GENERATION,
+        "provider": Provider.OPENAI_CHATGPT.value,
+        "fds": (101, 102),
+    }
+    if case == "provider_exception":
+        provider = RecordingProjectionProvider(error=RuntimeError("private detail"))
+    elif case == "wrong_type":
+        provider = RecordingProjectionProvider(ProjectionObject((101, 102)))
+    else:
+        changes = {
+            "empty": {"fds": ()},
+            "duplicate": {"fds": (101, 101)},
+            "negative": {"fds": (101, -1)},
+            "profile": {"profile_id": "profile.two"},
+            "binding": {"binding_id": "hmac-sha256:" + "e" * 64},
+            "generation": {"generation": POLICY_GENERATION + 1},
+            "provider": {"provider": Provider.OPENAI_API.value},
+        }[case]
+        values.update(changes)
+        provider = RecordingProjectionProvider(CredentialProjection(**values))
+    operations = reattest_operations()
+    operations.projection_fds = set(expected_closed)
+    host, _resolver, provider, operations, sink_calls, consumer, service = (
+        _trusted_service(
+            private_bus,
+            provider=provider,
+            operations=operations,
+        )
+    )
+    try:
+        with pytest.raises(RootSystemBusError):
+            service._handle_start(":1.1")
+        assert len(provider.calls) == 1
+        assert sink_calls == []
+        assert operations.closed_projection == list(expected_closed)
+        assert operations.projection_fds == set()
+        assert operations.open_fds == set()
+        assert host.snapshot().active_principals_or_agents == 0
+    finally:
+        consumer.close()
+        service.close()
+
+
+@pytest.mark.parametrize("issuer_result", ("exception", "wrong_type"))
+def test_grant_issuer_failure_closes_projection_before_sink(
+    private_bus: PrivateBus,
+    monkeypatch: pytest.MonkeyPatch,
+    issuer_result: str,
+) -> None:
+    def broken_issuer(_binding: tuple[object, ...]) -> object:
+        if issuer_result == "exception":
+            raise RuntimeError("private issuer detail")
+        return object()
+
+    monkeypatch.setattr(runtime, "_issue_start_grant", broken_issuer)
+    host, _resolver, provider, operations, sink_calls, consumer, service = (
+        _trusted_service(private_bus)
+    )
+    try:
+        with pytest.raises(RootSystemBusError):
+            service._handle_start(":1.1")
+        assert len(provider.calls) == 1
+        assert sink_calls == []
+        assert operations.closed_projection == [101, 102]
+        assert operations.projection_fds == set()
+        assert host.snapshot().active_principals_or_agents == 0
+    finally:
+        consumer.close()
+        service.close()
+
+
+@pytest.mark.parametrize("sink_result", ("exception", "non_none"))
+def test_sink_failure_closes_projection_and_leaves_ownership_local(
+    private_bus: PrivateBus,
+    sink_result: str,
+) -> None:
+    sink_calls: list[tuple[StartGrant, RootRuntimeActivityOwnership]] = []
+
+    def sink(grant: StartGrant, ownership: RootRuntimeActivityOwnership) -> object:
+        sink_calls.append((grant, ownership))
+        if sink_result == "exception":
+            raise RuntimeError("private sink detail")
+        return object()
+
+    host, _resolver, provider, operations, _unused, consumer, service = (
+        _trusted_service(private_bus, sink=sink)
+    )
+    before = host.snapshot()
+    try:
+        with pytest.raises(RootSystemBusError):
+            service._handle_start(":1.1")
+        assert len(provider.calls) == 1
+        assert len(sink_calls) == 1
+        assert operations.closed_projection == [101, 102]
+        assert operations.projection_fds == set()
+        after = host.snapshot()
+        assert after.active_principals_or_agents == 0
+        assert after.runtime_broker_epoch == before.runtime_broker_epoch + 2
+    finally:
+        consumer.close()
+        service.close()
+
+
+def test_projection_close_failure_is_sparse_terminal_and_not_retried(
+    private_bus: PrivateBus,
+) -> None:
+    operations = reattest_operations()
+    operations.fail_projection_close = True
+
+    def sink(_grant: StartGrant, _ownership: RootRuntimeActivityOwnership) -> None:
+        raise RuntimeError("private sink detail")
+
+    host, _resolver, _provider, operations, _unused, consumer, service = (
+        _trusted_service(private_bus, operations=operations, sink=sink)
+    )
+    try:
+        with pytest.raises(RootSystemBusError) as caught:
+            service._handle_start(":1.1")
+        assert caught.value.code == "trusted_consumer_cleanup_failed"
+        assert caught.value.args == ("trusted_consumer_cleanup_failed",)
+        assert operations.closed_projection == [101, 102]
+        assert operations.projection_fds == set()
+        assert host.snapshot().active_principals_or_agents == 0
+    finally:
+        consumer.close()
+        service.close()
+
+
+def test_service_close_closes_bound_trusted_consumer_idempotently(
+    private_bus: PrivateBus,
+) -> None:
+    _host, _resolver, _provider, _operations, _sink, consumer, service = (
+        _trusted_service(private_bus)
+    )
+
+    service.close()
+    service.close()
+    assert consumer._closed is True
+    consumer.close()
+    with pytest.raises(RootSystemBusError) as caught:
+        consumer(object(), object())
+    assert caught.value.code == "trusted_consumer_invocation_invalid"
+
+
+def test_generic_consumer_root_error_remains_normalized(
+    private_bus: PrivateBus,
+) -> None:
+    host = reconciled_host()
+
+    def consumer(
+        _attestation: RootSystemBusPeerAttestation,
+        _ownership: RootRuntimeActivityOwnership,
+    ) -> None:
+        raise RootSystemBusError("inner_consumer_failed")
+
+    service = HomeBrokerControlService(
+        host,
+        GENERATION,
+        release_spec(),
+        consumer,
+        private_bus_address=private_bus.address,
+        _operations=ScriptedOperations(),
+        _credential_reader=lambda _sender: raw_credentials(),
+    )
+    try:
+        assert_code("consumer_failed", lambda: service._handle_start(":1.1"))
+        assert host.snapshot().active_principals_or_agents == 0
+    finally:
+        service.close()
+
+
+def test_trusted_consumer_connection_close_failure_is_terminal_without_retry(
+    private_bus: PrivateBus,
+) -> None:
+    class CloseFailingBus:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def close(self) -> None:
+            self.calls += 1
+            raise OSError("private close detail")
+
+    _host, _resolver, _provider, _operations, _sink, consumer, service = (
+        _trusted_service(private_bus)
+    )
+    first = CloseFailingBus()
+    second = CloseFailingBus()
+    consumer._system_bus = first
+    consumer._credential_bus = second
+    try:
+        with pytest.raises(RootSystemBusError) as caught:
+            consumer.close()
+        assert caught.value.code == "trusted_consumer_cleanup_failed"
+        assert first.calls == second.calls == 1
+        consumer.close()
+        assert first.calls == second.calls == 1
+    finally:
+        service.close()
+
+
+def test_service_close_continues_after_trusted_consumer_cleanup_failure(
+    private_bus: PrivateBus,
+) -> None:
+    class CloseBus:
+        def __init__(self, *, fail: bool) -> None:
+            self.fail = fail
+            self.calls = 0
+
+        def close(self) -> None:
+            self.calls += 1
+            if self.fail:
+                raise OSError("private close detail")
+
+    _host, _resolver, _provider, _operations, _sink, consumer, service = (
+        _trusted_service(private_bus)
+    )
+    consumer_bus = CloseBus(fail=True)
+    service_bus = CloseBus(fail=False)
+    consumer._system_bus = consumer_bus
+    service._system_bus = service_bus
+
+    with pytest.raises(RootSystemBusError) as caught:
+        service.close()
+
+    assert caught.value.code == "trusted_consumer_cleanup_failed"
+    assert consumer_bus.calls == service_bus.calls == 1
+    service.close()
+    assert consumer_bus.calls == service_bus.calls == 1
 
 
 def test_private_bus_surface_name_and_empty_signature(
@@ -393,12 +1350,24 @@ def test_real_private_sender_credentials_and_bad_payload_blocked(
     host_before = host.snapshot()
     system_bus = dbus.SystemBus(private=True)
     operations = ProvenanceLinuxOperations(system_bus)
-    seen: list[RootSystemBusPeerAttestation] = []
+    consumer_system_bus = dbus.SystemBus(private=True)
+    consumer_operations = ProvenanceLinuxOperations(consumer_system_bus)
+    resolver = RecordingResolver()
+    provider = RecordingProjectionProvider()
+    seen: list[tuple[StartGrant, RootRuntimeActivityOwnership]] = []
+    consumer = TrustedPrincipalGrantConsumer(
+        trusted_context(),
+        resolver,
+        provider,
+        lambda grant, ownership: seen.append((grant, ownership)),
+        private_bus_address=private_bus.address,
+        _operations=consumer_operations,
+    )
     service = HomeBrokerControlService(
         host,
         GENERATION,
         release_spec(),
-        lambda attestation, _ownership: seen.append(attestation),
+        consumer,
         private_bus_address=private_bus.address,
         _operations=operations,
     )
@@ -517,6 +1486,8 @@ raise SystemExit(status)
             "pidfd provenance mismatch",
         )
         require(not seen, "negative sender reached consumer")
+        require(not resolver.calls, "negative sender reached resolver")
+        require(not provider.calls, "negative sender reached projection")
         after_negative = host.snapshot()
         require(
             after_negative.active_principals_or_agents == 0
@@ -573,9 +1544,11 @@ raise SystemExit(status)
                 child.terminate()
             child.wait(timeout=5)
         service.close()
+        consumer.close()
         loop_thread.join(5)
         assert not loop_thread.is_alive()
         system_bus.close()
+        consumer_system_bus.close()
     assert len(os.listdir("/proc/self/fd")) <= fd_ceiling
 
 
@@ -1141,6 +2114,7 @@ def test_external_name_loss_marks_participant_lost_and_close_cleans(
 ) -> None:
     host = reconciled_host()
     GLib.MainLoop()
+    gc.collect()
     before = len(os.listdir("/proc/self/fd"))
     service = HomeBrokerControlService(
         host,

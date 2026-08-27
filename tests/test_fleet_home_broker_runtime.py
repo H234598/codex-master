@@ -25,6 +25,7 @@ from codex_master.fleet_home_broker_runtime import (
     RuntimePeerOperations,
     RuntimePrincipalResolver,
     StartGrant,
+    TrustedPrincipalGrantContext,
     attest_kernel_peer,
 )
 from codex_master.fleet_home_broker_transport import BrokerPeer
@@ -287,7 +288,12 @@ def _attest(
 
 
 def test_public_types_are_frozen_slotted_and_protocols_are_narrow():
-    for type_ in (KernelPeerEvidence, CredentialProjection, StartGrant):
+    for type_ in (
+        KernelPeerEvidence,
+        CredentialProjection,
+        StartGrant,
+        TrustedPrincipalGrantContext,
+    ):
         assert dataclasses.is_dataclass(type_)
         assert type_.__dataclass_params__.frozen
         assert hasattr(type_, "__slots__")
@@ -322,6 +328,15 @@ def test_public_types_are_frozen_slotted_and_protocols_are_narrow():
         "binding_id",
         "generation",
         "provider",
+    )
+    assert tuple(
+        field.name for field in dataclasses.fields(TrustedPrincipalGrantContext)
+    ) == (
+        "snapshot",
+        "selection",
+        "profile_binding",
+        "expected_principal",
+        "identity",
     )
 
 
@@ -826,6 +841,46 @@ def test_issued_release_field_drift_is_detected_by_ten_field_carrier():
     assert runtime.closed == [101, 102]
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("peer", BrokerPeer(PEER.pid + 1)),
+        ("evidence", evidence(start_time=START_TIME + 1)),
+        ("principal", principal(cgroup_ino=30)),
+        ("identity", dataclasses.replace(IDENTITY, manifest_generation=4)),
+        ("profile_id", "profile.two"),
+        ("binding_id", "hmac-sha256:" + "e" * 64),
+        ("generation", GENERATION + 1),
+        ("provider", "openai_api"),
+        (
+            "projection",
+            CredentialProjection(
+                PROFILE_ID,
+                BINDING_ID,
+                GENERATION,
+                PROVIDER,
+                (201, 202),
+            ),
+        ),
+        ("release", release_spec(policy_abi="policy-v2")),
+    ),
+)
+def test_each_of_ten_issued_grant_fields_is_bound(field, value):
+    runtime = FakeRuntimeOperations()
+    grant = _attest(runtime=runtime)
+    object.__setattr__(grant, field, value)
+
+    with pytest.raises(RuntimeBoundaryError):
+        OneShotGrantConsumer(grant, runtime).consume(
+            PEER,
+            EVIDENCE,
+            PRINCIPAL,
+            IDENTITY,
+        )
+
+    assert runtime.closed == [101, 102]
+
+
 def test_two_distinct_grants_remain_independently_consumable():
     runtime = FakeRuntimeOperations()
     first_grant = _attest(runtime=runtime)
@@ -1032,9 +1087,10 @@ def test_internal_grant_issuer_is_only_called_by_attestation_and_not_exported():
         if isinstance(target, ast.Name)
     }
 
-    assert issuer_calls == ["attest_kernel_peer"]
+    assert issuer_calls == ["_issue_trusted_start_grant", "attest_kernel_peer"]
     assert constructors == ["_issue_start_grant"]
     assert "_issue_start_grant" not in runtime.__all__
+    assert "_issue_trusted_start_grant" not in runtime.__all__
     assert "_START_GRANT_ISSUER" not in assigned_names
 
 
@@ -1109,5 +1165,6 @@ def test_runtime_api_exports_only_a3a_surface():
         "RuntimePeerOperations",
         "RuntimePrincipalResolver",
         "StartGrant",
+        "TrustedPrincipalGrantContext",
         "attest_kernel_peer",
     )

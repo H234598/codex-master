@@ -15,6 +15,7 @@ import dbus.service
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
 
+import codex_master.fleet_home_broker_runtime as broker_runtime
 from codex_master.fleet_home_broker_protocol import (
     MAX_CHPB_DEVICE,
     MAX_CHPB_GENERATION,
@@ -25,8 +26,14 @@ from codex_master.fleet_home_broker_protocol import (
 )
 from codex_master.fleet_home_broker_runtime import (
     BrokerReleaseSpec,
+    CredentialProjectionProvider,
+    KernelPeerEvidence,
+    RuntimePrincipalResolver,
+    StartGrant,
+    TrustedPrincipalGrantContext,
     _validate_release_spec,
 )
+from codex_master.fleet_home_broker_transport import BrokerPeer
 from codex_master.fleet_root_runtime_host import (
     FleetRootRuntimeHost,
     FleetRootRuntimeHostError,
@@ -149,6 +156,7 @@ class _PeerObservation:
 @dataclass(frozen=True, slots=True, init=False, repr=False)
 class _IssuedAttestation(_NonTransferable):
     issuer: object
+    sender: str
     attestation: RootSystemBusPeerAttestation
     ownership: RootRuntimeActivityOwnership
 
@@ -636,6 +644,190 @@ class _LinuxPeerOperations:
         os.close(fd)
 
 
+class TrustedPrincipalGrantConsumer:
+    """Trusted follow-up consumer for one authenticated system-bus handoff."""
+
+    __slots__ = (
+        "_bound_service",
+        "_closed",
+        "_context",
+        "_credential_bus",
+        "_credential_reader",
+        "_operations",
+        "_principal_resolver",
+        "_projection_provider",
+        "_sink",
+        "_system_bus",
+    )
+
+    def __init__(
+        self,
+        context: TrustedPrincipalGrantContext,
+        principal_resolver: RuntimePrincipalResolver,
+        projection_provider: CredentialProjectionProvider,
+        sink: Callable[[StartGrant, RootRuntimeActivityOwnership], object],
+        *,
+        private_bus_address: str | None = None,
+        _operations: _PeerOperations | None = None,
+        _credential_reader: Callable[[str], object] | None = None,
+    ) -> None:
+        if type(context) is not TrustedPrincipalGrantContext or not callable(sink):
+            _fail("trusted_consumer_configuration_invalid")
+        credential_bus = None
+        system_bus = None
+        try:
+            if _credential_reader is None:
+                credential_bus = (
+                    dbus.SystemBus(private=True)
+                    if private_bus_address is None
+                    else dbus.bus.BusConnection(private_bus_address)
+                )
+                daemon = dbus.Interface(
+                    credential_bus.get_object(_DBUS_NAME, _DBUS_PATH),
+                    _DBUS_INTERFACE,
+                )
+                credential_reader = daemon.GetConnectionCredentials
+            else:
+                credential_reader = _credential_reader
+            if _operations is None:
+                system_bus = dbus.SystemBus(private=True)
+                operations = _LinuxPeerOperations(system_bus)
+            else:
+                operations = _operations
+        except Exception:
+            for bus in (system_bus, credential_bus):
+                if bus is not None:
+                    try:
+                        bus.close()
+                    except Exception:
+                        pass
+            _fail("trusted_consumer_configuration_invalid")
+        self._context = context
+        self._principal_resolver = principal_resolver
+        self._projection_provider = projection_provider
+        self._sink = sink
+        self._credential_bus = credential_bus
+        self._system_bus = system_bus
+        self._credential_reader = credential_reader
+        self._operations = operations
+        self._bound_service: HomeBrokerControlService | None = None
+        self._closed = False
+
+    def __call__(
+        self,
+        attestation: RootSystemBusPeerAttestation,
+        ownership: RootRuntimeActivityOwnership,
+    ) -> None:
+        _fail("trusted_consumer_invocation_invalid")
+
+    def _bind_service(self, service: HomeBrokerControlService) -> None:
+        if (
+            self._closed
+            or self._bound_service is not None
+            or type(service) is not HomeBrokerControlService
+        ):
+            _fail("trusted_consumer_configuration_invalid")
+        self._bound_service = service
+
+    def _reattest(
+        self,
+        service: HomeBrokerControlService,
+        attestation: RootSystemBusPeerAttestation,
+    ) -> KernelPeerEvidence:
+        if (
+            self._closed
+            or service is not self._bound_service
+            or type(attestation) is not RootSystemBusPeerAttestation
+            or attestation.service_generation != service._generation
+        ):
+            _fail("trusted_consumer_attestation_invalid")
+        observed = _attest_peer(
+            attestation.bus_unique_name,
+            self._credential_reader,
+            self._operations,
+            service._release,
+        )
+        if (
+            observed.pid != attestation.pid
+            or observed.uid != attestation.uid
+            or observed.effective_gid != attestation.effective_gid
+            or observed.groups != attestation.groups
+            or observed.start_time != attestation.start_time
+            or observed.cgroup_device != attestation.cgroup_device
+            or observed.cgroup_inode != attestation.cgroup_inode
+            or observed.unit_name != attestation.unit_name
+            or observed.invocation_id != attestation.invocation_id
+            or observed.selinux_context != attestation.selinux_context
+            or observed.mcs_pair != attestation.mcs_pair
+        ):
+            _fail("trusted_consumer_attestation_drifted")
+        return KernelPeerEvidence(
+            observed.pid,
+            observed.uid,
+            observed.effective_gid,
+            observed.start_time,
+            observed.cgroup_device,
+            observed.cgroup_inode,
+            service._generation,
+            observed.invocation_id,
+            observed.mcs_pair,
+        )
+
+    def _consume_from_service(
+        self,
+        service: HomeBrokerControlService,
+        attestation: RootSystemBusPeerAttestation,
+        ownership: RootRuntimeActivityOwnership,
+    ) -> None:
+        if type(ownership) is not RootRuntimeActivityOwnership:
+            _fail("trusted_consumer_ownership_invalid")
+        evidence = self._reattest(service, attestation)
+        try:
+            peer = BrokerPeer(evidence.pid)
+        except Exception:
+            _fail("trusted_consumer_attestation_invalid")
+        grant = broker_runtime._issue_trusted_start_grant(
+            peer,
+            evidence,
+            self._context,
+            service._release,
+            self._principal_resolver,
+            self._projection_provider,
+            lambda: self._reattest(service, attestation),
+            self._operations,
+        )
+        try:
+            result = self._sink(grant, ownership)
+        except Exception:
+            try:
+                broker_runtime._close_projection(self._operations, grant.projection)
+            except Exception:
+                _fail("trusted_consumer_cleanup_failed")
+            _fail("trusted_consumer_sink_failed")
+        if result is not None:
+            try:
+                broker_runtime._close_projection(self._operations, grant.projection)
+            except Exception:
+                _fail("trusted_consumer_cleanup_failed")
+            _fail("trusted_consumer_sink_failed")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        failed = False
+        for bus in (self._system_bus, self._credential_bus):
+            if bus is not None:
+                try:
+                    bus.close()
+                except Exception:
+                    failed = True
+        self._system_bus = None
+        self._credential_bus = None
+        if failed:
+            _fail("trusted_consumer_cleanup_failed")
+
+
 def _issue_attestation(
     sender: str, evidence: _PeerObservation, generation: int
 ) -> RootSystemBusPeerAttestation:
@@ -762,6 +954,8 @@ class HomeBrokerControlService(dbus.service.Object):
             path=_DBUS_PATH,
             arg0=BUS_NAME,
         )
+        if type(consumer) is TrustedPrincipalGrantConsumer:
+            consumer._bind_service(self)
 
     def run(self) -> None:
         if not self._active:
@@ -812,11 +1006,20 @@ class HomeBrokerControlService(dbus.service.Object):
             self._bus.close()
         except Exception:
             pass
+        consumer_cleanup_failed = False
+        if type(self._consumer) is TrustedPrincipalGrantConsumer:
+            try:
+                self._consumer.close()
+            except RootSystemBusError:
+                consumer_cleanup_failed = True
         if self._system_bus is not None:
             try:
                 self._system_bus.close()
             except Exception:
                 pass
+            self._system_bus = None
+        if consumer_cleanup_failed:
+            _fail("trusted_consumer_cleanup_failed")
 
     def _handoff(
         self,
@@ -833,13 +1036,25 @@ class HomeBrokerControlService(dbus.service.Object):
                 and type(issued) is _IssuedAttestation
                 and pending is issued
                 and issued.issuer is self
+                and issued.sender == attestation.bus_unique_name
                 and issued.attestation is attestation
                 and issued.ownership is ownership
             )
         if not valid:
             _fail("handoff_invalid")
         try:
-            result = self._consumer(attestation, ownership)
+            if type(self._consumer) is TrustedPrincipalGrantConsumer:
+                result = self._consumer._consume_from_service(
+                    self,
+                    attestation,
+                    ownership,
+                )
+            else:
+                result = self._consumer(attestation, ownership)
+        except RootSystemBusError:
+            if type(self._consumer) is TrustedPrincipalGrantConsumer:
+                raise
+            _fail("consumer_failed")
         except Exception:
             _fail("consumer_failed")
         if result is not None:
@@ -854,6 +1069,7 @@ class HomeBrokerControlService(dbus.service.Object):
         attestation = _issue_attestation(sender, evidence, self._generation)
         issued = object.__new__(_IssuedAttestation)
         object.__setattr__(issued, "issuer", self)
+        object.__setattr__(issued, "sender", sender)
         object.__setattr__(issued, "attestation", attestation)
         object.__setattr__(issued, "ownership", ownership)
         with self._issuance_lock:
@@ -932,4 +1148,5 @@ __all__ = (
     "HomeBrokerControlService",
     "RootSystemBusError",
     "RootSystemBusPeerAttestation",
+    "TrustedPrincipalGrantConsumer",
 )

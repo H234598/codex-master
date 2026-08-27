@@ -9,8 +9,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import Lock
-from typing import Protocol
+from typing import Callable, Protocol
 
+from codex_master.dynamic_teamlead import (
+    DynamicTeamleadRequest,
+    ProfileBinding,
+    prepare_dynamic_teamlead,
+)
 from codex_master.fleet_home_broker_identity import BrokerIdentity
 from codex_master.fleet_home_broker_linux import (
     LinuxOperations,
@@ -25,6 +30,12 @@ from codex_master.fleet_home_broker_protocol import (
     validate_principal_binding,
 )
 from codex_master.fleet_home_broker_transport import BrokerPeer
+from codex_master.fleet_registry import (
+    FleetAccountV2,
+    FleetRuntimePrincipalV2,
+    FleetSnapshotV2,
+    Provider,
+)
 
 
 class RuntimeBoundaryError(ValueError):
@@ -74,6 +85,15 @@ class BrokerReleaseSpec:
     broker_domain: str
     gateway_domain: str
     socket_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedPrincipalGrantContext:
+    snapshot: FleetSnapshotV2
+    selection: DynamicTeamleadRequest
+    profile_binding: ProfileBinding
+    expected_principal: PrincipalBinding
+    identity: BrokerIdentity
 
 
 class _StartGrantCarrier:
@@ -313,11 +333,14 @@ def _projection_fds(value: object) -> tuple[int, ...]:
 
 
 def _close_projection(operations: RuntimePeerOperations, value: object) -> None:
+    failed = False
     for fd in _projection_fds(value):
         try:
             operations.close(fd)
         except Exception:
-            pass
+            failed = True
+    if failed:
+        _fail("credential projection cleanup failed")
 
 
 def _start_grant_binding(grant: StartGrant) -> tuple[object, ...]:
@@ -400,6 +423,153 @@ def _read_rechecked_evidence(
         return _read_evidence(operations, peer)
     except RuntimeBoundaryError:
         _fail("peer evidence drifted")
+
+
+def _validate_trusted_context(
+    value: object,
+    evidence: KernelPeerEvidence,
+) -> tuple[TrustedPrincipalGrantContext, FleetRuntimePrincipalV2]:
+    if (
+        type(value) is not TrustedPrincipalGrantContext
+        or type(value.snapshot) is not FleetSnapshotV2
+        or type(value.selection) is not DynamicTeamleadRequest
+        or type(value.profile_binding) is not ProfileBinding
+        or type(value.expected_principal) is not PrincipalBinding
+        or type(value.identity) is not BrokerIdentity
+    ):
+        _fail("trusted principal context is invalid")
+    try:
+        identity = BrokerIdentity(
+            value.identity.agent_id,
+            value.identity.manifest_generation,
+            value.identity.mcs_pair,
+            value.identity.slot_snapshot,
+            value.identity.policy_generation,
+            value.identity.projection_digest,
+            value.identity.executable_fingerprint,
+            value.identity.fencing_epoch,
+        )
+        plan = prepare_dynamic_teamlead(
+            value.snapshot,
+            value.selection,
+            value.profile_binding,
+        )
+        validate_principal_binding(value.expected_principal)
+    except Exception:
+        _fail("trusted principal context is invalid")
+    accounts = tuple(
+        account
+        for account in value.snapshot.accounts
+        if type(account) is FleetAccountV2
+        and account.account_id == plan.principal.account_id
+    )
+    active_principals = tuple(
+        principal
+        for principal in value.snapshot.runtime_principals
+        if type(principal) is FleetRuntimePrincipalV2 and principal.enabled is True
+    )
+    if (
+        identity != value.identity
+        or type(plan.principal) is not FleetRuntimePrincipalV2
+        or len(accounts) != 1
+        or type(accounts[0]) is not FleetAccountV2
+        or len(active_principals) != 1
+        or active_principals[0] != plan.principal
+        or plan.principal.principal_id != value.expected_principal.agent_id
+        or value.selection.agent_id != value.expected_principal.agent_id
+        or value.expected_principal.unit_generation != evidence.unit_generation
+    ):
+        _fail("trusted principal context is invalid")
+    _validate_principal(value.expected_principal, evidence, value.identity)
+    return value, plan.principal
+
+
+def _issue_trusted_start_grant(
+    peer: BrokerPeer,
+    evidence: KernelPeerEvidence,
+    context: TrustedPrincipalGrantContext,
+    release: BrokerReleaseSpec,
+    principal_resolver: RuntimePrincipalResolver,
+    projection_provider: CredentialProjectionProvider,
+    post_projection_recheck: Callable[[], KernelPeerEvidence],
+    projection_operations: RuntimePeerOperations,
+) -> StartGrant:
+    """Issue one grant from already reattested trusted system-bus evidence."""
+
+    peer = _validate_peer(peer)
+    evidence = _validate_evidence(evidence, peer)
+    release = _validate_release_spec(release)
+    context, runtime_principal = _validate_trusted_context(context, evidence)
+    try:
+        principal = principal_resolver.resolve_principal(evidence)
+    except Exception:
+        _fail("principal resolution failed")
+    if principal != context.expected_principal:
+        _fail("principal resolution failed")
+    principal = _validate_principal(principal, evidence, context.identity)
+    provider = runtime_principal.provider.value
+    if runtime_principal.provider is not Provider.OPENAI_CHATGPT:
+        _fail("trusted principal context is invalid")
+    profile_id = context.profile_binding.profile_id
+    binding_id = context.profile_binding.credential_binding_id
+    generation = context.identity.policy_generation
+    _validate_runtime_binding(
+        profile_id,
+        binding_id,
+        generation,
+        provider,
+        context.identity,
+    )
+    try:
+        projection = projection_provider.project(
+            profile_id,
+            binding_id,
+            generation,
+            provider,
+        )
+    except Exception:
+        _fail("credential projection failed")
+    try:
+        projection = _validate_projection(
+            projection,
+            profile_id,
+            binding_id,
+            generation,
+            provider,
+        )
+        try:
+            rechecked = post_projection_recheck()
+        except Exception:
+            _fail("peer evidence drifted")
+        rechecked = _validate_evidence(rechecked, peer)
+        if rechecked != evidence:
+            _fail("peer evidence drifted")
+        binding = (
+            peer,
+            evidence,
+            principal,
+            context.identity,
+            profile_id,
+            binding_id,
+            generation,
+            provider,
+            projection,
+            release,
+        )
+        grant = _issue_start_grant(binding)
+        if (
+            type(grant) is not StartGrant
+            or not _start_grant_state(grant).matches(binding)
+            or _start_grant_binding(grant) != binding
+        ):
+            _fail("runtime grant construction failed")
+        return grant
+    except RuntimeBoundaryError:
+        _close_projection(projection_operations, projection)
+        raise
+    except Exception:
+        _close_projection(projection_operations, projection)
+        _fail("runtime grant construction failed")
 
 
 def attest_kernel_peer(
@@ -552,5 +722,6 @@ __all__ = (
     "RuntimePeerOperations",
     "RuntimePrincipalResolver",
     "StartGrant",
+    "TrustedPrincipalGrantContext",
     "attest_kernel_peer",
 )
