@@ -341,11 +341,11 @@ def open_pinned_child_directory(
     return fd
 
 
-def attest_peer_principal(
+def _attest_peer_principal_with_identity(
     operations: LinuxOperations,
     peer_pid: int,
     expected_principal: PrincipalBinding,
-) -> PeerSnapshot:
+) -> tuple[PeerSnapshot, PidfdIdentity]:
     """Attest a peer with explicit PID-FD-bound proc and cgroup reads."""
 
     _positive_integer(peer_pid, "peer pid")
@@ -467,6 +467,19 @@ def attest_peer_principal(
         )
 
     _close_all(operations, (cgroup_fd, proc_fd, pidfd))
+    return snapshot, identity
+
+
+def attest_peer_principal(
+    operations: LinuxOperations,
+    peer_pid: int,
+    expected_principal: PrincipalBinding,
+) -> PeerSnapshot:
+    """Attest a peer with explicit PID-FD-bound proc and cgroup reads."""
+
+    snapshot, _ = _attest_peer_principal_with_identity(
+        operations, peer_pid, expected_principal
+    )
     return snapshot
 
 

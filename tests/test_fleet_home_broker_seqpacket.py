@@ -24,6 +24,7 @@ PRINCIPAL = PrincipalBinding(
     "bee_1", 3, 9, 17, 29, "1" * 32, "c0,c1", 4
 )
 EXPECTED_LABEL = b"system_u:system_r:codex_master_agent_t:s0:c0,c1\0"
+SO_PEERSEC_NAME_MAX_BYTES = 255
 
 
 def release_spec(**changes: object) -> BrokerReleaseSpec:
@@ -95,6 +96,10 @@ class RecordingLinuxOperations:
         self.events = events
         self.reuse_checks = 0
         self.drift_at = values.pop("drift_at", None)
+        self.fresh_identity_per_reuse = values.pop(
+            "fresh_identity_per_reuse", False
+        )
+        self.observed_identities: list[PidfdIdentity] = []
         self.values = {
             "pid_identity": PidfdIdentity(PEER_PID, START_TIME),
             "cgroup_stat": FdStat(17, 29, 0o40755, 1000, 1000),
@@ -122,8 +127,13 @@ class RecordingLinuxOperations:
         self.events.append(("pidfd_reuse_check", pidfd, pid, proc_fd, cgroup_fd))
         self.reuse_checks += 1
         if self.drift_at is not None and self.reuse_checks >= self.drift_at:
-            return PidfdIdentity(PEER_PID, START_TIME + 1)
-        return self.values["pid_identity"]
+            observed = PidfdIdentity(PEER_PID, START_TIME + 1)
+        elif self.fresh_identity_per_reuse:
+            observed = PidfdIdentity(PEER_PID, START_TIME)
+        else:
+            observed = self.values["pid_identity"]
+        self.observed_identities.append(observed)
+        return observed
 
     def open_pinned_proc_pid(
         self, pidfd: int, pid: int, identity: PidfdIdentity
@@ -197,7 +207,7 @@ def assert_denied(
     *,
     expected: PrincipalBinding = PRINCIPAL,
     release: BrokerReleaseSpec | object = None,
-) -> None:
+) -> SeqpacketPeerError:
     if release is None:
         release = release_spec()
     with pytest.raises(SeqpacketPeerError) as caught:
@@ -205,6 +215,7 @@ def assert_denied(
     assert str(caught.value) == "seqpacket peer attestation failed"
     assert repr(caught.value) == "SeqpacketPeerError('seqpacket peer attestation failed')"
     assert caught.value.__cause__ is None
+    return caught.value
 
 
 def test_legal_order_and_evidence_conversion() -> None:
@@ -300,6 +311,43 @@ def test_linux_reattestation_drift_is_denied(values: dict[str, object]) -> None:
     assert ("selinux_enforcing",) not in events
 
 
+def test_seqpacket_binds_one_final_pidfd_identity_without_capture_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[object, ...]] = []
+    linux_operations = RecordingLinuxOperations(
+        events, fresh_identity_per_reuse=True
+    )
+    captured: list[tuple[object, object]] = []
+    original = seqpacket._attest_peer_principal_with_identity
+
+    def counted(*args: object) -> tuple[object, object]:
+        result = original(*args)
+        captured.append(result)
+        return result
+
+    monkeypatch.setattr(seqpacket, "_attest_peer_principal_with_identity", counted)
+    evidence = reattest_seqpacket_peer(
+        RecordingOperations(events), linux_operations, PRINCIPAL, release_spec()
+    )
+
+    _, final_identity = captured[0]
+    assert len(captured) == 1
+    assert linux_operations.reuse_checks == 16
+    assert final_identity is linux_operations.observed_identities[-1]
+    assert evidence.start_time == final_identity.start_time
+
+
+def test_last_pidfd_reuse_drift_returns_no_evidence_before_selinux() -> None:
+    events: list[tuple[object, ...]] = []
+    linux_operations = RecordingLinuxOperations(events, drift_at=16)
+
+    assert_denied(RecordingOperations(events), linux_operations)
+    assert linux_operations.reuse_checks == 16
+    assert ("selinux_enforcing",) not in events
+    assert ("peer_security_context",) not in events
+
+
 @pytest.mark.parametrize("enforcing", [False, 0, 1, "true", None])
 def test_non_enforcing_or_non_bool_selinux_state_is_denied(enforcing: object) -> None:
     events: list[tuple[object, ...]] = []
@@ -334,6 +382,78 @@ def test_malformed_or_unbound_peer_security_context_is_denied(
     assert_denied(operations, RecordingLinuxOperations(events))
     assert events[-2:] == [("selinux_enforcing",), ("peer_security_context",)]
     assert repr(context) not in repr(SeqpacketPeerError("seqpacket peer attestation failed"))
+
+
+def test_peer_security_context_accepts_linux_name_max_bytes() -> None:
+    events: list[tuple[object, ...]] = []
+    fixed = b":system_r:codex_master_agent_t:s0:c1022,c1023\0"
+    context = b"u" * (SO_PEERSEC_NAME_MAX_BYTES - len(fixed)) + fixed
+    expected = replace(PRINCIPAL, mcs_pair="c1022,c1023")
+
+    assert len(context) == SO_PEERSEC_NAME_MAX_BYTES
+    evidence = reattest_seqpacket_peer(
+        RecordingOperations(events, context=context),
+        RecordingLinuxOperations(events, peer_mcs_pair=expected.mcs_pair),
+        expected,
+        release_spec(),
+    )
+
+    assert evidence.mcs_pair == "c1022,c1023"
+
+
+def test_peer_security_context_rejects_linux_name_max_plus_one_before_decode() -> None:
+    events: list[tuple[object, ...]] = []
+    fixed = b":system_r:codex_master_agent_t:s0:c1022,c1023\0"
+    context = b"u" + b"u" * (SO_PEERSEC_NAME_MAX_BYTES - len(fixed)) + fixed
+    expected = replace(PRINCIPAL, mcs_pair="c1022,c1023")
+
+    assert len(context) == SO_PEERSEC_NAME_MAX_BYTES + 1
+    error = assert_denied(
+        RecordingOperations(events, context=context),
+        RecordingLinuxOperations(events, peer_mcs_pair=expected.mcs_pair),
+        expected=expected,
+    )
+
+    assert events[-2:] == [("selinux_enforcing",), ("peer_security_context",)]
+    marker = context[:-1].decode("ascii")
+    assert marker not in str(error)
+    assert marker not in repr(error)
+    assert error.__cause__ is None
+
+
+def test_peer_security_context_checks_size_before_decode() -> None:
+    source = Path(seqpacket.__file__).read_text()
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_peer_security_context"
+    )
+    function_source = ast.get_source_segment(source, function)
+    assert function_source is not None
+    decode_calls = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "decode"
+    ]
+    size_checks = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Compare)
+        and any(
+            isinstance(child, ast.Name) and child.id == "_MAX_SO_PEERSEC_BYTES"
+            for child in ast.walk(node)
+        )
+    ]
+
+    assert len(decode_calls) == 1
+    assert len(size_checks) == 1
+    assert size_checks[0].lineno < decode_calls[0].lineno
+    assert function_source.index("_MAX_SO_PEERSEC_BYTES") < function_source.index(
+        ".decode("
+    )
 
 
 @pytest.mark.parametrize(
@@ -429,3 +549,17 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
         "Home",
     )
     assert not any(term in source for term in source_terms)
+    assert "_PidfdIdentityCapture" not in source
+    assert not any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name in {"__getattr__", "pidfd_reuse_check"}
+        for node in ast.walk(tree)
+    )
+    private_attestation_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_attest_peer_principal_with_identity"
+    ]
+    assert len(private_attestation_calls) == 1

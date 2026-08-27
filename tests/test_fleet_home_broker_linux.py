@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import codex_master.fleet_home_broker_linux as linux
 from codex_master.fleet_home_broker_linux import (
     FdStat,
     LinuxBoundaryError,
@@ -82,6 +83,7 @@ class FakeOperations:
         pid_identity=EXPECTED_PID_IDENTITY,
         reuse_at=None,
         reuse_pid=None,
+        fresh_identity_per_reuse=False,
     ):
         self.calls = []
         self.directory_stat = directory_stat
@@ -96,7 +98,9 @@ class FakeOperations:
         self.pid_identity = pid_identity
         self.reuse_at = reuse_at
         self.reuse_pid = reuse_pid
+        self.fresh_identity_per_reuse = fresh_identity_per_reuse
         self.reuse_checks = 0
+        self.observed_identities = []
 
     def _raise_if_configured(self, name):
         error = self.operation_errors.get(name)
@@ -127,11 +131,18 @@ class FakeOperations:
         self._raise_if_configured("pidfd_reuse_check")
         self.reuse_checks += 1
         if self.reuse_checks == self.reuse_at:
-            return PidfdIdentity(
+            observed = PidfdIdentity(
                 self.reuse_pid if self.reuse_pid is not None else self.pid_identity.pid,
                 self.pid_identity.start_time + 1,
             )
-        return self.pid_identity
+        elif self.fresh_identity_per_reuse:
+            observed = PidfdIdentity(
+                self.pid_identity.pid, self.pid_identity.start_time
+            )
+        else:
+            observed = self.pid_identity
+        self.observed_identities.append(observed)
+        return observed
 
     def open_pinned_proc_pid(self, pidfd, pid, identity):
         self.calls.append(("open_pinned_proc_pid", pidfd, pid, identity))
@@ -390,6 +401,22 @@ def test_attestation_uses_pidfd_identity_and_exact_bound_call_order():
         ("close", PROC_FD),
         ("close", PID_FD),
     ]
+
+
+def test_private_attestation_returns_only_final_validated_identity():
+    operations = FakeOperations(fresh_identity_per_reuse=True)
+
+    observed_snapshot, final_identity = linux._attest_peer_principal_with_identity(
+        operations, PEER_PID, principal()
+    )
+
+    assert observed_snapshot == snapshot()
+    assert operations.reuse_checks == 16
+    assert final_identity is operations.observed_identities[-1]
+    assert "_attest_peer_principal_with_identity" not in linux.__all__
+    public_operations = FakeOperations()
+    assert attest_peer_principal(public_operations, PEER_PID, principal()) == snapshot()
+    assert public_operations.reuse_checks == 16
 
 
 def test_same_pid_reuse_with_new_start_identity_closes_all_peer_fds():
