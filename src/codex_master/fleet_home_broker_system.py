@@ -13,6 +13,7 @@ from codex_master.fleet_home_broker_runtime import (
     _start_grant_binding,
     _start_grant_state,
 )
+from codex_master.fleet_root_runtime_host import RootRuntimeActivityOwnership
 
 
 DIRECTORY_PATH = "/run/codex-master-home-broker"
@@ -516,6 +517,7 @@ class BrokerStartReceipt:
     release_id: str
     socket_unit: str
     projection: CredentialProjection
+    ownership: RootRuntimeActivityOwnership
 
     def __post_init__(self) -> None:
         if type(self.token) is not BrokerSnapshotToken:
@@ -524,6 +526,8 @@ class BrokerStartReceipt:
         _nonempty_text(self.socket_unit, "start receipt socket unit")
         if type(self.projection) is not CredentialProjection:
             _fail("start receipt projection is invalid")
+        if type(self.ownership) is not RootRuntimeActivityOwnership:
+            _fail("start receipt ownership is invalid")
 
 
 class _SnapshotRecord:
@@ -535,10 +539,18 @@ class _SnapshotRecord:
         self.consumed = False
 
 
+class _ReceiptRecord:
+    __slots__ = ("receipt", "terminal")
+
+    def __init__(self, receipt: BrokerStartReceipt):
+        self.receipt = receipt
+        self.terminal = False
+
+
 class BrokerSystemBoundary:
     """Serialize trusted observation, grant claim, and exactly one unit start."""
 
-    __slots__ = ("_operations", "_lock", "_records")
+    __slots__ = ("_operations", "_lock", "_records", "_receipts")
 
     def __init__(self, operations: object, lock: object = None) -> None:
         self._operations = operations
@@ -548,6 +560,7 @@ class BrokerSystemBoundary:
             lock = Lock()
         self._lock = lock
         self._records: dict[int, _SnapshotRecord] = {}
+        self._receipts: dict[int, _ReceiptRecord] = {}
 
     def _capture(self, token: BrokerSnapshotToken) -> BrokerSystemSnapshot:
         try:
@@ -576,7 +589,10 @@ class BrokerSystemBoundary:
             return snapshot
 
     def compare_and_start(
-        self, expected: BrokerSystemPlan, token: BrokerSnapshotToken
+        self,
+        expected: BrokerSystemPlan,
+        token: BrokerSnapshotToken,
+        ownership: RootRuntimeActivityOwnership,
     ) -> BrokerStartReceipt:
         with self._lock:
             record = (
@@ -586,6 +602,8 @@ class BrokerSystemBoundary:
             )
             if record is None or record.token is not token or record.consumed:
                 _fail("snapshot token is invalid")
+            if type(ownership) is not RootRuntimeActivityOwnership:
+                _fail("ownership is invalid")
             record.consumed = True
             expected = _require_issued_plan(expected)
             if not _snapshot_matches_plan(record.snapshot, expected):
@@ -616,12 +634,36 @@ class BrokerSystemBoundary:
             except Exception:
                 _close_projection(self, projection)
                 _fail("bound socket start failed")
-            return BrokerStartReceipt(
+            receipt = BrokerStartReceipt(
                 token,
                 expected.joint_release.release_id,
                 expected.service.socket_unit,
                 projection,
+                ownership,
             )
+            self._receipts[id(receipt)] = _ReceiptRecord(receipt)
+            return receipt
+
+    def close_start_receipt(self, receipt: BrokerStartReceipt) -> None:
+        with self._lock:
+            record = (
+                self._receipts.get(id(receipt))
+                if type(receipt) is BrokerStartReceipt
+                else None
+            )
+            if record is None or record.receipt is not receipt:
+                _fail("start receipt is invalid")
+            if record.terminal:
+                return
+            record.terminal = True
+            cleanup_failed = False
+            for fd in receipt.projection.fds:
+                try:
+                    self.close(fd)
+                except Exception:
+                    cleanup_failed = True
+            if cleanup_failed:
+                _fail("start receipt cleanup failed")
 
     def close(self, fd: int) -> None:
         if type(fd) is not int or fd < 0:

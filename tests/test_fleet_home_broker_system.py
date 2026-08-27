@@ -36,6 +36,12 @@ from codex_master.fleet_home_broker_system import (
     build_broker_system_plan,
 )
 from codex_master.fleet_home_broker_transport import BrokerPeer
+from codex_master.fleet_root_runtime_host import (
+    FleetRootRuntimeHost,
+    RootHostParticipant,
+    RootHostParticipantBinding,
+    RootRuntimeActivityOwnership,
+)
 
 
 PEER = BrokerPeer(1234)
@@ -152,6 +158,17 @@ def _issued_grant() -> StartGrant:
         _Resolver(),
         _Provider(),
     )
+
+
+def _issued_ownership() -> tuple[FleetRootRuntimeHost, RootRuntimeActivityOwnership]:
+    host = FleetRootRuntimeHost()
+    host.reconcile(
+        tuple(
+            RootHostParticipantBinding(participant, 1)
+            for participant in RootHostParticipant
+        )
+    )
+    return host, host.begin_principal_or_agent()
 
 
 def test_builder_accepts_only_real_issued_a3a1_grants() -> None:
@@ -395,20 +412,81 @@ def test_snapshot_returns_complete_typed_evidence_with_registered_opaque_token()
     assert hasattr(type(snapshot), "__slots__")
 
 
+def test_compare_and_start_binds_exact_ownership_and_claims_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    operations = _TrustedSystemOperations()
+    boundary = BrokerSystemBoundary(operations)
+    host, ownership = _issued_ownership()
+    plan = build_broker_system_plan(_issued_grant())
+    snapshot = boundary.snapshot()
+    claim_calls = 0
+    original_claim = broker_runtime._StartGrantState.claim
+
+    def counting_claim(state: broker_runtime._StartGrantState) -> bool:
+        nonlocal claim_calls
+        claim_calls += 1
+        return original_claim(state)
+
+    monkeypatch.setattr(broker_runtime._StartGrantState, "claim", counting_claim)
+
+    receipt = boundary.compare_and_start(plan, snapshot.token, ownership)
+
+    assert receipt.ownership is ownership
+    assert receipt.projection is plan.grant.projection
+    assert claim_calls == 1
+    assert operations.calls.count("observe") == 2
+    assert operations.calls.count(("start", RELEASE.socket_unit)) == 1
+    boundary.close_start_receipt(receipt)
+    host.end_principal_or_agent(ownership)
+
+
+def test_close_start_receipt_closes_projection_once_and_is_idempotent() -> None:
+    operations = _TrustedSystemOperations()
+    boundary = BrokerSystemBoundary(operations)
+    host, ownership = _issued_ownership()
+    plan = build_broker_system_plan(_issued_grant())
+    receipt = boundary.compare_and_start(plan, boundary.snapshot().token, ownership)
+
+    boundary.close_start_receipt(receipt)
+    boundary.close_start_receipt(receipt)
+
+    assert operations.closed == [101, 102]
+    host.end_principal_or_agent(ownership)
+
+
+def test_foreign_or_reconstructed_receipt_cannot_close_projection() -> None:
+    operations = _TrustedSystemOperations()
+    boundary = BrokerSystemBoundary(operations)
+    host, ownership = _issued_ownership()
+    plan = build_broker_system_plan(_issued_grant())
+    receipt = boundary.compare_and_start(plan, boundary.snapshot().token, ownership)
+    reconstructed = dataclasses.replace(receipt)
+
+    with pytest.raises(BrokerSystemError, match="start receipt is invalid"):
+        boundary.close_start_receipt(reconstructed)
+
+    assert operations.closed == []
+    boundary.close_start_receipt(receipt)
+    host.end_principal_or_agent(ownership)
+
+
 def test_missing_fedora_enforcing_fails_before_claim_without_start_or_close() -> None:
     operations = _TrustedSystemOperations(
         (_system_evidence(enforcing=BrokerFedoraEnforcingEvidence(False)),)
     )
     boundary = BrokerSystemBoundary(operations)
+    _host, ownership = _issued_ownership()
     snapshot = boundary.snapshot()
 
     with pytest.raises(BrokerSystemError, match="snapshot does not match plan"):
         boundary.compare_and_start(
-            build_broker_system_plan(_issued_grant()), snapshot.token
+            build_broker_system_plan(_issued_grant()), snapshot.token, ownership
         )
 
     assert operations.calls == ["observe"]
     assert operations.closed == []
+    assert boundary._receipts == {}
 
 
 @pytest.mark.parametrize(
@@ -453,30 +531,33 @@ def test_every_snapshot_evidence_field_drifting_after_claim_causes_zero_starts(
         (initial, dataclasses.replace(initial, **{field: changed(initial)}))
     )
     boundary = BrokerSystemBoundary(operations)
+    _host, ownership = _issued_ownership()
     snapshot = boundary.snapshot()
 
     with pytest.raises(BrokerSystemError, match="system snapshot drifted"):
         boundary.compare_and_start(
-            build_broker_system_plan(_issued_grant()), snapshot.token
+            build_broker_system_plan(_issued_grant()), snapshot.token, ownership
         )
 
     assert operations.calls == ["observe", "observe"]
     assert operations.closed == [101, 102]
+    assert boundary._receipts == {}
 
 
 def test_foreign_or_reused_tokens_cannot_start_a_unit() -> None:
     operations = _TrustedSystemOperations()
     boundary = BrokerSystemBoundary(operations)
     plan = build_broker_system_plan(_issued_grant())
+    _host, ownership = _issued_ownership()
     snapshot = boundary.snapshot()
 
     with pytest.raises(BrokerSystemError, match="snapshot token is invalid"):
-        boundary.compare_and_start(plan, BrokerSnapshotToken(object()))
+        boundary.compare_and_start(plan, BrokerSnapshotToken(object()), ownership)
     assert operations.calls == ["observe"]
 
-    receipt = boundary.compare_and_start(plan, snapshot.token)
+    receipt = boundary.compare_and_start(plan, snapshot.token, ownership)
     with pytest.raises(BrokerSystemError, match="snapshot token is invalid"):
-        boundary.compare_and_start(plan, snapshot.token)
+        boundary.compare_and_start(plan, snapshot.token, ownership)
 
     assert receipt.token is snapshot.token
     assert operations.calls == [
@@ -494,10 +575,11 @@ def test_reconstructed_plan_cannot_introduce_a_free_socket_unit() -> None:
     forged = dataclasses.replace(plan, service=forged_unit)
     operations = _TrustedSystemOperations((_system_evidence(unit=forged_unit),))
     boundary = BrokerSystemBoundary(operations)
+    _host, ownership = _issued_ownership()
     snapshot = boundary.snapshot()
 
     with pytest.raises(BrokerSystemError, match="broker system plan is invalid"):
-        boundary.compare_and_start(forged, snapshot.token)
+        boundary.compare_and_start(forged, snapshot.token, ownership)
 
     assert operations.calls == ["observe"]
     assert operations.closed == []
@@ -509,10 +591,11 @@ def test_compare_and_start_reobserves_starts_bound_socket_under_one_lock_and_rec
     operations = _TrustedSystemOperations()
     lock = _FakeLock()
     boundary = BrokerSystemBoundary(operations, lock)
+    _host, ownership = _issued_ownership()
     plan = build_broker_system_plan(_issued_grant())
     snapshot = boundary.snapshot()
 
-    receipt = boundary.compare_and_start(plan, snapshot.token)
+    receipt = boundary.compare_and_start(plan, snapshot.token, ownership)
 
     assert type(receipt) is BrokerStartReceipt
     assert receipt.token is snapshot.token
@@ -533,11 +616,12 @@ def test_compare_and_start_reobserves_starts_bound_socket_under_one_lock_and_rec
 def test_after_claim_start_failure_closes_transferred_fds_once() -> None:
     operations = _TrustedSystemOperations(start_error=RuntimeError("start failed"))
     boundary = BrokerSystemBoundary(operations)
+    _host, ownership = _issued_ownership()
     snapshot = boundary.snapshot()
 
     with pytest.raises(BrokerSystemError, match="bound socket start failed"):
         boundary.compare_and_start(
-            build_broker_system_plan(_issued_grant()), snapshot.token
+            build_broker_system_plan(_issued_grant()), snapshot.token, ownership
         )
 
     assert operations.calls == [
@@ -546,6 +630,7 @@ def test_after_claim_start_failure_closes_transferred_fds_once() -> None:
         ("start", RELEASE.socket_unit),
     ]
     assert operations.closed == [101, 102]
+    assert boundary._receipts == {}
 
 
 def test_post_claim_enforcing_drift_stops_start_and_closes_transferred_fds_once(
@@ -553,6 +638,7 @@ def test_post_claim_enforcing_drift_stops_start_and_closes_transferred_fds_once(
 ) -> None:
     operations = _TrustedSystemOperations()
     boundary = BrokerSystemBoundary(operations)
+    _host, ownership = _issued_ownership()
     snapshot = boundary.snapshot()
     original_claim = broker_runtime._StartGrantState.claim
 
@@ -573,11 +659,12 @@ def test_post_claim_enforcing_drift_stops_start_and_closes_transferred_fds_once(
 
     with pytest.raises(BrokerSystemError, match="system snapshot drifted"):
         boundary.compare_and_start(
-            build_broker_system_plan(_issued_grant()), snapshot.token
+            build_broker_system_plan(_issued_grant()), snapshot.token, ownership
         )
 
     assert operations.calls == ["observe", "observe"]
     assert operations.closed == [101, 102]
+    assert boundary._receipts == {}
 
 
 @pytest.mark.parametrize(
@@ -863,7 +950,11 @@ def test_complete_snapshot_plan_and_receipt_values_are_frozen_and_slotted() -> N
     plan = build_broker_system_plan(_issued_grant())
     snapshot = BrokerSystemBoundary(_TrustedSystemOperations()).snapshot()
     receipt = BrokerStartReceipt(
-        snapshot.token, RELEASE.release_id, RELEASE.socket_unit, plan.grant.projection
+        snapshot.token,
+        RELEASE.release_id,
+        RELEASE.socket_unit,
+        plan.grant.projection,
+        _issued_ownership()[1],
     )
 
     for value in (plan, _system_evidence(), snapshot, receipt):
