@@ -607,6 +607,7 @@ class BrokerSystemBoundary:
             record.consumed = True
             expected = _require_issued_plan(expected)
             if not _snapshot_matches_plan(record.snapshot, expected):
+                _close_projection(self, expected.grant.projection)
                 _fail("snapshot does not match plan")
             try:
                 projection = OneShotGrantConsumer(expected.grant, self).consume(

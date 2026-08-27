@@ -485,7 +485,7 @@ def test_missing_fedora_enforcing_fails_before_claim_without_start_or_close() ->
         )
 
     assert operations.calls == ["observe"]
-    assert operations.closed == []
+    assert operations.closed == [101, 102]
     assert boundary._receipts == {}
 
 

@@ -770,6 +770,35 @@ def test_trusted_consumer_r2a_drift_or_start_failure_ends_same_ownership_and_clo
         service.close()
 
 
+def test_trusted_consumer_r2a_preclaim_snapshot_mismatch_closes_projection_once_and_ends_ownership(
+    private_bus: PrivateBus,
+) -> None:
+    r2a_operations = R2AOperations(
+        (r2a_evidence(enforcing=broker_system.BrokerFedoraEnforcingEvidence(False)),)
+    )
+    host, _resolver, provider, operations, boundary, consumer, service = (
+        _trusted_service(private_bus, r2a_operations=r2a_operations)
+    )
+    before = host.snapshot()
+    try:
+        with pytest.raises(RootSystemBusError) as caught:
+            service._handle_start(":1.1")
+        assert caught.value.code == "trusted_consumer_start_failed"
+        assert len(provider.calls) == 1
+        assert r2a_operations.calls == ["observe"]
+        assert r2a_operations.closed == [101, 102]
+        assert operations.closed_projection == []
+        assert operations.projection_fds == {101, 102}
+        assert boundary._receipts == {}
+        assert consumer._active_start is None
+        assert host.snapshot().active_principals_or_agents == 0
+        assert host.snapshot().runtime_broker_epoch == before.runtime_broker_epoch + 2
+        service.close()
+        assert r2a_operations.closed == [101, 102]
+    finally:
+        service.close()
+
+
 def test_trusted_consumer_name_loss_releases_success_receipt_and_ownership_once(
     private_bus: PrivateBus,
 ) -> None:
