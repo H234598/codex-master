@@ -85,6 +85,7 @@ class BrokerReleaseSpec:
     broker_domain: str
     gateway_domain: str
     socket_type: str
+    agent_domain: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +229,7 @@ def _validate_release_spec(value: object) -> BrokerReleaseSpec:
         or value.broker_domain != "codex_master_home_broker_t"
         or value.gateway_domain != "codex_master_control_t"
         or value.socket_type != "codex_master_home_broker_runtime_t"
+        or value.agent_domain != "codex_master_agent_t"
     ):
         _fail("broker release is invalid")
     digests = (

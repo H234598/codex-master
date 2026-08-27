@@ -61,6 +61,7 @@ def release_spec(**changes):
         "broker_domain": "codex_master_home_broker_t",
         "gateway_domain": "codex_master_control_t",
         "socket_type": "codex_master_home_broker_runtime_t",
+        "agent_domain": "codex_master_agent_t",
     }
     values.update(changes)
     return BrokerReleaseSpec(**values)
@@ -359,12 +360,17 @@ def test_release_spec_is_frozen_slotted_and_has_only_root_release_fields():
         "broker_domain",
         "gateway_domain",
         "socket_type",
+        "agent_domain",
     )
 
     assert dataclasses.is_dataclass(BrokerReleaseSpec)
     assert BrokerReleaseSpec.__dataclass_params__.frozen
     assert hasattr(BrokerReleaseSpec, "__slots__")
     assert tuple(field.name for field in dataclasses.fields(RELEASE)) == expected_fields
+    fields = dataclasses.fields(BrokerReleaseSpec)
+    assert fields[-1].name == "agent_domain"
+    assert fields[-1].default is dataclasses.MISSING
+    assert fields[-1].default_factory is dataclasses.MISSING
     assert "mcs_pair" not in expected_fields
     assert "enforcing" not in expected_fields
     with pytest.raises(FrozenInstanceError):
@@ -413,6 +419,9 @@ def test_attestation_has_one_explicit_trusted_release_input_and_no_payload_input
         ("broker_domain", "untrusted_broker_t"),
         ("gateway_domain", "untrusted_control_t"),
         ("socket_type", "untrusted_runtime_t"),
+        ("agent_domain", "codex_master_agent_exec_t"),
+        ("agent_domain", "unconfined_t"),
+        ("agent_domain", ""),
     ],
 )
 def test_release_drift_is_rejected_before_projection(field, value):
@@ -421,6 +430,15 @@ def test_release_drift_is_rejected_before_projection(field, value):
     with pytest.raises(RuntimeBoundaryError, match="broker release is invalid"):
         _attest(release=release_spec(**{field: value}), provider=provider)
 
+    assert provider.calls == []
+
+
+def test_release_requires_exact_agent_selinux_domain() -> None:
+    provider = FakeProvider()
+    assert release_spec().agent_domain == "codex_master_agent_t"
+    for value in ("", "codex_master_agent_exec_t", "unconfined_t", None):
+        with pytest.raises(RuntimeBoundaryError, match="broker release is invalid"):
+            _attest(release=release_spec(agent_domain=value), provider=provider)
     assert provider.calls == []
 
 

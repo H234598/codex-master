@@ -68,6 +68,7 @@ RELEASE = BrokerReleaseSpec(
     "codex_master_home_broker_t",
     "codex_master_control_t",
     "codex_master_home_broker_runtime_t",
+    "codex_master_agent_t",
 )
 
 
