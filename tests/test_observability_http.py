@@ -1299,8 +1299,11 @@ def test_partial_preface_waits_for_new_bytes_then_routes_once() -> None:
                 response.extend(client.recv(4096))
             assert b" 200 " in response
             assert response.endswith(b"ok\n")
-            with preface_lock:
-                assert preface_calls == preface_calls_after_partial_read + 1
+            def preface_call_completed() -> bool:
+                with preface_lock:
+                    return preface_calls == preface_calls_after_partial_read + 1
+
+            assert wait_until(preface_call_completed)
     finally:
         client.close()
 

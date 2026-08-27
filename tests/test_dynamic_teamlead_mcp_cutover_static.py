@@ -150,7 +150,7 @@ def test_legacy_teamlead_exclusions_remain_before_start_side_effects() -> None:
     reject_line = min(_call_lines(legacy_start, "_reject_legacy_teamlead_start_target"))
     for side_effect in (
         "require_authenticated_agent_for_mutation",
-        "codex_usage_routing_decision",
+        "ensure_agent_not_blocked_by_codex_usage",
         "resolve_runtime_agent_selection",
         "claim_agent",
         "start_agent",
