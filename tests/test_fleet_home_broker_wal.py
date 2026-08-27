@@ -5,6 +5,7 @@ import inspect
 
 import pytest
 
+import codex_master.fleet_home_broker_wal as wal
 from codex_master.fleet_home_broker_protocol import (
     BrokerCheckpoint,
     BrokerObjectState,
@@ -382,8 +383,6 @@ def test_recovery_calls_existing_decision_only_after_full_chain_validation(monke
         calls.append((last_status, observed))
         return expected
 
-    import codex_master.fleet_home_broker_wal as wal
-
     monkeypatch.setattr(wal, "decide_broker_recovery", decide)
     observed = observation(BrokerObjectState.STAGING_EMPTY)
     assert recover_status(fake, observed).decision == expected
@@ -395,9 +394,172 @@ def test_recovery_calls_existing_decision_only_after_full_chain_validation(monke
     assert calls == []
 
 
-def test_wal_import_scope_has_no_legacy_or_runtime_boundaries():
-    import codex_master.fleet_home_broker_wal as wal
+def test_private_lookup_returns_exact_active_wal_principal_for_full_key(monkeypatch):
+    fake = FakeWalOperations()
+    append_status(fake, status())
+    append_status(fake, status(BrokerCheckpoint.STAGING_PINNED))
+    fake.events.clear()
+    validated = []
+    original = wal._validated_chain
 
+    def capture_validated_chain(raw_records):
+        records = original(raw_records)
+        validated.append(records)
+        return records
+
+    monkeypatch.setattr(wal, "_validated_chain", capture_validated_chain)
+
+    result = wal._lookup_active_principal_binding(
+        fake,
+        0,
+        1,
+        INVOCATION,
+        9,
+        "c0,c1",
+    )
+
+    assert len(validated) == 1
+    assert len(validated[0]) == 2
+    assert result is validated[0][-1].status.binding.principal
+    assert fake.events == ["read"]
+
+
+@pytest.mark.parametrize(
+    ("field", "mismatch"),
+    [
+        ("cgroup_dev", 2),
+        ("cgroup_ino", 2),
+        ("invocation_id", "2" * 32),
+        ("unit_generation", 10),
+        ("mcs_pair", "c0,c2"),
+    ],
+)
+def test_private_lookup_rejects_each_full_key_mismatch(field, mismatch):
+    fake = FakeWalOperations()
+    append_status(fake, status())
+    fake.events.clear()
+    lookup = {
+        "cgroup_dev": 0,
+        "cgroup_ino": 1,
+        "invocation_id": INVOCATION,
+        "unit_generation": 9,
+        "mcs_pair": "c0,c1",
+    }
+    lookup[field] = mismatch
+
+    assert wal._lookup_active_principal_binding(fake, **lookup) is None
+    assert fake.events == ["read"]
+
+
+def test_private_lookup_rejects_terminal_binding_as_inactive():
+    fake = FakeWalOperations()
+    append_status(fake, status())
+    append_status(fake, status(BrokerCheckpoint.BLOCKED_DRIFT))
+    fake.events.clear()
+
+    assert (
+        wal._lookup_active_principal_binding(fake, 0, 1, INVOCATION, 9, "c0,c1")
+        is None
+    )
+    assert fake.events == ["read"]
+
+
+def test_private_lookup_keeps_empty_or_invalid_wal_fail_closed():
+    empty = FakeWalOperations()
+    assert (
+        wal._lookup_active_principal_binding(empty, 0, 1, INVOCATION, 9, "c0,c1")
+        is None
+    )
+    assert empty.events == ["read"]
+
+    first, raw = first_wire()
+    payload = encode_status_payload(status(BrokerCheckpoint.STAGING_PINNED))
+    gap = wire_with_fields(3, first.digest, payload)
+    fork = wire_with_fields(2, "f" * 64, payload)
+    for records in (
+        (b"foreign",),
+        (raw[:-1],),
+        (raw, gap),
+        (raw, fork),
+    ):
+        invalid = FakeWalOperations(records)
+        with pytest.raises(WalValidationError):
+            wal._lookup_active_principal_binding(
+                invalid, 0, 1, INVOCATION, 9, "c0,c1"
+            )
+        assert invalid.events == ["read"]
+
+
+def test_private_lookup_has_no_second_authority_or_live_surface():
+    source = inspect.getsource(wal)
+    tree = ast.parse(source)
+    helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_lookup_active_principal_binding"
+    )
+    helper_calls = []
+    helper_identifiers = set()
+    for node in ast.walk(helper):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                helper_calls.append(node.func.id)
+            elif isinstance(node.func, ast.Attribute):
+                helper_calls.append(node.func.attr)
+        if isinstance(node, ast.Name):
+            helper_identifiers.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            helper_identifiers.add(node.attr)
+
+    assert helper_calls.count("read_all") == 1
+    assert helper_calls.count("_validated_chain") == 1
+    assert not helper_identifiers & {
+        "append",
+        "append_status",
+        "fsync_parent",
+        "fsync_wal",
+        "recover_status",
+        "recv",
+        "recvmsg",
+        "send",
+        "sendmsg",
+        "socket",
+        "SCM_RIGHTS",
+        "open",
+        "openat2",
+        "registry",
+        "resolver",
+        "runtime",
+        "seqpacket",
+        "home",
+    }
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_lookup_active_principal_binding"
+        for node in ast.walk(tree)
+    )
+    assert {
+        node.name for node in tree.body if isinstance(node, ast.ClassDef)
+    } == {"WalValidationError", "WalRecord", "WalRecovery", "WalOperations"}
+    assert not hasattr(WalOperations, "_lookup_active_principal_binding")
+    assert "_lookup_active_principal_binding" not in wal.__all__
+    assert wal.__all__ == [
+        "WalOperations",
+        "WalRecord",
+        "WalRecovery",
+        "WalValidationError",
+        "append_status",
+        "decode_status_payload",
+        "decode_wal_record",
+        "encode_status_payload",
+        "encode_wal_record",
+        "recover_status",
+    ]
+
+
+def test_wal_import_scope_has_no_legacy_or_runtime_boundaries():
     tree = ast.parse(inspect.getsource(wal))
     modules = []
     for node in ast.walk(tree):

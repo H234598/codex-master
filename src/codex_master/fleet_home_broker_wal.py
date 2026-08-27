@@ -13,6 +13,7 @@ from .fleet_home_broker_protocol import (
     BrokerResultCode,
     CHPB_PROTOCOL,
     ChpbMessageKind,
+    PrincipalBinding,
     RecoveryDecision,
     TransactionStatus,
     decode_chpb_message,
@@ -210,6 +211,32 @@ def _validated_chain(raw_records: tuple[bytes, ...]) -> tuple[WalRecord, ...]:
         expected_sequence += 1
         expected_previous = record.digest
     return tuple(records)
+
+
+def _lookup_active_principal_binding(
+    operations: WalOperations,
+    cgroup_dev: int,
+    cgroup_ino: int,
+    invocation_id: str,
+    unit_generation: int,
+    mcs_pair: str,
+) -> PrincipalBinding | None:
+    records = _validated_chain(operations.read_all())
+    if not records:
+        return None
+    status = records[-1].status
+    if status.terminal_result is not None:
+        return None
+    principal = status.binding.principal
+    if (
+        principal.cgroup_dev != cgroup_dev
+        or principal.cgroup_ino != cgroup_ino
+        or principal.invocation_id != invocation_id
+        or principal.unit_generation != unit_generation
+        or principal.mcs_pair != mcs_pair
+    ):
+        return None
+    return principal
 
 
 def append_status(operations: WalOperations, status: TransactionStatus) -> WalRecord:
