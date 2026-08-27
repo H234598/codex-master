@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import copy
 import dataclasses
 from dataclasses import replace
@@ -9,6 +10,7 @@ import os
 from pathlib import Path
 import pickle
 import select
+import socket
 import subprocess
 import sys
 from threading import Event, Thread
@@ -21,13 +23,13 @@ import pytest
 
 import codex_master.fleet_root_system_bus as system_bus
 import codex_master.fleet_home_broker_runtime as runtime
+import codex_master.fleet_home_broker_system as broker_system
 from codex_master.dynamic_teamlead import DynamicTeamleadRequest, ProfileBinding
 from codex_master.fleet_home_broker_identity import BrokerIdentity
 from codex_master.fleet_home_broker_protocol import PrincipalBinding
 from codex_master.fleet_home_broker_runtime import (
     BrokerReleaseSpec,
     CredentialProjection,
-    StartGrant,
     TrustedPrincipalGrantContext,
 )
 from codex_master.fleet_registry import (
@@ -362,6 +364,89 @@ class GrantOperations(ScriptedOperations):
         super().close(fd)
 
 
+def r2a_evidence(**changes: object) -> broker_system.BrokerSystemEvidence:
+    values = {
+        "directory": broker_system.BrokerDirectoryEvidence(
+            "/run/codex-master-home-broker",
+            broker_system.BrokerNodeType.DIRECTORY,
+            "root",
+            "codex-master-broker",
+            0o750,
+            17,
+            29,
+        ),
+        "socket": broker_system.BrokerSocketEvidence(
+            "/run/codex-master-home-broker/broker.sock",
+            broker_system.BrokerNodeType.SOCKET,
+            "root",
+            "codex-master-broker",
+            0o660,
+            socket.AF_UNIX,
+            socket.SOCK_SEQPACKET,
+            17,
+            31,
+        ),
+        "system_bus": broker_system.BrokerSystemBusEvidence(
+            BUS_NAME, BUS_PATH, BUS_INTERFACE
+        ),
+        "selinux": broker_system.BrokerSelinuxEvidence(
+            "codex_master_home_broker_t",
+            "codex_master_control_t",
+            "codex_master_home_broker_runtime_t",
+        ),
+        "enforcing": broker_system.BrokerFedoraEnforcingEvidence(True),
+        "mcs": broker_system.BrokerMcsEvidence("c1,c2"),
+        "unit": broker_system.BrokerUnitEvidence(
+            "codex-master-home-broker.socket",
+            "codex-master-home-broker.service",
+            False,
+            True,
+        ),
+        "joint_release": broker_system.BrokerJointReleaseEvidence(
+            1,
+            "0.11.0",
+            "1" * 64,
+            "2" * 64,
+            "CHPB/2",
+            "policy-v1",
+            "provider-v1",
+            "3" * 64,
+            "4" * 64,
+        ),
+    }
+    values.update(changes)
+    return broker_system.BrokerSystemEvidence(**values)
+
+
+class R2AOperations:
+    def __init__(
+        self,
+        observations: tuple[broker_system.BrokerSystemEvidence, ...] = (),
+        start_error: Exception | None = None,
+        fail_close: bool = False,
+    ) -> None:
+        self.observations = observations or (r2a_evidence(),)
+        self.start_error = start_error
+        self.fail_close = fail_close
+        self.calls: list[object] = []
+        self.closed: list[int] = []
+
+    def _observe_broker_system(self) -> broker_system.BrokerSystemEvidence:
+        self.calls.append("observe")
+        index = min(self.calls.count("observe") - 1, len(self.observations) - 1)
+        return self.observations[index]
+
+    def _start_bound_socket_unit(self, socket_unit: str) -> None:
+        self.calls.append(("start", socket_unit))
+        if self.start_error is not None:
+            raise self.start_error
+
+    def close(self, fd: int) -> None:
+        self.closed.append(fd)
+        if self.fail_close:
+            raise OSError("private close detail")
+
+
 def reattest_operations() -> GrantOperations:
     operations = GrantOperations()
     operations.alive *= 2
@@ -378,14 +463,15 @@ def _trusted_service(
     resolver: RecordingResolver | None = None,
     provider: RecordingProjectionProvider | None = None,
     operations: GrantOperations | None = None,
+    boundary: broker_system.BrokerSystemBoundary | None = None,
+    r2a_operations: R2AOperations | None = None,
     credential_reader: Callable[[str], object] | None = None,
-    sink: Callable[[StartGrant, RootRuntimeActivityOwnership], object] | None = None,
 ) -> tuple[
     FleetRootRuntimeHost,
     RecordingResolver,
     RecordingProjectionProvider,
     GrantOperations,
-    list[tuple[StartGrant, RootRuntimeActivityOwnership]],
+    broker_system.BrokerSystemBoundary,
     TrustedPrincipalGrantConsumer,
     HomeBrokerControlService,
 ]:
@@ -393,15 +479,13 @@ def _trusted_service(
     resolver = resolver or RecordingResolver()
     provider = provider or RecordingProjectionProvider()
     operations = operations or reattest_operations()
-    sink_calls: list[tuple[StartGrant, RootRuntimeActivityOwnership]] = []
-    effective_sink = sink or (
-        lambda grant, ownership: sink_calls.append((grant, ownership))
-    )
+    r2a_operations = r2a_operations or R2AOperations()
+    boundary = boundary or broker_system.BrokerSystemBoundary(r2a_operations)
     consumer = TrustedPrincipalGrantConsumer(
         context or trusted_context(),
         resolver,
         provider,
-        effective_sink,
+        boundary,
         private_bus_address=private_bus.address,
         _operations=operations,
         _credential_reader=credential_reader or (lambda _sender: raw_credentials()),
@@ -415,7 +499,19 @@ def _trusted_service(
         _operations=ScriptedOperations(),
         _credential_reader=lambda _sender: raw_credentials(),
     )
-    return host, resolver, provider, operations, sink_calls, consumer, service
+    return host, resolver, provider, operations, boundary, consumer, service
+
+
+def _consumer_for(private_bus: PrivateBus) -> TrustedPrincipalGrantConsumer:
+    return TrustedPrincipalGrantConsumer(
+        trusted_context(),
+        RecordingResolver(),
+        RecordingProjectionProvider(),
+        broker_system.BrokerSystemBoundary(R2AOperations()),
+        private_bus_address=private_bus.address,
+        _operations=reattest_operations(),
+        _credential_reader=lambda _sender: raw_credentials(),
+    )
 
 
 def mutate_recheck(
@@ -549,21 +645,24 @@ def test_trusted_principal_grant_consumer_surface_is_narrow() -> None:
         "context",
         "principal_resolver",
         "projection_provider",
-        "sink",
+        "boundary",
         "private_bus_address",
         "_operations",
         "_credential_reader",
     )
-    assert tuple(
-        inspect.signature(TrustedPrincipalGrantConsumer.__call__).parameters
-    ) == (
-        "self",
-        "attestation",
-        "ownership",
+    assert "__call__" not in TrustedPrincipalGrantConsumer.__dict__
+    assert tuple(inspect.signature(HomeBrokerControlService).parameters) == (
+        "host",
+        "generation",
+        "release",
+        "consumer",
+        "private_bus_address",
+        "_operations",
+        "_credential_reader",
     )
 
 
-def test_trusted_consumer_rechecks_and_sinks_one_bound_grant(
+def test_trusted_consumer_composes_r2b_to_r2a_with_same_ownership_once(
     private_bus: PrivateBus,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -571,20 +670,29 @@ def test_trusted_consumer_rechecks_and_sinks_one_bound_grant(
     resolver = RecordingResolver()
     provider = RecordingProjectionProvider()
     operations = reattest_operations()
-    sink_calls: list[tuple[StartGrant, RootRuntimeActivityOwnership]] = []
     issuer_calls: list[tuple[object, ...]] = []
+    claim_calls = 0
     real_issuer = runtime._issue_start_grant
+    real_claim = runtime._StartGrantState.claim
 
-    def observing_issuer(binding: tuple[object, ...]) -> StartGrant:
+    def observing_issuer(binding: tuple[object, ...]) -> object:
         issuer_calls.append(binding)
         return real_issuer(binding)
 
+    def observing_claim(state: runtime._StartGrantState) -> bool:
+        nonlocal claim_calls
+        claim_calls += 1
+        return real_claim(state)
+
     monkeypatch.setattr(runtime, "_issue_start_grant", observing_issuer)
+    monkeypatch.setattr(runtime._StartGrantState, "claim", observing_claim)
+    r2a_operations = R2AOperations()
+    boundary = broker_system.BrokerSystemBoundary(r2a_operations)
     consumer = TrustedPrincipalGrantConsumer(
         trusted_context(),
         resolver,
         provider,
-        lambda grant, ownership: sink_calls.append((grant, ownership)),
+        boundary,
         private_bus_address=private_bus.address,
         _operations=operations,
         _credential_reader=lambda _sender: raw_credentials(),
@@ -610,23 +718,203 @@ def test_trusted_consumer_rechecks_and_sinks_one_bound_grant(
             )
         ]
         assert len(issuer_calls) == 1
-        assert len(sink_calls) == 1
-        grant, ownership = sink_calls[0]
-        assert type(grant) is StartGrant
-        assert grant.peer.pid == 1234
-        assert grant.evidence.unit_generation == GENERATION
-        assert grant.principal == expected_principal()
-        assert grant.identity == trusted_context().identity
-        assert grant.projection is provider.value
-        assert grant.release == release_spec()
-        assert type(ownership) is RootRuntimeActivityOwnership
+        assert claim_calls == 1
+        assert len(boundary._receipts) == 1
+        active = consumer._active_start
+        assert active is not None
+        receipt = active.receipt
+        ownership = active.ownership
+        assert receipt.ownership is ownership
+        assert receipt.projection is provider.value
         assert operations.calls.count("pidfd_open") == 2
         assert operations.open_fds == set()
+        assert r2a_operations.calls == [
+            "observe",
+            "observe",
+            ("start", "codex-master-home-broker.socket"),
+        ]
         assert host.snapshot().active_principals_or_agents == 1
-        host.end_principal_or_agent(ownership)
-    finally:
-        consumer.close()
         service.close()
+        assert r2a_operations.closed == [101, 102]
+        assert host.snapshot().active_principals_or_agents == 0
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("failure", ("drift", "start"))
+def test_trusted_consumer_r2a_drift_or_start_failure_ends_same_ownership_and_closes_once(
+    private_bus: PrivateBus,
+    failure: str,
+) -> None:
+    initial = r2a_evidence()
+    if failure == "drift":
+        r2a_operations = R2AOperations(
+            (initial, replace(initial, enforcing=broker_system.BrokerFedoraEnforcingEvidence(False)))
+        )
+    else:
+        r2a_operations = R2AOperations(start_error=RuntimeError("start failed"))
+    host, _resolver, _provider, operations, boundary, consumer, service = (
+        _trusted_service(private_bus, r2a_operations=r2a_operations)
+    )
+    before = host.snapshot()
+    try:
+        with pytest.raises(RootSystemBusError):
+            service._handle_start(":1.1")
+        assert operations.open_fds == set()
+        assert boundary._receipts == {}
+        assert r2a_operations.closed == [101, 102]
+        assert r2a_operations.calls.count(("start", "codex-master-home-broker.socket")) <= 1
+        assert host.snapshot().active_principals_or_agents == 0
+        assert host.snapshot().runtime_broker_epoch == before.runtime_broker_epoch + 2
+    finally:
+        service.close()
+
+
+def test_trusted_consumer_name_loss_releases_success_receipt_and_ownership_once(
+    private_bus: PrivateBus,
+) -> None:
+    r2a_operations = R2AOperations()
+    host, _resolver, _provider, _operations, boundary, consumer, service = (
+        _trusted_service(private_bus, r2a_operations=r2a_operations)
+    )
+
+    try:
+        service._handle_start(":1.1")
+        owner = service._bus.get_unique_name()
+        service._name_owner_changed(BUS_NAME, owner, "")
+
+        assert r2a_operations.closed == [101, 102]
+        assert host.snapshot().active_principals_or_agents == 0
+        assert host.snapshot().reconciled is False
+        assert len(boundary._receipts) == 1
+        service.close()
+        assert r2a_operations.closed == [101, 102]
+        assert consumer._active_start is None
+    finally:
+        service.close()
+
+
+def test_second_start_while_trusted_receipt_is_active_fails_before_projection(
+    private_bus: PrivateBus,
+) -> None:
+    r2a_operations = R2AOperations()
+    host, _resolver, provider, operations, boundary, consumer, service = (
+        _trusted_service(private_bus, r2a_operations=r2a_operations)
+    )
+
+    try:
+        service._handle_start(":1.1")
+        provider_calls = list(provider.calls)
+        r2a_calls = list(r2a_operations.calls)
+
+        with pytest.raises(RootSystemBusError) as caught:
+            service._handle_start(":1.1")
+
+        assert caught.value.code == "trusted_consumer_start_active"
+        assert provider.calls == provider_calls
+        assert r2a_operations.calls == r2a_calls
+        assert len(boundary._receipts) == 1
+        assert operations.calls.count("pidfd_open") == 2
+        assert host.snapshot().active_principals_or_agents == 1
+    finally:
+        service.close()
+
+
+def test_r2b_service_and_consumer_have_no_generic_sink_surface() -> None:
+    source_path = Path(__file__).parents[1] / "src/codex_master/fleet_root_system_bus.py"
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(source_path))
+
+    assert "sink" not in inspect.signature(TrustedPrincipalGrantConsumer).parameters
+    assert "Callable[[StartGrant" not in source
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "TrustedPrincipalGrantConsumer"
+        and any(isinstance(argument, ast.Lambda) for argument in node.args)
+        for node in ast.walk(tree)
+    )
+    handoff = inspect.getsource(HomeBrokerControlService._handoff)
+    assert "self._consumer(" not in handoff
+    assert "else:" not in handoff
+
+
+def test_trusted_handoff_forge_or_replay_never_reaches_r2a(
+    private_bus: PrivateBus,
+) -> None:
+    def make_service() -> tuple[
+        FleetRootRuntimeHost,
+        R2AOperations,
+        TrustedPrincipalGrantConsumer,
+        HomeBrokerControlService,
+    ]:
+        r2a_operations = R2AOperations()
+        host, _resolver, _provider, _operations, _boundary, consumer, service = (
+            _trusted_service(private_bus, r2a_operations=r2a_operations)
+        )
+        return host, r2a_operations, consumer, service
+
+    def issue(
+        host: FleetRootRuntimeHost, service: HomeBrokerControlService
+    ) -> tuple[RootSystemBusPeerAttestation, object, RootRuntimeActivityOwnership]:
+        ownership = host.begin_principal_or_agent()
+        evidence = system_bus._attest_peer(
+            ":1.1",
+            service._credential_reader,
+            service._operations,
+            service._release,
+        )
+        attestation, issued = service._issue_handoff(":1.1", evidence, ownership)
+        return attestation, issued, ownership
+
+    host, r2a_operations, consumer, service = make_service()
+    attestation, issued, ownership = issue(host, service)
+    forged_attestation = object.__new__(RootSystemBusPeerAttestation)
+    for field in dataclasses.fields(attestation):
+        object.__setattr__(forged_attestation, field.name, getattr(attestation, field.name))
+    with pytest.raises(RootSystemBusError) as caught:
+        service._handoff(forged_attestation, ownership, issued)
+    assert caught.value.code == "handoff_invalid"
+    assert r2a_operations.calls == []
+    host.end_principal_or_agent(ownership)
+    service.close()
+    consumer.close()
+
+    host, r2a_operations, consumer, service = make_service()
+    attestation, issued, ownership = issue(host, service)
+    forged_issued = object.__new__(_IssuedAttestation)
+    for field in dataclasses.fields(issued):
+        object.__setattr__(forged_issued, field.name, getattr(issued, field.name))
+    with pytest.raises(RootSystemBusError) as caught:
+        service._handoff(attestation, ownership, forged_issued)
+    assert caught.value.code == "handoff_invalid"
+    assert r2a_operations.calls == []
+    host.end_principal_or_agent(ownership)
+    service.close()
+    consumer.close()
+
+    host, r2a_operations, consumer, service = make_service()
+    attestation, issued, ownership = issue(host, service)
+    other_ownership = host.begin_principal_or_agent()
+    with pytest.raises(RootSystemBusError) as caught:
+        service._handoff(attestation, other_ownership, issued)
+    assert caught.value.code == "handoff_invalid"
+    assert r2a_operations.calls == []
+    host.end_principal_or_agent(ownership)
+    host.end_principal_or_agent(other_ownership)
+    service.close()
+    consumer.close()
+
+    host, r2a_operations, consumer, service = make_service()
+    attestation, issued, ownership = issue(host, service)
+    service._handoff(attestation, ownership, issued)
+    calls_after_legal_handoff = list(r2a_operations.calls)
+    with pytest.raises(RootSystemBusError) as caught:
+        service._handoff(attestation, ownership, issued)
+    assert caught.value.code == "handoff_invalid"
+    assert r2a_operations.calls == calls_after_legal_handoff
+    service.close()
+    consumer.close()
 
 
 @pytest.mark.parametrize(
@@ -659,7 +947,7 @@ def test_trusted_consumer_blocks_preprojection_reattestation_drift(
         reader_calls.append(sender)
         return credentials.pop(0)
 
-    host, resolver, provider, operations, sink_calls, consumer, service = (
+    host, resolver, provider, operations, boundary, consumer, service = (
         _trusted_service(
             private_bus,
             operations=operations,
@@ -672,7 +960,7 @@ def test_trusted_consumer_blocks_preprojection_reattestation_drift(
             service._handle_start(":1.1")
         assert resolver.calls == []
         assert provider.calls == []
-        assert sink_calls == []
+        assert boundary._operations.calls == []
         assert operations.closed_projection == []
         assert operations.open_fds == set()
         assert len(set(reader_calls)) == 1
@@ -688,7 +976,7 @@ def test_trusted_consumer_binds_original_method_sender_before_recheck(
     private_bus: PrivateBus,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    host, resolver, provider, operations, sink_calls, consumer, service = (
+    host, resolver, provider, operations, boundary, consumer, service = (
         _trusted_service(private_bus)
     )
     original = HomeBrokerControlService._issue_handoff
@@ -714,7 +1002,7 @@ def test_trusted_consumer_binds_original_method_sender_before_recheck(
         assert caught.value.code == "handoff_invalid"
         assert resolver.calls == []
         assert provider.calls == []
-        assert sink_calls == []
+        assert boundary._operations.calls == []
         assert host.snapshot().active_principals_or_agents == 0
     finally:
         consumer.close()
@@ -725,7 +1013,7 @@ def test_trusted_consumer_binds_service_generation_before_projection(
     private_bus: PrivateBus,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    host, resolver, provider, _operations, sink_calls, consumer, service = (
+    host, resolver, provider, _operations, boundary, consumer, service = (
         _trusted_service(private_bus)
     )
     original = HomeBrokerControlService._issue_handoff
@@ -750,7 +1038,7 @@ def test_trusted_consumer_binds_service_generation_before_projection(
             service._handle_start(":1.1")
         assert resolver.calls == []
         assert provider.calls == []
-        assert sink_calls == []
+        assert boundary._operations.calls == []
         assert host.snapshot().active_principals_or_agents == 0
     finally:
         consumer.close()
@@ -768,7 +1056,7 @@ def test_postprojection_reattestation_drift_closes_projection_and_ownership(
         "start_time",
         post_projection=True,
     )
-    host, resolver, provider, operations, sink_calls, consumer, service = (
+    host, resolver, provider, operations, boundary, consumer, service = (
         _trusted_service(
             private_bus,
             operations=operations,
@@ -782,7 +1070,7 @@ def test_postprojection_reattestation_drift_closes_projection_and_ownership(
         assert caught.value.code == "consumer_failed"
         assert len(resolver.calls) == 1
         assert len(provider.calls) == 1
-        assert sink_calls == []
+        assert boundary._operations.calls == []
         assert operations.closed_projection == [101, 102]
         assert operations.projection_fds == set()
         assert operations.open_fds == set()
@@ -953,7 +1241,7 @@ def test_trusted_principal_registry_and_identity_drift_block_before_projection(
     else:
         raise AssertionError("unknown context case")
 
-    host, _resolver, provider, operations, sink_calls, consumer, service = (
+    host, _resolver, provider, operations, boundary, consumer, service = (
         _trusted_service(
             private_bus,
             context=context,
@@ -964,7 +1252,7 @@ def test_trusted_principal_registry_and_identity_drift_block_before_projection(
         with pytest.raises(RootSystemBusError):
             service._handle_start(":1.1")
         assert provider.calls == []
-        assert sink_calls == []
+        assert boundary._operations.calls == []
         assert operations.closed_projection == []
         assert host.snapshot().active_principals_or_agents == 0
     finally:
@@ -1016,7 +1304,7 @@ def test_projection_failures_close_only_returned_valid_fds_once(
         provider = RecordingProjectionProvider(CredentialProjection(**values))
     operations = reattest_operations()
     operations.projection_fds = set(expected_closed)
-    host, _resolver, provider, operations, sink_calls, consumer, service = (
+    host, _resolver, provider, operations, boundary, consumer, service = (
         _trusted_service(
             private_bus,
             provider=provider,
@@ -1027,7 +1315,7 @@ def test_projection_failures_close_only_returned_valid_fds_once(
         with pytest.raises(RootSystemBusError):
             service._handle_start(":1.1")
         assert len(provider.calls) == 1
-        assert sink_calls == []
+        assert boundary._operations.calls == []
         assert operations.closed_projection == list(expected_closed)
         assert operations.projection_fds == set()
         assert operations.open_fds == set()
@@ -1049,49 +1337,17 @@ def test_grant_issuer_failure_closes_projection_before_sink(
         return object()
 
     monkeypatch.setattr(runtime, "_issue_start_grant", broken_issuer)
-    host, _resolver, provider, operations, sink_calls, consumer, service = (
+    host, _resolver, provider, operations, boundary, consumer, service = (
         _trusted_service(private_bus)
     )
     try:
         with pytest.raises(RootSystemBusError):
             service._handle_start(":1.1")
         assert len(provider.calls) == 1
-        assert sink_calls == []
+        assert boundary._operations.calls == []
         assert operations.closed_projection == [101, 102]
         assert operations.projection_fds == set()
         assert host.snapshot().active_principals_or_agents == 0
-    finally:
-        consumer.close()
-        service.close()
-
-
-@pytest.mark.parametrize("sink_result", ("exception", "non_none"))
-def test_sink_failure_closes_projection_and_leaves_ownership_local(
-    private_bus: PrivateBus,
-    sink_result: str,
-) -> None:
-    sink_calls: list[tuple[StartGrant, RootRuntimeActivityOwnership]] = []
-
-    def sink(grant: StartGrant, ownership: RootRuntimeActivityOwnership) -> object:
-        sink_calls.append((grant, ownership))
-        if sink_result == "exception":
-            raise RuntimeError("private sink detail")
-        return object()
-
-    host, _resolver, provider, operations, _unused, consumer, service = (
-        _trusted_service(private_bus, sink=sink)
-    )
-    before = host.snapshot()
-    try:
-        with pytest.raises(RootSystemBusError):
-            service._handle_start(":1.1")
-        assert len(provider.calls) == 1
-        assert len(sink_calls) == 1
-        assert operations.closed_projection == [101, 102]
-        assert operations.projection_fds == set()
-        after = host.snapshot()
-        assert after.active_principals_or_agents == 0
-        assert after.runtime_broker_epoch == before.runtime_broker_epoch + 2
     finally:
         consumer.close()
         service.close()
@@ -1100,32 +1356,28 @@ def test_sink_failure_closes_projection_and_leaves_ownership_local(
 def test_projection_close_failure_is_sparse_terminal_and_not_retried(
     private_bus: PrivateBus,
 ) -> None:
-    operations = reattest_operations()
-    operations.fail_projection_close = True
-
-    def sink(_grant: StartGrant, _ownership: RootRuntimeActivityOwnership) -> None:
-        raise RuntimeError("private sink detail")
-
-    host, _resolver, _provider, operations, _unused, consumer, service = (
-        _trusted_service(private_bus, operations=operations, sink=sink)
+    r2a_operations = R2AOperations(fail_close=True)
+    host, _resolver, _provider, _operations, _boundary, consumer, service = (
+        _trusted_service(private_bus, r2a_operations=r2a_operations)
     )
     try:
+        service._handle_start(":1.1")
         with pytest.raises(RootSystemBusError) as caught:
-            service._handle_start(":1.1")
+            service.close()
         assert caught.value.code == "trusted_consumer_cleanup_failed"
         assert caught.value.args == ("trusted_consumer_cleanup_failed",)
-        assert operations.closed_projection == [101, 102]
-        assert operations.projection_fds == set()
+        assert r2a_operations.closed == [101, 102]
         assert host.snapshot().active_principals_or_agents == 0
+        service.close()
+        assert r2a_operations.closed == [101, 102]
     finally:
-        consumer.close()
         service.close()
 
 
 def test_service_close_closes_bound_trusted_consumer_idempotently(
     private_bus: PrivateBus,
 ) -> None:
-    _host, _resolver, _provider, _operations, _sink, consumer, service = (
+    _host, _resolver, _provider, _operations, _boundary, consumer, service = (
         _trusted_service(private_bus)
     )
 
@@ -1133,36 +1385,6 @@ def test_service_close_closes_bound_trusted_consumer_idempotently(
     service.close()
     assert consumer._closed is True
     consumer.close()
-    with pytest.raises(RootSystemBusError) as caught:
-        consumer(object(), object())
-    assert caught.value.code == "trusted_consumer_invocation_invalid"
-
-
-def test_generic_consumer_root_error_remains_normalized(
-    private_bus: PrivateBus,
-) -> None:
-    host = reconciled_host()
-
-    def consumer(
-        _attestation: RootSystemBusPeerAttestation,
-        _ownership: RootRuntimeActivityOwnership,
-    ) -> None:
-        raise RootSystemBusError("inner_consumer_failed")
-
-    service = HomeBrokerControlService(
-        host,
-        GENERATION,
-        release_spec(),
-        consumer,
-        private_bus_address=private_bus.address,
-        _operations=ScriptedOperations(),
-        _credential_reader=lambda _sender: raw_credentials(),
-    )
-    try:
-        assert_code("consumer_failed", lambda: service._handle_start(":1.1"))
-        assert host.snapshot().active_principals_or_agents == 0
-    finally:
-        service.close()
 
 
 def test_trusted_consumer_connection_close_failure_is_terminal_without_retry(
@@ -1176,7 +1398,7 @@ def test_trusted_consumer_connection_close_failure_is_terminal_without_retry(
             self.calls += 1
             raise OSError("private close detail")
 
-    _host, _resolver, _provider, _operations, _sink, consumer, service = (
+    _host, _resolver, _provider, _operations, _boundary, consumer, service = (
         _trusted_service(private_bus)
     )
     first = CloseFailingBus()
@@ -1207,7 +1429,7 @@ def test_service_close_continues_after_trusted_consumer_cleanup_failure(
             if self.fail:
                 raise OSError("private close detail")
 
-    _host, _resolver, _provider, _operations, _sink, consumer, service = (
+    _host, _resolver, _provider, _operations, _boundary, consumer, service = (
         _trusted_service(private_bus)
     )
     consumer_bus = CloseBus(fail=True)
@@ -1233,7 +1455,7 @@ def test_private_bus_surface_name_and_empty_signature(
         host,
         GENERATION,
         release_spec(),
-        lambda _attestation, _ownership: None,
+        _consumer_for(private_bus),
         private_bus_address=private_bus.address,
         _operations=operations,
         _credential_reader=lambda _sender: raw_credentials(),
@@ -1257,7 +1479,7 @@ def test_private_bus_surface_name_and_empty_signature(
                 reconciled_host(),
                 GENERATION,
                 release_spec(),
-                lambda _attestation, _ownership: None,
+                _consumer_for(private_bus),
                 private_bus_address=private_bus.address,
                 _operations=ScriptedOperations(),
                 _credential_reader=lambda _sender: raw_credentials(),
@@ -1276,13 +1498,12 @@ def test_unknown_bus_boundary_blocks_before_begin(
 ) -> None:
     host = reconciled_host()
     operations = ScriptedOperations()
-    received: list[object] = []
     credential_calls: list[None] = []
     service = HomeBrokerControlService(
         host,
         GENERATION,
         release_spec(),
-        lambda *_values: received.append(object()),
+        _consumer_for(private_bus),
         private_bus_address=private_bus.address,
         _operations=operations,
     )
@@ -1334,7 +1555,6 @@ def test_unknown_bus_boundary_blocks_before_begin(
             assert host.snapshot() == before
             assert operations.calls == []
             assert credential_calls == []
-            assert received == []
     finally:
         client.close()
         service.close()
@@ -1354,12 +1574,12 @@ def test_real_private_sender_credentials_and_bad_payload_blocked(
     consumer_operations = ProvenanceLinuxOperations(consumer_system_bus)
     resolver = RecordingResolver()
     provider = RecordingProjectionProvider()
-    seen: list[tuple[StartGrant, RootRuntimeActivityOwnership]] = []
+    boundary = broker_system.BrokerSystemBoundary(R2AOperations())
     consumer = TrustedPrincipalGrantConsumer(
         trusted_context(),
         resolver,
         provider,
-        lambda grant, ownership: seen.append((grant, ownership)),
+        boundary,
         private_bus_address=private_bus.address,
         _operations=consumer_operations,
     )
@@ -1485,7 +1705,7 @@ raise SystemExit(status)
             and operations.pid_events[0] == ("pidfd_open", child.pid),
             "pidfd provenance mismatch",
         )
-        require(not seen, "negative sender reached consumer")
+        require(consumer._active_start is None, "negative sender reached consumer")
         require(not resolver.calls, "negative sender reached resolver")
         require(not provider.calls, "negative sender reached projection")
         after_negative = host.snapshot()
@@ -1706,12 +1926,11 @@ def test_service_cleanup_failure_ends_ownership_without_consumer(
     before = host.snapshot()
     operations = CleanupFailingOperations()
     operations.enforcing = not prior_failure
-    received: list[object] = []
     service = HomeBrokerControlService(
         host,
         GENERATION,
         release_spec(),
-        lambda *_values: received.append(object()),
+        _consumer_for(private_bus),
         private_bus_address=private_bus.address,
         _operations=operations,
         _credential_reader=lambda _sender: raw_credentials(),
@@ -1719,7 +1938,6 @@ def test_service_cleanup_failure_ends_ownership_without_consumer(
     try:
         assert_code("peer_cleanup_failed", lambda: service._handle_start(":1.1"))
         after = host.snapshot()
-        assert received == []
         assert operations.close_attempts == [14, 13, 12, 11, 10]
         assert operations.open_fds == set()
         assert after.active_principals_or_agents == 0
@@ -1964,15 +2182,12 @@ def test_host_coordination_failure_and_success_ownership(
     private_bus: PrivateBus,
 ) -> None:
     operations = ScriptedOperations()
-    consumer_calls: list[
-        tuple[RootSystemBusPeerAttestation, RootRuntimeActivityOwnership]
-    ] = []
 
     service = HomeBrokerControlService(
         FleetRootRuntimeHost(),
         GENERATION,
         release_spec(),
-        lambda attestation, ownership: consumer_calls.append((attestation, ownership)),
+        _consumer_for(private_bus),
         private_bus_address=private_bus.address,
         _operations=operations,
         _credential_reader=lambda _sender: raw_credentials(),
@@ -1980,7 +2195,6 @@ def test_host_coordination_failure_and_success_ownership(
     try:
         assert_code("host_unavailable", lambda: service._handle_start(":1.1"))
         assert operations.calls == []
-        assert consumer_calls == []
     finally:
         service.close()
 
@@ -1989,7 +2203,7 @@ def test_host_coordination_failure_and_success_ownership(
         host,
         GENERATION + 1,
         release_spec(),
-        lambda attestation, ownership: consumer_calls.append((attestation, ownership)),
+        _consumer_for(private_bus),
         private_bus_address=private_bus.address,
         _operations=operations,
         _credential_reader=lambda _sender: raw_credentials(),
@@ -2001,24 +2215,33 @@ def test_host_coordination_failure_and_success_ownership(
         service.close()
 
     host = reconciled_host()
+    r2a_operations = R2AOperations()
+    consumer = TrustedPrincipalGrantConsumer(
+        trusted_context(),
+        RecordingResolver(),
+        RecordingProjectionProvider(),
+        broker_system.BrokerSystemBoundary(r2a_operations),
+        private_bus_address=private_bus.address,
+        _operations=reattest_operations(),
+        _credential_reader=lambda _sender: raw_credentials(),
+    )
     service = HomeBrokerControlService(
         host,
         GENERATION,
         release_spec(),
-        lambda attestation, ownership: consumer_calls.append((attestation, ownership)),
+        consumer,
         private_bus_address=private_bus.address,
         _operations=ScriptedOperations(),
         _credential_reader=lambda _sender: raw_credentials(),
     )
     try:
         service._handle_start(":1.1")
-        attestation, ownership = consumer_calls[-1]
-        assert type(attestation) is RootSystemBusPeerAttestation
-        assert type(ownership) is RootRuntimeActivityOwnership
+        active = consumer._active_start
+        assert active is not None
         assert host.snapshot().active_principals_or_agents == 1
-        host.end_principal_or_agent(ownership)
-        with pytest.raises(FleetRootRuntimeHostError):
-            host.end_principal_or_agent(ownership)
+        service.close()
+        assert r2a_operations.closed == [101, 102]
+        assert host.snapshot().active_principals_or_agents == 0
     finally:
         service.close()
 
@@ -2036,7 +2259,7 @@ def test_admission_stop_preserves_snapshot_and_window(
         host,
         GENERATION,
         release_spec(),
-        lambda _attestation, _ownership: pytest.fail("consumer called"),
+        _consumer_for(private_bus),
         private_bus_address=private_bus.address,
         _operations=operations,
         _credential_reader=lambda _sender: raw_credentials(),
@@ -2051,7 +2274,7 @@ def test_admission_stop_preserves_snapshot_and_window(
         service.close()
 
 
-@pytest.mark.parametrize("failure", ("attestation", "consumer"))
+@pytest.mark.parametrize("failure", ("attestation",))
 def test_local_failure_ends_ownership_once(
     private_bus: PrivateBus, failure: str
 ) -> None:
@@ -2061,24 +2284,17 @@ def test_local_failure_ends_ownership_once(
     if failure == "attestation":
         operations.enforcing = False
 
-    def consumer(_attestation: object, _ownership: object) -> None:
-        if failure == "consumer":
-            raise RuntimeError("private detail")
-
     service = HomeBrokerControlService(
         host,
         GENERATION,
         release_spec(),
-        consumer,
+        _consumer_for(private_bus),
         private_bus_address=private_bus.address,
         _operations=operations,
         _credential_reader=lambda _sender: raw_credentials(),
     )
     try:
-        expected = (
-            "selinux_not_enforcing" if failure == "attestation" else "consumer_failed"
-        )
-        assert_code(expected, lambda: service._handle_start(":1.1"))
+        assert_code("selinux_not_enforcing", lambda: service._handle_start(":1.1"))
         after = host.snapshot()
         assert after.active_principals_or_agents == 0
         assert after.active_leases_or_reservations == 0
@@ -2098,7 +2314,7 @@ def test_close_marks_system_bus_participant_lost_and_stale_calls_block(
         host,
         GENERATION,
         release_spec(),
-        lambda _attestation, _ownership: None,
+        _consumer_for(private_bus),
         private_bus_address=private_bus.address,
         _operations=operations,
         _credential_reader=lambda _sender: raw_credentials(),
@@ -2120,7 +2336,7 @@ def test_external_name_loss_marks_participant_lost_and_close_cleans(
         host,
         GENERATION,
         release_spec(),
-        lambda _attestation, _ownership: None,
+        _consumer_for(private_bus),
         private_bus_address=private_bus.address,
         _operations=ScriptedOperations(),
         _credential_reader=lambda _sender: raw_credentials(),
@@ -2148,10 +2364,16 @@ def test_handoff_is_nontransferable_and_forge_never_reaches_consumer(
     private_bus: PrivateBus, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     host = reconciled_host()
-    received: list[
-        tuple[RootSystemBusPeerAttestation, RootRuntimeActivityOwnership]
-    ] = []
-    issued_records: list[object] = []
+    r2a_operations = R2AOperations()
+    consumer = TrustedPrincipalGrantConsumer(
+        trusted_context(),
+        RecordingResolver(),
+        RecordingProjectionProvider(),
+        broker_system.BrokerSystemBoundary(r2a_operations),
+        private_bus_address=private_bus.address,
+        _operations=reattest_operations(),
+        _credential_reader=lambda _sender: raw_credentials(),
+    )
     original_handoff = HomeBrokerControlService._handoff
 
     def capture_handoff(
@@ -2160,7 +2382,6 @@ def test_handoff_is_nontransferable_and_forge_never_reaches_consumer(
         ownership: RootRuntimeActivityOwnership,
         issued: object,
     ) -> None:
-        issued_records.append(issued)
         original_handoff(service, attestation, ownership, issued)
 
     monkeypatch.setattr(HomeBrokerControlService, "_handoff", capture_handoff)
@@ -2168,15 +2389,20 @@ def test_handoff_is_nontransferable_and_forge_never_reaches_consumer(
         host,
         GENERATION,
         release_spec(),
-        lambda attestation, ownership: received.append((attestation, ownership)),
+        consumer,
         private_bus_address=private_bus.address,
         _operations=ScriptedOperations(),
         _credential_reader=lambda _sender: raw_credentials(),
     )
     try:
-        service._handle_start(":1.1")
-        attestation, ownership = received.pop()
-        issued = issued_records[0]
+        ownership = host.begin_principal_or_agent()
+        evidence = _attest_peer(
+            ":1.1",
+            service._credential_reader,
+            service._operations,
+            service._release,
+        )
+        attestation, issued = service._issue_handoff(":1.1", evidence, ownership)
         assert repr(attestation) == "<RootSystemBusPeerAttestation redacted>"
         assert str(attestation) == repr(attestation)
         for operation in (
@@ -2193,40 +2419,25 @@ def test_handoff_is_nontransferable_and_forge_never_reaches_consumer(
         for field in dataclasses.fields(attestation):
             object.__setattr__(forged, field.name, getattr(attestation, field.name))
 
-        def reaches_consumer(
-            candidate_attestation: RootSystemBusPeerAttestation,
-            candidate_ownership: RootRuntimeActivityOwnership,
-            candidate_issued: object,
-        ) -> bool:
-            before = len(received)
-            try:
-                service._handoff(
-                    candidate_attestation,
-                    candidate_ownership,
-                    candidate_issued,
-                )
-            except RootSystemBusError as exc:
-                assert exc.code == "handoff_invalid"
-            return len(received) != before
-
-        try:
-            forged_carrier: object = _IssuedAttestation(forged)
-        except TypeError:
-            forged_handoff_reached_consumer = False
-        else:
-            forged_handoff_reached_consumer = reaches_consumer(
-                forged,
-                ownership,
-                forged_carrier,
-            )
-        assert forged_handoff_reached_consumer is False
+        forged_carrier = object.__new__(_IssuedAttestation)
+        for field in dataclasses.fields(issued):
+            object.__setattr__(forged_carrier, field.name, getattr(issued, field.name))
+        with pytest.raises(RootSystemBusError) as caught:
+            service._handoff(forged, ownership, forged_carrier)
+        assert caught.value.code == "handoff_invalid"
+        assert r2a_operations.calls == []
 
         with pytest.raises(TypeError):
             _IssuedAttestation(attestation)
-        forged_record = object.__new__(type(issued))
+        forged_record = object.__new__(_IssuedAttestation)
         for field in dataclasses.fields(issued):
             object.__setattr__(forged_record, field.name, getattr(issued, field.name))
-        assert not reaches_consumer(attestation, ownership, forged_record)
+        with service._issuance_lock:
+            service._issued = issued
+        with pytest.raises(RootSystemBusError) as caught:
+            service._handoff(attestation, ownership, forged_record)
+        assert caught.value.code == "handoff_invalid"
+        assert r2a_operations.calls == []
 
         for operation in (
             lambda: copy.copy(issued),
@@ -2237,50 +2448,28 @@ def test_handoff_is_nontransferable_and_forge_never_reaches_consumer(
             with pytest.raises(TypeError):
                 operation()
 
-        assert not reaches_consumer(attestation, ownership, issued)
         with service._issuance_lock:
             service._issued = issued
-        assert not reaches_consumer(forged, ownership, issued)
+        service._handoff(attestation, ownership, issued)
+        calls_after_legal_handoff = list(r2a_operations.calls)
+        with pytest.raises(RootSystemBusError) as caught:
+            service._handoff(attestation, ownership, issued)
+        assert caught.value.code == "handoff_invalid"
+        assert r2a_operations.calls == calls_after_legal_handoff
+        with service._issuance_lock:
+            service._issued = issued
+        with pytest.raises(RootSystemBusError) as caught:
+            service._handoff(forged, ownership, issued)
+        assert caught.value.code == "handoff_invalid"
         other_ownership = host.begin_principal_or_agent()
         try:
             with service._issuance_lock:
                 service._issued = issued
-            assert not reaches_consumer(attestation, other_ownership, issued)
+            with pytest.raises(RootSystemBusError) as caught:
+                service._handoff(attestation, other_ownership, issued)
+            assert caught.value.code == "handoff_invalid"
         finally:
             host.end_principal_or_agent(other_ownership)
-
-        other_bus = PrivateBus()
-        other_host = reconciled_host()
-        other_received: list[
-            tuple[RootSystemBusPeerAttestation, RootRuntimeActivityOwnership]
-        ] = []
-        other_service = HomeBrokerControlService(
-            other_host,
-            GENERATION,
-            release_spec(),
-            lambda value, token: other_received.append((value, token)),
-            private_bus_address=other_bus.address,
-            _operations=ScriptedOperations(),
-            _credential_reader=lambda _sender: raw_credentials(),
-        )
-        try:
-            other_service._handle_start(":1.2")
-            other_attestation, other_ownership = other_received.pop()
-            other_issued = issued_records[-1]
-            with service._issuance_lock:
-                service._issued = other_issued
-            assert not reaches_consumer(
-                other_attestation,
-                other_ownership,
-                other_issued,
-            )
-            other_host.end_principal_or_agent(other_ownership)
-        finally:
-            other_service.close()
-            other_bus.close()
-
-        assert received == []
-        host.end_principal_or_agent(ownership)
     finally:
         service.close()
 
