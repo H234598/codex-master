@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import socket
+import struct
 from typing import Protocol
 
 from codex_master.fleet_home_broker_linux import (
@@ -44,9 +45,51 @@ class SeqpacketPeerOperations(Protocol):
     def peer_security_context(self) -> bytes: ...
 
 
+class _SeqpacketEnforcementOperations(Protocol):
+    def selinux_enforcing(self) -> bool: ...
+
+
 _MAX_UINT32 = 2**32 - 1
 # Linux SO_PEERSEC recommends an initial buffer of NAME_MAX bytes.
 _MAX_SO_PEERSEC_BYTES = 255
+_PEER_CREDENTIALS = struct.Struct("3i")
+
+
+class _ConnectedSeqpacketSocketOptions:
+    __slots__ = ("_connection", "_enforcement_operations")
+
+    def __init__(
+        self,
+        connection: socket.socket,
+        enforcement_operations: _SeqpacketEnforcementOperations,
+    ) -> None:
+        self._connection = connection
+        self._enforcement_operations = enforcement_operations
+
+    def socket_family(self) -> socket.AddressFamily:
+        if type(self._connection) is not socket.socket:
+            raise ValueError
+        return self._connection.family
+
+    def socket_type(self) -> socket.SocketKind:
+        return self._connection.type
+
+    def peer_credentials(self) -> tuple[int, int, int]:
+        self._connection.getpeername()
+        value = self._connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, _PEER_CREDENTIALS.size
+        )
+        if type(value) is not bytes or len(value) != _PEER_CREDENTIALS.size:
+            raise ValueError
+        return _PEER_CREDENTIALS.unpack(value)
+
+    def selinux_enforcing(self) -> bool:
+        return self._enforcement_operations.selinux_enforcing()
+
+    def peer_security_context(self) -> bytes:
+        return self._connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERSEC, _MAX_SO_PEERSEC_BYTES
+        )
 
 
 def _credentials(value: object) -> tuple[int, int, int]:
@@ -110,7 +153,7 @@ def _reattest_seqpacket_peer_from_active_wal_binding(
     wal_operations: WalOperations,
     release: BrokerReleaseSpec,
 ) -> KernelPeerEvidence:
-    """Private no-caller composition defined by the exact sequence below."""
+    """Private composition used by connected peer admission."""
 
     try:
         _validate_release_spec(release)
@@ -156,6 +199,21 @@ def _reattest_seqpacket_peer_from_active_wal_binding(
         raise SeqpacketPeerError("seqpacket peer attestation failed") from None
 
 
+def admit_connected_seqpacket_peer(
+    connection: socket.socket,
+    enforcement_operations: _SeqpacketEnforcementOperations,
+    linux_operations: LinuxOperations,
+    wal_operations: WalOperations,
+    release: BrokerReleaseSpec,
+) -> KernelPeerEvidence:
+    return _reattest_seqpacket_peer_from_active_wal_binding(
+        _ConnectedSeqpacketSocketOptions(connection, enforcement_operations),
+        linux_operations,
+        wal_operations,
+        release,
+    )
+
+
 def reattest_seqpacket_peer(
     operations: SeqpacketPeerOperations,
     linux_operations: LinuxOperations,
@@ -199,5 +257,6 @@ def reattest_seqpacket_peer(
 __all__ = (
     "SeqpacketPeerError",
     "SeqpacketPeerOperations",
+    "admit_connected_seqpacket_peer",
     "reattest_seqpacket_peer",
 )

@@ -4,6 +4,8 @@ from hashlib import sha256
 import socket
 from pathlib import Path
 
+import struct
+
 import pytest
 
 import codex_master.fleet_home_broker_seqpacket as seqpacket
@@ -105,6 +107,78 @@ class RecordingOperations:
     def peer_security_context(self) -> bytes:
         self.events.append(("peer_security_context",))
         return self.context
+
+
+class RecordingConnectedSocket:
+    def __init__(
+        self,
+        events: list[tuple[object, ...]],
+        *,
+        family: object = socket.AF_UNIX,
+        kind: object = socket.SOCK_SEQPACKET,
+        peername: object = ("ignored",),
+        peercred: object = struct.Struct("3i").pack(PEER_PID, 1000, 1000),
+        peersec: object = EXPECTED_LABEL,
+        peername_error: BaseException | None = None,
+        peercred_error: BaseException | None = None,
+        peersec_error: BaseException | None = None,
+    ) -> None:
+        self._events = events
+        self._family = family
+        self._kind = kind
+        self._peername = peername
+        self._peercred = peercred
+        self._peersec = peersec
+        self._peername_error = peername_error
+        self._peercred_error = peercred_error
+        self._peersec_error = peersec_error
+
+    @property
+    def family(self) -> object:
+        self._events.append(("family",))
+        return self._family
+
+    @property
+    def type(self) -> object:
+        self._events.append(("type",))
+        return self._kind
+
+    def getpeername(self) -> object:
+        self._events.append(("getpeername",))
+        if self._peername_error is not None:
+            raise self._peername_error
+        return self._peername
+
+    def getsockopt(self, level: object, option: object, buflen: object) -> object:
+        self._events.append(("getsockopt", level, option, buflen))
+        if option is socket.SO_PEERCRED:
+            if self._peercred_error is not None:
+                raise self._peercred_error
+            return self._peercred
+        if option is socket.SO_PEERSEC:
+            if self._peersec_error is not None:
+                raise self._peersec_error
+            return self._peersec
+        raise AssertionError(option)
+
+
+class RecordingEnforcementOperations:
+    def __init__(
+        self,
+        events: list[tuple[object, ...]],
+        *,
+        value: object = True,
+        error: BaseException | None = None,
+    ) -> None:
+        self._events = events
+        self._value = value
+        self._error = error
+
+    def selinux_enforcing(self) -> bool:
+        self._events.append(("enforcing",))
+        if self._error is not None:
+            raise self._error
+        return self._value
 
 
 class RecordingLinuxOperations:
@@ -317,6 +391,310 @@ def assert_wal_composition_denied(
     assert repr(caught.value) == "SeqpacketPeerError('seqpacket peer attestation failed')"
     assert caught.value.__cause__ is None
     return caught.value
+
+
+def test_connected_socket_adapter_init_is_inert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter_type = getattr(seqpacket, "_ConnectedSeqpacketSocketOptions")
+    monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
+    events: list[tuple[object, ...]] = []
+    connection = RecordingConnectedSocket(events)
+    enforcement_operations = RecordingEnforcementOperations(events)
+
+    adapter = adapter_type(connection, enforcement_operations)
+
+    assert adapter._connection is connection
+    assert adapter._enforcement_operations is enforcement_operations
+    assert events == []
+
+    linux_operations = RecordingLinuxOperations(events)
+    wal_operations = seeded_active_wal(PRINCIPAL)
+    with pytest.raises(SeqpacketPeerError) as caught:
+        getattr(seqpacket, "admit_connected_seqpacket_peer")(
+            connection,
+            enforcement_operations,
+            linux_operations,
+            wal_operations,
+            release_spec(agent_domain=None),
+        )
+    assert caught.value.__cause__ is None
+    assert events == []
+    assert wal_operations.events == []
+
+
+def test_connected_socket_adapter_socket_family_requires_exact_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter_type = getattr(seqpacket, "_ConnectedSeqpacketSocketOptions")
+    monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
+    events: list[tuple[object, ...]] = []
+    connection = RecordingConnectedSocket(events)
+    enforcement_operations = RecordingEnforcementOperations(events)
+
+    assert adapter_type(connection, enforcement_operations).socket_family() is socket.AF_UNIX
+    assert events == [("family",)]
+
+    class SocketProxy:
+        def __init__(self, target: object) -> None:
+            self._target = target
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._target, name)
+
+    class SocketSubclass(RecordingConnectedSocket):
+        pass
+
+    for invalid in (SocketProxy(connection), SocketSubclass(events), object()):
+        with pytest.raises(ValueError):
+            adapter_type(invalid, enforcement_operations).socket_family()
+    assert events == [("family",)]
+
+
+def test_connected_socket_adapter_socket_type_returns_kernel_kind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter_type = getattr(seqpacket, "_ConnectedSeqpacketSocketOptions")
+    monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
+    events: list[tuple[object, ...]] = []
+    connection = RecordingConnectedSocket(events, kind=socket.SOCK_STREAM)
+    enforcement_operations = RecordingEnforcementOperations(events)
+
+    assert adapter_type(connection, enforcement_operations).socket_type() is socket.SOCK_STREAM
+    assert events == [("type",)]
+
+    events.clear()
+    connection = RecordingConnectedSocket(events, kind=socket.SOCK_STREAM)
+    linux_operations = RecordingLinuxOperations(events)
+    wal_operations = seeded_active_wal(PRINCIPAL)
+    with pytest.raises(SeqpacketPeerError):
+        getattr(seqpacket, "admit_connected_seqpacket_peer")(
+            connection,
+            RecordingEnforcementOperations(events),
+            linux_operations,
+            wal_operations,
+            release_spec(),
+        )
+    assert events == [("family",), ("type",)]
+    assert wal_operations.events == []
+
+
+def test_connected_socket_adapter_peer_credentials_requires_connected_exact_peercred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter_type = getattr(seqpacket, "_ConnectedSeqpacketSocketOptions")
+    monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
+    peercred_size = struct.Struct("3i").size
+    assert peercred_size == 12
+
+    events: list[tuple[object, ...]] = []
+    connection = RecordingConnectedSocket(events)
+    enforcement_operations = RecordingEnforcementOperations(events)
+    assert adapter_type(connection, enforcement_operations).peer_credentials() == (
+        PEER_PID,
+        1000,
+        1000,
+    )
+    assert events == [
+        ("getpeername",),
+        ("getsockopt", socket.SOL_SOCKET, socket.SO_PEERCRED, 12),
+    ]
+
+    events.clear()
+    disconnected = RecordingConnectedSocket(events, peername_error=OSError())
+    with pytest.raises(OSError):
+        adapter_type(disconnected, enforcement_operations).peer_credentials()
+    assert events == [("getpeername",)]
+
+    for invalid_peercred in (object(), b"\0" * 11, b"\0" * 13):
+        events.clear()
+        connection = RecordingConnectedSocket(events, peercred=invalid_peercred)
+        linux_operations = RecordingLinuxOperations(events)
+        wal_operations = seeded_active_wal(PRINCIPAL)
+        with pytest.raises(SeqpacketPeerError) as caught:
+            getattr(seqpacket, "admit_connected_seqpacket_peer")(
+                connection,
+                RecordingEnforcementOperations(events),
+                linux_operations,
+                wal_operations,
+                release_spec(),
+            )
+        assert caught.value.__cause__ is None
+        assert events == [
+            ("family",),
+            ("type",),
+            ("getpeername",),
+            ("getsockopt", socket.SOL_SOCKET, socket.SO_PEERCRED, 12),
+        ]
+        assert linux_operations.reuse_checks == 0
+        assert wal_operations.events == []
+
+
+def test_connected_socket_adapter_selinux_enforcing_delegates_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter_type = getattr(seqpacket, "_ConnectedSeqpacketSocketOptions")
+    monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
+    events: list[tuple[object, ...]] = []
+    connection = RecordingConnectedSocket(events)
+    enforcement_operations = RecordingEnforcementOperations(events, value=True)
+
+    assert adapter_type(connection, enforcement_operations).selinux_enforcing() is True
+    assert events == [("enforcing",)]
+
+    admit = getattr(seqpacket, "admit_connected_seqpacket_peer")
+    events.clear()
+    connection = RecordingConnectedSocket(events)
+    linux_operations = RecordingLinuxOperations(events)
+    wal_operations = seeded_active_wal(PRINCIPAL)
+    admit(
+        connection,
+        RecordingEnforcementOperations(events, value=True),
+        linux_operations,
+        wal_operations,
+        release_spec(),
+    )
+    assert ("getsockopt", socket.SOL_SOCKET, socket.SO_PEERSEC, 255) in events
+
+    for value, error in (
+        (False, None),
+        (0, None),
+        (1, None),
+        (True, RuntimeError("enforcement unavailable")),
+    ):
+        events.clear()
+        connection = RecordingConnectedSocket(events)
+        linux_operations = RecordingLinuxOperations(events)
+        wal_operations = seeded_active_wal(PRINCIPAL)
+        with pytest.raises(SeqpacketPeerError) as caught:
+            admit(
+                connection,
+                RecordingEnforcementOperations(events, value=value, error=error),
+                linux_operations,
+                wal_operations,
+                release_spec(),
+            )
+        assert caught.value.__cause__ is None
+        assert ("getsockopt", socket.SOL_SOCKET, socket.SO_PEERSEC, 255) not in events
+        assert wal_operations.events == ["read"]
+
+
+def test_connected_socket_adapter_peer_security_context_reads_exact_peersec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter_type = getattr(seqpacket, "_ConnectedSeqpacketSocketOptions")
+    monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
+    raw_context = b"opaque\0bytes"
+    events: list[tuple[object, ...]] = []
+    connection = RecordingConnectedSocket(events, peersec=raw_context)
+    enforcement_operations = RecordingEnforcementOperations(events)
+
+    assert (
+        adapter_type(connection, enforcement_operations).peer_security_context()
+        is raw_context
+    )
+    assert events == [
+        ("getsockopt", socket.SOL_SOCKET, socket.SO_PEERSEC, 255),
+    ]
+
+    admit = getattr(seqpacket, "admit_connected_seqpacket_peer")
+    for peersec, peersec_error in (
+        ("not-bytes", None),
+        (EXPECTED_LABEL, OSError("peer security unavailable")),
+    ):
+        events.clear()
+        connection = RecordingConnectedSocket(
+            events, peersec=peersec, peersec_error=peersec_error
+        )
+        wal_operations = seeded_active_wal(PRINCIPAL)
+        with pytest.raises(SeqpacketPeerError) as caught:
+            admit(
+                connection,
+                RecordingEnforcementOperations(events),
+                RecordingLinuxOperations(events),
+                wal_operations,
+                release_spec(),
+            )
+        assert caught.value.__cause__ is None
+        assert events[-1] == (
+            "getsockopt",
+            socket.SOL_SOCKET,
+            socket.SO_PEERSEC,
+            255,
+        )
+
+
+def test_admit_connected_seqpacket_peer_is_real_single_caller_and_returns_wal_bound_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter_type = getattr(seqpacket, "_ConnectedSeqpacketSocketOptions")
+    admit = getattr(seqpacket, "admit_connected_seqpacket_peer")
+    monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
+    events: list[tuple[object, ...]] = []
+    connection = RecordingConnectedSocket(events)
+    enforcement_operations = RecordingEnforcementOperations(events)
+    linux_operations = RecordingLinuxOperations(
+        events, fresh_identity_per_reuse=True
+    )
+    wal_operations = seeded_active_wal(PRINCIPAL)
+    calls: list[tuple[object, ...]] = []
+    original = seqpacket._reattest_seqpacket_peer_from_active_wal_binding
+
+    def capture(*args: object) -> KernelPeerEvidence:
+        calls.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(
+        seqpacket, "_reattest_seqpacket_peer_from_active_wal_binding", capture
+    )
+
+    evidence_one = admit(
+        connection,
+        enforcement_operations,
+        linux_operations,
+        wal_operations,
+        release_spec(),
+    )
+    evidence_two = admit(
+        connection,
+        enforcement_operations,
+        linux_operations,
+        wal_operations,
+        release_spec(),
+    )
+
+    expected_evidence = KernelPeerEvidence(
+        PEER_PID,
+        1000,
+        1000,
+        START_TIME,
+        PRINCIPAL.cgroup_dev,
+        PRINCIPAL.cgroup_ino,
+        PRINCIPAL.unit_generation,
+        PRINCIPAL.invocation_id,
+        PRINCIPAL.mcs_pair,
+    )
+    assert evidence_one == expected_evidence
+    assert evidence_two == expected_evidence
+    assert len(calls) == 2
+    assert all(type(call[0]) is adapter_type for call in calls)
+    assert all(call[0]._connection is connection for call in calls)
+    assert linux_operations.reuse_checks == 32
+    assert wal_operations.events == ["read", "read"]
+    socket_events = [
+        event
+        for event in events
+        if event[0] in {"family", "type", "getpeername", "getsockopt", "enforcing"}
+    ]
+    one_socket_observation = [
+        ("family",),
+        ("type",),
+        ("getpeername",),
+        ("getsockopt", socket.SOL_SOCKET, socket.SO_PEERCRED, 12),
+        ("enforcing",),
+        ("getsockopt", socket.SOL_SOCKET, socket.SO_PEERSEC, 255),
+    ]
+    assert socket_events == one_socket_observation + one_socket_observation
 
 
 def test_private_wal_composition_uses_one_root_owned_key_and_original_principal(
@@ -565,17 +943,51 @@ def test_wal_composition_source_keeps_private_api_and_single_authority() -> None
     )
     assert "_reattest_seqpacket_peer_from_active_wal_binding" not in seqpacket.__all__
 
+    admissions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "admit_connected_seqpacket_peer"
+    ]
+    assert len(admissions) == 1
+    admission = admissions[0]
+    admission_calls = [
+        node for node in ast.walk(admission) if isinstance(node, ast.Call)
+    ]
+    assert sum(
+        isinstance(node.func, ast.Name)
+        and node.func.id == "_ConnectedSeqpacketSocketOptions"
+        for node in admission_calls
+    ) == 1
+    assert sum(
+        isinstance(node.func, ast.Name)
+        and node.func.id == "_reattest_seqpacket_peer_from_active_wal_binding"
+        for node in admission_calls
+    ) == 1
+
     production_calls = {"coordinator": 0, "lookup": 0}
+    coordinator_callers: list[str] = []
     for path in Path(seqpacket.__file__).parent.glob("*.py"):
         module_tree = ast.parse(path.read_text())
+        functions = [
+            node
+            for node in ast.walk(module_tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
         for node in ast.walk(module_tree):
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
                 continue
             if node.func.id == "_reattest_seqpacket_peer_from_active_wal_binding":
                 production_calls["coordinator"] += 1
+                coordinator_callers.extend(
+                    function.name
+                    for function in functions
+                    if node in ast.walk(function)
+                )
             elif node.func.id == "_lookup_active_principal_binding":
                 production_calls["lookup"] += 1
-    assert production_calls == {"coordinator": 0, "lookup": 1}
+    assert production_calls == {"coordinator": 1, "lookup": 1}
+    assert coordinator_callers == ["admit_connected_seqpacket_peer"]
 
 
 def test_legal_order_and_evidence_conversion() -> None:
@@ -847,6 +1259,7 @@ def test_public_surface_is_exact() -> None:
     assert seqpacket.__all__ == (
         "SeqpacketPeerError",
         "SeqpacketPeerOperations",
+        "admit_connected_seqpacket_peer",
         "reattest_seqpacket_peer",
     )
 
@@ -910,6 +1323,27 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
                 node.func.id if isinstance(node.func, ast.Name) else None
             )
             assert called_name not in forbidden_call_names
+
+    getpeername_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "getpeername"
+    ]
+    getsockopt_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "getsockopt"
+    ]
+    assert len(getpeername_calls) == 1
+    assert len(getsockopt_calls) == 2
+    assert [ast.unparse(node) for node in getsockopt_calls] == [
+        "self._connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _PEER_CREDENTIALS.size)",
+        "self._connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERSEC, _MAX_SO_PEERSEC_BYTES)",
+    ]
 
     source_terms = (
         "ScmFrame",
