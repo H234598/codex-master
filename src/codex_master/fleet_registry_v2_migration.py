@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import sha256
 import json
 import re
@@ -23,6 +23,8 @@ from .fleet_registry import (
 
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
+_PREPARED_CAPABILITY_SEAL = object()
+_RECOVERY_CAPABILITY_SEAL = object()
 
 
 class RegistryV2MigrationError(ValueError):
@@ -53,7 +55,7 @@ class RegistryV2QuiescenceEvidence:
         return repr(self)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class PreparedFleetRegistryV2Migration:
     source: FleetSnapshot
     candidate: FleetSnapshotV2
@@ -61,6 +63,11 @@ class PreparedFleetRegistryV2Migration:
     candidate_digest: str
     quiescence_before: RegistryV2QuiescenceEvidence
     quiescence_after: RegistryV2QuiescenceEvidence
+    profile_bindings: tuple[tuple[str, ProfileCredentialBinding], ...]
+    _seal: object = field(init=False, repr=False, compare=False)
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise TypeError("prepared_capability_factory_required")
 
     def __repr__(self) -> str:
         return "PreparedFleetRegistryV2Migration(<redacted>)"
@@ -68,20 +75,82 @@ class PreparedFleetRegistryV2Migration:
     def __str__(self) -> str:
         return repr(self)
 
+    def __reduce_ex__(self, _protocol: int) -> object:
+        raise TypeError("prepared_capability_not_serializable")
 
-@dataclass(frozen=True, slots=True)
+    def __copy__(self) -> PreparedFleetRegistryV2Migration:
+        raise TypeError("prepared_capability_not_cloneable")
+
+    def __deepcopy__(self, _memo: object) -> PreparedFleetRegistryV2Migration:
+        raise TypeError("prepared_capability_not_cloneable")
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class FleetRegistryV1RecoveryPlan:
     prepared: PreparedFleetRegistryV2Migration
     candidate: FleetSnapshot
     observed_candidate_digest: str
     quiescence_before: RegistryV2QuiescenceEvidence
     quiescence_after: RegistryV2QuiescenceEvidence
+    _seal: object = field(init=False, repr=False, compare=False)
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise TypeError("recovery_capability_factory_required")
 
     def __repr__(self) -> str:
         return "FleetRegistryV1RecoveryPlan(<redacted>)"
 
     def __str__(self) -> str:
         return repr(self)
+
+    def __reduce_ex__(self, _protocol: int) -> object:
+        raise TypeError("recovery_capability_not_serializable")
+
+    def __copy__(self) -> FleetRegistryV1RecoveryPlan:
+        raise TypeError("recovery_capability_not_cloneable")
+
+    def __deepcopy__(self, _memo: object) -> FleetRegistryV1RecoveryPlan:
+        raise TypeError("recovery_capability_not_cloneable")
+
+
+def _new_prepared(
+    *,
+    source: FleetSnapshot,
+    candidate: FleetSnapshotV2,
+    source_digest: str,
+    candidate_digest: str,
+    quiescence_before: RegistryV2QuiescenceEvidence,
+    quiescence_after: RegistryV2QuiescenceEvidence,
+    profile_bindings: tuple[tuple[str, ProfileCredentialBinding], ...],
+) -> PreparedFleetRegistryV2Migration:
+    prepared = object.__new__(PreparedFleetRegistryV2Migration)
+    object.__setattr__(prepared, "source", source)
+    object.__setattr__(prepared, "candidate", candidate)
+    object.__setattr__(prepared, "source_digest", source_digest)
+    object.__setattr__(prepared, "candidate_digest", candidate_digest)
+    object.__setattr__(prepared, "quiescence_before", quiescence_before)
+    object.__setattr__(prepared, "quiescence_after", quiescence_after)
+    object.__setattr__(prepared, "profile_bindings", profile_bindings)
+    object.__setattr__(prepared, "_seal", _PREPARED_CAPABILITY_SEAL)
+    return prepared
+
+
+def _new_recovery_plan(
+    *,
+    prepared: PreparedFleetRegistryV2Migration,
+    candidate: FleetSnapshot,
+    observed_candidate_digest: str,
+    quiescence_before: RegistryV2QuiescenceEvidence,
+    quiescence_after: RegistryV2QuiescenceEvidence,
+) -> FleetRegistryV1RecoveryPlan:
+    plan = object.__new__(FleetRegistryV1RecoveryPlan)
+    object.__setattr__(plan, "prepared", prepared)
+    object.__setattr__(plan, "candidate", candidate)
+    object.__setattr__(plan, "observed_candidate_digest", observed_candidate_digest)
+    object.__setattr__(plan, "quiescence_before", quiescence_before)
+    object.__setattr__(plan, "quiescence_after", quiescence_after)
+    object.__setattr__(plan, "_seal", _RECOVERY_CAPABILITY_SEAL)
+    return plan
 
 
 def _fail(code: str) -> None:
@@ -169,6 +238,26 @@ def _observe(
         source_generation=source_generation,
         source_digest=source_digest,
     )
+
+
+def _copy_profile_bindings(
+    profile_bindings: object,
+) -> dict[str, ProfileCredentialBinding]:
+    if not isinstance(profile_bindings, Mapping):
+        _fail("invalid_migration_binding")
+    try:
+        supplied = dict(profile_bindings.items())
+    except Exception:
+        _fail("invalid_migration_binding")
+    if any(
+        type(account_id) is not str or type(binding) is not ProfileCredentialBinding
+        for account_id, binding in supplied.items()
+    ):
+        _fail("invalid_migration_binding")
+    return {
+        account_id: ProfileCredentialBinding(binding.profile_id, binding.binding_id)
+        for account_id, binding in supplied.items()
+    }
 
 
 def _materialize_candidate(
@@ -284,8 +373,9 @@ def prepare_fleet_registry_v2_migration(
         source_generation=validated_source.generation,
         source_digest=source_digest,
     )
+    copied_bindings = _copy_profile_bindings(profile_bindings)
     candidate = _materialize_candidate(
-        validated_source, profile_bindings, runtime_principals
+        validated_source, copied_bindings, runtime_principals
     )
     candidate_digest = _digest(_canonical_bytes(candidate))
     after = _observe(
@@ -295,22 +385,52 @@ def prepare_fleet_registry_v2_migration(
     )
     if after != before:
         _fail("quiescence_drift")
-    return PreparedFleetRegistryV2Migration(
+    return _new_prepared(
         source=validated_source,
         candidate=candidate,
         source_digest=source_digest,
         candidate_digest=candidate_digest,
         quiescence_before=before,
         quiescence_after=after,
+        profile_bindings=tuple(sorted(copied_bindings.items())),
     )
 
 
 def _validated_prepared(
     prepared: object,
 ) -> tuple[PreparedFleetRegistryV2Migration, bytes]:
-    if type(prepared) is not PreparedFleetRegistryV2Migration:
-        _fail("recovery_candidate_mismatch")
+    if (
+        type(prepared) is not PreparedFleetRegistryV2Migration
+        or getattr(prepared, "_seal", None) is not _PREPARED_CAPABILITY_SEAL
+    ):
+        _fail("prepared_integrity_invalid")
     try:
+        if type(prepared.profile_bindings) is not tuple:
+            _fail("prepared_integrity_invalid")
+        stored_bindings: dict[str, ProfileCredentialBinding] = {}
+        previous_account_id: str | None = None
+        for item in prepared.profile_bindings:
+            if type(item) is not tuple or len(item) != 2:
+                _fail("prepared_integrity_invalid")
+            account_id, binding = item
+            if (
+                type(account_id) is not str
+                or type(binding) is not ProfileCredentialBinding
+                or (
+                    previous_account_id is not None
+                    and account_id <= previous_account_id
+                )
+            ):
+                _fail("prepared_integrity_invalid")
+            stored_bindings[account_id] = binding
+            previous_account_id = account_id
+        rematerialized_candidate = _materialize_candidate(
+            prepared.source,
+            stored_bindings,
+            prepared.candidate.runtime_principals,
+        )
+        if rematerialized_candidate != prepared.candidate:
+            _fail("prepared_integrity_invalid")
         source_payload = _canonical_bytes(prepared.source)
         candidate_payload = _canonical_bytes(prepared.candidate)
         normalized_source = normalize_fleet_document(fleet_document(prepared.source))
@@ -318,7 +438,7 @@ def _validated_prepared(
             fleet_document(prepared.candidate)
         )
     except Exception:
-        _fail("recovery_candidate_mismatch")
+        _fail("prepared_integrity_invalid")
     if (
         type(prepared.source) is not FleetSnapshot
         or type(prepared.candidate) is not FleetSnapshotV2
@@ -330,7 +450,7 @@ def _validated_prepared(
         or prepared.source_digest != _digest(source_payload)
         or prepared.candidate_digest != _digest(candidate_payload)
     ):
-        _fail("recovery_candidate_mismatch")
+        _fail("prepared_integrity_invalid")
     try:
         before = _validated_evidence(
             prepared.quiescence_before,
@@ -343,9 +463,9 @@ def _validated_prepared(
             source_digest=prepared.source_digest,
         )
     except RegistryV2MigrationError:
-        _fail("recovery_candidate_mismatch")
+        _fail("prepared_integrity_invalid")
     if before != after:
-        _fail("recovery_candidate_mismatch")
+        _fail("prepared_integrity_invalid")
     return prepared, candidate_payload
 
 
@@ -409,7 +529,7 @@ def plan_fleet_registry_v1_recovery(
     )
     if after != before:
         _fail("quiescence_drift")
-    return FleetRegistryV1RecoveryPlan(
+    return _new_recovery_plan(
         prepared=validated,
         candidate=candidate,
         observed_candidate_digest=observed_candidate_digest,

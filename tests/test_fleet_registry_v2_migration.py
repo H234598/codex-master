@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import FrozenInstanceError, astuple, replace
+import copy
+from dataclasses import FrozenInstanceError, astuple, fields, replace
 from hashlib import sha256
 import inspect
 import json
+import pickle
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,8 @@ from codex_master.fleet_registry import (
     FleetDynamicWorkerPrincipalV2,
     FleetRuntimePrincipalV2,
     FleetSeries,
+    FleetSeriesMember,
+    FleetSeriesV2,
     FleetSnapshot,
     FleetSnapshotV2,
     LimitState,
@@ -576,6 +580,7 @@ def test_recovery_rejects_candidate_or_prepared_drift(kind: str) -> None:
     observed = prepared.candidate
     observed_digest = prepared.candidate_digest
     supplied = prepared
+    expected_code = "recovery_candidate_mismatch"
     if kind == "content":
         account = observed.accounts[0]
         observed = replace(
@@ -592,7 +597,11 @@ def test_recovery_rejects_candidate_or_prepared_drift(kind: str) -> None:
     elif kind == "digest":
         observed_digest = "sha256:" + "f" * 64
     else:
-        supplied = replace(prepared, candidate_digest="sha256:" + "e" * 64)
+        supplied = _capability_clone(
+            prepared,
+            candidate_digest="sha256:" + "e" * 64,
+        )
+        expected_code = "prepared_integrity_invalid"
 
     with pytest.raises(RegistryV2MigrationError) as caught:
         _recover(
@@ -600,7 +609,273 @@ def test_recovery_rejects_candidate_or_prepared_drift(kind: str) -> None:
             observed=observed,
             observed_digest=observed_digest,
         )
-    assert caught.value.code == "recovery_candidate_mismatch"
+    assert caught.value.code == expected_code
+
+
+def _capability_clone(
+    capability: PreparedFleetRegistryV2Migration | FleetRegistryV1RecoveryPlan,
+    **changes: object,
+) -> PreparedFleetRegistryV2Migration | FleetRegistryV1RecoveryPlan:
+    forged = object.__new__(type(capability))
+    for item in fields(capability):
+        object.__setattr__(
+            forged,
+            item.name,
+            changes.get(item.name, getattr(capability, item.name)),
+        )
+    return forged
+
+
+def test_prepared_pickle_is_blocked_but_evidence_remains_transport_data() -> None:
+    prepared = _prepared()
+    with pytest.raises(TypeError, match="prepared_capability_not_serializable"):
+        pickle.dumps(prepared)
+
+    evidence = recovery_quiescence(prepared)
+    assert pickle.loads(pickle.dumps(evidence)) == evidence
+
+
+def test_recovery_plan_pickle_is_blocked() -> None:
+    plan = _recover(_prepared())
+    with pytest.raises(TypeError, match="recovery_capability_not_serializable"):
+        pickle.dumps(plan)
+
+
+def test_direct_capability_construction_is_blocked() -> None:
+    prepared = _prepared()
+    with pytest.raises(TypeError, match="prepared_capability_factory_required"):
+        PreparedFleetRegistryV2Migration(
+            prepared.source,
+            prepared.candidate,
+            prepared.source_digest,
+            prepared.candidate_digest,
+            prepared.quiescence_before,
+            prepared.quiescence_after,
+        )
+
+    plan = _recover(prepared)
+    with pytest.raises(TypeError, match="recovery_capability_factory_required"):
+        FleetRegistryV1RecoveryPlan(
+            plan.prepared,
+            plan.candidate,
+            plan.observed_candidate_digest,
+            plan.quiescence_before,
+            plan.quiescence_after,
+        )
+
+
+def test_dataclass_replace_cannot_reconstruct_capabilities() -> None:
+    prepared = _prepared()
+    with pytest.raises(TypeError, match="prepared_capability_factory_required"):
+        replace(prepared, candidate_digest=prepared.candidate_digest)
+
+    plan = _recover(prepared)
+    with pytest.raises(TypeError, match="recovery_capability_factory_required"):
+        replace(plan, observed_candidate_digest=plan.observed_candidate_digest)
+
+
+@pytest.mark.parametrize("copier", [copy.copy, copy.deepcopy])
+def test_copy_cannot_clone_accepted_capabilities(copier: object) -> None:
+    prepared = _prepared()
+    with pytest.raises(TypeError, match="prepared_capability_not_cloneable"):
+        copier(prepared)  # type: ignore[operator]
+
+    plan = _recover(prepared)
+    with pytest.raises(TypeError, match="recovery_capability_not_cloneable"):
+        copier(plan)  # type: ignore[operator]
+
+
+def _candidate_with(
+    prepared: PreparedFleetRegistryV2Migration,
+    *,
+    accounts: tuple[object, ...] | None = None,
+    series: tuple[object, ...] | None = None,
+    runtime_principals: tuple[object, ...] | None = None,
+) -> FleetSnapshotV2:
+    candidate = replace(
+        prepared.candidate,
+        accounts=prepared.candidate.accounts if accounts is None else accounts,
+        series=prepared.candidate.series if series is None else series,
+        runtime_principals=(
+            prepared.candidate.runtime_principals
+            if runtime_principals is None
+            else runtime_principals
+        ),
+    )
+    normalized = normalize_fleet_document(fleet_document(candidate))
+    assert type(normalized) is FleetSnapshotV2
+    return normalized
+
+
+def _assert_forged_prepared_rejected(
+    prepared: PreparedFleetRegistryV2Migration,
+    candidate: FleetSnapshotV2,
+) -> None:
+    assert normalize_fleet_document(fleet_document(candidate)) == candidate
+    forged = _capability_clone(
+        prepared,
+        candidate=candidate,
+        candidate_digest=_canonical_digest(candidate),
+    )
+    assert type(forged) is PreparedFleetRegistryV2Migration
+
+    with pytest.raises(RegistryV2MigrationError) as caught:
+        _recover(
+            forged,
+            observed=candidate,
+            observed_digest=_canonical_digest(candidate),
+        )
+    assert caught.value.code == "prepared_integrity_invalid"
+
+
+def test_recovery_rejects_sealed_pool_only_series_forge() -> None:
+    prepared = _prepared()
+    series = FleetSeriesV2(
+        prefix="o",
+        display_name="Forged shadow series",
+        runner=RunnerKind.CODEX_CLI,
+        provider=Provider.OLLAMA_LOCAL,
+        model="forged-local-model",
+        enabled=True,
+        skill_profile="generic",
+        task_profile="standard",
+        members=(
+            FleetSeriesMember(
+                member_id="11111111-1111-4111-8111-111111111111",
+                ordinal=1,
+                account_id=None,
+                enabled=True,
+            ),
+        ),
+    )
+    _assert_forged_prepared_rejected(
+        prepared,
+        _candidate_with(prepared, series=(series,)),
+    )
+
+
+@pytest.mark.parametrize("kind", ["account_label", "non_openai_binding", "attestation"])
+def test_recovery_rejects_sealed_account_or_attestation_forge(kind: str) -> None:
+    prepared = _prepared()
+    accounts = prepared.candidate.accounts
+    principals = prepared.candidate.runtime_principals
+    if kind == "account_label":
+        accounts = tuple(
+            replace(item, label="forged-account-label")
+            if item.account_id == ACCOUNT_ID
+            else item
+            for item in accounts
+        )
+    elif kind == "non_openai_binding":
+        accounts = tuple(
+            replace(item, credential_binding_id="forged-api-key-binding")
+            if item.account_id == "gemini-secondary"
+            else item
+            for item in accounts
+        )
+    else:
+        forged_binding = "hmac-sha256:" + "b" * 64
+        accounts = tuple(
+            replace(item, credential_binding_id=forged_binding)
+            if item.account_id == ACCOUNT_ID
+            else item
+            for item in accounts
+        )
+        principals = tuple(
+            replace(
+                item,
+                profile_id="forged-profile",
+                credential_binding_id=forged_binding,
+            )
+            for item in principals
+        )
+    _assert_forged_prepared_rejected(
+        prepared,
+        _candidate_with(
+            prepared,
+            accounts=accounts,
+            runtime_principals=principals,
+        ),
+    )
+
+
+@pytest.mark.parametrize("kind", ["missing", "additional", "mismatched"])
+def test_recovery_rejects_sealed_principal_set_forge(kind: str) -> None:
+    prepared = _prepared()
+    principals = prepared.candidate.runtime_principals
+    if kind == "missing":
+        principals = ()
+    elif kind == "additional":
+        principals = principals + (
+            runtime_principal(
+                principal_id="tl-" + "2" * 32,
+                profile_id="forged-extra-profile",
+                enabled=False,
+            ),
+        )
+    else:
+        principals = tuple(
+            replace(item, profile_id="forged-mismatched-profile") for item in principals
+        )
+    _assert_forged_prepared_rejected(
+        prepared,
+        _candidate_with(prepared, runtime_principals=principals),
+    )
+
+
+def test_prepared_copies_and_canonically_sorts_accepted_attestations() -> None:
+    source = source_snapshot()
+    primary = next(item for item in source.accounts if item.account_id == ACCOUNT_ID)
+    second = replace(
+        primary,
+        account_id="openai-disabled",
+        label="OpenAI disabled",
+        enabled=False,
+        secret_state=SecretState.MISSING,
+        limit_state=LimitState.DISABLED,
+    )
+    expanded = normalize_fleet_document(
+        fleet_document(replace(source, accounts=source.accounts + (second,)))
+    )
+    assert type(expanded) is FleetSnapshot
+    first_attestation = ProfileCredentialBinding(PROFILE_ID, BINDING_ID)
+    second_attestation = ProfileCredentialBinding(
+        "disabled-profile", "hmac-sha256:" + "c" * 64
+    )
+    caller_bindings = {
+        second.account_id: second_attestation,
+        ACCOUNT_ID: first_attestation,
+    }
+    observations = iter((quiescence(expanded), quiescence(expanded)))
+    prepared = prepare_fleet_registry_v2_migration(
+        expanded,
+        expected_generation=expanded.generation,
+        profile_bindings=caller_bindings,
+        runtime_principals=(
+            runtime_principal(),
+            runtime_principal(
+                principal_id="tl-" + "3" * 32,
+                account_id=second.account_id,
+                profile_id=second_attestation.profile_id,
+                credential_binding_id=second_attestation.binding_id,
+                enabled=False,
+            ),
+        ),
+        quiescence_probe=lambda: next(observations),
+    )
+    caller_bindings.clear()
+
+    assert tuple(item[0] for item in prepared.profile_bindings) == (
+        second.account_id,
+        ACCOUNT_ID,
+    )
+    stored = dict(prepared.profile_bindings)
+    assert stored == {
+        ACCOUNT_ID: first_attestation,
+        second.account_id: second_attestation,
+    }
+    assert stored[ACCOUNT_ID] is not first_attestation
+    assert stored[second.account_id] is not second_attestation
 
 
 @pytest.mark.parametrize(
