@@ -496,6 +496,26 @@ def test_root_owned_snapshot_source_keeps_linux_api_and_guard_contract():
         and node.func.id == "_observe_peer_snapshot_with_identity"
     ]
     assert len(observer_calls) == 1
+    assert [argument.arg for argument in observer.args.args] == [
+        "operations",
+        "peer_pid",
+    ]
+    assert observer.args.posonlyargs == []
+    assert observer.args.kwonlyargs == []
+    assert observer.args.vararg is None
+    assert observer.args.kwarg is None
+    assert observer.args.defaults == []
+    assert observer.args.kw_defaults == []
+
+    validation_calls = [
+        node
+        for node in ast.walk(private_attestation)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_validate_principal"
+    ]
+    assert len(validation_calls) == 1
+    assert validation_calls[0].lineno < observer_calls[0].lineno
     assert not any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -587,7 +607,7 @@ def test_snapshot_drift_closes_all_peer_fds(changes):
     ]
 
 
-def test_invalid_principal_binding_stops_before_root_observation():
+def test_invalid_principal_binding_contract_stops_before_linux_operations():
     operations = FakeOperations()
 
     with pytest.raises(LinuxBoundaryError):
