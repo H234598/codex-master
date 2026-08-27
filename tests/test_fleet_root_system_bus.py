@@ -6,9 +6,10 @@ from dataclasses import replace
 import os
 from pathlib import Path
 import pickle
+import select
 import subprocess
 import sys
-from threading import Thread
+from threading import Event, Thread
 from typing import Callable
 import xml.etree.ElementTree as ET
 
@@ -16,6 +17,7 @@ import dbus
 from gi.repository import GLib
 import pytest
 
+import codex_master.fleet_root_system_bus as system_bus
 from codex_master.fleet_home_broker_runtime import BrokerReleaseSpec
 from codex_master.fleet_root_runtime_host import (
     FleetRootRuntimeHost,
@@ -32,18 +34,21 @@ from codex_master.fleet_root_system_bus import (
     HomeBrokerControlService,
     RootSystemBusError,
     RootSystemBusPeerAttestation,
+    _IssuedAttestation,
     _LinuxPeerOperations,
     _ProcObservation,
     _UnitObservation,
     _attest_peer,
     _openat2,
     _parse_cgroup,
+    _selinux_context,
     _parse_stat,
 )
 
 
 GENERATION = 7
 PEER_LABEL = b"system_u:system_r:codex_master_control_t:s0:c1,c2"
+GATEWAY_LABEL = b"system_u:system_r:codex_master_control_t:s0"
 INVOCATION = bytes.fromhex("11" * 16)
 
 
@@ -128,7 +133,7 @@ class ScriptedOperations:
             ),
         ]
         self.enforcing = True
-        self.self_label = PEER_LABEL
+        self.self_label = GATEWAY_LABEL
 
     def _fd(self, call: str) -> int:
         self.calls.append(call)
@@ -189,6 +194,36 @@ class ScriptedOperations:
         assert fd in self.open_fds
         self.calls.append("close")
         self.open_fds.remove(fd)
+
+
+class CleanupFailingOperations(ScriptedOperations):
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_attempts: list[int] = []
+        self._failed_once = False
+
+    def close(self, fd: int) -> None:
+        assert fd in self.open_fds
+        self.calls.append("close")
+        self.close_attempts.append(fd)
+        self.open_fds.remove(fd)
+        if not self._failed_once:
+            self._failed_once = True
+            raise OSError("private close detail")
+
+
+class ProvenanceLinuxOperations(_LinuxPeerOperations):
+    def __init__(self, system_bus: dbus.bus.BusConnection) -> None:
+        super().__init__(system_bus)
+        self.pid_events: list[tuple[str, int]] = []
+
+    def pidfd_open(self, pid: int) -> int:
+        self.pid_events.append(("pidfd_open", pid))
+        return super().pidfd_open(pid)
+
+    def open_proc_pid(self, proc_root: int, pid: int) -> int:
+        self.pid_events.append(("open_proc_pid", pid))
+        return super().open_proc_pid(proc_root, pid)
 
 
 class PrivateBus:
@@ -279,11 +314,85 @@ def test_private_bus_surface_name_and_empty_signature(
         assert not loop_thread.is_alive()
 
 
-def test_real_private_sender_credentials_and_bad_payload_blocked(
+def test_unknown_bus_boundary_blocks_before_begin(
     private_bus: PrivateBus,
 ) -> None:
     host = reconciled_host()
     operations = ScriptedOperations()
+    received: list[object] = []
+    credential_calls: list[None] = []
+    service = HomeBrokerControlService(
+        host,
+        GENERATION,
+        release_spec(),
+        lambda *_values: received.append(object()),
+        private_bus_address=private_bus.address,
+        _operations=operations,
+    )
+    real_reader = service._credential_reader
+
+    def observing_reader(sender: str) -> object:
+        credential_calls.append(None)
+        return real_reader(sender)
+
+    service._credential_reader = observing_reader
+    loop_ready = Event()
+    GLib.idle_add(lambda: loop_ready.set() and False)
+    loop_thread = Thread(target=service.run)
+    loop_thread.start()
+    assert loop_ready.wait(5)
+    client = dbus.bus.BusConnection(private_bus.address)
+    try:
+        messages = (
+            dbus.lowlevel.MethodCallMessage(
+                destination=BUS_NAME,
+                path=BUS_PATH + "/Unknown",
+                interface=BUS_INTERFACE,
+                method=BUS_METHOD,
+            ),
+            dbus.lowlevel.MethodCallMessage(
+                destination=BUS_NAME,
+                path=BUS_PATH,
+                interface=BUS_INTERFACE + ".Unknown",
+                method=BUS_METHOD,
+            ),
+            dbus.lowlevel.MethodCallMessage(
+                destination=BUS_NAME,
+                path=BUS_PATH,
+                interface=BUS_INTERFACE,
+                method=BUS_METHOD + "Unknown",
+            ),
+            dbus.lowlevel.MethodCallMessage(
+                destination=BUS_NAME,
+                path=BUS_PATH,
+                interface=BUS_INTERFACE,
+                method=BUS_METHOD,
+            ),
+        )
+        messages[-1].append("forbidden", signature="s")
+        for message in messages:
+            before = host.snapshot()
+            with pytest.raises(dbus.DBusException):
+                client.send_message_with_reply_and_block(message)
+            assert host.snapshot() == before
+            assert operations.calls == []
+            assert credential_calls == []
+            assert received == []
+    finally:
+        client.close()
+        service.close()
+        loop_thread.join(5)
+        assert not loop_thread.is_alive()
+
+
+def test_real_private_sender_credentials_and_bad_payload_blocked(
+    private_bus: PrivateBus,
+) -> None:
+    GLib.MainLoop()
+    host = reconciled_host()
+    host_before = host.snapshot()
+    system_bus = dbus.SystemBus(private=True)
+    operations = ProvenanceLinuxOperations(system_bus)
     seen: list[RootSystemBusPeerAttestation] = []
     service = HomeBrokerControlService(
         host,
@@ -293,22 +402,54 @@ def test_real_private_sender_credentials_and_bad_payload_blocked(
         private_bus_address=private_bus.address,
         _operations=operations,
     )
+    real_reader = service._credential_reader
+    reader_entered = Event()
+    reader_release = Event()
+    observed_credentials: list[tuple[str, object]] = []
+
+    def observing_reader(sender: str) -> object:
+        value = real_reader(sender)
+        observed_credentials.append((str(sender), value))
+        if len(observed_credentials) == 1:
+            reader_entered.set()
+            if not reader_release.wait(5):
+                raise RuntimeError("credential observation timeout")
+        return value
+
+    service._credential_reader = observing_reader
+    loop_ready = Event()
+    GLib.idle_add(lambda: loop_ready.set() and False)
     loop_thread = Thread(target=service.run)
     loop_thread.start()
+    assert loop_ready.wait(5)
+    fd_ceiling = len(os.listdir("/proc/self/fd"))
+    child: subprocess.Popen[bytes] | None = None
+    identity_read, identity_write = os.pipe()
+
+    def require(condition: bool, code: str) -> None:
+        if not condition:
+            pytest.fail(code, pytrace=False)
+
     try:
         script = """
 import dbus, os, sys
 bus = dbus.bus.BusConnection(sys.argv[1])
+os.write(int(sys.argv[6]), (str(bus.get_unique_name()) + chr(10)).encode('ascii'))
+os.close(int(sys.argv[6]))
+sys.stdin.buffer.read(1)
 obj = bus.get_object(sys.argv[2], sys.argv[3])
 method = obj.get_dbus_method(sys.argv[4], sys.argv[5])
 try:
     method()
 except dbus.DBusException as exc:
-    print(exc.get_dbus_name())
-print('client-complete')
+    detail = str(exc)
+    status = 0 if ('unit_binding_invalid' in detail or 'selinux_gateway_invalid' in detail) else 4
+else:
+    status = 3
 bus.close()
+raise SystemExit(status)
 """
-        child = subprocess.run(
+        child = subprocess.Popen(
             [
                 sys.executable,
                 "-c",
@@ -318,18 +459,76 @@ bus.close()
                 BUS_PATH,
                 BUS_METHOD,
                 BUS_INTERFACE,
+                str(identity_write),
             ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            pass_fds=(identity_write,),
         )
-        assert "client-complete" in child.stdout
-        assert operations.calls[0] == "pidfd_open"
+        os.close(identity_write)
+        identity_write = -1
+        ready, _, _ = select.select((identity_read,), (), (), 5)
+        require(bool(ready), "private sender identity timeout")
+        unique_name = os.read(identity_read, 256).strip().decode("ascii")
+        os.close(identity_read)
+        identity_read = -1
+        require(unique_name.startswith(":"), "private sender identity invalid")
+        require(child.stdin is not None, "private sender control unavailable")
+        child.stdin.write(b"1")
+        child.stdin.flush()
+        require(reader_entered.wait(5), "credential reader timeout")
+        require(child.poll() is None, "private sender disconnected during read")
+
+        status_lines = Path(f"/proc/{child.pid}/status").read_bytes().splitlines()
+        uid_line = next(line for line in status_lines if line.startswith(b"Uid:"))
+        groups_line = next(line for line in status_lines if line.startswith(b"Groups:"))
+        expected_uid = int(uid_line.split()[1])
+        expected_groups = tuple(sorted(int(value) for value in groups_line.split()[1:]))
+        expected_label = (
+            Path(f"/proc/{child.pid}/attr/current").read_bytes().rstrip(b"\0\n")
+        )
+        observed_sender, raw = observed_credentials[0]
+        require(type(raw) is dbus.Dictionary, "credential container invalid")
+        require(observed_sender == unique_name, "method sender provenance mismatch")
+        require(int(raw["ProcessID"]) == child.pid, "sender PID provenance mismatch")
+        require(
+            int(raw["UnixUserID"]) == expected_uid == os.getuid(),
+            "sender UID provenance mismatch",
+        )
+        require(
+            tuple(sorted(int(value) for value in raw["UnixGroupIDs"]))
+            == expected_groups,
+            "sender groups provenance mismatch",
+        )
+        require(
+            bytes(raw["LinuxSecurityLabel"]).rstrip(b"\0") == expected_label,
+            "sender label provenance mismatch",
+        )
+        reader_release.set()
+        require(child.wait(timeout=10) == 0, "private sender negative gate mismatch")
+        require(
+            all(sender == unique_name for sender, _raw in observed_credentials),
+            "credential sender drift",
+        )
+        require(
+            bool(operations.pid_events)
+            and operations.pid_events[0] == ("pidfd_open", child.pid),
+            "pidfd provenance mismatch",
+        )
+        require(not seen, "negative sender reached consumer")
+        after_negative = host.snapshot()
+        require(
+            after_negative.active_principals_or_agents == 0
+            and after_negative.runtime_broker_epoch
+            == host_before.runtime_broker_epoch + 2,
+            "negative sender ownership mismatch",
+        )
 
         client = dbus.bus.BusConnection(private_bus.address)
         before = host.snapshot()
-        operations_before = len(operations.calls)
+        operations_before = len(operations.pid_events)
+        credentials_before = len(observed_credentials)
         for payload in (
             "principal",
             "account",
@@ -353,13 +552,31 @@ bus.close()
             message.append(payload, signature="s")
             with pytest.raises(dbus.DBusException):
                 client.send_message_with_reply_and_block(message)
-        assert len(operations.calls) == operations_before
+        assert len(operations.pid_events) == operations_before
+        assert len(observed_credentials) == credentials_before
         assert host.snapshot() == before
         client.close()
     finally:
+        reader_release.set()
+        if identity_read >= 0:
+            os.close(identity_read)
+        if identity_write >= 0:
+            os.close(identity_write)
+        if child is not None:
+            if child.stdin is not None and not child.stdin.closed:
+                try:
+                    child.stdin.write(b"1")
+                    child.stdin.close()
+                except (BrokenPipeError, OSError):
+                    pass
+            if child.poll() is None:
+                child.terminate()
+            child.wait(timeout=5)
         service.close()
         loop_thread.join(5)
         assert not loop_thread.is_alive()
+        system_bus.close()
+    assert len(os.listdir("/proc/self/fd")) <= fd_ceiling
 
 
 def test_attestation_binds_credentials_kernel_pid1_and_closes_all_fds() -> None:
@@ -439,7 +656,7 @@ def test_attestation_drift_and_policy_fail_closed(mutation: str, code: str) -> N
     elif mutation == "not_enforcing":
         operations.enforcing = False
     elif mutation == "gateway":
-        operations.self_label = b"system_u:system_r:other_t:s0:c1,c2"
+        operations.self_label = b"system_u:system_r:other_t:s0"
     elif mutation == "unconfined":
         label = b"unconfined_u:unconfined_r:unconfined_t:s0:c1,c2"
         reads = [raw_credentials(label=label)] * 3
@@ -463,6 +680,234 @@ def test_attestation_drift_and_policy_fail_closed(mutation: str, code: str) -> N
         ),
     )
     assert operations.open_fds == set()
+
+
+@pytest.mark.parametrize("effective_gid", (1001, 2000))
+def test_effective_gid_drift_is_bound_before_and_after(effective_gid: int) -> None:
+    operations = ScriptedOperations()
+    operations.proc[1] = replace(
+        operations.proc[1],
+        effective_gid=effective_gid,
+    )
+    reads = [raw_credentials(), raw_credentials(), raw_credentials()]
+
+    assert_code(
+        "credential_drift",
+        lambda: _attest_peer(
+            ":1.22",
+            lambda _sender: reads.pop(0),
+            operations,
+            release_spec(),
+        ),
+    )
+    assert operations.open_fds == set()
+
+
+@pytest.mark.parametrize("prior_failure", (False, True))
+def test_cleanup_failure_overrides_success_and_attestation_error(
+    prior_failure: bool,
+) -> None:
+    operations = CleanupFailingOperations()
+    operations.enforcing = not prior_failure
+    reads = [raw_credentials(), raw_credentials(), raw_credentials()]
+
+    assert_code(
+        "peer_cleanup_failed",
+        lambda: _attest_peer(
+            ":1.22",
+            lambda _sender: reads.pop(0),
+            operations,
+            release_spec(),
+        ),
+    )
+    assert operations.close_attempts == [14, 13, 12, 11, 10]
+    assert operations.open_fds == set()
+
+
+@pytest.mark.parametrize("prior_failure", (False, True))
+def test_service_cleanup_failure_ends_ownership_without_consumer(
+    private_bus: PrivateBus,
+    prior_failure: bool,
+) -> None:
+    host = reconciled_host()
+    before = host.snapshot()
+    operations = CleanupFailingOperations()
+    operations.enforcing = not prior_failure
+    received: list[object] = []
+    service = HomeBrokerControlService(
+        host,
+        GENERATION,
+        release_spec(),
+        lambda *_values: received.append(object()),
+        private_bus_address=private_bus.address,
+        _operations=operations,
+        _credential_reader=lambda _sender: raw_credentials(),
+    )
+    try:
+        assert_code("peer_cleanup_failed", lambda: service._handle_start(":1.1"))
+        after = host.snapshot()
+        assert received == []
+        assert operations.close_attempts == [14, 13, 12, 11, 10]
+        assert operations.open_fds == set()
+        assert after.active_principals_or_agents == 0
+        assert after.active_leases_or_reservations == 0
+        assert after.pending_registry_or_broker_transactions == 0
+        assert after.pending_recoveries == 0
+        assert after.runtime_broker_epoch == before.runtime_broker_epoch + 2
+    finally:
+        service.close()
+
+
+def test_gateway_s0_and_peer_mcs_are_validated_separately() -> None:
+    assert _selinux_context(GATEWAY_LABEL, peer=False) == (
+        "codex_master_control_t",
+        "",
+    )
+    assert _selinux_context(PEER_LABEL, peer=True) == (
+        "codex_master_control_t",
+        "c1,c2",
+    )
+    operations = ScriptedOperations()
+    reads = [raw_credentials(), raw_credentials(), raw_credentials()]
+
+    evidence = _attest_peer(
+        ":1.22",
+        lambda _sender: reads.pop(0),
+        operations,
+        release_spec(),
+    )
+
+    assert evidence.mcs_pair == "c1,c2"
+    assert operations.open_fds == set()
+
+
+@pytest.mark.parametrize(
+    "gateway_label",
+    (
+        b"system_u:system_r:other_t:s0",
+        b"system_u:system_r:codex_master_control_t:s0:c1,c2",
+        b"system_u:system_r:codex_master_control_t:s1",
+        b"system_u:system_r:codex_master_control_t:",
+        b"malformed",
+    ),
+)
+def test_invalid_gateway_selinux_contexts_fail_closed(gateway_label: bytes) -> None:
+    operations = ScriptedOperations()
+    operations.self_label = gateway_label
+    reads = [raw_credentials(), raw_credentials(), raw_credentials()]
+
+    assert_code(
+        "selinux_gateway_invalid",
+        lambda: _attest_peer(
+            ":1.22",
+            lambda _sender: reads.pop(0),
+            operations,
+            release_spec(),
+        ),
+    )
+    assert operations.open_fds == set()
+
+
+@pytest.mark.parametrize(
+    "peer_label",
+    (
+        b"system_u:system_r:peer_t:s0",
+        b"system_u:system_r:peer_t:s0:c2,c1",
+        b"system_u:system_r:peer_t:s0:c1,c1",
+        b"system_u:system_r:peer_t:s0:c1,c1024",
+        b"system_u:system_r:permissive_peer_t:s0:c1,c2",
+        b"unconfined_u:unconfined_r:unconfined_t:s0:c1,c2",
+    ),
+)
+def test_invalid_peer_selinux_contexts_fail_closed(peer_label: bytes) -> None:
+    assert_code(
+        "selinux_peer_invalid",
+        lambda: _selinux_context(peer_label, peer=True),
+    )
+
+
+class UnitManagerDouble:
+    def __init__(self, invocation: object) -> None:
+        self.invocation = invocation
+        self.received_unix_fd = False
+
+    def GetUnitByPIDFD(self, pidfd: object) -> tuple[object, object, object]:
+        self.received_unix_fd = type(pidfd) is dbus.types.UnixFd
+        return (
+            dbus.ObjectPath("/org/freedesktop/systemd1/unit/example_2escope"),
+            dbus.String("example.scope"),
+            self.invocation,
+        )
+
+
+class UnitPropertiesDouble:
+    def Get(self, interface: str, name: str) -> dbus.String:
+        assert interface == "org.freedesktop.systemd1.Unit"
+        assert name == "ControlGroup"
+        return dbus.String("/user.slice/example.scope")
+
+
+class UnitBusDouble:
+    def __init__(self, manager: UnitManagerDouble) -> None:
+        self.manager = manager
+        self.properties = UnitPropertiesDouble()
+
+    def get_object(self, name: str, path: object) -> object:
+        assert name == "org.freedesktop.systemd1"
+        if str(path) == "/org/freedesktop/systemd1":
+            return self.manager
+        return self.properties
+
+
+@pytest.mark.parametrize(
+    "invocation",
+    (
+        dbus.ByteArray(INVOCATION),
+        dbus.Array((dbus.Byte(value) for value in INVOCATION), signature="y"),
+    ),
+)
+def test_invocation_id_accepts_only_dbus_byte_arrays(
+    invocation: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = UnitManagerDouble(invocation)
+    monkeypatch.setattr(system_bus.dbus, "Interface", lambda value, _name: value)
+    operations = _LinuxPeerOperations(UnitBusDouble(manager))
+    read_fd, write_fd = os.pipe()
+    try:
+        observation = operations.read_unit(read_fd)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+    assert manager.received_unix_fd
+    assert len(observation.invocation_id) == 16
+
+
+@pytest.mark.parametrize(
+    "invocation",
+    (
+        dbus.Array((dbus.UInt32(value) for value in INVOCATION), signature="u"),
+        dbus.Array((dbus.Byte(value) for value in INVOCATION[:-1]), signature="y"),
+        INVOCATION,
+        dbus.Array((dbus.Int16(value) for value in INVOCATION), signature="n"),
+    ),
+)
+def test_invocation_id_rejects_wrong_dbus_type_or_signature(
+    invocation: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = UnitManagerDouble(invocation)
+    monkeypatch.setattr(system_bus.dbus, "Interface", lambda value, _name: value)
+    operations = _LinuxPeerOperations(UnitBusDouble(manager))
+    read_fd, write_fd = os.pipe()
+    try:
+        assert_code("unit_binding_invalid", lambda: operations.read_unit(read_fd))
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+    assert manager.received_unix_fd
 
 
 @pytest.mark.parametrize(
@@ -726,12 +1171,25 @@ def test_successful_nonprincipal_activity_invalidates_existing_window() -> None:
 
 
 def test_handoff_is_nontransferable_and_forge_never_reaches_consumer(
-    private_bus: PrivateBus,
+    private_bus: PrivateBus, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     host = reconciled_host()
     received: list[
         tuple[RootSystemBusPeerAttestation, RootRuntimeActivityOwnership]
     ] = []
+    issued_records: list[object] = []
+    original_handoff = HomeBrokerControlService._handoff
+
+    def capture_handoff(
+        service: HomeBrokerControlService,
+        attestation: RootSystemBusPeerAttestation,
+        ownership: RootRuntimeActivityOwnership,
+        issued: object,
+    ) -> None:
+        issued_records.append(issued)
+        original_handoff(service, attestation, ownership, issued)
+
+    monkeypatch.setattr(HomeBrokerControlService, "_handoff", capture_handoff)
     service = HomeBrokerControlService(
         host,
         GENERATION,
@@ -744,6 +1202,7 @@ def test_handoff_is_nontransferable_and_forge_never_reaches_consumer(
     try:
         service._handle_start(":1.1")
         attestation, ownership = received.pop()
+        issued = issued_records[0]
         assert repr(attestation) == "<RootSystemBusPeerAttestation redacted>"
         assert str(attestation) == repr(attestation)
         for operation in (
@@ -759,10 +1218,93 @@ def test_handoff_is_nontransferable_and_forge_never_reaches_consumer(
         forged = object.__new__(RootSystemBusPeerAttestation)
         for field in dataclasses.fields(attestation):
             object.__setattr__(forged, field.name, getattr(attestation, field.name))
-        assert_code(
-            "handoff_invalid",
-            lambda: service._handoff(forged, ownership, object()),
+
+        def reaches_consumer(
+            candidate_attestation: RootSystemBusPeerAttestation,
+            candidate_ownership: RootRuntimeActivityOwnership,
+            candidate_issued: object,
+        ) -> bool:
+            before = len(received)
+            try:
+                service._handoff(
+                    candidate_attestation,
+                    candidate_ownership,
+                    candidate_issued,
+                )
+            except RootSystemBusError as exc:
+                assert exc.code == "handoff_invalid"
+            return len(received) != before
+
+        try:
+            forged_carrier: object = _IssuedAttestation(forged)
+        except TypeError:
+            forged_handoff_reached_consumer = False
+        else:
+            forged_handoff_reached_consumer = reaches_consumer(
+                forged,
+                ownership,
+                forged_carrier,
+            )
+        assert forged_handoff_reached_consumer is False
+
+        with pytest.raises(TypeError):
+            _IssuedAttestation(attestation)
+        forged_record = object.__new__(type(issued))
+        for field in dataclasses.fields(issued):
+            object.__setattr__(forged_record, field.name, getattr(issued, field.name))
+        assert not reaches_consumer(attestation, ownership, forged_record)
+
+        for operation in (
+            lambda: copy.copy(issued),
+            lambda: copy.deepcopy(issued),
+            lambda: pickle.dumps(issued),
+            lambda: dataclasses.replace(issued),
+        ):
+            with pytest.raises(TypeError):
+                operation()
+
+        assert not reaches_consumer(attestation, ownership, issued)
+        with service._issuance_lock:
+            service._issued = issued
+        assert not reaches_consumer(forged, ownership, issued)
+        other_ownership = host.begin_principal_or_agent()
+        try:
+            with service._issuance_lock:
+                service._issued = issued
+            assert not reaches_consumer(attestation, other_ownership, issued)
+        finally:
+            host.end_principal_or_agent(other_ownership)
+
+        other_bus = PrivateBus()
+        other_host = reconciled_host()
+        other_received: list[
+            tuple[RootSystemBusPeerAttestation, RootRuntimeActivityOwnership]
+        ] = []
+        other_service = HomeBrokerControlService(
+            other_host,
+            GENERATION,
+            release_spec(),
+            lambda value, token: other_received.append((value, token)),
+            private_bus_address=other_bus.address,
+            _operations=ScriptedOperations(),
+            _credential_reader=lambda _sender: raw_credentials(),
         )
+        try:
+            other_service._handle_start(":1.2")
+            other_attestation, other_ownership = other_received.pop()
+            other_issued = issued_records[-1]
+            with service._issuance_lock:
+                service._issued = other_issued
+            assert not reaches_consumer(
+                other_attestation,
+                other_ownership,
+                other_issued,
+            )
+            other_host.end_principal_or_agent(other_ownership)
+        finally:
+            other_service.close()
+            other_bus.close()
+
         assert received == []
         host.end_principal_or_agent(ownership)
     finally:

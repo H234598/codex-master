@@ -7,6 +7,7 @@ import ctypes
 import os
 import re
 import select
+from threading import Lock
 from typing import Callable, Protocol
 
 import dbus
@@ -145,9 +146,11 @@ class _PeerObservation:
     mcs_pair: str
 
 
-@dataclass(slots=True)
-class _IssuedAttestation:
+@dataclass(frozen=True, slots=True, init=False, repr=False)
+class _IssuedAttestation(_NonTransferable):
+    issuer: object
     attestation: RootSystemBusPeerAttestation
+    ownership: RootRuntimeActivityOwnership
 
 
 class _PeerOperations(Protocol):
@@ -310,6 +313,10 @@ def _selinux_context(value: bytes, *, peer: bool) -> tuple[str, str]:
     ):
         _fail(code)
     domain = parts[2].decode("ascii")
+    if not peer:
+        if parts[3] != b"s0":
+            _fail(code)
+        return domain, ""
     match = _SELINUX_RANGE.fullmatch(parts[3])
     if match is None:
         _fail(code)
@@ -411,6 +418,11 @@ def _attest_peer(
             _fail("credential_drift")
         if proc_after.start_time != proc_before.start_time:
             _fail("pid_identity_drift")
+        if (
+            proc_after.effective_gid != proc_before.effective_gid
+            or proc_after.effective_gid not in first.groups
+        ):
+            _fail("credential_drift")
         if proc_after.security_label != proc_before.security_label:
             _fail("security_label_drift")
         if proc_after.cgroup_path != proc_before.cgroup_path:
@@ -454,12 +466,15 @@ def _attest_peer(
     except Exception:
         _fail("peer_attestation_failed")
     finally:
+        cleanup_failed = False
         while opened:
             fd = opened.pop()
             try:
                 operations.close(fd)
             except Exception:
-                pass
+                cleanup_failed = True
+        if cleanup_failed:
+            _fail("peer_cleanup_failed")
 
 
 def _parse_stat(value: bytes) -> int:
@@ -582,14 +597,21 @@ class _LinuxPeerOperations:
         if (
             type(object_path) is not dbus.ObjectPath
             or type(name) is not dbus.String
-            or type(invocation) not in (dbus.Array, dbus.ByteArray)
             or type(control_group) is not dbus.String
         ):
+            _fail("unit_binding_invalid")
+        if type(invocation) is dbus.ByteArray:
+            invocation_bytes = bytes(invocation)
+        elif type(invocation) is dbus.Array and str(invocation.signature) == "y":
+            invocation_bytes = bytes(invocation)
+        else:
+            _fail("unit_binding_invalid")
+        if len(invocation_bytes) != 16:
             _fail("unit_binding_invalid")
         return _UnitObservation(
             str(object_path),
             str(name),
-            bytes(invocation),
+            invocation_bytes,
             str(control_group),
         )
 
@@ -616,7 +638,7 @@ class _LinuxPeerOperations:
 
 def _issue_attestation(
     sender: str, evidence: _PeerObservation, generation: int
-) -> tuple[RootSystemBusPeerAttestation, _IssuedAttestation]:
+) -> RootSystemBusPeerAttestation:
     attestation = object.__new__(RootSystemBusPeerAttestation)
     values = (
         ("bus_unique_name", str(sender)),
@@ -635,7 +657,7 @@ def _issue_attestation(
     )
     for field, value in values:
         object.__setattr__(attestation, field, value)
-    return attestation, _IssuedAttestation(attestation)
+    return attestation
 
 
 class HomeBrokerControlService(dbus.service.Object):
@@ -649,6 +671,8 @@ class HomeBrokerControlService(dbus.service.Object):
         "_credential_reader",
         "_generation",
         "_host",
+        "_issuance_lock",
+        "_issued",
         "_loop",
         "_name",
         "_operations",
@@ -713,6 +737,8 @@ class HomeBrokerControlService(dbus.service.Object):
         self._generation = generation
         self._release = release
         self._consumer = consumer
+        self._issuance_lock = Lock()
+        self._issued: _IssuedAttestation | None = None
         self._loop = GLib.MainLoop()
         self._active = True
         self._closed = False
@@ -750,6 +776,7 @@ class HomeBrokerControlService(dbus.service.Object):
         if not self._active:
             return
         self._active = False
+        self._clear_issuance()
         try:
             self._host.mark_participant_lost(
                 RootHostParticipantBinding(
@@ -797,11 +824,19 @@ class HomeBrokerControlService(dbus.service.Object):
         ownership: RootRuntimeActivityOwnership,
         issued: object,
     ) -> None:
-        if (
-            type(attestation) is not RootSystemBusPeerAttestation
-            or type(issued) is not _IssuedAttestation
-            or issued.attestation is not attestation
-        ):
+        with self._issuance_lock:
+            pending = self._issued
+            self._issued = None
+            valid = (
+                type(attestation) is RootSystemBusPeerAttestation
+                and type(ownership) is RootRuntimeActivityOwnership
+                and type(issued) is _IssuedAttestation
+                and pending is issued
+                and issued.issuer is self
+                and issued.attestation is attestation
+                and issued.ownership is ownership
+            )
+        if not valid:
             _fail("handoff_invalid")
         try:
             result = self._consumer(attestation, ownership)
@@ -809,6 +844,34 @@ class HomeBrokerControlService(dbus.service.Object):
             _fail("consumer_failed")
         if result is not None:
             _fail("consumer_failed")
+
+    def _issue_handoff(
+        self,
+        sender: str,
+        evidence: _PeerObservation,
+        ownership: RootRuntimeActivityOwnership,
+    ) -> tuple[RootSystemBusPeerAttestation, _IssuedAttestation]:
+        attestation = _issue_attestation(sender, evidence, self._generation)
+        issued = object.__new__(_IssuedAttestation)
+        object.__setattr__(issued, "issuer", self)
+        object.__setattr__(issued, "attestation", attestation)
+        object.__setattr__(issued, "ownership", ownership)
+        with self._issuance_lock:
+            if not self._active or self._closed or self._issued is not None:
+                _fail("handoff_invalid")
+            self._issued = issued
+        return attestation, issued
+
+    def _clear_issuance(
+        self, ownership: RootRuntimeActivityOwnership | None = None
+    ) -> None:
+        with self._issuance_lock:
+            if (
+                ownership is None
+                or self._issued is not None
+                and self._issued.ownership is ownership
+            ):
+                self._issued = None
 
     def _handle_start(self, sender: str) -> None:
         if not self._active:
@@ -830,11 +893,12 @@ class HomeBrokerControlService(dbus.service.Object):
                 self._operations,
                 self._release,
             )
-            attestation, issued = _issue_attestation(sender, evidence, self._generation)
+            attestation, issued = self._issue_handoff(sender, evidence, ownership)
             self._handoff(attestation, ownership, issued)
             transferred = True
         finally:
             if not transferred:
+                self._clear_issuance(ownership)
                 try:
                     self._host.end_principal_or_agent(ownership)
                 except FleetRootRuntimeHostError:
