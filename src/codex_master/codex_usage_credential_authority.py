@@ -376,13 +376,18 @@ class CodexUsageCredentialAuthority:
             if not hmac.compare_digest(observed_binding, binding_id):
                 _close(auth_fd)
                 _fail("credential_binding_mismatch")
-            return CredentialProjection(
-                profile_id,
-                binding_id,
-                generation,
-                provider,
-                (auth_fd,),
-            )
+            try:
+                projection = CredentialProjection(
+                    profile_id,
+                    binding_id,
+                    generation,
+                    provider,
+                    (auth_fd,),
+                )
+            except Exception:
+                _close(auth_fd)
+                _fail("credential_projection_failed")
+            return projection
 
     def close(self) -> None:
         with self._lock:

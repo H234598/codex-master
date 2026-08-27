@@ -507,6 +507,45 @@ def test_auth_rename_at_final_offset_boundary_fails_closed_without_fd_leak(
     assert _fd_count() == before - 2
 
 
+def test_projection_construction_failure_is_sparse_and_closes_owned_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_fd_count = _fd_count()
+    profiles_root, key_path, _auth_path = _authority_layout(tmp_path)
+    authority = _open_authority(profiles_root, key_path)
+    binding = authority.attest(PROFILE_ID)
+    synthetic_message = "synthetic-secret-like projection constructor failure"
+
+    def fail_projection_construction(*_args: object) -> None:
+        raise RuntimeError(synthetic_message)
+
+    monkeypatch.setattr(
+        authority_module, "CredentialProjection", fail_projection_construction
+    )
+    before_project = _fd_count()
+    error = None
+    try:
+        try:
+            authority.project(PROFILE_ID, binding.binding_id, GENERATION, PROVIDER)
+        except Exception as caught:
+            error = caught
+
+        assert (type(error), _fd_count() - before_project) == (
+            CredentialAuthorityError,
+            0,
+        )
+        assert error.code == "credential_projection_failed"
+        rendered = repr(error) + str(error)
+        assert synthetic_message not in rendered
+        assert PROFILE_ID not in rendered
+        assert binding.binding_id not in rendered
+        assert AUTH_BYTES.decode("ascii") not in rendered
+        assert KEY_BYTES.hex() not in rendered
+    finally:
+        authority.close()
+    assert _fd_count() == original_fd_count
+
+
 def test_errors_and_binding_rendering_do_not_expose_sensitive_values(
     tmp_path: Path,
 ) -> None:
