@@ -9,6 +9,7 @@ from codex_master.fleet_home_broker_linux import (
     LinuxOperations,
     PeerSnapshot,
     _attest_peer_principal_with_identity,
+    _observe_peer_snapshot_with_identity,
 )
 from codex_master.fleet_home_broker_protocol import (
     PrincipalBinding,
@@ -18,6 +19,10 @@ from codex_master.fleet_home_broker_runtime import (
     BrokerReleaseSpec,
     KernelPeerEvidence,
     _validate_release_spec,
+)
+from codex_master.fleet_home_broker_wal import (
+    WalOperations,
+    _lookup_active_principal_binding,
 )
 
 
@@ -97,6 +102,58 @@ def _snapshot_matches(value: object, pid: int, expected: PrincipalBinding) -> Pe
     ):
         raise ValueError
     return value
+
+
+def _reattest_seqpacket_peer_from_active_wal_binding(
+    operations: SeqpacketPeerOperations,
+    linux_operations: LinuxOperations,
+    wal_operations: WalOperations,
+    release: BrokerReleaseSpec,
+) -> KernelPeerEvidence:
+    """Private no-caller composition defined by the exact sequence below."""
+
+    try:
+        _validate_release_spec(release)
+        family = operations.socket_family()
+        if type(family) is not socket.AddressFamily or family is not socket.AF_UNIX:
+            raise ValueError
+        kind = operations.socket_type()
+        if type(kind) is not socket.SocketKind or kind is not socket.SOCK_SEQPACKET:
+            raise ValueError
+        pid, uid, gid = _credentials(operations.peer_credentials())
+        snapshot, identity = _observe_peer_snapshot_with_identity(
+            linux_operations, pid
+        )
+        expected = _lookup_active_principal_binding(
+            wal_operations,
+            snapshot.cgroup_dev,
+            snapshot.cgroup_ino,
+            snapshot.invocation_id,
+            snapshot.unit_generation,
+            snapshot.mcs_pair,
+        )
+        if expected is None:
+            raise ValueError
+        validate_principal_binding(expected)
+        snapshot = _snapshot_matches(snapshot, pid, expected)
+        if operations.selinux_enforcing() is not True:
+            raise ValueError
+        _peer_security_context(
+            operations.peer_security_context(), release.agent_domain, expected.mcs_pair
+        )
+        return KernelPeerEvidence(
+            pid,
+            uid,
+            gid,
+            identity.start_time,
+            snapshot.cgroup_dev,
+            snapshot.cgroup_ino,
+            snapshot.unit_generation,
+            snapshot.invocation_id,
+            snapshot.mcs_pair,
+        )
+    except Exception:
+        raise SeqpacketPeerError("seqpacket peer attestation failed") from None
 
 
 def reattest_seqpacket_peer(

@@ -419,6 +419,125 @@ def test_private_attestation_returns_only_final_validated_identity():
     assert public_operations.reuse_checks == 16
 
 
+def test_private_root_owned_snapshot_exposes_only_final_attested_five_values():
+    operations = FakeOperations(fresh_identity_per_reuse=True)
+
+    observed, identity = linux._observe_peer_snapshot_with_identity(
+        operations, PEER_PID
+    )
+
+    assert observed == snapshot()
+    assert identity is operations.observed_identities[-1]
+    assert operations.reuse_checks == 16
+    assert "_observe_peer_snapshot_with_identity" not in linux.__all__
+    assert observed.cgroup_dev == VALID_CGROUP_STAT.dev
+    assert observed.cgroup_ino == VALID_CGROUP_STAT.ino
+    assert observed.invocation_id == operations.pid1_invocation_id
+    assert observed.unit_generation == operations.pid1_unit_generation
+    assert observed.mcs_pair == operations.peer_mcs_pair
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"cgroup_stat": FdStat(17, 29, 0o100644, 1000, 1000)},
+        {"pid1_unit_generation": True},
+        {"pid1_invocation_id": "not-a-digest"},
+        {"peer_mcs_pair": "c1,c0"},
+        {"pid1_control_group": "/user.slice/user-1000.slice/wrong.scope"},
+        {"reuse_at": 16},
+    ],
+)
+def test_private_root_owned_snapshot_rejects_invalid_or_drifting_values(changes):
+    operations = FakeOperations(**changes)
+
+    with pytest.raises(LinuxBoundaryError):
+        linux._observe_peer_snapshot_with_identity(operations, PEER_PID)
+
+    assert [call for call in operations.calls if call[0] == "close"] == [
+        ("close", CGROUP_FD),
+        ("close", PROC_FD),
+        ("close", PID_FD),
+    ]
+
+
+def test_root_owned_snapshot_source_keeps_linux_api_and_guard_contract():
+    source = Path(linux.__file__).read_text()
+    tree = ast.parse(source)
+    observers = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_observe_peer_snapshot_with_identity"
+    ]
+
+    assert len(observers) == 1
+    observer = observers[0]
+    observer_guards = [
+        node
+        for node in ast.walk(observer)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_pidfd_guard"
+    ]
+    assert len(observer_guards) == 16
+
+    private_attestation = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_attest_peer_principal_with_identity"
+    )
+    observer_calls = [
+        node
+        for node in ast.walk(private_attestation)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_observe_peer_snapshot_with_identity"
+    ]
+    assert len(observer_calls) == 1
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "operations"
+        for node in ast.walk(private_attestation)
+    )
+
+    protocol = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "LinuxOperations"
+    )
+    assert [
+        node.name for node in protocol.body if isinstance(node, ast.FunctionDef)
+    ] == [
+        "openat2",
+        "fstat",
+        "close",
+        "pidfd_open",
+        "pidfd_reuse_check",
+        "open_pinned_proc_pid",
+        "open_proc_cgroup",
+        "read_proc_control_group",
+        "read_pid1_unit_name",
+        "read_pid1_unit_generation",
+        "read_pid1_invocation_id",
+        "read_pid1_control_group",
+        "read_peer_mcs_pair",
+    ]
+    assert linux.__all__ == [
+        "FdStat",
+        "LinuxBoundaryError",
+        "LinuxOperations",
+        "PeerSnapshot",
+        "PidfdIdentity",
+        "SAFE_DIRECTORY_MODE",
+        "attest_peer_principal",
+        "open_pinned_child_directory",
+    ]
+
+
 def test_same_pid_reuse_with_new_start_identity_closes_all_peer_fds():
     operations = FakeOperations(reuse_at=5)
 
@@ -468,13 +587,13 @@ def test_snapshot_drift_closes_all_peer_fds(changes):
     ]
 
 
-def test_invalid_principal_binding_closes_pidfd_without_client_agent_argument():
+def test_invalid_principal_binding_stops_before_root_observation():
     operations = FakeOperations()
 
     with pytest.raises(LinuxBoundaryError):
         attest_peer_principal(operations, PEER_PID, principal(agent_id="not valid"))
 
-    assert operations.calls == [("pidfd_open", PEER_PID, 0), ("close", PID_FD)]
+    assert operations.calls == []
     assert tuple(inspect.signature(attest_peer_principal).parameters) == (
         "operations",
         "peer_pid",

@@ -1,18 +1,33 @@
 import ast
 from dataclasses import replace
+from hashlib import sha256
 import socket
 from pathlib import Path
 
 import pytest
 
 import codex_master.fleet_home_broker_seqpacket as seqpacket
+import codex_master.fleet_home_broker_wal as wal
 from codex_master.fleet_home_broker_linux import FdStat, PidfdIdentity
-from codex_master.fleet_home_broker_protocol import PrincipalBinding
+from codex_master.fleet_home_broker_protocol import (
+    BrokerCheckpoint,
+    BrokerObjectState,
+    BrokerObservation,
+    BrokerRegistryState,
+    BrokerResultCode,
+    ChpbTransactionOperation,
+    PolicyBinding,
+    PrincipalBinding,
+    TransactionBinding,
+    TransactionStatus,
+    b2a_phase_for_checkpoint,
+)
 from codex_master.fleet_home_broker_runtime import BrokerReleaseSpec, KernelPeerEvidence
 from codex_master.fleet_home_broker_seqpacket import (
     SeqpacketPeerError,
     reattest_seqpacket_peer,
 )
+from codex_master.fleet_home_broker_wal import append_status, encode_status_payload
 
 
 PEER_PID = 1234
@@ -25,6 +40,7 @@ PRINCIPAL = PrincipalBinding(
 )
 EXPECTED_LABEL = b"system_u:system_r:codex_master_agent_t:s0:c0,c1\0"
 SO_PEERSEC_NAME_MAX_BYTES = 255
+WAL_MAGIC = b"CHPB/2-WAL-Magic"
 
 
 def release_spec(**changes: object) -> BrokerReleaseSpec:
@@ -201,6 +217,73 @@ class RecordingLinuxOperations:
         self.events.append(("close", fd))
 
 
+class RecordingWalOperations:
+    def __init__(self, records: tuple[bytes, ...] = ()) -> None:
+        self.records = list(records)
+        self.events: list[str] = []
+
+    def read_all(self) -> tuple[bytes, ...]:
+        self.events.append("read")
+        return tuple(self.records)
+
+    def append(self, record: bytes) -> None:
+        self.events.append("append")
+        self.records.append(record)
+
+    def fsync_wal(self) -> None:
+        self.events.append("fsync_wal")
+
+    def fsync_parent(self) -> None:
+        self.events.append("fsync_parent")
+
+
+def wal_status(
+    principal: PrincipalBinding,
+    checkpoint: BrokerCheckpoint = BrokerCheckpoint.CREATE_INTENT,
+) -> TransactionStatus:
+    terminal = (
+        BrokerResultCode.BLOCKED_DRIFT
+        if checkpoint is BrokerCheckpoint.BLOCKED_DRIFT
+        else None
+    )
+    return TransactionStatus(
+        TransactionBinding(
+            ChpbTransactionOperation.PROVISION,
+            "2" * 32,
+            "3" * 32,
+            principal,
+            PolicyBinding(7, "a" * 64),
+        ),
+        b2a_phase_for_checkpoint(checkpoint),
+        checkpoint,
+        BrokerObservation(
+            BrokerObjectState.ABSENT,
+            BrokerRegistryState.NOT_APPLICABLE,
+            0,
+        ),
+        1,
+        terminal,
+    )
+
+
+def seeded_active_wal(principal: PrincipalBinding) -> RecordingWalOperations:
+    operations = RecordingWalOperations()
+    append_status(operations, wal_status(principal))
+    operations.events.clear()
+    return operations
+
+
+def wal_wire(sequence: int, previous_digest: str, payload: bytes) -> bytes:
+    preimage = (
+        WAL_MAGIC
+        + sequence.to_bytes(8, "big")
+        + previous_digest.encode("ascii")
+        + len(payload).to_bytes(4, "big")
+        + payload
+    )
+    return preimage + sha256(preimage).hexdigest().encode("ascii")
+
+
 def assert_denied(
     operations: RecordingOperations,
     linux_operations: RecordingLinuxOperations,
@@ -216,6 +299,283 @@ def assert_denied(
     assert repr(caught.value) == "SeqpacketPeerError('seqpacket peer attestation failed')"
     assert caught.value.__cause__ is None
     return caught.value
+
+
+def assert_wal_composition_denied(
+    operations: RecordingOperations,
+    linux_operations: RecordingLinuxOperations,
+    wal_operations: RecordingWalOperations,
+) -> SeqpacketPeerError:
+    with pytest.raises(SeqpacketPeerError) as caught:
+        seqpacket._reattest_seqpacket_peer_from_active_wal_binding(
+            operations,
+            linux_operations,
+            wal_operations,
+            release_spec(),
+        )
+    assert str(caught.value) == "seqpacket peer attestation failed"
+    assert repr(caught.value) == "SeqpacketPeerError('seqpacket peer attestation failed')"
+    assert caught.value.__cause__ is None
+    return caught.value
+
+
+def test_private_wal_composition_uses_one_root_owned_key_and_original_principal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[object, ...]] = []
+    linux_operations = RecordingLinuxOperations(
+        events, fresh_identity_per_reuse=True
+    )
+    wal_operations = seeded_active_wal(PRINCIPAL)
+    observed_keys: list[tuple[object, int, int, str, int, str]] = []
+    returned_principals: list[PrincipalBinding | None] = []
+    validated_records = []
+    original = seqpacket._lookup_active_principal_binding
+    original_validated_chain = wal._validated_chain
+
+    def capture_validated_chain(raw_records):
+        records = original_validated_chain(raw_records)
+        validated_records.append(records)
+        return records
+
+    def capture(*args: object) -> PrincipalBinding | None:
+        observed_keys.append(args)
+        principal = original(*args)
+        returned_principals.append(principal)
+        return principal
+
+    monkeypatch.setattr(wal, "_validated_chain", capture_validated_chain)
+    monkeypatch.setattr(seqpacket, "_lookup_active_principal_binding", capture)
+    evidence = seqpacket._reattest_seqpacket_peer_from_active_wal_binding(
+        RecordingOperations(events), linux_operations, wal_operations, release_spec()
+    )
+
+    assert len(observed_keys) == 1
+    assert observed_keys[0][1:] == (17, 29, "1" * 32, 9, "c0,c1")
+    assert returned_principals[0] is validated_records[0][-1].status.binding.principal
+    assert wal_operations.events == ["read"]
+    assert linux_operations.reuse_checks == 16
+    assert evidence == KernelPeerEvidence(
+        PEER_PID, 1000, 1000, START_TIME, 17, 29, 9, "1" * 32, "c0,c1"
+    )
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"cgroup_stat": FdStat(18, 29, 0o40755, 1000, 1000)},
+        {"cgroup_stat": FdStat(17, 30, 0o40755, 1000, 1000)},
+        {"pid1_invocation_id": "2" * 32},
+        {"pid1_unit_generation": 10},
+        {"peer_mcs_pair": "c0,c2"},
+    ],
+)
+def test_wal_composition_denies_each_drifting_root_owned_key(
+    values: dict[str, object],
+) -> None:
+    events: list[tuple[object, ...]] = []
+    wal_operations = seeded_active_wal(PRINCIPAL)
+
+    assert_wal_composition_denied(
+        RecordingOperations(events),
+        RecordingLinuxOperations(events, **values),
+        wal_operations,
+    )
+
+    assert wal_operations.events == ["read"]
+    assert ("selinux_enforcing",) not in events
+    assert ("peer_security_context",) not in events
+
+
+def invalid_wal(kind: str) -> RecordingWalOperations:
+    if kind == "empty":
+        return RecordingWalOperations()
+    if kind == "terminal":
+        operations = seeded_active_wal(PRINCIPAL)
+        append_status(
+            operations,
+            wal_status(PRINCIPAL, BrokerCheckpoint.BLOCKED_DRIFT),
+        )
+        operations.events.clear()
+        return operations
+    if kind == "foreign":
+        return RecordingWalOperations((b"foreign",))
+    active = seeded_active_wal(PRINCIPAL)
+    if kind == "truncated":
+        return RecordingWalOperations((active.records[0][:-1],))
+    if kind == "gap":
+        return RecordingWalOperations(
+            (
+                wal_wire(
+                    2,
+                    "f" * 64,
+                    encode_status_payload(wal_status(PRINCIPAL)),
+                ),
+            )
+        )
+    if kind == "fork":
+        return RecordingWalOperations(
+            (
+                active.records[0],
+                wal_wire(
+                    2,
+                    "f" * 64,
+                    encode_status_payload(
+                        wal_status(PRINCIPAL, BrokerCheckpoint.BLOCKED_DRIFT)
+                    ),
+                ),
+            )
+        )
+    raise AssertionError(kind)
+
+
+@pytest.mark.parametrize(
+    "kind", ["empty", "terminal", "foreign", "truncated", "gap", "fork"]
+)
+def test_wal_composition_denies_inactive_or_invalid_wal(kind: str) -> None:
+    events: list[tuple[object, ...]] = []
+    linux_operations = RecordingLinuxOperations(events)
+    wal_operations = invalid_wal(kind)
+
+    assert_wal_composition_denied(
+        RecordingOperations(events), linux_operations, wal_operations
+    )
+
+    assert linux_operations.reuse_checks == 16
+    assert wal_operations.events == ["read"]
+    assert ("selinux_enforcing",) not in events
+    assert ("peer_security_context",) not in events
+
+
+def test_wal_composition_does_not_use_peersec_mcs_as_root_owned_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[object, ...]] = []
+    wal_operations = seeded_active_wal(PRINCIPAL)
+    observed_keys: list[tuple[object, ...]] = []
+    original = seqpacket._lookup_active_principal_binding
+
+    def capture(*args: object) -> PrincipalBinding | None:
+        observed_keys.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(seqpacket, "_lookup_active_principal_binding", capture)
+    assert_wal_composition_denied(
+        RecordingOperations(
+            events,
+            context=b"system_u:system_r:codex_master_agent_t:s0:c0,c2\0",
+        ),
+        RecordingLinuxOperations(events),
+        wal_operations,
+    )
+
+    assert observed_keys[0][5] == "c0,c1"
+    assert wal_operations.events == ["read"]
+    assert events[-2:] == [("selinux_enforcing",), ("peer_security_context",)]
+
+
+@pytest.mark.parametrize(
+    "operation_values",
+    [
+        {"family": socket.AF_INET},
+        {"kind": socket.SOCK_STREAM},
+        {"credentials": (0, 1000, 1000)},
+    ],
+)
+def test_wal_composition_stops_before_root_owned_key_and_wal_on_socket_rejection(
+    operation_values: dict[str, object],
+) -> None:
+    events: list[tuple[object, ...]] = []
+    wal_operations = seeded_active_wal(PRINCIPAL)
+    linux_operations = RecordingLinuxOperations(events)
+
+    assert_wal_composition_denied(
+        RecordingOperations(events, **operation_values),
+        linux_operations,
+        wal_operations,
+    )
+
+    assert linux_operations.reuse_checks == 0
+    assert wal_operations.events == []
+
+
+def test_wal_composition_final_root_owned_key_guard_precedes_wal_and_selinux() -> None:
+    events: list[tuple[object, ...]] = []
+    wal_operations = seeded_active_wal(PRINCIPAL)
+    linux_operations = RecordingLinuxOperations(events, drift_at=16)
+
+    assert_wal_composition_denied(
+        RecordingOperations(events), linux_operations, wal_operations
+    )
+
+    assert linux_operations.reuse_checks == 16
+    assert wal_operations.events == []
+    assert ("selinux_enforcing",) not in events
+    assert ("peer_security_context",) not in events
+
+
+def test_wal_composition_source_keeps_private_api_and_single_authority() -> None:
+    source = Path(seqpacket.__file__).read_text()
+    tree = ast.parse(source)
+    coordinators = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_reattest_seqpacket_peer_from_active_wal_binding"
+    ]
+
+    assert len(coordinators) == 1
+    coordinator = coordinators[0]
+    calls = [node for node in ast.walk(coordinator) if isinstance(node, ast.Call)]
+    assert sum(
+        isinstance(node.func, ast.Name)
+        and node.func.id == "_observe_peer_snapshot_with_identity"
+        for node in calls
+    ) == 1
+    assert sum(
+        isinstance(node.func, ast.Name)
+        and node.func.id == "_lookup_active_principal_binding"
+        for node in calls
+    ) == 1
+    assert not any(
+        isinstance(node.func, ast.Name) and node.func.id == "PrincipalBinding"
+        for node in calls
+    )
+    assert not any(
+        (node.func.attr if isinstance(node.func, ast.Attribute) else None)
+        in {
+            "socket",
+            "socketpair",
+            "bind",
+            "listen",
+            "accept",
+            "connect",
+            "recv",
+            "recvmsg",
+            "send",
+            "sendmsg",
+            "append",
+            "append_status",
+            "fsync_wal",
+            "fsync_parent",
+            "recover_status",
+            "dispatch_request",
+        }
+        for node in calls
+    )
+    assert "_reattest_seqpacket_peer_from_active_wal_binding" not in seqpacket.__all__
+
+    production_calls = {"coordinator": 0, "lookup": 0}
+    for path in Path(seqpacket.__file__).parent.glob("*.py"):
+        module_tree = ast.parse(path.read_text())
+        for node in ast.walk(module_tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id == "_reattest_seqpacket_peer_from_active_wal_binding":
+                production_calls["coordinator"] += 1
+            elif node.func.id == "_lookup_active_principal_binding":
+                production_calls["lookup"] += 1
+    assert production_calls == {"coordinator": 0, "lookup": 1}
 
 
 def test_legal_order_and_evidence_conversion() -> None:
@@ -499,7 +859,6 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
         "fleet_home_broker_transport",
         "fleet_home_broker_dispatch",
         "fleet_home_broker_client",
-        "fleet_home_broker_wal",
         "subprocess",
         "systemd",
     )
@@ -513,6 +872,18 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
             assert not any(
                 fragment in (node.module or "") for fragment in forbidden_imports
             )
+
+    wal_imports = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "codex_master.fleet_home_broker_wal"
+    ]
+    assert len(wal_imports) == 1
+    assert [alias.name for alias in wal_imports[0].names] == [
+        "WalOperations",
+        "_lookup_active_principal_binding",
+    ]
 
     forbidden_call_names = {
         "socket",

@@ -11,6 +11,8 @@ from codex_master.fleet_home_broker_protocol import (
     MAX_CHPB_INODE,
     DirectoryIdentity,
     PrincipalBinding,
+    _digest,
+    _mcs,
     validate_principal_binding,
 )
 
@@ -168,9 +170,7 @@ def _validate_fd_stat(value: object) -> FdStat:
     return value
 
 
-def _validate_cgroup_stat(
-    value: object, expected_dev: int, expected_ino: int
-) -> FdStat:
+def _validate_cgroup_stat(value: object) -> FdStat:
     if type(value) is not FdStat:
         raise LinuxBoundaryError("cgroup stat is invalid")
     _strict_integer(value.dev, "cgroup dev", 0, MAX_CHPB_DEVICE)
@@ -178,8 +178,6 @@ def _validate_cgroup_stat(
     _strict_integer(value.mode, "cgroup mode", 0, _MAX_FILE_MODE)
     if value.mode & _FILE_TYPE_MASK != _DIRECTORY_FILE_TYPE:
         raise LinuxBoundaryError("cgroup stat is not a directory")
-    if value.dev != expected_dev or value.ino != expected_ino:
-        raise LinuxBoundaryError("cgroup identity does not match principal")
     return value
 
 
@@ -230,9 +228,9 @@ def _pidfd_guard(
     return observed
 
 
-def _validate_peer_snapshot(
-    value: object, peer_pid: int, expected: PrincipalBinding
-) -> PrincipalBinding:
+def _validate_observed_peer_snapshot(
+    value: object, peer_pid: int
+) -> PeerSnapshot:
     if type(value) is not PeerSnapshot:
         raise LinuxBoundaryError("peer snapshot is invalid")
     _positive_integer(value.pid, "snapshot pid")
@@ -246,25 +244,27 @@ def _validate_peer_snapshot(
         1,
         MAX_CHPB_GENERATION,
     )
-    _strict_text(value.invocation_id, "snapshot invocation id")
-    _strict_text(value.mcs_pair, "snapshot mcs pair")
-    candidate = PrincipalBinding(
-        expected.agent_id,
-        expected.manifest_generation,
-        value.unit_generation,
-        value.cgroup_dev,
-        value.cgroup_ino,
-        value.invocation_id,
-        value.mcs_pair,
-        expected.fencing_epoch,
-    )
     try:
-        validate_principal_binding(candidate)
+        _digest(value.invocation_id, 32)
+        _mcs(value.mcs_pair)
     except Exception as exc:
         raise LinuxBoundaryError("peer snapshot fields are invalid") from exc
-    if candidate != expected:
+    return value
+
+
+def _validate_peer_snapshot(
+    value: object, peer_pid: int, expected: PrincipalBinding
+) -> PrincipalBinding:
+    snapshot = _validate_observed_peer_snapshot(value, peer_pid)
+    if (
+        snapshot.cgroup_dev != expected.cgroup_dev
+        or snapshot.cgroup_ino != expected.cgroup_ino
+        or snapshot.unit_generation != expected.unit_generation
+        or snapshot.invocation_id != expected.invocation_id
+        or snapshot.mcs_pair != expected.mcs_pair
+    ):
         raise LinuxBoundaryError("peer principal does not match")
-    return candidate
+    return expected
 
 
 def _close_all(operations: LinuxOperations, fds: tuple[int | None, ...]) -> None:
@@ -341,12 +341,11 @@ def open_pinned_child_directory(
     return fd
 
 
-def _attest_peer_principal_with_identity(
+def _observe_peer_snapshot_with_identity(
     operations: LinuxOperations,
     peer_pid: int,
-    expected_principal: PrincipalBinding,
 ) -> tuple[PeerSnapshot, PidfdIdentity]:
-    """Attest a peer with explicit PID-FD-bound proc and cgroup reads."""
+    """Private extraction of the existing complete pidfd-bound observation body."""
 
     _positive_integer(peer_pid, "peer pid")
     pidfd = None
@@ -354,7 +353,6 @@ def _attest_peer_principal_with_identity(
     cgroup_fd = None
     try:
         pidfd = operations.pidfd_open(peer_pid, 0)
-        expected = _validate_principal(expected_principal)
         identity = _pidfd_guard(operations, pidfd, peer_pid, None, None, None)
 
         proc_fd = operations.open_pinned_proc_pid(pidfd, peer_pid, identity)
@@ -363,9 +361,7 @@ def _attest_peer_principal_with_identity(
         identity = _pidfd_guard(
             operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
         )
-        cgroup_stat = _validate_cgroup_stat(
-            operations.fstat(cgroup_fd), expected.cgroup_dev, expected.cgroup_ino
-        )
+        cgroup_stat = _validate_cgroup_stat(operations.fstat(cgroup_fd))
         identity = _pidfd_guard(
             operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
         )
@@ -455,7 +451,7 @@ def _attest_peer_principal_with_identity(
             unit_generation,
             mcs_pair,
         )
-        _validate_peer_snapshot(snapshot, peer_pid, expected)
+        _validate_observed_peer_snapshot(snapshot, peer_pid)
     except LinuxBoundaryError as exc:
         _fail_with_cleanup(operations, (cgroup_fd, proc_fd, pidfd), str(exc), exc)
     except Exception as exc:
@@ -467,6 +463,20 @@ def _attest_peer_principal_with_identity(
         )
 
     _close_all(operations, (cgroup_fd, proc_fd, pidfd))
+    return snapshot, identity
+
+
+def _attest_peer_principal_with_identity(
+    operations: LinuxOperations,
+    peer_pid: int,
+    expected_principal: PrincipalBinding,
+) -> tuple[PeerSnapshot, PidfdIdentity]:
+    """Attest a peer with explicit PID-FD-bound proc and cgroup reads."""
+
+    _positive_integer(peer_pid, "peer pid")
+    expected = _validate_principal(expected_principal)
+    snapshot, identity = _observe_peer_snapshot_with_identity(operations, peer_pid)
+    _validate_peer_snapshot(snapshot, peer_pid, expected)
     return snapshot, identity
 
 
