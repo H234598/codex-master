@@ -52,6 +52,9 @@ class RootHostParticipantBinding:
 class _NonTransferable:
     __slots__ = ()
 
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise TypeError("root_host_capability_factory_required")
+
     def __copy__(self):
         raise TypeError("root_host_capability_not_cloneable")
 

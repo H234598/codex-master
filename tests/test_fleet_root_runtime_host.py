@@ -234,6 +234,27 @@ ACTIVITIES = (
 )
 
 
+@pytest.mark.parametrize(
+    "capability_type",
+    (
+        pytest.param(RootRuntimeActivityOwnership, id="activity"),
+        pytest.param(RootAdmissionStopOwnership, id="admission"),
+        pytest.param(RootQuiescenceWindow, id="window"),
+    ),
+)
+@pytest.mark.parametrize("invocation", ("zero", "positional", "keyword"))
+def test_root_capability_constructor_requires_private_factory(
+    capability_type: type[object], invocation: str
+) -> None:
+    with pytest.raises(TypeError, match="^root_host_capability_factory_required$"):
+        if invocation == "zero":
+            capability_type()
+        elif invocation == "positional":
+            capability_type(object())
+        else:
+            capability_type(unexpected=object())
+
+
 @pytest.mark.parametrize(("begin_name", "end_name", "counter"), ACTIVITIES)
 def test_each_activity_has_one_owned_begin_and_terminal_end(
     begin_name: str, end_name: str, counter: str
@@ -318,6 +339,39 @@ def test_activity_ownership_cannot_be_cloned_replaced_pickled_or_rebuilt() -> No
     host.end_recovery(ownership)
 
 
+def test_private_capability_issuers_and_identity_boundaries() -> None:
+    host = reconciled_host()
+    activity = host.begin_recovery()
+    assert type(activity) is RootRuntimeActivityOwnership
+
+    forged_activity = object.__new__(RootRuntimeActivityOwnership)
+    object.__setattr__(forged_activity, "host_generation", activity.host_generation)
+    object.__setattr__(forged_activity, "begin_epoch", activity.begin_epoch)
+    assert_code("ownership_invalid", lambda: host.end_recovery(forged_activity))
+    host.end_recovery(activity)
+
+    admission = host.stop_admission()
+    assert type(admission) is RootAdmissionStopOwnership
+    forged_admission = object.__new__(RootAdmissionStopOwnership)
+    object.__setattr__(forged_admission, "host_generation", admission.host_generation)
+    object.__setattr__(forged_admission, "stop_epoch", admission.stop_epoch)
+    assert_code("ownership_invalid", lambda: host.reopen_admission(forged_admission))
+
+    source = source_snapshot()
+    window = host.open_quiescence_window(admission, source)
+    assert type(window) is RootQuiescenceWindow
+    forged_window = object.__new__(RootQuiescenceWindow)
+    for field in dataclasses.fields(window):
+        object.__setattr__(forged_window, field.name, getattr(window, field.name))
+    assert_code(
+        "quiescence_window_stale",
+        lambda: host.probe_quiescence(forged_window),
+    )
+    assert type(host.probe_quiescence(window)) is RegistryV2QuiescenceEvidence
+    host.close_quiescence_window(window)
+    host.reopen_admission(admission)
+
+
 def test_parallel_activity_uses_one_epoch_and_counter_serialization() -> None:
     host = reconciled_host()
     start = Barrier(33)
@@ -359,6 +413,50 @@ def test_epoch_overflow_blocks_before_state_change() -> None:
 
     assert_code("epoch_overflow", host.begin_recovery)
     assert host.snapshot() == before
+
+
+@pytest.mark.parametrize(
+    ("begin_name", "counter_index"),
+    tuple((activity[0], index) for index, activity in enumerate(ACTIVITIES)),
+)
+def test_each_activity_counter_overflow_blocks_before_state_change(
+    begin_name: str, counter_index: int
+) -> None:
+    host = reconciled_host()
+    host._counts[counter_index] = MAX_GENERATION
+    before = host.snapshot()
+    activities_before = host._activities.copy()
+
+    assert_code("epoch_overflow", getattr(host, begin_name))
+    assert host.snapshot() == before
+    assert host._activities == activities_before
+
+
+def test_host_generation_overflow_blocks_reconciliation_before_state_change() -> None:
+    host = FleetRootRuntimeHost()
+    host._host_generation = MAX_GENERATION
+    before = host.snapshot()
+    activities_before = host._activities.copy()
+
+    assert_code("epoch_overflow", lambda: host.reconcile(participant_bindings()))
+    assert host.snapshot() == before
+    assert host._activities == activities_before
+
+
+@pytest.mark.parametrize("generation", (MAX_GENERATION + 1, True))
+def test_invalid_participant_generation_blocks_before_state_change(
+    generation: object,
+) -> None:
+    host = FleetRootRuntimeHost()
+    before = host.snapshot()
+    activities_before = host._activities.copy()
+
+    assert_code(
+        "participant_contract_invalid",
+        lambda: host.reconcile(participant_bindings(generation)),
+    )
+    assert host.snapshot() == before
+    assert host._activities == activities_before
 
 
 def test_window_requires_stopped_admission_and_zero_activity() -> None:
