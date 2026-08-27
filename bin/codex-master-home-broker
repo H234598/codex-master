@@ -1,57 +1,7 @@
 #!/usr/bin/python3
-"""Offline adapter between the A3a1 attestation and A3b2 system boundary."""
-
-from codex_master.fleet_home_broker_identity import BrokerIdentity
-from codex_master.fleet_home_broker_linux import LinuxOperations
-from codex_master.fleet_home_broker_runtime import (
-    BrokerReleaseSpec,
-    CredentialProjectionProvider,
-    RuntimePeerOperations,
-    RuntimePrincipalResolver,
-    attest_kernel_peer,
-)
-from codex_master.fleet_home_broker_system import (
-    BrokerStartReceipt,
-    BrokerSystemBoundary,
-    build_broker_system_plan,
-)
-from codex_master.fleet_home_broker_transport import BrokerPeer
+"""Inert home-broker executable; trusted start is composed in R2-B."""
 
 INERT_EXIT_CODE = 78
-
-
-def start_broker(
-    *,
-    peer: BrokerPeer,
-    identity: BrokerIdentity,
-    release: BrokerReleaseSpec,
-    profile_id: str,
-    binding_id: str,
-    generation: int,
-    provider: str,
-    peer_operations: RuntimePeerOperations,
-    linux_operations: LinuxOperations,
-    principal_resolver: RuntimePrincipalResolver,
-    projection_provider: CredentialProjectionProvider,
-    boundary: BrokerSystemBoundary,
-) -> BrokerStartReceipt:
-    """Run exactly one injected, typed broker-start attempt."""
-    grant = attest_kernel_peer(
-        peer,
-        identity,
-        release,
-        profile_id,
-        binding_id,
-        generation,
-        provider,
-        peer_operations,
-        linux_operations,
-        principal_resolver,
-        projection_provider,
-    )
-    plan = build_broker_system_plan(grant)
-    snapshot = boundary.snapshot()
-    return boundary.compare_and_start(plan, snapshot.token)
 
 
 def main() -> int:
