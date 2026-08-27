@@ -12,6 +12,7 @@ import codex_master.fleet_home_broker_seqpacket as seqpacket
 import codex_master.fleet_home_broker_wal as wal
 from codex_master.fleet_home_broker_linux import FdStat, PidfdIdentity
 from codex_master.fleet_home_broker_protocol import (
+    MAX_CHPB_MESSAGE_BYTES,
     BrokerCheckpoint,
     BrokerObjectState,
     BrokerObservation,
@@ -122,6 +123,8 @@ class RecordingConnectedSocket:
         peername_error: BaseException | None = None,
         peercred_error: BaseException | None = None,
         peersec_error: BaseException | None = None,
+        recv_result: object = (b"raw-chpb2-candidate", [], 0, object()),
+        recv_error: BaseException | None = None,
     ) -> None:
         self._events = events
         self._family = family
@@ -132,6 +135,8 @@ class RecordingConnectedSocket:
         self._peername_error = peername_error
         self._peercred_error = peercred_error
         self._peersec_error = peersec_error
+        self._recv_result = recv_result
+        self._recv_error = recv_error
 
     @property
     def family(self) -> object:
@@ -160,6 +165,12 @@ class RecordingConnectedSocket:
                 raise self._peersec_error
             return self._peersec
         raise AssertionError(option)
+
+    def recvmsg(self, bufsize: object, ancbufsize: object) -> object:
+        self._events.append(("recvmsg", bufsize, ancbufsize))
+        if self._recv_error is not None:
+            raise self._recv_error
+        return self._recv_result
 
 
 class RecordingEnforcementOperations:
@@ -965,8 +976,9 @@ def test_wal_composition_source_keeps_private_api_and_single_authority() -> None
         for node in admission_calls
     ) == 1
 
-    production_calls = {"coordinator": 0, "lookup": 0}
+    production_calls = {"coordinator": 0, "lookup": 0, "admission": 0}
     coordinator_callers: list[str] = []
+    admission_callers: list[str] = []
     for path in Path(seqpacket.__file__).parent.glob("*.py"):
         module_tree = ast.parse(path.read_text())
         functions = [
@@ -984,10 +996,18 @@ def test_wal_composition_source_keeps_private_api_and_single_authority() -> None
                     for function in functions
                     if node in ast.walk(function)
                 )
+            elif node.func.id == "admit_connected_seqpacket_peer":
+                production_calls["admission"] += 1
+                admission_callers.extend(
+                    function.name
+                    for function in functions
+                    if node in ast.walk(function)
+                )
             elif node.func.id == "_lookup_active_principal_binding":
                 production_calls["lookup"] += 1
-    assert production_calls == {"coordinator": 1, "lookup": 1}
+    assert production_calls == {"coordinator": 1, "lookup": 1, "admission": 1}
     assert coordinator_callers == ["admit_connected_seqpacket_peer"]
+    assert admission_callers == ["receive_admitted_seqpacket_packet"]
 
 
 def test_legal_order_and_evidence_conversion() -> None:
@@ -1257,9 +1277,12 @@ def test_principal_binding_validation_is_bounded_before_evidence() -> None:
 
 def test_public_surface_is_exact() -> None:
     assert seqpacket.__all__ == (
+        "SeqpacketPacketCode",
+        "SeqpacketPacketError",
         "SeqpacketPeerError",
         "SeqpacketPeerOperations",
         "admit_connected_seqpacket_peer",
+        "receive_admitted_seqpacket_packet",
         "reattest_seqpacket_peer",
     )
 
@@ -1300,14 +1323,33 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
 
     forbidden_call_names = {
         "socket",
+        "socketpair",
         "bind",
         "listen",
         "accept",
         "connect",
         "recv",
-        "recvmsg",
+        "recvfrom",
+        "recv_into",
+        "recvmsg_into",
+        "peek",
+        "read",
+        "makefile",
         "send",
         "sendmsg",
+        "settimeout",
+        "gettimeout",
+        "setblocking",
+        "getblocking",
+        "shutdown",
+        "close",
+        "detach",
+        "dup",
+        "fileno",
+        "select",
+        "poll",
+        "thread",
+        "lock",
         "serve_once",
         "dispatch_request",
         "receive_attested_home",
@@ -1323,6 +1365,99 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
                 node.func.id if isinstance(node.func, ast.Name) else None
             )
             assert called_name not in forbidden_call_names
+
+    receive_functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "receive_admitted_seqpacket_packet"
+    ]
+    assert len(receive_functions) == 1
+    receive_function = receive_functions[0]
+    receive_source = ast.get_source_segment(source, receive_function)
+    assert receive_source is not None
+
+    admission_calls = [
+        node
+        for node in ast.walk(receive_function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "admit_connected_seqpacket_peer"
+    ]
+    assert len(admission_calls) == 1
+    assert len(admission_calls[0].args) == 5
+    assert ast.unparse(admission_calls[0].args[0]) == "connection"
+
+    recvmsg_calls = [
+        node
+        for node in ast.walk(receive_function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "recvmsg"
+    ]
+    assert len(recvmsg_calls) == 1
+    recvmsg_call = recvmsg_calls[0]
+    assert isinstance(recvmsg_call.func.value, ast.Name)
+    assert recvmsg_call.func.value.id == "connection"
+    assert len(recvmsg_call.args) == 2
+    assert not recvmsg_call.keywords
+    assert ast.unparse(recvmsg_call) == (
+        "connection.recvmsg(MAX_CHPB_MESSAGE_BYTES + 1, 0)"
+    )
+    assert admission_calls[0].lineno < recvmsg_call.lineno
+
+    receive_callers = [
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and recvmsg_call in ast.walk(node)
+    ]
+    assert receive_callers == ["receive_admitted_seqpacket_packet"]
+
+    assert not any(
+        isinstance(node, (ast.For, ast.AsyncFor, ast.While, ast.Await, ast.Yield, ast.YieldFrom))
+        for node in ast.walk(receive_function)
+    )
+    forbidden_receive_call_names = {
+        "recv",
+        "recvfrom",
+        "recv_into",
+        "recvmsg_into",
+        "peek",
+        "read",
+        "makefile",
+        "send",
+        "sendmsg",
+        "settimeout",
+        "gettimeout",
+        "setblocking",
+        "getblocking",
+        "shutdown",
+        "close",
+        "detach",
+        "dup",
+        "fileno",
+        "select",
+        "poll",
+        "thread",
+        "lock",
+        "decode",
+        "loads",
+        "dumps",
+        "decode_chpb_message",
+        "validate_chpb_message",
+        "dispatch_request",
+    }
+    for node in ast.walk(receive_function):
+        if not isinstance(node, ast.Call):
+            continue
+        called_name = node.func.attr if isinstance(node.func, ast.Attribute) else (
+            node.func.id if isinstance(node.func, ast.Name) else None
+        )
+        assert called_name not in forbidden_receive_call_names
+    for term in ("SCM_RIGHTS", "CMSG_", "schema", "request_type"):
+        assert term not in receive_source
+
 
     getpeername_calls = [
         node
@@ -1368,3 +1503,344 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
         and node.func.id == "_attest_peer_principal_with_identity"
     ]
     assert len(private_attestation_calls) == 1
+
+
+def test_seqpacket_packet_error_codes_are_stable() -> None:
+    code_type = getattr(seqpacket, "SeqpacketPacketCode")
+    error_type = getattr(seqpacket, "SeqpacketPacketError")
+    expected = (
+        ("RECEIVE_FAILED", "seqpacket_packet_receive_failed"),
+        ("CONTROL_TRUNCATED", "seqpacket_packet_control_truncated"),
+        ("ANCILLARY_PRESENT", "seqpacket_packet_ancillary_present"),
+        ("PAYLOAD_TRUNCATED", "seqpacket_packet_payload_truncated"),
+        ("ZERO_LENGTH_OR_EOF", "seqpacket_packet_zero_length_or_eof"),
+        ("TOO_LARGE", "seqpacket_packet_too_large"),
+    )
+
+    assert [(code.name, code.value) for code in code_type] == list(expected)
+    for name, value in expected:
+        code = getattr(code_type, name)
+        error = error_type(code)
+        assert type(error) is error_type
+        assert error.code is code
+        assert str(error) == value
+        assert error.args == (value,)
+        assert error.__cause__ is None
+
+
+def test_receive_admitted_seqpacket_packet_admits_then_reads_once_and_returns_raw_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receive = getattr(seqpacket, "receive_admitted_seqpacket_packet")
+    monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
+    events: list[tuple[object, ...]] = []
+    payload = b"raw-chpb2-candidate"
+    connection = RecordingConnectedSocket(
+        events, recv_result=(payload, [], 0, object())
+    )
+    enforcement_operations = RecordingEnforcementOperations(events)
+    linux_operations = RecordingLinuxOperations(events)
+    wal_operations = seeded_active_wal(PRINCIPAL)
+
+    evidence, received_payload = receive(
+        connection,
+        enforcement_operations,
+        linux_operations,
+        wal_operations,
+        release_spec(),
+    )
+
+    assert evidence == KernelPeerEvidence(
+        PEER_PID,
+        1000,
+        1000,
+        START_TIME,
+        PRINCIPAL.cgroup_dev,
+        PRINCIPAL.cgroup_ino,
+        PRINCIPAL.unit_generation,
+        PRINCIPAL.invocation_id,
+        PRINCIPAL.mcs_pair,
+    )
+    assert received_payload is payload
+    recv_events = [event for event in events if event[0] == "recvmsg"]
+    assert recv_events == [("recvmsg", MAX_CHPB_MESSAGE_BYTES + 1, 0)]
+    assert events.index(
+        ("getsockopt", socket.SOL_SOCKET, socket.SO_PEERSEC, 255)
+    ) < events.index(recv_events[0])
+    assert events[-1] == recv_events[0]
+
+
+def test_receive_admitted_seqpacket_packet_stops_before_read_when_admission_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receive = getattr(seqpacket, "receive_admitted_seqpacket_packet")
+    monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
+    cases = (
+        {"release": release_spec(agent_domain=None)},
+        {"connection": {"peername_error": OSError("disconnected")}},
+        {"linux": {"drift_at": 2}},
+        {"wal": RecordingWalOperations()},
+        {"enforcement": {"value": False}},
+        {"connection": {"peersec": b"bad\0"}},
+    )
+
+    for case in cases:
+        events: list[tuple[object, ...]] = []
+        connection = RecordingConnectedSocket(
+            events, **case.get("connection", {})
+        )
+        enforcement_operations = RecordingEnforcementOperations(
+            events, **case.get("enforcement", {})
+        )
+        linux_operations = RecordingLinuxOperations(
+            events, **case.get("linux", {})
+        )
+        wal_operations = case.get("wal", seeded_active_wal(PRINCIPAL))
+        release = case.get("release", release_spec())
+
+        with pytest.raises(SeqpacketPeerError) as caught:
+            receive(
+                connection,
+                enforcement_operations,
+                linux_operations,
+                wal_operations,
+                release,
+            )
+        assert type(caught.value) is SeqpacketPeerError
+        assert str(caught.value) == "seqpacket peer attestation failed"
+        assert repr(caught.value) == (
+            "SeqpacketPeerError('seqpacket peer attestation failed')"
+        )
+        assert caught.value.__cause__ is None
+        assert not any(event[0] == "recvmsg" for event in events)
+
+
+def test_receive_admitted_seqpacket_packet_maps_recvmsg_failures_and_malformed_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receive = getattr(seqpacket, "receive_admitted_seqpacket_packet")
+    code_type = getattr(seqpacket, "SeqpacketPacketCode")
+    error_type = getattr(seqpacket, "SeqpacketPacketError")
+    monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
+    marker = "recvmsg-secret-marker"
+    cases = (
+        {"recv_error": OSError(marker)},
+        {"recv_result": object()},
+        {"recv_result": (b"payload", [], 0)},
+        {"recv_result": (bytearray(b"payload"), [], 0, object())},
+        {"recv_result": (b"payload", (), 0, object())},
+        {"recv_result": (b"payload", [], True, object())},
+        {"recv_result": (b"payload", [], object(), object())},
+    )
+    expected_code = getattr(code_type, "RECEIVE_FAILED")
+
+    for case in cases:
+        events: list[tuple[object, ...]] = []
+        connection = RecordingConnectedSocket(events, **case)
+        with pytest.raises(error_type) as caught:
+            receive(
+                connection,
+                RecordingEnforcementOperations(events),
+                RecordingLinuxOperations(events),
+                seeded_active_wal(PRINCIPAL),
+                release_spec(),
+            )
+        assert caught.value.code is expected_code
+        assert str(caught.value) == expected_code.value
+        assert repr(caught.value) == (
+            "SeqpacketPacketError('seqpacket_packet_receive_failed')"
+        )
+        assert caught.value.__cause__ is None
+        assert marker not in str(caught.value)
+        assert marker not in repr(caught.value)
+        assert [event for event in events if event[0] == "recvmsg"] == [
+            ("recvmsg", MAX_CHPB_MESSAGE_BYTES + 1, 0)
+        ]
+
+
+def test_receive_admitted_seqpacket_packet_rejects_ancillary_and_truncation_in_stable_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receive = getattr(seqpacket, "receive_admitted_seqpacket_packet")
+    code_type = getattr(seqpacket, "SeqpacketPacketCode")
+    error_type = getattr(seqpacket, "SeqpacketPacketError")
+    monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
+    cases = (
+        (
+            (
+                b"x",
+                [("inert",)],
+                int(socket.MSG_CTRUNC) | int(socket.MSG_TRUNC),
+                object(),
+            ),
+            "CONTROL_TRUNCATED",
+        ),
+        (
+            (b"x", [("inert",)], int(socket.MSG_TRUNC), object()),
+            "ANCILLARY_PRESENT",
+        ),
+        ((b"x", [], int(socket.MSG_TRUNC), object()), "PAYLOAD_TRUNCATED"),
+    )
+
+    for recv_result, expected_name in cases:
+        events: list[tuple[object, ...]] = []
+        connection = RecordingConnectedSocket(events, recv_result=recv_result)
+        with pytest.raises(error_type) as caught:
+            receive(
+                connection,
+                RecordingEnforcementOperations(events),
+                RecordingLinuxOperations(events),
+                seeded_active_wal(PRINCIPAL),
+                release_spec(),
+            )
+        expected_code = getattr(code_type, expected_name)
+        assert caught.value.code is expected_code
+        assert caught.value.__cause__ is None
+        assert len([event for event in events if event[0] == "recvmsg"]) == 1
+
+
+def test_receive_admitted_seqpacket_packet_enforces_zero_and_size_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receive = getattr(seqpacket, "receive_admitted_seqpacket_packet")
+    code_type = getattr(seqpacket, "SeqpacketPacketCode")
+    error_type = getattr(seqpacket, "SeqpacketPacketError")
+    monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
+    expected_evidence = KernelPeerEvidence(
+        PEER_PID,
+        1000,
+        1000,
+        START_TIME,
+        PRINCIPAL.cgroup_dev,
+        PRINCIPAL.cgroup_ino,
+        PRINCIPAL.unit_generation,
+        PRINCIPAL.invocation_id,
+        PRINCIPAL.mcs_pair,
+    )
+
+    for payload in (b"x", b"x" * MAX_CHPB_MESSAGE_BYTES):
+        events: list[tuple[object, ...]] = []
+        result = receive(
+            RecordingConnectedSocket(
+                events, recv_result=(payload, [], 0, object())
+            ),
+            RecordingEnforcementOperations(events),
+            RecordingLinuxOperations(events),
+            seeded_active_wal(PRINCIPAL),
+            release_spec(),
+        )
+        assert result[0] == expected_evidence
+        assert result[1] is payload
+
+    cases = (
+        (b"", 0, "ZERO_LENGTH_OR_EOF"),
+        (b"x" * (MAX_CHPB_MESSAGE_BYTES + 1), 0, "TOO_LARGE"),
+        (
+            b"x" * (MAX_CHPB_MESSAGE_BYTES + 1),
+            int(socket.MSG_TRUNC),
+            "PAYLOAD_TRUNCATED",
+        ),
+    )
+    for payload, flags, expected_name in cases:
+        events: list[tuple[object, ...]] = []
+        with pytest.raises(error_type) as caught:
+            receive(
+                RecordingConnectedSocket(
+                    events, recv_result=(payload, [], flags, object())
+                ),
+                RecordingEnforcementOperations(events),
+                RecordingLinuxOperations(events),
+                seeded_active_wal(PRINCIPAL),
+                release_spec(),
+            )
+        assert caught.value.code is getattr(code_type, expected_name)
+        assert caught.value.__cause__ is None
+
+
+def test_receive_admitted_seqpacket_packet_repeats_fresh_admission_and_one_read_without_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receive = getattr(seqpacket, "receive_admitted_seqpacket_packet")
+    monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
+    events: list[tuple[object, ...]] = []
+    payload = b"raw-chpb2-candidate"
+    connection = RecordingConnectedSocket(
+        events, recv_result=(payload, [], 0, object())
+    )
+    enforcement_operations = RecordingEnforcementOperations(events)
+    linux_operations = RecordingLinuxOperations(
+        events, fresh_identity_per_reuse=True
+    )
+    wal_operations = seeded_active_wal(PRINCIPAL)
+
+    result_one = receive(
+        connection,
+        enforcement_operations,
+        linux_operations,
+        wal_operations,
+        release_spec(),
+    )
+    result_two = receive(
+        connection,
+        enforcement_operations,
+        linux_operations,
+        wal_operations,
+        release_spec(),
+    )
+
+    expected_evidence = KernelPeerEvidence(
+        PEER_PID,
+        1000,
+        1000,
+        START_TIME,
+        PRINCIPAL.cgroup_dev,
+        PRINCIPAL.cgroup_ino,
+        PRINCIPAL.unit_generation,
+        PRINCIPAL.invocation_id,
+        PRINCIPAL.mcs_pair,
+    )
+    assert result_one[0] == expected_evidence
+    assert result_two[0] == expected_evidence
+    assert result_one[1] is payload
+    assert result_two[1] is payload
+    assert linux_operations.reuse_checks == 32
+    assert len(linux_operations.observed_identities) == 32
+    assert wal_operations.events == ["read", "read"]
+    socket_events = [
+        event
+        for event in events
+        if event[0]
+        in {"family", "type", "getpeername", "getsockopt", "enforcing", "recvmsg"}
+    ]
+    one_sequence = [
+        ("family",),
+        ("type",),
+        ("getpeername",),
+        ("getsockopt", socket.SOL_SOCKET, socket.SO_PEERCRED, 12),
+        ("enforcing",),
+        ("getsockopt", socket.SOL_SOCKET, socket.SO_PEERSEC, 255),
+        ("recvmsg", MAX_CHPB_MESSAGE_BYTES + 1, 0),
+    ]
+    assert socket_events == one_sequence + one_sequence
+    assert len([event for event in events if event[0] == "recvmsg"]) == 2
+    assert not any(
+        event[0]
+        in {
+            "settimeout",
+            "gettimeout",
+            "setblocking",
+            "getblocking",
+            "shutdown",
+            "detach",
+            "dup",
+            "fileno",
+            "makefile",
+            "recv",
+            "recvfrom",
+            "recv_into",
+            "recvmsg_into",
+            "send",
+            "sendmsg",
+        }
+        for event in events
+    )

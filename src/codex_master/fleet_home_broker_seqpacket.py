@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from enum import Enum
 import socket
 import struct
 from typing import Protocol
@@ -13,6 +14,7 @@ from codex_master.fleet_home_broker_linux import (
     _observe_peer_snapshot_with_identity,
 )
 from codex_master.fleet_home_broker_protocol import (
+    MAX_CHPB_MESSAGE_BYTES,
     PrincipalBinding,
     validate_principal_binding,
 )
@@ -25,6 +27,23 @@ from codex_master.fleet_home_broker_wal import (
     WalOperations,
     _lookup_active_principal_binding,
 )
+
+
+class SeqpacketPacketCode(str, Enum):
+    RECEIVE_FAILED = "seqpacket_packet_receive_failed"
+    CONTROL_TRUNCATED = "seqpacket_packet_control_truncated"
+    ANCILLARY_PRESENT = "seqpacket_packet_ancillary_present"
+    PAYLOAD_TRUNCATED = "seqpacket_packet_payload_truncated"
+    ZERO_LENGTH_OR_EOF = "seqpacket_packet_zero_length_or_eof"
+    TOO_LARGE = "seqpacket_packet_too_large"
+
+
+class SeqpacketPacketError(ValueError):
+    __slots__ = ("code",)
+
+    def __init__(self, code: SeqpacketPacketCode) -> None:
+        self.code = code
+        super().__init__(code.value)
 
 
 class SeqpacketPeerError(ValueError):
@@ -214,6 +233,46 @@ def admit_connected_seqpacket_peer(
     )
 
 
+def receive_admitted_seqpacket_packet(
+    connection: socket.socket,
+    enforcement_operations: _SeqpacketEnforcementOperations,
+    linux_operations: LinuxOperations,
+    wal_operations: WalOperations,
+    release: BrokerReleaseSpec,
+) -> tuple[KernelPeerEvidence, bytes]:
+    evidence = admit_connected_seqpacket_peer(
+        connection,
+        enforcement_operations,
+        linux_operations,
+        wal_operations,
+        release,
+    )
+    try:
+        received = connection.recvmsg(MAX_CHPB_MESSAGE_BYTES + 1, 0)
+    except Exception:
+        raise SeqpacketPacketError(SeqpacketPacketCode.RECEIVE_FAILED) from None
+    if type(received) is not tuple or len(received) != 4:
+        raise SeqpacketPacketError(SeqpacketPacketCode.RECEIVE_FAILED) from None
+    payload, ancillary, flags, _address = received
+    if (
+        type(payload) is not bytes
+        or type(ancillary) is not list
+        or type(flags) is not int
+    ):
+        raise SeqpacketPacketError(SeqpacketPacketCode.RECEIVE_FAILED) from None
+    if flags & socket.MSG_CTRUNC:
+        raise SeqpacketPacketError(SeqpacketPacketCode.CONTROL_TRUNCATED) from None
+    if ancillary:
+        raise SeqpacketPacketError(SeqpacketPacketCode.ANCILLARY_PRESENT) from None
+    if flags & socket.MSG_TRUNC:
+        raise SeqpacketPacketError(SeqpacketPacketCode.PAYLOAD_TRUNCATED) from None
+    if not payload:
+        raise SeqpacketPacketError(SeqpacketPacketCode.ZERO_LENGTH_OR_EOF) from None
+    if len(payload) > MAX_CHPB_MESSAGE_BYTES:
+        raise SeqpacketPacketError(SeqpacketPacketCode.TOO_LARGE) from None
+    return evidence, payload
+
+
 def reattest_seqpacket_peer(
     operations: SeqpacketPeerOperations,
     linux_operations: LinuxOperations,
@@ -255,8 +314,11 @@ def reattest_seqpacket_peer(
 
 
 __all__ = (
+    "SeqpacketPacketCode",
+    "SeqpacketPacketError",
     "SeqpacketPeerError",
     "SeqpacketPeerOperations",
     "admit_connected_seqpacket_peer",
+    "receive_admitted_seqpacket_packet",
     "reattest_seqpacket_peer",
 )
