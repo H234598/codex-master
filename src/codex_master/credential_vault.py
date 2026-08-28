@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import hmac
+import json
 import math
 import os
 from pathlib import Path, PurePosixPath
@@ -16,7 +17,7 @@ import stat
 import struct
 import threading
 import time
-from typing import Final
+from typing import Final, cast
 import weakref
 
 from cryptography.exceptions import InvalidTag
@@ -48,6 +49,13 @@ _MAX_VAULT_FILE_BYTES: Final[int] = _HEADER.size + _MAX_ENVELOPE_BYTES + _TAG_BY
 _ACCOUNT_REF: Final[re.Pattern[str]] = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", re.ASCII
 )
+_MATERIALIZATION_DOCUMENT: Final[PurePosixPath] = PurePosixPath(
+    "materialization-claims.json"
+)
+_MAX_MATERIALIZATION_BYTES: Final[int] = 2 * 1024 * 1024
+_MAX_RUNTIME_PATH_BYTES: Final[int] = 4096
+_MATERIALIZED_NAME: Final[str] = "auth.json"
+_MATERIALIZED_TEMP_NAME: Final[str] = ".auth.json.tmp"
 _ERROR_CODES: Final[frozenset[str]] = frozenset(
     {
         "credential.generation_conflict",
@@ -100,6 +108,17 @@ class CredentialLease:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class CredentialCleanupTarget:
+    """Attested runtime directory target; never rendered publicly."""
+
+    directory_path: str
+    directory_metadata: tuple[int, ...]
+
+    def __repr__(self) -> str:
+        return "CredentialCleanupTarget(<redacted>)"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class _LeaseState:
     account_ref: str
     generation: int
@@ -119,6 +138,8 @@ class CredentialVault:
         "_leases",
         "_active_leases",
         "_process_id",
+        "_owner_boot_id",
+        "_owner_start_ticks",
         "_state",
         "__weakref__",
     )
@@ -189,6 +210,10 @@ class CredentialVault:
         self._active_leases: set[str] = set()
         self._lease_invalidators: dict[str, Callable[[], None]] = {}
         self._process_id = os.getpid()
+        self._owner_boot_id = self._boot_id()
+        self._owner_start_ticks = self._process_start_ticks(self._process_id)
+        if not self._owner_boot_id or self._owner_start_ticks <= 0:
+            raise CredentialVaultError("credential.source_unavailable")
         _VAULT_INSTANCES.add(self)
 
     @staticmethod
@@ -272,12 +297,14 @@ class CredentialVault:
         relative = self._relative(account_ref)
 
         invalidators: tuple[Callable[[], None], ...] = ()
+        cleanup_failed = False
         try:
             with self._state.locked():
                 current = self._read_or_migrate_locked(account_ref)
                 if current is not None and generation <= current[1]:
                     raise CredentialVaultError("credential.generation_conflict")
                 self._state.replace_private_bytes(relative, record)
+                cleanup_failed = self._invalidate_materializations_locked(account_ref)
                 invalidators = self._invalidate_account_leases_locked(
                     account_ref, active_only=True
                 )
@@ -286,6 +313,8 @@ class CredentialVault:
         except HiveStateError:
             raise CredentialVaultError("credential.source_unavailable") from None
         self._invoke_invalidators(invalidators)
+        if cleanup_failed:
+            raise CredentialVaultError("credential.source_unavailable")
 
     def lease(
         self,
@@ -315,7 +344,9 @@ class CredentialVault:
             process_id=self._process_id,
         )
         with self._lease_lock:
-            self._prune_expired_locked(now)
+            invalidators = self._prune_expired_locked(now)
+        self._invoke_invalidators(invalidators)
+        with self._lease_lock:
             if len(self._leases) >= MAX_ACTIVE_LEASES:
                 raise CredentialVaultError("credential.lease_limit")
             token = self._new_lease_token_locked()
@@ -353,8 +384,32 @@ class CredentialVault:
         expected_generation: int,
         ttl_seconds: int,
         invalidator: Callable[[], None],
+        cleanup_target: CredentialCleanupTarget,
     ) -> Iterator[tuple[CredentialLease, bytes]]:
-        """Issue one already-active lease with exactly one projection read."""
+        """Issue one durable active lease with exactly one projection read."""
+
+        active, plaintext = self.begin_materialization(
+            account_ref,
+            expected_generation=expected_generation,
+            ttl_seconds=ttl_seconds,
+            invalidator=invalidator,
+            cleanup_target=cleanup_target,
+        )
+        try:
+            yield active, plaintext
+        finally:
+            self.release_materialization(active)
+
+    def begin_materialization(
+        self,
+        account_ref: str,
+        *,
+        expected_generation: int,
+        ttl_seconds: int,
+        invalidator: Callable[[], None],
+        cleanup_target: CredentialCleanupTarget,
+    ) -> tuple[CredentialLease, bytes]:
+        """Persist one account claim before returning decrypted bytes."""
 
         self._ensure_current_process()
         account_ref = self._validated_account_ref(account_ref)
@@ -366,42 +421,106 @@ class CredentialVault:
             or not callable(invalidator)
         ):
             raise CredentialVaultError("credential.vault_request_invalid")
+        target = self._validated_cleanup_target(cleanup_target)
         now = self._now()
-        with self._state.locked():
-            with self._lease_lock:
-                if len(self._leases) >= MAX_ACTIVE_LEASES:
-                    raise CredentialVaultError("credential.lease_limit")
-                if any(
-                    token in self._active_leases and state.account_ref == account_ref
-                    for token, state in self._leases.items()
-                ):
+        try:
+            with self._state.locked():
+                claims = self._read_materialization_claims_locked()
+                if any(claim["account_ref"] == account_ref for claim in claims):
                     raise CredentialVaultError("credential.lease_limit")
                 current = self._read_or_migrate_locked(account_ref)
                 if current is None or current[0] != _STATE_ACTIVE:
                     raise CredentialVaultError("credential.source_unavailable")
                 if current[1] != expected_generation:
                     raise CredentialVaultError("credential.generation_conflict")
-                token = self._new_lease_token_locked()
-                self._leases[token] = _LeaseState(
-                    account_ref=account_ref,
-                    generation=expected_generation,
-                    expires_at=now + ttl_seconds,
-                    process_id=self._process_id,
-                )
-                self._active_leases.add(token)
-                self._lease_invalidators[token] = invalidator
-                plaintext = current[2]
+                with self._lease_lock:
+                    if len(self._leases) >= MAX_ACTIVE_LEASES:
+                        raise CredentialVaultError("credential.lease_limit")
+                    token = self._new_lease_token_locked()
+                    state = _LeaseState(
+                        account_ref=account_ref,
+                        generation=expected_generation,
+                        expires_at=now + ttl_seconds,
+                        process_id=self._process_id,
+                    )
+                    claims.append(
+                        {
+                            "account_ref": account_ref,
+                            "directory_metadata": list(target.directory_metadata),
+                            "directory_path": target.directory_path,
+                            "expires_at": state.expires_at,
+                            "file_metadata": None,
+                            "generation": expected_generation,
+                            "owner_boot_id": self._owner_boot_id,
+                            "owner_pid": self._process_id,
+                            "owner_start_ticks": self._owner_start_ticks,
+                            "state": "leased",
+                            "token": token,
+                        }
+                    )
+                    self._write_materialization_claims_locked(claims)
+                    self._leases[token] = state
+                    self._active_leases.add(token)
+                    self._lease_invalidators[token] = invalidator
+                    plaintext = current[2]
+        except CredentialVaultError:
+            raise
+        except HiveStateError:
+            raise CredentialVaultError("credential.source_unavailable") from None
         active = CredentialLease(token, self._lease_issuer)
+        return active, plaintext
+
+    def release_materialization(self, lease: CredentialLease) -> None:
+        """Release process-local callback state; durable claim remains authoritative."""
+
+        self._ensure_current_process()
+        self._validated_issued_lease(lease)
+        with self._lease_lock:
+            self._remove_leases_locked((lease._token,))
+
+    def complete_materialization(self, lease: CredentialLease) -> None:
+        """Remove durable claim only after caller confirmed runtime cleanup."""
+
+        self._ensure_current_process()
+        self._validated_issued_lease(lease)
         try:
-            yield active, plaintext
-        finally:
-            with self._lease_lock:
-                self._remove_leases_locked((token,))
+            with self._state.locked():
+                claims = self._read_materialization_claims_locked()
+                matching = [claim for claim in claims if claim["token"] == lease._token]
+                if len(matching) > 1:
+                    raise CredentialVaultError("credential.vault_schema_invalid")
+                if matching:
+                    if not self._cleanup_claim(matching[0]):
+                        raise CredentialVaultError("credential.source_unavailable")
+                    claims.remove(matching[0])
+                    self._write_materialization_claims_locked(claims)
+        except CredentialVaultError:
+            raise
+        except HiveStateError:
+            raise CredentialVaultError("credential.source_unavailable") from None
+
+    def abandon_materialization(self, lease: CredentialLease) -> None:
+        """Mark cleanup retryable by a restarted service in this process."""
+
+        self._ensure_current_process()
+        self._validated_issued_lease(lease)
+        try:
+            with self._state.locked():
+                claims = self._read_materialization_claims_locked()
+                claim = self._matching_claim(claims, lease._token)
+                claim["state"] = "orphaned"
+                self._write_materialization_claims_locked(claims)
+        except CredentialVaultError:
+            raise
+        except HiveStateError:
+            raise CredentialVaultError("credential.source_unavailable") from None
 
     def publish_active(
         self,
         lease: CredentialLease,
-        effect: Callable[[], tuple[int, tuple[int, ...]]],
+        effect: Callable[
+            [Callable[[tuple[int, ...]], None]], tuple[int, tuple[int, ...]]
+        ],
     ) -> tuple[int, tuple[int, ...]]:
         """Linearize one runtime publish before revoke/replace can commit."""
 
@@ -412,14 +531,46 @@ class CredentialVault:
             or not callable(effect)
         ):
             raise CredentialVaultError("credential.vault_request_invalid")
-        with self._state.locked():
-            with self._lease_lock:
-                state = self._leases.get(lease._token)
-                if state is None or lease._token not in self._active_leases:
+        try:
+            with self._state.locked():
+                claims = self._read_materialization_claims_locked()
+                claim = self._matching_claim(claims, lease._token)
+                with self._lease_lock:
+                    state = self._leases.get(lease._token)
+                    if state is None or lease._token not in self._active_leases:
+                        raise CredentialVaultError("credential.lease_consumed")
+                    if self._now() >= state.expires_at:
+                        raise CredentialVaultError("credential.lease_expired")
+                if claim["state"] != "leased":
                     raise CredentialVaultError("credential.lease_consumed")
-                if self._now() >= state.expires_at:
-                    raise CredentialVaultError("credential.lease_expired")
-                return effect()
+                current = self._read_or_migrate_locked(state.account_ref)
+                if (
+                    current is None
+                    or current[0] != _STATE_ACTIVE
+                    or current[1] != state.generation
+                ):
+                    raise CredentialVaultError("credential.generation_conflict")
+                claim["state"] = "publishing"
+                self._write_materialization_claims_locked(claims)
+
+                def record_file(metadata_value: tuple[int, ...]) -> None:
+                    metadata = self._validated_file_metadata(metadata_value)
+                    claim["file_metadata"] = list(metadata)
+                    self._write_materialization_claims_locked(claims)
+
+                result = effect(record_file)
+                metadata = self._validated_file_metadata(result[1])
+                recorded = tuple(cast(list[int], claim["file_metadata"]))
+                if recorded[:6] != metadata[:6] or recorded[6] != metadata[6]:
+                    raise CredentialVaultError("credential.source_unavailable")
+                claim["file_metadata"] = list(metadata)
+                claim["state"] = "published"
+                self._write_materialization_claims_locked(claims)
+                return result[0], metadata
+        except CredentialVaultError:
+            raise
+        except HiveStateError:
+            raise CredentialVaultError("credential.source_unavailable") from None
 
     def reconcile_active_leases(self) -> None:
         """Expire or invalidate live effects after cross-process vault mutation."""
@@ -428,11 +579,41 @@ class CredentialVault:
         invalidators: tuple[Callable[[], None], ...] = ()
         try:
             with self._state.locked():
+                claims = self._read_materialization_claims_locked()
+                retained_claims: list[dict[str, object]] = []
+                claims_changed = False
+                now = self._now()
+                claim_accounts: dict[str, tuple[int, int, bytes] | None] = {}
+                for claim in claims:
+                    claim_account = cast(str, claim["account_ref"])
+                    if claim_account not in claim_accounts:
+                        try:
+                            claim_accounts[claim_account] = (
+                                self._read_or_migrate_locked(claim_account)
+                            )
+                        except CredentialVaultError:
+                            claim_accounts[claim_account] = None
+                    current_claim = claim_accounts[claim_account]
+                    invalid_claim = (
+                        claim["state"] in {"invalidated", "orphaned"}
+                        or now >= cast(float, claim["expires_at"])
+                        or current_claim is None
+                        or current_claim[0] != _STATE_ACTIVE
+                        or current_claim[1] != claim["generation"]
+                    )
+                    if invalid_claim:
+                        claim["state"] = "invalidated"
+                        claims_changed = True
+                        if self._cleanup_claim(claim):
+                            continue
+                    retained_claims.append(claim)
+                if claims_changed:
+                    self._write_materialization_claims_locked(retained_claims)
                 with self._lease_lock:
                     invalid = {
                         token
                         for token, state in self._leases.items()
-                        if self._now() >= state.expires_at
+                        if now >= state.expires_at
                     }
                     accounts: dict[str, tuple[int, int, bytes] | None] = {}
                     for token in self._active_leases - invalid:
@@ -459,12 +640,53 @@ class CredentialVault:
             raise CredentialVaultError("credential.source_unavailable") from None
         self._invoke_invalidators(invalidators)
 
+    def recover_materializations(self) -> None:
+        """Retry cleanup for expired, orphaned, or provably dead owners."""
+
+        self._ensure_current_process()
+        try:
+            with self._state.locked():
+                claims = self._read_materialization_claims_locked()
+                retained: list[dict[str, object]] = []
+                for claim in claims:
+                    recoverable = (
+                        claim["state"] in {"invalidated", "orphaned"}
+                        or self._now() >= cast(float, claim["expires_at"])
+                        or self._claim_owner_dead(claim)
+                    )
+                    if not recoverable or not self._cleanup_claim(claim):
+                        retained.append(claim)
+                if retained != claims:
+                    self._write_materialization_claims_locked(retained)
+        except CredentialVaultError:
+            raise
+        except HiveStateError:
+            raise CredentialVaultError("credential.source_unavailable") from None
+
+    def _invalidate_materializations_locked(self, account_ref: str) -> bool:
+        claims = self._read_materialization_claims_locked()
+        targets = [claim for claim in claims if claim["account_ref"] == account_ref]
+        if not targets:
+            return False
+        for claim in targets:
+            claim["state"] = "invalidated"
+        self._write_materialization_claims_locked(claims)
+        failed = False
+        for claim in targets:
+            if self._cleanup_claim(claim):
+                claims.remove(claim)
+            else:
+                failed = True
+        self._write_materialization_claims_locked(claims)
+        return failed
+
     def revoke_account(self, account_ref: str, *, expected_generation: int) -> bool:
         self._ensure_current_process()
         account_ref = self._validated_account_ref(account_ref)
         expected_generation = self._validated_generation(expected_generation)
         relative = self._relative(account_ref)
         invalidators: tuple[Callable[[], None], ...] = ()
+        cleanup_failed = False
         try:
             with self._state.locked():
                 current = self._read_or_migrate_locked(account_ref)
@@ -476,6 +698,7 @@ class CredentialVault:
                     account_ref, expected_generation, _STATE_REVOKED, b""
                 )
                 self._state.replace_private_bytes(relative, tombstone)
+                cleanup_failed = self._invalidate_materializations_locked(account_ref)
                 invalidators = self._invalidate_account_leases_locked(
                     account_ref, active_only=False
                 )
@@ -484,6 +707,8 @@ class CredentialVault:
         except HiveStateError:
             raise CredentialVaultError("credential.source_unavailable") from None
         self._invoke_invalidators(invalidators)
+        if cleanup_failed:
+            raise CredentialVaultError("credential.source_unavailable")
         return True
 
     def _read_projection(self, account_ref: str) -> tuple[int, bytes]:
@@ -775,6 +1000,322 @@ class CredentialVault:
             self._invalidate_after_fork()
             raise CredentialVaultError("credential.source_unavailable")
 
+    @staticmethod
+    def _validated_cleanup_target(
+        value: CredentialCleanupTarget,
+    ) -> CredentialCleanupTarget:
+        if (
+            not isinstance(value, CredentialCleanupTarget)
+            or type(value.directory_path) is not str
+            or not value.directory_path.startswith("/")
+            or "\x00" in value.directory_path
+            or len(value.directory_path.encode("utf-8", errors="replace"))
+            > _MAX_RUNTIME_PATH_BYTES
+        ):
+            raise CredentialVaultError("credential.vault_request_invalid")
+        metadata = value.directory_metadata
+        if (
+            type(metadata) is not tuple
+            or len(metadata) != 6
+            or any(
+                isinstance(item, bool) or not isinstance(item, int) for item in metadata
+            )
+            or not stat.S_ISDIR(metadata[2])
+            or stat.S_IMODE(metadata[2]) != 0o700
+            or metadata[3] != os.geteuid()
+            or metadata[4] != os.getegid()
+            or metadata[5] < 1
+        ):
+            raise CredentialVaultError("credential.vault_request_invalid")
+        return value
+
+    @staticmethod
+    def _validated_file_metadata(value: object) -> tuple[int, ...]:
+        if (
+            type(value) is not tuple
+            or len(value) != 9
+            or any(
+                isinstance(item, bool) or not isinstance(item, int) for item in value
+            )
+            or not stat.S_ISREG(value[2])
+            or stat.S_IMODE(value[2]) != 0o600
+            or value[3] != os.geteuid()
+            or value[4] != os.getegid()
+            or value[5] != 1
+            or not 0 < value[6] <= MAX_PROJECTION_BYTES
+        ):
+            raise CredentialVaultError("credential.source_unavailable")
+        return value
+
+    def _validated_issued_lease(self, lease: CredentialLease) -> None:
+        if (
+            not isinstance(lease, CredentialLease)
+            or lease._issuer is not self._lease_issuer
+        ):
+            raise CredentialVaultError("credential.vault_request_invalid")
+
+    def _read_materialization_claims_locked(self) -> list[dict[str, object]]:
+        try:
+            raw = self._state.read_private_bytes(
+                _MATERIALIZATION_DOCUMENT, max_bytes=_MAX_MATERIALIZATION_BYTES
+            )
+        except HiveStateError as exc:
+            if exc.args == ("state_not_found",):
+                return []
+            raise
+        try:
+            document = json.loads(
+                raw.decode("ascii"), object_pairs_hook=self._strict_json_object
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            raise CredentialVaultError("credential.vault_schema_invalid") from None
+        if (
+            not isinstance(document, Mapping)
+            or set(document) != {"claims", "schema_version"}
+            or document.get("schema_version") != 1
+            or type(document.get("claims")) is not list
+            or len(document["claims"]) > MAX_ACTIVE_LEASES
+        ):
+            raise CredentialVaultError("credential.vault_schema_invalid")
+        claims = [self._validated_claim(value) for value in document["claims"]]
+        tokens = [claim["token"] for claim in claims]
+        accounts = [claim["account_ref"] for claim in claims]
+        if len(set(tokens)) != len(tokens) or len(set(accounts)) != len(accounts):
+            raise CredentialVaultError("credential.vault_schema_invalid")
+        if raw != self._materialization_document(claims):
+            raise CredentialVaultError("credential.vault_schema_invalid")
+        return claims
+
+    def _write_materialization_claims_locked(
+        self, claims: list[dict[str, object]]
+    ) -> None:
+        raw = self._materialization_document(claims)
+        if len(raw) > _MAX_MATERIALIZATION_BYTES:
+            raise CredentialVaultError("credential.lease_limit")
+        self._state.replace_private_bytes(_MATERIALIZATION_DOCUMENT, raw)
+
+    def _validated_claim(self, value: object) -> dict[str, object]:
+        fields = {
+            "account_ref",
+            "directory_metadata",
+            "directory_path",
+            "expires_at",
+            "file_metadata",
+            "generation",
+            "owner_boot_id",
+            "owner_pid",
+            "owner_start_ticks",
+            "state",
+            "token",
+        }
+        if not isinstance(value, Mapping) or set(value) != fields:
+            raise CredentialVaultError("credential.vault_schema_invalid")
+        claim = dict(value)
+        try:
+            self._validated_account_ref(claim["account_ref"])
+            self._validated_generation(claim["generation"])
+            target = CredentialCleanupTarget(
+                cast(str, claim["directory_path"]),
+                tuple(cast(list[int], claim["directory_metadata"])),
+            )
+            self._validated_cleanup_target(target)
+        except (CredentialVaultError, TypeError):
+            raise CredentialVaultError("credential.vault_schema_invalid") from None
+        expires_at = claim["expires_at"]
+        file_metadata = claim["file_metadata"]
+        if (
+            isinstance(expires_at, bool)
+            or not isinstance(expires_at, (int, float))
+            or not math.isfinite(expires_at)
+            or type(claim["owner_boot_id"]) is not str
+            or re.fullmatch(
+                r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",
+                cast(str, claim["owner_boot_id"]),
+                re.ASCII,
+            )
+            is None
+            or isinstance(claim["owner_pid"], bool)
+            or not isinstance(claim["owner_pid"], int)
+            or not 1 <= cast(int, claim["owner_pid"]) <= 2**31 - 1
+            or isinstance(claim["owner_start_ticks"], bool)
+            or not isinstance(claim["owner_start_ticks"], int)
+            or not 1 <= cast(int, claim["owner_start_ticks"]) <= 2**63 - 1
+            or claim["state"]
+            not in {"leased", "publishing", "published", "invalidated", "orphaned"}
+            or type(claim["token"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", cast(str, claim["token"]), re.ASCII)
+            is None
+            or (file_metadata is not None and type(file_metadata) is not list)
+        ):
+            raise CredentialVaultError("credential.vault_schema_invalid")
+        if file_metadata is not None:
+            try:
+                self._validated_file_metadata(tuple(cast(list[int], file_metadata)))
+            except CredentialVaultError:
+                raise CredentialVaultError("credential.vault_schema_invalid") from None
+        claim["expires_at"] = float(expires_at)
+        return claim
+
+    @staticmethod
+    def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise CredentialVaultError("credential.vault_schema_invalid")
+            result[key] = value
+        return result
+
+    @staticmethod
+    def _materialization_document(claims: list[dict[str, object]]) -> bytes:
+        try:
+            return (
+                json.dumps(
+                    {"claims": claims, "schema_version": 1},
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("ascii")
+        except (TypeError, ValueError, UnicodeError, RecursionError):
+            raise CredentialVaultError("credential.vault_schema_invalid") from None
+
+    @staticmethod
+    def _matching_claim(
+        claims: list[dict[str, object]], token: str
+    ) -> dict[str, object]:
+        matching = [claim for claim in claims if claim["token"] == token]
+        if len(matching) != 1:
+            raise CredentialVaultError("credential.lease_consumed")
+        return matching[0]
+
+    def _cleanup_claim(self, claim: Mapping[str, object]) -> bool:
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                cast(str, claim["directory_path"]),
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            observed_directory = self._raw_directory_metadata(os.fstat(descriptor))
+            if observed_directory != tuple(
+                cast(list[int], claim["directory_metadata"])
+            ):
+                return False
+            expected = claim["file_metadata"]
+            present: list[tuple[str, os.stat_result]] = []
+            for name in (_MATERIALIZED_TEMP_NAME, _MATERIALIZED_NAME):
+                try:
+                    present.append(
+                        (
+                            name,
+                            os.stat(name, dir_fd=descriptor, follow_symlinks=False),
+                        )
+                    )
+                except FileNotFoundError:
+                    pass
+            if expected is None:
+                return not present
+            expected_metadata = tuple(cast(list[int], expected))
+            for _name, observed in present:
+                if (
+                    not stat.S_ISREG(observed.st_mode)
+                    or stat.S_IMODE(observed.st_mode) != 0o600
+                    or observed.st_uid != os.geteuid()
+                    or observed.st_gid != os.getegid()
+                    or observed.st_nlink not in {1, 2}
+                    or (observed.st_dev, observed.st_ino) != expected_metadata[:2]
+                    or observed.st_size != expected_metadata[6]
+                ):
+                    return False
+            for name, _observed in present:
+                os.unlink(name, dir_fd=descriptor)
+            if present:
+                os.fsync(descriptor)
+            return True
+        except (CredentialVaultError, OSError, TypeError, ValueError):
+            return False
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _raw_directory_metadata(value: os.stat_result) -> tuple[int, ...]:
+        return (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_uid,
+            value.st_gid,
+            value.st_nlink,
+        )
+
+    @staticmethod
+    def _raw_file_metadata(value: os.stat_result) -> tuple[int, ...]:
+        return (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_uid,
+            value.st_gid,
+            value.st_nlink,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+
+    @staticmethod
+    def _boot_id() -> str:
+        try:
+            value = (
+                Path("/proc/sys/kernel/random/boot_id")
+                .read_text(encoding="ascii")
+                .strip()
+            )
+        except (OSError, UnicodeError):
+            return ""
+        return (
+            value
+            if re.fullmatch(
+                r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",
+                value,
+                re.ASCII,
+            )
+            else ""
+        )
+
+    @staticmethod
+    def _process_start_ticks(process_id: int) -> int:
+        try:
+            raw = Path(f"/proc/{process_id}/stat").read_text(encoding="ascii")
+            close = raw.rfind(")")
+            if close < 0:
+                return -1
+            fields = raw[close + 2 :].split()
+            value = int(fields[19])
+            return value if value >= 0 else -1
+        except (OSError, UnicodeError, ValueError, IndexError):
+            return -1
+
+    def _claim_owner_dead(self, claim: Mapping[str, object]) -> bool:
+        owner_boot = cast(str, claim["owner_boot_id"])
+        if owner_boot and self._owner_boot_id and owner_boot != self._owner_boot_id:
+            return True
+        process_id = cast(int, claim["owner_pid"])
+        observed = self._process_start_ticks(process_id)
+        expected = cast(int, claim["owner_start_ticks"])
+        if observed >= 0 and expected >= 0:
+            return observed != expected
+        try:
+            os.kill(process_id, 0)
+        except ProcessLookupError:
+            return True
+        except (OSError, ValueError):
+            return False
+        return False
+
     def _invalidate_after_fork(self) -> None:
         self._lease_lock = threading.Lock()
         self._leases = {}
@@ -845,6 +1386,7 @@ __all__ = [
     "MAX_ACTIVE_LEASES",
     "MAX_LEASE_SECONDS",
     "MAX_PROJECTION_BYTES",
+    "CredentialCleanupTarget",
     "CredentialLease",
     "CredentialVault",
     "CredentialVaultError",

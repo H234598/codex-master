@@ -7,6 +7,8 @@ import itertools
 import os
 from pathlib import Path, PurePosixPath
 import stat
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import replace
@@ -66,14 +68,15 @@ def make_service(
     nonce_counter = itertools.count(1)
     return OpenAICredentialService(
         vault,
-        OpenAIIdentitySource.for_test(
-            {
+        OpenAIIdentitySource(
+            tmp_path / "identities",
+            initial_identities={
                 "openai-one": OpenAIAccountIdentity(
                     enabled=True,
                     backend_account_id=registered_backend,
                     generation=identity_generation,
                 )
-            }
+            },
         ),
         OpenAIAuthReceiptStore(tmp_path / "receipts"),
         ingress_authority=INGRESS_AUTHORITY,
@@ -136,12 +139,13 @@ def test_identity_and_expiry_are_rechecked_under_guard_through_vault_cas(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     clock = Clock()
-    source = OpenAIIdentitySource.for_test(
-        {
+    source = OpenAIIdentitySource(
+        tmp_path / "identities",
+        initial_identities={
             "openai-one": OpenAIAccountIdentity(
                 enabled=True, backend_account_id="acct-one", generation=2
             )
-        }
+        },
     )
     vault = CredentialVault.for_test(tmp_path / "vault", key=KEY, clock=clock)
     service = OpenAICredentialService(
@@ -246,11 +250,15 @@ def test_idempotency_collision_and_durable_running_ambiguity_fail_closed(
         ttl_seconds=60,
     )
     with pytest.raises(OpenAICredentialError, match="control.idempotency_conflict"):
-        make_service(tmp_path, identity_generation=3).plan_auth_sync(
-            "openai-one",
-            expected_generation=3,
-            idempotency_key="durable-intent",
-            ttl_seconds=60,
+        service._receipts.plan(  # noqa: SLF001 - exercises durable collision CAS
+            {
+                "account_ref": "openai-one",
+                "expected_generation": 3,
+                "expires_at": plan.expires_at,
+                "idempotency_key": "durable-intent",
+                "nonce": plan.nonce,
+                "plan_digest": plan.plan_digest,
+            }
         )
 
     with monkeypatch.context() as context:
@@ -571,7 +579,7 @@ def test_cross_process_generation_reconciliation_removes_live_file(
         os.close(runtime_fd)
 
 
-def test_materialization_reads_projection_once_before_publish(
+def test_materialization_rereads_projection_at_publish_boundary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service = synced_service(tmp_path)
@@ -591,7 +599,7 @@ def test_materialization_reads_projection_once_before_publish(
         with service.materialize_auth_lease(
             "openai-one", expected_generation=2, runtime_dir_fd=runtime_fd
         ):
-            assert reads == 1
+            assert reads == 2
     finally:
         os.close(runtime_fd)
 
@@ -600,6 +608,7 @@ def test_revoke_winning_before_publish_never_exposes_auth(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service = synced_service(tmp_path)
+    revoker = CredentialVault.for_test(tmp_path / "vault", key=KEY)
     runtime_fd = open_private_runtime(tmp_path / "runtime")
     ready = threading.Event()
     release = threading.Event()
@@ -627,7 +636,7 @@ def test_revoke_winning_before_publish_never_exposes_auth(
     thread = threading.Thread(target=materialize)
     thread.start()
     assert ready.wait(timeout=2)
-    service._vault.revoke_account("openai-one", expected_generation=2)  # noqa: SLF001
+    revoker.revoke_account("openai-one", expected_generation=2)
     release.set()
     thread.join(timeout=2)
     try:
@@ -862,3 +871,193 @@ def test_public_rendering_never_contains_secret_or_backend_identity(
 
     rendered = repr(service) + repr(plan) + repr(upload) + repr(receipt)
     assert_private_values_absent(rendered, SECRET_MARKER, "acct-one", str(tmp_path))
+
+
+@pytest.mark.parametrize("tamper", ["duplicate", "noncanonical"])
+def test_receipt_state_rejects_duplicate_keys_and_noncanonical_json(
+    tmp_path: Path, tamper: str
+) -> None:
+    service = make_service(tmp_path)
+    plan = service.plan_auth_sync(
+        "openai-one",
+        expected_generation=2,
+        idempotency_key="strict-receipt",
+        ttl_seconds=60,
+    )
+    state_path = tmp_path / "receipts" / "openai-auth-sync.json"
+    document = json.loads(state_path.read_text(encoding="ascii"))
+    if tamper == "duplicate":
+        raw = (
+            '{"schema_version":1,"schema_version":1,"records":'
+            + json.dumps(document["records"], sort_keys=True, separators=(",", ":"))
+            + "}\n"
+        )
+    else:
+        raw = json.dumps(document, indent=2, sort_keys=True) + "\n"
+    state_path.write_text(raw, encoding="ascii")
+
+    upload = ingress(plan, auth_json("acct-one"))
+    with pytest.raises(OpenAICredentialError, match="credential.source_unavailable"):
+        service.apply_auth_sync(plan, upload)
+    assert upload.closed
+
+
+def test_productive_identity_source_is_durable_and_rebind_requires_generation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "identity-state"
+    initial = {
+        "openai-one": OpenAIAccountIdentity(
+            enabled=True, backend_account_id="acct-one", generation=2
+        )
+    }
+    source = OpenAIIdentitySource(root, initial_identities=initial)
+
+    with pytest.raises(OpenAICredentialError, match="credential.generation_conflict"):
+        source.set_identity(
+            "openai-one",
+            OpenAIAccountIdentity(
+                enabled=True, backend_account_id="acct-two", generation=2
+            ),
+        )
+
+    restarted = OpenAIIdentitySource(root)
+    with restarted.guard("openai-one") as identity:
+        assert identity == initial["openai-one"]
+
+
+def test_cross_vault_materialization_claim_blocks_second_decrypt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = synced_service(tmp_path)
+    second = make_service(tmp_path)
+    first_runtime_fd = open_private_runtime(tmp_path / "runtime-first")
+    second_runtime_fd = open_private_runtime(tmp_path / "runtime-second")
+    real_decrypt = CredentialVault._decrypt_record  # noqa: SLF001
+    second_decrypts = 0
+
+    def counted_decrypt(
+        vault: CredentialVault, raw: bytes, account_ref: str
+    ) -> tuple[int, int, bytes]:
+        nonlocal second_decrypts
+        if vault is second._vault:  # noqa: SLF001 - prove claim check precedes decrypt
+            second_decrypts += 1
+        return real_decrypt(vault, raw, account_ref)
+
+    monkeypatch.setattr(CredentialVault, "_decrypt_record", counted_decrypt)
+    try:
+        with first.materialize_auth_lease(
+            "openai-one", expected_generation=2, runtime_dir_fd=first_runtime_fd
+        ):
+            with pytest.raises(
+                OpenAICredentialError, match="credential.source_unavailable"
+            ):
+                with second.materialize_auth_lease(
+                    "openai-one",
+                    expected_generation=2,
+                    runtime_dir_fd=second_runtime_fd,
+                ):
+                    pass
+            assert second_decrypts == 0
+    finally:
+        os.close(first_runtime_fd)
+        os.close(second_runtime_fd)
+
+
+def test_cross_process_revoke_removes_published_file_before_return(
+    tmp_path: Path,
+) -> None:
+    service = synced_service(tmp_path)
+    runtime_fd = open_private_runtime(tmp_path / "runtime")
+    try:
+        with service.materialize_auth_lease(
+            "openai-one", expected_generation=2, runtime_dir_fd=runtime_fd
+        ):
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from pathlib import Path; "
+                        "from codex_master.credential_vault import CredentialVault; "
+                        "CredentialVault.for_test(Path(__import__('sys').argv[1]), "
+                        "key=b'k'*32).revoke_account('openai-one', "
+                        "expected_generation=2)"
+                    ),
+                    str(tmp_path / "vault"),
+                ],
+                check=True,
+                env={**os.environ, "PYTHONPATH": str(Path.cwd() / "src")},
+            )
+            with pytest.raises(FileNotFoundError):
+                os.stat("auth.json", dir_fd=runtime_fd, follow_symlinks=False)
+    finally:
+        os.close(runtime_fd)
+
+
+def test_normal_lease_prune_runs_materialization_invalidator(tmp_path: Path) -> None:
+    clock = Clock()
+    service = synced_service(tmp_path, clock=clock)
+    runtime_fd = open_private_runtime(tmp_path / "runtime")
+    try:
+        with service.materialize_auth_lease(
+            "openai-one", expected_generation=2, runtime_dir_fd=runtime_fd
+        ):
+            clock.value += 301
+            service._vault.lease(  # noqa: SLF001 - exercises legacy prune path
+                "openai-one", expected_generation=2, ttl_seconds=30
+            )
+            with pytest.raises(FileNotFoundError):
+                os.stat("auth.json", dir_fd=runtime_fd, follow_symlinks=False)
+    finally:
+        os.close(runtime_fd)
+
+
+def test_service_close_removes_file_while_context_is_held(tmp_path: Path) -> None:
+    service = synced_service(tmp_path)
+    runtime_fd = open_private_runtime(tmp_path / "runtime")
+    context = service.materialize_auth_lease(
+        "openai-one", expected_generation=2, runtime_dir_fd=runtime_fd
+    )
+    context.__enter__()
+    try:
+        service.close()
+        with pytest.raises(FileNotFoundError):
+            os.stat("auth.json", dir_fd=runtime_fd, follow_symlinks=False)
+    finally:
+        context.__exit__(None, None, None)
+        os.close(runtime_fd)
+
+
+def test_cleanup_claim_survives_service_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = synced_service(tmp_path)
+    runtime = tmp_path / "runtime"
+    runtime_fd = open_private_runtime(runtime)
+    context = service.materialize_auth_lease(
+        "openai-one", expected_generation=2, runtime_dir_fd=runtime_fd
+    )
+    context.__enter__()
+
+    def fail_remove(*_args: object, **_kwargs: object) -> None:
+        raise OpenAICredentialError("credential.source_unavailable")
+
+    with monkeypatch.context() as patching:
+        patching.setattr(service_module, "_remove_auth", fail_remove)
+        with pytest.raises(
+            OpenAICredentialError, match="credential.source_unavailable"
+        ):
+            context.__exit__(None, None, None)
+        with pytest.raises(
+            OpenAICredentialError, match="credential.source_unavailable"
+        ):
+            service.close()
+    os.close(runtime_fd)
+
+    restarted = make_service(tmp_path)
+    try:
+        with pytest.raises(FileNotFoundError):
+            os.stat(runtime / "auth.json", follow_symlinks=False)
+    finally:
+        restarted.close()
