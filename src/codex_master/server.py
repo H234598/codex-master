@@ -1453,7 +1453,7 @@ def merge_agent_inventories(*snapshots: InventorySnapshot) -> InventorySnapshot:
         MappingProxyType(agents),
         MappingProxyType({key: tuple(value) for key, value in by_series.items()}),
         MappingProxyType(positions),
-        tuple(by_series),
+        tuple(key.removesuffix("-series") for key in by_series),
     )
 
 

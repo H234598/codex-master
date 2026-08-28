@@ -14274,6 +14274,27 @@ google_accounts:
         with patch.dict(os.environ, {server_module.AGENT_SELECTOR_SERIES_ENV: "c,a,b"}), server_module.temporary_agent_inventory(inventory):
             self.assertEqual(server_module.agent_ids("both"), ["c1", "a1"])
 
+    def test_targetless_agent_start_uses_both_after_merging_inventory_views(self) -> None:
+        source = server_module.current_agent_inventory()
+        merged = server_module.merge_agent_inventories(source, source)
+
+        with server_module.temporary_agent_inventory(merged), patch.object(
+            server_module,
+            "call_agent_lifecycle",
+            side_effect=lambda agent, _callback: {
+                "agent": agent,
+                "status": "started",
+                "raw_output": "not_returned",
+            },
+        ):
+            result = server_module.call_tool("agent_start", {})
+
+        self.assertEqual(
+            [item["agent"] for item in result["results"]],
+            ["a1", "b1"],
+        )
+        self.assertFalse(result["broad_selection"]["required"])
+
     @patch("codex_master.server.status_agent")
     def test_multi_agent_status_results_are_paged_for_broad_selectors(self, mock_status_agent) -> None:
         mock_status_agent.side_effect = lambda agent, **_kwargs: {
