@@ -42,6 +42,7 @@ _BACKEND_ACCOUNT: Final[re.Pattern[str]] = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z", re.ASCII
 )
 _FINAL_NAME: Final[str] = "auth.json"
+_CLAIM_XATTR: Final[str] = "user.codex_master_claim"
 _ERROR_CODES: Final[frozenset[str]] = frozenset(
     {
         "control.plan_stale",
@@ -562,12 +563,14 @@ class _MaterializedAuth:
         "_account_ref",
         "_descriptor",
         "_file_metadata",
+        "_finalize_lock",
         "_invalidated",
         "_lease",
         "_lock",
         "_published",
         "_runtime_fd",
         "_runtime_metadata",
+        "_temporary_name",
     )
 
     def __init__(
@@ -575,16 +578,19 @@ class _MaterializedAuth:
         account_ref: str,
         runtime_fd: int,
         runtime_metadata: tuple[int, ...],
+        temporary_name: str,
     ) -> None:
         self._account_ref = account_ref
-        self._runtime_fd = runtime_fd
+        self._runtime_fd: int | None = runtime_fd
         self._runtime_metadata = runtime_metadata
+        self._temporary_name = temporary_name
         self._descriptor: int | None = None
         self._file_metadata: tuple[int, ...] | None = None
         self._published = False
         self._invalidated = False
         self._lease: CredentialLease | None = None
         self._lock = threading.RLock()
+        self._finalize_lock = threading.Lock()
 
     @property
     def published(self) -> bool:
@@ -596,6 +602,24 @@ class _MaterializedAuth:
         with self._lock:
             return self._invalidated
 
+    def prepare(self) -> tuple[int, ...]:
+        with self._lock:
+            if self._descriptor is not None:
+                raise OpenAICredentialError("credential.source_unavailable")
+            if self._runtime_fd is None:
+                raise OpenAICredentialError("credential.source_unavailable")
+            descriptor, metadata = _prepare_auth(
+                self._runtime_fd, self._runtime_metadata, self._temporary_name
+            )
+            self._descriptor = descriptor
+            return metadata
+
+    def bind_lease(self, lease: CredentialLease) -> None:
+        with self._lock:
+            if self._lease is not None:
+                raise OpenAICredentialError("credential.source_unavailable")
+            self._lease = lease
+
     def publish(
         self,
         payload: bytearray,
@@ -604,13 +628,21 @@ class _MaterializedAuth:
         with self._lock:
             if self._invalidated:
                 raise OpenAICredentialError("credential.source_unavailable")
-            descriptor, metadata = _publish_auth(
-                self._runtime_fd, self._runtime_metadata, payload, record_file
+            if self._descriptor is None:
+                raise OpenAICredentialError("credential.source_unavailable")
+            if self._runtime_fd is None:
+                raise OpenAICredentialError("credential.source_unavailable")
+            metadata = _publish_auth(
+                self._runtime_fd,
+                self._runtime_metadata,
+                self._temporary_name,
+                self._descriptor,
+                payload,
+                record_file,
             )
-            self._descriptor = descriptor
             self._file_metadata = metadata
             self._published = True
-            return descriptor, metadata
+            return self._descriptor, metadata
 
     def invalidate(self) -> None:
         with self._lock:
@@ -627,10 +659,13 @@ class _MaterializedAuth:
             return
         if self._descriptor is None or self._file_metadata is None:
             raise OpenAICredentialError("credential.source_unavailable")
+        if self._runtime_fd is None:
+            raise OpenAICredentialError("credential.source_unavailable")
         try:
             _remove_auth(
                 self._runtime_fd,
                 self._runtime_metadata,
+                self._temporary_name,
                 self._descriptor,
                 self._file_metadata,
             )
@@ -642,10 +677,18 @@ class _MaterializedAuth:
         else:
             self._published = False
 
-    def release_fds(self) -> None:
+    def lease(self) -> CredentialLease | None:
         with self._lock:
-            _close(self._descriptor)
+            return self._lease
+
+    def take_resources(self) -> tuple[int | None, int | None]:
+        with self._lock:
+            descriptor = self._descriptor
+            runtime_fd = self._runtime_fd
             self._descriptor = None
+            self._runtime_fd = None
+            self._lease = None
+            return descriptor, runtime_fd
 
 
 class OpenAICredentialService:
@@ -857,22 +900,25 @@ class OpenAICredentialService:
         runtime_fd, runtime_metadata, runtime_path = _duplicate_runtime_dir(
             runtime_dir_fd
         )
-        entry = _MaterializedAuth(account_ref, runtime_fd, runtime_metadata)
+        temporary_name = _materialization_temporary_name()
+        entry = _MaterializedAuth(
+            account_ref, runtime_fd, runtime_metadata, temporary_name
+        )
         payload = bytearray()
         owner_pid = self._process_id
         registered = False
         active: CredentialLease | None = None
         try:
-            with self._lock:
-                if self._closed:
-                    raise OpenAICredentialError("credential.source_unavailable")
-                if account_ref in self._materializing_accounts:
-                    raise OpenAICredentialError("credential.source_unavailable")
-                self._materializing_accounts.add(account_ref)
-                self._materializations.add(entry)
-                registered = True
-                self._ensure_janitor_locked()
-            try:
+            with entry._finalize_lock:  # noqa: SLF001 - setup/finalize boundary
+                with self._lock:
+                    if self._closed:
+                        raise OpenAICredentialError("credential.source_unavailable")
+                    if account_ref in self._materializing_accounts:
+                        raise OpenAICredentialError("credential.source_unavailable")
+                    self._materializing_accounts.add(account_ref)
+                    self._materializations.add(entry)
+                    registered = True
+                    self._ensure_janitor_locked()
                 with self._identity_source.guard(account_ref) as identity:
                     if (
                         not identity.enabled
@@ -885,10 +931,12 @@ class OpenAICredentialService:
                         ttl_seconds=MAX_AUTH_SYNC_PLAN_SECONDS,
                         invalidator=entry.invalidate,
                         cleanup_target=CredentialCleanupTarget(
-                            runtime_path, runtime_metadata
+                            runtime_path, runtime_metadata, temporary_name
                         ),
+                        prepare=entry.prepare,
                     )
-                    entry._lease = active  # noqa: SLF001 - registry binds cleanup claim
+                    entry.bind_lease(active)
+            try:
                 payload = bytearray(plaintext)
                 self._vault.publish_active(
                     active,
@@ -937,7 +985,9 @@ class OpenAICredentialService:
         with self._lock:
             entries = tuple(self._materializations)
         for entry in entries:
-            if entry.invalidated and entry.published:
+            if not entry.invalidated:
+                continue
+            if entry.published:
                 try:
                     entry.close()
                 except OpenAICredentialError:
@@ -950,8 +1000,6 @@ class OpenAICredentialService:
 
         self._ensure_current_process()
         with self._lock:
-            if self._closed:
-                return
             self._closed = True
             self._janitor_stop.set()
             thread = self._janitor_thread
@@ -961,31 +1009,23 @@ class OpenAICredentialService:
             entries = tuple(self._materializations)
         failed = False
         for entry in entries:
+            cleanup_failed = False
             try:
                 entry.close()
             except OpenAICredentialError:
                 failed = True
+                cleanup_failed = True
+            if cleanup_failed:
+                try:
+                    self._mark_entry_orphaned(entry)
+                except OpenAICredentialError:
+                    failed = True
+                continue
             if not entry.published:
                 try:
                     self._finalize_entry(entry, registered=True)
                 except OpenAICredentialError:
                     failed = True
-            else:
-                lease = entry._lease  # noqa: SLF001 - registry owns claim
-                if lease is not None:
-                    try:
-                        self._vault.abandon_materialization(lease)
-                    except CredentialVaultError:
-                        failed = True
-                    try:
-                        self._vault.release_materialization(lease)
-                    except CredentialVaultError:
-                        failed = True
-                entry.release_fds()
-                _close(entry._runtime_fd)  # noqa: SLF001 - registry owns duplicate
-                with self._lock:
-                    self._materializing_accounts.discard(entry._account_ref)  # noqa: SLF001
-                    self._materializations.discard(entry)
         if failed:
             raise OpenAICredentialError("credential.source_unavailable")
 
@@ -993,24 +1033,38 @@ class OpenAICredentialService:
         self._ensure_current_process()
         return self
 
-    def __exit__(self, *_exc: object) -> None:
-        self.close()
+    def __exit__(self, _exc_type: object, primary: object, _traceback: object) -> None:
+        try:
+            self.close()
+        except OpenAICredentialError:
+            if primary is None:
+                raise
 
     def _finalize_entry(self, entry: _MaterializedAuth, *, registered: bool) -> None:
-        lease = entry._lease  # noqa: SLF001 - registry owns claim
-        try:
-            if lease is not None:
-                self._vault.complete_materialization(lease)
-                self._vault.release_materialization(lease)
-                entry._lease = None  # noqa: SLF001 - registry owns claim
-        except CredentialVaultError:
-            raise OpenAICredentialError("credential.source_unavailable") from None
-        with self._lock:
-            if registered:
-                self._materializing_accounts.discard(entry._account_ref)  # noqa: SLF001
-                self._materializations.discard(entry)
-        entry.release_fds()
-        _close(entry._runtime_fd)  # noqa: SLF001 - registry owns duplicate
+        with entry._finalize_lock:  # noqa: SLF001 - service owns entry lifecycle
+            lease = entry.lease()
+            try:
+                if lease is not None:
+                    self._vault.complete_materialization(lease)
+                    self._vault.release_materialization(lease)
+            except CredentialVaultError:
+                raise OpenAICredentialError("credential.source_unavailable") from None
+            descriptor, runtime_fd = entry.take_resources()
+            with self._lock:
+                if registered:
+                    self._materializing_accounts.discard(entry._account_ref)  # noqa: SLF001
+                    self._materializations.discard(entry)
+            _close(descriptor)
+            _close(runtime_fd)
+
+    def _mark_entry_orphaned(self, entry: _MaterializedAuth) -> None:
+        with entry._finalize_lock:  # noqa: SLF001 - service owns entry lifecycle
+            lease = entry.lease()
+            try:
+                if lease is not None:
+                    self._vault.abandon_materialization(lease)
+            except CredentialVaultError:
+                raise OpenAICredentialError("credential.source_unavailable") from None
 
     def _ensure_janitor_locked(self) -> None:
         if self._janitor_started:
@@ -1246,13 +1300,15 @@ def _raw_directory_metadata(value: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _file_metadata(value: os.stat_result, expected_size: int) -> tuple[int, ...]:
+def _file_metadata(
+    value: os.stat_result, expected_size: int, *, expected_links: int = 1
+) -> tuple[int, ...]:
     if (
         not stat.S_ISREG(value.st_mode)
         or stat.S_IMODE(value.st_mode) != 0o600
         or value.st_uid != os.geteuid()
         or value.st_gid != os.getegid()
-        or value.st_nlink != 1
+        or value.st_nlink != expected_links
         or value.st_size != expected_size
     ):
         raise OpenAICredentialError("credential.source_unavailable")
@@ -1311,6 +1367,23 @@ def _duplicate_runtime_dir(value: object) -> tuple[int, tuple[int, ...], str]:
         raise OpenAICredentialError("credential.source_unavailable") from None
 
 
+def _materialization_temporary_name() -> str:
+    try:
+        random_part = os.urandom(32).hex()
+    except Exception:
+        raise OpenAICredentialError("credential.source_unavailable") from None
+    if re.fullmatch(r"[0-9a-f]{64}", random_part, re.ASCII) is None:
+        raise OpenAICredentialError("credential.source_unavailable")
+    return f".{_FINAL_NAME}.{random_part}.tmp"
+
+
+def _temporary_claim_token(temporary_name: str) -> bytes:
+    match = re.fullmatch(r"\.auth\.json\.([0-9a-f]{64})\.tmp", temporary_name)
+    if match is None:
+        raise OpenAICredentialError("credential.source_unavailable")
+    return match.group(1).encode("ascii")
+
+
 def _reattest_directory(fd: int, expected: tuple[int, ...]) -> None:
     try:
         observed = _directory_metadata(os.fstat(fd))
@@ -1322,26 +1395,57 @@ def _reattest_directory(fd: int, expected: tuple[int, ...]) -> None:
         raise OpenAICredentialError("credential.source_unavailable")
 
 
-def _publish_auth(
+def _prepare_auth(
     runtime_fd: int,
     runtime_metadata: tuple[int, ...],
-    payload: bytearray,
-    record_file: Callable[[tuple[int, ...]], None],
+    temporary_name: str,
 ) -> tuple[int, tuple[int, ...]]:
-    temporary = ""
     descriptor: int | None = None
-    linked = False
     succeeded = False
     try:
         _reattest_directory(runtime_fd, runtime_metadata)
-        temporary = f".{_FINAL_NAME}.tmp"
         descriptor = os.open(
-            temporary,
+            temporary_name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
             0o600,
             dir_fd=runtime_fd,
         )
         os.fchmod(descriptor, 0o600)
+        claim_token = _temporary_claim_token(temporary_name)
+        os.setxattr(descriptor, _CLAIM_XATTR, claim_token, flags=os.XATTR_CREATE)
+        if not hmac.compare_digest(os.getxattr(descriptor, _CLAIM_XATTR), claim_token):
+            raise OpenAICredentialError("credential.source_unavailable")
+        os.fsync(descriptor)
+        os.fsync(runtime_fd)
+        metadata = _file_metadata(os.fstat(descriptor), 0)
+        _reattest_directory(runtime_fd, runtime_metadata)
+        succeeded = True
+        return descriptor, metadata
+    except OpenAICredentialError:
+        raise
+    except Exception:
+        raise OpenAICredentialError("credential.source_unavailable") from None
+    finally:
+        if not succeeded:
+            _close(descriptor)
+            try:
+                os.unlink(temporary_name, dir_fd=runtime_fd)
+                os.fsync(runtime_fd)
+            except OSError:
+                pass
+
+
+def _publish_auth(
+    runtime_fd: int,
+    runtime_metadata: tuple[int, ...],
+    temporary_name: str,
+    descriptor: int,
+    payload: bytearray,
+    record_file: Callable[[tuple[int, ...]], None],
+) -> tuple[int, ...]:
+    try:
+        _reattest_directory(runtime_fd, runtime_metadata)
+        _file_metadata(os.fstat(descriptor), 0)
         offset = 0
         while offset < len(payload):
             written = os.write(descriptor, payload[offset:])
@@ -1353,15 +1457,13 @@ def _publish_auth(
         record_file(before)
         _reattest_directory(runtime_fd, runtime_metadata)
         os.link(
-            temporary,
+            temporary_name,
             _FINAL_NAME,
             src_dir_fd=runtime_fd,
             dst_dir_fd=runtime_fd,
             follow_symlinks=False,
         )
-        linked = True
-        os.unlink(temporary, dir_fd=runtime_fd)
-        temporary = ""
+        os.unlink(temporary_name, dir_fd=runtime_fd)
         os.fsync(runtime_fd)
         _reattest_directory(runtime_fd, runtime_metadata)
         named = _file_metadata(
@@ -1371,41 +1473,17 @@ def _publish_auth(
         opened = _file_metadata(os.fstat(descriptor), len(payload))
         if before[:2] != named[:2] or named != opened:
             raise OpenAICredentialError("credential.source_unavailable")
-        succeeded = True
-        return descriptor, opened
+        return opened
     except OpenAICredentialError:
         raise
     except Exception:
         raise OpenAICredentialError("credential.source_unavailable") from None
-    finally:
-        if temporary:
-            try:
-                os.unlink(temporary, dir_fd=runtime_fd)
-                os.fsync(runtime_fd)
-            except OSError:
-                pass
-        if not succeeded and linked and descriptor is not None:
-            try:
-                named_info = os.stat(
-                    _FINAL_NAME,
-                    dir_fd=runtime_fd,
-                    follow_symlinks=False,
-                )
-                if (named_info.st_dev, named_info.st_ino) == (
-                    os.fstat(descriptor).st_dev,
-                    os.fstat(descriptor).st_ino,
-                ):
-                    os.unlink(_FINAL_NAME, dir_fd=runtime_fd)
-                    os.fsync(runtime_fd)
-            except OSError:
-                pass
-        if not succeeded and descriptor is not None:
-            _close(descriptor)
 
 
 def _remove_auth(
     runtime_fd: int,
     runtime_metadata: tuple[int, ...],
+    temporary_name: str,
     descriptor: int,
     expected_metadata: tuple[int, ...],
 ) -> None:
@@ -1415,6 +1493,11 @@ def _remove_auth(
             raise OpenAICredentialError("credential.source_unavailable")
         directory_drifted = directory_before != runtime_metadata
         opened = _raw_file_metadata(os.fstat(descriptor))
+        if not hmac.compare_digest(
+            os.getxattr(descriptor, _CLAIM_XATTR),
+            _temporary_claim_token(temporary_name),
+        ):
+            raise OpenAICredentialError("credential.source_unavailable")
         named_info = os.stat(
             _FINAL_NAME,
             dir_fd=runtime_fd,

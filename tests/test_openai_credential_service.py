@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import hashlib
 import hmac
 import json
@@ -1061,3 +1062,329 @@ def test_cleanup_claim_survives_service_restart(
             os.stat(runtime / "auth.json", follow_symlinks=False)
     finally:
         restarted.close()
+
+
+def test_materialization_claim_is_durable_before_projection_decrypt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = synced_service(tmp_path)
+    runtime_fd = open_private_runtime(tmp_path / "runtime")
+    observed: list[bool] = []
+
+    def crash_at_decrypt(
+        _vault: CredentialVault, _raw: bytes, _account_ref: str
+    ) -> tuple[int, int, bytes]:
+        try:
+            document = json.loads(
+                (tmp_path / "vault" / "materialization-claims.json").read_text(
+                    encoding="ascii"
+                )
+            )
+        except FileNotFoundError:
+            observed.append(False)
+        else:
+            observed.append(len(document["claims"]) == 1)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(CredentialVault, "_decrypt_record", crash_at_decrypt)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            with service.materialize_auth_lease(
+                "openai-one", expected_generation=2, runtime_dir_fd=runtime_fd
+            ):
+                pass
+        assert observed == [True]
+    finally:
+        os.close(runtime_fd)
+
+
+def test_secret_write_starts_only_after_durable_temp_inode_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = synced_service(tmp_path)
+    runtime_fd = open_private_runtime(tmp_path / "runtime")
+    real_write = os.write
+    observed: list[bool] = []
+
+    def crash_after_first_secret_write(descriptor: int, payload: bytes) -> int:
+        name = Path(os.readlink(f"/proc/self/fd/{descriptor}")).name
+        written = real_write(descriptor, payload)
+        if name.startswith(".auth.json.") and name.endswith(".tmp"):
+            document = json.loads(
+                (tmp_path / "vault" / "materialization-claims.json").read_text(
+                    encoding="ascii"
+                )
+            )
+            observed.append(document["claims"][0]["file_metadata"] is not None)
+            raise KeyboardInterrupt
+        return written
+
+    monkeypatch.setattr(service_module.os, "write", crash_after_first_secret_write)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            with service.materialize_auth_lease(
+                "openai-one", expected_generation=2, runtime_dir_fd=runtime_fd
+            ):
+                pass
+        assert observed == [True]
+        assert not tuple((tmp_path / "runtime").iterdir())
+    finally:
+        os.close(runtime_fd)
+
+
+def test_prepare_crash_leaves_only_recoverable_empty_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = synced_service(tmp_path)
+    runtime = tmp_path / "runtime"
+    runtime_fd = open_private_runtime(runtime)
+    real_fsync = os.fsync
+    real_unlink = os.unlink
+
+    def crash_before_prepared_metadata(descriptor: int) -> None:
+        name = Path(os.readlink(f"/proc/self/fd/{descriptor}")).name
+        if name.startswith(".auth.json.") and name.endswith(".tmp"):
+            raise KeyboardInterrupt
+        real_fsync(descriptor)
+
+    def retain_temporary(name: object, *args: object, **kwargs: object) -> None:
+        if str(name).startswith(".auth.json.") and str(name).endswith(".tmp"):
+            raise OSError
+        real_unlink(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    try:
+        with monkeypatch.context() as patching:
+            patching.setattr(service_module.os, "fsync", crash_before_prepared_metadata)
+            patching.setattr(service_module.os, "unlink", retain_temporary)
+            with pytest.raises(KeyboardInterrupt):
+                with service.materialize_auth_lease(
+                    "openai-one", expected_generation=2, runtime_dir_fd=runtime_fd
+                ):
+                    pass
+        claim_document = json.loads(
+            (tmp_path / "vault" / "materialization-claims.json").read_text(
+                encoding="ascii"
+            )
+        )
+        assert claim_document["claims"][0]["file_metadata"] is None
+        assert len(tuple(runtime.iterdir())) == 1
+
+        restarted = make_service(tmp_path)
+        restarted.close()
+        assert not tuple(runtime.iterdir())
+        service.close()
+    finally:
+        os.close(runtime_fd)
+
+
+def test_janitor_does_not_finalize_valid_unpublished_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = make_service(tmp_path)
+    runtime_fd = open_private_runtime(tmp_path / "runtime")
+    owned_fd, metadata, _path = service_module._duplicate_runtime_dir(runtime_fd)
+    entry = service_module._MaterializedAuth(
+        "openai-one",
+        owned_fd,
+        metadata,
+        service_module._materialization_temporary_name(),
+    )
+    finalized: list[object] = []
+    with service._lock:  # noqa: SLF001 - exercise setup registry race
+        service._materializing_accounts.add("openai-one")  # noqa: SLF001
+        service._materializations.add(entry)  # noqa: SLF001
+    try:
+        with monkeypatch.context() as patching:
+            patching.setattr(
+                OpenAICredentialService,
+                "_finalize_entry",
+                lambda *_args, **_kwargs: finalized.append(entry),
+            )
+            service.reap_materializations()
+        assert finalized == []
+        service.close()
+    finally:
+        os.close(runtime_fd)
+
+
+def test_failed_service_close_can_retry_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = synced_service(tmp_path)
+    runtime_fd = open_private_runtime(tmp_path / "runtime")
+    context = service.materialize_auth_lease(
+        "openai-one", expected_generation=2, runtime_dir_fd=runtime_fd
+    )
+    context.__enter__()
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise OpenAICredentialError("credential.source_unavailable")
+
+    def fail_vault(*_args: object, **_kwargs: object) -> None:
+        raise CredentialVaultError("credential.source_unavailable")
+
+    try:
+        with monkeypatch.context() as patching:
+            patching.setattr(service_module, "_remove_auth", fail)
+            patching.setattr(CredentialVault, "abandon_materialization", fail_vault)
+            with pytest.raises(
+                OpenAICredentialError, match="credential.source_unavailable"
+            ):
+                service.close()
+        service.close()
+        with pytest.raises(FileNotFoundError):
+            os.stat("auth.json", dir_fd=runtime_fd, follow_symlinks=False)
+    finally:
+        context.__exit__(None, None, None)
+        os.close(runtime_fd)
+
+
+def test_parallel_context_and_service_finalization_never_double_closes_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = synced_service(tmp_path)
+    runtime_fd = open_private_runtime(tmp_path / "runtime")
+    context = service.materialize_auth_lease(
+        "openai-one", expected_generation=2, runtime_dir_fd=runtime_fd
+    )
+    context.__enter__()
+    entry = next(iter(service._materializations))  # noqa: SLF001
+    owned_runtime_fd = entry._runtime_fd  # noqa: SLF001
+    close_barrier = threading.Barrier(2)
+    real_entry_close = service_module._MaterializedAuth.close  # noqa: SLF001
+    real_close = service_module._close  # noqa: SLF001
+    replacement: list[int] = []
+    target_closes = 0
+    close_lock = threading.Lock()
+    errors: list[BaseException] = []
+
+    def synchronized_entry_close(value: object) -> None:
+        real_entry_close(value)  # type: ignore[arg-type]
+        close_barrier.wait(timeout=2)
+
+    def reuse_after_first_close(value: int | None) -> None:
+        nonlocal target_closes
+        if value != owned_runtime_fd:
+            real_close(value)
+            return
+        with close_lock:
+            target_closes += 1
+            real_close(value)
+            if target_closes == 1:
+                replacement.append(os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC))
+
+    def run(action: Callable[[], object]) -> None:
+        try:
+            action()
+        except BaseException as exc:  # pragma: no branch - assertion reports it
+            errors.append(exc)
+
+    monkeypatch.setattr(
+        service_module._MaterializedAuth, "close", synchronized_entry_close
+    )
+    monkeypatch.setattr(service_module, "_close", reuse_after_first_close)
+    context_thread = threading.Thread(
+        target=run, args=(lambda: context.__exit__(None, None, None),)
+    )
+    close_thread = threading.Thread(target=run, args=(service.close,))
+    context_thread.start()
+    close_thread.start()
+    context_thread.join(timeout=3)
+    close_thread.join(timeout=3)
+    try:
+        assert not context_thread.is_alive()
+        assert not close_thread.is_alive()
+        assert errors == []
+        assert len(replacement) == 1
+        os.fstat(replacement[0])
+    finally:
+        if replacement:
+            try:
+                os.close(replacement[0])
+            except OSError:
+                pass
+        os.close(runtime_fd)
+
+
+def test_service_context_preserves_primary_baseexception_on_cleanup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = synced_service(tmp_path)
+    runtime_fd = open_private_runtime(tmp_path / "runtime")
+
+    def fail_remove(*_args: object, **_kwargs: object) -> None:
+        raise OpenAICredentialError("credential.source_unavailable")
+
+    try:
+        with monkeypatch.context() as patching:
+            patching.setattr(service_module, "_remove_auth", fail_remove)
+            with pytest.raises(KeyboardInterrupt):
+                with service:
+                    with service.materialize_auth_lease(
+                        "openai-one",
+                        expected_generation=2,
+                        runtime_dir_fd=runtime_fd,
+                    ):
+                        raise KeyboardInterrupt
+        restarted = make_service(tmp_path)
+        restarted.close()
+        service.close()
+    finally:
+        os.close(runtime_fd)
+
+
+def test_restart_cleanup_never_unlinks_replacement_without_claim_temp_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = synced_service(tmp_path)
+    runtime = tmp_path / "runtime"
+    runtime_fd = open_private_runtime(runtime)
+    context = service.materialize_auth_lease(
+        "openai-one", expected_generation=2, runtime_dir_fd=runtime_fd
+    )
+    context.__enter__()
+    claim = json.loads(
+        (tmp_path / "vault" / "materialization-claims.json").read_text(encoding="ascii")
+    )["claims"][0]
+    claim_token = claim["temporary_name"].split(".")[-2].encode("ascii")
+    assert os.getxattr(runtime / "auth.json", "user.codex_master_claim") == claim_token
+    os.unlink("auth.json", dir_fd=runtime_fd)
+    replacement = b"foreign-runtime-file"
+    replacement_fd = os.open(
+        "auth.json",
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+        dir_fd=runtime_fd,
+    )
+    try:
+        os.write(replacement_fd, replacement)
+        os.fsync(replacement_fd)
+    finally:
+        os.close(replacement_fd)
+    os.fsync(runtime_fd)
+
+    def fail_remove(*_args: object, **_kwargs: object) -> None:
+        raise OpenAICredentialError("credential.source_unavailable")
+
+    try:
+        with monkeypatch.context() as patching:
+            patching.setattr(service_module, "_remove_auth", fail_remove)
+            with pytest.raises(
+                OpenAICredentialError, match="credential.source_unavailable"
+            ):
+                context.__exit__(None, None, None)
+            with pytest.raises(
+                OpenAICredentialError, match="credential.source_unavailable"
+            ):
+                service.close()
+        restarted = make_service(tmp_path)
+        try:
+            assert (runtime / "auth.json").read_bytes() == replacement
+            os.unlink("auth.json", dir_fd=runtime_fd)
+            os.fsync(runtime_fd)
+            restarted._vault.recover_materializations()  # noqa: SLF001
+        finally:
+            restarted.close()
+        service.close()
+    finally:
+        os.close(runtime_fd)

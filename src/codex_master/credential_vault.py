@@ -55,7 +55,10 @@ _MATERIALIZATION_DOCUMENT: Final[PurePosixPath] = PurePosixPath(
 _MAX_MATERIALIZATION_BYTES: Final[int] = 2 * 1024 * 1024
 _MAX_RUNTIME_PATH_BYTES: Final[int] = 4096
 _MATERIALIZED_NAME: Final[str] = "auth.json"
-_MATERIALIZED_TEMP_NAME: Final[str] = ".auth.json.tmp"
+_MATERIALIZED_CLAIM_XATTR: Final[str] = "user.codex_master_claim"
+_MATERIALIZED_TEMP_NAME: Final[re.Pattern[str]] = re.compile(
+    r"\.auth\.json\.[0-9a-f]{64}\.tmp\Z", re.ASCII
+)
 _ERROR_CODES: Final[frozenset[str]] = frozenset(
     {
         "credential.generation_conflict",
@@ -113,6 +116,7 @@ class CredentialCleanupTarget:
 
     directory_path: str
     directory_metadata: tuple[int, ...]
+    temporary_name: str
 
     def __repr__(self) -> str:
         return "CredentialCleanupTarget(<redacted>)"
@@ -385,6 +389,7 @@ class CredentialVault:
         ttl_seconds: int,
         invalidator: Callable[[], None],
         cleanup_target: CredentialCleanupTarget,
+        prepare: Callable[[], tuple[int, ...]],
     ) -> Iterator[tuple[CredentialLease, bytes]]:
         """Issue one durable active lease with exactly one projection read."""
 
@@ -394,6 +399,7 @@ class CredentialVault:
             ttl_seconds=ttl_seconds,
             invalidator=invalidator,
             cleanup_target=cleanup_target,
+            prepare=prepare,
         )
         try:
             yield active, plaintext
@@ -408,6 +414,7 @@ class CredentialVault:
         ttl_seconds: int,
         invalidator: Callable[[], None],
         cleanup_target: CredentialCleanupTarget,
+        prepare: Callable[[], tuple[int, ...]],
     ) -> tuple[CredentialLease, bytes]:
         """Persist one account claim before returning decrypted bytes."""
 
@@ -419,6 +426,7 @@ class CredentialVault:
             or not isinstance(ttl_seconds, int)
             or not 1 <= ttl_seconds <= MAX_LEASE_SECONDS
             or not callable(invalidator)
+            or not callable(prepare)
         ):
             raise CredentialVaultError("credential.vault_request_invalid")
         target = self._validated_cleanup_target(cleanup_target)
@@ -428,11 +436,6 @@ class CredentialVault:
                 claims = self._read_materialization_claims_locked()
                 if any(claim["account_ref"] == account_ref for claim in claims):
                     raise CredentialVaultError("credential.lease_limit")
-                current = self._read_or_migrate_locked(account_ref)
-                if current is None or current[0] != _STATE_ACTIVE:
-                    raise CredentialVaultError("credential.source_unavailable")
-                if current[1] != expected_generation:
-                    raise CredentialVaultError("credential.generation_conflict")
                 with self._lease_lock:
                     if len(self._leases) >= MAX_ACTIVE_LEASES:
                         raise CredentialVaultError("credential.lease_limit")
@@ -455,6 +458,7 @@ class CredentialVault:
                             "owner_pid": self._process_id,
                             "owner_start_ticks": self._owner_start_ticks,
                             "state": "leased",
+                            "temporary_name": target.temporary_name,
                             "token": token,
                         }
                     )
@@ -462,7 +466,30 @@ class CredentialVault:
                     self._leases[token] = state
                     self._active_leases.add(token)
                     self._lease_invalidators[token] = invalidator
+                try:
+                    prepared_metadata = self._validated_file_metadata(
+                        prepare(), allow_empty=True
+                    )
+                    claim = claims[-1]
+                    claim["file_metadata"] = list(prepared_metadata)
+                    self._write_materialization_claims_locked(claims)
+                    current = self._read_or_migrate_locked(account_ref)
+                    if current is None or current[0] != _STATE_ACTIVE:
+                        raise CredentialVaultError("credential.source_unavailable")
+                    if current[1] != expected_generation:
+                        raise CredentialVaultError("credential.generation_conflict")
                     plaintext = current[2]
+                except BaseException:
+                    with self._lease_lock:
+                        self._remove_leases_locked((token,))
+                    try:
+                        claims[-1]["state"] = "invalidated"
+                        if self._cleanup_claim(claims[-1]):
+                            claims.pop()
+                        self._write_materialization_claims_locked(claims)
+                    except BaseException:
+                        pass
+                    raise
         except CredentialVaultError:
             raise
         except HiveStateError:
@@ -561,7 +588,7 @@ class CredentialVault:
                 result = effect(record_file)
                 metadata = self._validated_file_metadata(result[1])
                 recorded = tuple(cast(list[int], claim["file_metadata"]))
-                if recorded[:6] != metadata[:6] or recorded[6] != metadata[6]:
+                if recorded[:5] != metadata[:5] or recorded[6] != metadata[6]:
                     raise CredentialVaultError("credential.source_unavailable")
                 claim["file_metadata"] = list(metadata)
                 claim["state"] = "published"
@@ -1011,6 +1038,8 @@ class CredentialVault:
             or "\x00" in value.directory_path
             or len(value.directory_path.encode("utf-8", errors="replace"))
             > _MAX_RUNTIME_PATH_BYTES
+            or type(value.temporary_name) is not str
+            or _MATERIALIZED_TEMP_NAME.fullmatch(value.temporary_name) is None
         ):
             raise CredentialVaultError("credential.vault_request_invalid")
         metadata = value.directory_metadata
@@ -1030,7 +1059,9 @@ class CredentialVault:
         return value
 
     @staticmethod
-    def _validated_file_metadata(value: object) -> tuple[int, ...]:
+    def _validated_file_metadata(
+        value: object, *, allow_empty: bool = False
+    ) -> tuple[int, ...]:
         if (
             type(value) is not tuple
             or len(value) != 9
@@ -1041,8 +1072,8 @@ class CredentialVault:
             or stat.S_IMODE(value[2]) != 0o600
             or value[3] != os.geteuid()
             or value[4] != os.getegid()
-            or value[5] != 1
-            or not 0 < value[6] <= MAX_PROJECTION_BYTES
+            or value[5] not in {1, 2}
+            or not (0 if allow_empty else 1) <= value[6] <= MAX_PROJECTION_BYTES
         ):
             raise CredentialVaultError("credential.source_unavailable")
         return value
@@ -1106,6 +1137,7 @@ class CredentialVault:
             "owner_pid",
             "owner_start_ticks",
             "state",
+            "temporary_name",
             "token",
         }
         if not isinstance(value, Mapping) or set(value) != fields:
@@ -1117,6 +1149,7 @@ class CredentialVault:
             target = CredentialCleanupTarget(
                 cast(str, claim["directory_path"]),
                 tuple(cast(list[int], claim["directory_metadata"])),
+                cast(str, claim["temporary_name"]),
             )
             self._validated_cleanup_target(target)
         except (CredentialVaultError, TypeError):
@@ -1150,7 +1183,9 @@ class CredentialVault:
             raise CredentialVaultError("credential.vault_schema_invalid")
         if file_metadata is not None:
             try:
-                self._validated_file_metadata(tuple(cast(list[int], file_metadata)))
+                self._validated_file_metadata(
+                    tuple(cast(list[int], file_metadata)), allow_empty=True
+                )
             except CredentialVaultError:
                 raise CredentialVaultError("credential.vault_schema_invalid") from None
         claim["expires_at"] = float(expires_at)
@@ -1201,33 +1236,55 @@ class CredentialVault:
                 cast(list[int], claim["directory_metadata"])
             ):
                 return False
+            temporary_name = cast(str, claim["temporary_name"])
             expected = claim["file_metadata"]
-            present: list[tuple[str, os.stat_result]] = []
-            for name in (_MATERIALIZED_TEMP_NAME, _MATERIALIZED_NAME):
+            present: dict[str, os.stat_result] = {}
+            for name in (temporary_name, _MATERIALIZED_NAME):
                 try:
-                    present.append(
-                        (
-                            name,
-                            os.stat(name, dir_fd=descriptor, follow_symlinks=False),
-                        )
+                    present[name] = os.stat(
+                        name, dir_fd=descriptor, follow_symlinks=False
                     )
                 except FileNotFoundError:
                     pass
+            temporary = present.get(temporary_name)
+            final = present.get(_MATERIALIZED_NAME)
             if expected is None:
-                return not present
+                if temporary is None:
+                    return final is None
+                if final is not None or not self._safe_unbound_temporary(temporary):
+                    return False
+                os.unlink(temporary_name, dir_fd=descriptor)
+                os.fsync(descriptor)
+                return True
+            claim_token = temporary_name.split(".")[-2].encode("ascii")
+            if any(
+                not self._claim_xattr_matches(descriptor, name, observed, claim_token)
+                for name, observed in present.items()
+            ):
+                return False
             expected_metadata = tuple(cast(list[int], expected))
-            for _name, observed in present:
+            if any(
+                not self._bound_materialized_file(observed, expected_metadata)
+                for observed in present.values()
+            ):
+                return False
+            if (
+                temporary is not None
+                and final is not None
+                and (
+                    final.st_dev,
+                    final.st_ino,
+                )
+                != (temporary.st_dev, temporary.st_ino)
+            ):
+                return False
+            if claim["state"] == "published" and final is not None:
                 if (
-                    not stat.S_ISREG(observed.st_mode)
-                    or stat.S_IMODE(observed.st_mode) != 0o600
-                    or observed.st_uid != os.geteuid()
-                    or observed.st_gid != os.getegid()
-                    or observed.st_nlink not in {1, 2}
-                    or (observed.st_dev, observed.st_ino) != expected_metadata[:2]
-                    or observed.st_size != expected_metadata[6]
+                    temporary is not None
+                    or self._raw_file_metadata(final) != expected_metadata
                 ):
                     return False
-            for name, _observed in present:
+            for name in present:
                 os.unlink(name, dir_fd=descriptor)
             if present:
                 os.fsync(descriptor)
@@ -1240,6 +1297,59 @@ class CredentialVault:
                     os.close(descriptor)
                 except OSError:
                     pass
+
+    @staticmethod
+    def _safe_unbound_temporary(value: os.stat_result) -> bool:
+        return (
+            stat.S_ISREG(value.st_mode)
+            and stat.S_IMODE(value.st_mode) == 0o600
+            and value.st_uid == os.geteuid()
+            and value.st_gid == os.getegid()
+            and value.st_nlink == 1
+            and value.st_size == 0
+        )
+
+    @staticmethod
+    def _claim_xattr_matches(
+        directory_fd: int,
+        name: str,
+        named: os.stat_result,
+        expected: bytes,
+    ) -> bool:
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory_fd
+            )
+            opened = os.fstat(descriptor)
+            return (opened.st_dev, opened.st_ino) == (
+                named.st_dev,
+                named.st_ino,
+            ) and hmac.compare_digest(
+                os.getxattr(descriptor, _MATERIALIZED_CLAIM_XATTR), expected
+            )
+        except OSError:
+            return False
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _bound_materialized_file(
+        value: os.stat_result, expected: tuple[int, ...]
+    ) -> bool:
+        return (
+            stat.S_ISREG(value.st_mode)
+            and stat.S_IMODE(value.st_mode) == 0o600
+            and value.st_uid == os.geteuid()
+            and value.st_gid == os.getegid()
+            and value.st_nlink in {1, 2}
+            and (value.st_dev, value.st_ino) == expected[:2]
+            and value.st_size <= MAX_PROJECTION_BYTES
+        )
 
     @staticmethod
     def _raw_directory_metadata(value: os.stat_result) -> tuple[int, ...]:
