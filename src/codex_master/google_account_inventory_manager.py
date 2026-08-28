@@ -554,6 +554,70 @@ class GoogleAccountInventoryManager:
                 )
             return self._active.snapshot
 
+    @staticmethod
+    def _account_admin_projection(
+        account: GoogleAccountV1, generation: int
+    ) -> Mapping[str, object]:
+        return MappingProxyType(
+            {
+                "ref": account.ref,
+                "label": account.label,
+                "subject_bound": account.subject_id is not None,
+                "inventory_generation": generation,
+                "project_count": len(account.projects),
+                "billing_count": len(account.billing_accounts),
+            }
+        )
+
+    @staticmethod
+    def _project_admin_projection(
+        project: GoogleProjectV1, generation: int
+    ) -> Mapping[str, object]:
+        return MappingProxyType(
+            {
+                "ref": project.ref,
+                "project_name": project.project_name,
+                "key_name": project.key_name,
+                "purpose": project.purpose,
+                "billing_account_ref": project.billing_account_ref,
+                "status": project.status,
+                "inventory_generation": generation,
+            }
+        )
+
+    def list_accounts(self) -> tuple[Mapping[str, object], ...]:
+        snapshot = self._snapshot_for_internal_use()
+        return tuple(
+            self._account_admin_projection(account, snapshot.generation)
+            for account in snapshot.accounts
+        )
+
+    def get_account(self, account_ref: str) -> Mapping[str, object]:
+        if not _valid_nonempty_string(account_ref):
+            raise GoogleAccountInventoryError("credential.account_not_found")
+        snapshot = self._snapshot_for_internal_use()
+        try:
+            account = snapshot.by_account_ref[account_ref]
+        except KeyError:
+            raise GoogleAccountInventoryError("credential.account_not_found") from None
+        return self._account_admin_projection(account, snapshot.generation)
+
+    def list_projects(self, account_ref: str) -> tuple[Mapping[str, object], ...]:
+        if not _valid_nonempty_string(account_ref):
+            raise GoogleAccountInventoryError("credential.account_not_found")
+        snapshot = self._snapshot_for_internal_use()
+        try:
+            account = snapshot.by_account_ref[account_ref]
+        except KeyError:
+            raise GoogleAccountInventoryError("credential.account_not_found") from None
+        return tuple(
+            self._project_admin_projection(project, snapshot.generation)
+            for project in account.projects
+        )
+
+    def inventory_generation(self) -> int:
+        return self._snapshot_for_internal_use().generation
+
     def _read_monotonic(self) -> float:
         try:
             value = self._monotonic_clock()
