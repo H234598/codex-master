@@ -14,6 +14,8 @@ from codex_master.fleet_home_broker_linux import FdStat, PidfdIdentity
 from codex_master.fleet_home_broker_protocol import (
     MAX_CHPB_MESSAGE_BYTES,
     CHPB_PROTOCOL,
+    AttestHomeRequest,
+    BindingExpectation,
     BrokerReply,
     BrokerCheckpoint,
     BrokerObjectState,
@@ -1013,13 +1015,13 @@ def test_wal_composition_source_keeps_private_api_and_single_authority() -> None
                 production_calls["lookup"] += 1
     assert production_calls == {"coordinator": 1, "lookup": 1, "admission": 1}
     assert coordinator_callers == ["admit_connected_seqpacket_peer"]
-    assert admission_callers == ["receive_admitted_seqpacket_message"]
+    assert admission_callers == ["receive_admitted_seqpacket_request"]
 
     entries = [
         node
         for node in tree.body
         if isinstance(node, ast.FunctionDef)
-        and node.name == "receive_admitted_seqpacket_message"
+        and node.name == "receive_admitted_seqpacket_request"
     ]
     assert len(entries) == 1
     entry_calls = [node for node in ast.walk(entries[0]) if isinstance(node, ast.Call)]
@@ -1305,10 +1307,12 @@ def test_public_surface_is_exact() -> None:
     assert seqpacket.__all__ == (
         "SeqpacketPacketCode",
         "SeqpacketPacketError",
+        "SeqpacketRequestCode",
+        "SeqpacketRequestError",
         "SeqpacketPeerError",
         "SeqpacketPeerOperations",
         "admit_connected_seqpacket_peer",
-        "receive_admitted_seqpacket_message",
+        "receive_admitted_seqpacket_request",
         "reattest_seqpacket_peer",
     )
 
@@ -1396,7 +1400,7 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
         node
         for node in tree.body
         if isinstance(node, ast.FunctionDef)
-        and node.name == "receive_admitted_seqpacket_message"
+        and node.name == "receive_admitted_seqpacket_request"
     ]
     assert len(receive_functions) == 1
     assert not any(
@@ -1407,6 +1411,9 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
     receive_function = receive_functions[0]
     receive_source = ast.get_source_segment(source, receive_function)
     assert receive_source is not None
+    assert ast.unparse(receive_function.returns) == (
+        "tuple[KernelPeerEvidence, BrokerRequest]"
+    )
 
     admission_calls = [
         node
@@ -1450,13 +1457,50 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
     assert ast.unparse(decode_calls[0].args[0]) == "payload"
     assert recvmsg_call.lineno < decode_calls[0].lineno
 
+    packet_raises = [
+        node
+        for node in ast.walk(receive_function)
+        if isinstance(node, ast.Raise)
+        and node.exc is not None
+        and "SeqpacketPacketError" in ast.unparse(node.exc)
+    ]
+    assert packet_raises
+    assert recvmsg_call.lineno < min(node.lineno for node in packet_raises)
+    assert max(node.lineno for node in packet_raises) < decode_calls[0].lineno
+
+    role_gates = [
+        node
+        for node in ast.walk(receive_function)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "type(message) is BrokerReply"
+    ]
+    request_raises = [
+        node
+        for node in ast.walk(receive_function)
+        if isinstance(node, ast.Raise)
+        and node.exc is not None
+        and ast.unparse(node.exc)
+        == "SeqpacketRequestError(SeqpacketRequestCode.NOT_REQUEST)"
+    ]
+    returns = [
+        node
+        for node in ast.walk(receive_function)
+        if isinstance(node, ast.Return)
+        and node.value is not None
+        and ast.unparse(node.value) == "(evidence, message)"
+    ]
+    assert len(role_gates) == len(request_raises) == len(returns) == 1
+    assert decode_calls[0].lineno < role_gates[0].lineno
+    assert role_gates[0].lineno <= request_raises[0].lineno
+    assert request_raises[0].lineno < returns[0].lineno
+
     receive_callers = [
         node.name
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and recvmsg_call in ast.walk(node)
     ]
-    assert receive_callers == ["receive_admitted_seqpacket_message"]
+    assert receive_callers == ["receive_admitted_seqpacket_request"]
 
     assert not any(
         isinstance(node, (ast.For, ast.AsyncFor, ast.While, ast.Await, ast.Yield, ast.YieldFrom))
@@ -1527,12 +1571,24 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
         "ScmFrame",
         "BrokerPeer",
         "BrokerTransportResponse",
-        "BrokerRequest",
+        "ChpbMessage",
         "SCM_RIGHTS",
         "WAL",
         "Home",
     )
     assert not any(term in source for term in source_terms)
+    assert "receive_admitted_seqpacket_message" not in source
+    assert not any(
+        request_type in source
+        for request_type in (
+            "AttestHomeRequest",
+            "QueryTransactionRequest",
+            "GetTerminalResultRequest",
+            "ProvisionHomeRequest",
+            "ReplaceHomeRequest",
+            "DeprovisionHomeRequest",
+        )
+    )
     assert "receive_admitted_seqpacket_packet" not in source
     assert "_PidfdIdentityCapture" not in source
     assert not any(
@@ -1573,21 +1629,42 @@ def test_seqpacket_packet_error_codes_are_stable() -> None:
         assert error.__cause__ is None
 
 
-def test_receive_admitted_seqpacket_message_admits_reads_once_then_decodes_canonical_message(
+def test_seqpacket_request_error_codes_are_stable() -> None:
+    code_type = getattr(seqpacket, "SeqpacketRequestCode")
+    error_type = getattr(seqpacket, "SeqpacketRequestError")
+    expected = (("NOT_REQUEST", "seqpacket_request_not_request"),)
+
+    assert [(code.name, code.value) for code in code_type] == list(expected)
+    code = getattr(code_type, "NOT_REQUEST")
+    error = error_type(code)
+    assert type(error) is error_type
+    assert error.code is code
+    assert str(error) == code.value
+    assert error.args == (code.value,)
+    assert error.__cause__ is None
+
+
+def test_receive_admitted_seqpacket_request_admits_reads_once_then_decodes_canonical_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    receive = getattr(seqpacket, "receive_admitted_seqpacket_message")
+    receive = getattr(seqpacket, "receive_admitted_seqpacket_request")
     monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
     events: list[tuple[object, ...]] = []
-    message = BrokerReply(
+    request = AttestHomeRequest(
         CHPB_PROTOCOL,
-        ChpbMessageKind.REPLY,
+        ChpbMessageKind.ATTEST_HOME,
         "2" * 32,
-        BrokerResultCode.INVALID_MESSAGE,
-        None,
-        None,
+        "3" * 32,
+        BindingExpectation(
+            PRINCIPAL.agent_id,
+            PRINCIPAL.manifest_generation,
+            PRINCIPAL.unit_generation,
+            7,
+            "a" * 64,
+            PRINCIPAL.fencing_epoch,
+        ),
     )
-    payload = encode_chpb_message(message)
+    payload = encode_chpb_message(request)
     canonical_decode = seqpacket.decode_chpb_message
 
     def recording_decode(raw: bytes):
@@ -1602,7 +1679,7 @@ def test_receive_admitted_seqpacket_message_admits_reads_once_then_decodes_canon
     linux_operations = RecordingLinuxOperations(events)
     wal_operations = seeded_active_wal(PRINCIPAL)
 
-    evidence, received_message = receive(
+    evidence, received_request = receive(
         connection,
         enforcement_operations,
         linux_operations,
@@ -1621,8 +1698,8 @@ def test_receive_admitted_seqpacket_message_admits_reads_once_then_decodes_canon
         PRINCIPAL.invocation_id,
         PRINCIPAL.mcs_pair,
     )
-    assert type(received_message) is BrokerReply
-    assert received_message == message
+    assert type(received_request) is AttestHomeRequest
+    assert received_request == request
     recv_events = [event for event in events if event[0] == "recvmsg"]
     assert recv_events == [("recvmsg", MAX_CHPB_MESSAGE_BYTES + 1, 0)]
     assert [event for event in events if event[0] == "decode"] == [
@@ -1635,10 +1712,65 @@ def test_receive_admitted_seqpacket_message_admits_reads_once_then_decodes_canon
     assert events[-1] == ("decode", payload)
 
 
-def test_receive_admitted_seqpacket_message_stops_before_read_and_decode_when_admission_fails(
+def test_receive_admitted_seqpacket_request_rejects_canonical_reply_after_decode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    receive = getattr(seqpacket, "receive_admitted_seqpacket_message")
+    receive = getattr(seqpacket, "receive_admitted_seqpacket_request")
+    code_type = getattr(seqpacket, "SeqpacketRequestCode")
+    error_type = getattr(seqpacket, "SeqpacketRequestError")
+    monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
+    events: list[tuple[object, ...]] = []
+    reply = BrokerReply(
+        CHPB_PROTOCOL,
+        ChpbMessageKind.REPLY,
+        "2" * 32,
+        BrokerResultCode.INVALID_MESSAGE,
+        None,
+        None,
+    )
+    payload = encode_chpb_message(reply)
+    canonical_decode = seqpacket.decode_chpb_message
+
+    def recording_decode(raw: bytes):
+        events.append(("decode", raw))
+        return canonical_decode(raw)
+
+    monkeypatch.setattr(seqpacket, "decode_chpb_message", recording_decode)
+    connection = RecordingConnectedSocket(
+        events, recv_result=(payload, [], 0, object())
+    )
+
+    with pytest.raises(error_type) as caught:
+        receive(
+            connection,
+            RecordingEnforcementOperations(events),
+            RecordingLinuxOperations(events),
+            seeded_active_wal(PRINCIPAL),
+            release_spec(),
+        )
+
+    expected_code = getattr(code_type, "NOT_REQUEST")
+    error = caught.value
+    assert type(error) is error_type
+    assert error.code is expected_code
+    assert str(error) == expected_code.value
+    assert error.args == (expected_code.value,)
+    assert error.__cause__ is None
+    recv_event = ("recvmsg", MAX_CHPB_MESSAGE_BYTES + 1, 0)
+    decode_event = ("decode", payload)
+    assert [event for event in events if event[0] == "recvmsg"] == [recv_event]
+    assert [event for event in events if event[0] == "decode"] == [decode_event]
+    assert events.index(
+        ("getsockopt", socket.SOL_SOCKET, socket.SO_PEERSEC, 255)
+    ) < events.index(recv_event)
+    assert events.index(recv_event) < events.index(decode_event)
+    assert events[-1] == decode_event
+
+
+def test_receive_admitted_seqpacket_request_stops_before_read_and_decode_when_admission_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    receive = getattr(seqpacket, "receive_admitted_seqpacket_request")
     monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
 
     def unreachable_decode(raw: bytes):
@@ -1687,10 +1819,10 @@ def test_receive_admitted_seqpacket_message_stops_before_read_and_decode_when_ad
         assert not any(event[0] == "recvmsg" for event in events)
 
 
-def test_receive_admitted_seqpacket_message_maps_recvmsg_failures_and_malformed_results_before_decode(
+def test_receive_admitted_seqpacket_request_maps_recvmsg_failures_and_malformed_results_before_decode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    receive = getattr(seqpacket, "receive_admitted_seqpacket_message")
+    receive = getattr(seqpacket, "receive_admitted_seqpacket_request")
     code_type = getattr(seqpacket, "SeqpacketPacketCode")
     error_type = getattr(seqpacket, "SeqpacketPacketError")
     monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
@@ -1737,10 +1869,10 @@ def test_receive_admitted_seqpacket_message_maps_recvmsg_failures_and_malformed_
         ]
 
 
-def test_receive_admitted_seqpacket_message_rejects_ancillary_and_truncation_before_decode_in_stable_order(
+def test_receive_admitted_seqpacket_request_rejects_ancillary_and_truncation_before_decode_in_stable_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    receive = getattr(seqpacket, "receive_admitted_seqpacket_message")
+    receive = getattr(seqpacket, "receive_admitted_seqpacket_request")
     code_type = getattr(seqpacket, "SeqpacketPacketCode")
     error_type = getattr(seqpacket, "SeqpacketPacketError")
     monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
@@ -1785,26 +1917,32 @@ def test_receive_admitted_seqpacket_message_rejects_ancillary_and_truncation_bef
         assert len([event for event in events if event[0] == "recvmsg"]) == 1
 
 
-def test_receive_admitted_seqpacket_message_enforces_packet_size_boundaries_before_decode(
+def test_receive_admitted_seqpacket_request_enforces_packet_size_boundaries_before_decode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    receive = getattr(seqpacket, "receive_admitted_seqpacket_message")
+    receive = getattr(seqpacket, "receive_admitted_seqpacket_request")
     code_type = getattr(seqpacket, "SeqpacketPacketCode")
     error_type = getattr(seqpacket, "SeqpacketPacketError")
     monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
-    message = BrokerReply(
+    request = AttestHomeRequest(
         CHPB_PROTOCOL,
-        ChpbMessageKind.REPLY,
+        ChpbMessageKind.ATTEST_HOME,
         "2" * 32,
-        BrokerResultCode.INVALID_MESSAGE,
-        None,
-        None,
+        "3" * 32,
+        BindingExpectation(
+            PRINCIPAL.agent_id,
+            PRINCIPAL.manifest_generation,
+            PRINCIPAL.unit_generation,
+            7,
+            "a" * 64,
+            PRINCIPAL.fencing_epoch,
+        ),
     )
     decode_calls: list[bytes] = []
 
     def recording_decode(raw: bytes):
         decode_calls.append(raw)
-        return message
+        return request
 
     monkeypatch.setattr(
         seqpacket, "decode_chpb_message", recording_decode, raising=False
@@ -1833,7 +1971,7 @@ def test_receive_admitted_seqpacket_message_enforces_packet_size_boundaries_befo
             release_spec(),
         )
         assert result[0] == expected_evidence
-        assert result[1] is message
+        assert result[1] is request
         assert decode_calls == [payload]
         decode_calls.clear()
 
@@ -1863,21 +2001,42 @@ def test_receive_admitted_seqpacket_message_enforces_packet_size_boundaries_befo
         assert decode_calls == []
 
 
-def test_receive_admitted_seqpacket_message_repeats_fresh_admission_read_and_decode_without_cache(
+def test_receive_admitted_seqpacket_request_repeats_fresh_admission_read_and_decode_without_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    receive = getattr(seqpacket, "receive_admitted_seqpacket_message")
+    receive = getattr(seqpacket, "receive_admitted_seqpacket_request")
     monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
     events: list[tuple[object, ...]] = []
-    message = BrokerReply(
+    request_one = AttestHomeRequest(
         CHPB_PROTOCOL,
-        ChpbMessageKind.REPLY,
+        ChpbMessageKind.ATTEST_HOME,
         "2" * 32,
-        BrokerResultCode.INVALID_MESSAGE,
-        None,
-        None,
+        "3" * 32,
+        BindingExpectation(
+            PRINCIPAL.agent_id,
+            PRINCIPAL.manifest_generation,
+            PRINCIPAL.unit_generation,
+            7,
+            "a" * 64,
+            PRINCIPAL.fencing_epoch,
+        ),
     )
-    payload = encode_chpb_message(message)
+    request_two = AttestHomeRequest(
+        CHPB_PROTOCOL,
+        ChpbMessageKind.ATTEST_HOME,
+        "4" * 32,
+        "3" * 32,
+        BindingExpectation(
+            PRINCIPAL.agent_id,
+            PRINCIPAL.manifest_generation,
+            PRINCIPAL.unit_generation,
+            7,
+            "a" * 64,
+            PRINCIPAL.fencing_epoch,
+        ),
+    )
+    payload_one = encode_chpb_message(request_one)
+    payload_two = encode_chpb_message(request_two)
     canonical_decode = seqpacket.decode_chpb_message
 
     def recording_decode(raw: bytes):
@@ -1885,8 +2044,11 @@ def test_receive_admitted_seqpacket_message_repeats_fresh_admission_read_and_dec
         return canonical_decode(raw)
 
     monkeypatch.setattr(seqpacket, "decode_chpb_message", recording_decode)
-    connection = RecordingConnectedSocket(
-        events, recv_result=(payload, [], 0, object())
+    connection_one = RecordingConnectedSocket(
+        events, recv_result=(payload_one, [], 0, object())
+    )
+    connection_two = RecordingConnectedSocket(
+        events, recv_result=(payload_two, [], 0, object())
     )
     enforcement_operations = RecordingEnforcementOperations(events)
     linux_operations = RecordingLinuxOperations(
@@ -1895,14 +2057,14 @@ def test_receive_admitted_seqpacket_message_repeats_fresh_admission_read_and_dec
     wal_operations = seeded_active_wal(PRINCIPAL)
 
     result_one = receive(
-        connection,
+        connection_one,
         enforcement_operations,
         linux_operations,
         wal_operations,
         release_spec(),
     )
     result_two = receive(
-        connection,
+        connection_two,
         enforcement_operations,
         linux_operations,
         wal_operations,
@@ -1922,10 +2084,10 @@ def test_receive_admitted_seqpacket_message_repeats_fresh_admission_read_and_dec
     )
     assert result_one[0] == expected_evidence
     assert result_two[0] == expected_evidence
-    assert type(result_one[1]) is BrokerReply
-    assert type(result_two[1]) is BrokerReply
-    assert result_one[1] == message
-    assert result_two[1] == message
+    assert type(result_one[1]) is AttestHomeRequest
+    assert type(result_two[1]) is AttestHomeRequest
+    assert result_one[1] == request_one
+    assert result_two[1] == request_two
     assert linux_operations.reuse_checks == 32
     assert len(linux_operations.observed_identities) == 32
     assert wal_operations.events == ["read", "read"]
@@ -1947,7 +2109,7 @@ def test_receive_admitted_seqpacket_message_repeats_fresh_admission_read_and_dec
     assert socket_events == one_sequence + one_sequence
     assert len([event for event in events if event[0] == "recvmsg"]) == 2
     decode_events = [event for event in events if event[0] == "decode"]
-    assert decode_events == [("decode", payload), ("decode", payload)]
+    assert decode_events == [("decode", payload_one), ("decode", payload_two)]
     recv_positions = [
         index for index, event in enumerate(events) if event[0] == "recvmsg"
     ]
@@ -1981,10 +2143,10 @@ def test_receive_admitted_seqpacket_message_repeats_fresh_admission_read_and_dec
     )
 
 
-def test_receive_admitted_seqpacket_message_propagates_canonical_decode_errors(
+def test_receive_admitted_seqpacket_request_propagates_canonical_decode_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    receive = getattr(seqpacket, "receive_admitted_seqpacket_message")
+    receive = getattr(seqpacket, "receive_admitted_seqpacket_request")
     monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
     message = BrokerReply(
         CHPB_PROTOCOL,

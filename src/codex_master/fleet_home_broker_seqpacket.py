@@ -14,7 +14,8 @@ from codex_master.fleet_home_broker_linux import (
     _observe_peer_snapshot_with_identity,
 )
 from codex_master.fleet_home_broker_protocol import (
-    ChpbMessage,
+    BrokerReply,
+    BrokerRequest,
     MAX_CHPB_MESSAGE_BYTES,
     PrincipalBinding,
     decode_chpb_message,
@@ -44,6 +45,18 @@ class SeqpacketPacketError(ValueError):
     __slots__ = ("code",)
 
     def __init__(self, code: SeqpacketPacketCode) -> None:
+        self.code = code
+        super().__init__(code.value)
+
+
+class SeqpacketRequestCode(str, Enum):
+    NOT_REQUEST = "seqpacket_request_not_request"
+
+
+class SeqpacketRequestError(ValueError):
+    __slots__ = ("code",)
+
+    def __init__(self, code: SeqpacketRequestCode) -> None:
         self.code = code
         super().__init__(code.value)
 
@@ -235,13 +248,13 @@ def admit_connected_seqpacket_peer(
     )
 
 
-def receive_admitted_seqpacket_message(
+def receive_admitted_seqpacket_request(
     connection: socket.socket,
     enforcement_operations: _SeqpacketEnforcementOperations,
     linux_operations: LinuxOperations,
     wal_operations: WalOperations,
     release: BrokerReleaseSpec,
-) -> tuple[KernelPeerEvidence, ChpbMessage]:
+) -> tuple[KernelPeerEvidence, BrokerRequest]:
     evidence = admit_connected_seqpacket_peer(
         connection,
         enforcement_operations,
@@ -273,6 +286,8 @@ def receive_admitted_seqpacket_message(
     if len(payload) > MAX_CHPB_MESSAGE_BYTES:
         raise SeqpacketPacketError(SeqpacketPacketCode.TOO_LARGE) from None
     message = decode_chpb_message(payload)
+    if type(message) is BrokerReply:
+        raise SeqpacketRequestError(SeqpacketRequestCode.NOT_REQUEST) from None
     return evidence, message
 
 
@@ -319,9 +334,11 @@ def reattest_seqpacket_peer(
 __all__ = (
     "SeqpacketPacketCode",
     "SeqpacketPacketError",
+    "SeqpacketRequestCode",
+    "SeqpacketRequestError",
     "SeqpacketPeerError",
     "SeqpacketPeerOperations",
     "admit_connected_seqpacket_peer",
-    "receive_admitted_seqpacket_message",
+    "receive_admitted_seqpacket_request",
     "reattest_seqpacket_peer",
 )
