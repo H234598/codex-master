@@ -1,19 +1,32 @@
 # Auth Copy
 
 `codex-master` treats authentication data as per-Agentin state. The pool spec
-can mark source homes as authenticated, but it does not contain credentials.
-The credential-bearing file is the real `auth.json` inside a `CODEX_HOME`.
+does not contain credentials. For every configured Codex series, it names the
+`codex_usage_account`; on provisioning the canonical source is copied as a
+regular private file:
 
-Example source files:
+```text
+/home/teladi/.local/share/codex-usage/profiles/<ACCOUNT>/codex-home/auth.json
+```
+
+Existing target auth is preserved. A missing profile or auth file blocks the
+provisioning operation with an explicit error; there is no silent cross-account
+fallback.
+
+Example target files:
 
 ```text
 ~/.codex-agents/a1/auth.json
 ~/.codex-agents/b1/auth.json
 ```
 
+The mapping is stored beside each `series` entry, for example
+`"codex_usage_account": "BW_Work"`.
+
 ## What The Command Does
 
-`pool copy_auth` copies one source `auth.json` into a selected group of
+`pool copy_auth` remains available for an intentional, explicit copy from one
+already provisioned source home into a selected group of
 installed Agentin homes:
 
 ```sh
@@ -110,8 +123,9 @@ Use `--overwrite` only when replacing existing target auth is intentional:
 
 ## Install-Time Auth Copy
 
-`pool install` can run the same explicit auth copy after creating or refreshing
-homes:
+`pool install` performs the configured profile-to-home copy automatically while
+creating or refreshing homes. It can additionally run the old explicit
+home-to-home copy:
 
 ```sh
 ./bin/codex-master-mcp pool install \

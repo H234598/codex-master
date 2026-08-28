@@ -26,7 +26,7 @@ availability, or an enabled Hive.
 
 ## Safe assignment flow
 
-1. Inspect current status, capabilities, selection options, and available slots.
+1. Inspect current status, capabilities, selection options, and resource-admission evidence.
 2. Define the smallest read scope and exact persistent write paths.
 3. Run `scope-check` before a write assignment.
 4. Prefer `assign-readonly`, `assign-live-data`, or `assign-write` over raw send.

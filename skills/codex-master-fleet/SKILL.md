@@ -79,11 +79,11 @@ not show it; test the user's model IDs instead of assuming they are unavailable.
 - Only the Koenigin may restart or reload Masterjet, install it, or synchronize
   its plugin cache. Other roles may inspect status and provide verification or
   a reload recommendation, but must not perform these lifecycle actions.
-- Temporary global cap is 10 Bienen total across running Masterjet sessions and
-  active or unconfirmed native Subagentinnen. At 10, spawn no further Biene.
-  Existing CPU, load, I/O-wait, RAM, host-pressure, and Ollama two-agent
-  thresholds remain configured and are enforced; they are additional admission
-  gates below the global cap. In addition, fremde Bienen may be spawned
+- No numeric global, series, or provider spawn cap exists. Session/native
+  totals and configured homes are inventory/observability only. CPU, load,
+  I/O-wait, RAM, Cgroup-scope, auth/quota, capability, cost, and ruckel gates
+  remain enforced; Ollama stays `simple_only`. `required_slots <= 10` bounds
+  one operator batch, never running concurrency. Fremde Bienen may be spawned
   directly through MCP/plugin control surfaces, with leases, auth checks, and
   write scopes as the safety boundary.
 - Exploriererinnen read, analyze, and report concise context packages only.
@@ -118,11 +118,12 @@ the Teamleiterin, or `codex-master-mcp` is not installed/configured there.
 ## Agentinnen Pool
 
 - Homes live under `~/.codex-agents/<id>`.
-- Concrete ids are `a1..a100`, `b1..b100`, and `c1..c100`.
+- Concrete ids are `a1..a100`, `b1..b100`, `c1..c100`, and the configured
+  U-series ids (currently `u1`).
 - Legacy aliases `a` and `b` resolve to `a1` and `b1`; `both` resolves to
   `a1,b1`.
-- Series selectors are `a-series`, `b-series`, `c-series`; `all` covers all
-  300 Agentinnen.
+- Series selectors are `a-series`, `b-series`, `c-series`, `u-series`; `all` covers the
+  configured pool.
 - `a1` and `b1` preserve the authenticated original homes. Additional homes are
   sleeping/slim by default and must not receive copied auth material without an
   explicit user instruction.

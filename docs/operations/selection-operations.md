@@ -91,3 +91,24 @@ Masterjet lifecycle administration is outside selection resolution. Only the
 Koenigin may restart or reload Masterjet, install it, or synchronize the plugin
 cache. Teamleiterinnen and other roles may inspect status, retain verification
 evidence, and recommend the Queen action, but must not execute it.
+
+## Emergency token burn and Spark quota steering
+
+When the emergency token-burn tracker activates for an account, it publishes a
+reversible Codex Usage display override. Delta is enabled for both panel and
+hover, and the target window is selected in this order: 5h, weekly, monthly.
+The override is removed when the account leaves the emergency state.
+
+Accounts with a verified `gpt-5.3-codex-spark` pool are evaluated separately;
+Spark 5h/weekly/monthly windows never get merged into the main OpenAI pool.
+Spark emergency pressure activates a temporary Spark-priority state for worker
+selection instead of Fast mode. Leadership classes are unaffected and cannot
+be routed to Spark.
+
+The emergency tracker counts only running assignments whose role is
+`arbeitsbiene` and whose worker activity is observable. Sleeping or idle
+Gottbienen, Koeniginnen, and Teamleiterinnen do not satisfy this count. If an
+emergency trigger occurs with zero working workers, Masterjet queues a Queen
+fallback request containing a randomly selected approved/in-progress Bauplan;
+the request is bounded, auditable, and remains subject to the normal Queen and
+resource gates.

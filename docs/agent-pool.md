@@ -27,9 +27,10 @@ Default layout:
     codex
 ```
 
-The default spec describes `a1..a100`, `b1..b100`, and `c1..c100`. `a1` and
-`b1` are authenticated source homes; the C series is intentionally unauthenticated
-until another account is available.
+The default spec describes the configured A/B/C pool and the single-member
+U-series (`u1`). `a1` and `b1` are authenticated source homes; the C series is
+intentionally unauthenticated until another account is available. `u1` is an
+existing authenticated Codex home and is not copied to additional U homes.
 
 Selectors are case-insensitive. `A1`, `a1`, `A-Series`, and `a-series` resolve
 to the same Agentinnen. Numeric selectors are single-Agentin shortcuts driven
@@ -143,9 +144,21 @@ symlink-attack-resistant `rmtree` semantics.
 
 ## Auth Rules
 
-Auth is intentionally not copied during normal install. To inspect a mass-copy
-operation first, omit `--yes`; to apply it, repeat the same command with
-`--yes`.
+Each Codex series declares its `codex_usage_account` in the pool spec. During
+normal install, a missing target `auth.json` is copied from the canonical
+codex-usage profile
+`/home/teladi/.local/share/codex-usage/profiles/<ACCOUNT>/codex-home/auth.json`.
+Existing target auth is preserved and missing profiles fail closed. No
+cross-account fallback is performed. The explicit `pool copy_auth` command
+remains available for deliberate home-to-home propagation; to inspect it first,
+omit `--yes`, then repeat with `--yes`.
+
+`pool refresh_auth --agent a2` is separate: it reads only the account mapped to
+that Agentin in `codex-agent-pool.json` (currently `a2` maps to `BW_Nufker`),
+never another Agentin home or account. It is a dry-run without `--yes`; with
+`--yes`, it requires the target to be stopped and unused, takes its lifecycle
+lock, and atomically replaces only a real private `auth.json` with mode `0600`.
+Responses omit auth content, hashes, profile names, and local paths.
 
 MCP working mutations require each selected Agentin to have a regular local
 `auth.json` by default. This protects Teamleiterinnen from accidentally

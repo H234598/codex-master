@@ -10,8 +10,9 @@ or stale status authoritative.
 ## Contract layers
 
 - **Principals and authority:** identify who may delegate each class and scope.
-- **Admission:** checks global capacity, task capability, resource policy, and
-  structured denial reasons before work is accepted.
+- **Admission:** checks shared resource pressure, Cgroup scope, task capability,
+  and structured denial reasons before work is accepted; it has no numeric
+  global, series, or provider concurrency cap.
 - **Selection:** applies the central resolver to currently valid offers.
 - **Assignment binding:** records the approved principal, scope, write paths,
   lifecycle, and effective selection at the execution boundary.
