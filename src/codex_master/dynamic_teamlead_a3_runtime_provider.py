@@ -1,21 +1,34 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from codex_master.dynamic_teamlead import prepare_dynamic_teamlead
+from codex_master.dynamic_teamlead_a3_registry import FleetV2RegistryOperations
 from codex_master.dynamic_teamlead_coordinator import (
     DynamicTeamleadCoordinatorRequest,
+    DynamicTeamleadRegistryOperations,
     _check_static_request,
+)
+from codex_master.dynamic_teamlead_a3_runner import (
+    RootDynamicTeamleadRunnerBindingEvidence,
+    RootDynamicTeamleadStartComposition,
+)
+from codex_master.fleet_home_broker_client import BrokerClientOperations
+from codex_master.fleet_home_broker_client_seqpacket import (
+    SeqpacketBrokerClientOperations,
 )
 from codex_master.fleet_home_broker_runtime import (
     BrokerReleaseSpec,
     TrustedPrincipalGrantContext,
 )
 from codex_master.fleet_registry import FleetRuntimePrincipalV2, FleetSnapshotV2
+from codex_master.fleet_runners import DynamicTeamleadRunnerPlan
 
 
 _INVALID_CONTEXT = "invalid_dynamic_teamlead_a3_runtime_context"
 _NONTRANSFERABLE_CONTEXT = "dynamic_teamlead_a3_runtime_context_nontransferable"
+_INVALID_COMPOSITION = "invalid_root_owned_dynamic_teamlead_start_composition"
+_NONTRANSFERABLE_PORT = "root_owned_dynamic_teamlead_start_port_nontransferable"
 
 
 class DynamicTeamleadA3RuntimeProviderError(ValueError):
@@ -127,8 +140,93 @@ def validate_dynamic_teamlead_a3_runtime_context(
     return value
 
 
+@dataclass(frozen=True, slots=True, init=False, repr=False)
+class RootOwnedDynamicTeamleadStartPort:
+    request: DynamicTeamleadCoordinatorRequest
+    registry_operations: DynamicTeamleadRegistryOperations
+    broker_operations: BrokerClientOperations
+    _executor: object = field(repr=False, compare=False)
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise TypeError("root_owned_dynamic_teamlead_start_port_factory_required")
+
+    def __copy__(self) -> RootOwnedDynamicTeamleadStartPort:
+        raise DynamicTeamleadA3RuntimeProviderError(_NONTRANSFERABLE_PORT)
+
+    def __deepcopy__(self, memo: object) -> RootOwnedDynamicTeamleadStartPort:
+        del memo
+        raise DynamicTeamleadA3RuntimeProviderError(_NONTRANSFERABLE_PORT)
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise DynamicTeamleadA3RuntimeProviderError(_NONTRANSFERABLE_PORT)
+
+    def __repr__(self) -> str:
+        return "<RootOwnedDynamicTeamleadStartPort redacted>"
+
+    __str__ = __repr__
+
+    def execute_dynamic_teamlead_runner(
+        self, plan: DynamicTeamleadRunnerPlan
+    ) -> None:
+        self._executor.execute_dynamic_teamlead_runner(plan)
+
+
+def _reject_composition() -> None:
+    raise DynamicTeamleadA3RuntimeProviderError(_INVALID_COMPOSITION)
+
+
+def build_root_owned_dynamic_teamlead_start_port(
+    composition: RootDynamicTeamleadStartComposition,
+) -> RootOwnedDynamicTeamleadStartPort:
+    if type(composition) is not RootDynamicTeamleadStartComposition:
+        _reject_composition()
+    try:
+        request = composition.request
+        registry_operations = composition.registry_operations
+        broker_operations = composition.broker_operations
+        executor = composition.executor
+        evidence = composition.evidence
+        context = composition.context_identity
+        snapshot_identity = composition.snapshot_identity
+        release_identity = composition.release_identity
+        validate_dynamic_teamlead_a3_runtime_context(context)
+        if (
+            type(request) is not DynamicTeamleadCoordinatorRequest
+            or type(registry_operations) is not FleetV2RegistryOperations
+            or type(broker_operations) is not SeqpacketBrokerClientOperations
+            or type(evidence) is not RootDynamicTeamleadRunnerBindingEvidence
+            or not callable(executor.execute_dynamic_teamlead_runner)
+            or executor.binding_evidence is not evidence
+            or context.request is not request
+            or context.context.snapshot is not snapshot_identity
+            or context.release is not release_identity
+            or registry_operations._snapshot is not request.snapshot
+            or broker_operations.a3_context_identity is not context
+            or broker_operations.release_identity is not release_identity
+            or evidence.executor_identity is not executor
+            or evidence.context_identity is not context.context
+            or evidence.snapshot_identity is not snapshot_identity
+            or evidence.release_identity is not release_identity
+        ):
+            _reject_composition()
+    except DynamicTeamleadA3RuntimeProviderError:
+        raise
+    except Exception:
+        _reject_composition()
+
+    port = object.__new__(RootOwnedDynamicTeamleadStartPort)
+    object.__setattr__(port, "request", request)
+    object.__setattr__(port, "registry_operations", registry_operations)
+    object.__setattr__(port, "broker_operations", broker_operations)
+    object.__setattr__(port, "_executor", executor)
+    return port
+
+
 __all__ = (
     "DynamicTeamleadA3RuntimeContext",
     "DynamicTeamleadA3RuntimeProviderError",
+    "RootOwnedDynamicTeamleadStartPort",
+    "build_root_owned_dynamic_teamlead_start_port",
     "validate_dynamic_teamlead_a3_runtime_context",
 )
