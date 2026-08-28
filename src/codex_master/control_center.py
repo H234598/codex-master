@@ -52,8 +52,8 @@ MAX_BACKEND_STDOUT_BYTES = 1024 * 1024
 MAX_BACKEND_STDERR_BYTES = 64 * 1024
 DEFAULT_BACKEND_TIMEOUT_SECONDS = 180
 MAX_BACKEND_TIMEOUT_SECONDS = 660
-AGENT_ID_RE = re.compile(r"^[abc](?:[1-9]|[1-9][0-9]|100)$")
-SERIES_FILTER_RE = re.compile(r"^[abc]$")
+AGENT_ID_RE = re.compile(r"^[abcu](?:[1-9]|[1-9][0-9]|100)$")
+SERIES_FILTER_RE = re.compile(r"^[abcu]$")
 STATUS_PAGE_FIELDS = {
     "results",
     "result_count",
@@ -832,7 +832,7 @@ class ControlCenterWindow:
         outer.set_border_width(12)
         controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.search = Gtk.SearchEntry()
-        self.search.set_placeholder_text("Bienen-ID oder Serie a/b/c")
+        self.search.set_placeholder_text("Bienen-ID oder Serie a/b/c/u")
         self.search.connect("activate", lambda _entry: self._apply_filter())
         controls.pack_start(self.search, True, True, 0)
         self.previous_button = Gtk.Button.new_with_label("Zurück")

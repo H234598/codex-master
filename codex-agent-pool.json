@@ -8,6 +8,7 @@
       "prefix": "a",
       "count": 5,
       "template": "a1",
+      "codex_usage_account": "BW_Nufker",
       "authenticated": [
         "a1"
       ]
@@ -16,6 +17,7 @@
       "prefix": "b",
       "count": 3,
       "template": "b1",
+      "codex_usage_account": "BW_Work",
       "authenticated": [
         "b1"
       ]
@@ -24,7 +26,17 @@
       "prefix": "c",
       "count": 3,
       "template": "c1",
+      "codex_usage_account": "RH_Privat",
       "authenticated": []
+    },
+    {
+      "prefix": "u",
+      "count": 1,
+      "template": "u1",
+      "codex_usage_account": "Birthe_Privat",
+      "authenticated": [
+        "u1"
+      ]
     }
   ],
   "aliases": {

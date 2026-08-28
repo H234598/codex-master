@@ -53,6 +53,11 @@
               "type": "string"
             },
             "default": []
+          },
+          "codex_usage_account": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_.-]{1,64}$",
+            "description": "Account id below the canonical codex-usage profiles root."
           }
         }
       }
