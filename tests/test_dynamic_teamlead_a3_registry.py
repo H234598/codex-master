@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import threading
 
 import pytest
 
@@ -98,6 +99,19 @@ def test_rejects_source_drift_before_commit() -> None:
     assert store.commit_calls == []
 
 
+def test_rejects_same_generation_source_content_drift_before_commit() -> None:
+    captured = snapshot()
+    store = InMemoryStore(
+        replace(captured, runtime_principals=(object(),)),
+    )
+    operations = FleetV2RegistryOperations(store, captured)
+
+    with pytest.raises(ValueError):
+        operations.commit_snapshot(snapshot(8), expected_generation=7)
+
+    assert store.commit_calls == []
+
+
 @pytest.mark.parametrize("expected_generation", (6, 8, True, "7"))
 def test_rejects_wrong_expected_generation_before_commit(
     expected_generation: object,
@@ -180,6 +194,64 @@ def test_rejects_stale_return_generation_without_retry() -> None:
         operations.commit_snapshot(candidate, expected_generation=7)
 
     assert store.commit_calls == [(candidate, 7)]
+
+
+def test_rejects_same_generation_store_content_drift_without_retry() -> None:
+    captured = snapshot()
+    candidate = snapshot(8)
+    store = InMemoryStore(
+        captured,
+        result=replace(candidate, runtime_principals=(object(),)),
+    )
+    operations = FleetV2RegistryOperations(store, captured)
+
+    with pytest.raises(ValueError):
+        operations.commit_snapshot(candidate, expected_generation=7)
+    with pytest.raises(ValueError, match="already used"):
+        operations.commit_snapshot(candidate, expected_generation=7)
+
+    assert store.commit_calls == [(candidate, 7)]
+
+
+def test_concurrent_calls_make_at_most_one_store_attempt() -> None:
+    class FalseLatch:
+        def __init__(self) -> None:
+            self._barrier = threading.Barrier(2)
+
+        def __bool__(self) -> bool:
+            try:
+                self._barrier.wait(timeout=0.2)
+            except threading.BrokenBarrierError:
+                pass
+            return False
+
+    captured = snapshot()
+    candidate = snapshot(8)
+    store = InMemoryStore(captured)
+    operations = FleetV2RegistryOperations(store, captured)
+    operations._used = FalseLatch()  # type: ignore[assignment]
+    start = threading.Barrier(2)
+    errors: list[Exception] = []
+
+    def attempt() -> None:
+        start.wait()
+        try:
+            operations.commit_snapshot(candidate, expected_generation=7)
+        except Exception as error:
+            errors.append(error)
+
+    threads = (threading.Thread(target=attempt), threading.Thread(target=attempt))
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert store.load_calls == 1
+    assert store.commit_calls == [(candidate, 7)]
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert "already used" in str(errors[0])
 
 
 def test_rejects_duplicate_commit_after_success() -> None:

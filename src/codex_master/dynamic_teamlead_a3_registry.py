@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from threading import Lock
 from typing import Protocol
 
 from codex_master.dynamic_teamlead_coordinator import DynamicTeamleadRegistryOperations
@@ -18,7 +19,7 @@ class FleetV2RegistryStore(Protocol):
 
 
 class FleetV2RegistryOperations(DynamicTeamleadRegistryOperations):
-    __slots__ = ("_store", "_snapshot", "_used")
+    __slots__ = ("_store", "_snapshot", "_used", "_lock")
 
     def __init__(self, store: FleetV2RegistryStore, snapshot: FleetSnapshotV2):
         if (
@@ -32,6 +33,7 @@ class FleetV2RegistryOperations(DynamicTeamleadRegistryOperations):
         self._store = store
         self._snapshot = snapshot
         self._used = False
+        self._lock = Lock()
 
     def commit_snapshot(
         self,
@@ -39,9 +41,10 @@ class FleetV2RegistryOperations(DynamicTeamleadRegistryOperations):
         *,
         expected_generation: int,
     ) -> FleetSnapshotV2:
-        if self._used:
-            raise ValueError("fleet V2 registry operations already used")
-        self._used = True
+        with self._lock:
+            if self._used:
+                raise ValueError("fleet V2 registry operations already used")
+            self._used = True
         current = self._store.load()
         if (
             type(current) is not FleetSnapshotV2
