@@ -55,8 +55,16 @@ class CgroupPreflightError(ValueError):
     """Raised for every fail-closed cgroup preflight violation."""
 
 
+class ResourceCgroupError(ValueError):
+    """Raised when an instance cgroup profile is invalid."""
+
+
 def _fail() -> None:
     raise CgroupPreflightError("cgroup_preflight_failed")
+
+
+def _profile_fail() -> None:
+    raise ResourceCgroupError("resource.cgroup_profile_invalid")
 
 
 def _canonical_cpu_set(value: object, *, allow_empty: bool = False) -> CpuSet:
@@ -137,6 +145,54 @@ class CgroupProfileV1:
     @property
     def cpuset_expression(self) -> str:
         return _format_cpu_set(self.cpuset_cpus)
+
+
+@dataclass(frozen=True, slots=True)
+class OllamaCpuProfile:
+    allowed_cpus: CpuSet
+    cpu_quota_percent: int
+    cpu_weight: int
+
+    def __post_init__(self) -> None:
+        try:
+            allowed_cpus = _canonical_cpu_set(self.allowed_cpus)
+        except CgroupPreflightError:
+            _profile_fail()
+        if (
+            type(self.cpu_quota_percent) is not int
+            or type(self.cpu_weight) is not int
+            or not 1 <= self.cpu_quota_percent <= 10000
+            or not 1 <= self.cpu_weight <= 10000
+        ):
+            _profile_fail()
+        object.__setattr__(self, "allowed_cpus", allowed_cpus)
+
+    @classmethod
+    def parse(
+        cls,
+        allowed_cpus: object,
+        cpu_quota_percent: object,
+        cpu_weight: object,
+        *,
+        available_cpus: object,
+    ) -> "OllamaCpuProfile":
+        if not isinstance(allowed_cpus, str):
+            _profile_fail()
+        try:
+            parsed_cpus = _parse_cpu_set(allowed_cpus)
+            host_cpus = _canonical_cpu_set(tuple(sorted(available_cpus)))
+        except (CgroupPreflightError, TypeError):
+            _profile_fail()
+        if not set(parsed_cpus).issubset(host_cpus):
+            _profile_fail()
+        return cls(parsed_cpus, cpu_quota_percent, cpu_weight)
+
+    def systemd_properties(self) -> dict[str, str]:
+        return {
+            "AllowedCPUs": _format_cpu_set(self.allowed_cpus),
+            "CPUQuota": f"{self.cpu_quota_percent}%",
+            "CPUWeight": str(self.cpu_weight),
+        }
 
 
 @dataclass(frozen=True, slots=True)
