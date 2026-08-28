@@ -91,6 +91,18 @@ def validate_dynamic_teamlead_a3_runtime_context(
         raise DynamicTeamleadA3RuntimeProviderError(_INVALID_CONTEXT)
     context = value.context
     request = value.request
+    try:
+        _check_static_request(request)
+    except Exception:
+        raise DynamicTeamleadA3RuntimeProviderError(_INVALID_CONTEXT) from None
+    if (
+        type(context.snapshot) is not type(request.snapshot)
+        or type(context.selection) is not type(request.selection)
+        or type(context.profile_binding) is not type(request.profile_binding)
+        or type(context.expected_principal) is not type(request.expected_principal)
+        or type(context.identity) is not type(request.identity)
+    ):
+        raise DynamicTeamleadA3RuntimeProviderError(_INVALID_CONTEXT)
     if (
         context.snapshot != request.snapshot
         or context.selection != request.selection
@@ -100,7 +112,6 @@ def validate_dynamic_teamlead_a3_runtime_context(
     ):
         raise DynamicTeamleadA3RuntimeProviderError(_INVALID_CONTEXT)
     try:
-        _check_static_request(request)
         plan = prepare_dynamic_teamlead(
             context.snapshot,
             context.selection,

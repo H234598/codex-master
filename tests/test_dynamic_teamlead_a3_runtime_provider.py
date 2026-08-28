@@ -236,6 +236,12 @@ def assert_invalid(value: object) -> None:
     assert caught.value.code == "invalid_dynamic_teamlead_a3_runtime_context"
 
 
+class ContextEqualityImpostor:
+    def __ne__(self, other: object) -> bool:
+        del other
+        return False
+
+
 def test_validate_returns_same_frozen_context_repeatedly() -> None:
     value = valid_value()
 
@@ -290,6 +296,14 @@ def test_rejects_shared_untyped_principal_or_identity(member: str) -> None:
     request = replace(value.request, **{member: untyped})
 
     assert_invalid(replace(value, context=trusted, request=request))
+
+
+@pytest.mark.parametrize("member", ("expected_principal", "identity"))
+def test_rejects_context_only_equality_impostor(member: str) -> None:
+    value = valid_value()
+    trusted = replace(value.context, **{member: ContextEqualityImpostor()})
+
+    assert_invalid(replace(value, context=trusted))
 
 
 def test_rejects_shared_typed_principal_and_identity_foreign_to_selection() -> None:
