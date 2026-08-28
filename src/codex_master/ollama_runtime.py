@@ -608,12 +608,6 @@ class SystemOllamaRuntime:
             with socket.create_connection(
                 ("127.0.0.1", port), timeout=_remaining_seconds(deadline)
             ) as connection:
-                connection.settimeout(_remaining_seconds(deadline))
-                connection.sendall(
-                    b"GET /api/tags HTTP/1.1\r\n"
-                    b"Host: 127.0.0.1\r\n"
-                    b"Connection: close\r\n\r\n"
-                )
                 client_port = int(connection.getsockname()[1])
                 if not _wait_for_connected_server_owner(
                     pid,
@@ -622,6 +616,12 @@ class SystemOllamaRuntime:
                     deadline=deadline,
                 ):
                     return None
+                connection.settimeout(_remaining_seconds(deadline))
+                connection.sendall(
+                    b"GET /api/tags HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
                 encoded = _read_http_response(
                     connection, deadline=deadline, max_body_bytes=max_bytes
                 )

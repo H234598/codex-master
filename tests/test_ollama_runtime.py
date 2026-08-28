@@ -1121,7 +1121,6 @@ def test_http_probe_parses_bounded_content_length_and_chunked_tags(
         try:
             connection.recv(4096)
             connection.sendall(response)
-            time.sleep(0.05)
         finally:
             connection.close()
             listener.close()
@@ -1149,9 +1148,8 @@ def test_http_probe_rejects_connected_server_owned_by_foreign_pid() -> None:
     def serve() -> None:
         connection, _address = listener.accept()
         try:
-            connection.recv(4096)
-            connection.sendall(response)
-            time.sleep(0.1)
+            if connection.recv(4096):
+                connection.sendall(response)
         finally:
             connection.close()
             listener.close()
