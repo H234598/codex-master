@@ -86,10 +86,23 @@ class FakeRuntime:
         self.cleaned.append(request.unit_name)  # type: ignore[attr-defined]
 
     def fetch_tags(
-        self, pid: int, port: int, *, timeout_seconds: float, max_bytes: int
+        self,
+        pid: int,
+        port: int,
+        *,
+        unit_name: str,
+        control_group: str,
+        start_ticks: int,
+        timeout_seconds: float,
+        max_bytes: int,
     ) -> set[str] | None:
         assert pid == self.scope_pid
         assert port == 11435
+        assert re.fullmatch(
+            r"codex-master-ollama-[0-9a-f]{32}\.scope", unit_name
+        )
+        assert control_group == self.scope_control_group
+        assert start_ticks == self.scope_start_ticks
         self.tag_probe_limits = (timeout_seconds, max_bytes)
         if self.invalidate_scope_after_fetch:
             self.cgroup_matches = False
@@ -103,6 +116,22 @@ def make_executable(path: Path) -> Path:
     path.write_bytes(b"#!/bin/sh\nexit 0\n")
     path.chmod(0o700)
     return path
+
+
+def bind_current_scope_identity(
+    runtime: SystemOllamaRuntime,
+    monkeypatch: pytest.MonkeyPatch,
+    pid: int,
+) -> tuple[str, str, int]:
+    unit_name = "codex-master-ollama-0123456789abcdef0123456789abcdef.scope"
+    control_group = ollama_runtime._process_control_group(pid)
+    start_ticks = ollama_runtime._process_start_ticks(pid)
+    monkeypatch.setattr(
+        runtime,
+        "_scope_observation",
+        lambda _unit_name, **_kwargs: (pid, control_group, start_ticks),
+    )
+    return unit_name, control_group, start_ticks
 
 
 def make_models_directory(path: Path) -> Path:
@@ -1058,7 +1087,9 @@ def test_listener_identity_is_bound_to_owning_pid() -> None:
         assert SystemOllamaRuntime().listener_owned_by(os.getppid(), port) is False
 
 
-def test_http_probe_enforces_one_monotonic_total_deadline() -> None:
+def test_http_probe_enforces_one_monotonic_total_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
@@ -1082,9 +1113,19 @@ def test_http_probe_enforces_one_monotonic_total_deadline() -> None:
     thread = threading.Thread(target=trickle, daemon=True)
     thread.start()
     started = time.monotonic()
+    runtime = SystemOllamaRuntime()
+    unit_name, control_group, start_ticks = bind_current_scope_identity(
+        runtime, monkeypatch, os.getpid()
+    )
 
-    result = SystemOllamaRuntime().fetch_tags(
-        os.getpid(), port, timeout_seconds=0.2, max_bytes=64 * 1024
+    result = runtime.fetch_tags(
+        os.getpid(),
+        port,
+        unit_name=unit_name,
+        control_group=control_group,
+        start_ticks=start_ticks,
+        timeout_seconds=0.2,
+        max_bytes=64 * 1024,
     )
     elapsed = time.monotonic() - started
 
@@ -1094,7 +1135,7 @@ def test_http_probe_enforces_one_monotonic_total_deadline() -> None:
 
 @pytest.mark.parametrize("chunked", [False, True])
 def test_http_probe_parses_bounded_content_length_and_chunked_tags(
-    chunked: bool,
+    chunked: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     body = b'{"models":[{"model":"llama-small"}]}'
     if chunked:
@@ -1126,13 +1167,25 @@ def test_http_probe_parses_bounded_content_length_and_chunked_tags(
             listener.close()
 
     threading.Thread(target=serve, daemon=True).start()
+    runtime = SystemOllamaRuntime()
+    unit_name, control_group, start_ticks = bind_current_scope_identity(
+        runtime, monkeypatch, os.getpid()
+    )
 
-    assert SystemOllamaRuntime().fetch_tags(
-        os.getpid(), port, timeout_seconds=0.5, max_bytes=64 * 1024
+    assert runtime.fetch_tags(
+        os.getpid(),
+        port,
+        unit_name=unit_name,
+        control_group=control_group,
+        start_ticks=start_ticks,
+        timeout_seconds=0.5,
+        max_bytes=64 * 1024,
     ) == {"llama-small"}
 
 
-def test_http_probe_rejects_connected_server_owned_by_foreign_pid() -> None:
+def test_http_probe_rejects_connected_server_owned_by_foreign_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     body = b'{"models":[{"model":"llama-small"}]}'
     response = (
         b"HTTP/1.1 200 OK\r\nContent-Length: "
@@ -1155,7 +1208,83 @@ def test_http_probe_rejects_connected_server_owned_by_foreign_pid() -> None:
             listener.close()
 
     threading.Thread(target=serve, daemon=True).start()
+    runtime = SystemOllamaRuntime()
+    unit_name, control_group, start_ticks = bind_current_scope_identity(
+        runtime, monkeypatch, os.getppid()
+    )
 
-    assert SystemOllamaRuntime().fetch_tags(
-        os.getppid(), port, timeout_seconds=0.5, max_bytes=64 * 1024
+    assert runtime.fetch_tags(
+        os.getppid(),
+        port,
+        unit_name=unit_name,
+        control_group=control_group,
+        start_ticks=start_ticks,
+        timeout_seconds=0.5,
+        max_bytes=64 * 1024,
     ) is None
+
+
+def test_http_probe_rejects_reused_pid_identity_before_request_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(1.0)
+    port = listener.getsockname()[1]
+    received: list[bytes] = []
+
+    def serve() -> None:
+        try:
+            connection, _address = listener.accept()
+        except OSError:
+            return
+        try:
+            connection.settimeout(1.0)
+            received.append(connection.recv(4096))
+        except OSError:
+            received.append(b"timeout")
+        finally:
+            connection.close()
+            listener.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    runtime = SystemOllamaRuntime()
+    current_start_ticks = ollama_runtime._process_start_ticks(os.getpid())
+    monkeypatch.setattr(
+        runtime,
+        "_scope_observation",
+        lambda _unit_name, **_kwargs: (
+            os.getpid(),
+            "/user.slice/original.scope",
+            current_start_ticks,
+        ),
+    )
+    monkeypatch.setattr(
+        ollama_runtime,
+        "_process_control_group",
+        lambda _pid: "/user.slice/original.scope",
+    )
+    observed_start_ticks = iter((current_start_ticks, current_start_ticks + 1))
+    monkeypatch.setattr(
+        ollama_runtime,
+        "_process_start_ticks",
+        lambda _pid: next(observed_start_ticks),
+    )
+    try:
+        result = runtime.fetch_tags(
+            os.getpid(),
+            port,
+            unit_name="codex-master-ollama-0123456789abcdef0123456789abcdef.scope",
+            control_group="/user.slice/original.scope",
+            start_ticks=current_start_ticks,
+            timeout_seconds=0.5,
+            max_bytes=64 * 1024,
+        )
+    finally:
+        listener.close()
+        thread.join(timeout=2.0)
+
+    assert result is None
+    assert received == [b""]

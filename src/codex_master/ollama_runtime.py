@@ -469,7 +469,15 @@ class OllamaRuntime(Protocol):
     def listener_owned_by(self, pid: int, port: int) -> bool: ...
 
     def fetch_tags(
-        self, pid: int, port: int, *, timeout_seconds: float, max_bytes: int
+        self,
+        pid: int,
+        port: int,
+        *,
+        unit_name: str,
+        control_group: str,
+        start_ticks: int,
+        timeout_seconds: float,
+        max_bytes: int,
     ) -> set[str] | None: ...
 
     def cleanup_scope(self, request: OllamaStartRequest, process: OllamaProcess) -> None: ...
@@ -543,8 +551,15 @@ class SystemOllamaRuntime:
             return False
         return self._scope_observation(unit_name) == (pid, control_group, start_ticks)
 
-    def _scope_observation(self, unit_name: str) -> tuple[int, str, int] | None:
+    def _scope_observation(
+        self, unit_name: str, *, deadline: float | None = None
+    ) -> tuple[int, str, int] | None:
         try:
+            timeout = (
+                PROBE_TIMEOUT_SECONDS
+                if deadline is None
+                else _remaining_seconds(deadline)
+            )
             result = subprocess.run(
                 (
                     SYSTEMCTL_PATH,
@@ -556,7 +571,7 @@ class SystemOllamaRuntime:
                 ),
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
-                timeout=PROBE_TIMEOUT_SECONDS,
+                timeout=timeout,
                 check=False,
             )
             if result.returncode != 0 or result.stderr or len(result.stdout) > _MAX_CGROUP_BYTES:
@@ -590,13 +605,28 @@ class SystemOllamaRuntime:
             return False
 
     def fetch_tags(
-        self, pid: int, port: int, *, timeout_seconds: float, max_bytes: int
+        self,
+        pid: int,
+        port: int,
+        *,
+        unit_name: str,
+        control_group: str,
+        start_ticks: int,
+        timeout_seconds: float,
+        max_bytes: int,
     ) -> set[str] | None:
         if (
             type(pid) is not int
             or pid < 1
             or type(port) is not int
             or not 1 <= port <= 65535
+            or not isinstance(unit_name, str)
+            or _UNIT_NAME.fullmatch(unit_name) is None
+            or not isinstance(control_group, str)
+            or not control_group.startswith("/")
+            or "\n" in control_group
+            or type(start_ticks) is not int
+            or start_ticks < 1
             or not isinstance(timeout_seconds, (int, float))
             or not 0 < timeout_seconds <= PROBE_TIMEOUT_SECONDS
             or type(max_bytes) is not int
@@ -609,8 +639,11 @@ class SystemOllamaRuntime:
                 ("127.0.0.1", port), timeout=_remaining_seconds(deadline)
             ) as connection:
                 client_port = int(connection.getsockname()[1])
-                if not _wait_for_connected_server_owner(
+                if not self._wait_for_connected_server_identity(
+                    unit_name,
                     pid,
+                    control_group,
+                    start_ticks,
                     server_port=port,
                     client_port=client_port,
                     deadline=deadline,
@@ -644,6 +677,37 @@ class SystemOllamaRuntime:
             return tags
         except (OSError, TimeoutError, ValueError, json.JSONDecodeError):
             return None
+
+    def _wait_for_connected_server_identity(
+        self,
+        unit_name: str,
+        pid: int,
+        control_group: str,
+        start_ticks: int,
+        *,
+        server_port: int,
+        client_port: int,
+        deadline: float,
+    ) -> bool:
+        expected = (pid, control_group, start_ticks)
+        while True:
+            try:
+                inodes = _connected_server_inodes(server_port, client_port)
+                if inodes:
+                    if self._scope_observation(unit_name, deadline=deadline) != expected:
+                        return False
+                    if _pid_owns_socket_inodes(pid, inodes):
+                        current_start_ticks = _process_start_ticks(pid)
+                        current_control_group = _process_control_group(pid)
+                        return (
+                            current_start_ticks == start_ticks
+                            and current_control_group == control_group
+                            and _process_start_ticks(pid) == start_ticks
+                        )
+                remaining = _remaining_seconds(deadline)
+            except (OSError, TimeoutError):
+                return False
+            time.sleep(min(0.005, remaining))
 
     def cleanup_scope(self, request: OllamaStartRequest, process: OllamaProcess) -> None:
         if not _recorded_start_request(request):
@@ -910,6 +974,9 @@ def probe_instance_readiness(
     tags = adapter.fetch_tags(
         instance.ollama_pid,
         instance.port,
+        unit_name=instance.unit_name,
+        control_group=instance.control_group,
+        start_ticks=instance.process_start_ticks,
         timeout_seconds=PROBE_TIMEOUT_SECONDS,
         max_bytes=MAX_TAG_RESPONSE_BYTES,
     )
@@ -1780,24 +1847,6 @@ def _loopback_listener_inodes(port: int) -> set[str]:
         if len(fields) >= 10 and fields[1] == target and fields[3] == "0A":
             inodes.add(fields[9])
     return inodes
-
-
-def _wait_for_connected_server_owner(
-    pid: int,
-    *,
-    server_port: int,
-    client_port: int,
-    deadline: float,
-) -> bool:
-    while True:
-        try:
-            inodes = _connected_server_inodes(server_port, client_port)
-            if inodes and _pid_owns_socket_inodes(pid, inodes):
-                return True
-            remaining = _remaining_seconds(deadline)
-        except (OSError, TimeoutError):
-            return False
-        time.sleep(min(0.005, remaining))
 
 
 def _connected_server_inodes(server_port: int, client_port: int) -> set[str]:
