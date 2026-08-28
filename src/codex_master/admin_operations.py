@@ -20,7 +20,16 @@ from codex_master.hive.state import HiveStateError, HiveStateStore
 
 MAX_OPERATION_RECORDS = 256
 MAX_OPERATION_STEPS = 1_000
-MAX_OPERATION_STATE_BYTES = 2 * 1024 * 1024
+MAX_OPERATION_V1_STATE_BYTES = 2 * 1024 * 1024
+# Largest canonical `,"owner":...` admitted by owner validation below.
+_MAX_OWNER_METADATA_BYTES = len(
+    b',"owner":{"boot_id":"ffffffff-ffff-ffff-ffff-ffffffffffff",'
+    b'"pid":2147483647,"start_ticks":9223372036854775807}'
+)
+MAX_OPERATION_V2_STATE_BYTES = (
+    MAX_OPERATION_V1_STATE_BYTES
+    + MAX_OPERATION_RECORDS * _MAX_OWNER_METADATA_BYTES
+)
 OPERATION_LIFETIME = timedelta(minutes=15)
 
 _DOCUMENT = PurePosixPath("operations.json")
@@ -347,7 +356,7 @@ class AdminOperationStore:
     def _read_locked(self) -> list[dict[str, Any]]:
         try:
             raw = self._state.read_private_bytes(
-                _DOCUMENT, max_bytes=MAX_OPERATION_STATE_BYTES
+                _DOCUMENT, max_bytes=MAX_OPERATION_V2_STATE_BYTES
             )
         except HiveStateError as exc:
             if exc.args == ("state_not_found",):
@@ -367,6 +376,12 @@ class AdminOperationStore:
         ):
             raise AdminOperationError("control.operation_store_unavailable")
         legacy = document.get("schema_version") == 1
+        if len(raw) > (
+            MAX_OPERATION_V1_STATE_BYTES
+            if legacy
+            else MAX_OPERATION_V2_STATE_BYTES
+        ):
+            raise AdminOperationError("control.operation_store_unavailable")
         records: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
         seen_keys: set[str] = set()
@@ -391,6 +406,7 @@ class AdminOperationStore:
             seen_keys.add(record["idempotency_key"])
             records.append(record)
         if legacy:
+            self._prune_expired(records, self._now())
             self._write_locked(records)
         return records
 
@@ -398,22 +414,36 @@ class AdminOperationStore:
         if len(records) > MAX_OPERATION_RECORDS:
             raise AdminOperationError("control.operation_limit")
         try:
-            raw = (
-                json.dumps(
-                    {"schema_version": 2, "operations": records},
-                    ensure_ascii=True,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                + "\n"
-            ).encode("utf-8")
-            if len(raw) > MAX_OPERATION_STATE_BYTES:
+            payload_records = [
+                {key: value for key, value in record.items() if key != "owner"}
+                for record in records
+            ]
+            payload = self._encoded_document(1, payload_records)
+            raw = self._encoded_document(2, records)
+            if (
+                len(payload) > MAX_OPERATION_V1_STATE_BYTES
+                or len(raw) > MAX_OPERATION_V2_STATE_BYTES
+            ):
                 raise AdminOperationError("control.operation_limit")
             self._state.replace_private_bytes(_DOCUMENT, raw)
         except AdminOperationError:
             raise
         except (HiveStateError, OSError, TypeError, ValueError, RecursionError):
             raise AdminOperationError("control.operation_store_unavailable") from None
+
+    @staticmethod
+    def _encoded_document(
+        schema_version: int, records: list[dict[str, Any]]
+    ) -> bytes:
+        return (
+            json.dumps(
+                {"schema_version": schema_version, "operations": records},
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
 
     def _validate_record(self, value: object) -> dict[str, Any]:
         if not isinstance(value, Mapping) or set(value) != _RECORD_FIELDS:

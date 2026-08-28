@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 import multiprocessing
 from pathlib import Path
@@ -19,6 +20,12 @@ from codex_master.admin_operations import (
 
 NOW = datetime(2026, 8, 28, 10, 0, tzinfo=UTC)
 LEGACY_DIGEST = "sha256:b5029f1bcea0a6630628a94cccbed49e025e36551d85fddd6224c7788ca096b5"
+V1_STATE_BYTES = 2 * 1024 * 1024
+MAX_OWNER_METADATA_BYTES = len(
+    b',"owner":{"boot_id":"ffffffff-ffff-ffff-ffff-ffffffffffff",'
+    b'"pid":2147483647,"start_ticks":9223372036854775807}'
+)
+V2_STATE_BYTES = V1_STATE_BYTES + MAX_OPERATION_RECORDS * MAX_OWNER_METADATA_BYTES
 
 
 class Clock:
@@ -86,13 +93,172 @@ def legacy_v1_record(state: str) -> dict[str, object]:
     }
 
 
-def write_operation_document(tmp_path, payload: dict[str, object]) -> Path:
+def write_operation_bytes(tmp_path, raw: bytes) -> Path:
     root = tmp_path / "admin-operations"
     root.mkdir(mode=0o700)
     document = root / "operations.json"
-    document.write_text(json.dumps(payload), encoding="utf-8")
+    document.write_bytes(raw)
     document.chmod(0o600)
     return document
+
+
+def write_operation_document(tmp_path, payload: dict[str, object]) -> Path:
+    return write_operation_bytes(tmp_path, json.dumps(payload).encode("utf-8"))
+
+
+def canonical_document(schema_version: int, records: list[dict[str, object]]) -> bytes:
+    return (
+        json.dumps(
+            {"schema_version": schema_version, "operations": records},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def fixture_digest(steps: list[str]) -> str:
+    payload = json.dumps(
+        {"generation": 4, "kind": "google.provision", "steps": steps},
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def maximum_v1_records() -> list[dict[str, object]]:
+    step_sets = {
+        count: [f"s{index}" for index in range(count)] for count in (134, 135)
+    }
+    digests = {count: fixture_digest(steps) for count, steps in step_sets.items()}
+    records = []
+    for index in range(MAX_OPERATION_RECORDS):
+        count = 135 if index < 192 else 134
+        steps = step_sets[count]
+        records.append(
+            {
+                "id": f"op-cap-{index}",
+                "kind": "google.provision",
+                "state": "planned",
+                "expected_generation": 4,
+                "resulting_generation": None,
+                "plan_digest": digests[count],
+                "created_at": "2026-08-28T10:00:00Z",
+                "expires_at": "2026-08-28T10:15:00Z",
+                "idempotency_key": f"cap-{index}",
+                "steps": [
+                    {"name": name, "state": "not_attempted", "reason_code": None}
+                    for name in steps
+                ],
+                "reason_codes": ["control.plan_ready"],
+            }
+        )
+    remaining = V1_STATE_BYTES - len(canonical_document(1, records))
+    first_key = records[0]["idempotency_key"]
+    assert isinstance(first_key, str)
+    assert 0 <= remaining <= 128 - len(first_key)
+    records[0]["idempotency_key"] = first_key + "x" * remaining
+    assert len(canonical_document(1, records)) == V1_STATE_BYTES
+    return records
+
+
+def test_maximum_v1_document_migrates_without_evicting_unexpired_ids(
+    tmp_path,
+) -> None:
+    records = maximum_v1_records()
+    document = write_operation_bytes(tmp_path, canonical_document(1, records))
+    retained_ids = {record["id"] for record in records}
+
+    store = store_at(tmp_path)
+    persisted_raw = document.read_bytes()
+    persisted = json.loads(persisted_raw)
+
+    assert len(persisted_raw) == (
+        V1_STATE_BYTES + MAX_OPERATION_RECORDS * len(b',"owner":null')
+    )
+    assert len(persisted_raw) <= V2_STATE_BYTES
+    assert persisted["schema_version"] == 2
+    assert {record["id"] for record in persisted["operations"]} == retained_ids
+    assert store.plan(
+        kind="google.provision",
+        generation=4,
+        key=records[0]["idempotency_key"],
+        steps=tuple(step["name"] for step in records[0]["steps"]),
+    ).operation_id == records[0]["id"]
+    assert store_at(tmp_path).get(records[-1]["id"]).id == records[-1]["id"]
+
+
+def test_v1_migration_prunes_only_expired_stable_records(tmp_path) -> None:
+    expired = legacy_v1_record("planned")
+    expired["id"] = "op-v1-expired"
+    expired["idempotency_key"] = "legacy-expired"
+    expired["created_at"] = "2026-08-28T09:00:00Z"
+    expired["expires_at"] = "2026-08-28T09:15:00Z"
+    retained = legacy_v1_record("planned")
+    document = write_operation_document(
+        tmp_path, {"schema_version": 1, "operations": [expired, retained]}
+    )
+
+    store = store_at(tmp_path)
+
+    assert [
+        record["id"]
+        for record in json.loads(document.read_text(encoding="utf-8"))["operations"]
+    ] == [retained["id"]]
+    assert store.get(retained["id"]).id == retained["id"]
+    with pytest.raises(AdminOperationError, match="control.operation_not_found"):
+        store.get(expired["id"])
+
+
+def test_v2_document_one_byte_over_calculated_limit_is_rejected(tmp_path) -> None:
+    store = store_at(tmp_path)
+    store.plan(kind="google.provision", generation=4, key="oversized", steps=("one",))
+    document = tmp_path / "admin-operations" / "operations.json"
+    raw = document.read_bytes()
+    document.write_bytes(raw + b" " * (V2_STATE_BYTES + 1 - len(raw)))
+    document.chmod(0o600)
+
+    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+        store_at(tmp_path)
+
+
+def test_v1_document_one_byte_over_legacy_limit_is_rejected(tmp_path) -> None:
+    raw = canonical_document(1, maximum_v1_records()) + b" "
+    assert len(raw) == V1_STATE_BYTES + 1
+    assert len(raw) <= V2_STATE_BYTES
+    write_operation_bytes(tmp_path, raw)
+
+    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+        store_at(tmp_path)
+
+
+def test_regular_write_cannot_consume_v2_owner_metadata_reserve(tmp_path) -> None:
+    records = maximum_v1_records()[:-1]
+    target = V1_STATE_BYTES - 1
+    remaining = target - len(canonical_document(1, records))
+    for record in records:
+        key = record["idempotency_key"]
+        assert isinstance(key, str)
+        added = min(remaining, 128 - len(key))
+        record["idempotency_key"] = key + "x" * added
+        remaining -= added
+        if remaining == 0:
+            break
+    assert remaining == 0
+    v2_records = [dict(record, owner=None) for record in records]
+    raw = canonical_document(2, v2_records)
+    assert V1_STATE_BYTES < len(raw) <= V2_STATE_BYTES
+    document = write_operation_bytes(tmp_path, raw)
+    store = store_at(tmp_path)
+
+    with pytest.raises(AdminOperationError, match="control.operation_limit"):
+        store.plan(
+            kind="google.provision", generation=4, key="reserve", steps=("one",)
+        )
+
+    assert document.read_bytes() == raw
 
 
 @pytest.mark.parametrize("state", ["planned", "succeeded"])
