@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 from dataclasses import asdict
 import json
-import os
 from pathlib import Path
 import threading
 import urllib.parse
@@ -15,7 +14,6 @@ import codex_master.google_oauth_session as oauth_session
 from codex_master.credential_vault import CredentialVault
 from codex_master.google_account_inventory import GoogleAccountInventoryLoader
 from codex_master.google_account_inventory_manager import GoogleAccountInventoryManager
-from codex_master.google_inventory_token_vault import GoogleInventoryReadonlyTokenVault
 from codex_master.google_oauth_authorization import GoogleOAuthProfileIdV1
 
 from codex_master.google_oauth_session import (
@@ -187,7 +185,7 @@ class _SecretIngress:
             self.generation = plan.expected_generation
             self.plan_digest = plan.plan_digest
             self.payload = bytearray(payload)
-            self.consumed = False
+            self.acknowledged = False
 
         def __repr__(self) -> str:
             return "SecretIngressSession(<redacted>)"
@@ -195,7 +193,7 @@ class _SecretIngress:
     def put(self, plan, payload: bytes):
         return self.Session(plan, payload)
 
-    def consume_oauth_client(
+    def read_oauth_client(
         self,
         session,
         *,
@@ -205,16 +203,86 @@ class _SecretIngress:
     ) -> bytearray:
         if (
             not isinstance(session, self.Session)
-            or session.consumed
+            or session.acknowledged
             or session.account_ref != account_ref
             or session.generation != expected_generation
             or session.plan_digest != plan_digest
         ):
             raise oauth_session.GoogleOAuthSessionError("credential.upload_expired")
-        session.consumed = True
-        payload = session.payload
-        session.payload = bytearray(len(payload))
-        return payload
+        return bytearray(session.payload)
+
+    def acknowledge_oauth_client(
+        self,
+        session,
+        *,
+        account_ref: str,
+        expected_generation: int,
+        plan_digest: str,
+    ) -> None:
+        if (
+            not isinstance(session, self.Session)
+            or session.account_ref != account_ref
+            or session.generation != expected_generation
+            or session.plan_digest != plan_digest
+        ):
+            raise oauth_session.GoogleOAuthSessionError("credential.upload_expired")
+        session.acknowledged = True
+        session.payload[:] = b"\0" * len(session.payload)
+
+
+class _TokenWriter:
+    def __init__(self) -> None:
+        self.receipts: dict[str, oauth_session.GoogleOAuthTokenWriteReceiptV1] = {}
+        self.writes: list[tuple[str, str, str]] = []
+
+    def lookup_refresh_token_receipt(
+        self,
+        operation_id: str,
+        *,
+        account_ref: str,
+        scope_profile: GoogleOAuthProfileIdV1,
+        scope_fingerprint: str,
+    ):
+        receipt = self.receipts.get(operation_id)
+        if receipt is not None and (
+            receipt.account_ref != account_ref
+            or receipt.scope_profile is not scope_profile
+            or receipt.scope_fingerprint != scope_fingerprint
+        ):
+            raise oauth_session.GoogleOAuthSessionError("oauth.scope_mismatch")
+        return receipt
+
+    def store_refresh_token(
+        self,
+        operation_id: str,
+        *,
+        account_ref: str,
+        subject_id: str,
+        oauth_client_fingerprint: str,
+        scope_profile: GoogleOAuthProfileIdV1,
+        scope_fingerprint: str,
+        refresh_token: bytearray,
+    ):
+        existing = self.lookup_refresh_token_receipt(
+            operation_id,
+            account_ref=account_ref,
+            scope_profile=scope_profile,
+            scope_fingerprint=scope_fingerprint,
+        )
+        if existing is not None:
+            return existing
+        assert refresh_token == bytearray(b"private-refresh-token")
+        self.writes.append((account_ref, scope_profile.value, scope_fingerprint))
+        receipt = oauth_session.GoogleOAuthTokenWriteReceiptV1(
+            operation_id=operation_id,
+            account_ref=account_ref,
+            subject_id=subject_id,
+            oauth_client_fingerprint=oauth_client_fingerprint,
+            scope_profile=scope_profile,
+            scope_fingerprint=scope_fingerprint,
+        )
+        self.receipts[operation_id] = receipt
+        return receipt
 
 
 class _Exchange:
@@ -282,18 +350,6 @@ def _manager(tmp_path: Path) -> GoogleAccountInventoryManager:
     return manager
 
 
-def _token_vault(root: Path) -> GoogleInventoryReadonlyTokenVault:
-    root.mkdir(mode=0o700, exist_ok=True)
-    (root / "tokens").mkdir(mode=0o700, exist_ok=True)
-    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        return GoogleInventoryReadonlyTokenVault._for_test_tokens_parent_directory_fd(
-            descriptor
-        )
-    finally:
-        os.close(descriptor)
-
-
 def _client_json(marker: str = "private-client-secret") -> bytes:
     return json.dumps(
         {
@@ -315,11 +371,13 @@ def _service(
     clock: _Clock | None = None,
     exchange: _Exchange | None = None,
     ingress: _SecretIngress | None = None,
+    token_writer: _TokenWriter | None = None,
     manager: GoogleAccountInventoryManager | None = None,
 ):
     manager = manager or _manager(tmp_path)
     clock = clock or _Clock()
     ingress = ingress or _SecretIngress()
+    token_writer = token_writer or _TokenWriter()
     exchange = exchange or _Exchange()
     service = oauth_session.GoogleOAuthControlService(
         tmp_path / "oauth-state",
@@ -327,7 +385,7 @@ def _service(
         client_vault=CredentialVault.for_test(
             tmp_path / "client-vault", key=b"k" * 32, clock=clock
         ),
-        token_vault=_token_vault(tmp_path / "token-vault"),
+        token_writer=token_writer,
         secret_ingress=ingress,
         code_exchange=exchange,
         clock=clock,
@@ -412,7 +470,7 @@ def test_oauth_callback_binding_mismatch_is_terminal_without_token_write(
 
     with pytest.raises(GoogleOAuthSessionError, match=code):
         _complete(service, transaction, **override)
-    assert not list((tmp_path / "token-vault" / "tokens").iterdir())
+    assert service._token_writer.writes == []
     assert exchange.calls == []
     with pytest.raises(GoogleOAuthSessionError, match="oauth.transaction_expired"):
         _complete(service, transaction)
@@ -427,7 +485,7 @@ def test_subject_mismatch_is_terminal_and_writes_no_token(tmp_path: Path) -> Non
 
     with pytest.raises(GoogleOAuthSessionError, match="oauth.subject_mismatch"):
         _complete(service, transaction)
-    assert not list((tmp_path / "token-vault" / "tokens").iterdir())
+    assert service._token_writer.writes == []
 
 
 def test_expired_transaction_stays_terminal_across_restart(tmp_path: Path) -> None:
@@ -467,7 +525,7 @@ def test_inventory_generation_change_prevents_token_write(tmp_path: Path) -> Non
 
     with pytest.raises(GoogleOAuthSessionError, match="oauth.generation_mismatch"):
         _complete(service, transaction)
-    assert not list((tmp_path / "token-vault" / "tokens").iterdir())
+    assert service._token_writer.writes == []
     assert exchange.calls == []
 
 
@@ -496,8 +554,7 @@ def test_concurrent_completion_exchanges_and_writes_token_once(tmp_path: Path) -
 
     assert sorted(outcomes) == ["oauth.transaction_expired", "succeeded"]
     assert len(exchange.calls) == 1
-    token_records = list((tmp_path / "token-vault" / "tokens").glob("*.json"))
-    assert len(token_records) == 1
+    assert len(service._token_writer.writes) == 1
 
 
 def test_client_import_apply_is_idempotent_but_ingress_cannot_be_replayed(
@@ -572,3 +629,317 @@ def test_oauth_client_ref_cannot_cross_accounts(tmp_path: Path) -> None:
             scope_profile=GoogleOAuthProfileIdV1.INVENTORY_READONLY,
             expected_generation=1,
         )
+
+
+def test_provisioner_grant_is_rejected_before_any_transaction_or_token_write(
+    tmp_path: Path,
+) -> None:
+    service, ingress, _exchange, _manager_instance = _service(tmp_path)
+    _plan, _session, imported = _import_client(service, ingress)
+
+    with pytest.raises(GoogleOAuthSessionError, match="oauth.scope_mismatch"):
+        service.begin_oauth_transaction(
+            "google-account-01",
+            oauth_client_ref=imported.client_ref,
+            redirect_uri="http://127.0.0.1:8765/callback",
+            scope_profile=GoogleOAuthProfileIdV1.PROVISIONER,
+            expected_generation=1,
+        )
+
+    document = json.loads(
+        (tmp_path / "oauth-state" / "google-oauth-control.json").read_text()
+    )
+    assert document["transactions"] == []
+    assert service._token_writer.writes == []
+
+
+def test_client_import_recovers_receipt_after_control_write_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, ingress, exchange, manager = _service(tmp_path)
+    plan = service.plan_oauth_client_import(
+        "google-account-01", expected_generation=1, idempotency_key="import-one"
+    )
+    session = ingress.put(plan, _client_json())
+    original_write = service._write_locked
+    writes = 0
+
+    def crash_after_vault_write(document):
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise oauth_session.HiveStateError("simulated_crash")
+        original_write(document)
+
+    monkeypatch.setattr(service, "_write_locked", crash_after_vault_write)
+    with pytest.raises(GoogleOAuthSessionError, match="oauth.client_write_failed"):
+        service.apply_oauth_client_import(plan, session)
+    monkeypatch.setattr(service, "_write_locked", original_write)
+
+    restarted, _ingress, _exchange, _manager_instance = _service(
+        tmp_path, ingress=ingress, exchange=exchange, manager=manager
+    )
+    receipt = restarted.apply_oauth_client_import(plan, session)
+    assert receipt.account_ref == "google-account-01"
+    assert receipt.inventory_generation == 1
+    assert session.acknowledged is True
+
+
+def test_token_write_receipt_recovers_after_control_write_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token_writer = _TokenWriter()
+    clock = _Clock()
+    service, ingress, exchange, manager = _service(
+        tmp_path, token_writer=token_writer, clock=clock
+    )
+    _plan, _session, imported = _import_client(service, ingress)
+    transaction = _begin(service, imported.client_ref)
+    original_write = service._write_locked
+    writes = 0
+
+    def crash_after_token_write(document):
+        nonlocal writes
+        writes += 1
+        if writes == 3:
+            raise oauth_session.HiveStateError("simulated_crash")
+        original_write(document)
+
+    monkeypatch.setattr(service, "_write_locked", crash_after_token_write)
+    with pytest.raises(GoogleOAuthSessionError, match="oauth.token_write_failed"):
+        _complete(service, transaction)
+    monkeypatch.setattr(service, "_write_locked", original_write)
+    assert len(token_writer.writes) == 1
+    clock.value += 1_000
+
+    restarted, _ingress, _exchange, _manager_instance = _service(
+        tmp_path,
+        ingress=ingress,
+        exchange=exchange,
+        manager=manager,
+        token_writer=token_writer,
+        clock=clock,
+    )
+    assert _complete(restarted, transaction).refresh_token_stored is True
+    assert len(token_writer.writes) == 1
+    assert len(exchange.calls) == 1
+
+
+def test_concurrent_client_reimport_invalidates_inflight_completion(
+    tmp_path: Path,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingExchange(_Exchange):
+        def exchange(self, client, *, code, redirect_uri, pkce_verifier):
+            started.set()
+            assert release.wait(5)
+            return super().exchange(
+                client,
+                code=code,
+                redirect_uri=redirect_uri,
+                pkce_verifier=pkce_verifier,
+            )
+
+    exchange = BlockingExchange()
+    service, ingress, _exchange, _manager_instance = _service(
+        tmp_path, exchange=exchange
+    )
+    _plan, _session, imported = _import_client(service, ingress)
+    transaction = _begin(service, imported.client_ref)
+    outcome: list[str] = []
+
+    def complete() -> None:
+        try:
+            _complete(service, transaction)
+        except GoogleOAuthSessionError as error:
+            outcome.append(error.code)
+        else:
+            outcome.append("succeeded")
+
+    thread = threading.Thread(target=complete)
+    thread.start()
+    assert started.wait(5)
+    _import_client(service, ingress, key="import-two")
+    release.set()
+    thread.join(5)
+
+    assert outcome == ["oauth.client_expired"]
+    assert service._token_writer.writes == []
+
+
+def test_client_load_failure_terminalizes_and_removes_callback_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, ingress, _exchange, _manager_instance = _service(tmp_path)
+    _plan, _session, imported = _import_client(service, ingress)
+    transaction = _begin(service, imported.client_ref)
+
+    def fail_load(*_args, **_kwargs):
+        raise GoogleOAuthSessionError("oauth.client_expired")
+
+    monkeypatch.setattr(service, "_load_client", fail_load)
+    with pytest.raises(GoogleOAuthSessionError, match="oauth.client_expired"):
+        _complete(service, transaction)
+
+    document = json.loads(
+        (tmp_path / "oauth-state" / "google-oauth-control.json").read_text()
+    )
+    record = next(
+        item for item in document["transactions"] if item["id"] == transaction.id
+    )
+    assert record["state"] == "failed"
+    assert record["pkce_verifier"] is None
+    assert record["state_token"] is None
+
+
+def test_unexpected_base_exception_zeroes_token_and_terminalizes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    held: list[bytearray] = []
+
+    class HoldingExchange(_Exchange):
+        def exchange(self, client, *, code, redirect_uri, pkce_verifier):
+            result = super().exchange(
+                client,
+                code=code,
+                redirect_uri=redirect_uri,
+                pkce_verifier=pkce_verifier,
+            )
+            held.append(result.refresh_token)
+            return result
+
+    class FatalProviderBoundary(BaseException):
+        pass
+
+    service, ingress, _exchange, _manager_instance = _service(
+        tmp_path, exchange=HoldingExchange()
+    )
+    _plan, _session, imported = _import_client(service, ingress)
+    transaction = _begin(service, imported.client_ref)
+    original_subject = service._account_subject
+    calls = 0
+
+    def fail_after_exchange(account_ref, generation):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise FatalProviderBoundary()
+        return original_subject(account_ref, generation)
+
+    monkeypatch.setattr(service, "_account_subject", fail_after_exchange)
+    with pytest.raises(FatalProviderBoundary):
+        _complete(service, transaction)
+
+    assert held and held[0] == bytearray(len(held[0]))
+    document = json.loads(
+        (tmp_path / "oauth-state" / "google-oauth-control.json").read_text()
+    )
+    record = next(
+        item for item in document["transactions"] if item["id"] == transaction.id
+    )
+    assert record["state"] == "failed"
+    assert record["pkce_verifier"] is None
+    assert record["state_token"] is None
+
+
+def test_terminal_history_is_pruned_without_dropping_active_transactions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(oauth_session, "_MAX_CONTROL_RECORDS", 2)
+    service, ingress, _exchange, _manager_instance = _service(tmp_path)
+    _plan, _session, imported = _import_client(service, ingress)
+    active = _begin(service, imported.client_ref)
+    terminal = _begin(service, imported.client_ref)
+    with pytest.raises(GoogleOAuthSessionError, match="oauth.state_mismatch"):
+        _complete(service, terminal, state="wrong-state")
+
+    replacement = _begin(service, imported.client_ref)
+    document = json.loads(
+        (tmp_path / "oauth-state" / "google-oauth-control.json").read_text()
+    )
+    ids = {item["id"] for item in document["transactions"]}
+    assert ids == {active.id, replacement.id}
+    assert all(item["state"] == "pending" for item in document["transactions"])
+
+
+def test_corrupt_durable_record_fails_closed_during_service_start(
+    tmp_path: Path,
+) -> None:
+    service, ingress, exchange, manager = _service(tmp_path)
+    _plan, _session, imported = _import_client(service, ingress)
+    transaction = _begin(service, imported.client_ref)
+    path = tmp_path / "oauth-state" / "google-oauth-control.json"
+    document = json.loads(path.read_text())
+    document["transactions"][0]["inventory_generation"] = "one"
+    path.write_text(json.dumps(document))
+
+    with pytest.raises(GoogleOAuthSessionError, match="oauth.control_unavailable"):
+        _service(tmp_path, ingress=ingress, exchange=exchange, manager=manager)
+
+    assert transaction.id
+
+
+def test_valid_v1_records_migrate_before_callback_effect(
+    tmp_path: Path,
+) -> None:
+    token_writer = _TokenWriter()
+    service, ingress, exchange, manager = _service(tmp_path, token_writer=token_writer)
+    _plan, _session, imported = _import_client(service, ingress)
+    transaction = _begin(service, imported.client_ref)
+    path = tmp_path / "oauth-state" / "google-oauth-control.json"
+    document = json.loads(path.read_text())
+    document["schema_version"] = 1
+    document["token_generations"] = {}
+    document["imports"] = []
+    for record in document["clients"]:
+        record.pop("state")
+        record.pop("terminal_at")
+    for record in document["transactions"]:
+        for field in (
+            "client_vault_generation",
+            "state_digest",
+            "token_operation_id",
+            "terminal_at",
+        ):
+            record.pop(field)
+    path.write_text(json.dumps(document))
+
+    restarted, _ingress, _exchange, _manager_instance = _service(
+        tmp_path,
+        ingress=ingress,
+        exchange=exchange,
+        manager=manager,
+        token_writer=token_writer,
+    )
+    assert json.loads(path.read_text())["schema_version"] == 2
+    assert _complete(restarted, transaction).refresh_token_stored is True
+
+
+def test_stale_completing_record_is_terminalized_after_restart(
+    tmp_path: Path,
+) -> None:
+    token_writer = _TokenWriter()
+    service, ingress, exchange, manager = _service(tmp_path, token_writer=token_writer)
+    _plan, _session, imported = _import_client(service, ingress)
+    transaction = _begin(service, imported.client_ref)
+    path = tmp_path / "oauth-state" / "google-oauth-control.json"
+    document = json.loads(path.read_text())
+    document["transactions"][0]["state"] = "completing"
+    path.write_text(json.dumps(document))
+
+    restarted, _ingress, _exchange, _manager_instance = _service(
+        tmp_path,
+        ingress=ingress,
+        exchange=exchange,
+        manager=manager,
+        token_writer=token_writer,
+    )
+    with pytest.raises(GoogleOAuthSessionError, match="oauth.token_write_failed"):
+        _complete(restarted, transaction)
+    record = json.loads(path.read_text())["transactions"][0]
+    assert record["state"] == "failed"
+    assert record["pkce_verifier"] is None
+    assert record["state_token"] is None
+    assert token_writer.writes == []

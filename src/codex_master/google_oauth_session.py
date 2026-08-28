@@ -24,10 +24,6 @@ from .credential_vault import CredentialVault, CredentialVaultError
 from .google_account_inventory import GoogleAccountInventoryError
 from .google_account_inventory_manager import GoogleAccountInventoryManager
 from .google_cloud_api import GoogleCloudApi, GoogleCloudApiError
-from .google_inventory_token_vault import (
-    GoogleInventoryReadonlyTokenVault,
-    GoogleInventoryReadonlyTokenVaultError,
-)
 from .google_oauth_authorization import (
     GoogleOAuthOperationV1,
     GoogleOAuthProfileIdV1,
@@ -340,11 +336,17 @@ MAX_OAUTH_CLIENT_IMPORT_SECONDS: Final[int] = 5 * 60
 _CONTROL_DOCUMENT: Final[PurePosixPath] = PurePosixPath("google-oauth-control.json")
 _MAX_CONTROL_BYTES: Final[int] = 2 * 1024 * 1024
 _MAX_CONTROL_RECORDS: Final[int] = 4096
+_CONTROL_SCHEMA_VERSION: Final[int] = 2
 _REF: Final[re.Pattern[str]] = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII
 )
 _REDIRECT: Final[re.Pattern[str]] = re.compile(
     r"http://127\.0\.0\.1:([1-9][0-9]{0,4})/callback\Z", re.ASCII
+)
+_DIGEST: Final[re.Pattern[str]] = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
+_URLSAFE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_-]{16,512}\Z", re.ASCII)
+_DISPLAY_NAME: Final[re.Pattern[str]] = re.compile(
+    r"[A-Za-z]{2,20} [A-Za-z]{2,20}\Z", re.ASCII
 )
 
 
@@ -352,9 +354,9 @@ GoogleOAuthError = GoogleOAuthSessionError
 
 
 class SecretIngressPort(Protocol):
-    """Task-8/9 adapter port for one authorized, session-bound secret put."""
+    """Task-8/9 durable claim port; read stays replayable until acknowledged."""
 
-    def consume_oauth_client(
+    def read_oauth_client(
         self,
         session: object,
         *,
@@ -362,6 +364,15 @@ class SecretIngressPort(Protocol):
         expected_generation: int,
         plan_digest: str,
     ) -> bytearray: ...
+
+    def acknowledge_oauth_client(
+        self,
+        session: object,
+        *,
+        account_ref: str,
+        expected_generation: int,
+        plan_digest: str,
+    ) -> None: ...
 
 
 class GoogleOAuthCodeExchangePort(Protocol):
@@ -375,6 +386,35 @@ class GoogleOAuthCodeExchangePort(Protocol):
         redirect_uri: str,
         pkce_verifier: str,
     ) -> GoogleOAuthCodeExchangeV1: ...
+
+
+class GoogleOAuthTokenWriterPort(Protocol):
+    """Account/scope-bound authority over the existing Google token owner.
+
+    Implementations atomically bind token effect and durable operation receipt.
+    Repeating one operation ID returns that receipt without another token write.
+    """
+
+    def lookup_refresh_token_receipt(
+        self,
+        operation_id: str,
+        *,
+        account_ref: str,
+        scope_profile: GoogleOAuthProfileIdV1,
+        scope_fingerprint: str,
+    ) -> GoogleOAuthTokenWriteReceiptV1 | None: ...
+
+    def store_refresh_token(
+        self,
+        operation_id: str,
+        *,
+        account_ref: str,
+        subject_id: str,
+        oauth_client_fingerprint: str,
+        scope_profile: GoogleOAuthProfileIdV1,
+        scope_fingerprint: str,
+        refresh_token: bytearray,
+    ) -> GoogleOAuthTokenWriteReceiptV1: ...
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -393,6 +433,19 @@ class GoogleOAuthCodeExchangeV1:
 
     def __repr__(self) -> str:
         return "GoogleOAuthCodeExchangeV1(<redacted>)"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class GoogleOAuthTokenWriteReceiptV1:
+    operation_id: str
+    account_ref: str
+    subject_id: str
+    oauth_client_fingerprint: str
+    scope_profile: GoogleOAuthProfileIdV1
+    scope_fingerprint: str
+
+    def __repr__(self) -> str:
+        return "GoogleOAuthTokenWriteReceiptV1(<redacted>)"
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -446,7 +499,7 @@ class GoogleOAuthControlService:
         *,
         manager: GoogleAccountInventoryManager,
         client_vault: CredentialVault,
-        token_vault: GoogleInventoryReadonlyTokenVault,
+        token_writer: GoogleOAuthTokenWriterPort,
         secret_ingress: SecretIngressPort,
         code_exchange: GoogleOAuthCodeExchangePort,
         clock: Callable[[], float] | None = None,
@@ -456,8 +509,10 @@ class GoogleOAuthControlService:
             or not state_root.is_absolute()
             or not isinstance(manager, GoogleAccountInventoryManager)
             or not isinstance(client_vault, CredentialVault)
-            or not isinstance(token_vault, GoogleInventoryReadonlyTokenVault)
-            or not callable(getattr(secret_ingress, "consume_oauth_client", None))
+            or not callable(getattr(token_writer, "lookup_refresh_token_receipt", None))
+            or not callable(getattr(token_writer, "store_refresh_token", None))
+            or not callable(getattr(secret_ingress, "read_oauth_client", None))
+            or not callable(getattr(secret_ingress, "acknowledge_oauth_client", None))
             or not callable(getattr(code_exchange, "exchange", None))
             or (clock is not None and not callable(clock))
         ):
@@ -465,23 +520,21 @@ class GoogleOAuthControlService:
         self._root = state_root
         self._manager = manager
         self._client_vault = client_vault
-        self._token_vault = token_vault
+        self._token_writer = token_writer
         self._secret_ingress = secret_ingress
         self._code_exchange = code_exchange
         self._clock = clock or time.time
+        self._owned_completions: set[str] = set()
         try:
             self._state = HiveStateStore(state_root)
             with self._state.locked():
                 try:
+                    os.lstat(state_root / _CONTROL_DOCUMENT.name)
+                except FileNotFoundError:
+                    self._write_locked(self._empty_document())
+                else:
                     self._read_locked()
-                except HiveStateError:
-                    try:
-                        os.lstat(state_root / _CONTROL_DOCUMENT.name)
-                    except FileNotFoundError:
-                        self._write_locked(self._empty_document())
-                    else:
-                        raise
-        except (HiveStateError, OSError):
+        except (GoogleOAuthSessionError, HiveStateError, OSError):
             raise GoogleOAuthSessionError("oauth.control_unavailable") from None
 
     def __repr__(self) -> str:
@@ -490,47 +543,546 @@ class GoogleOAuthControlService:
     @staticmethod
     def _empty_document() -> dict[str, object]:
         return {
-            "schema_version": 1,
+            "schema_version": _CONTROL_SCHEMA_VERSION,
             "imports": [],
             "clients": [],
             "transactions": [],
-            "token_generations": {},
         }
 
     def _read_locked(self) -> dict[str, object]:
-        value = dict(
-            self._state.read_json_locked(
-                _CONTROL_DOCUMENT, max_bytes=_MAX_CONTROL_BYTES
+        try:
+            value = dict(
+                self._state.read_json_locked(
+                    _CONTROL_DOCUMENT, max_bytes=_MAX_CONTROL_BYTES
+                )
             )
-        )
+            if value.get("schema_version") == 1:
+                value = self._migrate_v1(value)
+                self._write_locked(value)
+            self._validate_v2(value)
+        except (HiveStateError, OSError):
+            raise GoogleOAuthSessionError("oauth.control_unavailable") from None
+        return value
+
+    @staticmethod
+    def _record(value: object, fields: set[str]) -> dict[str, object]:
+        if type(value) is not dict or set(value) != fields:
+            raise HiveStateError("invalid_google_oauth_control_state")
+        return cast(dict[str, object], value)
+
+    @staticmethod
+    def _stored_ref(value: object) -> bool:
+        return type(value) is str and _REF.fullmatch(value) is not None
+
+    @staticmethod
+    def _stored_digest(value: object) -> bool:
+        return type(value) is str and _DIGEST.fullmatch(value) is not None
+
+    @staticmethod
+    def _stored_urlsafe(value: object) -> bool:
+        return type(value) is str and _URLSAFE.fullmatch(value) is not None
+
+    @staticmethod
+    def _stored_generation(value: object) -> bool:
+        return type(value) is int and 1 <= value <= 2**63 - 1
+
+    @staticmethod
+    def _stored_time(value: object) -> bool:
+        if type(value) is int:
+            return 0 <= value <= 2**63 - 1
+        if type(value) is float:
+            return 0 <= value <= float(2**63 - 1)
+        return False
+
+    @staticmethod
+    def _stored_display_name(value: object) -> bool:
+        return type(value) is str and _DISPLAY_NAME.fullmatch(value) is not None
+
+    @classmethod
+    def _validate_v2(cls, value: Mapping[str, object]) -> None:
+        if set(value) != {"schema_version", "imports", "clients", "transactions"}:
+            raise HiveStateError("invalid_google_oauth_control_state")
+        if value.get("schema_version") != _CONTROL_SCHEMA_VERSION:
+            raise HiveStateError("invalid_google_oauth_control_state")
+        collections: list[list[object]] = []
+        for field in ("imports", "clients", "transactions"):
+            records = value.get(field)
+            if type(records) is not list or len(records) > _MAX_CONTROL_RECORDS:
+                raise HiveStateError("invalid_google_oauth_control_state")
+            collections.append(records)
+        imports, clients, transactions = collections
+        import_ids: set[str] = set()
+        idempotency_keys: set[str] = set()
+        for item in imports:
+            record = cls._record(
+                item,
+                {
+                    "id",
+                    "account_ref",
+                    "expected_generation",
+                    "expires_at",
+                    "idempotency_key",
+                    "plan_digest",
+                    "state",
+                    "nonce",
+                    "client_ref",
+                    "client_digest",
+                    "display_name",
+                    "vault_generation",
+                    "terminal_at",
+                },
+            )
+            common = (
+                cls._stored_ref(record["id"])
+                and cls._stored_ref(record["account_ref"])
+                and cls._stored_generation(record["expected_generation"])
+                and cls._stored_time(record["expires_at"])
+                and cls._stored_ref(record["idempotency_key"])
+                and cls._stored_digest(record["plan_digest"])
+            )
+            state = record["state"]
+            pending = state == "planned" and (
+                cls._stored_urlsafe(record["nonce"])
+                and record["plan_digest"]
+                == cls._digest(
+                    "google.oauth-client-import",
+                    record["id"],
+                    record["account_ref"],
+                    record["expected_generation"],
+                    record["expires_at"],
+                    record["idempotency_key"],
+                    record["nonce"],
+                )
+                and all(
+                    record[field] is None
+                    for field in (
+                        "client_ref",
+                        "client_digest",
+                        "display_name",
+                        "vault_generation",
+                        "terminal_at",
+                    )
+                )
+            )
+            has_client = (
+                cls._stored_ref(record["client_ref"])
+                and cls._stored_digest(record["client_digest"])
+                and cls._stored_display_name(record["display_name"])
+                and cls._stored_generation(record["vault_generation"])
+            )
+            persisting = (
+                state == "persisting"
+                and record["nonce"] is None
+                and has_client
+                and record["terminal_at"] is None
+            )
+            succeeded = (
+                state == "succeeded"
+                and record["nonce"] is None
+                and has_client
+                and cls._stored_time(record["terminal_at"])
+            )
+            failed = (
+                state in {"failed", "expired"}
+                and record["nonce"] is None
+                and all(
+                    record[field] is None
+                    for field in (
+                        "client_ref",
+                        "client_digest",
+                        "display_name",
+                        "vault_generation",
+                    )
+                )
+                and cls._stored_time(record["terminal_at"])
+            )
+            if not common or not (pending or persisting or succeeded or failed):
+                raise HiveStateError("invalid_google_oauth_control_state")
+            import_id = cast(str, record["id"])
+            idempotency_key = cast(str, record["idempotency_key"])
+            if import_id in import_ids or idempotency_key in idempotency_keys:
+                raise HiveStateError("invalid_google_oauth_control_state")
+            import_ids.add(import_id)
+            idempotency_keys.add(idempotency_key)
+        client_ids: set[str] = set()
+        client_authorities: set[tuple[str, int]] = set()
+        active_accounts: set[str] = set()
+        for item in clients:
+            record = cls._record(
+                item,
+                {
+                    "id",
+                    "account_ref",
+                    "inventory_generation",
+                    "client_digest",
+                    "display_name",
+                    "vault_generation",
+                    "state",
+                    "terminal_at",
+                },
+            )
+            state = record["state"]
+            valid_state = (state == "active" and record["terminal_at"] is None) or (
+                state == "retired" and cls._stored_time(record["terminal_at"])
+            )
+            if not (
+                cls._stored_ref(record["id"])
+                and cls._stored_ref(record["account_ref"])
+                and cls._stored_generation(record["inventory_generation"])
+                and cls._stored_digest(record["client_digest"])
+                and cls._stored_display_name(record["display_name"])
+                and cls._stored_generation(record["vault_generation"])
+                and valid_state
+            ):
+                raise HiveStateError("invalid_google_oauth_control_state")
+            client_id = cast(str, record["id"])
+            account_ref = cast(str, record["account_ref"])
+            if client_id in client_ids or (
+                state == "active" and account_ref in active_accounts
+            ):
+                raise HiveStateError("invalid_google_oauth_control_state")
+            authority = (account_ref, cast(int, record["vault_generation"]))
+            if authority in client_authorities:
+                raise HiveStateError("invalid_google_oauth_control_state")
+            client_ids.add(client_id)
+            client_authorities.add(authority)
+            if state == "active":
+                active_accounts.add(account_ref)
+        transaction_ids: set[str] = set()
+        operation_ids: set[str] = set()
+        for item in transactions:
+            record = cls._record(
+                item,
+                {
+                    "id",
+                    "account_ref",
+                    "oauth_client_ref",
+                    "client_digest",
+                    "client_vault_generation",
+                    "pkce_verifier",
+                    "redirect_uri",
+                    "scope_profile",
+                    "scope_fingerprint",
+                    "state_token",
+                    "state_digest",
+                    "inventory_generation",
+                    "expires_at",
+                    "state",
+                    "token_operation_id",
+                    "terminal_at",
+                },
+            )
+            base = (
+                cls._stored_ref(record["id"])
+                and cls._stored_ref(record["account_ref"])
+                and cls._stored_ref(record["oauth_client_ref"])
+                and cls._stored_digest(record["client_digest"])
+                and cls._stored_generation(record["client_vault_generation"])
+                and type(record["redirect_uri"]) is str
+                and _REDIRECT.fullmatch(cast(str, record["redirect_uri"])) is not None
+                and record["scope_profile"]
+                == GoogleOAuthProfileIdV1.INVENTORY_READONLY.value
+                and cls._stored_digest(record["scope_fingerprint"])
+                and record["scope_fingerprint"]
+                == resolve_google_oauth_profile_v1(
+                    GoogleOAuthProfileIdV1.INVENTORY_READONLY,
+                    GoogleOAuthOperationV1.PROJECTS_SEARCH,
+                ).scope_fingerprint
+                and cls._stored_digest(record["state_digest"])
+                and cls._stored_generation(record["inventory_generation"])
+                and cls._stored_time(record["expires_at"])
+            )
+            state = record["state"]
+            callback = state in {"pending", "completing"} and (
+                cls._stored_urlsafe(record["pkce_verifier"])
+                and cls._stored_urlsafe(record["state_token"])
+                and record["state_digest"]
+                == cls._digest("google.oauth-state", record["state_token"])
+                and record["token_operation_id"] is None
+                and record["terminal_at"] is None
+            )
+            persisting = state == "persisting" and (
+                record["pkce_verifier"] is None
+                and record["state_token"] is None
+                and cls._stored_digest(record["token_operation_id"])
+                and record["token_operation_id"]
+                == cls._digest(
+                    "google.oauth-token-write",
+                    record["id"],
+                    record["account_ref"],
+                    record["client_digest"],
+                    record["scope_fingerprint"],
+                )
+                and record["terminal_at"] is None
+            )
+            terminal = state in {"succeeded", "failed", "expired"} and (
+                record["pkce_verifier"] is None
+                and record["state_token"] is None
+                and cls._stored_time(record["terminal_at"])
+                and (
+                    record["token_operation_id"] is None
+                    or (
+                        cls._stored_digest(record["token_operation_id"])
+                        and record["token_operation_id"]
+                        == cls._digest(
+                            "google.oauth-token-write",
+                            record["id"],
+                            record["account_ref"],
+                            record["client_digest"],
+                            record["scope_fingerprint"],
+                        )
+                    )
+                )
+            )
+            if not base or not (callback or persisting or terminal):
+                raise HiveStateError("invalid_google_oauth_control_state")
+            transaction_id = cast(str, record["id"])
+            operation_id = record["token_operation_id"]
+            if transaction_id in transaction_ids or (
+                type(operation_id) is str and operation_id in operation_ids
+            ):
+                raise HiveStateError("invalid_google_oauth_control_state")
+            transaction_ids.add(transaction_id)
+            if type(operation_id) is str:
+                operation_ids.add(operation_id)
+            if state in {"pending", "completing", "persisting"}:
+                authorities = [
+                    cast(dict[str, object], item)
+                    for item in clients
+                    if cast(dict[str, object], item)["id"] == record["oauth_client_ref"]
+                    and cast(dict[str, object], item)["account_ref"]
+                    == record["account_ref"]
+                    and cast(dict[str, object], item)["client_digest"]
+                    == record["client_digest"]
+                    and cast(dict[str, object], item)["vault_generation"]
+                    == record["client_vault_generation"]
+                ]
+                if len(authorities) != 1:
+                    raise HiveStateError("invalid_google_oauth_control_state")
+
+    @classmethod
+    def _migrate_v1(cls, value: Mapping[str, object]) -> dict[str, object]:
+        if set(value) != {
+            "schema_version",
+            "imports",
+            "clients",
+            "transactions",
+            "token_generations",
+        }:
+            raise HiveStateError("invalid_google_oauth_control_state")
+        imports = value.get("imports")
+        clients = value.get("clients")
+        transactions = value.get("transactions")
+        generations = value.get("token_generations")
         if (
-            value.get("schema_version") != 1
-            or type(value.get("imports")) is not list
-            or type(value.get("clients")) is not list
-            or type(value.get("transactions")) is not list
-            or type(value.get("token_generations")) is not dict
+            type(imports) is not list
+            or type(clients) is not list
+            or type(transactions) is not list
+            or type(generations) is not dict
             or any(
-                len(cast(list[object], value[field])) > _MAX_CONTROL_RECORDS
-                for field in ("imports", "clients", "transactions")
+                len(items) > _MAX_CONTROL_RECORDS
+                for items in (imports, clients, transactions)
             )
             or any(
-                type(record) is not dict
-                for field in ("imports", "clients", "transactions")
-                for record in cast(list[object], value[field])
+                not cls._stored_ref(key) or not cls._stored_generation(generation)
+                for key, generation in generations.items()
             )
         ):
             raise HiveStateError("invalid_google_oauth_control_state")
-        return value
+        migrated_imports: list[object] = []
+        for item in imports:
+            record = cls._record(
+                item,
+                {
+                    "id",
+                    "account_ref",
+                    "expected_generation",
+                    "expires_at",
+                    "idempotency_key",
+                    "nonce",
+                    "plan_digest",
+                    "state",
+                    "client_ref",
+                    "client_digest",
+                    "display_name",
+                    "vault_generation",
+                },
+            )
+            if not (
+                cls._stored_ref(record["id"])
+                and cls._stored_ref(record["account_ref"])
+                and cls._stored_generation(record["expected_generation"])
+                and cls._stored_time(record["expires_at"])
+                and cls._stored_ref(record["idempotency_key"])
+                and cls._stored_digest(record["plan_digest"])
+                and cls._stored_urlsafe(record["nonce"])
+                and record["plan_digest"]
+                == cls._digest(
+                    "google.oauth-client-import",
+                    record["id"],
+                    record["account_ref"],
+                    record["expected_generation"],
+                    record["expires_at"],
+                    record["idempotency_key"],
+                    record["nonce"],
+                )
+                and record["state"]
+                in {"planned", "applying", "succeeded", "failed", "expired"}
+            ):
+                raise HiveStateError("invalid_google_oauth_control_state")
+            client_fields_none = all(
+                record[field] is None
+                for field in (
+                    "client_ref",
+                    "client_digest",
+                    "display_name",
+                    "vault_generation",
+                )
+            )
+            client_fields_valid = (
+                cls._stored_ref(record["client_ref"])
+                and cls._stored_digest(record["client_digest"])
+                and cls._stored_display_name(record["display_name"])
+                and cls._stored_generation(record["vault_generation"])
+            )
+            succeeded = record["state"] == "succeeded"
+            valid_fields = (
+                client_fields_valid
+                if succeeded
+                else (
+                    client_fields_none or client_fields_valid
+                    if record["state"] == "failed"
+                    else client_fields_none
+                )
+            )
+            if not valid_fields:
+                raise HiveStateError("invalid_google_oauth_control_state")
+            state = (
+                "planned"
+                if record["state"] == "planned"
+                else ("succeeded" if succeeded else "failed")
+            )
+            migrated_imports.append(
+                {
+                    **record,
+                    "state": state,
+                    "nonce": record["nonce"] if state == "planned" else None,
+                    "client_ref": record["client_ref"] if succeeded else None,
+                    "client_digest": record["client_digest"] if succeeded else None,
+                    "display_name": record["display_name"] if succeeded else None,
+                    "vault_generation": record["vault_generation"]
+                    if succeeded
+                    else None,
+                    "terminal_at": None if state == "planned" else record["expires_at"],
+                }
+            )
+        migrated_clients: list[object] = []
+        for item in clients:
+            record = cls._record(
+                item,
+                {
+                    "id",
+                    "account_ref",
+                    "inventory_generation",
+                    "client_digest",
+                    "display_name",
+                    "vault_generation",
+                },
+            )
+            if not (
+                cls._stored_ref(record["id"])
+                and cls._stored_ref(record["account_ref"])
+                and cls._stored_generation(record["inventory_generation"])
+                and cls._stored_digest(record["client_digest"])
+                and cls._stored_display_name(record["display_name"])
+                and cls._stored_generation(record["vault_generation"])
+            ):
+                raise HiveStateError("invalid_google_oauth_control_state")
+            migrated_clients.append({**record, "state": "active", "terminal_at": None})
+        migrated_transactions: list[object] = []
+        for item in transactions:
+            record = cls._record(
+                item,
+                {
+                    "id",
+                    "account_ref",
+                    "oauth_client_ref",
+                    "client_digest",
+                    "pkce_verifier",
+                    "redirect_uri",
+                    "scope_profile",
+                    "scope_fingerprint",
+                    "state_token",
+                    "inventory_generation",
+                    "expires_at",
+                    "state",
+                },
+            )
+            if not (
+                cls._stored_ref(record["id"])
+                and cls._stored_ref(record["account_ref"])
+                and cls._stored_ref(record["oauth_client_ref"])
+                and cls._stored_digest(record["client_digest"])
+                and cls._stored_urlsafe(record["pkce_verifier"])
+                and type(record["redirect_uri"]) is str
+                and _REDIRECT.fullmatch(cast(str, record["redirect_uri"])) is not None
+                and record["scope_profile"]
+                == GoogleOAuthProfileIdV1.INVENTORY_READONLY.value
+                and cls._stored_digest(record["scope_fingerprint"])
+                and cls._stored_urlsafe(record["state_token"])
+                and cls._stored_generation(record["inventory_generation"])
+                and cls._stored_time(record["expires_at"])
+                and record["state"]
+                in {"pending", "completing", "succeeded", "failed", "expired"}
+            ):
+                raise HiveStateError("invalid_google_oauth_control_state")
+            matching_clients = [
+                candidate
+                for candidate in migrated_clients
+                if cast(dict[str, object], candidate)["id"]
+                == record["oauth_client_ref"]
+            ]
+            if len(matching_clients) != 1:
+                raise HiveStateError("invalid_google_oauth_control_state")
+            active = record["state"] == "pending"
+            migrated_transactions.append(
+                {
+                    **record,
+                    "client_vault_generation": cast(
+                        dict[str, object], matching_clients[0]
+                    )["vault_generation"],
+                    "state": "pending" if active else "failed",
+                    "pkce_verifier": record["pkce_verifier"] if active else None,
+                    "state_token": record["state_token"] if active else None,
+                    "state_digest": cls._digest(
+                        "google.oauth-state", record["state_token"]
+                    ),
+                    "token_operation_id": None,
+                    "terminal_at": None if active else record["expires_at"],
+                }
+            )
+        migrated = {
+            "schema_version": _CONTROL_SCHEMA_VERSION,
+            "imports": migrated_imports,
+            "clients": migrated_clients,
+            "transactions": migrated_transactions,
+        }
+        cls._validate_v2(migrated)
+        return migrated
 
     def _write_locked(self, document: Mapping[str, object]) -> None:
-        self._state.replace_json_locked(_CONTROL_DOCUMENT, document)
+        try:
+            self._validate_v2(document)
+            self._state.replace_json_locked(_CONTROL_DOCUMENT, document)
+        except (HiveStateError, OSError):
+            raise GoogleOAuthSessionError("oauth.control_unavailable") from None
 
     def _now(self) -> float:
         try:
             value = float(self._clock())
         except (TypeError, ValueError, OverflowError):
             raise GoogleOAuthSessionError("oauth.control_unavailable") from None
-        if not 0 <= value < float("inf"):
+        if not 0 <= value <= 2**63 - 1 - MAX_OAUTH_TRANSACTION_SECONDS:
             raise GoogleOAuthSessionError("oauth.control_unavailable")
         return value
 
@@ -598,6 +1150,91 @@ class GoogleOAuthControlService:
         account_digest = sha256(account_ref.encode("ascii")).hexdigest()
         return f"google-oauth-{account_digest}"
 
+    @staticmethod
+    def _make_room(records: list[object], active_states: set[str]) -> None:
+        while len(records) >= _MAX_CONTROL_RECORDS:
+            terminal = [
+                (index, cast(dict[str, object], item))
+                for index, item in enumerate(records)
+                if cast(dict[str, object], item)["state"] not in active_states
+            ]
+            if not terminal:
+                raise GoogleOAuthSessionError("oauth.control_unavailable")
+            index, _record = min(
+                terminal,
+                key=lambda pair: (
+                    cast(float, pair[1]["terminal_at"]),
+                    cast(str, pair[1]["id"]),
+                ),
+            )
+            records.pop(index)
+
+    @staticmethod
+    def _make_client_room(document: Mapping[str, object]) -> None:
+        clients = cast(list[object], document["clients"])
+        protected = {
+            cast(str, cast(dict[str, object], item)["oauth_client_ref"])
+            for item in cast(list[object], document["transactions"])
+            if cast(dict[str, object], item)["state"]
+            in {"pending", "completing", "persisting"}
+        }
+        while len(clients) >= _MAX_CONTROL_RECORDS:
+            terminal = [
+                (index, cast(dict[str, object], item))
+                for index, item in enumerate(clients)
+                if cast(dict[str, object], item)["state"] == "retired"
+                and cast(dict[str, object], item)["id"] not in protected
+            ]
+            if not terminal:
+                raise GoogleOAuthSessionError("oauth.control_unavailable")
+            index, _record = min(
+                terminal,
+                key=lambda pair: (
+                    cast(float, pair[1]["terminal_at"]),
+                    cast(str, pair[1]["id"]),
+                ),
+            )
+            clients.pop(index)
+
+    def _retire_client_records(
+        self,
+        document: Mapping[str, object],
+        *,
+        account_ref: str,
+        replacement_id: str,
+    ) -> None:
+        clients = cast(list[object], document["clients"])
+        now = self._now()
+        for item in clients:
+            record = cast(dict[str, object], item)
+            if record["account_ref"] == account_ref and record["state"] == "active":
+                record["state"] = "retired"
+                record["terminal_at"] = now
+        if len(clients) >= _MAX_CONTROL_RECORDS or any(
+            cast(dict[str, object], item)["id"] == replacement_id for item in clients
+        ):
+            raise GoogleOAuthSessionError("oauth.control_unavailable")
+
+    def _client_projection_matches(
+        self, account_ref: str, vault_generation: int, client_digest: str
+    ) -> bool:
+        raw = bytearray()
+        client: dict[str, object] = {}
+        try:
+            lease = self._client_vault.lease(
+                self._client_vault_ref(account_ref),
+                expected_generation=vault_generation,
+                ttl_seconds=30,
+            )
+            raw = bytearray(self._client_vault.consume_lease(lease))
+            client, observed_digest = _client_document(raw)
+            return observed_digest == client_digest
+        except (CredentialVaultError, GoogleOAuthSessionError):
+            return False
+        finally:
+            client.clear()
+            _zero_bytes(raw)
+
     def plan_oauth_client_import(
         self,
         account_ref: str,
@@ -622,8 +1259,7 @@ class GoogleOAuthControlService:
                 ):
                     raise GoogleOAuthSessionError("control.idempotency_conflict")
                 return self._import_plan(existing)
-            if len(imports) >= _MAX_CONTROL_RECORDS:
-                raise GoogleOAuthSessionError("oauth.control_unavailable")
+            self._make_room(imports, {"planned", "persisting"})
             now = self._now()
             plan_id = "oauth-import-" + secrets.token_hex(16)
             expires_at = now + ttl_seconds
@@ -650,6 +1286,7 @@ class GoogleOAuthControlService:
                 "client_digest": None,
                 "display_name": None,
                 "vault_generation": None,
+                "terminal_at": None,
             }
             imports.append(record)
             self._write_locked(document)
@@ -658,12 +1295,12 @@ class GoogleOAuthControlService:
     @staticmethod
     def _import_plan(record: Mapping[str, object]) -> GoogleOAuthClientImportPlanV1:
         return GoogleOAuthClientImportPlanV1(
-            str(record["id"]),
-            str(record["account_ref"]),
+            cast(str, record["id"]),
+            cast(str, record["account_ref"]),
             cast(int, record["expected_generation"]),
             cast(float, record["expires_at"]),
-            str(record["idempotency_key"]),
-            str(record["plan_digest"]),
+            cast(str, record["idempotency_key"]),
+            cast(str, record["plan_digest"]),
         )
 
     @staticmethod
@@ -671,11 +1308,11 @@ class GoogleOAuthControlService:
         record: Mapping[str, object],
     ) -> GoogleOAuthClientImportReceiptV1:
         return GoogleOAuthClientImportReceiptV1(
-            str(record["account_ref"]),
-            str(record["client_ref"]),
-            str(record["display_name"]),
+            cast(str, record["account_ref"]),
+            cast(str, record["client_ref"]),
+            cast(str, record["display_name"]),
             cast(int, record["expected_generation"]),
-            str(record["client_digest"]),
+            cast(str, record["client_digest"]),
         )
 
     def apply_oauth_client_import(
@@ -704,23 +1341,35 @@ class GoogleOAuthControlService:
                 ):
                     raise GoogleOAuthSessionError("oauth.import_plan_invalid")
                 if record.get("state") == "succeeded":
+                    self._ack_ingress(plan, ingress_session)
                     return self._import_receipt(record)
-                if record.get("state") != "planned":
+                if record.get("state") not in {"planned", "persisting"}:
                     raise GoogleOAuthSessionError("oauth.import_plan_expired")
                 if self._now() >= plan.expires_at:
-                    record["state"] = "expired"
+                    self._terminalize_import(record, "expired")
                     self._write_locked(document)
                     raise GoogleOAuthSessionError("oauth.import_plan_expired")
                 try:
                     self._account_subject(plan.account_ref, plan.expected_generation)
                 except GoogleOAuthSessionError:
-                    record["state"] = "expired"
+                    self._terminalize_import(record, "expired")
                     self._write_locked(document)
                     raise
-                record["state"] = "applying"
-                self._write_locked(document)
+                if any(
+                    cast(dict[str, object], item)["account_ref"] == plan.account_ref
+                    and cast(dict[str, object], item)["state"] == "persisting"
+                    for item in cast(list[object], document["transactions"])
+                ):
+                    raise GoogleOAuthSessionError("oauth.client_busy")
+                if any(
+                    cast(dict[str, object], item)["id"] != plan.id
+                    and cast(dict[str, object], item)["account_ref"] == plan.account_ref
+                    and cast(dict[str, object], item)["state"] == "persisting"
+                    for item in imports
+                ):
+                    raise GoogleOAuthSessionError("oauth.client_busy")
                 try:
-                    raw = self._secret_ingress.consume_oauth_client(
+                    raw = self._secret_ingress.read_oauth_client(
                         ingress_session,
                         account_ref=plan.account_ref,
                         expected_generation=plan.expected_generation,
@@ -729,65 +1378,117 @@ class GoogleOAuthControlService:
                     if type(raw) is not bytearray:
                         raise GoogleOAuthSessionError("credential.upload_expired")
                     client_data, client_digest = _client_document(raw)
-                    identity = generate_pretty_project_identity(
-                        visible_names=(), reserved_project_ids=()
-                    )
-                    display_name = identity.project_name
-                    clients = cast(list[object], document["clients"])
-                    previous = next(
-                        (
-                            cast(dict[str, object], item)
-                            for item in clients
-                            if cast(dict[str, object], item).get("account_ref")
-                            == plan.account_ref
-                        ),
-                        None,
-                    )
-                    vault_generation = (
-                        cast(int, previous["vault_generation"]) + 1
-                        if previous is not None
-                        else 1
-                    )
-                    client_ref = "oauth-client-" + secrets.token_hex(16)
-                    self._client_vault.store_projection(
-                        self._client_vault_ref(plan.account_ref),
+                    if record["state"] == "planned":
+                        active = next(
+                            (
+                                cast(dict[str, object], item)
+                                for item in cast(list[object], document["clients"])
+                                if cast(dict[str, object], item)["account_ref"]
+                                == plan.account_ref
+                                and cast(dict[str, object], item)["state"] == "active"
+                            ),
+                            None,
+                        )
+                        vault_generation = (
+                            cast(int, active["vault_generation"]) + 1
+                            if active is not None
+                            else 1
+                        )
+                        identity = generate_pretty_project_identity(
+                            visible_names=(), reserved_project_ids=()
+                        )
+                        self._make_client_room(document)
+                        record.update(
+                            {
+                                "state": "persisting",
+                                "nonce": None,
+                                "client_ref": "oauth-client-" + secrets.token_hex(16),
+                                "client_digest": client_digest,
+                                "display_name": identity.project_name,
+                                "vault_generation": vault_generation,
+                            }
+                        )
+                        self._write_locked(document)
+                    elif record["client_digest"] != client_digest:
+                        raise GoogleOAuthSessionError("credential.upload_expired")
+                    vault_generation = cast(int, record["vault_generation"])
+                    persisted = self._client_projection_matches(
+                        plan.account_ref,
                         vault_generation,
-                        bytes(raw),
+                        cast(str, record["client_digest"]),
                     )
-                    if previous is not None:
-                        clients.remove(previous)
+                    if not persisted:
+                        self._client_vault.store_projection(
+                            self._client_vault_ref(plan.account_ref),
+                            vault_generation,
+                            bytes(raw),
+                        )
+                    if not self._client_projection_matches(
+                        plan.account_ref,
+                        vault_generation,
+                        cast(str, record["client_digest"]),
+                    ):
+                        raise GoogleOAuthSessionError("oauth.client_write_failed")
+                    clients = cast(list[object], document["clients"])
+                    client_ref = cast(str, record["client_ref"])
+                    self._retire_client_records(
+                        document,
+                        account_ref=plan.account_ref,
+                        replacement_id=client_ref,
+                    )
                     clients.append(
                         {
                             "id": client_ref,
                             "account_ref": plan.account_ref,
                             "inventory_generation": plan.expected_generation,
-                            "client_digest": client_digest,
-                            "display_name": display_name,
+                            "client_digest": record["client_digest"],
+                            "display_name": record["display_name"],
                             "vault_generation": vault_generation,
+                            "state": "active",
+                            "terminal_at": None,
                         }
                     )
-                    record.update(
-                        {
-                            "state": "succeeded",
-                            "client_ref": client_ref,
-                            "client_digest": client_digest,
-                            "display_name": display_name,
-                            "vault_generation": vault_generation,
-                        }
-                    )
+                    record["state"] = "succeeded"
+                    record["terminal_at"] = self._now()
                     self._write_locked(document)
-                    return self._import_receipt(record)
+                    receipt = self._import_receipt(record)
                 except GoogleOAuthSessionError:
-                    record["state"] = "failed"
-                    self._write_locked(document)
                     raise
                 except (CredentialVaultError, HiveStateError, OSError):
-                    record["state"] = "failed"
-                    self._write_locked(document)
                     raise GoogleOAuthSessionError("oauth.client_write_failed") from None
+            self._ack_ingress(plan, ingress_session)
+            return receipt
         finally:
             client_data.clear()
             _zero_bytes(raw)
+
+    def _ack_ingress(
+        self, plan: GoogleOAuthClientImportPlanV1, ingress_session: object
+    ) -> None:
+        try:
+            self._secret_ingress.acknowledge_oauth_client(
+                ingress_session,
+                account_ref=plan.account_ref,
+                expected_generation=plan.expected_generation,
+                plan_digest=plan.plan_digest,
+            )
+        except GoogleOAuthSessionError:
+            raise
+        except Exception:
+            raise GoogleOAuthSessionError("credential.upload_expired") from None
+
+    def _terminalize_import(self, record: dict[str, object], state: str) -> None:
+        record.update(
+            {
+                "state": state,
+                "nonce": None,
+                "client_ref": None,
+                "client_digest": None,
+                "display_name": None,
+                "vault_generation": None,
+                "terminal_at": self._now(),
+            }
+        )
 
     def _load_client(
         self, account_ref: str, record: Mapping[str, object]
@@ -810,13 +1511,12 @@ class GoogleOAuthControlService:
 
     @staticmethod
     def _profile(profile_id: object):
-        operation = (
-            GoogleOAuthOperationV1.PROJECTS_SEARCH
-            if profile_id is GoogleOAuthProfileIdV1.INVENTORY_READONLY
-            else GoogleOAuthOperationV1.USERINFO_GET
-        )
+        if profile_id is not GoogleOAuthProfileIdV1.INVENTORY_READONLY:
+            raise GoogleOAuthSessionError("oauth.scope_mismatch")
         try:
-            return resolve_google_oauth_profile_v1(profile_id, operation)
+            return resolve_google_oauth_profile_v1(
+                profile_id, GoogleOAuthOperationV1.PROJECTS_SEARCH
+            )
         except Exception:
             raise GoogleOAuthSessionError("oauth.scope_mismatch") from None
 
@@ -841,7 +1541,11 @@ class GoogleOAuthControlService:
             document = self._read_locked()
             clients = cast(list[object], document["clients"])
             client_record = self._find(clients, "id", oauth_client_ref)
-            if client_record is None or client_record.get("account_ref") != account_ref:
+            if (
+                client_record is None
+                or client_record.get("account_ref") != account_ref
+                or client_record.get("state") != "active"
+            ):
                 raise GoogleOAuthSessionError("oauth.client_account_mismatch")
             if client_record.get("inventory_generation") != expected_generation:
                 raise GoogleOAuthSessionError("oauth.generation_mismatch")
@@ -878,22 +1582,25 @@ class GoogleOAuthControlService:
                 )
             )
             transactions = cast(list[object], document["transactions"])
-            if len(transactions) >= _MAX_CONTROL_RECORDS:
-                raise GoogleOAuthSessionError("oauth.control_unavailable")
+            self._make_room(transactions, {"pending", "completing", "persisting"})
             transactions.append(
                 {
                     "id": transaction_id,
                     "account_ref": account_ref,
                     "oauth_client_ref": oauth_client_ref,
                     "client_digest": client_digest,
+                    "client_vault_generation": client_record["vault_generation"],
                     "pkce_verifier": verifier,
                     "redirect_uri": redirect_uri,
                     "scope_profile": profile.profile_id.value,
                     "scope_fingerprint": profile.scope_fingerprint,
                     "state_token": state,
+                    "state_digest": self._digest("google.oauth-state", state),
                     "inventory_generation": expected_generation,
                     "expires_at": expires_at,
                     "state": "pending",
+                    "token_operation_id": None,
+                    "terminal_at": None,
                 }
             )
             self._write_locked(document)
@@ -919,83 +1626,17 @@ class GoogleOAuthControlService:
         account_ref = self._ref(account_ref)
         redirect_uri = self._redirect_uri(redirect_uri)
         expected_generation = self._generation(expected_generation)
-        if type(code) is not str or not code or type(state) is not str or not state:
+        if (
+            type(code) is not str
+            or not 1 <= len(code) <= 8192
+            or type(state) is not str
+            or not 1 <= len(state) <= 512
+        ):
             raise GoogleOAuthSessionError("oauth.request_invalid")
         client: dict[str, object] = {}
         result: GoogleOAuthCodeExchangeV1 | None = None
-        with self._state.locked():
-            document = self._read_locked()
-            record = self._find(
-                cast(list[object], document["transactions"]), "id", transaction_id
-            )
-            if record is None or record.get("state") != "pending":
-                raise GoogleOAuthSessionError("oauth.transaction_expired")
-            mismatch: str | None = None
-            if self._now() >= cast(float, record["expires_at"]):
-                mismatch = "oauth.transaction_expired"
-            elif record.get("account_ref") != account_ref:
-                mismatch = "oauth.account_mismatch"
-            elif record.get("inventory_generation") != expected_generation:
-                mismatch = "oauth.generation_mismatch"
-            elif record.get("redirect_uri") != redirect_uri:
-                mismatch = "oauth.redirect_mismatch"
-            elif not secrets.compare_digest(str(record.get("state_token")), state):
-                mismatch = "oauth.state_mismatch"
-            else:
-                try:
-                    self._account_subject(account_ref, expected_generation)
-                except GoogleOAuthSessionError as error:
-                    mismatch = error.code
-            if mismatch is not None:
-                record["state"] = "expired"
-                self._write_locked(document)
-                raise GoogleOAuthSessionError(mismatch)
-            client_record = self._find(
-                cast(list[object], document["clients"]),
-                "id",
-                record["oauth_client_ref"],
-            )
-            if (
-                client_record is None
-                or client_record.get("account_ref") != account_ref
-                or client_record.get("client_digest") != record.get("client_digest")
-            ):
-                record["state"] = "expired"
-                self._write_locked(document)
-                raise GoogleOAuthSessionError("oauth.client_expired")
-            record["state"] = "completing"
-            self._write_locked(document)
-            verifier = str(record["pkce_verifier"])
-            client, client_digest = self._load_client(account_ref, client_record)
-        try:
-            result = self._code_exchange.exchange(
-                client,
-                code=code,
-                redirect_uri=redirect_uri,
-                pkce_verifier=verifier,
-            )
-            if not isinstance(result, GoogleOAuthCodeExchangeV1):
-                raise GoogleOAuthSessionError("oauth.exchange_failed")
-        except GoogleOAuthSessionError:
-            self._terminalize(transaction_id, "failed")
-            raise
-        except Exception:
-            self._terminalize(transaction_id, "failed")
-            raise GoogleOAuthSessionError("oauth.exchange_failed") from None
-        finally:
-            client.clear()
-            code = ""
-            verifier = ""
-        try:
-            expected_subject = self._account_subject(account_ref, expected_generation)
-        except GoogleOAuthSessionError:
-            _zero_bytes(result.refresh_token)
-            self._terminalize(transaction_id, "failed")
-            raise
-        if result.subject_id != expected_subject:
-            _zero_bytes(result.refresh_token)
-            self._terminalize(transaction_id, "failed")
-            raise GoogleOAuthSessionError("oauth.subject_mismatch")
+        verifier = ""
+        owns_completion = False
         try:
             with self._state.locked():
                 document = self._read_locked()
@@ -1004,39 +1645,224 @@ class GoogleOAuthControlService:
                     "id",
                     transaction_id,
                 )
-                if record is None or record.get("state") != "completing":
+                if record is None:
+                    raise GoogleOAuthSessionError("oauth.transaction_expired")
+                mismatch = self._callback_mismatch(
+                    record,
+                    account_ref=account_ref,
+                    redirect_uri=redirect_uri,
+                    expected_generation=expected_generation,
+                    state=state,
+                    check_expiry=record["state"] != "persisting",
+                )
+                if record["state"] == "persisting":
+                    if mismatch is not None:
+                        self._mark_transaction_terminal(record, "failed")
+                        self._write_locked(document)
+                        raise GoogleOAuthSessionError(mismatch)
+                    receipt = self._lookup_token_receipt(record)
+                    if receipt is None:
+                        self._mark_transaction_terminal(record, "failed")
+                        self._write_locked(document)
+                        raise GoogleOAuthSessionError("oauth.token_write_failed")
+                    self._validate_token_receipt(record, receipt)
+                    self._mark_transaction_terminal(record, "succeeded")
+                    self._write_locked(document)
+                    return GoogleOAuthSessionReceipt(account_ref, True, True)
+                if record["state"] == "completing":
+                    if transaction_id in self._owned_completions:
+                        raise GoogleOAuthSessionError("oauth.transaction_expired")
+                    self._mark_transaction_terminal(record, "failed")
+                    self._write_locked(document)
+                    raise GoogleOAuthSessionError("oauth.token_write_failed")
+                if record["state"] != "pending":
+                    raise GoogleOAuthSessionError("oauth.transaction_expired")
+                if mismatch is not None:
+                    self._mark_transaction_terminal(record, "expired")
+                    self._write_locked(document)
+                    raise GoogleOAuthSessionError(mismatch)
+                self._account_subject(account_ref, expected_generation)
+                client_record = self._bound_active_client(document, record)
+                record["state"] = "completing"
+                self._write_locked(document)
+                owns_completion = True
+                self._owned_completions.add(transaction_id)
+                verifier = cast(str, record["pkce_verifier"])
+            client, client_digest = self._load_client(account_ref, client_record)
+            if client_digest != record["client_digest"]:
+                raise GoogleOAuthSessionError("oauth.client_expired")
+            try:
+                result = self._code_exchange.exchange(
+                    client,
+                    code=code,
+                    redirect_uri=redirect_uri,
+                    pkce_verifier=verifier,
+                )
+            except GoogleOAuthSessionError:
+                raise
+            except Exception:
+                raise GoogleOAuthSessionError("oauth.exchange_failed") from None
+            if not isinstance(result, GoogleOAuthCodeExchangeV1):
+                raise GoogleOAuthSessionError("oauth.exchange_failed")
+            expected_subject = self._account_subject(account_ref, expected_generation)
+            if result.subject_id != expected_subject:
+                raise GoogleOAuthSessionError("oauth.subject_mismatch")
+            with self._state.locked():
+                document = self._read_locked()
+                record = self._find(
+                    cast(list[object], document["transactions"]),
+                    "id",
+                    transaction_id,
+                )
+                if record is None or record["state"] != "completing":
                     raise GoogleOAuthSessionError("oauth.transaction_expired")
                 if self._now() >= cast(float, record["expires_at"]):
-                    record["state"] = "expired"
+                    self._mark_transaction_terminal(record, "expired")
                     self._write_locked(document)
                     raise GoogleOAuthSessionError("oauth.transaction_expired")
-                if (
-                    self._account_subject(account_ref, expected_generation)
-                    != result.subject_id
-                ):
-                    record["state"] = "failed"
-                    self._write_locked(document)
-                    raise GoogleOAuthSessionError("oauth.subject_mismatch")
-                generations = cast(dict[str, object], document["token_generations"])
-                token_receipt = self._token_vault.store_inventory_refresh_token(
-                    self._manager,
-                    account_ref=account_ref,
-                    subject_id=result.subject_id,
-                    oauth_client_fingerprint=client_digest,
-                    refresh_token=result.refresh_token,
-                    expected_vault_generation=generations.get(account_ref),
+                self._account_subject(account_ref, expected_generation)
+                self._bound_active_client(document, record)
+                operation_id = self._digest(
+                    "google.oauth-token-write",
+                    transaction_id,
+                    account_ref,
+                    client_digest,
+                    record["scope_fingerprint"],
                 )
-                generations[account_ref] = token_receipt.vault_generation
-                record["state"] = "succeeded"
+                record.update(
+                    {
+                        "state": "persisting",
+                        "pkce_verifier": None,
+                        "state_token": None,
+                        "token_operation_id": operation_id,
+                    }
+                )
                 self._write_locked(document)
+                self._owned_completions.discard(transaction_id)
+                try:
+                    token_receipt = self._token_writer.store_refresh_token(
+                        operation_id,
+                        account_ref=account_ref,
+                        subject_id=result.subject_id,
+                        oauth_client_fingerprint=client_digest,
+                        scope_profile=GoogleOAuthProfileIdV1.INVENTORY_READONLY,
+                        scope_fingerprint=cast(str, record["scope_fingerprint"]),
+                        refresh_token=result.refresh_token,
+                    )
+                    self._validate_token_receipt(record, token_receipt)
+                except GoogleOAuthSessionError:
+                    raise
+                except Exception:
+                    raise GoogleOAuthSessionError("oauth.token_write_failed") from None
+                self._mark_transaction_terminal(record, "succeeded")
+                try:
+                    self._write_locked(document)
+                except (HiveStateError, OSError):
+                    raise GoogleOAuthSessionError("oauth.token_write_failed") from None
+        except BaseException as error:
+            if owns_completion:
+                try:
+                    self._terminalize(transaction_id, "failed")
+                except GoogleOAuthSessionError as control_error:
+                    raise control_error from error
+            raise
+        finally:
+            if result is not None:
+                _zero_bytes(result.refresh_token)
+            client.clear()
+            code = ""
+            verifier = ""
+            self._owned_completions.discard(transaction_id)
+        return GoogleOAuthSessionReceipt(account_ref, True, True)
+
+    def _callback_mismatch(
+        self,
+        record: Mapping[str, object],
+        *,
+        account_ref: str,
+        redirect_uri: str,
+        expected_generation: int,
+        state: str,
+        check_expiry: bool = True,
+    ) -> str | None:
+        if check_expiry and self._now() >= cast(float, record["expires_at"]):
+            return "oauth.transaction_expired"
+        if record["account_ref"] != account_ref:
+            return "oauth.account_mismatch"
+        if record["inventory_generation"] != expected_generation:
+            return "oauth.generation_mismatch"
+        if record["redirect_uri"] != redirect_uri:
+            return "oauth.redirect_mismatch"
+        observed_digest = self._digest("google.oauth-state", state)
+        if not secrets.compare_digest(
+            cast(str, record["state_digest"]), observed_digest
+        ):
+            return "oauth.state_mismatch"
+        return None
+
+    @staticmethod
+    def _bound_active_client(
+        document: Mapping[str, object], record: Mapping[str, object]
+    ) -> dict[str, object]:
+        clients = cast(list[object], document["clients"])
+        matches = [
+            cast(dict[str, object], item)
+            for item in clients
+            if cast(dict[str, object], item)["id"] == record["oauth_client_ref"]
+            and cast(dict[str, object], item)["state"] == "active"
+            and cast(dict[str, object], item)["account_ref"] == record["account_ref"]
+            and cast(dict[str, object], item)["client_digest"]
+            == record["client_digest"]
+            and cast(dict[str, object], item)["vault_generation"]
+            == record["client_vault_generation"]
+        ]
+        if len(matches) != 1:
+            raise GoogleOAuthSessionError("oauth.client_expired")
+        return matches[0]
+
+    def _lookup_token_receipt(
+        self, record: Mapping[str, object]
+    ) -> GoogleOAuthTokenWriteReceiptV1 | None:
+        try:
+            return self._token_writer.lookup_refresh_token_receipt(
+                cast(str, record["token_operation_id"]),
+                account_ref=cast(str, record["account_ref"]),
+                scope_profile=GoogleOAuthProfileIdV1.INVENTORY_READONLY,
+                scope_fingerprint=cast(str, record["scope_fingerprint"]),
+            )
         except GoogleOAuthSessionError:
             raise
-        except (GoogleInventoryReadonlyTokenVaultError, HiveStateError, OSError):
-            self._terminalize(transaction_id, "failed")
+        except Exception:
             raise GoogleOAuthSessionError("oauth.token_write_failed") from None
-        finally:
-            _zero_bytes(result.refresh_token)
-        return GoogleOAuthSessionReceipt(account_ref, True, True)
+
+    def _validate_token_receipt(
+        self, record: Mapping[str, object], receipt: object
+    ) -> None:
+        if not isinstance(receipt, GoogleOAuthTokenWriteReceiptV1) or any(
+            (
+                receipt.operation_id != record["token_operation_id"],
+                receipt.account_ref != record["account_ref"],
+                receipt.oauth_client_fingerprint != record["client_digest"],
+                receipt.scope_profile is not GoogleOAuthProfileIdV1.INVENTORY_READONLY,
+                receipt.scope_fingerprint != record["scope_fingerprint"],
+                receipt.subject_id
+                != self._account_subject(
+                    cast(str, record["account_ref"]),
+                    cast(int, record["inventory_generation"]),
+                ),
+            )
+        ):
+            raise GoogleOAuthSessionError("oauth.token_write_failed")
+
+    def _mark_transaction_terminal(self, record: dict[str, object], state: str) -> None:
+        record.update(
+            {
+                "state": state,
+                "pkce_verifier": None,
+                "state_token": None,
+                "terminal_at": self._now(),
+            }
+        )
 
     def _terminalize(self, transaction_id: str, state: str) -> None:
         try:
@@ -1048,10 +1874,10 @@ class GoogleOAuthControlService:
                     transaction_id,
                 )
                 if record is not None and record.get("state") == "completing":
-                    record["state"] = state
+                    self._mark_transaction_terminal(record, state)
                     self._write_locked(document)
         except (HiveStateError, OSError):
-            pass
+            raise GoogleOAuthSessionError("oauth.control_unavailable") from None
 
 
 def plan_oauth_client_import(
