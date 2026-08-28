@@ -2617,6 +2617,7 @@ def test_agent_start_peer_reattestation_binds_so_peercred_and_peersec():
     assert result.unit_name == unit_name
     assert result.service_generation == 9
     assert result.mcs_pair == "c0,c1"
+    assert result.selinux_context == EXPECTED_LABEL[:-1].decode("utf-8")
     assert ("peer_credentials",) in events
     assert ("peer_security_context",) in events
 
@@ -2628,7 +2629,6 @@ def test_agent_start_peer_reattestation_binds_so_peercred_and_peersec():
         RecordingOperations([], kind=socket.SOCK_STREAM),
         RecordingOperations([], credentials=(PEER_PID, True, 1001)),
         RecordingOperations([], credentials=(PEER_PID, 1000, True)),
-        RecordingOperations([], context=b"system_u:system_r:wrong_t:s0:c0,c1\0"),
     ),
 )
 def test_agent_start_peer_reattestation_rejects_socket_credential_and_label_drift(
@@ -2648,3 +2648,37 @@ def test_agent_start_peer_reattestation_rejects_socket_credential_and_label_drif
         reattest_agent_start_peer(
             operations, linux_operations, agent_start_envelope()
         )
+
+
+@pytest.mark.parametrize(
+    "context",
+    (
+        b"other_u:system_r:codex_master_agent_t:s0:c0,c1\0",
+        b"system_u:other_r:codex_master_agent_t:s0:c0,c1\0",
+        b"system_u:system_r:wrong_t:s0:c0,c1\0",
+        b"system_u:system_r:codex_master_agent_t:s0:c0,c2\0",
+        b"system_u:system_r:codex_master_agent_t:s0:c0,c1",
+        b"system_u:system_r:codex_master_agent_t:s0:c0,c1\0\0",
+        b"system_u:system_r:codex_master_agent_t:s0:c0,c1\xff\0",
+    ),
+)
+def test_agent_start_peer_reattestation_rejects_inexact_full_peersec(context):
+    events: list[tuple[object, ...]] = []
+    operations = RecordingOperations(events, context=context)
+    unit_name = "codex-master-agent@c0\\x2cc1.service"
+    control_group = f"/user.slice/user-1000.slice/{unit_name}"
+    linux_operations = RecordingLinuxOperations(
+        events,
+        proc_control_group=control_group,
+        pid1_unit_name=unit_name,
+        pid1_control_group=control_group,
+    )
+
+    with pytest.raises(SeqpacketPeerError) as caught:
+        reattest_agent_start_peer(
+            operations, linux_operations, agent_start_envelope()
+        )
+
+    assert str(caught.value) == "agent start peer attestation failed"
+    assert caught.value.__cause__ is None
+    assert repr(context) not in str(caught.value)

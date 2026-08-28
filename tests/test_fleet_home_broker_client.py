@@ -1,8 +1,10 @@
 import ast
 from dataclasses import fields, replace
 import importlib
+import inspect
 import json
 from pathlib import Path
+import socket
 from types import SimpleNamespace
 from typing import get_type_hints
 
@@ -315,11 +317,26 @@ def agent_start_envelope():
     )
 
 
-def agent_start_frame(envelope=None, fds=(61,), **changes):
+def agent_start_cmsg(
+    fds=(61,), *, level=socket.SOL_SOCKET, cmsg_type=socket.SCM_RIGHTS
+):
+    return client.AgentStartCmsg(level, cmsg_type, fds)
+
+
+def agent_start_frame(
+    envelope=None,
+    cmsgs=None,
+    *,
+    message_truncated=False,
+    control_truncated=False,
+):
+    if cmsgs is None:
+        cmsgs = (agent_start_cmsg(),)
     return client.AgentStartFrame(
         encode_chpb_message(envelope or agent_start_envelope()),
-        tuple(fds),
-        **changes,
+        cmsgs,
+        message_truncated,
+        control_truncated,
     )
 
 
@@ -351,6 +368,35 @@ def test_public_api_types_are_frozen_and_slotted():
         "fd",
         "reply",
         "attestation",
+    )
+
+
+def test_agent_start_cmsg_and_frame_api_is_exact_and_has_no_defaults():
+    cmsg = client.AgentStartCmsg(socket.SOL_SOCKET, socket.SCM_RIGHTS, (61,))
+    frame_ = client.AgentStartFrame(b"payload", (cmsg,), False, False)
+
+    for type_, instance in (
+        (client.AgentStartCmsg, cmsg),
+        (client.AgentStartFrame, frame_),
+    ):
+        assert getattr(type_, "__dataclass_params__").frozen
+        assert getattr(type_, "__slots__")
+        assert not hasattr(instance, "__dict__")
+        assert all(
+            parameter.default is inspect.Parameter.empty
+            for parameter in inspect.signature(type_).parameters.values()
+        )
+
+    assert tuple(field.name for field in fields(client.AgentStartCmsg)) == (
+        "level",
+        "cmsg_type",
+        "fds",
+    )
+    assert tuple(field.name for field in fields(client.AgentStartFrame)) == (
+        "payload",
+        "cmsgs",
+        "message_truncated",
+        "control_truncated",
     )
 
 
@@ -921,24 +967,75 @@ def test_agent_start_client_returns_one_attested_fd_without_closing_success():
     assert operations.closed == []
 
 
-def test_agent_start_client_rejects_injected_frame_drift_and_closes_each_fd_once():
+def test_agent_start_client_rejects_injected_frame_drift_and_closes_each_fd_once(
+    monkeypatch,
+):
     claim = agent_start_claim()
     envelope = agent_start_envelope()
     cases = (
-        (client.ScmFrame(b"", (61,)), (61,)),
-        (agent_start_frame(envelope, fds=(61, 61)), (61,)),
-        (agent_start_frame(envelope, fds=(61, -1, True, 62)), (61, 62)),
+        (agent_start_frame(envelope, ()), ()),
+        (
+            agent_start_frame(
+                envelope,
+                (agent_start_cmsg(level=socket.SOL_SOCKET + 1),),
+            ),
+            (61,),
+        ),
+        (
+            agent_start_frame(
+                envelope,
+                (agent_start_cmsg(cmsg_type=socket.SCM_RIGHTS + 1),),
+            ),
+            (61,),
+        ),
+        (
+            agent_start_frame(
+                envelope,
+                (
+                    agent_start_cmsg(),
+                    agent_start_cmsg((62,), cmsg_type=socket.SCM_RIGHTS + 1),
+                ),
+            ),
+            (61, 62),
+        ),
+        (
+            agent_start_frame(
+                envelope,
+                (agent_start_cmsg(), agent_start_cmsg((61, 62))),
+            ),
+            (61, 62),
+        ),
+        (agent_start_frame(envelope, (agent_start_cmsg(()),)), ()),
+        (agent_start_frame(envelope, (agent_start_cmsg((61, 62)),)), (61, 62)),
+        (agent_start_frame(envelope, (agent_start_cmsg((-1,)),)), ()),
+        (agent_start_frame(envelope, (agent_start_cmsg((True,)),)), ()),
+        (
+            agent_start_frame(
+                envelope,
+                (agent_start_cmsg((61, -1, True, 62)),),
+            ),
+            (61, 62),
+        ),
+        (agent_start_frame(envelope, [agent_start_cmsg()]), (61,)),
+        (agent_start_frame(envelope, (agent_start_cmsg([61]),)), (61,)),
         (agent_start_frame(envelope, message_truncated=True), (61,)),
         (agent_start_frame(envelope, control_truncated=True), (61,)),
-        (agent_start_frame(envelope, scm_rights_count=2), (61,)),
-        (agent_start_frame(envelope, fds=()), ()),
     )
+    decoded = []
+
+    def record_decode(payload):
+        decoded.append(payload)
+        raise AssertionError("malformed ancillary data reached decode")
+
+    monkeypatch.setattr(client, "decode_chpb_message", record_decode)
     for frame_, expected_closed in cases:
         operations = FakeAgentStartOperations(frame_)
         with pytest.raises(client.BrokerClientError):
             client.receive_attested_agent_start(claim, envelope, operations)
         assert operations.closed == list(expected_closed)
         assert operations.received == [claim]
+        assert operations.fstat_calls == []
+    assert decoded == []
 
 
 @pytest.mark.parametrize(

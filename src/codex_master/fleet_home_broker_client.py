@@ -39,12 +39,18 @@ class ScmFrame:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentStartCmsg:
+    level: int
+    cmsg_type: int
+    fds: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class AgentStartFrame:
     payload: bytes
-    fds: tuple[int, ...]
-    message_truncated: bool = False
-    control_truncated: bool = False
-    scm_rights_count: int = 1
+    cmsgs: tuple[AgentStartCmsg, ...]
+    message_truncated: bool
+    control_truncated: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +93,27 @@ def _frame_fds(value: object) -> tuple[int, ...]:
     for fd in fds:
         if type(fd) is int and fd >= 0 and fd not in result:
             result.append(fd)
+    return tuple(result)
+
+
+def _agent_start_cmsg_fds(value: object) -> tuple[int, ...]:
+    try:
+        cmsgs = getattr(value, "cmsgs")
+    except Exception:
+        return ()
+    if type(cmsgs) not in (tuple, list):
+        return ()
+    result = []
+    for cmsg in cmsgs:
+        try:
+            fds = getattr(cmsg, "fds")
+        except Exception:
+            continue
+        if type(fds) not in (tuple, list):
+            continue
+        for fd in fds:
+            if type(fd) is int and fd >= 0 and fd not in result:
+                result.append(fd)
     return tuple(result)
 
 
@@ -341,11 +368,11 @@ def receive_attested_agent_start(
     except Exception as exc:
         raise BrokerClientError("agent start frame receive failed") from exc
 
-    cleanup_fds = _frame_fds(frame)
+    cleanup_fds = _agent_start_cmsg_fds(frame)
     try:
         if type(frame) is not AgentStartFrame:
             raise BrokerClientError("agent start frame has wrong type")
-        if type(frame.payload) is not bytes or type(frame.fds) is not tuple:
+        if type(frame.payload) is not bytes or type(frame.cmsgs) is not tuple:
             raise BrokerClientError("agent start frame is invalid")
         if (
             type(frame.message_truncated) is not bool
@@ -354,12 +381,23 @@ def receive_attested_agent_start(
             or frame.control_truncated
         ):
             raise BrokerClientError("agent start frame is truncated")
-        if type(frame.scm_rights_count) is not int or frame.scm_rights_count != 1:
+        if len(frame.cmsgs) != 1:
             raise BrokerClientError("agent start frame ancillary count is invalid")
-        if len(frame.fds) != 1 or type(frame.fds[0]) is not int or frame.fds[0] < 0:
+        cmsg = frame.cmsgs[0]
+        if (
+            type(cmsg) is not AgentStartCmsg
+            or type(cmsg.level) is not int
+            or cmsg.level != 1
+            or type(cmsg.cmsg_type) is not int
+            or cmsg.cmsg_type != 1
+            or type(cmsg.fds) is not tuple
+        ):
+            raise BrokerClientError("agent start ancillary descriptor is invalid")
+        if len(cmsg.fds) != 1 or type(cmsg.fds[0]) is not int or cmsg.fds[0] < 0:
             raise BrokerClientError("agent start frame does not contain one fd")
         if len(cleanup_fds) != 1:
             raise BrokerClientError("agent start frame fd identity is invalid")
+        fd = cmsg.fds[0]
 
         envelope = decode_chpb_message(frame.payload)
         if type(envelope) is not AgentStartEnvelope:
@@ -367,7 +405,7 @@ def receive_attested_agent_start(
         if envelope != expected or envelope.request_id != claim.request_id:
             raise BrokerClientError("agent start envelope binding drifted")
 
-        observed = _validate_fd_stat(operations.fstat(frame.fds[0]))
+        observed = _validate_fd_stat(operations.fstat(fd))
         if (
             observed.uid != 0
             or observed.gid != 0
@@ -376,7 +414,7 @@ def receive_attested_agent_start(
             or observed.mode != envelope.attestation.directory.mode
         ):
             raise BrokerClientError("agent start fd stat drifted")
-        return AttestedAgentStart(frame.fds[0], envelope)
+        return AttestedAgentStart(fd, envelope)
     except Exception as exc:
         _close_all(operations, cleanup_fds)
         if isinstance(exc, BrokerClientError):
@@ -386,6 +424,7 @@ def receive_attested_agent_start(
 
 __all__ = [
     "AgentStartClientOperations",
+    "AgentStartCmsg",
     "AgentStartFrame",
     "AttestedAgentStart",
     "AttestedHome",

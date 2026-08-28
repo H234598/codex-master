@@ -54,6 +54,9 @@ EXPECTED_DIRECTORY = DirectoryIdentity(17, 29, 0o40700)
 EXPECTED_STAT = FdStat(17, 29, 0o40700, 0, 0)
 VALID_CGROUP_STAT = FdStat(17, 29, 0o40755, 1000, 1000)
 EXPECTED_PID_IDENTITY = PidfdIdentity(PEER_PID, PID_START_TIME)
+EXPECTED_SELINUX_CONTEXT = (
+    "system_u:system_r:codex_master_agent_t:s0:c0,c1"
+)
 
 
 def principal(**changes):
@@ -167,6 +170,9 @@ class FakeOperations:
         reuse_at=None,
         reuse_pid=None,
         fresh_identity_per_reuse=False,
+        pidfd_value=PID_FD,
+        proc_fd_value=PROC_FD,
+        cgroup_fd_value=CGROUP_FD,
     ):
         self.calls = []
         self.directory_stat = directory_stat
@@ -182,6 +188,9 @@ class FakeOperations:
         self.reuse_at = reuse_at
         self.reuse_pid = reuse_pid
         self.fresh_identity_per_reuse = fresh_identity_per_reuse
+        self.pidfd_value = pidfd_value
+        self.proc_fd_value = proc_fd_value
+        self.cgroup_fd_value = cgroup_fd_value
         self.reuse_checks = 0
         self.observed_identities = []
 
@@ -205,7 +214,7 @@ class FakeOperations:
     def pidfd_open(self, pid, flags):
         self.calls.append(("pidfd_open", pid, flags))
         self._raise_if_configured("pidfd_open")
-        return PID_FD
+        return self.pidfd_value
 
     def pidfd_reuse_check(self, pidfd, pid, proc_fd, cgroup_fd, identity):
         self.calls.append(
@@ -230,12 +239,12 @@ class FakeOperations:
     def open_pinned_proc_pid(self, pidfd, pid, identity):
         self.calls.append(("open_pinned_proc_pid", pidfd, pid, identity))
         self._raise_if_configured("open_pinned_proc_pid")
-        return PROC_FD
+        return self.proc_fd_value
 
     def open_proc_cgroup(self, pidfd, proc_fd, identity):
         self.calls.append(("open_proc_cgroup", pidfd, proc_fd, identity))
         self._raise_if_configured("open_proc_cgroup")
-        return CGROUP_FD
+        return self.cgroup_fd_value
 
     def read_proc_control_group(
         self, pidfd, proc_fd, cgroup_fd, cgroup_dev, cgroup_ino
@@ -847,6 +856,7 @@ def test_agent_start_peer_observation_binds_peer_credentials_and_unit_instance()
         1000,
         1001,
         agent_start_envelope(),
+        EXPECTED_SELINUX_CONTEXT,
     )
 
     assert type(result) is AgentStartPeerObservation
@@ -860,11 +870,146 @@ def test_agent_start_peer_observation_binds_peer_credentials_and_unit_instance()
     assert result.invocation_id == "1" * 32
     assert result.service_generation == 9
     assert result.mcs_pair == "c0,c1"
-    assert operations.calls[-3:] == [
+    assert result.selinux_context == EXPECTED_SELINUX_CONTEXT
+    closes = [call for call in operations.calls if call[0] == "close"]
+    assert closes == [
         ("close", CGROUP_FD),
         ("close", PROC_FD),
         ("close", PID_FD),
     ]
+    assert len(closes) == len({call[1] for call in closes})
+
+
+@pytest.mark.parametrize(
+    ("fd_changes", "expected_operation_names", "expected_closes"),
+    (
+        (
+            {"proc_fd_value": PID_FD},
+            ["pidfd_open", "pidfd_reuse_check", "open_pinned_proc_pid", "close"],
+            [("close", PID_FD)],
+        ),
+        (
+            {"cgroup_fd_value": PID_FD},
+            [
+                "pidfd_open",
+                "pidfd_reuse_check",
+                "open_pinned_proc_pid",
+                "pidfd_reuse_check",
+                "open_proc_cgroup",
+                "close",
+                "close",
+            ],
+            [("close", PROC_FD), ("close", PID_FD)],
+        ),
+        (
+            {"cgroup_fd_value": PROC_FD},
+            [
+                "pidfd_open",
+                "pidfd_reuse_check",
+                "open_pinned_proc_pid",
+                "pidfd_reuse_check",
+                "open_proc_cgroup",
+                "close",
+                "close",
+            ],
+            [("close", PROC_FD), ("close", PID_FD)],
+        ),
+    ),
+)
+def test_agent_start_rejects_aliased_acquired_fds_before_next_boundary_use(
+    fd_changes, expected_operation_names, expected_closes
+):
+    operations = FakeOperations(**fd_changes)
+
+    with pytest.raises(LinuxBoundaryError):
+        observe_agent_start_peer(
+            operations,
+            PEER_PID,
+            1000,
+            1001,
+            agent_start_envelope(),
+            EXPECTED_SELINUX_CONTEXT,
+        )
+
+    assert [call[0] for call in operations.calls] == expected_operation_names
+    closes = [call for call in operations.calls if call[0] == "close"]
+    assert closes == expected_closes
+    assert len(closes) == len({call[1] for call in closes})
+
+
+@pytest.mark.parametrize(
+    ("fd_changes", "expected_operation_names", "expected_closes"),
+    tuple(
+        (
+            {field: value},
+            operation_names,
+            closes,
+        )
+        for field, operation_names, closes in (
+            ("pidfd_value", ["pidfd_open"], []),
+            (
+                "proc_fd_value",
+                ["pidfd_open", "pidfd_reuse_check", "open_pinned_proc_pid", "close"],
+                [("close", PID_FD)],
+            ),
+            (
+                "cgroup_fd_value",
+                [
+                    "pidfd_open",
+                    "pidfd_reuse_check",
+                    "open_pinned_proc_pid",
+                    "pidfd_reuse_check",
+                    "open_proc_cgroup",
+                    "close",
+                    "close",
+                ],
+                [("close", PROC_FD), ("close", PID_FD)],
+            ),
+        )
+        for value in (True, -1, "73")
+    ),
+)
+def test_agent_start_rejects_invalid_acquired_fd_before_use_or_close(
+    fd_changes, expected_operation_names, expected_closes
+):
+    operations = FakeOperations(**fd_changes)
+
+    with pytest.raises(LinuxBoundaryError):
+        observe_agent_start_peer(
+            operations,
+            PEER_PID,
+            1000,
+            1001,
+            agent_start_envelope(),
+            EXPECTED_SELINUX_CONTEXT,
+        )
+
+    assert [call[0] for call in operations.calls] == expected_operation_names
+    assert [call for call in operations.calls if call[0] == "close"] == expected_closes
+
+
+def test_agent_start_reader_failure_closes_three_unique_owned_fds_once_in_lifo_order():
+    operations = FakeOperations(
+        operation_errors={"read_proc_control_group": OSError("read failed")}
+    )
+
+    with pytest.raises(LinuxBoundaryError):
+        observe_agent_start_peer(
+            operations,
+            PEER_PID,
+            1000,
+            1001,
+            agent_start_envelope(),
+            EXPECTED_SELINUX_CONTEXT,
+        )
+
+    closes = [call for call in operations.calls if call[0] == "close"]
+    assert closes == [
+        ("close", CGROUP_FD),
+        ("close", PROC_FD),
+        ("close", PID_FD),
+    ]
+    assert len(closes) == len({call[1] for call in closes})
 
 
 @pytest.mark.parametrize(
@@ -890,6 +1035,7 @@ def test_agent_start_peer_observation_rejects_pid_uid_gid_and_unit_drift(
             credentials[1],
             credentials[2],
             agent_start_envelope(),
+            EXPECTED_SELINUX_CONTEXT,
         )
     if credentials[1] is True or credentials[2] is True:
         assert operations.calls == []
@@ -901,6 +1047,33 @@ def test_agent_start_peer_observation_rejects_pid_uid_gid_and_unit_drift(
             ("close", PROC_FD),
             ("close", PID_FD),
         ]
+
+
+@pytest.mark.parametrize(
+    "selinux_context",
+    (
+        "other_u:system_r:codex_master_agent_t:s0:c0,c1",
+        "system_u:other_r:codex_master_agent_t:s0:c0,c1",
+        "system_u:system_r:wrong_t:s0:c0,c1",
+        "system_u:system_r:codex_master_agent_t:s0:c0,c2",
+    ),
+)
+def test_direct_agent_start_observation_rejects_full_selinux_context_drift(
+    selinux_context,
+):
+    operations = FakeOperations()
+
+    with pytest.raises(LinuxBoundaryError):
+        observe_agent_start_peer(
+            operations,
+            PEER_PID,
+            1000,
+            1001,
+            agent_start_envelope(),
+            selinux_context,
+        )
+
+    assert operations.calls == []
 
 
 def test_agent_start_observation_keeps_v1_peer_snapshot_shape_untouched():
@@ -923,4 +1096,21 @@ def test_agent_start_observation_keeps_v1_peer_snapshot_shape_untouched():
         "invocation_id",
         "service_generation",
         "mcs_pair",
+        "selinux_context",
     )
+    observation = AgentStartPeerObservation(
+        PEER_PID,
+        1000,
+        1001,
+        PID_START_TIME,
+        17,
+        29,
+        "codex-master-agent@c0\\x2cc1.service",
+        "1" * 32,
+        9,
+        "c0,c1",
+        EXPECTED_SELINUX_CONTEXT,
+    )
+    assert type(observation).__dataclass_params__.frozen
+    assert hasattr(type(observation), "__slots__")
+    assert not hasattr(observation, "__dict__")

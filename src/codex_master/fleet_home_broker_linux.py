@@ -67,6 +67,7 @@ class AgentStartPeerObservation:
     invocation_id: str
     service_generation: int
     mcs_pair: str
+    selinux_context: str
 
 
 class LinuxOperations(Protocol):
@@ -510,6 +511,48 @@ def attest_peer_principal(
     return snapshot
 
 
+def _acquire_agent_start_fd(
+    value: object, owned_fds: tuple[int, ...]
+) -> tuple[int, tuple[int, ...]]:
+    if type(value) is not int or value < 0 or value in owned_fds:
+        raise LinuxBoundaryError("agent start fd ownership is invalid")
+    return value, owned_fds + (value,)
+
+
+def _close_agent_start_fds(
+    operations: LinuxOperations, owned_fds: tuple[object, ...]
+) -> None:
+    first_error = None
+    closed = set()
+    for fd in reversed(owned_fds):
+        if type(fd) is not int or fd < 0 or fd in closed:
+            continue
+        closed.add(fd)
+        try:
+            operations.close(fd)
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise LinuxBoundaryError("agent start fd close failed") from first_error
+
+
+def _fail_agent_start_cleanup(
+    operations: LinuxOperations,
+    owned_fds: tuple[object, ...],
+    message: str,
+    cause=None,
+) -> None:
+    try:
+        _close_agent_start_fds(operations, owned_fds)
+    except LinuxBoundaryError as exc:
+        raise LinuxBoundaryError(f"{message}; close failed") from exc
+    error = LinuxBoundaryError(message)
+    if cause is None:
+        raise error
+    raise error from cause
+
+
 def _validate_agent_start_peer_observation(
     value: object,
     peer_pid: int,
@@ -543,6 +586,8 @@ def _validate_agent_start_peer_observation(
         or value.invocation_id != expected.principal.invocation_id
         or value.service_generation != expected.principal.unit_generation
         or value.mcs_pair != expected.principal.mcs_pair
+        or value.selinux_context
+        != f"system_u:system_r:codex_master_agent_t:s0:{expected.principal.mcs_pair}"
     ):
         raise LinuxBoundaryError("agent start peer observation drifted")
     return value
@@ -554,6 +599,7 @@ def _observe_agent_start_peer_with_identity(
     peer_uid: int,
     peer_gid: int,
     expected: AgentStartEnvelope,
+    selinux_context: str,
 ) -> tuple[AgentStartPeerObservation, PidfdIdentity]:
     """Read one envelope-bound peer using only injected Linux operations."""
 
@@ -563,18 +609,28 @@ def _observe_agent_start_peer_with_identity(
         validate_chpb_message(expected)
     except Exception as exc:
         raise LinuxBoundaryError("agent start envelope is invalid") from exc
+    if (
+        type(selinux_context) is not str
+        or selinux_context
+        != f"system_u:system_r:codex_master_agent_t:s0:{expected.principal.mcs_pair}"
+    ):
+        raise LinuxBoundaryError("agent start SELinux context is invalid")
     _positive_integer(peer_pid, "peer pid")
     _strict_integer(peer_uid, "peer uid", 0, 2**32 - 1)
     _strict_integer(peer_gid, "peer gid", 0, 2**32 - 1)
-    pidfd = None
-    proc_fd = None
-    cgroup_fd = None
+    owned_fds: tuple[int, ...] = ()
     try:
-        pidfd = operations.pidfd_open(peer_pid, 0)
+        pidfd, owned_fds = _acquire_agent_start_fd(
+            operations.pidfd_open(peer_pid, 0), owned_fds
+        )
         identity = _pidfd_guard(operations, pidfd, peer_pid, None, None, None)
-        proc_fd = operations.open_pinned_proc_pid(pidfd, peer_pid, identity)
+        proc_fd, owned_fds = _acquire_agent_start_fd(
+            operations.open_pinned_proc_pid(pidfd, peer_pid, identity), owned_fds
+        )
         identity = _pidfd_guard(operations, pidfd, peer_pid, proc_fd, None, identity)
-        cgroup_fd = operations.open_proc_cgroup(pidfd, proc_fd, identity)
+        cgroup_fd, owned_fds = _acquire_agent_start_fd(
+            operations.open_proc_cgroup(pidfd, proc_fd, identity), owned_fds
+        )
         identity = _pidfd_guard(
             operations, pidfd, peer_pid, proc_fd, cgroup_fd, identity
         )
@@ -664,20 +720,21 @@ def _observe_agent_start_peer_with_identity(
             invocation_id,
             service_generation,
             mcs_pair,
+            selinux_context,
         )
         _validate_agent_start_peer_observation(
             observation, peer_pid, peer_uid, peer_gid, expected
         )
     except LinuxBoundaryError as exc:
-        _fail_with_cleanup(operations, (cgroup_fd, proc_fd, pidfd), str(exc), exc)
+        _fail_agent_start_cleanup(operations, owned_fds, str(exc), exc)
     except Exception as exc:
-        _fail_with_cleanup(
+        _fail_agent_start_cleanup(
             operations,
-            (cgroup_fd, proc_fd, pidfd),
+            owned_fds,
             "agent start peer boundary operation failed",
             exc,
         )
-    _close_all(operations, (cgroup_fd, proc_fd, pidfd))
+    _close_agent_start_fds(operations, owned_fds)
     return observation, identity
 
 
@@ -687,11 +744,12 @@ def observe_agent_start_peer(
     peer_uid: int,
     peer_gid: int,
     expected: AgentStartEnvelope,
+    selinux_context: str,
 ) -> AgentStartPeerObservation:
     """Return one fully validated, pidfd-bound V2 peer observation."""
 
     observation, _ = _observe_agent_start_peer_with_identity(
-        operations, peer_pid, peer_uid, peer_gid, expected
+        operations, peer_pid, peer_uid, peer_gid, expected, selinux_context
     )
     return observation
 

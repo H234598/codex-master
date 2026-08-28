@@ -164,7 +164,7 @@ def _credentials(value: object) -> tuple[int, int, int]:
 
 def _peer_security_context(
     value: object, agent_domain: str, expected_mcs_pair: str
-) -> None:
+) -> str:
     if type(value) is not bytes or not 1 <= len(value) <= _MAX_SO_PEERSEC_BYTES:
         raise ValueError
     if not value.endswith(b"\0"):
@@ -184,6 +184,19 @@ def _peer_security_context(
         or fields[3] != f"s0:{expected_mcs_pair}"
     ):
         raise ValueError
+    return label
+
+
+def _agent_start_security_context(value: object, expected_mcs_pair: str) -> str:
+    label = _peer_security_context(
+        value, "codex_master_agent_t", expected_mcs_pair
+    )
+    if (
+        label
+        != f"system_u:system_r:codex_master_agent_t:s0:{expected_mcs_pair}"
+    ):
+        raise ValueError
+    return label
 
 
 def _snapshot_matches(value: object, pid: int, expected: PrincipalBinding) -> PeerSnapshot:
@@ -383,15 +396,13 @@ def reattest_agent_start_peer(
         if type(kind) is not socket.SocketKind or kind is not socket.SOCK_SEQPACKET:
             raise ValueError
         pid, uid, gid = _credentials(operations.peer_credentials())
-        observation = observe_agent_start_peer(
-            linux_operations, pid, uid, gid, expected
-        )
         if operations.selinux_enforcing() is not True:
             raise ValueError
-        _peer_security_context(
-            operations.peer_security_context(),
-            "codex_master_agent_t",
-            expected.principal.mcs_pair,
+        selinux_context = _agent_start_security_context(
+            operations.peer_security_context(), expected.principal.mcs_pair
+        )
+        observation = observe_agent_start_peer(
+            linux_operations, pid, uid, gid, expected, selinux_context
         )
         return observation
     except Exception:
