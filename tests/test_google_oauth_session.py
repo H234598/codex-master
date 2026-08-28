@@ -190,6 +190,10 @@ class _SecretIngress:
         def __repr__(self) -> str:
             return "SecretIngressSession(<redacted>)"
 
+    def __init__(self) -> None:
+        self.receipts: dict[str, tuple[str, int, str]] = {}
+        self.ack_calls: list[str] = []
+
     def put(self, plan, payload: bytes):
         return self.Session(plan, payload)
 
@@ -218,9 +222,18 @@ class _SecretIngress:
         account_ref: str,
         expected_generation: int,
         plan_digest: str,
+        ack_operation_id: str,
     ) -> None:
+        binding = (account_ref, expected_generation, plan_digest)
+        self.ack_calls.append(ack_operation_id)
+        receipt = self.receipts.get(ack_operation_id)
+        if receipt is not None:
+            if receipt != binding:
+                raise oauth_session.GoogleOAuthSessionError("credential.upload_expired")
+            return
         if (
             not isinstance(session, self.Session)
+            or session.acknowledged
             or session.account_ref != account_ref
             or session.generation != expected_generation
             or session.plan_digest != plan_digest
@@ -228,6 +241,7 @@ class _SecretIngress:
             raise oauth_session.GoogleOAuthSessionError("credential.upload_expired")
         session.acknowledged = True
         session.payload[:] = b"\0" * len(session.payload)
+        self.receipts[ack_operation_id] = binding
 
 
 class _TokenWriter:
@@ -1356,6 +1370,14 @@ def test_acknowledged_import_recovers_after_final_journal_crash(
     receipt = restarted.apply_oauth_client_import(plan, session)
     assert receipt.inventory_generation == 1
     assert session.acknowledged is True
+    assert ingress.ack_calls == [plan.plan_digest, plan.plan_digest]
+    assert ingress.receipts == {
+        plan.plan_digest: (
+            plan.account_ref,
+            plan.expected_generation,
+            plan.plan_digest,
+        )
+    }
 
 
 def test_expired_import_retries_claim_cleanup_before_terminalizing(
@@ -1426,3 +1448,51 @@ def test_v1_ambiguous_import_migrates_to_manual_repair_block(
             idempotency_key="new-import",
         )
     assert plan.account_ref == "google-account-01"
+
+
+def test_v1_succeeded_import_migrates_terminal_without_obsolete_ack(
+    tmp_path: Path,
+) -> None:
+    service, ingress, exchange, manager = _service(tmp_path)
+    _plan, _session, receipt = _import_client(service, ingress)
+    path = tmp_path / "oauth-state" / "google-oauth-control.json"
+    document = json.loads(path.read_text())
+    record = document["imports"][0]
+    nonce = "v1-terminal-import-nonce"
+    plan_digest = service._digest(
+        "google.oauth-client-import",
+        record["id"],
+        record["account_ref"],
+        record["expected_generation"],
+        record["expires_at"],
+        record["idempotency_key"],
+        nonce,
+    )
+    record.update({"nonce": nonce, "plan_digest": plan_digest, "state": "succeeded"})
+    record.pop("terminal_at")
+    for client in document["clients"]:
+        client.pop("state")
+        client.pop("terminal_at")
+    document.update(
+        {
+            "schema_version": 1,
+            "token_generations": {},
+            "transactions": [],
+        }
+    )
+    path.write_text(json.dumps(document))
+    legacy_plan = oauth_session.GoogleOAuthClientImportPlanV1(
+        record["id"],
+        record["account_ref"],
+        record["expected_generation"],
+        record["expires_at"],
+        record["idempotency_key"],
+        plan_digest,
+    )
+
+    restarted, _ingress, _exchange, _manager_instance = _service(
+        tmp_path, ingress=ingress, exchange=exchange, manager=manager
+    )
+    migrated = json.loads(path.read_text())
+    assert migrated["imports"][0]["state"] == "succeeded"
+    assert restarted.apply_oauth_client_import(legacy_plan, object()) == receipt

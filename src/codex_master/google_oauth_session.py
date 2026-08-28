@@ -354,7 +354,13 @@ GoogleOAuthError = GoogleOAuthSessionError
 
 
 class SecretIngressPort(Protocol):
-    """Task-8/9 durable claim port; read stays replayable until acknowledged."""
+    """Task-8/9 durable claim port.
+
+    Read stays replayable until acknowledged. Ack atomically removes the claim
+    and durably records its binding. ``ack_operation_id`` is the persisted,
+    unique plan digest. Repeating that exact operation ID with the same binding
+    succeeds even after claim removal.
+    """
 
     def read_oauth_client(
         self,
@@ -372,6 +378,7 @@ class SecretIngressPort(Protocol):
         account_ref: str,
         expected_generation: int,
         plan_digest: str,
+        ack_operation_id: str,
     ) -> None: ...
 
 
@@ -1098,7 +1105,7 @@ class GoogleOAuthControlService:
                 "planned"
                 if record["state"] == "planned"
                 else (
-                    "ack_pending"
+                    "succeeded"
                     if succeeded
                     else ("repair_required" if ambiguous else "expired")
                 )
@@ -1120,7 +1127,9 @@ class GoogleOAuthControlService:
                     "vault_generation": record["vault_generation"]
                     if succeeded or (ambiguous and client_fields_valid)
                     else None,
-                    "terminal_at": record["expires_at"] if state == "expired" else None,
+                    "terminal_at": record["expires_at"]
+                    if state in {"succeeded", "expired"}
+                    else None,
                 }
             )
         migrated_clients: list[object] = []
@@ -1675,7 +1684,11 @@ class GoogleOAuthControlService:
                     self._write_locked(document)
                     ack_failed = False
                     try:
-                        self._ack_ingress(plan, ingress_session)
+                        self._ack_ingress(
+                            plan,
+                            ingress_session,
+                            plan.plan_digest,
+                        )
                     except BaseException:
                         ack_failed = True
                     if not ack_failed:
@@ -1798,7 +1811,7 @@ class GoogleOAuthControlService:
         ingress_session: object,
     ) -> GoogleOAuthClientImportReceiptV1:
         cleanup = record["state"] == "cleanup"
-        self._ack_ingress(plan, ingress_session)
+        self._ack_ingress(plan, ingress_session, plan.plan_digest)
         if cleanup:
             self._terminalize_import(record, "expired")
             self._write_import_locked(document)
@@ -1817,7 +1830,10 @@ class GoogleOAuthControlService:
             raise GoogleOAuthSessionError("oauth.client_write_failed") from None
 
     def _ack_ingress(
-        self, plan: GoogleOAuthClientImportPlanV1, ingress_session: object
+        self,
+        plan: GoogleOAuthClientImportPlanV1,
+        ingress_session: object,
+        ack_operation_id: str,
     ) -> None:
         failed = False
         try:
@@ -1826,6 +1842,7 @@ class GoogleOAuthControlService:
                 account_ref=plan.account_ref,
                 expected_generation=plan.expected_generation,
                 plan_digest=plan.plan_digest,
+                ack_operation_id=ack_operation_id,
             )
         except BaseException:
             failed = True
