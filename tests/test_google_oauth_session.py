@@ -417,13 +417,21 @@ def _import_client(service, ingress: _SecretIngress, *, key: str = "import-one")
     return plan, session, service.apply_oauth_client_import(plan, session)
 
 
-def _begin(service, client_ref: str, *, ttl_seconds: int = 600):
+def _begin(
+    service,
+    client_ref: str,
+    *,
+    ttl_seconds: int = 600,
+    idempotency_key: str = "oauth-begin-default",
+):
     return service.begin_oauth_transaction(
         "google-account-01",
         oauth_client_ref=client_ref,
         redirect_uri="http://127.0.0.1:8765/callback",
         scope_profile=GoogleOAuthProfileIdV1.INVENTORY_READONLY,
         expected_generation=1,
+        idempotency_key=idempotency_key,
+        principal="operator-one",
         ttl_seconds=ttl_seconds,
     )
 
@@ -462,6 +470,39 @@ def test_oauth_transaction_is_account_bound_and_code_is_consumed_once(
     with pytest.raises(GoogleOAuthSessionError, match="oauth.transaction_expired"):
         _complete(service, transaction, code="second-code")
     assert len(exchange.calls) == 1
+
+
+def test_oauth_begin_replays_same_receipt_after_restart_and_conflicts_on_rebind(
+    tmp_path: Path,
+) -> None:
+    service, ingress, exchange, manager = _service(tmp_path)
+    _plan, _session, imported = _import_client(service, ingress)
+    values = {
+        "oauth_client_ref": imported.client_ref,
+        "redirect_uri": "http://127.0.0.1:8765/callback",
+        "scope_profile": GoogleOAuthProfileIdV1.INVENTORY_READONLY,
+        "expected_generation": 1,
+        "idempotency_key": "oauth-begin-one",
+        "principal": "operator-one",
+    }
+    first = service.begin_oauth_transaction("google-account-01", **values)
+    restarted, _ingress, _exchange, _manager_instance = _service(
+        tmp_path,
+        ingress=ingress,
+        exchange=exchange,
+        manager=manager,
+    )
+
+    assert restarted.begin_oauth_transaction("google-account-01", **values) == first
+    with pytest.raises(GoogleOAuthSessionError, match="control.idempotency_conflict"):
+        restarted.begin_oauth_transaction(
+            "google-account-01",
+            **{**values, "redirect_uri": "http://127.0.0.1:8766/callback"},
+        )
+    document = json.loads(
+        (tmp_path / "oauth-state" / "google-oauth-control.json").read_text()
+    )
+    assert len(document["transactions"]) == 1
 
 
 @pytest.mark.parametrize(
@@ -642,6 +683,8 @@ def test_oauth_client_ref_cannot_cross_accounts(tmp_path: Path) -> None:
             redirect_uri="http://127.0.0.1:8765/callback",
             scope_profile=GoogleOAuthProfileIdV1.INVENTORY_READONLY,
             expected_generation=1,
+            idempotency_key="oauth-cross-account",
+            principal="operator-one",
         )
 
 
@@ -658,6 +701,8 @@ def test_provisioner_grant_is_rejected_before_any_transaction_or_token_write(
             redirect_uri="http://127.0.0.1:8765/callback",
             scope_profile=GoogleOAuthProfileIdV1.PROVISIONER,
             expected_generation=1,
+            idempotency_key="oauth-wrong-profile",
+            principal="operator-one",
         )
 
     document = json.loads(
@@ -864,12 +909,14 @@ def test_terminal_history_is_pruned_without_dropping_active_transactions(
     monkeypatch.setattr(oauth_session, "_MAX_CONTROL_RECORDS", 2)
     service, ingress, _exchange, _manager_instance = _service(tmp_path)
     _plan, _session, imported = _import_client(service, ingress)
-    active = _begin(service, imported.client_ref)
-    terminal = _begin(service, imported.client_ref)
+    active = _begin(service, imported.client_ref, idempotency_key="active-begin")
+    terminal = _begin(service, imported.client_ref, idempotency_key="terminal-begin")
     with pytest.raises(GoogleOAuthSessionError, match="oauth.state_mismatch"):
         _complete(service, terminal, state="wrong-state")
 
-    replacement = _begin(service, imported.client_ref)
+    replacement = _begin(
+        service, imported.client_ref, idempotency_key="replacement-begin"
+    )
     document = json.loads(
         (tmp_path / "oauth-state" / "google-oauth-control.json").read_text()
     )

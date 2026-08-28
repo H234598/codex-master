@@ -280,6 +280,9 @@ def _service(tmp_path, *, api=None, authority=None, clock=None):
 
 def _apply(service, plan, **overrides):
     arguments = {
+        "account_ref": plan.account_ref,
+        "project_ref": plan.project_ref,
+        "billing_ref": plan.billing_ref,
         "expected_generation": plan.inventory_generation,
         "confirmed_digest": plan.digest,
         "idempotency_key": plan.idempotency_key,
@@ -312,6 +315,7 @@ def test_plan_rejects_project_and_billing_from_different_accounts(tmp_path) -> N
 
     with pytest.raises(GoogleBillingError, match="billing.account_mismatch"):
         service.plan_billing_binding(
+            account_ref="google-one",
             project_ref="the-hive-1",
             billing_ref="billing-two",
             expected_generation=1,
@@ -322,6 +326,7 @@ def test_plan_rejects_project_and_billing_from_different_accounts(tmp_path) -> N
     assert api.calls == []
 
     retry = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -330,12 +335,64 @@ def test_plan_rejects_project_and_billing_from_different_accounts(tmp_path) -> N
     assert retry.billing_ref == "billing-one"
 
 
+def test_plan_rejects_request_account_mismatch_before_any_effect_owner(
+    tmp_path,
+) -> None:
+    lease = FakeBillingLease()
+    authority = FakeCredentialAuthority(lease)
+    service, _, _, _ = _service(tmp_path, api=lease, authority=authority)
+
+    with pytest.raises(GoogleBillingError, match="billing.account_mismatch"):
+        service.plan_billing_binding(
+            account_ref="google-two",
+            project_ref="the-hive-1",
+            billing_ref="billing-one",
+            expected_generation=1,
+            idempotency_key="request-account-mismatch",
+        )
+
+    assert authority.requests == []
+    assert lease.reads == []
+    assert lease.calls == []
+
+
+def test_apply_rejects_request_binding_mismatch_before_credential_or_provider(
+    tmp_path,
+) -> None:
+    lease = FakeBillingLease()
+    authority = FakeCredentialAuthority(lease)
+    service, _, _, _ = _service(tmp_path, api=lease, authority=authority)
+    plan = service.plan_billing_binding(
+        account_ref="google-one",
+        project_ref="the-hive-1",
+        billing_ref="billing-one",
+        expected_generation=1,
+        idempotency_key="apply-request-binding",
+    )
+
+    with pytest.raises(GoogleBillingError, match="billing.account_mismatch"):
+        service.apply_billing_binding(
+            plan.id,
+            account_ref="google-two",
+            project_ref="the-hive-1",
+            billing_ref="billing-one",
+            expected_generation=1,
+            confirmed_digest=plan.digest,
+            idempotency_key=plan.idempotency_key,
+        )
+
+    assert authority.requests == []
+    assert lease.reads == []
+    assert lease.calls == []
+
+
 def test_plan_binds_private_snapshot_identity_but_public_view_is_redacted(
     tmp_path,
 ) -> None:
     service, manager, _, _ = _service(tmp_path)
 
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -371,12 +428,14 @@ def test_plan_idempotency_reuses_same_plan_and_rejects_changed_payload(
 ) -> None:
     service, _, _, _ = _service(tmp_path)
     first = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
         idempotency_key="same-key",
     )
     second = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -386,6 +445,7 @@ def test_plan_idempotency_reuses_same_plan_and_rejects_changed_payload(
     assert second == first
     with pytest.raises(GoogleBillingError, match="billing.idempotency_conflict"):
         service.plan_billing_binding(
+            account_ref="google-one",
             project_ref="the-hive-1",
             billing_ref="billing-other",
             expected_generation=1,
@@ -396,6 +456,7 @@ def test_plan_idempotency_reuses_same_plan_and_rejects_changed_payload(
 def test_apply_exposes_only_project_binding_lookup_and_create(tmp_path) -> None:
     service, _, api, _ = _service(tmp_path)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -428,6 +489,7 @@ def test_effect_credential_lease_is_requested_and_attested_for_plan_identity(
     authority = FakeCredentialAuthority(lease)
     service, _, _, _ = _service(tmp_path, api=lease, authority=authority)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -445,6 +507,7 @@ def test_foreign_credential_lease_fails_before_provider_access(tmp_path) -> None
     authority = FakeCredentialAuthority(lease)
     service, _, _, _ = _service(tmp_path, api=lease, authority=authority)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -467,6 +530,7 @@ def test_credential_authority_failure_is_typed_and_redacted(tmp_path) -> None:
     authority.fail = True
     service, _, _, _ = _service(tmp_path, api=lease, authority=authority)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -488,6 +552,7 @@ def test_credential_attestation_failure_is_typed_and_redacted(tmp_path) -> None:
     authority = FakeCredentialAuthority(lease)  # type: ignore[arg-type]
     service, _, _, _ = _service(tmp_path, authority=authority)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -509,6 +574,7 @@ def test_missing_digest_or_idempotency_never_reaches_credential_authority(
     authority = FakeCredentialAuthority(lease)
     service, _, _, _ = _service(tmp_path, api=lease, authority=authority)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -518,12 +584,18 @@ def test_missing_digest_or_idempotency_never_reaches_credential_authority(
     with pytest.raises(TypeError):
         service.apply_billing_binding(
             plan.id,
+            account_ref=plan.account_ref,
+            project_ref=plan.project_ref,
+            billing_ref=plan.billing_ref,
             expected_generation=1,
             idempotency_key=plan.idempotency_key,
         )
     with pytest.raises(TypeError):
         service.apply_billing_binding(
             plan.id,
+            account_ref=plan.account_ref,
+            project_ref=plan.project_ref,
+            billing_ref=plan.billing_ref,
             expected_generation=1,
             confirmed_digest=plan.digest,
         )
@@ -547,6 +619,7 @@ def test_apply_rejects_wrong_digest_or_idempotency_before_credential(
     authority = FakeCredentialAuthority(lease)
     service, _, _, _ = _service(tmp_path, api=lease, authority=authority)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -577,6 +650,7 @@ def test_manager_state_errors_are_typed_at_plan_boundary(tmp_path, state: str) -
 
     with pytest.raises(GoogleBillingError, match="billing.inventory_unavailable"):
         service.plan_billing_binding(
+            account_ref="google-one",
             project_ref="the-hive-1",
             billing_ref="billing-one",
             expected_generation=1,
@@ -603,6 +677,7 @@ def test_reload_blocked_between_status_and_snapshot_cannot_publish_plan(
 
     with pytest.raises(GoogleBillingError, match="billing.inventory_unavailable"):
         service.plan_billing_binding(
+            account_ref="google-one",
             project_ref="the-hive-1",
             billing_ref="billing-one",
             expected_generation=1,
@@ -616,6 +691,7 @@ def test_reload_blocked_between_status_and_snapshot_cannot_publish_plan(
 def test_manager_failure_is_typed_at_apply_boundary(tmp_path) -> None:
     service, manager, lease, _ = _service(tmp_path)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -633,6 +709,7 @@ def test_manager_failure_is_typed_at_apply_boundary(tmp_path) -> None:
 def test_apply_revalidates_generation_and_fingerprint_before_api(tmp_path) -> None:
     service, manager, api, _ = _service(tmp_path)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -655,6 +732,7 @@ def test_apply_revalidates_generation_and_fingerprint_before_api(tmp_path) -> No
     assert api.reads == []
     assert api.calls == []
     retry = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -675,6 +753,7 @@ def test_apply_rejects_ref_reuse_and_provider_id_change_before_api(
 ) -> None:
     service, manager, api, _ = _service(tmp_path)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -697,6 +776,7 @@ def test_expired_plan_stops_before_api(tmp_path) -> None:
     clock = Clock()
     service, _, api, _ = _service(tmp_path, clock=clock)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -718,6 +798,7 @@ def test_plan_expiring_during_lookup_stops_before_effect(tmp_path) -> None:
     lease.lookup_hook = lambda: clock.advance(5)
     service, _, _, _ = _service(tmp_path, api=lease, clock=clock)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -739,6 +820,7 @@ def test_expired_plan_does_not_poison_idempotency_key(
     clock = Clock()
     service, _, _, _ = _service(tmp_path, clock=clock)
     arguments = {
+        "account_ref": "google-one",
         "project_ref": "the-hive-1",
         "billing_ref": "billing-one",
         "expected_generation": 1,
@@ -759,6 +841,7 @@ def test_unexpired_plan_collection_is_bounded(tmp_path) -> None:
     service, _, _, _ = _service(tmp_path)
     for number in range(256):
         service.plan_billing_binding(
+            account_ref="google-one",
             project_ref="the-hive-1",
             billing_ref="billing-one",
             expected_generation=1,
@@ -767,6 +850,7 @@ def test_unexpired_plan_collection_is_bounded(tmp_path) -> None:
 
     with pytest.raises(GoogleBillingError, match="billing.plan_limit"):
         service.plan_billing_binding(
+            account_ref="google-one",
             project_ref="the-hive-1",
             billing_ref="billing-one",
             expected_generation=1,
@@ -779,6 +863,7 @@ def test_existing_foreign_binding_is_never_replaced(tmp_path) -> None:
     api.bindings["provider-project-one"] = "provider-billing-foreign"
     service, _, _, _ = _service(tmp_path, api=api)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -799,6 +884,7 @@ def test_provider_race_to_foreign_binding_is_cas_blocked(tmp_path) -> None:
     )
     service, _, _, _ = _service(tmp_path, api=lease)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -824,6 +910,7 @@ def test_malformed_binding_lookup_is_redacted_before_mutation(tmp_path) -> None:
     api.bindings["provider-project-one"] = 7  # type: ignore[assignment]
     service, _, _, _ = _service(tmp_path, api=api)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -858,6 +945,7 @@ def test_provider_observation_surrogate_is_typed_and_redacted(
     lease.observation_override = observation
     service, _, _, _ = _service(tmp_path, api=lease)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -880,6 +968,7 @@ def test_provider_bind_result_surrogate_is_typed_and_redacted(tmp_path) -> None:
     )
     service, _, _, _ = _service(tmp_path, api=lease)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -906,6 +995,7 @@ def test_exploding_provider_code_property_is_typed_and_redacted(
         lease.bind_error = ExplodingProviderCodeError()
     service, _, _, _ = _service(tmp_path, api=lease)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -923,6 +1013,7 @@ def test_repeated_and_concurrent_apply_create_one_association(tmp_path) -> None:
     api = BlockingBillingLease()
     service, _, _, _ = _service(tmp_path, api=api)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -966,6 +1057,7 @@ def test_provider_failures_are_structured_redacted_and_retryable(
     api.fail_create = provider_code
     service, _, _, _ = _service(tmp_path, api=api)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,
@@ -989,6 +1081,7 @@ def test_provider_lookup_failure_is_typed_without_partial_effect(tmp_path) -> No
     lease.fail_get = "google.api_unavailable"
     service, _, _, _ = _service(tmp_path, api=lease)
     plan = service.plan_billing_binding(
+        account_ref="google-one",
         project_ref="the-hive-1",
         billing_ref="billing-one",
         expected_generation=1,

@@ -1914,12 +1914,16 @@ class GoogleOAuthControlService:
         redirect_uri: str,
         scope_profile: GoogleOAuthProfileIdV1,
         expected_generation: int,
+        idempotency_key: str,
+        principal: str,
         ttl_seconds: int = MAX_OAUTH_TRANSACTION_SECONDS,
     ) -> GoogleOAuthTransactionV1:
         account_ref = self._ref(account_ref)
         oauth_client_ref = self._ref(oauth_client_ref)
         redirect_uri = self._redirect_uri(redirect_uri)
         expected_generation = self._generation(expected_generation)
+        idempotency_key = self._ref(idempotency_key)
+        principal = self._ref(principal)
         ttl_seconds = self._ttl(ttl_seconds, MAX_OAUTH_TRANSACTION_SECONDS)
         self._account_subject(account_ref, expected_generation)
         profile = self._profile(scope_profile)
@@ -1940,34 +1944,74 @@ class GoogleOAuthControlService:
                 raise GoogleOAuthSessionError("oauth.client_expired")
             now = self._now()
             expires_at = now + ttl_seconds
-            transaction_id = "oauth-txn-" + secrets.token_hex(16)
-            state = secrets.token_urlsafe(32)
-            verifier = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
-            challenge = (
-                base64.urlsafe_b64encode(sha256(verifier.encode("ascii")).digest())
-                .rstrip(b"=")
-                .decode()
+            transaction_prefix = (
+                "oauth-txn-"
+                + sha256(
+                    ("google.oauth-begin\0" + idempotency_key).encode("utf-8")
+                ).hexdigest()[:32]
+                + "-"
             )
-            authorization_url = (
-                str(client["auth_uri"])
-                + "?"
-                + urllib.parse.urlencode(
-                    {
-                        "access_type": "offline",
-                        "client_id": str(client["client_id"]),
-                        "code_challenge": challenge,
-                        "code_challenge_method": "S256",
-                        "prompt": "consent",
-                        "redirect_uri": redirect_uri,
-                        "response_type": "code",
-                        "scope": " ".join(
-                            google_oauth_scope_values_v1(profile.profile_id)
-                        ),
-                        "state": state,
-                    }
-                )
+            transaction_id = (
+                transaction_prefix
+                + sha256(
+                    ("google.oauth-principal\0" + principal).encode("utf-8")
+                ).hexdigest()[:32]
             )
             transactions = cast(list[object], document["transactions"])
+            prior_matches = [
+                cast(dict[str, object], item)
+                for item in transactions
+                if cast(str, cast(dict[str, object], item)["id"]).startswith(
+                    transaction_prefix
+                )
+            ]
+            if prior_matches:
+                if len(prior_matches) != 1:
+                    raise GoogleOAuthSessionError("oauth.control_unavailable")
+                prior = prior_matches[0]
+                if (
+                    any(
+                        prior[field] != expected
+                        for field, expected in (
+                            ("id", transaction_id),
+                            ("account_ref", account_ref),
+                            ("oauth_client_ref", oauth_client_ref),
+                            ("client_digest", client_digest),
+                            (
+                                "client_vault_generation",
+                                client_record["vault_generation"],
+                            ),
+                            ("redirect_uri", redirect_uri),
+                            ("scope_profile", profile.profile_id.value),
+                            ("scope_fingerprint", profile.scope_fingerprint),
+                            ("inventory_generation", expected_generation),
+                        )
+                    )
+                    or prior["state"] != "pending"
+                ):
+                    raise GoogleOAuthSessionError("control.idempotency_conflict")
+                return GoogleOAuthTransactionV1(
+                    transaction_id,
+                    account_ref,
+                    self._authorization_url(
+                        client,
+                        redirect_uri=redirect_uri,
+                        profile_id=profile.profile_id,
+                        state=cast(str, prior["state_token"]),
+                        verifier=cast(str, prior["pkce_verifier"]),
+                    ),
+                    cast(float, prior["expires_at"]),
+                    expected_generation,
+                )
+            state = secrets.token_urlsafe(32)
+            verifier = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
+            authorization_url = self._authorization_url(
+                client,
+                redirect_uri=redirect_uri,
+                profile_id=profile.profile_id,
+                state=state,
+                verifier=verifier,
+            )
             if any(
                 cast(dict[str, object], item)["account_ref"] == account_ref
                 and cast(dict[str, object], item)["state"] == "repair_required"
@@ -2015,6 +2059,38 @@ class GoogleOAuthControlService:
             authorization_url,
             expires_at,
             expected_generation,
+        )
+
+    @staticmethod
+    def _authorization_url(
+        client: Mapping[str, object],
+        *,
+        redirect_uri: str,
+        profile_id: GoogleOAuthProfileIdV1,
+        state: str,
+        verifier: str,
+    ) -> str:
+        challenge = (
+            base64.urlsafe_b64encode(sha256(verifier.encode("ascii")).digest())
+            .rstrip(b"=")
+            .decode()
+        )
+        return (
+            str(client["auth_uri"])
+            + "?"
+            + urllib.parse.urlencode(
+                {
+                    "access_type": "offline",
+                    "client_id": str(client["client_id"]),
+                    "code_challenge": challenge,
+                    "code_challenge_method": "S256",
+                    "prompt": "consent",
+                    "redirect_uri": redirect_uri,
+                    "response_type": "code",
+                    "scope": " ".join(google_oauth_scope_values_v1(profile_id)),
+                    "state": state,
+                }
+            )
         )
 
     def complete_oauth_transaction(

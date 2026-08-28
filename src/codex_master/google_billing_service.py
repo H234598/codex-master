@@ -192,12 +192,14 @@ class GoogleBillingService:
     def plan_billing_binding(
         self,
         *,
+        account_ref: str,
         project_ref: str,
         billing_ref: str,
         expected_generation: int,
         idempotency_key: str | None = None,
         ttl_seconds: int | float = DEFAULT_BILLING_PLAN_TTL_SECONDS,
     ) -> GoogleBillingPlanV1:
+        account_ref = _token(account_ref, "billing.account_mismatch")
         project_ref = _token(project_ref, "billing.project_not_found")
         billing_ref = _token(billing_ref, "billing.account_not_found")
         expected_generation = _generation(expected_generation)
@@ -210,6 +212,8 @@ class GoogleBillingService:
             if snapshot.generation != expected_generation:
                 raise GoogleBillingError("billing.generation_conflict")
             binding = _resolve_binding(snapshot, project_ref, billing_ref)
+            if binding[0] != account_ref:
+                raise GoogleBillingError("billing.account_mismatch")
             if idempotency_key is None:
                 idempotency_key = _automatic_idempotency_key(
                     expected_generation, project_ref, billing_ref
@@ -255,11 +259,17 @@ class GoogleBillingService:
         self,
         plan_id: str,
         *,
+        account_ref: str,
+        project_ref: str,
+        billing_ref: str,
         expected_generation: int,
         confirmed_digest: str,
         idempotency_key: str,
     ) -> GoogleBillingReceiptV1:
         plan_id = _token(plan_id, "billing.plan_not_found")
+        account_ref = _token(account_ref, "billing.account_mismatch")
+        project_ref = _token(project_ref, "billing.account_mismatch")
+        billing_ref = _token(billing_ref, "billing.account_mismatch")
         expected_generation = _generation(expected_generation)
         if (
             type(confirmed_digest) is not str
@@ -273,6 +283,12 @@ class GoogleBillingService:
                 plan = self._plans[plan_id]
             except KeyError:
                 raise GoogleBillingError("billing.plan_not_found") from None
+            if (
+                account_ref != plan.account_ref
+                or project_ref != plan.project_ref
+                or billing_ref != plan.billing_ref
+            ):
+                raise GoogleBillingError("billing.account_mismatch")
             if expected_generation != plan.inventory_generation:
                 raise GoogleBillingError("billing.plan_stale")
             if confirmed_digest != plan.digest:

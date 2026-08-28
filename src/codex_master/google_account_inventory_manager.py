@@ -519,10 +519,18 @@ class GoogleAccountInventoryManager:
             source = None
             return _ReloadFailureV1("credential.inventory_reload_failed")
 
-    def reload(self) -> GoogleAccountInventoryStatusV1:
+    def reload(
+        self, *, expected_generation: int | None = None
+    ) -> GoogleAccountInventoryStatusV1:
         with self._lock:
             if self._state is InventoryManagerStateV1.CLOSED:
                 raise GoogleAccountInventoryError("credential.inventory_manager_closed")
+            if expected_generation is not None and (
+                type(expected_generation) is not int
+                or not 0 <= expected_generation <= MAX_INVENTORY_GENERATION
+                or expected_generation != self._generation
+            ):
+                raise GoogleAccountInventoryError("credential.generation_conflict")
             if self._generation >= MAX_INVENTORY_GENERATION:
                 self._block_after_reload_failure(
                     "credential.inventory_generation_exhausted"

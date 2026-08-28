@@ -23,10 +23,18 @@ DIGEST = "sha256:" + "a" * 64
 
 def operation(**changes: object) -> OperationV1:
     values: dict[str, object] = {
-        "id": "op-1", "kind": "google.provision", "state": "planned",
-        "expected_generation": 4, "resulting_generation": None, "plan_digest": DIGEST,
-        "created_at": CREATED, "expires_at": EXPIRES, "completed_count": 0,
-        "failed_count": 0, "not_attempted_count": 1, "reason_codes": ("control.plan_ready",),
+        "id": "op-1",
+        "kind": "google.provision",
+        "state": "planned",
+        "expected_generation": 4,
+        "resulting_generation": None,
+        "plan_digest": DIGEST,
+        "created_at": CREATED,
+        "expires_at": EXPIRES,
+        "completed_count": 0,
+        "failed_count": 0,
+        "not_attempted_count": 1,
+        "reason_codes": ("control.plan_ready",),
     }
     values.update(changes)
     return OperationV1(**values)  # type: ignore[arg-type]
@@ -34,10 +42,16 @@ def operation(**changes: object) -> OperationV1:
 
 def problem(**changes: object) -> HiveProblemV1:
     values: dict[str, object] = {
-        "code": "control.failed", "severity": "error", "title": "Request failed",
-        "detail": "Retry with a new request", "effect": "Operation was not started",
-        "action": "Review request", "retryable": True, "retry_after_seconds": 30,
-        "correlation_id": "corr-1", "occurred_at": CREATED,
+        "code": "control.failed",
+        "severity": "error",
+        "title": "Request failed",
+        "detail": "Retry with a new request",
+        "effect": "Operation was not started",
+        "action": "Review request",
+        "retryable": True,
+        "retry_after_seconds": 30,
+        "correlation_id": "corr-1",
+        "occurred_at": CREATED,
     }
     values.update(changes)
     return HiveProblemV1(**values)  # type: ignore[arg-type]
@@ -45,7 +59,9 @@ def problem(**changes: object) -> HiveProblemV1:
 
 def test_admin_request_rejects_unknown_operation() -> None:
     with pytest.raises(AdminContractError, match="control.request_invalid"):
-        parse_admin_request({"schema_version": 1, "operation": "google.provision.apply.v2"})
+        parse_admin_request(
+            {"schema_version": 1, "operation": "google.provision.apply.v2"}
+        )
 
 
 @pytest.mark.parametrize("value", [True, 2])
@@ -54,12 +70,17 @@ def test_admin_request_requires_exact_schema_major_one(value: object) -> None:
         parse_admin_request({"schema_version": value, "operation": "hosts.list"})
 
 
-@pytest.mark.parametrize("missing", ["expected_generation", "idempotency_key", "plan_digest"])
+@pytest.mark.parametrize(
+    "missing", ["expected_generation", "idempotency_key", "plan_digest"]
+)
 def test_apply_requires_all_concurrency_fields(missing: str) -> None:
     request = {
-        "schema_version": 1, "operation": "google.provision.apply",
-        "arguments": {"account_ref": "google-one"}, "expected_generation": 4,
-        "idempotency_key": "request-1", "plan_digest": DIGEST,
+        "schema_version": 1,
+        "operation": "google.provision.apply",
+        "arguments": {"account_ref": "google-one"},
+        "expected_generation": 4,
+        "idempotency_key": "request-1",
+        "plan_digest": DIGEST,
     }
     del request[missing]
 
@@ -86,19 +107,9 @@ def test_apply_requires_all_concurrency_fields(missing: str) -> None:
             },
             False,
         ),
-        (
-            "google.oauth.complete",
-            {
-                "account_ref": "google-one",
-                "transaction_id": "transaction-one",
-                "redirect_uri": "http://127.0.0.1/callback",
-                "state": "state-one",
-            },
-            True,
-        ),
         ("google.oauth-client-import.plan", {"account_ref": "google-one"}, False),
         ("google.oauth-client-import.apply", {"account_ref": "google-one"}, True),
-        ("google.inventory.refresh", {"account_ref": "google-one"}, False),
+        ("google.inventory.refresh", {}, False),
         ("google.provision.plan", {"account_ref": "google-one"}, False),
         (
             "google.billing.plan",
@@ -157,13 +168,72 @@ def test_operations_get_is_account_bound() -> None:
     }
 
 
+def test_oauth_complete_uses_transaction_generation_without_shadow_replay_fields() -> (
+    None
+):
+    request = parse_admin_request(
+        {
+            "schema_version": 1,
+            "operation": "google.oauth.complete",
+            "arguments": {
+                "account_ref": "google-one",
+                "transaction_id": "transaction-one",
+                "redirect_uri": "http://127.0.0.1/callback",
+                "state": "state-one",
+            },
+            "expected_generation": 4,
+        }
+    )
+
+    assert request.expected_generation == 4
+    assert request.idempotency_key is None
+    assert request.plan_digest is None
+
+
+@pytest.mark.parametrize("credential_kind", ["openai.auth-json", "google.oauth-client"])
+def test_secret_ingress_accepts_only_closed_v1_credential_kinds(
+    credential_kind: str,
+) -> None:
+    request = parse_admin_request(
+        {
+            "schema_version": 1,
+            "operation": "secret.ingress.create",
+            "arguments": {
+                "account_ref": "google-one",
+                "credential_kind": credential_kind,
+            },
+            "expected_generation": 4,
+            "idempotency_key": "request-one",
+            "plan_digest": DIGEST,
+        }
+    )
+
+    assert request.arguments["credential_kind"] == credential_kind
+
+
+def test_secret_ingress_rejects_unknown_credential_kind() -> None:
+    with pytest.raises(AdminContractError, match="control.request_invalid"):
+        parse_admin_request(
+            {
+                "schema_version": 1,
+                "operation": "secret.ingress.create",
+                "arguments": {
+                    "account_ref": "google-one",
+                    "credential_kind": "future.secret-format",
+                },
+                "expected_generation": 4,
+                "idempotency_key": "request-one",
+                "plan_digest": DIGEST,
+            }
+        )
+
+
 @pytest.mark.parametrize(
     "operation",
     [
         "openai.auth.plan",
         "secret.ingress.create",
         "google.oauth.begin",
-        "google.oauth.complete",
         "google.oauth-client-import.plan",
         "google.oauth-client-import.apply",
         "google.inventory.refresh",
@@ -205,6 +275,8 @@ def _valid_command_arguments(operation: str) -> dict[str, object]:
             "project_ref": "project-one",
             "billing_ref": "billing-one",
         }
+    if operation == "google.inventory.refresh":
+        return {}
     return {"account_ref": "google-one"}
 
 
@@ -218,17 +290,24 @@ def _valid_command_arguments(operation: str) -> dict[str, object]:
         ("google.provision.plan", {"global_account_id": "all"}),
     ],
 )
-def test_operation_arguments_follow_exact_schema(operation: str, arguments: dict[str, object]) -> None:
+def test_operation_arguments_follow_exact_schema(
+    operation: str, arguments: dict[str, object]
+) -> None:
     with pytest.raises(AdminContractError, match="control.request_invalid"):
-        parse_admin_request({"schema_version": 1, "operation": operation, "arguments": arguments})
+        parse_admin_request(
+            {"schema_version": 1, "operation": operation, "arguments": arguments}
+        )
 
 
 def test_parse_request_freezes_arguments() -> None:
     request = parse_admin_request(
         {
-            "schema_version": 1, "operation": "google.provision.apply",
-            "arguments": {"account_ref": "google-one"}, "expected_generation": 4,
-            "idempotency_key": "request-1", "plan_digest": DIGEST,
+            "schema_version": 1,
+            "operation": "google.provision.apply",
+            "arguments": {"account_ref": "google-one"},
+            "expected_generation": 4,
+            "idempotency_key": "request-1",
+            "plan_digest": DIGEST,
         }
     )
 
@@ -243,10 +322,18 @@ def test_direct_request_constructor_validates() -> None:
 
 def test_operation_wire_matches_spec_fixture() -> None:
     assert public_admin_result(operation()) == {
-        "schema_version": 1, "id": "op-1", "kind": "google.provision", "state": "planned",
-        "expected_generation": 4, "resulting_generation": None, "plan_digest": DIGEST,
-        "created_at": "2026-08-28T10:00:00Z", "expires_at": "2026-08-28T10:15:00Z",
-        "completed_count": 0, "failed_count": 0, "not_attempted_count": 1,
+        "schema_version": 1,
+        "id": "op-1",
+        "kind": "google.provision",
+        "state": "planned",
+        "expected_generation": 4,
+        "resulting_generation": None,
+        "plan_digest": DIGEST,
+        "created_at": "2026-08-28T10:00:00Z",
+        "expires_at": "2026-08-28T10:15:00Z",
+        "completed_count": 0,
+        "failed_count": 0,
+        "not_attempted_count": 1,
         "reason_codes": ["control.plan_ready"],
     }
 
@@ -275,29 +362,54 @@ def test_operation_rejects_invalid_time_and_counts(changes: dict[str, object]) -
 
 def test_problem_wire_matches_spec_fixture() -> None:
     assert public_admin_result(problem()) == {
-        "schema_version": 1, "code": "control.failed", "severity": "error",
-        "title": "Request failed", "detail": "Retry with a new request",
-        "effect": "Operation was not started", "action": "Review request",
-        "retryable": True, "retry_after_seconds": 30, "correlation_id": "corr-1",
+        "schema_version": 1,
+        "code": "control.failed",
+        "severity": "error",
+        "title": "Request failed",
+        "detail": "Retry with a new request",
+        "effect": "Operation was not started",
+        "action": "Review request",
+        "retryable": True,
+        "retry_after_seconds": 30,
+        "correlation_id": "corr-1",
         "occurred_at": "2026-08-28T10:00:00Z",
     }
 
 
-@pytest.mark.parametrize("text", [
-    "access_token=never", "cookie=session-secret", "Basic never", "eyJhbGciOiJIUzI1NiJ9.payload.sig",
-    "sk-verysecretkey", "AIzaSyD012345678901234567890",
-    "refresh_token=never", "clientSecret=never", "password never",
-    "client.secret=never", "refresh-token=never", "client secret never",
-    "apiKey=never", "failed at \"/private/auth.json\"", r"\\server\share\auth.json",
-    "error [/home/x]", r"\Windows\private", r"\private\auth.json",
-    "file:///private/auth.json", "bad\x1b[31mtext", "token rejected",
-])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "access_token=never",
+        "cookie=session-secret",
+        "Basic never",
+        "eyJhbGciOiJIUzI1NiJ9.payload.sig",
+        "sk-verysecretkey",
+        "AIzaSyD012345678901234567890",
+        "refresh_token=never",
+        "clientSecret=never",
+        "password never",
+        "client.secret=never",
+        "refresh-token=never",
+        "client secret never",
+        "apiKey=never",
+        'failed at "/private/auth.json"',
+        r"\\server\share\auth.json",
+        "error [/home/x]",
+        r"\Windows\private",
+        r"\private\auth.json",
+        "file:///private/auth.json",
+        "bad\x1b[31mtext",
+        "token rejected",
+    ],
+)
 def test_problem_rejects_secret_path_and_control_text(text: str) -> None:
     with pytest.raises(AdminContractError, match="control.response_private"):
         problem(detail=text)
 
 
-@pytest.mark.parametrize("text", ["client_secret=never", r"\secret.txt", r"\report.txt"])
+@pytest.mark.parametrize(
+    "text", ["client_secret=never", r"\secret.txt", r"\report.txt"]
+)
 def test_public_problem_projection_rejects_exact_adversarial_text(text: str) -> None:
     with pytest.raises(AdminContractError, match="control.response_private"):
         public_admin_result(problem(detail=text))

@@ -3,25 +3,34 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 import re
 from types import MappingProxyType
 from typing import Any, Protocol, cast
+import urllib.parse
 import uuid
 
 from .admin_contracts import (
     AdminPrincipalV1,
     AdminRequestV1,
     HiveProblemV1,
-    OperationV1,
     public_admin_result,
+    public_admin_text,
 )
-from .admin_hosts import HostRegistry
-from .admin_operations import AdminOperationStore
+from .admin_hosts import ControlHostV1, HostRegistry, HostRegistryError
+from .admin_operations import AdminOperationError, AdminOperationStore
+from .google_account_inventory import GoogleAccountInventoryError
 from .google_account_inventory_manager import GoogleAccountInventoryManager
-from .google_billing_service import GoogleBillingService
+from .google_billing_service import (
+    GoogleBillingError,
+    GoogleBillingPlanV1,
+    GoogleBillingReceiptV1,
+    GoogleBillingService,
+)
 from .google_cloud_provisioner import (
     FillToQuotaPlan,
+    GoogleCloudProvisionerError,
     ProvisionPartialReceipt,
     ProvisionReceipt,
 )
@@ -30,12 +39,14 @@ from .google_oauth_session import (
     GoogleOAuthClientImportPlanV1,
     GoogleOAuthClientImportReceiptV1,
     GoogleOAuthControlService,
+    GoogleOAuthSessionError,
     GoogleOAuthSessionReceipt,
     GoogleOAuthTransactionV1,
 )
 from .openai_credential_service import (
     AuthSyncPlanV1,
     AuthSyncReceiptV1,
+    OpenAICredentialError,
     OpenAICredentialService,
 )
 
@@ -59,7 +70,7 @@ COMMAND_SCOPES = MappingProxyType(
         "google.oauth.complete": "fleet.google.oauth",
         "google.oauth-client-import.plan": "fleet.google.oauth",
         "google.oauth-client-import.apply": "fleet.google.oauth",
-        "google.inventory.refresh": "fleet.google.oauth",
+        "google.inventory.refresh": "fleet.google.inventory.refresh",
         "google.provision.plan": "fleet.google.provision",
         "google.provision.apply": "fleet.google.provision",
         "google.billing.plan": "fleet.google.billing.bind",
@@ -94,11 +105,10 @@ _FORBIDDEN_ARGUMENT_KEYS = frozenset(
         "secret",
     }
 )
-_FORBIDDEN_RESULT_KEYS = _FORBIDDEN_ARGUMENT_KEYS | frozenset({"backend_account_id"})
 
 
 class OpenAIAccountsPort(Protocol):
-    def list_accounts(self) -> Sequence[object]: ...
+    def list_accounts(self) -> Sequence[OpenAIAccountSummaryV1]: ...
 
 
 class QuotaCollectorPort(Protocol):
@@ -111,9 +121,9 @@ class GoogleProvisionerPort(Protocol):
         account_ref: str,
         *,
         expected_generation: int,
-        idempotency_key: str,
+        idempotency_key: str | None,
         quota_evidence: object,
-    ) -> object: ...
+    ) -> FillToQuotaPlan: ...
 
     def apply(
         self,
@@ -122,13 +132,26 @@ class GoogleProvisionerPort(Protocol):
         expected_generation: int,
         idempotency_key: str,
         plan_digest: str,
-    ) -> object: ...
+    ) -> ProvisionReceipt | ProvisionPartialReceipt: ...
 
 
 class SecretIngressPort(Protocol):
-    def create_session(self, **values: object) -> object: ...
+    def create_session(self, **values: object) -> SecretIngressSessionV1: ...
 
     def resolve(self, session: object, **values: object) -> tuple[object, object]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIAccountSummaryV1:
+    ref: str
+    generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class SecretIngressSessionV1:
+    id: str
+    account_ref: str
+    state: str
 
 
 class AdminServiceError(Exception):
@@ -257,21 +280,30 @@ class MasterjetControlService:
         except AdminServiceError:
             raise
         except BaseException as error:
-            code = _foreign_error_code(error)
+            owner_error = _owner_service_error(error)
             del error
         else:
             return _public_mapping(result)
-        raise _service_error(code) from None
+        raise owner_error from None
 
     def _hosts_list(self, *_values: object) -> dict[str, object]:
-        return {"hosts": _public_sequence(self._host_registry.list())}
+        return {"hosts": [_serialize_host(item) for item in self._host_registry.list()]}
 
     def _openai_accounts_list(self, *_values: object) -> dict[str, object]:
         owner = _required(self._openai_accounts)
-        return {"accounts": _public_sequence(owner.list_accounts())}
+        return {
+            "accounts": [
+                _serialize_openai_account(item) for item in owner.list_accounts()
+            ]
+        }
 
     def _google_accounts_list(self, *_values: object) -> dict[str, object]:
-        return {"accounts": _public_sequence(self._google_manager.list_accounts())}
+        return {
+            "accounts": [
+                _serialize_google_account(item)
+                for item in self._google_manager.list_accounts()
+            ]
+        }
 
     def _google_projects_list(
         self,
@@ -281,9 +313,10 @@ class MasterjetControlService:
     ) -> dict[str, object]:
         account_ref = cast(str, request.arguments["account_ref"])
         return {
-            "projects": _public_sequence(
-                self._google_manager.list_projects(account_ref)
-            )
+            "projects": [
+                _serialize_google_project(item)
+                for item in self._google_manager.list_projects(account_ref)
+            ]
         }
 
     def _operation_get(
@@ -306,7 +339,7 @@ class MasterjetControlService:
         *_values: object,
     ) -> dict[str, object]:
         owner = _required(self._openai_credentials)
-        return _project(
+        return _serialize_openai_plan(
             owner.plan_auth_sync(
                 cast(str, request.arguments["account_ref"]),
                 expected_generation=_generation(request),
@@ -332,7 +365,7 @@ class MasterjetControlService:
             idempotency_key=_idempotency(request),
             plan_digest=_digest(request),
         )
-        return _project(credentials.apply_auth_sync(plan, upload))
+        return _serialize_openai_receipt(credentials.apply_auth_sync(plan, upload))
 
     def _secret_ingress_create(
         self,
@@ -341,7 +374,7 @@ class MasterjetControlService:
         *_values: object,
     ) -> dict[str, object]:
         ingress = _required(self._secret_ingress)
-        return _project(
+        return _serialize_ingress_session(
             ingress.create_session(
                 principal=principal.subject,
                 account_ref=request.arguments["account_ref"],
@@ -363,13 +396,15 @@ class MasterjetControlService:
             profile = GoogleOAuthProfileIdV1(request.arguments["scope_profile"])
         except (TypeError, ValueError):
             raise _service_error("control.request_invalid") from None
-        return _project(
+        return _serialize_oauth_transaction(
             owner.begin_oauth_transaction(
                 cast(str, request.arguments["account_ref"]),
                 oauth_client_ref=cast(str, request.arguments["oauth_client_ref"]),
                 redirect_uri=cast(str, request.arguments["redirect_uri"]),
                 scope_profile=profile,
                 expected_generation=_generation(request),
+                idempotency_key=_idempotency(request),
+                principal=_principal.subject,
             )
         )
 
@@ -383,7 +418,7 @@ class MasterjetControlService:
         owner = _required(self._google_oauth)
         if type(oauth_code) is not str or not oauth_code:
             raise _service_error("control.request_invalid")
-        return _project(
+        return _serialize_oauth_receipt(
             owner.complete_oauth_transaction(
                 cast(str, request.arguments["transaction_id"]),
                 code=oauth_code,
@@ -401,7 +436,7 @@ class MasterjetControlService:
         *_values: object,
     ) -> dict[str, object]:
         owner = _required(self._google_oauth)
-        return _project(
+        return _serialize_oauth_client_plan(
             owner.plan_oauth_client_import(
                 cast(str, request.arguments["account_ref"]),
                 expected_generation=_generation(request),
@@ -427,7 +462,9 @@ class MasterjetControlService:
             idempotency_key=_idempotency(request),
             plan_digest=_digest(request),
         )
-        return _project(owner.apply_oauth_client_import(plan, upload))
+        return _serialize_oauth_client_receipt(
+            owner.apply_oauth_client_import(plan, upload)
+        )
 
     def _google_inventory_refresh(
         self,
@@ -435,8 +472,35 @@ class MasterjetControlService:
         request: AdminRequestV1,
         *_values: object,
     ) -> dict[str, object]:
-        self._google_manager.get_account(cast(str, request.arguments["account_ref"]))
-        return _project(self._google_manager.reload())
+        generation = _generation(request)
+        operation_plan = self._operation_store.plan(
+            kind="google.inventory.refresh",
+            generation=generation,
+            key=_idempotency(request),
+            steps=("inventory.reload",),
+        )
+        if operation_plan.operation.state != "planned":
+            return public_admin_result(operation_plan.operation)
+        current_generation = self._google_manager.inventory_generation()
+        self._operation_store.begin(
+            operation_plan.operation_id,
+            current_generation=current_generation,
+        )
+        status = self._google_manager.reload(expected_generation=generation)
+        self._operation_store.record_step(
+            operation_plan.operation_id,
+            "inventory.reload",
+            succeeded=True,
+        )
+        if type(status.generation) is not int:
+            raise _service_error("control.response_private")
+        return public_admin_result(
+            self._operation_store.finish(
+                operation_plan.operation_id,
+                state="succeeded",
+                resulting_generation=status.generation,
+            )
+        )
 
     def _google_provision_plan(
         self,
@@ -449,7 +513,7 @@ class MasterjetControlService:
         account_ref = cast(str, request.arguments["account_ref"])
         generation = _generation(request)
         evidence = collector.collect(account_ref, expected_generation=generation)
-        return _project(
+        return _serialize_provision_plan(
             provisioner.plan(
                 account_ref,
                 expected_generation=generation,
@@ -465,7 +529,7 @@ class MasterjetControlService:
         *_values: object,
     ) -> dict[str, object]:
         provisioner = _required(self._google_provisioner)
-        return _project(
+        return _serialize_provision_receipt(
             provisioner.apply(
                 cast(str, request.arguments["account_ref"]),
                 expected_generation=_generation(request),
@@ -481,8 +545,9 @@ class MasterjetControlService:
         *_values: object,
     ) -> dict[str, object]:
         owner = _required(self._google_billing)
-        return _project(
+        return _serialize_billing_plan(
             owner.plan_billing_binding(
+                account_ref=cast(str, request.arguments["account_ref"]),
                 project_ref=cast(str, request.arguments["project_ref"]),
                 billing_ref=cast(str, request.arguments["billing_ref"]),
                 expected_generation=_generation(request),
@@ -497,9 +562,12 @@ class MasterjetControlService:
         *_values: object,
     ) -> dict[str, object]:
         owner = _required(self._google_billing)
-        return _project(
+        return _serialize_billing_receipt(
             owner.apply_billing_binding(
                 cast(str, request.arguments["plan_id"]),
+                account_ref=cast(str, request.arguments["account_ref"]),
+                project_ref=cast(str, request.arguments["project_ref"]),
+                billing_ref=cast(str, request.arguments["billing_ref"]),
                 expected_generation=_generation(request),
                 confirmed_digest=_digest(request),
                 idempotency_key=_idempotency(request),
@@ -606,82 +674,242 @@ def _public_mapping(value: object) -> dict[str, object]:
     return cast(dict[str, object], projected)
 
 
-def _public_sequence(value: object) -> list[object]:
-    if type(value) not in {list, tuple}:
+def _public_value(value: object, *, field: str | None = None) -> object:
+    if value is None or type(value) in {bool, int, float}:
+        return value
+    if type(value) is str:
+        if field == "authorization_url":
+            return _public_authorization_url(value)
+        try:
+            text = public_admin_text(value)
+        except BaseException:
+            raise _service_error("control.response_private")
+        if text.startswith(("/", "\\")) or re.match(r"[A-Za-z]:[\\/]", text):
+            raise _service_error("control.response_private")
+        return text
+    if type(value) in {bytes, bytearray, memoryview}:
         raise _service_error("control.response_private")
-    values = cast(list[object] | tuple[object, ...], value)
-    return [_public_value(item) for item in values]
+    if type(value) in {list, tuple}:
+        values = cast(list[object] | tuple[object, ...], value)
+        return [_public_value(item) for item in values]
+    if type(value) is dict:
+        result: dict[str, object] = {}
+        items = cast(dict[object, object], value).items()
+        for key, item in items:
+            if type(key) is not str:
+                raise _service_error("control.response_private")
+            result[key] = _public_value(item, field=key)
+        return result
+    raise _service_error("control.response_private")
 
 
-def _project(value: object) -> dict[str, object]:
-    if isinstance(value, OperationV1):
-        return public_admin_result(value)
-    if isinstance(value, AuthSyncPlanV1):
-        return {
-            "account_ref": value.account_ref,
-            "expected_generation": value.expected_generation,
-            "expires_at": value.expires_at,
-            "plan_digest": _public_digest(value.plan_digest),
+def _public_authorization_url(value: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        pairs = urllib.parse.parse_qsl(parsed.query, strict_parsing=True)
+        allowed = {
+            "access_type",
+            "client_id",
+            "code_challenge",
+            "code_challenge_method",
+            "prompt",
+            "redirect_uri",
+            "response_type",
+            "scope",
+            "state",
         }
-    if isinstance(value, AuthSyncReceiptV1):
-        return {
-            "account_ref": value.account_ref,
-            "generation": value.generation,
-            "plan_digest": _public_digest(value.plan_digest),
-            "state": value.state,
-        }
-    if isinstance(value, GoogleOAuthTransactionV1):
-        return {
-            "id": value.id,
-            "account_ref": value.account_ref,
-            "authorization_url": value.authorization_url,
-            "expires_at": value.expires_at,
-            "inventory_generation": value.inventory_generation,
-        }
-    if isinstance(value, GoogleOAuthSessionReceipt):
-        return {
-            "account_ref": value.account_ref,
-            "subject_bound": value.subject_bound,
-            "refresh_token_stored": value.refresh_token_stored,
-        }
-    if isinstance(value, GoogleOAuthClientImportPlanV1):
-        return {
-            "id": value.id,
-            "account_ref": value.account_ref,
-            "expected_generation": value.expected_generation,
-            "expires_at": value.expires_at,
-            "plan_digest": _public_digest(value.plan_digest),
-        }
-    if isinstance(value, GoogleOAuthClientImportReceiptV1):
-        return {
-            "account_ref": value.account_ref,
-            "client_ref": value.client_ref,
-            "display_name": value.display_name,
-            "inventory_generation": value.inventory_generation,
-            "client_digest": _public_digest(value.client_digest),
-        }
-    if isinstance(value, FillToQuotaPlan):
-        return {
-            "account_ref": value.account_ref,
-            "expected_subject_id": value.expected_subject_id,
-            "quota_remaining": value.quota_remaining,
-            "inventory_generation": value.inventory_generation,
-            "inventory_fingerprint": value.inventory_fingerprint,
-            "projects": [
-                {
-                    "ref": project.ref,
-                    "project_name": project.project_name,
-                    "project_id": project.project_id,
-                    "expected_project_number": project.expected_project_number,
-                    "key_display_name": project.key_display_name,
-                }
-                for project in value.projects
-            ],
-            "plan_digest": value.fingerprint,
-        }
-    if isinstance(value, ProvisionReceipt):
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+            or len(value.encode("utf-8")) > 16_384
+            or len(pairs) > len(allowed)
+            or any(key not in allowed for key, _item in pairs)
+        ):
+            raise ValueError
+        for key, item in pairs:
+            if key == "redirect_uri":
+                if not item.startswith(("http://127.0.0.1", "http://localhost")):
+                    raise ValueError
+            elif key == "scope":
+                if any(
+                    scope != "openid"
+                    and not scope.startswith("https://www.googleapis.com/auth/")
+                    for scope in item.split()
+                ):
+                    raise ValueError
+            else:
+                public_admin_text(item)
+    except BaseException:
+        raise _service_error("control.response_private") from None
+    return value
+
+
+def _serialize_host(value: ControlHostV1) -> dict[str, object]:
+    if type(value) is not ControlHostV1:
+        raise _service_error("control.response_private")
+    return dict(value.public_projection())
+
+
+def _serialize_openai_account(value: OpenAIAccountSummaryV1) -> dict[str, object]:
+    if type(value) is not OpenAIAccountSummaryV1:
+        raise _service_error("control.response_private")
+    return {"ref": value.ref, "generation": value.generation}
+
+
+def _exact_mapping(value: object, fields: frozenset[str]) -> dict[str, object]:
+    try:
+        if not isinstance(value, Mapping) or frozenset(value) != fields:
+            raise _service_error("control.response_private")
+        return {field: value[field] for field in fields}
+    except AdminServiceError:
+        raise
+    except BaseException:
+        raise _service_error("control.response_private") from None
+
+
+def _serialize_google_account(value: object) -> dict[str, object]:
+    return _exact_mapping(
+        value,
+        frozenset(
+            {
+                "ref",
+                "label",
+                "subject_bound",
+                "inventory_generation",
+                "project_count",
+                "billing_count",
+            }
+        ),
+    )
+
+
+def _serialize_google_project(value: object) -> dict[str, object]:
+    return _exact_mapping(
+        value,
+        frozenset(
+            {
+                "ref",
+                "project_name",
+                "key_name",
+                "purpose",
+                "billing_ref",
+                "status",
+                "inventory_generation",
+            }
+        ),
+    )
+
+
+def _serialize_openai_plan(value: AuthSyncPlanV1) -> dict[str, object]:
+    if type(value) is not AuthSyncPlanV1:
+        raise _service_error("control.response_private")
+    return {
+        "account_ref": value.account_ref,
+        "expected_generation": value.expected_generation,
+        "expires_at": value.expires_at,
+        "plan_digest": _public_digest(value.plan_digest),
+    }
+
+
+def _serialize_openai_receipt(value: AuthSyncReceiptV1) -> dict[str, object]:
+    if type(value) is not AuthSyncReceiptV1:
+        raise _service_error("control.response_private")
+    return {
+        "account_ref": value.account_ref,
+        "generation": value.generation,
+        "plan_digest": _public_digest(value.plan_digest),
+        "state": value.state,
+    }
+
+
+def _serialize_ingress_session(value: SecretIngressSessionV1) -> dict[str, object]:
+    if type(value) is not SecretIngressSessionV1:
+        raise _service_error("control.response_private")
+    return {"id": value.id, "account_ref": value.account_ref, "state": value.state}
+
+
+def _serialize_oauth_transaction(value: GoogleOAuthTransactionV1) -> dict[str, object]:
+    if type(value) is not GoogleOAuthTransactionV1:
+        raise _service_error("control.response_private")
+    return {
+        "id": value.id,
+        "account_ref": value.account_ref,
+        "authorization_url": value.authorization_url,
+        "expires_at": value.expires_at,
+        "inventory_generation": value.inventory_generation,
+    }
+
+
+def _serialize_oauth_receipt(value: GoogleOAuthSessionReceipt) -> dict[str, object]:
+    if type(value) is not GoogleOAuthSessionReceipt:
+        raise _service_error("control.response_private")
+    return {
+        "account_ref": value.account_ref,
+        "subject_bound": value.subject_bound,
+        "refresh_token_stored": value.refresh_token_stored,
+    }
+
+
+def _serialize_oauth_client_plan(
+    value: GoogleOAuthClientImportPlanV1,
+) -> dict[str, object]:
+    if type(value) is not GoogleOAuthClientImportPlanV1:
+        raise _service_error("control.response_private")
+    return {
+        "id": value.id,
+        "account_ref": value.account_ref,
+        "expected_generation": value.expected_generation,
+        "expires_at": value.expires_at,
+        "plan_digest": _public_digest(value.plan_digest),
+    }
+
+
+def _serialize_oauth_client_receipt(
+    value: GoogleOAuthClientImportReceiptV1,
+) -> dict[str, object]:
+    if type(value) is not GoogleOAuthClientImportReceiptV1:
+        raise _service_error("control.response_private")
+    return {
+        "account_ref": value.account_ref,
+        "client_ref": value.client_ref,
+        "display_name": value.display_name,
+        "inventory_generation": value.inventory_generation,
+        "client_digest": _public_digest(value.client_digest),
+    }
+
+
+def _serialize_provision_plan(value: FillToQuotaPlan) -> dict[str, object]:
+    if type(value) is not FillToQuotaPlan:
+        raise _service_error("control.response_private")
+    return {
+        "account_ref": value.account_ref,
+        "expected_subject_id": value.expected_subject_id,
+        "quota_remaining": value.quota_remaining,
+        "inventory_generation": value.inventory_generation,
+        "inventory_fingerprint": value.inventory_fingerprint,
+        "projects": [
+            {
+                "ref": project.ref,
+                "project_name": project.project_name,
+                "project_id": project.project_id,
+                "expected_project_number": project.expected_project_number,
+                "key_display_name": project.key_display_name,
+            }
+            for project in value.projects
+        ],
+        "plan_digest": _public_digest(value.fingerprint),
+    }
+
+
+def _serialize_provision_receipt(
+    value: ProvisionReceipt | ProvisionPartialReceipt,
+) -> dict[str, object]:
+    if type(value) is ProvisionReceipt:
         return {"completed": value.completed, "planned": value.planned}
-    if isinstance(value, ProvisionPartialReceipt):
+    if type(value) is ProvisionPartialReceipt:
         return {
             "attempted": value.attempted,
             "completed": value.completed,
@@ -690,45 +918,37 @@ def _project(value: object) -> dict[str, object]:
             "not_attempted": value.not_attempted,
             "reason_code": value.reason_code,
         }
-    try:
-        projector = getattr(value, "public_projection")
-    except BaseException:
-        if isinstance(value, Mapping):
-            return _public_mapping(value)
-        raise _service_error("control.response_private") from None
-    try:
-        projected = projector()
-    except BaseException:
-        raise _service_error("control.response_private") from None
-    return _public_mapping(projected)
+    raise _service_error("control.response_private")
 
 
-def _public_value(value: object) -> object:
-    if value is None or type(value) in {bool, int, float}:
-        return value
-    if type(value) is str:
-        if value.startswith(("/", "\\")) or re.match(r"[A-Za-z]:[\\/]", value):
-            raise _service_error("control.response_private")
-        return value
-    if type(value) in {bytes, bytearray, memoryview}:
+def _serialize_billing_plan(value: GoogleBillingPlanV1) -> dict[str, object]:
+    if type(value) is not GoogleBillingPlanV1:
         raise _service_error("control.response_private")
-    if type(value) in {list, tuple}:
-        values = cast(list[object] | tuple[object, ...], value)
-        return [_public_value(item) for item in values]
-    if isinstance(value, Mapping):
-        result: dict[str, object] = {}
-        try:
-            items = tuple(value.items())
-        except BaseException:
-            raise _service_error("control.response_private") from None
-        for key, item in items:
-            if type(key) is not str or key.casefold() in _FORBIDDEN_RESULT_KEYS:
-                raise _service_error("control.response_private")
-            result[key] = _public_value(item)
-        return result
-    if isinstance(value, OperationV1):
-        return public_admin_result(value)
-    return _project(value)
+    return {
+        "id": value.id,
+        "account_ref": value.account_ref,
+        "inventory_generation": value.inventory_generation,
+        "snapshot_fingerprint": value.snapshot_fingerprint,
+        "project_ref": value.project_ref,
+        "billing_ref": value.billing_ref,
+        "plan_digest": _public_digest(value.digest),
+        "created_at": value.created_at.isoformat().replace("+00:00", "Z"),
+        "expires_at": value.expires_at.isoformat().replace("+00:00", "Z"),
+    }
+
+
+def _serialize_billing_receipt(value: GoogleBillingReceiptV1) -> dict[str, object]:
+    if type(value) is not GoogleBillingReceiptV1:
+        raise _service_error("control.response_private")
+    return {
+        "plan_id": value.plan_id,
+        "state": value.state,
+        "attempted": value.attempted,
+        "completed": value.completed,
+        "failed": value.failed,
+        "not_attempted": value.not_attempted,
+        "reason_code": value.reason_code,
+    }
 
 
 def _public_digest(value: object) -> str:
@@ -743,23 +963,56 @@ def _public_digest(value: object) -> str:
     return "sha256:" + candidate
 
 
-def _foreign_error_code(error: BaseException) -> str:
+_OWNER_ERROR_PREFIXES: tuple[tuple[type[BaseException], tuple[str, ...]], ...] = (
+    (AdminOperationError, ("control.",)),
+    (HostRegistryError, ("control.",)),
+    (OpenAICredentialError, ("control.", "credential.", "oauth.")),
+    (GoogleAccountInventoryError, ("credential.",)),
+    (GoogleOAuthSessionError, ("control.", "credential.", "oauth.")),
+    (GoogleCloudProvisionerError, ("provisioner.", "quota.")),
+    (GoogleBillingError, ("billing.",)),
+)
+
+
+def _owner_service_error(error: BaseException) -> AdminServiceError:
+    prefixes = next(
+        (
+            allowed
+            for error_type, allowed in _OWNER_ERROR_PREFIXES
+            if type(error) is error_type
+        ),
+        None,
+    )
     try:
         code = getattr(error, "code", None)
     except BaseException:
-        return "control.owner_unavailable"
-    if type(code) is str and _CODE.fullmatch(code) is not None:
-        return code
-    return "control.owner_unavailable"
+        code = None
+    if not (
+        prefixes is not None
+        and type(code) is str
+        and _CODE.fullmatch(code) is not None
+        and code.startswith(prefixes)
+    ):
+        code = "control.owner_unavailable"
+    partial = False
+    if prefixes is not None:
+        try:
+            partial = getattr(error, "partial", None) is not None
+        except BaseException:
+            partial = True
+    effect = (
+        "Action may be partially completed" if partial else "Action outcome is unknown"
+    )
+    return AdminServiceError(_problem(code, effect=effect))
 
 
-def _problem(code: str) -> HiveProblemV1:
+def _problem(code: str, *, effect: str = "No action was started") -> HiveProblemV1:
     return HiveProblemV1(
         code=code,
         severity="error",
         title="Request failed",
         detail="Request could not be completed",
-        effect="No action was started",
+        effect=effect,
         action="Review access and retry",
         retryable=False,
         retry_after_seconds=None,

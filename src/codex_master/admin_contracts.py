@@ -12,22 +12,42 @@ import unicodedata
 from urllib.parse import unquote
 
 
-_OPERATIONS = frozenset({
-    "openai.accounts.list", "google.accounts.list", "google.projects.list", "hosts.list",
-    "operations.get", "openai.auth.plan", "openai.auth.apply", "google.oauth.begin",
-    "secret.ingress.create", "google.oauth.complete",
-    "google.oauth-client-import.plan", "google.oauth-client-import.apply",
-    "google.inventory.refresh",
-    "google.provision.plan", "google.provision.apply", "google.billing.plan",
-    "google.billing.apply",
-})
-_GLOBAL_LISTS = frozenset({"openai.accounts.list", "google.accounts.list", "hosts.list"})
+_OPERATIONS = frozenset(
+    {
+        "openai.accounts.list",
+        "google.accounts.list",
+        "google.projects.list",
+        "hosts.list",
+        "operations.get",
+        "openai.auth.plan",
+        "openai.auth.apply",
+        "google.oauth.begin",
+        "secret.ingress.create",
+        "google.oauth.complete",
+        "google.oauth-client-import.plan",
+        "google.oauth-client-import.apply",
+        "google.inventory.refresh",
+        "google.provision.plan",
+        "google.provision.apply",
+        "google.billing.plan",
+        "google.billing.apply",
+    }
+)
+_GLOBAL_LISTS = frozenset(
+    {"openai.accounts.list", "google.accounts.list", "hosts.list"}
+)
 _QUERY_OPERATIONS = _GLOBAL_LISTS | {"google.projects.list", "operations.get"}
 _COMMAND_OPERATIONS = _OPERATIONS - _QUERY_OPERATIONS
-_DIGEST_OPERATIONS = frozenset({
-    "openai.auth.apply", "secret.ingress.create", "google.oauth.complete",
-    "google.oauth-client-import.apply", "google.provision.apply", "google.billing.apply",
-})
+_IDEMPOTENCY_OPERATIONS = _COMMAND_OPERATIONS - {"google.oauth.complete"}
+_DIGEST_OPERATIONS = frozenset(
+    {
+        "openai.auth.apply",
+        "secret.ingress.create",
+        "google.oauth-client-import.apply",
+        "google.provision.apply",
+        "google.billing.apply",
+    }
+)
 _ARGUMENT_FIELDS = {
     "hosts.list": (),
     "openai.accounts.list": (),
@@ -38,22 +58,40 @@ _ARGUMENT_FIELDS = {
     "openai.auth.apply": ("account_ref",),
     "secret.ingress.create": ("account_ref", "credential_kind"),
     "google.oauth.begin": (
-        "account_ref", "oauth_client_ref", "redirect_uri", "scope_profile",
+        "account_ref",
+        "oauth_client_ref",
+        "redirect_uri",
+        "scope_profile",
     ),
     "google.oauth.complete": (
-        "account_ref", "transaction_id", "redirect_uri", "state",
+        "account_ref",
+        "transaction_id",
+        "redirect_uri",
+        "state",
     ),
     "google.oauth-client-import.plan": ("account_ref",),
     "google.oauth-client-import.apply": ("account_ref",),
-    "google.inventory.refresh": ("account_ref",),
+    "google.inventory.refresh": (),
     "google.provision.plan": ("account_ref",),
     "google.provision.apply": ("account_ref",),
     "google.billing.plan": ("account_ref", "project_ref", "billing_ref"),
     "google.billing.apply": (
-        "account_ref", "project_ref", "billing_ref", "plan_id",
+        "account_ref",
+        "project_ref",
+        "billing_ref",
+        "plan_id",
     ),
 }
-_REQUEST_FIELDS = frozenset({"schema_version", "operation", "arguments", "expected_generation", "idempotency_key", "plan_digest"})
+_REQUEST_FIELDS = frozenset(
+    {
+        "schema_version",
+        "operation",
+        "arguments",
+        "expected_generation",
+        "idempotency_key",
+        "plan_digest",
+    }
+)
 _MAX_TEXT_BYTES = 4096
 _MAX_KEY_BYTES = 128
 _MAX_GENERATION = 2**63 - 1
@@ -69,7 +107,9 @@ _PRIVATE_TEXT = re.compile(
     r"|\b(?:traceback|[A-Z][A-Z0-9_.]*(?:error|exception))\s*(?::|\()",
     re.IGNORECASE,
 )
-_OPERATION_STATES = frozenset({"planned", "queued", "running", "partial", "succeeded", "failed", "blocked"})
+_OPERATION_STATES = frozenset(
+    {"planned", "queued", "running", "partial", "succeeded", "failed", "blocked"}
+)
 _PROBLEM_SEVERITIES = frozenset({"info", "warning", "error", "critical"})
 
 
@@ -140,7 +180,11 @@ def public_admin_ref(value: object) -> str:
 
 
 def _utc_time(value: object) -> datetime:
-    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() != timedelta(0):
+    if (
+        type(value) is not datetime
+        or value.tzinfo is None
+        or value.utcoffset() != timedelta(0)
+    ):
         _private()
     return value.astimezone(UTC)
 
@@ -196,10 +240,18 @@ def _arguments(operation: str, value: object) -> Mapping[str, object]:
     fields = _ARGUMENT_FIELDS[operation]
     if set(arguments) != set(fields):
         _invalid()
-    return MappingProxyType({
-        field: _text(arguments[field]) if field == "redirect_uri" else _token(arguments[field])
+    result = {
+        field: _text(arguments[field])
+        if field == "redirect_uri"
+        else _token(arguments[field])
         for field in fields
-    })
+    }
+    if operation == "secret.ingress.create" and result["credential_kind"] not in {
+        "openai.auth-json",
+        "google.oauth-client",
+    }:
+        _invalid()
+    return MappingProxyType(result)
 
 
 def _reason_codes(value: object, *, private: bool = False) -> tuple[str, ...]:
@@ -227,13 +279,27 @@ class AdminRequestV1:
         object.__setattr__(self, "operation", operation)
         object.__setattr__(self, "arguments", _arguments(operation, self.arguments))
         if operation in _COMMAND_OPERATIONS:
-            object.__setattr__(self, "expected_generation", _generation(self.expected_generation))
-            object.__setattr__(self, "idempotency_key", _token(self.idempotency_key))
+            object.__setattr__(
+                self, "expected_generation", _generation(self.expected_generation)
+            )
+            if operation in _IDEMPOTENCY_OPERATIONS:
+                object.__setattr__(
+                    self, "idempotency_key", _token(self.idempotency_key)
+                )
+            elif self.idempotency_key is not None:
+                _invalid()
             if operation in _DIGEST_OPERATIONS:
                 object.__setattr__(self, "plan_digest", _digest(self.plan_digest))
             elif self.plan_digest is not None:
                 _invalid()
-        elif any(value is not None for value in (self.expected_generation, self.idempotency_key, self.plan_digest)):
+        elif any(
+            value is not None
+            for value in (
+                self.expected_generation,
+                self.idempotency_key,
+                self.plan_digest,
+            )
+        ):
             _invalid()
 
 
@@ -247,7 +313,9 @@ class AdminPrincipalV1:
     def __post_init__(self) -> None:
         object.__setattr__(self, "subject", _token(self.subject, private=True))
         object.__setattr__(self, "scopes", _reason_codes(self.scopes, private=True))
-        object.__setattr__(self, "authentication", _token(self.authentication, private=True))
+        object.__setattr__(
+            self, "authentication", _token(self.authentication, private=True)
+        )
         if type(self.step_up) is not bool:
             _private()
 
@@ -274,9 +342,15 @@ class OperationV1:
         if state not in _OPERATION_STATES:
             _private()
         object.__setattr__(self, "state", state)
-        object.__setattr__(self, "expected_generation", _public_generation(self.expected_generation))
+        object.__setattr__(
+            self, "expected_generation", _public_generation(self.expected_generation)
+        )
         if self.resulting_generation is not None:
-            object.__setattr__(self, "resulting_generation", _public_generation(self.resulting_generation))
+            object.__setattr__(
+                self,
+                "resulting_generation",
+                _public_generation(self.resulting_generation),
+            )
         digest = _text(self.plan_digest, private=True)
         if _DIGEST.fullmatch(digest) is None:
             _private()
@@ -289,8 +363,12 @@ class OperationV1:
         object.__setattr__(self, "expires_at", expires_at)
         object.__setattr__(self, "completed_count", _count(self.completed_count))
         object.__setattr__(self, "failed_count", _count(self.failed_count))
-        object.__setattr__(self, "not_attempted_count", _count(self.not_attempted_count))
-        object.__setattr__(self, "reason_codes", _reason_codes(self.reason_codes, private=True))
+        object.__setattr__(
+            self, "not_attempted_count", _count(self.not_attempted_count)
+        )
+        object.__setattr__(
+            self, "reason_codes", _reason_codes(self.reason_codes, private=True)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,11 +395,16 @@ class HiveProblemV1:
         if type(self.retryable) is not bool:
             _private()
         if self.retry_after_seconds is not None:
-            if type(self.retry_after_seconds) is not int or not 0 <= self.retry_after_seconds <= 86_400:
+            if (
+                type(self.retry_after_seconds) is not int
+                or not 0 <= self.retry_after_seconds <= 86_400
+            ):
                 _private()
             if not self.retryable:
                 _private()
-        object.__setattr__(self, "correlation_id", _token(self.correlation_id, private=True))
+        object.__setattr__(
+            self, "correlation_id", _token(self.correlation_id, private=True)
+        )
         object.__setattr__(self, "occurred_at", _utc_time(self.occurred_at))
 
 
@@ -344,31 +427,49 @@ def public_admin_result(value: object) -> dict[str, object]:
     """Serialize only validated V1 DTOs into their explicit public wire forms."""
     if type(value) is HiveProblemV1:
         return {
-            "schema_version": 1, "code": value.code, "severity": value.severity,
-            "title": value.title, "detail": value.detail, "effect": value.effect,
-            "action": value.action, "retryable": value.retryable,
+            "schema_version": 1,
+            "code": value.code,
+            "severity": value.severity,
+            "title": value.title,
+            "detail": value.detail,
+            "effect": value.effect,
+            "action": value.action,
+            "retryable": value.retryable,
             "retry_after_seconds": value.retry_after_seconds,
-            "correlation_id": value.correlation_id, "occurred_at": _wire_time(value.occurred_at),
+            "correlation_id": value.correlation_id,
+            "occurred_at": _wire_time(value.occurred_at),
         }
     if type(value) is OperationV1:
         return {
-            "schema_version": 1, "id": value.id, "kind": value.kind,
-            "state": value.state, "expected_generation": value.expected_generation,
-            "resulting_generation": value.resulting_generation, "plan_digest": value.plan_digest,
-            "created_at": _wire_time(value.created_at), "expires_at": _wire_time(value.expires_at),
-            "completed_count": value.completed_count, "failed_count": value.failed_count,
+            "schema_version": 1,
+            "id": value.id,
+            "kind": value.kind,
+            "state": value.state,
+            "expected_generation": value.expected_generation,
+            "resulting_generation": value.resulting_generation,
+            "plan_digest": value.plan_digest,
+            "created_at": _wire_time(value.created_at),
+            "expires_at": _wire_time(value.expires_at),
+            "completed_count": value.completed_count,
+            "failed_count": value.failed_count,
             "not_attempted_count": value.not_attempted_count,
             "reason_codes": list(value.reason_codes),
         }
     if type(value) is AdminPrincipalV1:
         return {
-            "schema_version": 1, "subject": value.subject, "scopes": list(value.scopes),
-            "authentication": value.authentication, "step_up": value.step_up,
+            "schema_version": 1,
+            "subject": value.subject,
+            "scopes": list(value.scopes),
+            "authentication": value.authentication,
+            "step_up": value.step_up,
         }
     if type(value) is AdminRequestV1:
         return {
-            "schema_version": 1, "operation": value.operation, "arguments": dict(value.arguments),
-            "expected_generation": value.expected_generation, "idempotency_key": value.idempotency_key,
+            "schema_version": 1,
+            "operation": value.operation,
+            "arguments": dict(value.arguments),
+            "expected_generation": value.expected_generation,
+            "idempotency_key": value.idempotency_key,
             "plan_digest": value.plan_digest,
         }
     _private()

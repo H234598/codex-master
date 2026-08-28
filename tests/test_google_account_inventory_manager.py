@@ -209,6 +209,22 @@ def test_manager(*outcomes: object, **kwargs: object) -> GoogleAccountInventoryM
 test_manager.__test__ = False
 
 
+def test_reload_rejects_stale_expected_generation_before_publish(
+    tmp_path: Path,
+) -> None:
+    first = fresh_document(tmp_path / "first")
+    second = fresh_document(tmp_path / "second", key_id="000655")
+    manager = test_manager(first, second)
+    assert manager.reload().generation == 1
+
+    with pytest.raises(
+        GoogleAccountInventoryError, match="credential.generation_conflict"
+    ):
+        manager.reload(expected_generation=0)
+
+    assert manager.inventory_generation() == 1
+
+
 def issue_valid_lease(
     manager: GoogleAccountInventoryManager,
     snapshot: object,
