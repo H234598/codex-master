@@ -114,13 +114,12 @@ from codex_master.resource_cgroup import (
     start_released_scope,
 )
 from codex_master.resource_monitor import (
-    ResourceGateFacts,
-    ResourceOperatorStatus,
+    ResourceEvidenceStateV2,
+    ResourceEvidenceV2,
+    ResourceMeasurementsV2,
     ResourceSnapshotError,
-    build_resource_operator_status,
     read_current_resource_boot_id,
-    read_resource_gate_facts,
-    read_resource_snapshot,
+    read_resource_evidence_v2,
     run_resource_monitor as run_resource_monitor_loop,
 )
 from codex_master.fleet_snapshot import (
@@ -505,6 +504,7 @@ RESOURCE_REASON_CODES = frozenset(
         "spawn_warmup_active",
         "temperature_pressure_high",
         "temperature_monitor_unavailable",
+        "resource_monitor_warming",
         "resource_monitor_unavailable",
         "resource_snapshot_invalid",
         "resource_snapshot_generation_mismatch",
@@ -1018,6 +1018,31 @@ class ResourceGateRuntime:
     h2_ready: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class ResourceEvidenceOperatorViewV2:
+    state: ResourceEvidenceStateV2
+    generation: int
+    boot_id: str
+    observed_at_utc: _dt.datetime
+    reason_codes: tuple[str, ...]
+    measurements: ResourceMeasurementsV2 | None
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceEvidenceGateFactsV2:
+    state: ResourceEvidenceStateV2
+    generation: int
+    reason_codes: tuple[str, ...]
+    measurements: ResourceMeasurementsV2 | None
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceEvidenceProjectionV2:
+    evidence: ResourceEvidenceV2
+    operator_status: ResourceEvidenceOperatorViewV2
+    gate_facts: ResourceEvidenceGateFactsV2
+
+
 _RESOURCE_GATE_RUNTIME: contextvars.ContextVar[ResourceGateRuntime | None] = contextvars.ContextVar(
     "codex_master_resource_gate_runtime",
     default=None,
@@ -1138,55 +1163,111 @@ def _call_with_resource_gate_composer(callback: Any) -> Any:
         return callback()
 
 
-def _read_resource_operator_status() -> ResourceOperatorStatus:
-    """Read one authorized snapshot and return its bounded operator projection."""
+def _read_resource_evidence_projection_v2(
+    runtime: ResourceGateRuntime,
+) -> ResourceEvidenceProjectionV2:
+    if not isinstance(runtime, ResourceGateRuntime) or not isinstance(runtime.state, HiveStateStore):
+        raise ResourceSnapshotError("resource_snapshot_invalid")
+    now_utc = runtime.now_utc()
+    if (
+        not isinstance(now_utc, _dt.datetime)
+        or now_utc.tzinfo is None
+        or now_utc.utcoffset() != _dt.timedelta(0)
+    ):
+        raise ResourceSnapshotError("resource_snapshot_invalid")
+    evidence = read_resource_evidence_v2(
+        runtime.state,
+        now_utc=now_utc,
+        expected_boot_id=runtime.expected_boot_id,
+    )
+    if not isinstance(evidence, ResourceEvidenceV2):
+        raise ResourceSnapshotError("resource_snapshot_invalid")
+    if evidence.state in {
+        ResourceEvidenceStateV2.WARMING,
+        ResourceEvidenceStateV2.UNAVAILABLE,
+    }:
+        if evidence.measurements is not None:
+            raise ResourceSnapshotError("resource_snapshot_invalid")
+    elif evidence.state in {
+        ResourceEvidenceStateV2.READY,
+        ResourceEvidenceStateV2.PRESSURE,
+    }:
+        if not isinstance(evidence.measurements, ResourceMeasurementsV2):
+            raise ResourceSnapshotError("resource_snapshot_invalid")
+        if evidence.state is ResourceEvidenceStateV2.READY:
+            if evidence.reason_codes != ("resource_ready",):
+                raise ResourceSnapshotError("resource_snapshot_invalid")
+        elif not evidence.reason_codes or any(
+            reason not in {"temperature_monitor_unavailable", "temperature_pressure_high"}
+            for reason in evidence.reason_codes
+        ):
+            raise ResourceSnapshotError("resource_snapshot_invalid")
+    else:
+        raise ResourceSnapshotError("resource_snapshot_invalid")
+    operator_status = ResourceEvidenceOperatorViewV2(
+        state=evidence.state,
+        generation=evidence.generation,
+        boot_id=evidence.boot_id,
+        observed_at_utc=evidence.observed_at_utc,
+        reason_codes=evidence.reason_codes,
+        measurements=evidence.measurements,
+    )
+    gate_facts = ResourceEvidenceGateFactsV2(
+        state=evidence.state,
+        generation=evidence.generation,
+        reason_codes=evidence.reason_codes,
+        measurements=evidence.measurements,
+    )
+    return ResourceEvidenceProjectionV2(
+        evidence=evidence,
+        operator_status=operator_status,
+        gate_facts=gate_facts,
+    )
+
+
+def _read_resource_operator_status() -> ResourceEvidenceOperatorViewV2:
+    """Read one authorized V2 evidence document and return its operator view."""
 
     with _resource_gate_composer_scope():
         runtime = _RESOURCE_GATE_RUNTIME.get()
         if runtime is None or not isinstance(runtime.state, HiveStateStore):
             raise AgentError("resource_status_unavailable")
         try:
-            now_utc = runtime.now_utc()
-            if (
-                not isinstance(now_utc, _dt.datetime)
-                or now_utc.tzinfo is None
-                or now_utc.utcoffset() != _dt.timedelta(0)
-            ):
-                raise ValueError
-            snapshot = read_resource_snapshot(
-                runtime.state,
-                now_utc=now_utc,
-                expected_boot_id=runtime.expected_boot_id,
-            )
-            status = build_resource_operator_status(snapshot)
-            if not isinstance(status, ResourceOperatorStatus):
-                raise ValueError
-            return status
+            return _read_resource_evidence_projection_v2(runtime).operator_status
         except (ResourceSnapshotError, TypeError, ValueError, AttributeError, OverflowError):
             raise AgentError("resource_status_unavailable") from None
 
 
-def _resource_operator_document(status: ResourceOperatorStatus) -> dict[str, Any]:
-    if not isinstance(status, ResourceOperatorStatus):
+def _resource_operator_document(status: ResourceEvidenceOperatorViewV2) -> dict[str, Any]:
+    if not isinstance(status, ResourceEvidenceOperatorViewV2):
         raise AgentError("resource_status_unavailable")
     if any(reason != "resource_ready" and reason not in RESOURCE_REASON_CODES for reason in status.reason_codes):
         raise AgentError("resource_status_unavailable")
-    return {
-        "schema_version": status.schema_version,
+    document: dict[str, Any] = {
+        "schema_version": 2,
+        "boot_id": status.boot_id,
         "generation": status.generation,
-        "state": status.state,
-        "bottleneck": status.bottleneck,
-        "current": dict(status.current),
-        "mean_1m": dict(status.mean_1m),
-        "mean_10m": dict(status.mean_10m),
-        "peak_10m": dict(status.peak_10m),
-        "trend": dict(status.trend),
-        "confidence": status.confidence,
-        "preferred_profiles": list(status.preferred_profiles),
-        "avoid_profiles": list(status.avoid_profiles),
+        "observed_at_utc": status.observed_at_utc.isoformat().replace("+00:00", "Z"),
+        "state": status.state.value,
         "reason_codes": list(status.reason_codes),
         "raw_output": "not_returned",
     }
+    measurements = status.measurements
+    if measurements is not None:
+        document.update(
+            {
+                "bottleneck": measurements.bottleneck,
+                "current": dict(measurements.current),
+                "mean_1m": dict(measurements.mean_1m),
+                "mean_10m": dict(measurements.mean_10m),
+                "peak_10m": dict(measurements.peak_10m),
+                "trend": dict(measurements.trend),
+                "confidence": measurements.confidence,
+                "preferred_profiles": list(measurements.preferred_profiles),
+                "avoid_profiles": list(measurements.avoid_profiles),
+            }
+        )
+    return document
 
 
 def run_resource_monitor() -> None:
@@ -5372,7 +5453,7 @@ def activate_native_agent_resume(payload: Any, *, now: float | None = None) -> d
         record["activity_state"] = "active"
         record["updated_at"] = timestamp
         _write_native_agent_registry(registry)
-    return {"allowed": True}
+    return {"allowed": True, "reason_codes": []}
 
 
 def _native_completed_agent_ids_from_tool_event(payload: Mapping[str, Any]) -> frozenset[str]:
@@ -6049,7 +6130,7 @@ def _total_running_agent_count(*, managed_ids: frozenset[str] | None = None) -> 
 
 
 def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> dict[str, Any]:
-    """Project exactly one authorized GateFacts read; never read host metrics here."""
+    """Project exactly one authorized V2 evidence read; never read host metrics here."""
 
     runtime = _RESOURCE_GATE_RUNTIME.get()
     if running_agents_override is None:
@@ -6072,21 +6153,31 @@ def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> di
             "raw_output": "not_returned",
         }
     try:
-        now_utc = runtime.now_utc()
-        if (
-            not isinstance(now_utc, _dt.datetime)
-            or now_utc.tzinfo is None
-            or now_utc.utcoffset() != _dt.timedelta(0)
-        ):
+        facts = _read_resource_evidence_projection_v2(runtime).gate_facts
+        if facts.state is ResourceEvidenceStateV2.WARMING:
+            reasons.append("resource_monitor_warming")
+            return {
+                "ok": False,
+                "_typed_hive_io_pressure": False,
+                "_g5_facts": True,
+                "running_agents": running_agents,
+                "reason_codes": list(dict.fromkeys(reasons)),
+                "raw_output": "not_returned",
+            }
+        if facts.state is ResourceEvidenceStateV2.UNAVAILABLE:
+            reasons.append("resource_monitor_unavailable")
+            return {
+                "ok": False,
+                "_typed_hive_io_pressure": False,
+                "_g5_facts": True,
+                "running_agents": running_agents,
+                "reason_codes": list(dict.fromkeys(reasons)),
+                "raw_output": "not_returned",
+            }
+        measurements = facts.measurements
+        if not isinstance(measurements, ResourceMeasurementsV2):
             raise ValueError
-        facts = read_resource_gate_facts(
-            runtime.state,
-            now_utc=now_utc,
-            expected_boot_id=runtime.expected_boot_id,
-        )
-        if not isinstance(facts, ResourceGateFacts):
-            raise ValueError
-        legacy = facts.legacy_pressure
+        legacy = measurements.legacy_pressure
         adapter = runtime.cgroup_adapter
         typed_hive_io_pressure = type(adapter) is SystemdUserCgroupAdapter
         io_psi = None
@@ -6098,40 +6189,38 @@ def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> di
                 legacy.cpu_busy_percent,
                 legacy.io_wait_percent,
                 legacy.available_memory_percent,
-                facts.available_memory_mib,
+                measurements.available_memory_mib,
             )
         else:
             values = (
                 legacy.load_per_cpu,
                 legacy.cpu_busy_percent,
                 legacy.available_memory_percent,
-                facts.available_memory_mib,
+                measurements.available_memory_mib,
             )
         if any(not _finite_resource_number(value) for value in values):
             raise ValueError
-        if facts.gate_state not in {"ready", "blocked"}:
+        if facts.state is ResourceEvidenceStateV2.READY:
+            declared: list[str] = []
+        elif facts.state is ResourceEvidenceStateV2.PRESSURE:
+            declared = list(facts.reason_codes)
+            if not declared or any(
+                reason not in {"temperature_monitor_unavailable", "temperature_pressure_high"}
+                for reason in declared
+            ):
+                raise ValueError
+        else:
             raise ValueError
     except (ResourceSnapshotError, TypeError, ValueError, AttributeError, OverflowError):
-        reasons.append("resource_snapshot_invalid")
         return {
             "ok": False,
             "_typed_hive_io_pressure": False,
             "_g5_facts": True,
             "running_agents": running_agents,
-            "reason_codes": list(dict.fromkeys(reasons)),
+            "reason_codes": ["resource_snapshot_invalid"],
             "raw_output": "not_returned",
         }
 
-    # G3 records cgroup as unavailable until G5's separately injected typed preflight.
-    declared = [
-        reason
-        for reason in facts.reason_codes
-        if reason in RESOURCE_REASON_CODES and reason != "cgroup_preflight_failed"
-    ]
-    if facts.thermal_state in {"warming_up", "monitor_unavailable"}:
-        declared.append("temperature_monitor_unavailable")
-    if facts.gate_state == "blocked" and not declared and set(facts.reason_codes) != {"cgroup_preflight_failed"}:
-        reasons.append("resource_snapshot_invalid")
     reasons.extend(declared)
     return {
         "ok": not [reason for reason in reasons if reason != "session_metrics_unavailable"],
@@ -6142,7 +6231,7 @@ def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> di
         "io_wait_percent": legacy.io_wait_percent,
         "io_psi_percent": io_psi,
         "available_memory_percent": legacy.available_memory_percent,
-        "available_memory_mib": facts.available_memory_mib,
+        "available_memory_mib": measurements.available_memory_mib,
         "running_agents": running_agents,
         "reason_codes": list(dict.fromkeys(reasons)),
         "raw_output": "not_returned",
@@ -6150,7 +6239,7 @@ def _resource_gate_snapshot(*, running_agents_override: int | None = None) -> di
 
 
 def system_resource_snapshot(*, running_agents_override: int | None = None) -> dict[str, Any]:
-    """Compatibility name for G5's injected Facts-only resource snapshot."""
+    """Return the V2-backed admission projection for the current G5 flow."""
 
     return _resource_gate_snapshot(running_agents_override=running_agents_override)
 
@@ -6195,6 +6284,18 @@ def spawn_error_details(
     """Translate stable admission codes into data-sparse operator errors."""
 
     configured = {
+        "resource_monitor_warming": (
+            "Ressourcenmonitor waermt auf",
+            "Vollstaendige V2-Ressourcenevidenz ist noch nicht verfuegbar.",
+            "Mindestens zehn gueltige Samples sind fuer belastbare Messwerte erforderlich.",
+            "Nach Abschluss des Messfensters erneut versuchen.",
+        ),
+        "resource_monitor_unavailable": (
+            "Ressourcenmonitor nicht verfuegbar",
+            "Der Ressourcenmonitor konnte keine gueltige V2-Evidenz bereitstellen.",
+            "Ohne frische V2-Evidenz bleibt Spawn fail-closed.",
+            "Monitorstatus pruefen und nach Wiederherstellung erneut versuchen.",
+        ),
         "cpu_metrics_unavailable": (
             "CPU-Messung nicht verfuegbar",
             "CPU-/Load-Werte konnten nicht verlaesslich ermittelt werden.",
@@ -7265,6 +7366,29 @@ def _managed_codex_wrapper_snapshot(wrapper: Path) -> os.stat_result:
     ):
         raise AgentError("managed_codex_runner_metadata_invalid")
     return expected
+
+
+def _managed_codex_runner_candidate(wrapper: Path) -> bool:
+    """Recognize a Fleet wrapper before applying its stricter home contract."""
+
+    if wrapper.name != "codex":
+        return False
+    try:
+        metadata = wrapper.lstat()
+    except OSError:
+        return False
+    if stat_module.S_ISLNK(metadata.st_mode) or getattr(metadata, "st_nlink", 1) != 1:
+        return True
+    if not stat_module.S_ISREG(metadata.st_mode):
+        return False
+    try:
+        with wrapper.open("rb") as source:
+            prefix = source.read(128)
+    except OSError:
+        return True
+    return prefix.startswith(
+        b"#!/usr/bin/env bash\nset -euo pipefail\n\nexport CODEX_HOME="
+    )
 
 
 def _read_managed_codex_wrapper(wrapper: Path, expected: os.stat_result) -> str:
@@ -8566,7 +8690,13 @@ def _materialize_managed_codex_runtime_class(
             ):
                 raise AgentError("agent_class_materialization_invalid")
 
+            legacy_marker = (
+                _FLEET_RUNTIME_SKILL_PROFILE_FIELD not in marker
+                and marker.get("model") != descriptor.model
+            )
             projection: dict[str, tuple[bytes, os.stat_result]] = {}
+            managed_projection: dict[str, tuple[bytes, os.stat_result]] = {}
+            digest_drift: set[str] = set()
             for name, digest in marker_files.items():
                 if (
                     not _fleet_managed_name(name)
@@ -8582,17 +8712,33 @@ def _materialize_managed_codex_runtime_class(
                     "agent_class_materialization_invalid",
                 )
                 if not hmac.compare_digest(hashlib.sha256(content).hexdigest(), digest):
-                    raise AgentError("agent_class_materialization_invalid")
+                    digest_drift.add(name)
+                managed_projection[name] = (content, current_stat)
                 if _runtime_class_projection_name(name):
                     projection[name] = (content, current_stat)
 
-            current_descriptor, _current_runtime_profile = _fleet_effective_runtime_descriptor(
-                marker,
-                descriptor,
-                "agent_class_materialization_invalid",
-            )
-            if marker.get("model") != descriptor.model:
+            if not legacy_marker and digest_drift:
                 raise AgentError("agent_class_materialization_invalid")
+            if legacy_marker:
+                if (
+                    "codex" not in managed_projection
+                    or "config.toml" not in managed_projection
+                    or digest_drift - {"codex", "config.toml"}
+                ):
+                    raise AgentError("agent_class_materialization_invalid")
+                current_descriptor = _fleet_projection_descriptor_from_marker(
+                    marker,
+                    descriptor.home,
+                    "agent_class_materialization_invalid",
+                )
+            else:
+                current_descriptor, _current_runtime_profile = _fleet_effective_runtime_descriptor(
+                    marker,
+                    descriptor,
+                    "agent_class_materialization_invalid",
+                )
+                if marker.get("model") != descriptor.model:
+                    raise AgentError("agent_class_materialization_invalid")
             policy_projection = _fleet_current_policy_projection(
                 marker,
                 current_descriptor,
@@ -8618,11 +8764,90 @@ def _materialize_managed_codex_runtime_class(
             if marker_markdown != current_markdown:
                 raise AgentError("agent_class_materialization_invalid")
 
+            refreshed_config: bytes | None = None
+            if legacy_marker:
+                if _fleet_tmux_state(descriptor.session) != "stopped":
+                    raise AgentError("agent_class_materialization_invalid")
+                process_summary = agent_home_process_summary(descriptor.agent_id)
+                if process_summary.get("process_count") != 0:
+                    raise AgentError("agent_class_materialization_invalid")
+
+                codex_runtime_directories = _FLEET_CODEX_RUNTIME_DIRECTORIES
+                with _fleet_pinned_shared_runtime_symlinks(
+                    root,
+                    descriptor,
+                    "fleet_home_content_invalid",
+                ) as codex_runtime_symlinks:
+                    actual_files, actual_directories, actual_symlinks = _fleet_tree_entries(
+                        home_fd,
+                        "fleet_home_content_invalid",
+                        allow_gemini_runtime=True,
+                        opaque_runtime_directories=codex_runtime_directories,
+                        allowed_runtime_symlinks=codex_runtime_symlinks,
+                    )
+                    runtime_regular_files = {
+                        path
+                        for path in actual_files
+                        if path in _FLEET_CODEX_RUNTIME_FILES
+                        or _FLEET_CODEX_RUNTIME_DATABASE_RE.fullmatch(path) is not None
+                    }
+                    for path in runtime_regular_files:
+                        _fleet_codex_runtime_regular_file_stat(
+                            home_fd,
+                            path,
+                            "fleet_home_content_invalid",
+                        )
+                    allowed_files = {
+                        FLEET_AGENT_MARKER_FILE,
+                        *marker_files,
+                        "auth.json",
+                        ".gemini/projects.json",
+                        "settings.json",
+                    }
+                    expected_directories = _fleet_artifact_directories(
+                        {name: None for name in marker_files}
+                    )
+                    runtime_files = runtime_regular_files | set(actual_symlinks)
+                    runtime_directories = actual_directories & set(codex_runtime_directories)
+                    if (
+                        not (actual_files | set(actual_symlinks)) <= allowed_files | runtime_files
+                        or actual_directories != expected_directories | runtime_directories
+                    ):
+                        raise AgentError("fleet_home_content_invalid")
+                    _fleet_revalidate_symlink_snapshots(
+                        home_fd,
+                        actual_symlinks,
+                        "fleet_home_content_invalid",
+                    )
+
+                if digest_drift:
+                    _legacy_pool_wrapper_runner(
+                        descriptor.home,
+                        managed_projection["codex"][0].decode("utf-8"),
+                    )
+                    refreshed_config = _home_refresh_config(
+                        descriptor.home,
+                        managed_projection["config.toml"][0],
+                        model=descriptor.model,
+                        reasoning_effort=model_reasoning_effort,
+                    )
+                    if not confirm_home_refresh:
+                        raise AgentError("agent_home_refresh_confirmation_required")
+
             next_digests = {
                 name: digest
                 for name, digest in marker_files.items()
                 if not _runtime_class_projection_name(name)
             }
+            if legacy_marker and digest_drift:
+                next_digests["codex"] = hashlib.sha256(
+                    managed_projection["codex"][0]
+                ).hexdigest()
+                next_digests["config.toml"] = hashlib.sha256(
+                    refreshed_config
+                    if refreshed_config is not None
+                    else managed_projection["config.toml"][0]
+                ).hexdigest()
             next_digests.update(
                 {name: hashlib.sha256(content).hexdigest() for name, content in desired.items()}
             )
@@ -8636,7 +8861,9 @@ def _materialize_managed_codex_runtime_class(
             next_runtime_profile = (
                 None if runtime_profile == descriptor.skill_profile else runtime_profile
             )
-            if (
+            if legacy_marker:
+                next_marker[_FLEET_RUNTIME_SKILL_PROFILE_FIELD] = runtime_profile
+            elif (
                 _FLEET_RUNTIME_SKILL_PROFILE_FIELD in marker
                 or next_runtime_profile is not None
             ):
@@ -8658,6 +8885,21 @@ def _materialize_managed_codex_runtime_class(
                 return False
 
             try:
+                if refreshed_config is not None:
+                    old_config, old_config_stat = managed_projection["config.toml"]
+                    if old_config != refreshed_config:
+                        journal_file(
+                            "config.toml",
+                            old_config,
+                            old_config_stat,
+                            refreshed_config,
+                        )
+                        replace_at(
+                            home_fd,
+                            "config.toml",
+                            refreshed_config,
+                            old_config_stat,
+                        )
                 for name in sorted(desired_directories, key=lambda item: (len(Path(item).parts), item)):
                     ensure_directory_at(home_fd, name)
                 for name, content in sorted(desired.items()):
@@ -8720,7 +8962,7 @@ def _materialize_managed_codex_runtime_class(
                 _fleet_managed_home_state(
                     AGENT_POOL_ROOT,
                     descriptor,
-                    strict_contents=True,
+                    strict_contents=False,
                 )
             except BaseException as exc:
                 if not rollback(home_fd):
@@ -11100,11 +11342,20 @@ def _start_agent_unlocked(
         enroll_managed_principal(agent, "teamleiterin")
     runner = cfg["runner"]
     session = cfg["session"]
-    managed_codex = descriptor is not None and descriptor.runner is RunnerKind.CODEX_CLI
+    managed_fleet_home = (
+        descriptor is not None
+        and descriptor.runner is RunnerKind.CODEX_CLI
+        and descriptor.home == AGENT_POOL_ROOT / agent
+    )
+    managed_codex = managed_fleet_home or (
+        descriptor is not None
+        and descriptor.runner is RunnerKind.CODEX_CLI
+        and _managed_codex_runner_candidate(runner)
+    )
     if managed_codex:
         managed_home = _managed_codex_home(cfg["home"])
         managed_wrapper_snapshot = _managed_codex_wrapper_snapshot(runner)
-        if agent_class is not None:
+        if agent_class is not None and managed_fleet_home:
             try:
                 managed_pool_parent_stat = AGENT_POOL_ROOT.parent.lstat()
                 managed_pool_root_stat = AGENT_POOL_ROOT.lstat()
@@ -11185,7 +11436,7 @@ def _start_agent_unlocked(
                 "through codex-master-mcp"
             )
 
-        if managed_codex and agent_class is not None:
+        if managed_fleet_home and agent_class is not None:
             refresh_reasoning_effort = model_reasoning_effort or (
                 WRITE_AGENT_MODEL_EFFORT if model == WRITE_AGENT_MODEL else DEFAULT_AGENT_MODEL_EFFORT
             )
@@ -11200,7 +11451,7 @@ def _start_agent_unlocked(
             )
             if refreshed:
                 managed_wrapper_snapshot = _managed_codex_wrapper_snapshot(runner)
-        elif managed_codex:
+        elif managed_fleet_home:
             _fleet_managed_home_state(
                 AGENT_POOL_ROOT,
                 descriptor,
@@ -12628,7 +12879,11 @@ def _start_agent_with_lease_unlocked(
         if (
             active_model != selected_model
             or active_effort != selected_effort
-            or (selection is not None and active_class != selection.class_id)
+            or (
+                selection is not None
+                and active_class is not None
+                and active_class != selection.class_id
+            )
         ):
             raise AgentError(
                 "routed model or class differs from active session; controlled restart requires "
@@ -16244,7 +16499,11 @@ def ensure_assignment_session_model(
     if (
         current_model == model
         and current_reasoning_effort == reasoning_effort
-        and (agent_class is None or current_agent_class == agent_class)
+        and (
+            agent_class is None
+            or current_agent_class is None
+            or current_agent_class == agent_class
+        )
     ):
         return {
             "status": "unchanged",
@@ -16463,6 +16722,16 @@ def _assign_agent_unlocked(
         )
         model = selection.model
         reasoning_effort = selection.reasoning
+        if agent_class is None and authority_class == "teamleiterin":
+            descriptor = current_agent_inventory().agents.get(agent)
+            active_meta = read_meta(agent)
+            if (
+                getattr(descriptor, "skill_profile", None) == "teamleiterin"
+                and active_meta.get("model") == "gpt-5.6-terra"
+                and active_meta.get("model_reasoning_effort") == "xhigh"
+            ):
+                model = "gpt-5.6-terra"
+                reasoning_effort = "xhigh"
     subagent_admission = (
         admission if allow_subagents and admission is not None
         else spawn_admission_decision(1) if allow_subagents
@@ -16525,7 +16794,7 @@ def _assign_agent_unlocked(
                 reasoning_effort=reasoning_effort,
                 lease=lease,
                 release_lease_on_failure=release_on_failure,
-                agent_class=selection.class_id if selection is not None else None,
+                agent_class=agent_class,
                 **name_args,
             )
         else:
@@ -16536,7 +16805,7 @@ def _assign_agent_unlocked(
                     reasoning_effort=reasoning_effort,
                     lease=lease,
                     release_lease_on_failure=release_on_failure,
-                    agent_class=selection.class_id if selection is not None else None,
+                    agent_class=agent_class,
                     **name_args,
                 )
         sent = send_agent(agent, prompt, enter, operation=operation)
@@ -20578,9 +20847,11 @@ def resource_monitor_status(
     try:
         operator_status = _read_resource_operator_status()
         snapshot = {
-            "valid": isinstance(operator_status, ResourceOperatorStatus),
-            "fresh": isinstance(operator_status, ResourceOperatorStatus),
-            "generation": operator_status.generation if isinstance(operator_status, ResourceOperatorStatus) else None,
+            "valid": isinstance(operator_status, ResourceEvidenceOperatorViewV2),
+            "fresh": isinstance(operator_status, ResourceEvidenceOperatorViewV2),
+            "generation": operator_status.generation
+            if isinstance(operator_status, ResourceEvidenceOperatorViewV2)
+            else None,
         }
     except Exception:
         pass
@@ -33279,7 +33550,7 @@ def _fleet_overview_cli(argv: list[str]) -> int:
         return 1
 
 
-def _render_resource_operator_status(status: ResourceOperatorStatus, *, format: str) -> str:
+def _render_resource_operator_status(status: ResourceEvidenceOperatorViewV2, *, format: str) -> str:
     if format not in {"compact", "json", "markdown"}:
         raise AgentError("resource_status_unavailable")
     document = _resource_operator_document(status)
@@ -36062,13 +36333,8 @@ def fleet_sync_skill_projections() -> dict[str, Any]:
                     descriptor,
                     strict_contents=False,
                 )
-                effective_descriptor = (
-                    dataclass_replace(descriptor, skill_profile=runtime_skill_profile)
-                    if runtime_skill_profile is not None
-                    else descriptor
-                )
                 home_artifacts = _fleet_home_artifacts(
-                    effective_descriptor,
+                    descriptor,
                     executable,
                     include_portable_skills=True,
                     runtime_skill_profile=runtime_skill_profile,

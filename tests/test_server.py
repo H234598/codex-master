@@ -37,7 +37,13 @@ from codex_master.resource_cgroup import (
     CgroupIoPressureEvidenceV1,
     PreparedAgentScope,
 )
-from codex_master.resource_monitor import LegacyPressureV1, ResourceGateFacts, ResourceOperatorStatus
+from codex_master.resource_monitor import (
+    LegacyPressureV1,
+    ResourceEvidenceStateV2,
+    ResourceEvidenceV2,
+    ResourceMeasurementsV2,
+    ResourceSnapshotError,
+)
 from codex_master.selection.task_classification import TaskClassificationRequest, TaskClassifier
 from codex_master.usage_snapshot import UsageSnapshot
 
@@ -219,6 +225,100 @@ from codex_master.server import (
     watchdog_output_changed_since_marker,
     system_resource_snapshot,
 )
+
+
+RESOURCE_TEST_BOOT_ID = "123e4567-e89b-12d3-a456-426614174000"
+RESOURCE_TEST_NOW = datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc)
+
+
+def resource_measurements_v2_for_test(
+    *,
+    available_memory_mib: int = 8192,
+    load_per_cpu: float = 0.25,
+    cpu_busy_percent: float = 25.0,
+    io_wait_percent: float = 0.0,
+    available_memory_percent: float = 50.0,
+    monitor_cgroup_state: str = "ready",
+    thermal_state: str = "ready",
+) -> ResourceMeasurementsV2:
+    metrics = {"cpu": 25.0, "io": 0.0, "memory": 50.0}
+    return ResourceMeasurementsV2(
+        current=metrics,
+        available_memory_mib=available_memory_mib,
+        legacy_pressure=LegacyPressureV1(
+            load_per_cpu,
+            cpu_busy_percent,
+            io_wait_percent,
+            available_memory_percent,
+        ),
+        mean_1m=metrics,
+        mean_10m=metrics,
+        peak_10m=metrics,
+        normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
+        normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
+        trend={"cpu": "stable", "io": "stable", "memory": "stable"},
+        bottleneck="unknown",
+        preferred_profiles=("balanced",),
+        avoid_profiles=(),
+        confidence="high",
+        monitor_cgroup_state=monitor_cgroup_state,
+        thermal_state=thermal_state,
+    )
+
+
+def resource_evidence_v2_for_test(
+    state: ResourceEvidenceStateV2,
+    *,
+    reason_codes: tuple[str, ...] | None = None,
+    measurements: ResourceMeasurementsV2 | None = None,
+) -> ResourceEvidenceV2:
+    if reason_codes is None:
+        reason_codes = {
+            ResourceEvidenceStateV2.WARMING: ("resource_monitor_warming",),
+            ResourceEvidenceStateV2.UNAVAILABLE: ("resource_monitor_unavailable",),
+            ResourceEvidenceStateV2.READY: ("resource_ready",),
+            ResourceEvidenceStateV2.PRESSURE: ("temperature_pressure_high",),
+        }[state]
+    if state is ResourceEvidenceStateV2.WARMING:
+        completed_sample_count = 3
+    elif state is ResourceEvidenceStateV2.UNAVAILABLE:
+        completed_sample_count = 0
+    else:
+        completed_sample_count = 10
+        measurements = measurements or resource_measurements_v2_for_test()
+    return ResourceEvidenceV2(
+        schema_version=2,
+        boot_id=RESOURCE_TEST_BOOT_ID,
+        generation=7,
+        observed_at_utc=RESOURCE_TEST_NOW,
+        observed_monotonic_ns=7,
+        state=state,
+        completed_sample_count=completed_sample_count,
+        reason_codes=reason_codes,
+        measurements=measurements,
+    )
+
+
+def resource_runtime_for_test(root: Path, *, typed_g5: bool = True) -> server_module.ResourceGateRuntime:
+    profile = CgroupProfileV1(
+        cpuset_cpus=(0, 1),
+        cpu_quota_percent=750,
+        cpu_weight=50,
+        memory_high_bytes=8 * 1024**3,
+        memory_max_bytes=9 * 1024**3,
+        memory_swap_max_bytes=8 * 1024**3,
+        io_weight=50,
+    )
+    adapter = regular_systemd_adapter_for_test(root)[0] if typed_g5 else None
+    return server_module.ResourceGateRuntime(
+        state=HiveStateStore(root),
+        expected_boot_id=RESOURCE_TEST_BOOT_ID,
+        now_utc=lambda: RESOURCE_TEST_NOW,
+        monotonic_ns=lambda: 7,
+        cgroup_profile=profile if typed_g5 else None,
+        cgroup_adapter=adapter,
+        h2_ready=typed_g5,
+    )
 
 
 def fake_g5_start_scope_for_test(session: str) -> tuple[Any, PreparedAgentScope]:
@@ -466,7 +566,7 @@ def write_legacy_home_refresh_for_test(
     home = descriptor.home
     marker_path = home / server_module.FLEET_AGENT_MARKER_FILE
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    marker.pop("runtime_skill_profile")
+    marker.pop("runtime_skill_profile", None)
     marker["model"] = "gpt-5.4-mini"
     marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     wrapper = "\n".join(
@@ -740,6 +840,9 @@ class HeldScopeControl:
     def accept(self, *, timeout_seconds: float) -> None:
         assert timeout_seconds > 0
 
+    def peer_pid(self) -> int:
+        return 4241
+
     def read_challenge(self, *, expected_gate_pid: int, timeout_seconds: float) -> str:
         assert expected_gate_pid == 4241
         assert timeout_seconds > 0
@@ -748,6 +851,9 @@ class HeldScopeControl:
     def release_once(self, payload: bytes, *, timeout_seconds: float) -> None:
         assert timeout_seconds > 0
         self.releases.append(payload)
+
+    def read_ready(self, *, timeout_seconds: float) -> None:
+        assert timeout_seconds > 0
 
     def close(self) -> None:
         self.closed = True
@@ -792,14 +898,15 @@ class ScopeSystemdRunner:
                 0,
                 stdout=b"ControlGroup=/user.slice/codex-master.slice\n",
             )
-        if argv[0] == "/usr/bin/systemctl" and "--property=Id" in argv:
+        if argv[0] == "/usr/bin/systemctl" and (
+            "--property=Id" in argv or "--property=LoadState" in argv
+        ):
             return self._result(4)
         if argv[0] == "/usr/bin/systemctl" and argv[3] == "show":
             return self._result(
                 0,
                 stdout=(
                     f"ControlGroup=/user.slice/codex-master.slice/{self.unit_name}\n"
-                    "MainPID=4241\n"
                     "DelegateControllers=cpu cpuset memory pids io\n"
                 ).encode(),
             )
@@ -833,7 +940,7 @@ class ScopeSystemdRunner:
             "memory.high": f"{9 * 1024**3}\n".encode(),
             "memory.max": f"{12 * 1024**3}\n".encode(),
             "memory.swap.max": f"{8 * 1024**3}\n".encode(),
-            "io.weight": b"50\n",
+            "io.weight": b"default 50\n",
             "cgroup.procs": b"4241\n4242\n4243\n",
         }
         for name, payload in documents.items():
@@ -1264,6 +1371,134 @@ def _overview_cli_test_snapshot(*, generation: int = 9) -> Any:
 
 
 class ServerHelpersTest(unittest.TestCase):
+    def test_v2_projection_maps_all_states_and_keeps_transient_measurements_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = resource_runtime_for_test(Path(directory))
+            cases = (
+                (ResourceEvidenceStateV2.WARMING, ("resource_monitor_warming",), None),
+                (ResourceEvidenceStateV2.UNAVAILABLE, ("resource_monitor_unavailable",), None),
+                (ResourceEvidenceStateV2.READY, ("resource_ready",), resource_measurements_v2_for_test()),
+                (ResourceEvidenceStateV2.PRESSURE, ("temperature_pressure_high",), resource_measurements_v2_for_test()),
+            )
+            for state, reasons, measurements in cases:
+                with self.subTest(state=state), patch.object(
+                    server_module,
+                    "read_resource_evidence_v2",
+                    create=True,
+                    return_value=resource_evidence_v2_for_test(
+                        state,
+                        reason_codes=reasons,
+                        measurements=measurements,
+                    ),
+                ) as reader:
+                    projection = server_module._read_resource_evidence_projection_v2(runtime)
+
+                self.assertEqual(projection.operator_status.state, state)
+                self.assertEqual(projection.operator_status.reason_codes, reasons)
+                self.assertIs(projection.operator_status.measurements, measurements)
+                self.assertIs(projection.gate_facts.measurements, measurements)
+                reader.assert_called_once_with(
+                    runtime.state,
+                    now_utc=RESOURCE_TEST_NOW,
+                    expected_boot_id=RESOURCE_TEST_BOOT_ID,
+                )
+
+    def test_v2_warming_offer_is_publicly_retryable_without_numeric_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = resource_runtime_for_test(Path(directory))
+            evidence = resource_evidence_v2_for_test(ResourceEvidenceStateV2.WARMING)
+            with server_module._resource_gate_runtime_scope(runtime), patch.object(
+                server_module,
+                "read_resource_evidence_v2",
+                create=True,
+                return_value=evidence,
+            ) as reader, patch.object(
+                server_module, "_total_running_agent_count", return_value=0
+            ), patch.object(
+                server_module, "read_hive_io_pressure", return_value=None
+            ), patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0):
+                result = agent_spawn_offers()
+
+        self.assertEqual(result["reason_codes"], ["resource_monitor_warming"])
+        self.assertEqual(result["errors"][0]["code"], "resource_monitor_warming")
+        self.assertNotIn("current", json.dumps(result))
+        reader.assert_called_once()
+
+    def test_v2_transient_error_details_are_data_sparse_for_both_states(self) -> None:
+        details = server_module.spawn_error_details(
+            ["resource_monitor_warming", "resource_monitor_unavailable"]
+        )
+
+        self.assertEqual(
+            [item["code"] for item in details],
+            ["resource_monitor_warming", "resource_monitor_unavailable"],
+        )
+        for item in details:
+            self.assertEqual(
+                set(item),
+                {"code", "title", "explanation", "rule", "action"},
+            )
+            self.assertNotIn("current", json.dumps(item))
+
+    def test_v2_transient_operator_document_contains_no_metric_fields(self) -> None:
+        status = server_module.ResourceEvidenceOperatorViewV2(
+            state=ResourceEvidenceStateV2.UNAVAILABLE,
+            generation=7,
+            boot_id=RESOURCE_TEST_BOOT_ID,
+            observed_at_utc=RESOURCE_TEST_NOW,
+            reason_codes=("resource_monitor_unavailable",),
+            measurements=None,
+        )
+
+        document = server_module._resource_operator_document(status)
+
+        self.assertEqual(document["reason_codes"], ["resource_monitor_unavailable"])
+        self.assertNotIn("current", document)
+        self.assertNotIn("mean_1m", document)
+        self.assertNotIn("available_memory_mib", document)
+
+    def test_v2_invalid_evidence_is_only_snapshot_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = resource_runtime_for_test(Path(directory), typed_g5=False)
+            with server_module._resource_gate_runtime_scope(runtime), patch.object(
+                server_module,
+                "read_resource_evidence_v2",
+                create=True,
+                side_effect=ResourceSnapshotError("resource_snapshot_invalid"),
+            ) as reader:
+                result = server_module._resource_gate_snapshot(running_agents_override=0)
+
+        self.assertEqual(result["reason_codes"], ["resource_snapshot_invalid"])
+        reader.assert_called_once()
+
+    def test_v2_missing_live_g5_wins_before_pressure_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = resource_runtime_for_test(Path(directory), typed_g5=False)
+            evidence = resource_evidence_v2_for_test(
+                ResourceEvidenceStateV2.PRESSURE,
+                reason_codes=("temperature_pressure_high",),
+            )
+            with server_module._resource_gate_runtime_scope(runtime), patch.object(
+                server_module,
+                "read_resource_evidence_v2",
+                create=True,
+                return_value=evidence,
+            ), patch.object(server_module, "read_hive_io_pressure", return_value=None):
+                snapshot = server_module._resource_gate_snapshot(running_agents_override=0)
+                result = server_module._resource_admission_decision(snapshot=snapshot)
+
+        self.assertEqual(result["reason_codes"], ["cgroup_preflight_failed"])
+
+    def test_server_admission_has_no_v1_resource_reader_or_projection_import(self) -> None:
+        for name in (
+            "Resource" + "GateFacts",
+            "Resource" + "OperatorStatus",
+            "read_resource_" + "gate_facts",
+            "read_resource_" + "snapshot",
+            "build_resource_" + "operator_status",
+        ):
+            self.assertNotIn(name, server_module.__dict__)
+
     def test_bounded_stdout_command_rejects_oversized_output(self) -> None:
         with self.assertRaises(server_module.AgentError) as context:
             server_module._run_bounded_stdout_command(
@@ -1832,21 +2067,7 @@ class ServerHelpersTest(unittest.TestCase):
         assert result["reason_codes"] == ["cgroup_preflight_failed"]
 
     def test_spawn_admission_accepts_fresh_hive_snapshot_with_verified_typed_runtime(self) -> None:
-        facts = ResourceGateFacts(
-            generation=7,
-            observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
-            observed_monotonic_ns=1,
-            gate_state="ready",
-            reason_codes=(),
-            current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
-            available_memory_mib=8192,
-            legacy_pressure=LegacyPressureV1(0.25, 25.0, 0.0, 50.0),
-            normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
-            normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
-            bottleneck="unknown",
-            cgroup_state="unavailable",
-            thermal_state="ready",
-        )
+        facts = resource_evidence_v2_for_test(ResourceEvidenceStateV2.READY)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             state = HiveStateStore(root)
@@ -1866,7 +2087,7 @@ class ServerHelpersTest(unittest.TestCase):
                 return_value=approved,
             ), patch.object(
                 server_module,
-                "read_resource_gate_facts",
+                "read_resource_evidence_v2",
                 return_value=facts,
             ) as read_facts, patch.object(
                 server_module, "_total_running_agent_count", return_value=0
@@ -1882,21 +2103,7 @@ class ServerHelpersTest(unittest.TestCase):
     def test_spawn_admission_binds_and_prefers_dynamic_control_group_in_flow(self) -> None:
         first_slice = "/user.slice/codex-master.slice"
         second_slice = "/user.slice/user-1000.slice/user@1000.service/codex.slice/codex-master.slice"
-        facts = ResourceGateFacts(
-            generation=7,
-            observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
-            observed_monotonic_ns=1,
-            gate_state="ready",
-            reason_codes=(),
-            current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
-            available_memory_mib=8192,
-            legacy_pressure=LegacyPressureV1(0.25, 25.0, 0.0, 50.0),
-            normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
-            normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
-            bottleneck="unknown",
-            cgroup_state="unavailable",
-            thermal_state="ready",
-        )
+        facts = resource_evidence_v2_for_test(ResourceEvidenceStateV2.READY)
         runner = RebindingSystemdRunner(
             control_slice_sequence=(first_slice, second_slice),
         )
@@ -1946,7 +2153,7 @@ class ServerHelpersTest(unittest.TestCase):
                 return_value=approved,
             ), patch.object(
                 server_module,
-                "read_resource_gate_facts",
+                "read_resource_evidence_v2",
                 return_value=facts,
             ) as read_facts, patch.object(
                 server_module, "_total_running_agent_count", return_value=0
@@ -1960,20 +2167,9 @@ class ServerHelpersTest(unittest.TestCase):
         read_facts.assert_called_once()
 
     def test_spawn_admission_does_not_report_resource_snapshot_invalid_for_fresh_valid_composed_runtime(self) -> None:
-        facts = ResourceGateFacts(
-            generation=7,
-            observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
-            observed_monotonic_ns=1,
-            gate_state="blocked",
-            reason_codes=("cgroup_preflight_failed",),
-            current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
-            available_memory_mib=8192,
-            legacy_pressure=LegacyPressureV1(0.25, 25.0, 0.0, 50.0),
-            normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
-            normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
-            bottleneck="cgroup",
-            cgroup_state="unavailable",
-            thermal_state="ready",
+        facts = resource_evidence_v2_for_test(
+            ResourceEvidenceStateV2.READY,
+            measurements=resource_measurements_v2_for_test(monitor_cgroup_state="preflight_failed"),
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1993,7 +2189,7 @@ class ServerHelpersTest(unittest.TestCase):
                 return_value=approved,
             ), patch.object(
                 server_module,
-                "read_resource_gate_facts",
+                "read_resource_evidence_v2",
                 return_value=facts,
             ), patch.object(server_module, "_total_running_agent_count", return_value=0), patch.object(
                 server_module, "_SPAWN_WARMUP_UNTIL_NS", 0
@@ -2134,26 +2330,7 @@ class ServerHelpersTest(unittest.TestCase):
         provider.assert_called_once_with()
 
     def test_g5_offer_reads_one_injected_fresh_facts_snapshot(self) -> None:
-        facts = ResourceGateFacts(
-            generation=7,
-            observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
-            observed_monotonic_ns=1,
-            gate_state="ready",
-            reason_codes=(),
-            current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
-            available_memory_mib=8192,
-            legacy_pressure=LegacyPressureV1(
-                load_per_cpu=0.25,
-                cpu_busy_percent=25.0,
-                io_wait_percent=0.0,
-                available_memory_percent=50.0,
-            ),
-            normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
-            normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
-            bottleneck="unknown",
-            cgroup_state="unavailable",
-            thermal_state="ready",
-        )
+        facts = resource_evidence_v2_for_test(ResourceEvidenceStateV2.READY)
         profile = CgroupProfileV1(
             cpuset_cpus=(0, 1),
             cpu_quota_percent=750,
@@ -2176,11 +2353,11 @@ class ServerHelpersTest(unittest.TestCase):
                 h2_ready=True,
             )
             with patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0), server_module._resource_gate_runtime_scope(runtime), patch(
-                "codex_master.server.read_resource_gate_facts", return_value=facts
+                "codex_master.server.read_resource_evidence_v2", return_value=facts
             ) as read_facts, patch("codex_master.server._total_running_agent_count", return_value=2):
                 result = agent_spawn_offers()
             with patch.object(server_module, "_SPAWN_WARMUP_UNTIL_NS", 0), server_module._resource_gate_runtime_scope(runtime), patch(
-                "codex_master.server.read_resource_gate_facts", return_value=facts
+                "codex_master.server.read_resource_evidence_v2", return_value=facts
             ) as denied_read_facts, patch("codex_master.server._total_running_agent_count", return_value=10):
                 denied = agent_spawn_offers()
 
@@ -2202,75 +2379,35 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(denied["reason_codes"], [])
 
     def test_resource_gate_snapshot_denies_blocked_facts_without_recognized_reason(self) -> None:
-        def facts(*, gate_state: str, reason_codes: tuple[str, ...]) -> ResourceGateFacts:
-            return ResourceGateFacts(
-                generation=7,
-                observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
-                observed_monotonic_ns=1,
-                gate_state=gate_state,
-                reason_codes=reason_codes,
-                current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
-                available_memory_mib=8192,
-                legacy_pressure=LegacyPressureV1(
-                    load_per_cpu=0.25,
-                    cpu_busy_percent=25.0,
-                    io_wait_percent=0.0,
-                    available_memory_percent=50.0,
-                ),
-                normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
-                normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
-                bottleneck="unknown",
-                cgroup_state="unavailable",
-                thermal_state="ready",
-            )
-
         cases = (
-            ("blocked_empty", facts(gate_state="blocked", reason_codes=()), False, ["resource_snapshot_invalid"]),
-            ("blocked_unknown", facts(gate_state="blocked", reason_codes=("unknown_reason",)), False, ["resource_snapshot_invalid"]),
-            ("blocked_filtered", facts(gate_state="blocked", reason_codes=("cgroup_preflight_failed",)), True, []),
-            ("blocked_known", facts(gate_state="blocked", reason_codes=("cpu_pressure_high",)), False, ["cpu_pressure_high"]),
-            ("ready_unknown", facts(gate_state="ready", reason_codes=("unknown_reason",)), True, []),
+            ("warming", resource_evidence_v2_for_test(ResourceEvidenceStateV2.WARMING), ["resource_monitor_warming"]),
+            ("unavailable", resource_evidence_v2_for_test(ResourceEvidenceStateV2.UNAVAILABLE), ["resource_monitor_unavailable"]),
+            ("pressure", resource_evidence_v2_for_test(ResourceEvidenceStateV2.PRESSURE), ["temperature_pressure_high"]),
         )
         with tempfile.TemporaryDirectory() as directory:
             runtime = server_module.ResourceGateRuntime(
                 state=HiveStateStore(Path(directory)),
-                expected_boot_id="123e4567-e89b-12d3-a456-426614174000",
-                now_utc=lambda: datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
+                expected_boot_id=RESOURCE_TEST_BOOT_ID,
+                now_utc=lambda: RESOURCE_TEST_NOW,
                 monotonic_ns=lambda: 0,
                 cgroup_profile=None,
                 cgroup_adapter=None,
             )
-            for name, gate_facts, expected_ok, expected_reasons in cases:
+            for name, evidence, expected_reasons in cases:
                 with self.subTest(name=name), server_module._resource_gate_runtime_scope(runtime), patch(
-                    "codex_master.server.read_resource_gate_facts", return_value=gate_facts
+                    "codex_master.server.read_resource_evidence_v2", return_value=evidence
                 ):
                     result = server_module._resource_gate_snapshot(running_agents_override=2)
 
-                self.assertEqual(result["ok"], expected_ok)
+                self.assertFalse(result["ok"])
                 self.assertEqual(result["reason_codes"], expected_reasons)
                 self.assertEqual(result["raw_output"], "not_returned")
 
     def test_resource_gate_snapshot_prefers_hive_io_pressure_over_host_wait_metrics(self) -> None:
-        def facts(*, gate_state: str, io_wait_percent: float) -> ResourceGateFacts:
-            return ResourceGateFacts(
-                generation=7,
-                observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
-                observed_monotonic_ns=1,
-                gate_state=gate_state,
-                reason_codes=(),
-                current={"cpu": 25.0, "io": 99.0, "memory": 50.0},
-                available_memory_mib=8192,
-                legacy_pressure=LegacyPressureV1(
-                    load_per_cpu=0.25,
-                    cpu_busy_percent=25.0,
-                    io_wait_percent=io_wait_percent,
-                    available_memory_percent=50.0,
-                ),
-                normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
-                normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
-                bottleneck="unknown",
-                cgroup_state="unavailable",
-                thermal_state="ready",
+        def facts(*, io_wait_percent: float) -> ResourceEvidenceV2:
+            return resource_evidence_v2_for_test(
+                ResourceEvidenceStateV2.READY,
+                measurements=resource_measurements_v2_for_test(io_wait_percent=io_wait_percent),
             )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -2285,8 +2422,8 @@ class ServerHelpersTest(unittest.TestCase):
             )
             with server_module._resource_gate_runtime_scope(runtime), patch.object(
                 server_module,
-                "read_resource_gate_facts",
-                return_value=facts(gate_state="ready", io_wait_percent=99.001),
+                "read_resource_evidence_v2",
+                return_value=facts(io_wait_percent=99.001),
             ):
                 snapshot = server_module._resource_gate_snapshot(running_agents_override=2)
 
@@ -2295,28 +2432,12 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(server_module._resource_pressure_reason_codes(snapshot, spawn_resource_policy()), [])
 
     def test_resource_gate_snapshot_accepts_invalid_host_io_wait_when_hive_evidence_is_valid(self) -> None:
-        def facts() -> ResourceGateFacts:
-            data = ResourceGateFacts(
-                generation=7,
-                observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
-                observed_monotonic_ns=1,
-                gate_state="ready",
-                reason_codes=(),
-                current={"cpu": 25.0, "io": 99.0, "memory": 50.0},
-                available_memory_mib=8192,
-                legacy_pressure=LegacyPressureV1(
-                    load_per_cpu=0.25,
-                    cpu_busy_percent=25.0,
-                    io_wait_percent=99.001,
-                    available_memory_percent=50.0,
-                ),
-                normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
-                normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
-                bottleneck="unknown",
-                cgroup_state="unavailable",
-                thermal_state="ready",
+        def facts() -> ResourceEvidenceV2:
+            data = resource_evidence_v2_for_test(
+                ResourceEvidenceStateV2.READY,
+                measurements=resource_measurements_v2_for_test(io_wait_percent=99.001),
             )
-            object.__setattr__(data.legacy_pressure, "io_wait_percent", float("nan"))
+            object.__setattr__(data.measurements.legacy_pressure, "io_wait_percent", float("nan"))
             return data
 
         with tempfile.TemporaryDirectory() as directory:
@@ -2331,7 +2452,7 @@ class ServerHelpersTest(unittest.TestCase):
             )
             with server_module._resource_gate_runtime_scope(runtime), patch.object(
                 server_module,
-                "read_resource_gate_facts",
+                "read_resource_evidence_v2",
                 return_value=facts(),
             ):
                 snapshot = server_module._resource_gate_snapshot(running_agents_override=2)
@@ -2345,27 +2466,8 @@ class ServerHelpersTest(unittest.TestCase):
         )
 
     def test_resource_gate_snapshot_fail_closed_without_hive_io_pressure_evidence(self) -> None:
-        def facts() -> ResourceGateFacts:
-            return ResourceGateFacts(
-                generation=7,
-                observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
-                observed_monotonic_ns=1,
-                gate_state="ready",
-                reason_codes=(),
-                current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
-                available_memory_mib=8192,
-                legacy_pressure=LegacyPressureV1(
-                    load_per_cpu=0.25,
-                    cpu_busy_percent=25.0,
-                    io_wait_percent=0.0,
-                    available_memory_percent=50.0,
-                ),
-                normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
-                normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
-                bottleneck="unknown",
-                cgroup_state="unavailable",
-                thermal_state="ready",
-            )
+        def facts() -> ResourceEvidenceV2:
+            return resource_evidence_v2_for_test(ResourceEvidenceStateV2.READY)
 
         with tempfile.TemporaryDirectory() as directory:
             adapter, _runner = regular_systemd_adapter_for_test(Path(directory))
@@ -2381,7 +2483,7 @@ class ServerHelpersTest(unittest.TestCase):
                 server_module, "read_hive_io_pressure", return_value=None
             ), server_module._resource_gate_runtime_scope(runtime), patch.object(
                 server_module,
-                "read_resource_gate_facts",
+                "read_resource_evidence_v2",
                 return_value=facts(),
             ):
                 snapshot = server_module._resource_gate_snapshot(running_agents_override=2)
@@ -2442,26 +2544,7 @@ class ServerHelpersTest(unittest.TestCase):
         )
 
     def test_g5_product_composer_reads_one_authorized_hive_state_facts_snapshot_for_offer(self) -> None:
-        facts = ResourceGateFacts(
-            generation=7,
-            observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
-            observed_monotonic_ns=1,
-            gate_state="ready",
-            reason_codes=(),
-            current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
-            available_memory_mib=8192,
-            legacy_pressure=LegacyPressureV1(
-                load_per_cpu=0.25,
-                cpu_busy_percent=25.0,
-                io_wait_percent=0.0,
-                available_memory_percent=50.0,
-            ),
-            normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
-            normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
-            bottleneck="unknown",
-            cgroup_state="unavailable",
-            thermal_state="ready",
-        )
+        facts = resource_evidence_v2_for_test(ResourceEvidenceStateV2.READY)
         with tempfile.TemporaryDirectory() as directory:
             state = HiveStateStore(Path(directory))
             hive_runtime = SimpleNamespace(state=state)
@@ -2469,7 +2552,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.read_current_resource_boot_id",
                 return_value="123e4567-e89b-12d3-a456-426614174000",
             ), patch(
-                "codex_master.server.read_resource_gate_facts", return_value=facts
+                "codex_master.server.read_resource_evidence_v2", return_value=facts
             ) as read_facts, patch(
                 "codex_master.server.build_approved_cgroup_runtime",
                 side_effect=CgroupPreflightError("cgroup_preflight_failed"),
@@ -2485,26 +2568,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertIs(read_facts.call_args.args[0], state)
 
     def test_g5_direct_pressure_decision_composes_one_authorized_hive_state_facts_snapshot(self) -> None:
-        facts = ResourceGateFacts(
-            generation=7,
-            observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
-            observed_monotonic_ns=1,
-            gate_state="ready",
-            reason_codes=(),
-            current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
-            available_memory_mib=8192,
-            legacy_pressure=LegacyPressureV1(
-                load_per_cpu=0.25,
-                cpu_busy_percent=25.0,
-                io_wait_percent=0.0,
-                available_memory_percent=50.0,
-            ),
-            normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
-            normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
-            bottleneck="unknown",
-            cgroup_state="unavailable",
-            thermal_state="ready",
-        )
+        facts = resource_evidence_v2_for_test(ResourceEvidenceStateV2.READY)
         with tempfile.TemporaryDirectory() as directory:
             state = HiveStateStore(Path(directory))
             with patch.object(
@@ -2513,7 +2577,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.read_current_resource_boot_id",
                 return_value="123e4567-e89b-12d3-a456-426614174000",
             ), patch(
-                "codex_master.server.read_resource_gate_facts", return_value=facts
+                "codex_master.server.read_resource_evidence_v2", return_value=facts
             ) as read_facts, patch(
                 "codex_master.server.build_approved_cgroup_runtime",
                 side_effect=CgroupPreflightError("cgroup_preflight_failed"),
@@ -2530,21 +2594,7 @@ class ServerHelpersTest(unittest.TestCase):
 
     def test_g5_ollama_status_composes_one_product_facts_snapshot(self) -> None:
         """Removing the central status decision must deny before cgroup preflight."""
-        facts = ResourceGateFacts(
-            generation=7,
-            observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
-            observed_monotonic_ns=1,
-            gate_state="ready",
-            reason_codes=(),
-            current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
-            available_memory_mib=8192,
-            legacy_pressure=LegacyPressureV1(0.25, 25.0, 0.0, 50.0),
-            normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
-            normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
-            bottleneck="unknown",
-            cgroup_state="unavailable",
-            thermal_state="ready",
-        )
+        facts = resource_evidence_v2_for_test(ResourceEvidenceStateV2.READY)
         descriptor = server_module.AgentDescriptor(
             agent_id="o1",
             series_prefix="o",
@@ -2570,7 +2620,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.read_current_resource_boot_id",
                 return_value="123e4567-e89b-12d3-a456-426614174000",
             ), patch(
-                "codex_master.server.read_resource_gate_facts", return_value=facts
+                "codex_master.server.read_resource_evidence_v2", return_value=facts
             ) as read_facts, patch(
                 "codex_master.server.build_approved_cgroup_runtime",
                 side_effect=CgroupPreflightError("cgroup_preflight_failed"),
@@ -2695,26 +2745,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual(events, ["enter", "exit"])
 
     def test_g5_product_start_reads_facts_then_denies_missing_h2_before_tmux(self) -> None:
-        facts = ResourceGateFacts(
-            generation=7,
-            observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
-            observed_monotonic_ns=1,
-            gate_state="ready",
-            reason_codes=(),
-            current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
-            available_memory_mib=8192,
-            legacy_pressure=LegacyPressureV1(
-                load_per_cpu=0.25,
-                cpu_busy_percent=25.0,
-                io_wait_percent=0.0,
-                available_memory_percent=50.0,
-            ),
-            normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
-            normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
-            bottleneck="unknown",
-            cgroup_state="unavailable",
-            thermal_state="ready",
-        )
+        facts = resource_evidence_v2_for_test(ResourceEvidenceStateV2.READY)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runner = root / "codex"
@@ -2728,7 +2759,7 @@ class ServerHelpersTest(unittest.TestCase):
                 "codex_master.server.read_current_resource_boot_id",
                 return_value="123e4567-e89b-12d3-a456-426614174000",
             ), patch(
-                "codex_master.server.read_resource_gate_facts", return_value=facts
+                "codex_master.server.read_resource_evidence_v2", return_value=facts
             ) as read_facts, patch(
                 "codex_master.server.build_approved_cgroup_runtime",
                 side_effect=CgroupPreflightError("cgroup_preflight_failed"),
@@ -3324,21 +3355,7 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertTrue(allowed["allowed"])
 
     def test_g5_replacement_reads_fresh_facts_once_then_confirms_scope_before_warmup(self) -> None:
-        facts = ResourceGateFacts(
-            generation=7,
-            observed_at_utc=datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc),
-            observed_monotonic_ns=1,
-            gate_state="ready",
-            reason_codes=(),
-            current={"cpu": 25.0, "io": 0.0, "memory": 50.0},
-            available_memory_mib=8192,
-            legacy_pressure=LegacyPressureV1(0.25, 25.0, 0.0, 50.0),
-            normalized_pressure={"cpu": 25, "io": 0, "memory": 50},
-            normalized_headroom={"cpu": 75, "io": 100, "memory": 50},
-            bottleneck="unknown",
-            cgroup_state="unavailable",
-            thermal_state="ready",
-        )
+        facts = resource_evidence_v2_for_test(ResourceEvidenceStateV2.READY)
         process_summary = {
             "process_count": 0, "external_process_count": 0, "managed_process_count": 0,
             "external_processes": [], "external_processes_truncated": False, "raw_output": "not_returned",
@@ -3388,7 +3405,7 @@ class ServerHelpersTest(unittest.TestCase):
                 proc_root = root / "proc"
                 children = proc_root / "4242" / "task" / "4242" / "children"
                 children.parent.mkdir(parents=True)
-                children.write_bytes(b"4243\n")
+                children.write_bytes(b"4243 ")
                 state = root / "state"
                 hive_state = HiveStateStore(root / "hive-state")
 
@@ -3449,7 +3466,7 @@ class ServerHelpersTest(unittest.TestCase):
                     "codex_master.server.require_managed_replacement_reservation",
                     return_value={"allowed": True, "reservation_id": "r", "managed_session": "g5session"},
                 ), product_resource_dependencies(), patch(
-                    "codex_master.server.read_resource_gate_facts", return_value=facts
+                    "codex_master.server.read_resource_evidence_v2", return_value=facts
                 ) as read_facts, patch(
                     "codex_master.server.agent_base_args", return_value=[]
                 ), patch(
@@ -3473,7 +3490,9 @@ class ServerHelpersTest(unittest.TestCase):
         self.assertEqual([control.releases for control in HeldScopeControl.instances], [[b"c" * 64 + b"\n"]])
         self.assertEqual(len(adapter._owned), 1)
         self.assertEqual(warmup_until, 115_000_000_000)
-        scope_socket = scope_runner.started[0][-2]
+        scope_socket = next(
+            item for item in scope_runner.started[0] if item.startswith("g5-")
+        )
         self.assertEqual(
             [
                 call.args[0][2]
@@ -3498,7 +3517,13 @@ class ServerHelpersTest(unittest.TestCase):
         outcomes: dict[str, Any] = {}
         admission_calls = 0
         admission_lock = threading.Lock()
-        runtime = SimpleNamespace(monotonic_ns=lambda: 100_000_000_000, cgroup_adapter=None)
+        runtime = SimpleNamespace(
+            monotonic_ns=lambda: 100_000_000_000,
+            cgroup_adapter=SimpleNamespace(
+                confirm_scope=lambda _scope: 4242,
+                verify_tmux_membership_and_inheritance=lambda _scope, _tmux_pid: None,
+            ),
+        )
 
         def fake_admission(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
             nonlocal admission_calls
@@ -3514,7 +3539,7 @@ class ServerHelpersTest(unittest.TestCase):
                 {"reason_codes": ["spawn_warmup_active"], "raw_output": "not_returned"},
             )
 
-        def fake_scope(session: str) -> tuple[Any, PreparedAgentScope]:
+        def fake_scope(session: str, *_target: Any) -> tuple[Any, PreparedAgentScope]:
             return runtime, PreparedAgentScope(
                 unit_name="g5-test.scope",
                 socket_name="g5-0123456789abcdef0123",
@@ -5787,35 +5812,6 @@ class ServerHelpersTest(unittest.TestCase):
                     "unrelated": {"command": "/tmp/unrelated"},
                 },
                 "features": {"memories": True},
-            },
-        )
-
-    def test_updated_mcp_config_replaces_dotted_approval_and_preserves_comment(self) -> None:
-        existing = "\n".join(
-            [
-                'theme = "dark"',
-                'mcp_servers."codex-master-mcp".command = "/tmp/codex-master-mcp"',
-                'mcp_servers."codex-master-mcp".startup_timeout_sec = 120',
-                'mcp_servers."codex-master-mcp".default_tools_approval_mode = "prompt" # keep',
-            ]
-        ) + "\n"
-
-        updated, changed, previous = updated_mcp_startup_timeout_config(existing)
-
-        self.assertTrue(changed)
-        self.assertEqual(previous, 120)
-        self.assertIn('default_tools_approval_mode = "approve" # keep', updated)
-        self.assertEqual(
-            tomllib.loads(updated),
-            {
-                "theme": "dark",
-                "mcp_servers": {
-                    "codex-master-mcp": {
-                        "command": "/tmp/codex-master-mcp",
-                        "startup_timeout_sec": 120,
-                        "default_tools_approval_mode": "approve",
-                    }
-                },
             },
         )
 
@@ -26889,7 +26885,7 @@ google_accounts:
             "codex_master.server.agent_auth_status",
             return_value={"authenticated": True, "auth_state": "present_regular"},
         ):
-            with self.assertRaisesRegex(AgentError, "routed model differs from active session"):
+            with self.assertRaisesRegex(AgentError, "routed model or class differs from active session"):
                 start_agent_with_lease("a")
 
         mock_remember_routing.assert_not_called()
@@ -26919,7 +26915,7 @@ google_accounts:
             "raw_output": "not_returned",
         }
 
-        with self.assertRaisesRegex(AgentError, "routed model differs from active session"):
+        with self.assertRaisesRegex(AgentError, "routed model or class differs from active session"):
             start_agent_with_lease("a", allow_unauthenticated=True)
 
         mock_remember_routing.assert_not_called()
@@ -26944,7 +26940,7 @@ google_accounts:
             "codex_master.server.agent_lease_status",
             return_value={"held_by_this_server": True},
         ), patch("codex_master.server.release_agent") as mock_release:
-            with self.assertRaisesRegex(AgentError, "routed model differs from active session"):
+            with self.assertRaisesRegex(AgentError, "routed model or class differs from active session"):
                 start_agent_with_lease("a", allow_unauthenticated=True)
             mock_release.assert_called_once_with("a1", force=True)
 
@@ -26969,7 +26965,7 @@ google_accounts:
         }
 
         with patch("codex_master.server.agent_auth_status", return_value={"authenticated": True}):
-            with self.assertRaisesRegex(AgentError, "routed model differs from active session"):
+            with self.assertRaisesRegex(AgentError, "routed model or class differs from active session"):
                 start_agent_with_lease("a", allow_unauthenticated=True)
 
         mock_remember_routing.assert_not_called()
@@ -28153,7 +28149,7 @@ google_accounts:
             home = descriptor.home
             marker_path = home / server_module.FLEET_AGENT_MARKER_FILE
             marker = json.loads(marker_path.read_text(encoding="utf-8"))
-            marker.pop("runtime_skill_profile")
+            marker.pop("runtime_skill_profile", None)
             marker["model"] = "gpt-5.4-mini"
             previous_wrapper = "\n".join(
                 [
@@ -28671,7 +28667,7 @@ google_accounts:
             home = descriptor.home
             marker_path = home / server_module.FLEET_AGENT_MARKER_FILE
             marker = json.loads(marker_path.read_text(encoding="utf-8"))
-            marker.pop("runtime_skill_profile")
+            marker.pop("runtime_skill_profile", None)
             marker["model"] = "gpt-5.4-mini"
             marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             native = root / "codex-native"
@@ -29128,7 +29124,7 @@ google_accounts:
             home = descriptor.home
             marker_path = home / server_module.FLEET_AGENT_MARKER_FILE
             marker = json.loads(marker_path.read_text(encoding="utf-8"))
-            marker.pop("runtime_skill_profile")
+            marker.pop("runtime_skill_profile", None)
             marker["model"] = "gpt-5.4-mini"
             marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             clear_process_summary = {
@@ -29206,7 +29202,7 @@ google_accounts:
                 home = descriptor.home
                 marker_path = home / server_module.FLEET_AGENT_MARKER_FILE
                 marker = json.loads(marker_path.read_text(encoding="utf-8"))
-                marker.pop("runtime_skill_profile")
+                marker.pop("runtime_skill_profile", None)
                 marker["model"] = "gpt-5.4-mini"
                 if invalid_kind == "missing":
                     class_name = "AGENTS.class-teamleiterin.md"
@@ -29264,7 +29260,7 @@ google_accounts:
                 home = descriptor.home
                 marker_path = home / server_module.FLEET_AGENT_MARKER_FILE
                 marker = json.loads(marker_path.read_text(encoding="utf-8"))
-                marker.pop("runtime_skill_profile")
+                marker.pop("runtime_skill_profile", None)
                 marker["model"] = "gpt-5.4-mini"
                 marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n", encoding="utf-8")
                 before = managed_home_tree_for_test(home)
@@ -30944,9 +30940,15 @@ google_accounts:
             "raw_output": "not_returned",
         }
         started_sessions: list[str] = []
-        runtime = SimpleNamespace(monotonic_ns=lambda: 100_000_000_000, cgroup_adapter=None)
+        runtime = SimpleNamespace(
+            monotonic_ns=lambda: 100_000_000_000,
+            cgroup_adapter=SimpleNamespace(
+                confirm_scope=lambda _scope: 4242,
+                verify_tmux_membership_and_inheritance=lambda _scope, _tmux_pid: None,
+            ),
+        )
 
-        def fake_g5_start_scope(session: str) -> tuple[Any, PreparedAgentScope]:
+        def fake_g5_start_scope(session: str, *_target: Any) -> tuple[Any, PreparedAgentScope]:
             return runtime, PreparedAgentScope(
                 unit_name="g5-test.scope",
                 socket_name=(
@@ -35516,27 +35518,25 @@ class AppletStatusContractTest(unittest.TestCase):
 
 class CliLifecycleTest(unittest.TestCase):
     @staticmethod
-    def _resource_operator_status(reason_codes: tuple[str, ...] = ("resource_ready",)) -> ResourceOperatorStatus:
-        return ResourceOperatorStatus(
-            schema_version=1,
+    def _resource_operator_status(
+        reason_codes: tuple[str, ...] = ("resource_ready",),
+    ) -> server_module.ResourceEvidenceOperatorViewV2:
+        metrics = resource_measurements_v2_for_test()
+        return server_module.ResourceEvidenceOperatorViewV2(
+            state=ResourceEvidenceStateV2.READY,
             generation=23,
-            state="ready",
-            bottleneck="io",
-            current={"cpu": 12.0, "io": 18.0, "memory": 31.0},
-            mean_1m={"cpu": 11.0, "io": 17.0, "memory": 30.0},
-            mean_10m={"cpu": 10.0, "io": 16.0, "memory": 29.0},
-            peak_10m={"cpu": 20.0, "io": 25.0, "memory": 40.0},
-            trend={"cpu": "stable", "io": "rising", "memory": "falling"},
-            confidence="high",
-            preferred_profiles=("cpu_low",),
-            avoid_profiles=("io_high",),
+            boot_id=RESOURCE_TEST_BOOT_ID,
+            observed_at_utc=RESOURCE_TEST_NOW,
             reason_codes=reason_codes,
+            measurements=metrics,
         )
 
     def test_local_resource_status_has_only_operator_projection_and_fixed_formats(self) -> None:
         expected_fields = {
             "schema_version",
+            "boot_id",
             "generation",
+            "observed_at_utc",
             "state",
             "bottleneck",
             "current",
@@ -41894,22 +41894,32 @@ class ResourceMonitorLifecycleTest(unittest.TestCase):
             },
         }
 
-    def _valid_resource_status(self) -> ResourceOperatorStatus:
+    def _valid_resource_status(self) -> server_module.ResourceEvidenceOperatorViewV2:
         metrics = {"cpu": 10.0, "io": 20.0, "memory": 30.0}
-        return ResourceOperatorStatus(
-            schema_version=1,
+        measurements = resource_measurements_v2_for_test()
+        return server_module.ResourceEvidenceOperatorViewV2(
+            state=ResourceEvidenceStateV2.READY,
             generation=7,
-            state="ready",
-            bottleneck="cpu",
-            current=metrics,
-            mean_1m=metrics,
-            mean_10m=metrics,
-            peak_10m=metrics,
-            trend={"cpu": "stable", "io": "stable", "memory": "stable"},
-            confidence="high",
-            preferred_profiles=("balanced",),
-            avoid_profiles=(),
+            boot_id=RESOURCE_TEST_BOOT_ID,
+            observed_at_utc=RESOURCE_TEST_NOW,
             reason_codes=("resource_ready",),
+            measurements=ResourceMeasurementsV2(
+                current=metrics,
+                available_memory_mib=measurements.available_memory_mib,
+                legacy_pressure=measurements.legacy_pressure,
+                mean_1m=metrics,
+                mean_10m=metrics,
+                peak_10m=metrics,
+                normalized_pressure=measurements.normalized_pressure,
+                normalized_headroom=measurements.normalized_headroom,
+                trend=measurements.trend,
+                bottleneck="cpu",
+                preferred_profiles=("balanced",),
+                avoid_profiles=(),
+                confidence="high",
+                monitor_cgroup_state="ready",
+                thermal_state="ready",
+            ),
         )
 
     def test_install_resource_monitor_materializes_units_atomically_and_enables_monitor(self) -> None:
