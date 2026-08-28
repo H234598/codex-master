@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 import re
 from types import MappingProxyType
+import unicodedata
 
 
 _OPERATIONS = frozenset({
@@ -21,9 +23,18 @@ _REQUEST_FIELDS = frozenset({"schema_version", "operation", "arguments", "expect
 _MAX_TEXT_BYTES = 4096
 _MAX_KEY_BYTES = 128
 _MAX_GENERATION = 2**63 - 1
+_MAX_COUNT = 100_000
+_MAX_OPERATION_LIFETIME = timedelta(days=1)
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
-_PRIVATE_TEXT = re.compile(r"\bbearer\s+\S+|file://|\\\\[^\\\s]+\\|(?:^|[\s:=])/\S+|[A-Za-z]:[\\/]", re.IGNORECASE)
+_PRIVATE_TEXT = re.compile(
+    r"\b(?:bearer|basic|access(?:[_ -]?token)?|api(?:[_ -]?key)?|auth(?:entication|orization)?|token|cookie|credential|passphrase|session|secret|jwt)\b"
+    r"|(?:sk-[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"
+    r"|file:|\\\\|(?:^|[\s\"'=:(])/(?:[^\s]+)|[A-Za-z]:[\\/]",
+    re.IGNORECASE,
+)
+_OPERATION_STATES = frozenset({"planned", "queued", "running", "partial", "succeeded", "failed", "blocked"})
+_PROBLEM_SEVERITIES = frozenset({"info", "warning", "error", "critical"})
 
 
 class AdminContractError(ValueError):
@@ -51,9 +62,14 @@ def _text(value: object, *, private: bool = False) -> str:
             fail()
     except UnicodeError:
         fail()
-    if private and _PRIVATE_TEXT.search(value):
-        fail()
     return value
+
+
+def _public_text(value: object) -> str:
+    text = _text(value, private=True)
+    if _PRIVATE_TEXT.search(text) or any(unicodedata.category(char).startswith("C") for char in text):
+        _private()
+    return text
 
 
 def _token(value: object, *, private: bool = False) -> str:
@@ -61,6 +77,22 @@ def _token(value: object, *, private: bool = False) -> str:
     if _TOKEN.fullmatch(text) is None:
         (_private if private else _invalid)()
     return text
+
+
+def _utc_time(value: object) -> datetime:
+    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() != timedelta(0):
+        _private()
+    return value.astimezone(UTC)
+
+
+def _count(value: object) -> int:
+    if type(value) is not int or not 0 <= value <= _MAX_COUNT:
+        _private()
+    return value
+
+
+def _wire_time(value: datetime) -> str:
+    return value.isoformat().replace("+00:00", "Z")
 
 
 def _generation(value: object) -> int:
@@ -126,16 +158,6 @@ def _reason_codes(value: object, *, private: bool = False) -> tuple[str, ...]:
     return tuple(_token(item, private=private) for item in value)
 
 
-def _problem_details(value: object) -> Mapping[str, object]:
-    details = _mapping(value, private=True)
-    if set(details) - {"reason_codes"}:
-        _private()
-    result: dict[str, object] = {}
-    if "reason_codes" in details:
-        result["reason_codes"] = _reason_codes(details["reason_codes"], private=True)
-    return MappingProxyType(result)
-
-
 @dataclass(frozen=True, slots=True)
 class AdminRequestV1:
     operation: str
@@ -175,18 +197,26 @@ class AdminPrincipalV1:
 
 @dataclass(frozen=True, slots=True)
 class OperationV1:
-    operation_id: str
+    id: str
     kind: str
     state: str
     expected_generation: int
     resulting_generation: int | None
     plan_digest: str
+    created_at: datetime
+    expires_at: datetime
+    completed_count: int
+    failed_count: int
+    not_attempted_count: int
     reason_codes: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "operation_id", _token(self.operation_id, private=True))
+        object.__setattr__(self, "id", _token(self.id, private=True))
         object.__setattr__(self, "kind", _token(self.kind, private=True))
-        object.__setattr__(self, "state", _token(self.state, private=True))
+        state = _token(self.state, private=True)
+        if state not in _OPERATION_STATES:
+            _private()
+        object.__setattr__(self, "state", state)
         object.__setattr__(self, "expected_generation", _public_generation(self.expected_generation))
         if self.resulting_generation is not None:
             object.__setattr__(self, "resulting_generation", _public_generation(self.resulting_generation))
@@ -194,19 +224,48 @@ class OperationV1:
         if _DIGEST.fullmatch(digest) is None:
             _private()
         object.__setattr__(self, "plan_digest", digest)
+        created_at = _utc_time(self.created_at)
+        expires_at = _utc_time(self.expires_at)
+        if not created_at < expires_at <= created_at + _MAX_OPERATION_LIFETIME:
+            _private()
+        object.__setattr__(self, "created_at", created_at)
+        object.__setattr__(self, "expires_at", expires_at)
+        object.__setattr__(self, "completed_count", _count(self.completed_count))
+        object.__setattr__(self, "failed_count", _count(self.failed_count))
+        object.__setattr__(self, "not_attempted_count", _count(self.not_attempted_count))
         object.__setattr__(self, "reason_codes", _reason_codes(self.reason_codes, private=True))
 
 
 @dataclass(frozen=True, slots=True)
 class HiveProblemV1:
     code: str
-    message: str
-    details: Mapping[str, object]
+    severity: str
+    title: str
+    detail: str
+    effect: str
+    action: str
+    retryable: bool
+    retry_after_seconds: int | None
+    correlation_id: str
+    occurred_at: datetime
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "code", _token(self.code, private=True))
-        object.__setattr__(self, "message", _text(self.message, private=True))
-        object.__setattr__(self, "details", _problem_details(self.details))
+        severity = _token(self.severity, private=True)
+        if severity not in _PROBLEM_SEVERITIES:
+            _private()
+        object.__setattr__(self, "severity", severity)
+        for field in ("title", "detail", "effect", "action"):
+            object.__setattr__(self, field, _public_text(getattr(self, field)))
+        if type(self.retryable) is not bool:
+            _private()
+        if self.retry_after_seconds is not None:
+            if type(self.retry_after_seconds) is not int or not 0 <= self.retry_after_seconds <= 86_400:
+                _private()
+            if not self.retryable:
+                _private()
+        object.__setattr__(self, "correlation_id", _token(self.correlation_id, private=True))
+        object.__setattr__(self, "occurred_at", _utc_time(self.occurred_at))
 
 
 def parse_admin_request(value: object) -> AdminRequestV1:
@@ -224,14 +283,21 @@ def parse_admin_request(value: object) -> AdminRequestV1:
 def public_admin_result(value: object) -> dict[str, object]:
     """Serialize only validated V1 DTOs into their explicit public wire forms."""
     if type(value) is HiveProblemV1:
-        return {"schema_version": 1, "code": value.code, "message": value.message, "details": {
-            key: list(item) if type(item) is tuple else item for key, item in value.details.items()
-        }}
+        return {
+            "schema_version": 1, "code": value.code, "severity": value.severity,
+            "title": value.title, "detail": value.detail, "effect": value.effect,
+            "action": value.action, "retryable": value.retryable,
+            "retry_after_seconds": value.retry_after_seconds,
+            "correlation_id": value.correlation_id, "occurred_at": _wire_time(value.occurred_at),
+        }
     if type(value) is OperationV1:
         return {
-            "schema_version": 1, "operation_id": value.operation_id, "kind": value.kind,
+            "schema_version": 1, "id": value.id, "kind": value.kind,
             "state": value.state, "expected_generation": value.expected_generation,
             "resulting_generation": value.resulting_generation, "plan_digest": value.plan_digest,
+            "created_at": _wire_time(value.created_at), "expires_at": _wire_time(value.expires_at),
+            "completed_count": value.completed_count, "failed_count": value.failed_count,
+            "not_attempted_count": value.not_attempted_count,
             "reason_codes": list(value.reason_codes),
         }
     if type(value) is AdminPrincipalV1:
