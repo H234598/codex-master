@@ -14,8 +14,10 @@ from codex_master.fleet_home_broker_linux import (
     _observe_peer_snapshot_with_identity,
 )
 from codex_master.fleet_home_broker_protocol import (
+    ChpbMessage,
     MAX_CHPB_MESSAGE_BYTES,
     PrincipalBinding,
+    decode_chpb_message,
     validate_principal_binding,
 )
 from codex_master.fleet_home_broker_runtime import (
@@ -233,13 +235,13 @@ def admit_connected_seqpacket_peer(
     )
 
 
-def receive_admitted_seqpacket_packet(
+def receive_admitted_seqpacket_message(
     connection: socket.socket,
     enforcement_operations: _SeqpacketEnforcementOperations,
     linux_operations: LinuxOperations,
     wal_operations: WalOperations,
     release: BrokerReleaseSpec,
-) -> tuple[KernelPeerEvidence, bytes]:
+) -> tuple[KernelPeerEvidence, ChpbMessage]:
     evidence = admit_connected_seqpacket_peer(
         connection,
         enforcement_operations,
@@ -270,7 +272,8 @@ def receive_admitted_seqpacket_packet(
         raise SeqpacketPacketError(SeqpacketPacketCode.ZERO_LENGTH_OR_EOF) from None
     if len(payload) > MAX_CHPB_MESSAGE_BYTES:
         raise SeqpacketPacketError(SeqpacketPacketCode.TOO_LARGE) from None
-    return evidence, payload
+    message = decode_chpb_message(payload)
+    return evidence, message
 
 
 def reattest_seqpacket_peer(
@@ -319,6 +322,6 @@ __all__ = (
     "SeqpacketPeerError",
     "SeqpacketPeerOperations",
     "admit_connected_seqpacket_peer",
-    "receive_admitted_seqpacket_packet",
+    "receive_admitted_seqpacket_message",
     "reattest_seqpacket_peer",
 )
