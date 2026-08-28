@@ -53,7 +53,7 @@ class OllamaModelV1:
         if (
             type(self.installed) is not bool
             or type(self.hive_enabled) is not bool
-            or type(self.simple_only) is not bool
+            or self.simple_only is not True
             or (
                 self.evidence_at_utc is not None
                 and not isinstance(self.evidence_at_utc, str)
