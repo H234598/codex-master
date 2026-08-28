@@ -204,7 +204,7 @@ from codex_master.fleet_runners import (
     probe_provider_models,
     validate_gemini_probe_model,
 )
-from codex_master.dynamic_teamlead_start import dynamic_teamlead_start
+from codex_master.masterjet_runtime import MasterjetRuntime
 from codex_master.selection import (
     AdmissionMode,
     AdmissionPolicy,
@@ -23568,6 +23568,7 @@ def call_tool(
     args: dict[str, Any],
     *,
     principal_class: str | None = None,
+    runtime: MasterjetRuntime | None = None,
 ) -> dict[str, Any]:
     authority_class = principal_class or "arbeitsbiene"
     if name in {tool["name"] for tool in hive_tool_definitions()}:
@@ -23627,7 +23628,14 @@ def call_tool(
     if name == "agent_spawn_offers":
         return agent_spawn_offers(int_arg(args, "required_slots", 1))
     if name == "dynamic_teamlead_start":
-        return dynamic_teamlead_start()
+        if type(runtime) is MasterjetRuntime:
+            return runtime.start_dynamic_teamlead()
+        return {
+            "schema_version": 1,
+            "status": "unavailable",
+            "reason": "dynamic_teamlead_runtime_unavailable",
+            "raw_output": "not_returned",
+        }
     if name == "agent_start":
         selected = agent_ids(str(args.get("agent", "both")))
         allow_unauthenticated = bool_arg(args, "allow_unauthenticated", False)
