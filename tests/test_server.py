@@ -24,6 +24,8 @@ from types import MappingProxyType, SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
 
+import yaml
+
 import codex_master.server as server_module
 import codex_master.resource_cgroup as resource_cgroup
 from codex_master import __version__
@@ -8092,6 +8094,44 @@ google_accounts:
             path.chmod(0o600)
             with self.assertRaisesRegex(server_module.AgentError, "api_token_yaml_duplicate_project"):
                 server_module._read_hive_api_token_yaml(path=path)
+
+    def test_read_hive_api_token_yaml_accepts_more_than_ten_google_projects(self) -> None:
+        projects = [
+            {
+                "ref": f"the-hive-{number}",
+                "billing_account_ref": None,
+                "status": "active",
+                "project_id": f"project-{number}",
+                "project_number": str(1000 + number),
+                "key_id": f"key-{number}",
+                "key_uid": f"uid-{number}",
+                "secret": f"secret-{number}",
+            }
+            for number in range(1, 18)
+        ]
+        document = {
+            "schema_version": 1,
+            "google_accounts": [
+                {
+                    "ref": "google-a",
+                    "login_email": "one@example.com",
+                    "recovery_email": None,
+                    "subject_id": None,
+                    "billing_accounts": [],
+                    "projects": projects,
+                }
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "api-token.yaml"
+            path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+            path.chmod(0o600)
+
+            tokens = server_module._read_hive_api_token_yaml(path=path)
+
+        self.assertEqual(len(tokens), 17)
+        self.assertEqual(tokens[17], "secret-17")
 
     def test_read_hive_api_token_yaml_rejects_slim_schema_violations(self) -> None:
         base_project = """\

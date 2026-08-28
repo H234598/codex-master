@@ -38184,8 +38184,6 @@ def _read_hive_api_token_yaml(
             raise AgentError("api_token_yaml_invalid_structure")
         if len(billing_accounts) > 4:
             raise AgentError("api_token_yaml_google_account_billing_limit_exceeded")
-        if len(projects) > 10:
-            raise AgentError("api_token_yaml_google_account_project_limit_exceeded")
 
         local_billing_refs: set[str] = set()
         for billing_account in billing_accounts:
