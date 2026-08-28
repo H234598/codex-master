@@ -1,0 +1,12 @@
+[Unit]
+Description=Masterjet Wochen-/Monatstrend alle vier Stunden prüfen
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=4h
+AccuracySec=30s
+Persistent=true
+Unit=codex-master-limit-tracker.service
+
+[Install]
+WantedBy=timers.target

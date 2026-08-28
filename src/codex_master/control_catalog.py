@@ -119,6 +119,8 @@ _READ_ONLY_TOOLS = {
     "fleet_status_compact",
     "goddess_report_status",
     "goddess_report_list",
+    "usage_fast_mode_status",
+    "emergency_queen_status",
 }
 _MUTATING_TOOLS = {
     "agent_claim",
@@ -142,6 +144,9 @@ _MUTATING_TOOLS = {
     "fleet_series_disable",
     "fleet_series_delete",
     "goddess_report_run",
+    "emergency_queen_plan_completed",
+    "emergency_queen_child_started",
+    "emergency_queen_child_completed",
 }
 _BROAD_TOOLS = {
     "agent_start",
@@ -150,6 +155,8 @@ _BROAD_TOOLS = {
     "usage_watchdog",
     "agent_pool_install",
     "agent_pool_copy_auth",
+    "usage_fast_mode",
+    "usage_fast_mode_reconcile",
 }
 _DESTRUCTIVE_TOOLS = {"agent_pool_destroy_pool"}
 

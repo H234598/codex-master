@@ -1,0 +1,14 @@
+[Unit]
+Description=Masterjet OpenAI 5h-Notfalltracker
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/codex-master-limit-tracker --emergency
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=no
+ReadWritePaths=%h/.local/state/codex-master-mcp %h/.codex-agents
+RestrictAddressFamilies=AF_UNIX
+UMask=0077

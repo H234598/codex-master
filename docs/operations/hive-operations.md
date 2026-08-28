@@ -28,6 +28,21 @@ followed by a typed safe progress report before a workpackage can enter
 `paused`. Selection fairness and SP0–SP3 never stop, interrupt, restart, or
 take over a lease. Resuming requires fresh admission and scope revalidation.
 
+Emergency-Queen control is serialized under the private Masterjet state root.
+`emergency_queen_status` is read-only; `emergency_queen_plan_completed`
+advances one generation-bound plan queue. A completion after emergency mode
+ends moves the Queen to `draining` and sends a graceful shutdown signal. No
+second Queen is started while the state is active. Queens are logical Hive
+principals with `home_policy: none`; this excludes a permanent series home,
+not a lease-bound runtime home. The currently materialized q-homes carry
+Teamleiterin profiles, but provider and series are not class bindings; an
+arbitrary native home is nevertheless never silently promoted to a Queen.
+Until the planned logical Queen runtime adapter is materialized, the controller
+returns the explicit blocker `queen_spawn_unavailable:hive_queen_runtime_not_materialized`
+and does not simulate a successful spawn. Queen children are registered in the
+same generation-bound state, so draining waits for both the Queen and
+registered children.
+
 Private state is bounded, lock-protected, no-follow, and redacted at public
 boundaries. Real provider credentials and external pilot approval remain
 operational gates.

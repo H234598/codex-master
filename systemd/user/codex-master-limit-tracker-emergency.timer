@@ -1,0 +1,12 @@
+[Unit]
+Description=Masterjet OpenAI 5h-Notfallprüfung alle zehn Minuten
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+AccuracySec=30s
+Persistent=true
+Unit=codex-master-limit-tracker-emergency.service
+
+[Install]
+WantedBy=timers.target

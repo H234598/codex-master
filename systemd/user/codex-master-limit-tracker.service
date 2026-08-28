@@ -1,0 +1,14 @@
+[Unit]
+Description=Masterjet OpenAI Limittrend- und Fast/Flex-Tracker
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/codex-master-limit-tracker
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=no
+ReadWritePaths=%h/.local/state/codex-master-mcp %h/.codex-agents
+RestrictAddressFamilies=AF_UNIX
+UMask=0077

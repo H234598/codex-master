@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Run the account-scoped EMA60 Fast/Flex reconciler."""
+
+import json
+import sys
+
+from codex_master.server import reconcile_usage_fast_modes
+
+
+result = reconcile_usage_fast_modes(emergency_only="--emergency" in sys.argv)
+json.dump(result, sys.stdout, ensure_ascii=True, separators=(",", ":"))
+sys.stdout.write("\n")
