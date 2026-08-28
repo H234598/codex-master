@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import stat
+import struct
 import threading
 from types import SimpleNamespace
 
 import pytest
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from codex_master.credential_vault import (
     MAX_LEASE_SECONDS,
@@ -35,6 +37,38 @@ def vault_at(tmp_path: Path, *, clock: Clock | None = None) -> CredentialVault:
 def vault_path(tmp_path: Path, account_ref: str = "openai-one") -> Path:
     storage_id = hashlib.sha256(account_ref.encode("ascii")).hexdigest()
     return tmp_path / f"{storage_id}.vault"
+
+
+def legacy_vault_path(tmp_path: Path, account_ref: str = "openai-one") -> Path:
+    return tmp_path / f"{account_ref}.vault"
+
+
+def legacy_vault_record(
+    account_ref: str, generation: int, plaintext: bytes, *, nonce: bytes = b"n" * 12
+) -> bytes:
+    encoded_ref = account_ref.encode("ascii")
+    aad = (
+        b"codex-master-credential-projection\0"
+        + b"\x01"
+        + len(encoded_ref).to_bytes(2, "big")
+        + encoded_ref
+        + generation.to_bytes(8, "big")
+    )
+    ciphertext = AESGCM(KEY).encrypt(nonce, plaintext, aad)
+    return struct.pack(">8sBQ12s", b"CMVAULT\0", 1, generation, nonce) + ciphertext
+
+
+def write_legacy_vault(
+    tmp_path: Path,
+    account_ref: str = "openai-one",
+    generation: int = 7,
+    plaintext: bytes = b"legacy-secret",
+) -> bytes:
+    raw = legacy_vault_record(account_ref, generation, plaintext)
+    path = legacy_vault_path(tmp_path, account_ref)
+    path.write_bytes(raw)
+    path.chmod(0o600)
+    return raw
 
 
 def test_vault_file_does_not_contain_auth_json(tmp_path: Path) -> None:
@@ -74,6 +108,233 @@ def test_generation_must_increase_and_failed_replace_preserves_current(
     lease = vault.lease("openai-one", expected_generation=2, ttl_seconds=30)
     assert vault.consume_lease(lease) == b"second"
     assert b"stale-marker" not in vault_path(tmp_path).read_bytes()
+
+
+def test_legacy_v1_is_migrated_before_generation_cas_and_can_be_leased(
+    tmp_path: Path,
+) -> None:
+    write_legacy_vault(tmp_path, generation=7, plaintext=b"legacy-secret")
+    restarted = vault_at(tmp_path)
+
+    for generation in (6, 7):
+        with pytest.raises(
+            CredentialVaultError, match="credential.generation_conflict"
+        ):
+            restarted.store_projection("openai-one", generation, b"stale")
+
+    lease = restarted.lease("openai-one", expected_generation=7, ttl_seconds=30)
+    assert restarted.consume_lease(lease) == b"legacy-secret"
+    assert not legacy_vault_path(tmp_path).exists()
+    assert vault_path(tmp_path).read_bytes()[8] == 2
+
+
+def test_legacy_v1_can_be_revoked_after_migration(tmp_path: Path) -> None:
+    write_legacy_vault(tmp_path, generation=7)
+    restarted = vault_at(tmp_path)
+
+    assert restarted.revoke_account("openai-one", expected_generation=7) is True
+
+    second_restart = vault_at(tmp_path)
+    with pytest.raises(CredentialVaultError, match="credential.generation_conflict"):
+        second_restart.store_projection("openai-one", 7, b"replay")
+
+
+def test_migration_recovers_v1_already_moved_to_hashed_path(tmp_path: Path) -> None:
+    raw = legacy_vault_record("openai-one", 7, b"legacy-secret")
+    vault_path(tmp_path).write_bytes(raw)
+    vault_path(tmp_path).chmod(0o600)
+
+    restarted = vault_at(tmp_path)
+    lease = restarted.lease("openai-one", expected_generation=7, ttl_seconds=30)
+
+    assert restarted.consume_lease(lease) == b"legacy-secret"
+    assert vault_path(tmp_path).read_bytes()[8] == 2
+
+
+def test_migration_recovers_identical_dual_v1_records(tmp_path: Path) -> None:
+    raw = write_legacy_vault(tmp_path, generation=7, plaintext=b"legacy-secret")
+    vault_path(tmp_path).write_bytes(raw)
+    vault_path(tmp_path).chmod(0o600)
+
+    restarted = vault_at(tmp_path)
+    lease = restarted.lease("openai-one", expected_generation=7, ttl_seconds=30)
+
+    assert restarted.consume_lease(lease) == b"legacy-secret"
+    assert not legacy_vault_path(tmp_path).exists()
+    assert vault_path(tmp_path).read_bytes()[8] == 2
+
+
+def test_migration_cleans_identical_legacy_record_beside_schema2(
+    tmp_path: Path,
+) -> None:
+    vault = vault_at(tmp_path)
+    vault.store_projection("openai-one", 7, b"legacy-secret")
+    write_legacy_vault(tmp_path, generation=7, plaintext=b"legacy-secret")
+
+    restarted = vault_at(tmp_path)
+    lease = restarted.lease("openai-one", expected_generation=7, ttl_seconds=30)
+
+    assert restarted.consume_lease(lease) == b"legacy-secret"
+    assert not legacy_vault_path(tmp_path).exists()
+    assert vault_path(tmp_path).read_bytes()[8] == 2
+
+
+def test_migration_recovers_after_crash_before_old_record_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from codex_master.hive.state import HiveStateError, HiveStateStore
+
+    write_legacy_vault(tmp_path, generation=7, plaintext=b"legacy-secret")
+
+    def crash_remove(_state: HiveStateStore, _relative: PurePosixPath) -> None:
+        raise HiveStateError("state_unavailable")
+
+    with monkeypatch.context() as context:
+        context.setattr(HiveStateStore, "remove_private_bytes", crash_remove)
+        with pytest.raises(CredentialVaultError, match="credential.source_unavailable"):
+            vault_at(tmp_path).lease(
+                "openai-one", expected_generation=7, ttl_seconds=30
+            )
+
+    assert legacy_vault_path(tmp_path).exists()
+    assert vault_path(tmp_path).read_bytes()[8] == 1
+    restarted = vault_at(tmp_path)
+    lease = restarted.lease("openai-one", expected_generation=7, ttl_seconds=30)
+    assert restarted.consume_lease(lease) == b"legacy-secret"
+
+
+def test_migration_recovers_after_move_before_schema2_rewrite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from codex_master.hive.state import HiveStateError, HiveStateStore
+
+    write_legacy_vault(tmp_path, generation=7, plaintext=b"legacy-secret")
+    real_replace = HiveStateStore.replace_private_bytes
+    calls = 0
+
+    def crash_second_replace(
+        state: HiveStateStore, relative: PurePosixPath, payload: bytes
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise HiveStateError("state_write_failed")
+        real_replace(state, relative, payload)
+
+    with monkeypatch.context() as context:
+        context.setattr(HiveStateStore, "replace_private_bytes", crash_second_replace)
+        with pytest.raises(CredentialVaultError, match="credential.source_unavailable"):
+            vault_at(tmp_path).lease(
+                "openai-one", expected_generation=7, ttl_seconds=30
+            )
+
+    assert not legacy_vault_path(tmp_path).exists()
+    assert vault_path(tmp_path).read_bytes()[8] == 1
+    restarted = vault_at(tmp_path)
+    with pytest.raises(CredentialVaultError, match="credential.generation_conflict"):
+        restarted.store_projection("openai-one", 7, b"replay")
+    lease = restarted.lease("openai-one", expected_generation=7, ttl_seconds=30)
+    assert restarted.consume_lease(lease) == b"legacy-secret"
+
+
+@pytest.mark.parametrize("hashed_generation", [6, 8])
+def test_divergent_dual_records_fail_closed_without_floor_loss(
+    tmp_path: Path, hashed_generation: int
+) -> None:
+    write_legacy_vault(tmp_path, generation=7, plaintext=b"legacy-secret")
+    hashed = legacy_vault_record(
+        "openai-one", hashed_generation, b"divergent-secret", nonce=b"h" * 12
+    )
+    vault_path(tmp_path).write_bytes(hashed)
+    vault_path(tmp_path).chmod(0o600)
+    before_old = legacy_vault_path(tmp_path).read_bytes()
+    before_hashed = vault_path(tmp_path).read_bytes()
+    restarted = vault_at(tmp_path)
+
+    with pytest.raises(CredentialVaultError):
+        restarted.store_projection("openai-one", 9, b"replacement")
+
+    assert legacy_vault_path(tmp_path).read_bytes() == before_old
+    assert vault_path(tmp_path).read_bytes() == before_hashed
+
+
+def test_divergent_legacy_and_schema2_records_fail_closed(tmp_path: Path) -> None:
+    vault = vault_at(tmp_path)
+    vault.store_projection("openai-one", 8, b"schema2-secret")
+    write_legacy_vault(tmp_path, generation=7, plaintext=b"legacy-secret")
+    before_old = legacy_vault_path(tmp_path).read_bytes()
+    before_hashed = vault_path(tmp_path).read_bytes()
+
+    with pytest.raises(
+        CredentialVaultError, match="credential.vault_authentication_failed"
+    ):
+        vault.store_projection("openai-one", 9, b"replacement")
+
+    assert legacy_vault_path(tmp_path).read_bytes() == before_old
+    assert vault_path(tmp_path).read_bytes() == before_hashed
+
+
+def test_tampered_legacy_beside_schema2_fails_closed_without_cleanup(
+    tmp_path: Path,
+) -> None:
+    vault = vault_at(tmp_path)
+    vault.store_projection("openai-one", 8, b"schema2-secret")
+    raw = write_legacy_vault(tmp_path, generation=8, plaintext=b"schema2-secret")
+    tampered = raw[:-1] + bytes([raw[-1] ^ 1])
+    legacy_vault_path(tmp_path).write_bytes(tampered)
+    legacy_vault_path(tmp_path).chmod(0o600)
+    before_hashed = vault_path(tmp_path).read_bytes()
+
+    with pytest.raises(
+        CredentialVaultError, match="credential.vault_authentication_failed"
+    ):
+        vault.lease("openai-one", expected_generation=8, ttl_seconds=30)
+
+    assert legacy_vault_path(tmp_path).read_bytes() == tampered
+    assert vault_path(tmp_path).read_bytes() == before_hashed
+
+
+@pytest.mark.parametrize("corruption", ["truncated", "tampered"])
+def test_invalid_legacy_v1_fails_closed_before_migration(
+    tmp_path: Path, corruption: str
+) -> None:
+    raw = write_legacy_vault(tmp_path, generation=7, plaintext=b"legacy-secret")
+    invalid = raw[:10] if corruption == "truncated" else raw[:-1] + bytes([raw[-1] ^ 1])
+    legacy_vault_path(tmp_path).write_bytes(invalid)
+    legacy_vault_path(tmp_path).chmod(0o600)
+    restarted = vault_at(tmp_path)
+
+    with pytest.raises(CredentialVaultError) as captured:
+        restarted.store_projection("openai-one", 8, b"replacement")
+
+    assert captured.value.code in {
+        "credential.vault_authentication_failed",
+        "credential.vault_schema_invalid",
+    }
+    assert not vault_path(tmp_path).exists()
+
+
+@pytest.mark.parametrize("untrusted", ["permissions", "hardlink", "symlink"])
+def test_untrusted_legacy_v1_fails_closed_before_migration(
+    tmp_path: Path, untrusted: str
+) -> None:
+    write_legacy_vault(tmp_path, generation=7)
+    if untrusted == "permissions":
+        legacy_vault_path(tmp_path).chmod(0o640)
+    elif untrusted == "hardlink":
+        os.link(legacy_vault_path(tmp_path), tmp_path / "legacy-extra-link")
+    else:
+        legacy_vault_path(tmp_path).unlink()
+        target = tmp_path / "outside-legacy"
+        target.write_bytes(legacy_vault_record("openai-one", 7, b"outside"))
+        target.chmod(0o600)
+        legacy_vault_path(tmp_path).symlink_to(target)
+    restarted = vault_at(tmp_path)
+
+    with pytest.raises(CredentialVaultError, match="credential.source_unavailable"):
+        restarted.store_projection("openai-one", 8, b"replacement")
+
+    assert not vault_path(tmp_path).exists()
 
 
 def test_lease_is_one_shot_under_concurrent_consumers(tmp_path: Path) -> None:

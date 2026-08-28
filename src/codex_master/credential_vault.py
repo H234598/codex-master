@@ -33,10 +33,15 @@ _MAX_ACCOUNT_REF_BYTES: Final[int] = 128
 _NONCE_BYTES: Final[int] = 12
 _TAG_BYTES: Final[int] = 16
 _MAGIC: Final[bytes] = b"CMVAULT\0"
+_LEGACY_SCHEMA_VERSION: Final[int] = 1
 _SCHEMA_VERSION: Final[int] = 2
 _STATE_ACTIVE: Final[int] = 1
 _STATE_REVOKED: Final[int] = 2
+_LEGACY_HEADER: Final[struct.Struct] = struct.Struct(">8sBQ12s")
 _HEADER: Final[struct.Struct] = struct.Struct(">8sBBQ12s")
+_MAX_LEGACY_FILE_BYTES: Final[int] = (
+    _LEGACY_HEADER.size + MAX_PROJECTION_BYTES + _TAG_BYTES
+)
 _MAX_ENVELOPE_BYTES: Final[int] = 2 + _MAX_ACCOUNT_REF_BYTES + MAX_PROJECTION_BYTES
 _MAX_VAULT_FILE_BYTES: Final[int] = _HEADER.size + _MAX_ENVELOPE_BYTES + _TAG_BYTES
 _ACCOUNT_REF: Final[re.Pattern[str]] = re.compile(
@@ -263,7 +268,7 @@ class CredentialVault:
 
         try:
             with self._state.locked():
-                current = self._read_optional_locked(relative, account_ref)
+                current = self._read_or_migrate_locked(account_ref)
                 if current is not None and generation <= current[1]:
                     raise CredentialVaultError("credential.generation_conflict")
                 self._state.replace_private_bytes(relative, record)
@@ -335,7 +340,7 @@ class CredentialVault:
         relative = self._relative(account_ref)
         try:
             with self._state.locked():
-                current = self._read_optional_locked(relative, account_ref)
+                current = self._read_or_migrate_locked(account_ref)
                 if current is None or current[0] != _STATE_ACTIVE:
                     raise CredentialVaultError("credential.generation_conflict")
                 if current[1] != expected_generation:
@@ -357,10 +362,9 @@ class CredentialVault:
         return True
 
     def _read_projection(self, account_ref: str) -> tuple[int, bytes]:
-        relative = self._relative(account_ref)
         try:
             with self._state.locked():
-                current = self._read_optional_locked(relative, account_ref)
+                current = self._read_or_migrate_locked(account_ref)
         except CredentialVaultError:
             raise
         except HiveStateError:
@@ -372,9 +376,79 @@ class CredentialVault:
             raise CredentialVaultError("credential.source_unavailable")
         return generation, plaintext
 
-    def _read_optional_locked(
-        self, relative: PurePosixPath, account_ref: str
+    def _read_or_migrate_locked(
+        self, account_ref: str
     ) -> tuple[int, int, bytes] | None:
+        relative = self._relative(account_ref)
+        legacy_relative = self._legacy_relative(account_ref)
+        hashed_raw = self._read_raw_optional_locked(relative)
+        legacy_raw = (
+            None
+            if legacy_relative is None or legacy_relative == relative
+            else self._read_raw_optional_locked(legacy_relative)
+        )
+
+        hashed: tuple[int, int, bytes] | None = None
+        hashed_is_legacy = False
+        if hashed_raw is not None:
+            schema_version = self._record_schema(hashed_raw)
+            if schema_version == _SCHEMA_VERSION:
+                hashed = self._decrypt_record(hashed_raw, account_ref)
+            elif schema_version == _LEGACY_SCHEMA_VERSION:
+                generation, plaintext = self._decrypt_legacy_record(
+                    hashed_raw, account_ref
+                )
+                hashed = _STATE_ACTIVE, generation, plaintext
+                hashed_is_legacy = True
+            else:
+                raise CredentialVaultError("credential.vault_schema_invalid")
+
+        legacy: tuple[int, bytes] | None = None
+        if legacy_raw is not None:
+            legacy = self._decrypt_legacy_record(legacy_raw, account_ref)
+
+        if hashed is not None and legacy is not None:
+            legacy_generation, legacy_plaintext = legacy
+            if not self._same_active_projection(
+                hashed, legacy_generation, legacy_plaintext
+            ):
+                raise CredentialVaultError("credential.vault_authentication_failed")
+            if legacy_relative is None:
+                raise CredentialVaultError("credential.vault_schema_invalid")
+            migrated = (
+                self._encrypt_record(
+                    account_ref, legacy_generation, _STATE_ACTIVE, legacy_plaintext
+                )
+                if hashed_is_legacy
+                else None
+            )
+            self._state.remove_private_bytes(legacy_relative)
+            if migrated is not None:
+                self._state.replace_private_bytes(relative, migrated)
+            return _STATE_ACTIVE, legacy_generation, legacy_plaintext
+
+        if hashed is not None:
+            if hashed_is_legacy:
+                state, generation, plaintext = hashed
+                migrated = self._encrypt_record(
+                    account_ref, generation, state, plaintext
+                )
+                self._state.replace_private_bytes(relative, migrated)
+            return hashed
+
+        if legacy is None or legacy_raw is None or legacy_relative is None:
+            return None
+
+        generation, plaintext = legacy
+        migrated = self._encrypt_record(
+            account_ref, generation, _STATE_ACTIVE, plaintext
+        )
+        self._state.replace_private_bytes(relative, legacy_raw)
+        self._state.remove_private_bytes(legacy_relative)
+        self._state.replace_private_bytes(relative, migrated)
+        return _STATE_ACTIVE, generation, plaintext
+
+    def _read_raw_optional_locked(self, relative: PurePosixPath) -> bytes | None:
         try:
             raw = self._state.read_private_bytes(
                 relative, max_bytes=_MAX_VAULT_FILE_BYTES
@@ -383,7 +457,51 @@ class CredentialVault:
             if str(exc) == "state_not_found":
                 return None
             raise
-        return self._decrypt_record(raw, account_ref)
+        return raw
+
+    @staticmethod
+    def _record_schema(raw: bytes) -> int:
+        if len(raw) < len(_MAGIC) + 1 or raw[: len(_MAGIC)] != _MAGIC:
+            raise CredentialVaultError("credential.vault_schema_invalid")
+        return raw[len(_MAGIC)]
+
+    @staticmethod
+    def _same_active_projection(
+        hashed: tuple[int, int, bytes], generation: int, plaintext: bytes
+    ) -> bool:
+        return (
+            hashed[0] == _STATE_ACTIVE
+            and hashed[1] == generation
+            and hmac.compare_digest(hashed[2], plaintext)
+        )
+
+    def _decrypt_legacy_record(self, raw: bytes, account_ref: str) -> tuple[int, bytes]:
+        if len(raw) < _LEGACY_HEADER.size + _TAG_BYTES:
+            raise CredentialVaultError("credential.vault_schema_invalid")
+        try:
+            magic, schema_version, generation, nonce = _LEGACY_HEADER.unpack_from(raw)
+        except struct.error:
+            raise CredentialVaultError("credential.vault_schema_invalid") from None
+        if (
+            magic != _MAGIC
+            or schema_version != _LEGACY_SCHEMA_VERSION
+            or not 1 <= generation <= _MAX_GENERATION
+            or len(raw) > _MAX_LEGACY_FILE_BYTES
+        ):
+            raise CredentialVaultError("credential.vault_schema_invalid")
+        try:
+            plaintext = self._cipher.decrypt(
+                nonce,
+                raw[_LEGACY_HEADER.size :],
+                self._legacy_aad(account_ref, generation),
+            )
+        except InvalidTag:
+            raise CredentialVaultError(
+                "credential.vault_authentication_failed"
+            ) from None
+        if not plaintext or len(plaintext) > MAX_PROJECTION_BYTES:
+            raise CredentialVaultError("credential.vault_schema_invalid")
+        return generation, plaintext
 
     def _decrypt_record(self, raw: bytes, account_ref: str) -> tuple[int, int, bytes]:
         if len(raw) < _HEADER.size + _TAG_BYTES:
@@ -467,8 +585,26 @@ class CredentialVault:
         )
 
     @staticmethod
+    def _legacy_aad(account_ref: str, generation: int) -> bytes:
+        encoded = account_ref.encode("ascii")
+        return (
+            b"codex-master-credential-projection\0"
+            + bytes([_LEGACY_SCHEMA_VERSION])
+            + len(encoded).to_bytes(2, "big")
+            + encoded
+            + generation.to_bytes(8, "big")
+        )
+
+    @staticmethod
     def _relative(account_ref: str) -> PurePosixPath:
         return PurePosixPath(CredentialVault._storage_name(account_ref))
+
+    @staticmethod
+    def _legacy_relative(account_ref: str) -> PurePosixPath | None:
+        name = f"{account_ref}.vault"
+        if len(name) > 128:
+            return None
+        return PurePosixPath(name)
 
     @staticmethod
     def _storage_name(account_ref: str) -> str:
