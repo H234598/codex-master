@@ -1,21 +1,32 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Protocol
 
 from codex_master.dynamic_teamlead import prepare_dynamic_teamlead
+from codex_master.dynamic_teamlead_a3_registry import FleetV2RegistryOperations
 from codex_master.dynamic_teamlead_coordinator import (
     DynamicTeamleadCoordinatorRequest,
+    DynamicTeamleadRegistryOperations,
     _check_static_request,
+)
+from codex_master.dynamic_teamlead_start import DynamicTeamleadStartA3Port
+from codex_master.fleet_home_broker_client import BrokerClientOperations
+from codex_master.fleet_home_broker_client_seqpacket import (
+    SeqpacketBrokerClientOperations,
 )
 from codex_master.fleet_home_broker_runtime import (
     BrokerReleaseSpec,
     TrustedPrincipalGrantContext,
 )
 from codex_master.fleet_registry import FleetRuntimePrincipalV2, FleetSnapshotV2
+from codex_master.fleet_runners import DynamicTeamleadRunnerPlan
 
 
 _INVALID_CONTEXT = "invalid_dynamic_teamlead_a3_runtime_context"
 _NONTRANSFERABLE_CONTEXT = "dynamic_teamlead_a3_runtime_context_nontransferable"
+_INVALID_PORT = "invalid_dynamic_teamlead_a3_runtime_port"
+_NONTRANSFERABLE_PORT = "dynamic_teamlead_a3_runtime_port_nontransferable"
 
 
 class DynamicTeamleadA3RuntimeProviderError(ValueError):
@@ -24,6 +35,12 @@ class DynamicTeamleadA3RuntimeProviderError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+class OneShotDynamicTeamleadRunnerExecutor(Protocol):
+    def execute_dynamic_teamlead_runner(
+        self, plan: DynamicTeamleadRunnerPlan
+    ) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +59,40 @@ class DynamicTeamleadA3RuntimeContext:
     def __reduce_ex__(self, protocol: int) -> object:
         del protocol
         raise DynamicTeamleadA3RuntimeProviderError(_NONTRANSFERABLE_CONTEXT)
+
+
+@dataclass(frozen=True, slots=True, init=False, repr=False)
+class RootOwnedDynamicTeamleadStartPort(DynamicTeamleadStartA3Port):
+    request: DynamicTeamleadCoordinatorRequest
+    registry_operations: DynamicTeamleadRegistryOperations
+    broker_operations: BrokerClientOperations
+    _executor: OneShotDynamicTeamleadRunnerExecutor = field(
+        repr=False, compare=False
+    )
+
+    def __init__(self) -> None:
+        raise TypeError("root_owned_dynamic_teamlead_start_port_factory_required")
+
+    def execute_dynamic_teamlead_runner(
+        self, plan: DynamicTeamleadRunnerPlan
+    ) -> None:
+        self._executor.execute_dynamic_teamlead_runner(plan)
+
+    def __copy__(self) -> RootOwnedDynamicTeamleadStartPort:
+        raise DynamicTeamleadA3RuntimeProviderError(_NONTRANSFERABLE_PORT)
+
+    def __deepcopy__(self, memo: object) -> RootOwnedDynamicTeamleadStartPort:
+        del memo
+        raise DynamicTeamleadA3RuntimeProviderError(_NONTRANSFERABLE_PORT)
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        raise DynamicTeamleadA3RuntimeProviderError(_NONTRANSFERABLE_PORT)
+
+    def __repr__(self) -> str:
+        return f"<{type(self).__name__} redacted>"
+
+    __str__ = __repr__
 
 
 def validate_dynamic_teamlead_a3_runtime_context(
@@ -127,8 +178,35 @@ def validate_dynamic_teamlead_a3_runtime_context(
     return value
 
 
+def build_root_owned_dynamic_teamlead_start_port(
+    context: DynamicTeamleadA3RuntimeContext,
+    registry_operations: FleetV2RegistryOperations,
+    broker_operations: SeqpacketBrokerClientOperations,
+    executor: OneShotDynamicTeamleadRunnerExecutor,
+) -> RootOwnedDynamicTeamleadStartPort:
+    validated = validate_dynamic_teamlead_a3_runtime_context(context)
+    if (
+        type(registry_operations) is not FleetV2RegistryOperations
+        or type(broker_operations) is not SeqpacketBrokerClientOperations
+        or registry_operations._snapshot != validated.request.snapshot
+        or not callable(
+            getattr(executor, "execute_dynamic_teamlead_runner", None)
+        )
+    ):
+        raise DynamicTeamleadA3RuntimeProviderError(_INVALID_PORT)
+    port = object.__new__(RootOwnedDynamicTeamleadStartPort)
+    object.__setattr__(port, "request", validated.request)
+    object.__setattr__(port, "registry_operations", registry_operations)
+    object.__setattr__(port, "broker_operations", broker_operations)
+    object.__setattr__(port, "_executor", executor)
+    return port
+
+
 __all__ = (
     "DynamicTeamleadA3RuntimeContext",
     "DynamicTeamleadA3RuntimeProviderError",
+    "OneShotDynamicTeamleadRunnerExecutor",
+    "RootOwnedDynamicTeamleadStartPort",
+    "build_root_owned_dynamic_teamlead_start_port",
     "validate_dynamic_teamlead_a3_runtime_context",
 )

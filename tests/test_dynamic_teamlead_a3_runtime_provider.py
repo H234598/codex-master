@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import copy
 from dataclasses import FrozenInstanceError, replace
 import pickle
+from pathlib import Path
 
 import pytest
 
@@ -10,24 +12,50 @@ from codex_master.dynamic_teamlead import DynamicTeamleadRequest, ProfileBinding
 from codex_master.dynamic_teamlead_a3_runtime_provider import (
     DynamicTeamleadA3RuntimeContext,
     DynamicTeamleadA3RuntimeProviderError,
+    OneShotDynamicTeamleadRunnerExecutor,
+    RootOwnedDynamicTeamleadStartPort,
+    build_root_owned_dynamic_teamlead_start_port,
     validate_dynamic_teamlead_a3_runtime_context,
 )
-from codex_master.dynamic_teamlead_coordinator import DynamicTeamleadCoordinatorRequest
+from codex_master.dynamic_teamlead_start import dynamic_teamlead_start
+from codex_master.fleet_home_broker_client import ScmFrame
+from codex_master.dynamic_teamlead_coordinator import (
+    DynamicTeamleadCoordinatorCode,
+    DynamicTeamleadCoordinatorError,
+    DynamicTeamleadCoordinatorRequest,
+)
 from codex_master.fleet_home_broker_identity import BrokerIdentity
+from codex_master.fleet_home_broker_linux import FdStat
 from codex_master.fleet_home_broker_protocol import (
     AttestHomeRequest,
+    B2aRecoveryPhase,
     BindingExpectation,
+    BrokerCheckpoint,
+    BrokerObservation,
+    BrokerRegistryState,
+    BrokerObjectState,
+    BrokerReply,
+    BrokerResultCode,
     ChpbMessageKind,
     ChpbTransactionOperation,
+    CANONICAL_AGENT_HOME,
+    DirectoryIdentity,
+    HomeAttestation,
     PolicyBinding,
     PrincipalBinding,
     ProvisionHomeRequest,
     TransactionBinding,
+    TransactionStatus,
+    encode_chpb_message,
 )
 from codex_master.fleet_home_broker_runtime import (
     BrokerReleaseSpec,
     TrustedPrincipalGrantContext,
 )
+from codex_master.fleet_home_broker_client_seqpacket import (
+    SeqpacketBrokerClientOperations,
+)
+from codex_master.dynamic_teamlead_a3_registry import FleetV2RegistryOperations
 from codex_master.fleet_registry import (
     AuthKind,
     FleetAccountV2,
@@ -49,6 +77,7 @@ MUTATION_REQUEST_ID = "a" * 32
 ATTESTATION_REQUEST_ID = "b" * 32
 TRANSACTION_ID = "c" * 32
 STORE_UUID = "d" * 32
+DIRECTORY = DirectoryIdentity(17, 31, 0o40700)
 
 
 def account() -> FleetAccountV2:
@@ -537,3 +566,373 @@ def test_rejects_altered_bound_component(name: str, changed) -> None:
 )
 def test_rejects_malformed_context_members(value: object) -> None:
     assert_invalid(value)
+
+
+class InMemoryRegistryStore:
+    def __init__(self, snapshot: FleetSnapshotV2) -> None:
+        self.snapshot = snapshot
+        self.calls: list[tuple[FleetSnapshotV2, int]] = []
+
+    def load(self) -> FleetSnapshotV2:
+        return self.snapshot
+
+    def commit_snapshot(
+        self, candidate: FleetSnapshotV2, *, expected_generation: int
+    ) -> FleetSnapshotV2:
+        self.calls.append((candidate, expected_generation))
+        self.snapshot = candidate
+        return candidate
+
+
+class InMemoryBrokerExchange:
+    def __init__(self, frames: list[ScmFrame]) -> None:
+        self.frames = list(frames)
+        self.requests = []
+        self.fstat_calls: list[int] = []
+        self.closed: list[int] = []
+
+    def exchange(self, request: ScmFrame) -> ScmFrame:
+        self.requests.append(request)
+        return self.frames.pop(0)
+
+    def fstat(self, fd: int) -> FdStat:
+        self.fstat_calls.append(fd)
+        return FdStat(DIRECTORY.dev, DIRECTORY.ino, DIRECTORY.mode, 0, 0)
+
+    def close(self, fd: int) -> None:
+        self.closed.append(fd)
+
+
+class RecordingExecutor:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.plans = []
+        self.error = error
+
+    def execute_dynamic_teamlead_runner(self, plan) -> None:
+        self.plans.append(plan)
+        if self.error is not None:
+            raise self.error
+
+
+class OneShotRecordingExecutor(RecordingExecutor):
+    def execute_dynamic_teamlead_runner(self, plan) -> None:
+        if self.plans:
+            raise RuntimeError("runner permit consumed")
+        super().execute_dynamic_teamlead_runner(plan)
+
+
+def committed_status(binding: TransactionBinding) -> TransactionStatus:
+    return TransactionStatus(
+        binding=binding,
+        b2a_phase=B2aRecoveryPhase.COMMITTED,
+        checkpoint=BrokerCheckpoint.COMMITTED,
+        observation=BrokerObservation(
+            BrokerObjectState.FINAL_COMPLETE,
+            BrokerRegistryState.CURRENT,
+            1,
+        ),
+        population_total=1,
+        terminal_result=BrokerResultCode.COMMITTED,
+    )
+
+
+def committed_attestation(binding: TransactionBinding) -> HomeAttestation:
+    return HomeAttestation(
+        binding=binding,
+        canonical_path=CANONICAL_AGENT_HOME,
+        directory=DIRECTORY,
+        manifest_digest="7" * 64,
+        mcs_pair=binding.principal.mcs_pair,
+    )
+
+
+def valid_broker_frames(value: DynamicTeamleadA3RuntimeContext) -> list[ScmFrame]:
+    binding = value.request.mutation.binding
+    status = committed_status(binding)
+    home = committed_attestation(binding)
+    return [
+        ScmFrame(
+            encode_chpb_message(
+                BrokerReply(
+                    "CHPB/2",
+                    ChpbMessageKind.REPLY,
+                    value.request.mutation.request_id,
+                    BrokerResultCode.COMMITTED,
+                    status,
+                    None,
+                )
+            ),
+            (),
+        ),
+        ScmFrame(
+            encode_chpb_message(
+                BrokerReply(
+                    "CHPB/2",
+                    ChpbMessageKind.REPLY,
+                    value.request.attestation.request_id,
+                    BrokerResultCode.OK,
+                    status,
+                    home,
+                )
+            ),
+            (61,),
+        ),
+    ]
+
+
+def capabilities(
+    value: DynamicTeamleadA3RuntimeContext,
+    *,
+    frames: list[ScmFrame] | None = None,
+    executor: OneShotDynamicTeamleadRunnerExecutor | None = None,
+) -> tuple[
+    FleetV2RegistryOperations,
+    SeqpacketBrokerClientOperations,
+    RecordingExecutor | OneShotRecordingExecutor,
+    InMemoryRegistryStore,
+    InMemoryBrokerExchange,
+]:
+    store = InMemoryRegistryStore(value.request.snapshot)
+    registry = FleetV2RegistryOperations(store, value.request.snapshot)
+    exchange = InMemoryBrokerExchange(frames or valid_broker_frames(value))
+    broker = SeqpacketBrokerClientOperations(exchange)
+    runner = executor or RecordingExecutor()
+    return registry, broker, runner, store, exchange
+
+
+def build_port(
+    value: DynamicTeamleadA3RuntimeContext,
+    *,
+    frames: list[ScmFrame] | None = None,
+    executor: OneShotDynamicTeamleadRunnerExecutor | None = None,
+) -> tuple[
+    RootOwnedDynamicTeamleadStartPort,
+    RecordingExecutor | OneShotRecordingExecutor,
+    InMemoryRegistryStore,
+    InMemoryBrokerExchange,
+]:
+    registry, broker, runner, store, exchange = capabilities(
+        value, frames=frames, executor=executor
+    )
+    return (
+        build_root_owned_dynamic_teamlead_start_port(
+            value, registry, broker, runner
+        ),
+        runner,
+        store,
+        exchange,
+    )
+
+
+def test_valid_capabilities_compose_port_and_start_once() -> None:
+    value = valid_value()
+    port, runner, store, exchange = build_port(value)
+
+    assert port.request is value.request
+    assert isinstance(port.registry_operations, FleetV2RegistryOperations)
+    assert isinstance(port.broker_operations, SeqpacketBrokerClientOperations)
+    assert callable(port.execute_dynamic_teamlead_runner)
+    assert dynamic_teamlead_start(port) == {
+        "schema_version": 1,
+        "status": "started",
+        "raw_output": "not_returned",
+    }
+    assert len(exchange.requests) == 2
+    assert len(runner.plans) == 1
+    assert store.calls == []
+
+
+def test_port_is_constructible_only_through_factory() -> None:
+    value = valid_value()
+    registry, broker, runner, _, _ = capabilities(value)
+
+    with pytest.raises(
+        TypeError, match="root_owned_dynamic_teamlead_start_port_factory_required"
+    ):
+        RootOwnedDynamicTeamleadStartPort()
+
+
+def test_factory_rejects_registry_capability_from_another_context() -> None:
+    value = valid_value()
+    foreign = valid_value()
+    foreign_snapshot = replace(
+        foreign.request.snapshot,
+        accounts=(replace(foreign.request.snapshot.accounts[0], label="Foreign"),),
+    )
+    foreign_store = InMemoryRegistryStore(foreign_snapshot)
+    foreign_registry = FleetV2RegistryOperations(
+        foreign_store, foreign_snapshot
+    )
+    _, broker, runner, _, _ = capabilities(value)
+
+    with pytest.raises(DynamicTeamleadA3RuntimeProviderError) as caught:
+        build_root_owned_dynamic_teamlead_start_port(
+            value, foreign_registry, broker, runner
+        )
+
+    assert caught.value.code == "invalid_dynamic_teamlead_a3_runtime_port"
+
+
+def test_factory_rejects_v2_generation_drift_between_context_and_registry() -> None:
+    value = valid_value()
+    drifted_snapshot = replace(value.request.snapshot, generation=8)
+    registry = FleetV2RegistryOperations(
+        InMemoryRegistryStore(drifted_snapshot), drifted_snapshot
+    )
+    _, broker, runner, _, _ = capabilities(value)
+
+    with pytest.raises(DynamicTeamleadA3RuntimeProviderError) as caught:
+        build_root_owned_dynamic_teamlead_start_port(
+            value, registry, broker, runner
+        )
+
+    assert caught.value.code == "invalid_dynamic_teamlead_a3_runtime_port"
+
+
+def test_factory_rejects_missing_executor_callable() -> None:
+    value = valid_value()
+    registry, broker, _, _, _ = capabilities(value)
+
+    with pytest.raises(DynamicTeamleadA3RuntimeProviderError) as caught:
+        build_root_owned_dynamic_teamlead_start_port(
+            value, registry, broker, object()
+        )
+
+    assert caught.value.code == "invalid_dynamic_teamlead_a3_runtime_port"
+
+
+@pytest.mark.parametrize("position", ("registry", "broker"))
+def test_factory_rejects_nonconcrete_task_capability(position: str) -> None:
+    value = valid_value()
+    registry, broker, runner, _, _ = capabilities(value)
+    registry_argument = object() if position == "registry" else registry
+    broker_argument = object() if position == "broker" else broker
+
+    with pytest.raises(DynamicTeamleadA3RuntimeProviderError) as caught:
+        build_root_owned_dynamic_teamlead_start_port(
+            value,
+            registry_argument,  # type: ignore[arg-type]
+            broker_argument,  # type: ignore[arg-type]
+            runner,
+        )
+
+    assert caught.value.code == "invalid_dynamic_teamlead_a3_runtime_port"
+
+
+def test_consumed_executor_stays_terminal_across_repeated_factory_calls() -> None:
+    value = valid_value()
+    executor = OneShotRecordingExecutor()
+    first, _, _, exchange = build_port(value, executor=executor)
+    assert dynamic_teamlead_start(first)["status"] == "started"
+
+    second, _, _, _ = build_port(value, executor=executor)
+    with pytest.raises(RuntimeError, match="runner permit consumed"):
+        dynamic_teamlead_start(second)
+
+    assert len(executor.plans) == 1
+    assert len(exchange.requests) == 2
+
+
+def test_registry_conflict_fails_without_executor_or_legacy_fallback() -> None:
+    value = valid_value()
+    foreign_snapshot = replace(
+        value.request.snapshot,
+        accounts=(replace(value.request.snapshot.accounts[0], label="Conflict"),),
+    )
+    registry = FleetV2RegistryOperations(
+        InMemoryRegistryStore(foreign_snapshot), foreign_snapshot
+    )
+    _, broker, runner, _, exchange = capabilities(value)
+
+    with pytest.raises(DynamicTeamleadA3RuntimeProviderError) as caught:
+        build_root_owned_dynamic_teamlead_start_port(value, registry, broker, runner)
+
+    assert caught.value.code == "invalid_dynamic_teamlead_a3_runtime_port"
+    assert runner.plans == []
+    assert exchange.requests == []
+
+
+def test_malformed_broker_frame_fails_before_executor() -> None:
+    value = valid_value()
+    malformed = [ScmFrame(b"not-a-chpb-frame", ())]
+    port, runner, _, exchange = build_port(value, frames=malformed)
+
+    with pytest.raises(DynamicTeamleadCoordinatorError) as caught:
+        dynamic_teamlead_start(port)
+
+    assert caught.value.code is DynamicTeamleadCoordinatorCode.BROKER_TRANSACTION_FAILED
+    assert runner.plans == []
+    assert len(exchange.requests) == 1
+
+
+def test_executor_failure_propagates_without_legacy_fallback() -> None:
+    value = valid_value()
+    failure = RuntimeError("executor failed")
+    port, runner, _, exchange = build_port(
+        value, executor=RecordingExecutor(error=failure)
+    )
+
+    with pytest.raises(RuntimeError, match="executor failed"):
+        dynamic_teamlead_start(port)
+
+    assert len(runner.plans) == 1
+    assert len(exchange.requests) == 2
+
+
+@pytest.mark.parametrize("transfer", (copy.copy, copy.deepcopy, pickle.dumps))
+def test_port_rejects_transfer_and_does_not_log_executor(transfer) -> None:
+    port, _, _, _ = build_port(valid_value())
+
+    assert repr(port) == "<RootOwnedDynamicTeamleadStartPort redacted>"
+    with pytest.raises(DynamicTeamleadA3RuntimeProviderError) as caught:
+        transfer(port)
+
+    assert caught.value.code == "dynamic_teamlead_a3_runtime_port_nontransferable"
+
+
+def test_provider_ast_has_no_forbidden_runtime_boundary_imports_or_calls() -> None:
+    path = Path(__file__).parents[1] / (
+        "src/codex_master/dynamic_teamlead_a3_runtime_provider.py"
+    )
+    tree = ast.parse(path.read_text())
+    modules = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    } | {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    forbidden_modules = {
+        "os",
+        "socket",
+        "subprocess",
+        "codex_master.server",
+        "codex_master.fleet_root_system_bus",
+    }
+    calls = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    } | {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+
+    assert not modules & forbidden_modules
+    assert not calls & {
+        "open",
+        "connect",
+        "bind",
+        "listen",
+        "accept",
+        "send",
+        "recv",
+        "Popen",
+        "system",
+        "start_process",
+        "create_subprocess_exec",
+    }
