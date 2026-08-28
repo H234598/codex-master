@@ -305,7 +305,7 @@ def test_cli_plans_from_manager_snapshot_without_second_inventory_read(
     assert manager.closed is True
 
 
-def test_untrusted_private_evidence_can_preview_but_never_apply(
+def test_untrusted_private_evidence_blocks_apply_before_token_factory(
     tmp_path, monkeypatch, capsys
 ) -> None:
     path = _private_evidence_file(
@@ -371,8 +371,14 @@ def test_untrusted_private_evidence_can_preview_but_never_apply(
 
     store = Store()
     api = Api()
+
+    def mutating_token_factory(store_arg, *, account_ref, client_file):
+        store_arg.mutations += 1
+        return "opaque"
+
     monkeypatch.setattr(cli, "GoogleInventoryStore", lambda: store)
-    monkeypatch.setattr(cli, "_api", lambda *_: api)
+    monkeypatch.setattr(cli, "load_access_token", mutating_token_factory)
+    monkeypatch.setattr(cli, "GoogleCloudApi", lambda token: api)
     monkeypatch.setattr(cli, "GoogleAccountInventoryManager", Manager)
     arguments = build_parser().parse_args(
         [
@@ -391,8 +397,7 @@ def test_untrusted_private_evidence_can_preview_but_never_apply(
     with pytest.raises(GoogleCloudProvisionerError, match="quota_evidence_untrusted"):
         cli.run(arguments)
 
-    output = capsys.readouterr().out
-    assert '"apply_blocked_reason": "quota_evidence_untrusted"' in output
+    assert capsys.readouterr().out == ""
     assert api.creates == 0
     assert store.mutations == 0
 

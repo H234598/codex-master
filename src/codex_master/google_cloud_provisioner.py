@@ -36,6 +36,7 @@ class PlannedHiveProject:
     ref: str
     project_name: str
     project_id: str
+    expected_project_number: str | None
     key_display_name: str
 
 
@@ -69,6 +70,7 @@ class ProvisionReceipt:
 
 @dataclass(frozen=True, slots=True)
 class ProvisionPartialReceipt:
+    attempted: int
     completed: int
     planned: int
     failed: int
@@ -260,6 +262,7 @@ def build_fill_to_quota_plan(
                 ref=ref,
                 project_name=project_name,
                 project_id=project_id,
+                expected_project_number=project_number,
                 key_display_name=key_name,
             )
         )
@@ -297,6 +300,7 @@ def build_fill_to_quota_plan(
             ref=ref,
             project_name=identity.project_name,
             project_id=identity.project_id,
+            expected_project_number=None,
             key_display_name=pretty_key_display_name(identity.project_name),
         )
         planned.append(item)
@@ -319,6 +323,7 @@ def build_fill_to_quota_plan(
                 "ref": item.ref,
                 "project_name": item.project_name,
                 "project_id": item.project_id,
+                "expected_project_number": item.expected_project_number,
                 "key_display_name": item.key_display_name,
             }
             for item in planned
@@ -396,16 +401,15 @@ def _persist_created(
 ) -> None:
     def update(document: dict[str, object]) -> None:
         _validate_account_subject(document, plan)
+        if item.expected_project_number is not None:
+            raise GoogleCloudProvisionerError("provisioner.inventory_conflict")
         account = _account(document, plan.account_ref)
         projects = account.get("projects")
         if type(projects) is not list:
             raise GoogleCloudProvisionerError("provisioner.inventory_invalid")
         existing = _find_project(document, plan.account_ref, item.ref)
         if existing is not None:
-            _validate_project_identity(existing, item, project_number)
-            if existing.get("status") != "provisioning":
-                raise GoogleCloudProvisionerError("provisioner.inventory_conflict")
-            return
+            raise GoogleCloudProvisionerError("provisioner.inventory_conflict")
         projects.append(
             {
                 "ref": item.ref,
@@ -423,6 +427,22 @@ def _persist_created(
         )
 
     store.atomic_update(update)
+
+
+def _partial_failure(
+    code: str, *, attempted: int, completed: int, planned: int
+) -> GoogleCloudProvisionerError:
+    return GoogleCloudProvisionerError(
+        code,
+        partial=ProvisionPartialReceipt(
+            attempted=attempted,
+            completed=completed,
+            planned=planned,
+            failed=int(attempted > completed),
+            not_attempted=max(planned - attempted, 0),
+            reason_code=code,
+        ),
+    )
 
 
 def _persist_services(
@@ -502,9 +522,20 @@ def execute_fill_to_quota_plan(
     if type(plan) is not FillToQuotaPlan or confirmed_fingerprint != plan.fingerprint:
         raise GoogleCloudProvisionerError("provisioner.confirmation_invalid")
     completed = 0
+    attempted = 0
+    planned = len(plan.projects)
     try:
-        if api.subject_id() != plan.expected_subject_id:
-            raise GoogleCloudProvisionerError("provisioner.subject_mismatch")
+        subject_id = api.subject_id()
+    except GoogleCloudApiError:
+        raise _partial_failure(
+            "provisioner.setup_retryable",
+            attempted=attempted,
+            completed=completed,
+            planned=planned,
+        ) from None
+    if subject_id != plan.expected_subject_id:
+        raise GoogleCloudProvisionerError("provisioner.subject_mismatch")
+    try:
         try:
             current_generation, current_fingerprint = current_inventory()
             current_now = now()
@@ -520,67 +551,83 @@ def execute_fill_to_quota_plan(
             now=current_now,
         )
         for item in plan.projects:
+            attempted += 1
             document = store._read()[1]
             _validate_account_subject(document, plan)
             project = _find_project(document, plan.account_ref, item.ref)
             if project is None:
-                response = api.create_project(item.project_id, item.project_name)
+                if item.expected_project_number is not None:
+                    raise GoogleCloudProvisionerError("provisioner.inventory_conflict")
+                try:
+                    response = api.create_project(item.project_id, item.project_name)
+                except GoogleCloudApiError as error:
+                    code = (
+                        "quota.provider_exhausted"
+                        if error.code == "google.api_quota_exhausted"
+                        else "provisioner.project_create_failed"
+                    )
+                    raise _partial_failure(
+                        code,
+                        attempted=attempted,
+                        completed=completed,
+                        planned=planned,
+                    ) from None
                 number = _project_number(response)
                 _persist_created(store, plan, item, number)
                 status = "provisioning"
             else:
-                if (
-                    project.get("project_name") != item.project_name
-                    or project.get("project_id") != item.project_id
-                    or project.get("key_name") != item.key_display_name
-                    or project.get("purpose") != "hive"
-                    or project.get("status")
-                    not in {"provisioning", "services_enabled", "active"}
-                ):
+                expected_number = item.expected_project_number
+                if expected_number is None:
                     raise GoogleCloudProvisionerError("provisioner.inventory_conflict")
-                number = project.get("project_number")
-                if type(number) is not str or not number:
-                    raise GoogleCloudProvisionerError("provisioner.inventory_invalid")
+                _validate_project_identity(project, item, expected_number)
+                number = expected_number
+                if project.get("status") not in {
+                    "provisioning",
+                    "services_enabled",
+                    "active",
+                }:
+                    raise GoogleCloudProvisionerError("provisioner.inventory_conflict")
                 status = project["status"]
             if status == "active":
                 completed += 1
                 continue
             if status == "provisioning":
-                api.enable_required_services(number)
+                try:
+                    api.enable_required_services(number)
+                except GoogleCloudApiError:
+                    raise _partial_failure(
+                        "provisioner.services_retryable",
+                        attempted=attempted,
+                        completed=completed,
+                        planned=planned,
+                    ) from None
                 _persist_services(store, plan, item, number)
-            matches = [
-                key
-                for key in api.list_keys(number)
-                if key.get("displayName") == item.key_display_name
-                and key.get("restrictions")
-                == {"apiTargets": [{"service": "generativelanguage.googleapis.com"}]}
-            ]
-            if len(matches) > 1:
-                raise GoogleCloudProvisionerError("provisioner.inventory_conflict")
-            if matches:
-                key = matches[0]
-                key["keyString"] = api.get_key_string(str(key.get("name", "")))
-            else:
-                key = api.create_restricted_key(number, item.key_display_name)
+            try:
+                matches = [
+                    key
+                    for key in api.list_keys(number)
+                    if key.get("displayName") == item.key_display_name
+                    and key.get("restrictions")
+                    == {
+                        "apiTargets": [{"service": "generativelanguage.googleapis.com"}]
+                    }
+                ]
+                if len(matches) > 1:
+                    raise GoogleCloudProvisionerError("provisioner.inventory_conflict")
+                if matches:
+                    key = matches[0]
+                    key["keyString"] = api.get_key_string(str(key.get("name", "")))
+                else:
+                    key = api.create_restricted_key(number, item.key_display_name)
+            except GoogleCloudApiError:
+                raise _partial_failure(
+                    "provisioner.api_key_retryable",
+                    attempted=attempted,
+                    completed=completed,
+                    planned=planned,
+                ) from None
             _persist_key(store, plan, item, number, key)
             completed += 1
-        return ProvisionReceipt(completed=completed, planned=len(plan.projects))
+        return ProvisionReceipt(completed=completed, planned=planned)
     except GoogleCloudProvisionerError:
         raise
-    except GoogleCloudApiError as error:
-        if error.code == "google.api_quota_exhausted":
-            failed = int(completed < len(plan.projects))
-            raise GoogleCloudProvisionerError(
-                "quota.provider_exhausted",
-                partial=ProvisionPartialReceipt(
-                    completed=completed,
-                    planned=len(plan.projects),
-                    failed=failed,
-                    not_attempted=max(
-                        len(plan.projects) - completed - failed,
-                        0,
-                    ),
-                    reason_code="quota.provider_exhausted",
-                ),
-            ) from None
-        raise GoogleCloudProvisionerError("provisioner.google_failed") from None

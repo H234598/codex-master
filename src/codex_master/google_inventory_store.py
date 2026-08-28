@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import copy
+import fcntl
 import os
 from pathlib import Path
 import stat
@@ -156,6 +157,39 @@ class GoogleInventoryStore:
     def atomic_update(
         self, transform: Callable[[dict[str, object]], None]
     ) -> GoogleInventoryStoreReceipt:
+        path = self._path
+        lock_fd: int | None = None
+        try:
+            lock_fd = os.open(
+                path.parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            opened_parent = os.fstat(lock_fd)
+            current_parent = os.lstat(path.parent)
+            if (
+                not stat.S_ISDIR(opened_parent.st_mode)
+                or opened_parent.st_uid != os.geteuid()
+                or bool(stat.S_IMODE(opened_parent.st_mode) & 0o022)
+                or (opened_parent.st_dev, opened_parent.st_ino)
+                != (current_parent.st_dev, current_parent.st_ino)
+            ):
+                _raise("inventory.store_permissions")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            return self._atomic_update_locked(transform)
+        except GoogleInventoryStoreError:
+            raise
+        except OSError:
+            _raise("inventory.store_unavailable")
+        finally:
+            if lock_fd is not None:
+                try:
+                    os.close(lock_fd)
+                except OSError:
+                    pass
+
+    def _atomic_update_locked(
+        self, transform: Callable[[dict[str, object]], None]
+    ) -> GoogleInventoryStoreReceipt:
         original, loaded = self._read()
         candidate = copy.deepcopy(loaded)
         try:
@@ -202,7 +236,9 @@ class GoogleInventoryStore:
             os.fsync(temporary_fd)
             os.close(temporary_fd)
             temporary_fd = None
-            os.replace(temporary.name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            os.replace(
+                temporary.name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd
+            )
             replaced = True
             os.fsync(parent_fd)
         except OSError:

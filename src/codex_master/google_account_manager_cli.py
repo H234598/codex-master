@@ -170,6 +170,8 @@ def _provision_document(
 
 
 def run(arguments: argparse.Namespace) -> int:
+    if arguments.command == "provision" and arguments.yes:
+        raise GoogleCloudProvisionerError("quota_evidence_untrusted")
     store = GoogleInventoryStore()
     if arguments.command == "oauth-authorize":
         receipt = authorize_google_account(
@@ -258,8 +260,6 @@ def run(arguments: argparse.Namespace) -> int:
                     sort_keys=True,
                 )
             )
-            if arguments.yes:
-                raise GoogleCloudProvisionerError("quota_evidence_untrusted")
             return 2
         finally:
             manager.close()

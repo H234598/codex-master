@@ -163,6 +163,27 @@ class FakeApi:
         }
 
 
+class PhaseFailApi(FakeApi):
+    def __init__(self, phase: str) -> None:
+        super().__init__()
+        self.phase = phase
+
+    def subject_id(self):
+        if self.phase == "setup":
+            raise GoogleCloudApiError("google.api_quota_exhausted")
+        return super().subject_id()
+
+    def enable_required_services(self, project_number):
+        if self.phase == "services":
+            raise GoogleCloudApiError("google.api_quota_exhausted")
+        return super().enable_required_services(project_number)
+
+    def list_keys(self, project_number):
+        if self.phase == "api_key":
+            raise GoogleCloudApiError("google.api_quota_exhausted")
+        return super().list_keys(project_number)
+
+
 def test_plan_uses_fresh_provider_quota_above_ten_and_global_refs() -> None:
     plan = build_fill_to_quota_plan(
         _document(),
@@ -289,11 +310,77 @@ def test_first_create_failure_stops_remaining_batch_without_rollback() -> None:
     assert len(api.keys) == 1
     assert store.writes == 3
     assert caught.value.partial == ProvisionPartialReceipt(
+        attempted=2,
         completed=1,
         planned=3,
         failed=1,
         not_attempted=1,
         reason_code="quota.provider_exhausted",
+    )
+
+
+@pytest.mark.parametrize(
+    ("phase", "reason_code"),
+    [
+        ("services", "provisioner.services_retryable"),
+        ("api_key", "provisioner.api_key_retryable"),
+    ],
+)
+def test_non_create_429_keeps_phase_and_exact_partial_counts(
+    phase: str, reason_code: str
+) -> None:
+    document = _document()
+    plan = build_fill_to_quota_plan(
+        document,
+        account_ref="google-account-01",
+        expected_subject_id="subject-one",
+        quota_evidence=_evidence(3),
+        inventory_generation=INVENTORY_GENERATION,
+        inventory_fingerprint=INVENTORY_FINGERPRINT,
+        now=NOW,
+        visible_project_names=set(),
+        reserved_project_ids=set(),
+    )
+
+    with pytest.raises(GoogleCloudProvisionerError, match=reason_code) as caught:
+        _execute(plan, api=PhaseFailApi(phase), store=MemoryStore(document))
+
+    assert caught.value.partial == ProvisionPartialReceipt(
+        attempted=1,
+        completed=0,
+        planned=3,
+        failed=1,
+        not_attempted=2,
+        reason_code=reason_code,
+    )
+
+
+def test_setup_429_attempts_no_project_and_keeps_setup_phase() -> None:
+    document = _document()
+    plan = build_fill_to_quota_plan(
+        document,
+        account_ref="google-account-01",
+        expected_subject_id="subject-one",
+        quota_evidence=_evidence(3),
+        inventory_generation=INVENTORY_GENERATION,
+        inventory_fingerprint=INVENTORY_FINGERPRINT,
+        now=NOW,
+        visible_project_names=set(),
+        reserved_project_ids=set(),
+    )
+
+    with pytest.raises(
+        GoogleCloudProvisionerError, match="provisioner.setup_retryable"
+    ) as caught:
+        _execute(plan, api=PhaseFailApi("setup"), store=MemoryStore(document))
+
+    assert caught.value.partial == ProvisionPartialReceipt(
+        attempted=0,
+        completed=0,
+        planned=3,
+        failed=0,
+        not_attempted=3,
+        reason_code="provisioner.setup_retryable",
     )
 
 
@@ -329,6 +416,8 @@ def test_plan_resumes_partial_projects_before_using_current_quota() -> None:
 
     assert len(plan.projects) == 3
     assert plan.projects[0].ref == "the-hive-41"
+    assert plan.projects[0].expected_project_number == "200041"
+    assert plan.projects[1].expected_project_number is None
     assert plan.projects[1].ref == "the-hive-42"
     assert plan.projects[2].ref == "the-hive-43"
 
@@ -533,6 +622,58 @@ def test_restart_same_generation_changed_inventory_fingerprint_rejects_old_evide
             visible_project_names=set(),
             reserved_project_ids=set(),
         )
+
+
+def test_resume_project_number_is_bound_to_plan_and_fingerprint() -> None:
+    original = _document()
+    partial = {
+        "ref": "the-hive-41",
+        "purpose": "hive",
+        "project_name": "Calmbright Robinfield",
+        "billing_account_ref": None,
+        "status": "services_enabled",
+        "project_id": "calmbright-robinfield-a1b2c3",
+        "project_number": "200041",
+        "key_id": None,
+        "key_uid": None,
+        "key_name": "Calmbright Robinfield Key",
+        "secret": None,
+    }
+    original["google_accounts"][0]["projects"].append(partial)
+    plan = build_fill_to_quota_plan(
+        original,
+        account_ref="google-account-01",
+        expected_subject_id="subject-one",
+        quota_evidence=_evidence(0),
+        inventory_generation=INVENTORY_GENERATION,
+        inventory_fingerprint=INVENTORY_FINGERPRINT,
+        now=NOW,
+        visible_project_names={"Calmbright Robinfield"},
+        reserved_project_ids={"calmbright-robinfield-a1b2c3"},
+    )
+    changed = copy.deepcopy(original)
+    changed["google_accounts"][0]["projects"][-1]["project_number"] = "999999"
+    changed_plan = build_fill_to_quota_plan(
+        changed,
+        account_ref="google-account-01",
+        expected_subject_id="subject-one",
+        quota_evidence=_evidence(0),
+        inventory_generation=INVENTORY_GENERATION,
+        inventory_fingerprint=INVENTORY_FINGERPRINT,
+        now=NOW,
+        visible_project_names={"Calmbright Robinfield"},
+        reserved_project_ids={"calmbright-robinfield-a1b2c3"},
+    )
+    api = FakeApi()
+
+    with pytest.raises(
+        GoogleCloudProvisionerError, match="provisioner.inventory_conflict"
+    ):
+        _execute(plan, api=api, store=MemoryStore(changed))
+
+    assert changed_plan.fingerprint != plan.fingerprint
+    assert api.enabled == []
+    assert api.keys == []
 
 
 @pytest.mark.parametrize(
