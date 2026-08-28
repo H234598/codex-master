@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
 import re
-from typing import Collection, Protocol
+from typing import Collection, Protocol, cast
 
 from .google_cloud_api import GoogleCloudApiError
 from .google_project_naming import (
@@ -36,10 +37,21 @@ class PlannedHiveProject:
 
 
 @dataclass(frozen=True, slots=True)
+class GoogleQuotaEvidenceV1:
+    remaining: int
+    observed_at: str
+    source: str
+    account_ref: str
+    inventory_generation: int
+
+
+@dataclass(frozen=True, slots=True)
 class FillToQuotaPlan:
     account_ref: str
     expected_subject_id: str
     quota_remaining: int
+    quota_evidence: GoogleQuotaEvidenceV1
+    inventory_generation: int
     projects: tuple[PlannedHiveProject, ...]
     fingerprint: str
 
@@ -52,7 +64,9 @@ class ProvisionReceipt:
 
 class _Api(Protocol):
     def subject_id(self) -> str: ...
-    def create_project(self, project_id: str, project_name: str) -> dict[str, object]: ...
+    def create_project(
+        self, project_id: str, project_name: str
+    ) -> dict[str, object]: ...
     def enable_required_services(self, project_number: str) -> dict[str, object]: ...
     def list_keys(self, project_number: str) -> list[dict[str, object]]: ...
     def get_key_string(self, key_name: str) -> str: ...
@@ -64,6 +78,58 @@ class _Api(Protocol):
 class _Store(Protocol):
     def _read(self) -> tuple[bytes, dict[str, object]]: ...
     def atomic_update(self, transform) -> object: ...
+
+
+_QUOTA_SOURCES = frozenset({"cloudresourcemanager"})
+_MAX_QUOTA_REMAINING = 10_000
+_MAX_QUOTA_AGE = timedelta(minutes=5)
+_MAX_QUOTA_FUTURE_SKEW = timedelta(seconds=30)
+_UTC_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
+
+
+def _utc_timestamp(value: object) -> datetime:
+    if type(value) is not str or _UTC_TIMESTAMP.fullmatch(value) is None:
+        raise GoogleCloudProvisionerError("quota.evidence_invalid")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except ValueError:
+        raise GoogleCloudProvisionerError("quota.evidence_invalid") from None
+    if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
+        raise GoogleCloudProvisionerError("quota.evidence_invalid")
+    return parsed
+
+
+def _validate_quota_evidence(
+    evidence: object,
+    *,
+    account_ref: str,
+    inventory_generation: int,
+    now: object,
+) -> GoogleQuotaEvidenceV1:
+    if (
+        type(evidence) is not GoogleQuotaEvidenceV1
+        or type(evidence.remaining) is not int
+        or not 0 <= evidence.remaining <= _MAX_QUOTA_REMAINING
+        or type(evidence.account_ref) is not str
+        or not evidence.account_ref
+        or len(evidence.account_ref.encode("utf-8")) > 256
+        or type(evidence.inventory_generation) is not int
+        or not 1 <= evidence.inventory_generation <= 2**63 - 1
+    ):
+        raise GoogleCloudProvisionerError("quota.evidence_invalid")
+    if type(evidence.source) is not str or evidence.source not in _QUOTA_SOURCES:
+        raise GoogleCloudProvisionerError("quota.evidence_source_invalid")
+    observed_at = _utc_timestamp(evidence.observed_at)
+    now_utc = _utc_timestamp(now)
+    if evidence.account_ref != account_ref:
+        raise GoogleCloudProvisionerError("quota.evidence_account_mismatch")
+    if evidence.inventory_generation != inventory_generation:
+        raise GoogleCloudProvisionerError("quota.evidence_generation_mismatch")
+    if observed_at > now_utc + _MAX_QUOTA_FUTURE_SKEW:
+        raise GoogleCloudProvisionerError("quota.evidence_future")
+    if now_utc - observed_at > _MAX_QUOTA_AGE:
+        raise GoogleCloudProvisionerError("quota.evidence_stale")
+    return evidence
 
 
 def _account(document: dict[str, object], account_ref: str) -> dict[str, object]:
@@ -92,7 +158,9 @@ def build_fill_to_quota_plan(
     *,
     account_ref: str,
     expected_subject_id: str,
-    quota_remaining: int,
+    quota_evidence: GoogleQuotaEvidenceV1,
+    inventory_generation: int,
+    now: str,
     visible_project_names: Collection[str],
     reserved_project_ids: Collection[str],
 ) -> FillToQuotaPlan:
@@ -101,23 +169,32 @@ def build_fill_to_quota_plan(
         or not account_ref
         or type(expected_subject_id) is not str
         or not expected_subject_id
-        or type(quota_remaining) is not int
-        or not 0 <= quota_remaining <= 10_000
+        or type(inventory_generation) is not int
+        or not 1 <= inventory_generation <= 2**63 - 1
     ):
         raise GoogleCloudProvisionerError("provisioner.plan_invalid")
+    evidence = _validate_quota_evidence(
+        quota_evidence,
+        account_ref=account_ref,
+        inventory_generation=inventory_generation,
+        now=now,
+    )
     account = _account(document, account_ref)
     if account.get("subject_id") != expected_subject_id:
         raise GoogleCloudProvisionerError("provisioner.subject_mismatch")
-    accounts = document.get("google_accounts", [])
-    refs = [
+    accounts = document.get("google_accounts")
+    if type(accounts) is not list:
+        raise GoogleCloudProvisionerError("provisioner.inventory_invalid")
+    raw_refs = [
         project.get("ref")
         for item in accounts
         if type(item) is dict
         for project in item.get("projects", [])
         if type(project) is dict
     ]
-    if any(type(ref) is not str for ref in refs):
+    if any(type(ref) is not str for ref in raw_refs):
         raise GoogleCloudProvisionerError("provisioner.inventory_invalid")
+    refs = cast(list[str], raw_refs)
     names = set(visible_project_names)
     project_ids = set(reserved_project_ids)
     projects = account.get("projects")
@@ -160,10 +237,32 @@ def build_fill_to_quota_plan(
         )
         names.add(project_name)
         project_ids.add(project_id)
-    for _ in range(quota_remaining):
+    naming_seed = sha256(
+        json.dumps(
+            {
+                "account_ref": account_ref,
+                "expected_subject_id": expected_subject_id,
+                "quota_evidence": {
+                    "remaining": evidence.remaining,
+                    "observed_at": evidence.observed_at,
+                    "source": evidence.source,
+                    "account_ref": evidence.account_ref,
+                    "inventory_generation": evidence.inventory_generation,
+                },
+                "refs": sorted(refs),
+                "visible_project_names": sorted(names),
+                "reserved_project_ids": sorted(project_ids),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).digest()
+    for _ in range(evidence.remaining):
         ref = next_hive_ref(refs)
         identity = generate_pretty_project_identity(
-            visible_names=names, reserved_project_ids=project_ids
+            visible_names=names,
+            reserved_project_ids=project_ids,
+            entropy=sha256(naming_seed + ref.encode("ascii")).digest(),
         )
         item = PlannedHiveProject(
             ref=ref,
@@ -178,7 +277,13 @@ def build_fill_to_quota_plan(
     payload = {
         "account_ref": account_ref,
         "expected_subject_id": expected_subject_id,
-        "quota_remaining": quota_remaining,
+        "quota_evidence": {
+            "remaining": evidence.remaining,
+            "observed_at": evidence.observed_at,
+            "source": evidence.source,
+            "account_ref": evidence.account_ref,
+            "inventory_generation": evidence.inventory_generation,
+        },
         "projects": [
             {
                 "ref": item.ref,
@@ -189,13 +294,18 @@ def build_fill_to_quota_plan(
             for item in planned
         ],
     }
-    fingerprint = "sha256:" + sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    fingerprint = (
+        "sha256:"
+        + sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    )
     return FillToQuotaPlan(
         account_ref=account_ref,
         expected_subject_id=expected_subject_id,
-        quota_remaining=quota_remaining,
+        quota_remaining=evidence.remaining,
+        quota_evidence=evidence,
+        inventory_generation=inventory_generation,
         projects=tuple(planned),
         fingerprint=fingerprint,
     )
@@ -216,7 +326,9 @@ def _find_project(document: dict[str, object], account_ref: str, ref: str):
     projects = account.get("projects")
     if type(projects) is not list:
         raise GoogleCloudProvisionerError("provisioner.inventory_invalid")
-    matches = [item for item in projects if type(item) is dict and item.get("ref") == ref]
+    matches = [
+        item for item in projects if type(item) is dict and item.get("ref") == ref
+    ]
     if len(matches) > 1:
         raise GoogleCloudProvisionerError("provisioner.inventory_invalid")
     return matches[0] if matches else None
@@ -233,7 +345,9 @@ def _persist_created(
         projects = account.get("projects")
         if type(projects) is not list:
             raise GoogleCloudProvisionerError("provisioner.inventory_invalid")
-        if any(type(value) is dict and value.get("ref") == item.ref for value in projects):
+        if any(
+            type(value) is dict and value.get("ref") == item.ref for value in projects
+        ):
             return
         projects.append(
             {
@@ -254,7 +368,9 @@ def _persist_created(
     store.atomic_update(update)
 
 
-def _persist_services(store: _Store, plan: FillToQuotaPlan, item: PlannedHiveProject) -> None:
+def _persist_services(
+    store: _Store, plan: FillToQuotaPlan, item: PlannedHiveProject
+) -> None:
     def update(document: dict[str, object]) -> None:
         project = _find_project(document, plan.account_ref, item.ref)
         if project is None:
@@ -341,11 +457,7 @@ def execute_fill_to_quota_plan(
                 for key in api.list_keys(number)
                 if key.get("displayName") == item.key_display_name
                 and key.get("restrictions")
-                == {
-                    "apiTargets": [
-                        {"service": "generativelanguage.googleapis.com"}
-                    ]
-                }
+                == {"apiTargets": [{"service": "generativelanguage.googleapis.com"}]}
             ]
             if len(matches) > 1:
                 raise GoogleCloudProvisionerError("provisioner.inventory_conflict")

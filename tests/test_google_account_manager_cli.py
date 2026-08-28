@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import os
+from types import SimpleNamespace
+import time
+
 import pytest
 
-from codex_master.google_account_manager_cli import build_parser
+from codex_master import google_account_manager_cli as cli
+from codex_master.google_account_manager_cli import _load_quota_evidence, build_parser
+from codex_master.google_cloud_provisioner import GoogleCloudProvisionerError
 
 
-def test_cli_has_inventory_oauth_rename_and_dynamic_quota_only() -> None:
+def test_cli_has_inventory_oauth_rename_and_private_quota_evidence_only() -> None:
     parser = build_parser()
 
     oauth = parser.parse_args(
@@ -24,7 +30,13 @@ def test_cli_has_inventory_oauth_rename_and_dynamic_quota_only() -> None:
     assert oauth.browser_debug_port == 9241
 
     inventory = parser.parse_args(
-        ["inventory", "--account", "google-account-01", "--client-file", "/private/client.json"]
+        [
+            "inventory",
+            "--account",
+            "google-account-01",
+            "--client-file",
+            "/private/client.json",
+        ]
     )
     assert inventory.command == "inventory"
 
@@ -36,12 +48,26 @@ def test_cli_has_inventory_oauth_rename_and_dynamic_quota_only() -> None:
             "--client-file",
             "/private/client.json",
             "--fill-to-quota",
-            "--quota-remaining",
-            "37",
+            "--quota-evidence-file",
+            "/private/quota.json",
         ]
     )
     assert provision.fill_to_quota is True
-    assert provision.quota_remaining == 37
+    assert provision.quota_evidence_file.as_posix() == "/private/quota.json"
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "provision",
+                "--account",
+                "google-account-01",
+                "--client-file",
+                "/private/client.json",
+                "--fill-to-quota",
+                "--quota-remaining",
+                "37",
+            ]
+        )
 
     with pytest.raises(SystemExit):
         parser.parse_args(
@@ -55,3 +81,226 @@ def test_cli_has_inventory_oauth_rename_and_dynamic_quota_only() -> None:
                 "10",
             ]
         )
+
+
+def _private_evidence_file(tmp_path, payload: str):
+    path = tmp_path / "quota.json"
+    path.write_text(payload, encoding="utf-8")
+    path.chmod(0o600)
+    return path
+
+
+def test_private_quota_evidence_file_loads_exact_schema(tmp_path) -> None:
+    path = _private_evidence_file(
+        tmp_path,
+        '{"remaining":23,"observed_at":"2026-08-28T12:00:00Z",'
+        '"source":"cloudresourcemanager","account_ref":"google-account-01",'
+        '"inventory_generation":7}',
+    )
+
+    evidence = _load_quota_evidence(path)
+
+    assert evidence.remaining == 23
+    assert evidence.inventory_generation == 7
+    assert "secret" not in repr(evidence).casefold()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"remaining":1,"remaining":2,"observed_at":"2026-08-28T12:00:00Z",'
+        '"source":"cloudresourcemanager","account_ref":"google-account-01",'
+        '"inventory_generation":7}',
+        '{"remaining":NaN,"observed_at":"2026-08-28T12:00:00Z",'
+        '"source":"cloudresourcemanager","account_ref":"google-account-01",'
+        '"inventory_generation":7}',
+        '{"remaining":null,"observed_at":"2026-08-28T12:00:00Z",'
+        '"source":"cloudresourcemanager","account_ref":"google-account-01",'
+        '"inventory_generation":7}',
+        '{"remaining":1,"observed_at":"2026-08-28T12:00:00Z",'
+        '"source":"cloudresourcemanager","account_ref":"google-account-01",'
+        '"inventory_generation":7,"access_token":"private-secret"}',
+    ],
+)
+def test_private_quota_evidence_file_rejects_ambiguous_or_extra_data(
+    tmp_path, payload: str
+) -> None:
+    path = _private_evidence_file(tmp_path, payload)
+
+    with pytest.raises(
+        GoogleCloudProvisionerError, match="quota.evidence_file_invalid"
+    ):
+        _load_quota_evidence(path)
+
+
+def test_private_quota_evidence_file_rejects_unsafe_file_and_oversize(tmp_path) -> None:
+    unsafe = _private_evidence_file(tmp_path, "{}")
+    unsafe.chmod(0o644)
+    with pytest.raises(
+        GoogleCloudProvisionerError, match="quota.evidence_file_invalid"
+    ):
+        _load_quota_evidence(unsafe)
+
+    target = _private_evidence_file(tmp_path, "{}")
+    link = tmp_path / "quota-link.json"
+    os.symlink(target, link)
+    with pytest.raises(
+        GoogleCloudProvisionerError, match="quota.evidence_file_invalid"
+    ):
+        _load_quota_evidence(link)
+
+    oversized = _private_evidence_file(tmp_path, " " * 16_385)
+    with pytest.raises(
+        GoogleCloudProvisionerError, match="quota.evidence_file_invalid"
+    ):
+        _load_quota_evidence(oversized)
+
+
+def test_cli_binds_evidence_to_current_manager_generation_before_provider_search(
+    tmp_path, monkeypatch
+) -> None:
+    path = _private_evidence_file(
+        tmp_path,
+        json_payload(
+            remaining=1,
+            observed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            inventory_generation=2,
+        ),
+    )
+
+    class Store:
+        def _read(self):
+            return b"", {
+                "google_accounts": [
+                    {
+                        "ref": "google-account-01",
+                        "subject_id": "subject-one",
+                    }
+                ]
+            }
+
+    class Api:
+        searches = 0
+
+        def subject_id(self):
+            return "subject-one"
+
+        def search_projects(self):
+            self.searches += 1
+            return []
+
+    class Manager:
+        closed = False
+
+        def reload(self):
+            return None
+
+        def _snapshot_for_internal_use(self):
+            account = SimpleNamespace(subject_id="subject-one")
+            return SimpleNamespace(
+                generation=1,
+                by_account_ref={"google-account-01": account},
+            )
+
+        def close(self):
+            self.closed = True
+
+    api = Api()
+    manager = Manager()
+    monkeypatch.setattr(cli, "GoogleInventoryStore", Store)
+    monkeypatch.setattr(cli, "_api", lambda *_: api)
+    monkeypatch.setattr(cli, "GoogleAccountInventoryManager", lambda: manager)
+    arguments = build_parser().parse_args(
+        [
+            "provision",
+            "--account",
+            "google-account-01",
+            "--client-file",
+            "/private/client.json",
+            "--fill-to-quota",
+            "--quota-evidence-file",
+            str(path),
+        ]
+    )
+
+    with pytest.raises(
+        GoogleCloudProvisionerError, match="quota.evidence_generation_mismatch"
+    ):
+        cli.run(arguments)
+
+    assert api.searches == 0
+    assert manager.closed is True
+
+
+def test_cli_plans_from_manager_snapshot_without_second_inventory_read(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    path = _private_evidence_file(
+        tmp_path,
+        json_payload(
+            remaining=1,
+            observed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            inventory_generation=1,
+        ),
+    )
+
+    class Store:
+        def _read(self):
+            raise AssertionError("raw inventory reread")
+
+    class Api:
+        def subject_id(self):
+            return "subject-one"
+
+        def search_projects(self):
+            return []
+
+    account = SimpleNamespace(
+        ref="google-account-01", subject_id="subject-one", projects=()
+    )
+    snapshot = SimpleNamespace(
+        generation=1,
+        accounts=(account,),
+        by_account_ref={"google-account-01": account},
+    )
+
+    class Manager:
+        closed = False
+
+        def reload(self):
+            return None
+
+        def _snapshot_for_internal_use(self):
+            return snapshot
+
+        def close(self):
+            self.closed = True
+
+    manager = Manager()
+    monkeypatch.setattr(cli, "GoogleInventoryStore", Store)
+    monkeypatch.setattr(cli, "_api", lambda *_: Api())
+    monkeypatch.setattr(cli, "GoogleAccountInventoryManager", lambda: manager)
+    arguments = build_parser().parse_args(
+        [
+            "provision",
+            "--account",
+            "google-account-01",
+            "--client-file",
+            "/private/client.json",
+            "--fill-to-quota",
+            "--quota-evidence-file",
+            str(path),
+        ]
+    )
+
+    assert cli.run(arguments) == 2
+    assert '"planned_projects": 1' in capsys.readouterr().out
+    assert manager.closed is True
+
+
+def json_payload(*, remaining: int, observed_at: str, inventory_generation: int) -> str:
+    return (
+        f'{{"remaining":{remaining},"observed_at":"{observed_at}",'
+        '"source":"cloudresourcemanager","account_ref":"google-account-01",'
+        f'"inventory_generation":{inventory_generation}}}'
+    )

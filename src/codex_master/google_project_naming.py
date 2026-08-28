@@ -3,30 +3,119 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 import re
 import secrets
 from typing import Collection, Iterable
 
 
 _ADJECTIVE_STEMS = (
-    "Amber", "Azure", "Bright", "Calm", "Clear", "Cobalt", "Coral", "Cosmic",
-    "Crimson", "Dawn", "Emerald", "Gentle", "Golden", "Happy", "Indigo", "Ivory",
-    "Jade", "Kind", "Lilac", "Lively", "Lucid", "Lunar", "Mellow", "Misty",
-    "Noble", "Quiet", "Radiant", "Silver", "Solar", "Sunny", "Swift", "Tender",
-    "Velvet", "Verdant", "Violet", "Warm", "Wild", "Wise", "Witty", "Young",
+    "Amber",
+    "Azure",
+    "Bright",
+    "Calm",
+    "Clear",
+    "Cobalt",
+    "Coral",
+    "Cosmic",
+    "Crimson",
+    "Dawn",
+    "Emerald",
+    "Gentle",
+    "Golden",
+    "Happy",
+    "Indigo",
+    "Ivory",
+    "Jade",
+    "Kind",
+    "Lilac",
+    "Lively",
+    "Lucid",
+    "Lunar",
+    "Mellow",
+    "Misty",
+    "Noble",
+    "Quiet",
+    "Radiant",
+    "Silver",
+    "Solar",
+    "Sunny",
+    "Swift",
+    "Tender",
+    "Velvet",
+    "Verdant",
+    "Violet",
+    "Warm",
+    "Wild",
+    "Wise",
+    "Witty",
+    "Young",
 )
 _NOUN_STEMS = (
-    "Aurora", "Badger", "Bay", "Birch", "Breeze", "Brook", "Cedar", "Cloud",
-    "Comet", "Cove", "Dahlia", "Dawn", "Delta", "Dune", "Echo", "Falcon",
-    "Fern", "Forest", "Grove", "Harbor", "Heron", "Hill", "Iris", "Island",
-    "Juniper", "Lake", "Lark", "Maple", "Meadow", "Moon", "Nova", "Ocean",
-    "Orchid", "Otter", "Pine", "River", "Robin", "Sage", "Sky", "Sparrow",
+    "Aurora",
+    "Badger",
+    "Bay",
+    "Birch",
+    "Breeze",
+    "Brook",
+    "Cedar",
+    "Cloud",
+    "Comet",
+    "Cove",
+    "Dahlia",
+    "Dawn",
+    "Delta",
+    "Dune",
+    "Echo",
+    "Falcon",
+    "Fern",
+    "Forest",
+    "Grove",
+    "Harbor",
+    "Heron",
+    "Hill",
+    "Iris",
+    "Island",
+    "Juniper",
+    "Lake",
+    "Lark",
+    "Maple",
+    "Meadow",
+    "Moon",
+    "Nova",
+    "Ocean",
+    "Orchid",
+    "Otter",
+    "Pine",
+    "River",
+    "Robin",
+    "Sage",
+    "Sky",
+    "Sparrow",
 )
 _ADJECTIVE_ENDINGS = (
-    "bloom", "bright", "calm", "glow", "light", "mist", "song", "soft", "warm", "wise",
+    "bloom",
+    "bright",
+    "calm",
+    "glow",
+    "light",
+    "mist",
+    "song",
+    "soft",
+    "warm",
+    "wise",
 )
 _NOUN_ENDINGS = (
-    "bay", "brook", "cove", "field", "glen", "grove", "haven", "mead", "ridge", "wood",
+    "bay",
+    "brook",
+    "cove",
+    "field",
+    "glen",
+    "grove",
+    "haven",
+    "mead",
+    "ridge",
+    "wood",
 )
 _ADJECTIVES = tuple(
     stem + ending for stem in _ADJECTIVE_STEMS for ending in _ADJECTIVE_ENDINGS
@@ -46,17 +135,41 @@ class GoogleProjectIdentity:
 
 
 def generate_pretty_project_identity(
-    *, visible_names: Collection[str], reserved_project_ids: Collection[str]
+    *,
+    visible_names: Collection[str],
+    reserved_project_ids: Collection[str],
+    entropy: bytes | None = None,
 ) -> GoogleProjectIdentity:
     """Generate unrelated display and technical identities without internal ordinals."""
 
-    for _ in range(16_384):
-        project_name = f"{secrets.choice(_ADJECTIVES)} {secrets.choice(_NOUNS)}"
+    if entropy is not None and (type(entropy) is not bytes or not entropy):
+        raise GoogleProjectNamingError("project.naming_entropy_invalid")
+    for name_attempt in range(16_384):
+        if entropy is None:
+            adjective = secrets.choice(_ADJECTIVES)
+            noun = secrets.choice(_NOUNS)
+        else:
+            digest = sha256(entropy + name_attempt.to_bytes(2, "big")).digest()
+            adjective = _ADJECTIVES[
+                int.from_bytes(digest[:2], "big") % len(_ADJECTIVES)
+            ]
+            noun = _NOUNS[int.from_bytes(digest[2:4], "big") % len(_NOUNS)]
+        project_name = f"{adjective} {noun}"
         if len(project_name) > 30 or project_name in visible_names:
             continue
         slug = project_name.casefold().replace(" ", "-")[:23].rstrip("-")
-        for _ in range(128):
-            project_id = f"{slug}-{secrets.token_hex(3)}"
+        for id_attempt in range(128):
+            suffix = (
+                secrets.token_hex(3)
+                if entropy is None
+                else sha256(
+                    entropy
+                    + b"\x00"
+                    + name_attempt.to_bytes(2, "big")
+                    + id_attempt.to_bytes(1, "big")
+                ).hexdigest()[:6]
+            )
+            project_id = f"{slug}-{suffix}"
             if project_id not in reserved_project_ids:
                 return GoogleProjectIdentity(project_name, project_id)
     raise GoogleProjectNamingError("project.naming_capacity_exhausted")
@@ -75,8 +188,9 @@ def next_hive_ref(existing_refs: Iterable[str]) -> str:
 
 
 def pretty_key_display_name(project_name: str) -> str:
-    if type(project_name) is not str or re.fullmatch(
-        r"[A-Za-z][A-Za-z' !-]{2,28}[A-Za-z]", project_name
-    ) is None:
+    if (
+        type(project_name) is not str
+        or re.fullmatch(r"[A-Za-z][A-Za-z' !-]{2,28}[A-Za-z]", project_name) is None
+    ):
         raise GoogleProjectNamingError("project.naming_name_invalid")
     return f"{project_name} Key"
