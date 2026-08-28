@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import re
 from dataclasses import FrozenInstanceError
@@ -14,7 +15,9 @@ import codex_master.codex_usage_credential_authority as authority_module
 from codex_master.codex_usage_credential_authority import (
     CodexUsageCredentialAuthority,
     CredentialAuthorityError,
+    MAX_AUTH_BYTES,
     ProfileCredentialBinding,
+    validate_openai_auth_json,
 )
 
 
@@ -79,6 +82,75 @@ def _digest(value: bytes) -> bytes:
 
 def _fd_count() -> int:
     return len(os.listdir("/proc/self/fd"))
+
+
+def test_validate_openai_auth_json_returns_canonical_bytes_without_identity_dto() -> (
+    None
+):
+    raw = b'{"tokens":{"refresh_token":"r","account_id":"acct-one","access_token":"a"},"auth_mode":"chatgpt"}'
+
+    assert validate_openai_auth_json(raw, expected_account_id="acct-one") == (
+        b'{"auth_mode":"chatgpt","tokens":{"access_token":"a","account_id":"acct-one","refresh_token":"r"}}\n'
+    )
+
+
+def test_validate_openai_auth_json_rejects_identity_mismatch_sparsely() -> None:
+    raw = b'{"tokens":{"account_id":"acct-two","access_token":"secret-marker"},"auth_mode":"chatgpt"}'
+
+    with pytest.raises(CredentialAuthorityError) as raised:
+        validate_openai_auth_json(raw, expected_account_id="acct-one")
+
+    assert raised.value.code == "credential_identity_mismatch"
+    rendered = repr(raised.value) + str(raised.value)
+    if any(value in rendered for value in ("acct-one", "acct-two", "secret-marker")):
+        pytest.fail("private value exposed", pytrace=False)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"auth_mode":"chatgpt","tokens":{"account_id":"acct-one","account_id":"acct-one","access_token":"a"}}',
+        b'{"auth_mode":"chatgpt","tokens":{"account_id":"acct-one","access_token":"a"},"extra":NaN}',
+        b'{"auth_mode":"chatgpt","tokens":{"account_id":"acct-one","access_token":"a"},"extra":999999999999999999999999999999999999}',
+        b'{"auth_mode":"chatgpt","tokens":{"account_id":"acct-one"}}',
+        b'{"auth_mode":"api","tokens":{"account_id":"acct-one","access_token":"a"}}',
+        b'{"auth_mode":"chatgpt","tokens":{"account_id":"acct-one","access_token":"\\ud800"}}',
+        b"\xff",
+    ],
+)
+def test_validate_openai_auth_json_rejects_noncanonical_or_unsafe_shapes(
+    raw: bytes,
+) -> None:
+    with pytest.raises(CredentialAuthorityError, match="invalid_auth_json"):
+        validate_openai_auth_json(raw, expected_account_id="acct-one")
+
+
+def test_validate_openai_auth_json_rejects_oversized_input() -> None:
+    with pytest.raises(CredentialAuthorityError, match="invalid_auth_json"):
+        validate_openai_auth_json(
+            b"{" + b"x" * (MAX_AUTH_BYTES + 1), expected_account_id="acct-one"
+        )
+
+
+def test_validate_openai_auth_json_rejects_deep_and_canonical_oversize() -> None:
+    deep = (
+        b'{"auth_mode":"chatgpt","tokens":{"account_id":"acct-one",'
+        b'"access_token":"a"},"extra":' + b"[" * 2000 + b"0" + b"]" * 2000 + b"}"
+    )
+    expanded = json.dumps(
+        {
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "account_id": "acct-one",
+                "access_token": "é" * 300_000,
+            },
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    for raw in (deep, expanded):
+        with pytest.raises(CredentialAuthorityError, match="invalid_auth_json"):
+            validate_openai_auth_json(raw, expected_account_id="acct-one")
 
 
 def _assert_error_without_fd_leak(
@@ -534,6 +606,7 @@ def test_projection_construction_failure_is_sparse_and_closes_owned_fd(
             CredentialAuthorityError,
             0,
         )
+        assert isinstance(error, CredentialAuthorityError)
         assert error.code == "credential_projection_failed"
         rendered = repr(error) + str(error)
         assert synthetic_message not in rendered
