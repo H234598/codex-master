@@ -14,10 +14,12 @@ from codex_master.fleet_home_broker_linux import (
     _observe_peer_snapshot_with_identity,
 )
 from codex_master.fleet_home_broker_protocol import (
+    AttestHomeRequest,
     BrokerReply,
-    BrokerRequest,
+    GetTerminalResultRequest,
     MAX_CHPB_MESSAGE_BYTES,
     PrincipalBinding,
+    QueryTransactionRequest,
     decode_chpb_message,
     validate_principal_binding,
 )
@@ -57,6 +59,18 @@ class SeqpacketRequestError(ValueError):
     __slots__ = ("code",)
 
     def __init__(self, code: SeqpacketRequestCode) -> None:
+        self.code = code
+        super().__init__(code.value)
+
+
+class SeqpacketRouteCode(str, Enum):
+    FORBIDDEN_REQUEST_KIND = "seqpacket_route_forbidden_request_kind"
+
+
+class SeqpacketRouteError(ValueError):
+    __slots__ = ("code",)
+
+    def __init__(self, code: SeqpacketRouteCode) -> None:
         self.code = code
         super().__init__(code.value)
 
@@ -254,7 +268,10 @@ def receive_admitted_seqpacket_request(
     linux_operations: LinuxOperations,
     wal_operations: WalOperations,
     release: BrokerReleaseSpec,
-) -> tuple[KernelPeerEvidence, BrokerRequest]:
+) -> tuple[
+    KernelPeerEvidence,
+    AttestHomeRequest | QueryTransactionRequest | GetTerminalResultRequest,
+]:
     evidence = admit_connected_seqpacket_peer(
         connection,
         enforcement_operations,
@@ -288,6 +305,14 @@ def receive_admitted_seqpacket_request(
     message = decode_chpb_message(payload)
     if type(message) is BrokerReply:
         raise SeqpacketRequestError(SeqpacketRequestCode.NOT_REQUEST) from None
+    if type(message) not in (
+        AttestHomeRequest,
+        QueryTransactionRequest,
+        GetTerminalResultRequest,
+    ):
+        raise SeqpacketRouteError(
+            SeqpacketRouteCode.FORBIDDEN_REQUEST_KIND
+        ) from None
     return evidence, message
 
 
@@ -336,6 +361,8 @@ __all__ = (
     "SeqpacketPacketError",
     "SeqpacketRequestCode",
     "SeqpacketRequestError",
+    "SeqpacketRouteCode",
+    "SeqpacketRouteError",
     "SeqpacketPeerError",
     "SeqpacketPeerOperations",
     "admit_connected_seqpacket_peer",
