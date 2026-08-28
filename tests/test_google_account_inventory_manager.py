@@ -14,6 +14,7 @@ import pytest
 import yaml
 
 import codex_master.google_account_inventory_manager as manager_module
+from codex_master.admin_contracts import AdminContractError
 from codex_master.google_account_inventory import GoogleAccountInventoryError
 from codex_master.google_account_inventory import GoogleAccountInventoryLoader
 from codex_master.google_account_inventory_manager import (
@@ -87,7 +88,12 @@ def fresh_document(
     return GoogleAccountInventoryLoader._for_test_path(path).load()
 
 
-def projection_document(root: Path, *, private_marker: str) -> object:
+def projection_document(
+    root: Path,
+    *,
+    private_marker: str,
+    public_overrides: dict[str, str] | None = None,
+) -> object:
     if root.exists():
         root = root / "inventory"
     accounts = []
@@ -148,6 +154,14 @@ def projection_document(root: Path, *, private_marker: str) -> object:
                 ],
             }
         )
+    for field, value in (public_overrides or {}).items():
+        if field in {"ref", "label"}:
+            accounts[0][field] = value
+        elif field == "billing_ref":
+            accounts[0]["billing_accounts"][0]["ref"] = value
+            accounts[0]["projects"][0]["billing_account_ref"] = value
+        else:
+            accounts[0]["projects"][0][field] = value
     root.mkdir(mode=0o700)
     root.chmod(0o700)
     path = root / "api-token.yaml"
@@ -504,7 +518,7 @@ def test_admin_views_are_immutable_redacted_and_account_isolated(
             "project_name": "Quietglow Aurorabay",
             "key_name": "Quietglow Aurorabay Key",
             "purpose": "hive",
-            "billing_account_ref": "billing-01",
+            "billing_ref": "billing-01",
             "status": "active",
             "inventory_generation": 1,
         },
@@ -519,6 +533,59 @@ def test_admin_views_are_immutable_redacted_and_account_isolated(
     )
     with pytest.raises(TypeError):
         accounts[0]["label"] = "changed"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "operation"),
+    [
+        ("ref", "/private/credential.json", "accounts"),
+        ("label", "private-login@example.test", "accounts"),
+        ("label", "RuntimeError: provider exploded", "accounts"),
+        ("label", "ＣＬＩＥＮＴＳＥＣＲＥＴ topvalue", "accounts"),
+        ("label", "client%5Fsecret=topvalue", "accounts"),
+        ("label", "client%255Fsecret=topvalue", "accounts"),
+        ("label", "failed%20at%20%2Fprivate%2Fauth.json", "accounts"),
+        ("project_name", "Secret Meadow", "projects"),
+        ("key_name", "cLiEnTsEcReT Meadow", "projects"),
+        ("billing_ref", "client%5Fsecret", "projects"),
+    ],
+)
+def test_admin_views_reject_private_smuggling_in_public_source_fields(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    operation: str,
+) -> None:
+    manager = test_manager(
+        projection_document(
+            tmp_path,
+            private_marker="private-source-marker",
+            public_overrides={field: value},
+        )
+    )
+    manager.reload()
+
+    with pytest.raises(AdminContractError) as caught:
+        if operation == "accounts":
+            manager.list_accounts()
+        else:
+            manager.list_projects("google-account-01")
+
+    assert caught.value.code == "control.response_private"
+    assert value not in repr(caught.value)
+
+
+def test_admin_views_keep_safe_unicode_label(tmp_path: Path) -> None:
+    manager = test_manager(
+        projection_document(
+            tmp_path,
+            private_marker="private-source-marker",
+            public_overrides={"label": "Café München"},
+        )
+    )
+    manager.reload()
+
+    assert manager.get_account("google-account-01")["label"] == "Café München"
 
 
 def test_admin_views_use_one_existing_snapshot_per_call(

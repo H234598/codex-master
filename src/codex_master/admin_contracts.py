@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import re
 from types import MappingProxyType
+from typing import Never
 import unicodedata
+from urllib.parse import unquote
 
 
 _OPERATIONS = frozenset({
@@ -30,7 +32,9 @@ _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
 _PRIVATE_TEXT = re.compile(
     r"\b(?:bearer|basic|(?:access|refresh)[\s_.-]*token|client[\s_.-]*secret|api[\s_.-]*key|auth(?:entication|orization)?|token|cookie|credential|passphrase|password|session|secret|jwt)\b"
     r"|(?:sk-[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"
-    r"|file:|\\\\|\\[^\\\s]+|(?:^|[\s\"'=:(\[])/(?:[^\s]+)|[A-Za-z]:[\\/]",
+    r"|file:|\\\\|\\[^\\\s]+|(?:^|[\s\"'=:(\[])/(?:[^\s]+)|[A-Za-z]:[\\/]"
+    r"|\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"
+    r"|\b(?:traceback|[A-Z][A-Z0-9_.]*(?:error|exception))\s*(?::|\()",
     re.IGNORECASE,
 )
 _OPERATION_STATES = frozenset({"planned", "queued", "running", "partial", "succeeded", "failed", "blocked"})
@@ -45,11 +49,11 @@ class AdminContractError(ValueError):
         super().__init__(code)
 
 
-def _invalid() -> None:
+def _invalid() -> Never:
     raise AdminContractError("control.request_invalid")
 
 
-def _private() -> None:
+def _private() -> Never:
     raise AdminContractError("control.response_private")
 
 
@@ -67,9 +71,21 @@ def _text(value: object, *, private: bool = False) -> str:
 
 def _public_text(value: object) -> str:
     text = _text(value, private=True)
-    if _PRIVATE_TEXT.search(text) or any(unicodedata.category(char).startswith("C") for char in text):
-        _private()
-    return text
+    candidate = text
+    for _ in range(4):
+        candidate = unicodedata.normalize("NFKC", candidate)
+        if _PRIVATE_TEXT.search(candidate) or any(
+            unicodedata.category(char).startswith("C") for char in candidate
+        ):
+            _private()
+        try:
+            decoded = unquote(candidate, errors="strict")
+        except UnicodeError:
+            _private()
+        if decoded == candidate:
+            return text
+        candidate = decoded
+    _private()
 
 
 def _token(value: object, *, private: bool = False) -> str:
@@ -77,6 +93,18 @@ def _token(value: object, *, private: bool = False) -> str:
     if _TOKEN.fullmatch(text) is None:
         (_private if private else _invalid)()
     return text
+
+
+def public_admin_text(value: object) -> str:
+    """Return one bounded public string or fail with a code-only error."""
+
+    return _public_text(value)
+
+
+def public_admin_ref(value: object) -> str:
+    """Return one public ASCII reference after public-text classification."""
+
+    return _token(_public_text(value), private=True)
 
 
 def _utc_time(value: object) -> datetime:

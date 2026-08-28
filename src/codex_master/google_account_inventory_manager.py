@@ -12,6 +12,7 @@ from typing import Callable, Mapping
 import weakref
 
 from . import google_account_inventory as _inventory
+from .admin_contracts import public_admin_ref, public_admin_text
 from .google_account_inventory import GoogleAccountInventoryDocumentV1
 from .google_account_inventory import GoogleAccountInventoryError
 from .google_account_inventory import GoogleAccountInventoryLoader
@@ -560,8 +561,10 @@ class GoogleAccountInventoryManager:
     ) -> Mapping[str, object]:
         return MappingProxyType(
             {
-                "ref": account.ref,
-                "label": account.label,
+                "ref": public_admin_ref(account.ref),
+                "label": (
+                    None if account.label is None else public_admin_text(account.label)
+                ),
                 "subject_bound": account.subject_id is not None,
                 "inventory_generation": generation,
                 "project_count": len(account.projects),
@@ -575,12 +578,24 @@ class GoogleAccountInventoryManager:
     ) -> Mapping[str, object]:
         return MappingProxyType(
             {
-                "ref": project.ref,
-                "project_name": project.project_name,
-                "key_name": project.key_name,
-                "purpose": project.purpose,
-                "billing_account_ref": project.billing_account_ref,
-                "status": project.status,
+                "ref": public_admin_ref(project.ref),
+                "project_name": (
+                    None
+                    if project.project_name is None
+                    else public_admin_text(project.project_name)
+                ),
+                "key_name": (
+                    None
+                    if project.key_name is None
+                    else public_admin_text(project.key_name)
+                ),
+                "purpose": public_admin_text(project.purpose),
+                "billing_ref": (
+                    None
+                    if project.billing_account_ref is None
+                    else public_admin_ref(project.billing_account_ref)
+                ),
+                "status": public_admin_text(project.status),
                 "inventory_generation": generation,
             }
         )
