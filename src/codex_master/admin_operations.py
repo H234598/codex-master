@@ -8,9 +8,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
-from typing import Any
+from typing import Any, Protocol
 import uuid
 
 from codex_master.admin_contracts import AdminContractError, OperationV1
@@ -25,6 +26,10 @@ OPERATION_LIFETIME = timedelta(minutes=15)
 _DOCUMENT = PurePosixPath("operations.json")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
+_BOOT_ID = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z",
+    re.ASCII,
+)
 _STEP_STATES = frozenset({"not_attempted", "succeeded", "failed"})
 _TERMINAL_STATES = frozenset({"partial", "succeeded", "failed", "blocked"})
 _RECORD_FIELDS = frozenset(
@@ -38,11 +43,68 @@ _RECORD_FIELDS = frozenset(
         "created_at",
         "expires_at",
         "idempotency_key",
+        "owner",
         "steps",
         "reason_codes",
     }
 )
 _STEP_FIELDS = frozenset({"name", "state", "reason_code"})
+_OWNER_FIELDS = frozenset({"boot_id", "pid", "start_ticks"})
+
+OwnerIdentity = tuple[str, int, int]
+
+
+class _OwnerProbe(Protocol):
+    def current(self) -> OwnerIdentity: ...
+
+    def is_alive(self, owner: OwnerIdentity) -> bool | None: ...
+
+
+class _LinuxOwnerProbe:
+    @staticmethod
+    def _boot_id() -> str:
+        try:
+            value = Path("/proc/sys/kernel/random/boot_id").read_text(
+                encoding="ascii"
+            ).strip()
+        except (OSError, UnicodeError):
+            raise AdminOperationError("control.operation_owner_unavailable") from None
+        if _BOOT_ID.fullmatch(value) is None:
+            raise AdminOperationError("control.operation_owner_unavailable")
+        return value
+
+    @staticmethod
+    def _start_ticks(pid: int) -> int | None:
+        try:
+            stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeError):
+            raise AdminOperationError("control.operation_owner_unavailable") from None
+        fields = stat_text.rsplit(")", 1)[-1].split()
+        if len(fields) <= 19 or not fields[19].isdigit():
+            raise AdminOperationError("control.operation_owner_unavailable")
+        value = int(fields[19])
+        if value <= 0:
+            raise AdminOperationError("control.operation_owner_unavailable")
+        return value
+
+    def current(self) -> OwnerIdentity:
+        pid = os.getpid()
+        start_ticks = self._start_ticks(pid)
+        if start_ticks is None:
+            raise AdminOperationError("control.operation_owner_unavailable")
+        return self._boot_id(), pid, start_ticks
+
+    def is_alive(self, owner: OwnerIdentity) -> bool | None:
+        boot_id, pid, start_ticks = owner
+        try:
+            if self._boot_id() != boot_id:
+                return False
+            observed = self._start_ticks(pid)
+        except AdminOperationError:
+            return None
+        return observed == start_ticks if observed is not None else False
 
 
 class AdminOperationError(ValueError):
@@ -73,11 +135,13 @@ class AdminOperationStore:
         state_root: Path,
         *,
         clock: Callable[[], datetime] | None = None,
+        owner_probe: _OwnerProbe | None = None,
     ) -> None:
         if not isinstance(state_root, Path) or not state_root.is_absolute():
             raise AdminOperationError("control.operation_store_unavailable")
         self._root = state_root / "admin-operations"
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._owner_probe = owner_probe or _LinuxOwnerProbe()
         try:
             self._state = HiveStateStore(self._root)
             self._reconcile_running()
@@ -90,8 +154,9 @@ class AdminOperationStore:
         state_root: Path,
         *,
         clock: Callable[[], datetime] | None = None,
+        owner_probe: _OwnerProbe | None = None,
     ) -> AdminOperationStore:
-        return cls(state_root, clock=clock)
+        return cls(state_root, clock=clock, owner_probe=owner_probe)
 
     def plan(
         self,
@@ -109,7 +174,8 @@ class AdminOperationStore:
         now = self._now()
 
         with self._locked_records() as records:
-            self._prune(records, now)
+            if self._prune_expired(records, now):
+                self._write_locked(records)
             for record in records:
                 if record["idempotency_key"] != key:
                     continue
@@ -135,6 +201,7 @@ class AdminOperationStore:
                 "created_at": self._wire_time(now),
                 "expires_at": self._wire_time(now + OPERATION_LIFETIME),
                 "idempotency_key": key,
+                "owner": None,
                 "steps": [
                     {"name": step, "state": "not_attempted", "reason_code": None}
                     for step in steps
@@ -156,6 +223,7 @@ class AdminOperationStore:
                 raise AdminOperationError("control.operation_state_conflict")
             if self._parse_time(record["expires_at"]) <= self._now():
                 raise AdminOperationError("control.plan_expired")
+            record["owner"] = self._owner_document(self._current_owner())
             record["state"] = "running"
             record["reason_codes"] = ["control.operation_running"]
             self._write_locked(records)
@@ -228,9 +296,20 @@ class AdminOperationStore:
                 or resulting_generation < record["expected_generation"]
             ):
                 raise AdminOperationError("control.operation_invalid")
+            if not reason_codes and state in {"partial", "failed", "blocked"}:
+                reason_codes = tuple(
+                    dict.fromkeys(
+                        step["reason_code"]
+                        for step in record["steps"]
+                        if step["state"] == "failed"
+                        and step["reason_code"] is not None
+                    )
+                )
             record["state"] = state
             record["resulting_generation"] = resulting_generation
             record["reason_codes"] = list(reason_codes)
+            record["owner"] = None
+            self._validate_state(record, "control.operation_invalid")
             self._write_locked(records)
             return self._operation(record)
 
@@ -243,9 +322,12 @@ class AdminOperationStore:
         with self._locked_records() as records:
             changed = False
             for record in records:
-                if record["state"] == "running":
+                if record["state"] == "running" and self._owner_is_dead(
+                    record["owner"]
+                ):
                     record["state"] = "partial"
                     record["reason_codes"] = ["control.restart_reconciled"]
+                    record["owner"] = None
                     changed = True
             if changed:
                 self._write_locked(records)
@@ -321,6 +403,10 @@ class AdminOperationStore:
         record["id"] = self._stored_token(record["id"])
         record["kind"] = self._stored_token(record["kind"])
         record["idempotency_key"] = self._stored_token(record["idempotency_key"])
+        if record["owner"] is not None:
+            record["owner"] = self._owner_document(
+                self._stored_owner(record["owner"])
+            )
         record["expected_generation"] = self._stored_generation(
             record["expected_generation"]
         )
@@ -366,8 +452,45 @@ class AdminOperationStore:
         record["reason_codes"] = [
             self._stored_token(code) for code in record["reason_codes"]
         ]
+        self._validate_state(record, "control.operation_store_unavailable")
         self._operation(record)
         return record
+
+    @staticmethod
+    def _validate_state(record: Mapping[str, Any], error_code: str) -> None:
+        state = record["state"]
+        expected_generation = record["expected_generation"]
+        resulting_generation = record["resulting_generation"]
+        step_states = tuple(step["state"] for step in record["steps"])
+        step_shape_valid = all(
+            (step["state"] != "not_attempted" or step["reason_code"] is None)
+            and (step["state"] != "failed" or step["reason_code"] is not None)
+            for step in record["steps"]
+        )
+        generation_valid = (
+            resulting_generation is None
+            or resulting_generation >= expected_generation
+        )
+        if state in {"planned", "queued"}:
+            valid = (
+                record["owner"] is None
+                and resulting_generation is None
+                and all(value == "not_attempted" for value in step_states)
+            )
+        elif state == "running":
+            valid = record["owner"] is not None and resulting_generation is None
+        elif state == "succeeded":
+            valid = (
+                record["owner"] is None
+                and resulting_generation is not None
+                and all(value == "succeeded" for value in step_states)
+            )
+        elif state in {"partial", "failed", "blocked"}:
+            valid = record["owner"] is None and bool(record["reason_codes"])
+        else:
+            valid = False
+        if not valid or not generation_valid or not step_shape_valid:
+            raise AdminOperationError(error_code)
 
     def _operation(self, record: Mapping[str, Any]) -> OperationV1:
         steps = record["steps"]
@@ -402,6 +525,51 @@ class AdminOperationStore:
             operation=operation,
         )
 
+    def _current_owner(self) -> OwnerIdentity:
+        try:
+            return self._owner(self._owner_probe.current())
+        except AdminOperationError:
+            raise
+        except Exception:
+            raise AdminOperationError("control.operation_owner_unavailable") from None
+
+    def _owner_is_dead(self, value: object) -> bool:
+        owner = self._stored_owner(value)
+        try:
+            alive = self._owner_probe.is_alive(owner)
+        except Exception:
+            return False
+        return alive is False
+
+    @staticmethod
+    def _owner(value: object) -> OwnerIdentity:
+        if (
+            type(value) is not tuple
+            or len(value) != 3
+            or type(value[0]) is not str
+            or _BOOT_ID.fullmatch(value[0]) is None
+            or type(value[1]) is not int
+            or not 0 < value[1] <= 2**31 - 1
+            or type(value[2]) is not int
+            or not 0 < value[2] <= 2**63 - 1
+        ):
+            raise AdminOperationError("control.operation_owner_unavailable")
+        return value
+
+    @staticmethod
+    def _stored_owner(value: object) -> OwnerIdentity:
+        if not isinstance(value, Mapping) or set(value) != _OWNER_FIELDS:
+            raise AdminOperationError("control.operation_store_unavailable")
+        candidate = (value["boot_id"], value["pid"], value["start_ticks"])
+        try:
+            return AdminOperationStore._owner(candidate)
+        except AdminOperationError:
+            raise AdminOperationError("control.operation_store_unavailable") from None
+
+    @staticmethod
+    def _owner_document(owner: OwnerIdentity) -> dict[str, object]:
+        return {"boot_id": owner[0], "pid": owner[1], "start_ticks": owner[2]}
+
     @staticmethod
     def _find(records: list[dict[str, Any]], operation_id: str) -> dict[str, Any]:
         for record in records:
@@ -410,23 +578,16 @@ class AdminOperationStore:
         raise AdminOperationError("control.operation_not_found")
 
     @staticmethod
-    def _prune(records: list[dict[str, Any]], now: datetime) -> None:
-        if len(records) < MAX_OPERATION_RECORDS:
-            return
+    def _prune_expired(records: list[dict[str, Any]], now: datetime) -> bool:
         retained = [
             record
             for record in records
-            if record["state"] not in _TERMINAL_STATES
+            if record["state"] == "running"
             or AdminOperationStore._parse_time(record["expires_at"]) > now
         ]
+        changed = len(retained) != len(records)
         records[:] = retained
-        if len(records) < MAX_OPERATION_RECORDS:
-            return
-        for record in tuple(records):
-            if len(records) < MAX_OPERATION_RECORDS:
-                break
-            if record["state"] in _TERMINAL_STATES:
-                records.remove(record)
+        return changed
 
     @staticmethod
     def _new_id(records: list[dict[str, Any]]) -> str:

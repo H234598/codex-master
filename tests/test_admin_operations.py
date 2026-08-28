@@ -2,12 +2,19 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 import json
+import multiprocessing
+from pathlib import Path
 import stat
+from typing import Any
 
 import pytest
 
 from codex_master.admin_contracts import OperationV1
-from codex_master.admin_operations import AdminOperationError, AdminOperationStore
+from codex_master.admin_operations import (
+    MAX_OPERATION_RECORDS,
+    AdminOperationError,
+    AdminOperationStore,
+)
 
 
 NOW = datetime(2026, 8, 28, 10, 0, tzinfo=UTC)
@@ -21,8 +28,39 @@ class Clock:
         return self.now
 
 
-def store_at(tmp_path, clock: Clock | None = None) -> AdminOperationStore:
-    return AdminOperationStore.for_test(tmp_path, clock=clock or Clock())
+class OwnerProbe:
+    def __init__(self, alive: bool | None) -> None:
+        self.alive = alive
+
+    def current(self) -> tuple[str, int, int]:
+        return ("11111111-1111-1111-1111-111111111111", 1234, 99)
+
+    def is_alive(self, _owner: tuple[str, int, int]) -> bool | None:
+        return self.alive
+
+
+def store_at(
+    tmp_path,
+    clock: Clock | None = None,
+    *,
+    owner_probe: OwnerProbe | None = None,
+) -> AdminOperationStore:
+    kwargs = {"owner_probe": owner_probe} if owner_probe is not None else {}
+    return AdminOperationStore.for_test(tmp_path, clock=clock or Clock(), **kwargs)
+
+
+def _run_owned_operation(root: str, connection: Any) -> None:
+    store = AdminOperationStore.for_test(Path(root), clock=Clock())
+    plan = store.plan(
+        kind="google.provision",
+        generation=4,
+        key="restart",
+        steps=("create", "probe"),
+    )
+    store.begin(plan.operation_id, current_generation=4)
+    store.record_step(plan.operation_id, "create", succeeded=True)
+    connection.send(plan.operation_id)
+    connection.recv()
 
 
 def test_repeated_idempotency_key_returns_same_operation(tmp_path) -> None:
@@ -52,6 +90,123 @@ def test_idempotency_key_cannot_be_rebound_to_another_payload(tmp_path) -> None:
         )
 
     assert store.get(first.operation_id).state == "planned"
+
+
+def test_unexpired_terminal_capacity_preserves_idempotency_binding(tmp_path) -> None:
+    store = store_at(tmp_path)
+    first_id = ""
+    for index in range(MAX_OPERATION_RECORDS):
+        plan = store.plan(
+            kind="google.provision",
+            generation=7,
+            key=f"retained-{index}",
+            steps=("one",),
+        )
+        if index == 0:
+            first_id = plan.operation_id
+        store.begin(plan.operation_id, current_generation=7)
+        store.record_step(plan.operation_id, "one", succeeded=True)
+        store.finish(
+            plan.operation_id,
+            state="succeeded",
+            resulting_generation=8,
+        )
+
+    repeated = store.plan(
+        kind="google.provision", generation=7, key="retained-0", steps=("one",)
+    )
+    assert repeated.operation_id == first_id
+    with pytest.raises(AdminOperationError, match="control.operation_limit"):
+        store.plan(
+            kind="google.provision", generation=7, key="new", steps=("one",)
+        )
+
+
+def test_expired_planned_records_are_removed_at_record_pressure(tmp_path) -> None:
+    clock = Clock()
+    store = store_at(tmp_path, clock)
+    for index in range(MAX_OPERATION_RECORDS):
+        store.plan(
+            kind="google.provision",
+            generation=7,
+            key=f"expired-{index}",
+            steps=("one",),
+        )
+    clock.now += timedelta(minutes=16)
+
+    replacement = store.plan(
+        kind="google.provision", generation=8, key="replacement", steps=("one",)
+    )
+
+    assert replacement.operation.expected_generation == 8
+
+
+def test_expired_records_are_removed_at_byte_pressure(tmp_path) -> None:
+    clock = Clock()
+    store = store_at(tmp_path, clock)
+    large_steps = tuple(
+        f"step-{index:04d}-" + "x" * 116 for index in range(1_000)
+    )
+    created = 0
+    for index in range(MAX_OPERATION_RECORDS):
+        try:
+            store.plan(
+                kind="google.provision",
+                generation=7,
+                key=f"large-{index}",
+                steps=large_steps,
+            )
+        except AdminOperationError as exc:
+            assert exc.code == "control.operation_limit"
+            break
+        created += 1
+    else:
+        pytest.fail("byte capacity was not reached before record capacity")
+    assert created < MAX_OPERATION_RECORDS
+    clock.now += timedelta(minutes=16)
+
+    replacement = store.plan(
+        kind="google.provision",
+        generation=8,
+        key="large-replacement",
+        steps=large_steps,
+    )
+
+    assert replacement.operation.expected_generation == 8
+
+
+def test_byte_capacity_failure_still_persists_safe_expiry_cleanup(tmp_path) -> None:
+    clock = Clock()
+    store = store_at(tmp_path, clock)
+    large_steps = tuple(
+        f"step-{index:04d}-" + "x" * 116 for index in range(1_000)
+    )
+    running_ids = []
+    for index in range(11):
+        plan = store.plan(
+            kind="google.provision",
+            generation=7,
+            key=f"running-large-{index}",
+            steps=large_steps,
+        )
+        store.begin(plan.operation_id, current_generation=7)
+        running_ids.append(plan.operation_id)
+    expired = store.plan(
+        kind="google.provision", generation=7, key="expired-small", steps=("one",)
+    )
+    clock.now += timedelta(minutes=16)
+
+    with pytest.raises(AdminOperationError, match="control.operation_limit"):
+        store.plan(
+            kind="google.provision",
+            generation=8,
+            key="blocked-by-running",
+            steps=large_steps,
+        )
+
+    with pytest.raises(AdminOperationError, match="control.operation_not_found"):
+        store.get(expired.operation_id)
+    assert store.get(running_ids[0]).state == "running"
 
 
 @pytest.mark.parametrize(
@@ -135,27 +290,42 @@ def test_step_progress_and_finish_survive_restart(tmp_path) -> None:
     assert store_at(tmp_path, clock).get(plan.operation_id) == finished
 
 
-def test_restart_reconciles_running_operation_to_partial(tmp_path) -> None:
-    clock = Clock()
-    store = store_at(tmp_path, clock)
+def test_running_operation_reconciles_only_after_owner_process_exits(tmp_path) -> None:
+    context = multiprocessing.get_context("fork")
+    parent, child = context.Pipe()
+    process = context.Process(target=_run_owned_operation, args=(str(tmp_path), child))
+    process.start()
+    try:
+        operation_id = parent.recv()
+
+        assert store_at(tmp_path).get(operation_id).state == "running"
+
+        parent.send("exit")
+        process.join(timeout=10)
+        assert process.exitcode == 0
+        recovered = store_at(tmp_path).get(operation_id)
+        assert recovered.state == "partial"
+        assert recovered.completed_count == 1
+        assert recovered.failed_count == 0
+        assert recovered.not_attempted_count == 1
+        assert recovered.reason_codes == ("control.restart_reconciled",)
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=10)
+
+
+def test_unknown_owner_status_keeps_running_operation_unchanged(tmp_path) -> None:
+    probe = OwnerProbe(None)
+    store = store_at(tmp_path, owner_probe=probe)
     plan = store.plan(
-        kind="google.provision",
-        generation=4,
-        key="restart",
-        steps=("create", "probe"),
+        kind="google.provision", generation=4, key="unknown-owner", steps=("one",)
     )
     store.begin(plan.operation_id, current_generation=4)
-    store.record_step(plan.operation_id, "create", succeeded=True)
 
-    restarted = store_at(tmp_path, clock)
-    recovered = restarted.get(plan.operation_id)
+    restarted = store_at(tmp_path, owner_probe=probe)
 
-    assert recovered.state == "partial"
-    assert recovered.completed_count == 1
-    assert recovered.failed_count == 0
-    assert recovered.not_attempted_count == 1
-    assert recovered.reason_codes == ("control.restart_reconciled",)
-    assert store_at(tmp_path, clock).get(plan.operation_id) == recovered
+    assert restarted.get(plan.operation_id).state == "running"
 
 
 def test_failed_step_is_counted_once(tmp_path) -> None:
@@ -212,6 +382,26 @@ def test_failed_finish_does_not_require_resulting_generation(tmp_path) -> None:
 
     assert finished.state == "failed"
     assert finished.resulting_generation is None
+
+
+def test_failed_finish_preserves_step_failure_reason_when_codes_omitted(
+    tmp_path,
+) -> None:
+    store = store_at(tmp_path)
+    plan = store.plan(
+        kind="google.provision", generation=4, key="finish-reason", steps=("probe",)
+    )
+    store.begin(plan.operation_id, current_generation=4)
+    store.record_step(
+        plan.operation_id,
+        "probe",
+        succeeded=False,
+        reason_code="control.probe_failed",
+    )
+
+    finished = store.finish(plan.operation_id, state="failed")
+
+    assert finished.reason_codes == ("control.probe_failed",)
 
 
 def test_state_files_remain_private(tmp_path) -> None:
@@ -271,3 +461,53 @@ def test_restart_rejects_digest_not_bound_to_persisted_plan(tmp_path) -> None:
 
     with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
         store_at(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["succeeded_with_pending", "planned_with_completed", "running_with_result"],
+)
+def test_restart_rejects_state_machine_tampering(tmp_path, mutation: str) -> None:
+    store = store_at(tmp_path)
+    plan = store.plan(
+        kind="google.provision", generation=4, key="state-safe", steps=("one",)
+    )
+    if mutation == "running_with_result":
+        store.begin(plan.operation_id, current_generation=4)
+    document = tmp_path / "admin-operations" / "operations.json"
+    payload = json.loads(document.read_text(encoding="utf-8"))
+    record = payload["operations"][0]
+    if mutation == "succeeded_with_pending":
+        record["state"] = "succeeded"
+        record["resulting_generation"] = None
+    elif mutation == "planned_with_completed":
+        record["steps"][0]["state"] = "succeeded"
+    else:
+        record["resulting_generation"] = 5
+    document.write_text(json.dumps(payload), encoding="utf-8")
+    document.chmod(0o600)
+
+    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+        store_at(tmp_path)
+
+
+def test_finish_rejects_generation_regression(tmp_path) -> None:
+    store = store_at(tmp_path)
+    plan = store.plan(
+        kind="google.provision", generation=4, key="generation", steps=("one",)
+    )
+    store.begin(plan.operation_id, current_generation=4)
+    store.record_step(
+        plan.operation_id,
+        "one",
+        succeeded=False,
+        reason_code="control.step_failed",
+    )
+
+    with pytest.raises(AdminOperationError, match="control.operation_invalid"):
+        store.finish(
+            plan.operation_id,
+            state="failed",
+            resulting_generation=3,
+            reason_codes=("control.apply_failed",),
+        )
