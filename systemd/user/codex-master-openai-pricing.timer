@@ -1,0 +1,11 @@
+[Unit]
+Description=OpenAI Modell- und Preisbestand täglich aktualisieren
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30m
+Persistent=true
+Unit=codex-master-openai-pricing.service
+
+[Install]
+WantedBy=timers.target

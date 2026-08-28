@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenAI Modell- und Preisbestand täglich aktualisieren
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/codex-master-openai-pricing-inventory
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=no
+ReadWritePaths=%h/.local/state/codex-master-mcp/openai-pricing %h/.codex %h/.codex-agents %h/.local/share/codex-usage/profiles %h/.codex-test
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryDenyWriteExecute=yes
+UMask=0077
