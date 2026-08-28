@@ -234,6 +234,21 @@ def test_v1_document_one_byte_over_legacy_limit_is_rejected(tmp_path) -> None:
         store_at(tmp_path)
 
 
+def test_v2_payload_cannot_consume_one_byte_of_owner_reserve(tmp_path) -> None:
+    records = maximum_v1_records()
+    key = records[-1]["idempotency_key"]
+    assert isinstance(key, str)
+    records[-1]["idempotency_key"] = key + "x"
+    v2_records = [dict(record, owner=None) for record in records]
+    raw = canonical_document(2, v2_records)
+    assert len(canonical_document(1, records)) == V1_STATE_BYTES + 1
+    assert len(raw) <= V2_STATE_BYTES
+    write_operation_bytes(tmp_path, raw)
+
+    with pytest.raises(AdminOperationError, match="control.operation_store_unavailable"):
+        store_at(tmp_path)
+
+
 def test_regular_write_cannot_consume_v2_owner_metadata_reserve(tmp_path) -> None:
     records = maximum_v1_records()[:-1]
     target = V1_STATE_BYTES - 1

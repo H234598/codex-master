@@ -405,6 +405,10 @@ class AdminOperationStore:
             seen_ids.add(record["id"])
             seen_keys.add(record["idempotency_key"])
             records.append(record)
+        if not legacy and len(self._owner_free_document(records)) > (
+            MAX_OPERATION_V1_STATE_BYTES
+        ):
+            raise AdminOperationError("control.operation_store_unavailable")
         if legacy:
             self._prune_expired(records, self._now())
             self._write_locked(records)
@@ -414,11 +418,7 @@ class AdminOperationStore:
         if len(records) > MAX_OPERATION_RECORDS:
             raise AdminOperationError("control.operation_limit")
         try:
-            payload_records = [
-                {key: value for key, value in record.items() if key != "owner"}
-                for record in records
-            ]
-            payload = self._encoded_document(1, payload_records)
+            payload = self._owner_free_document(records)
             raw = self._encoded_document(2, records)
             if (
                 len(payload) > MAX_OPERATION_V1_STATE_BYTES
@@ -430,6 +430,16 @@ class AdminOperationStore:
             raise
         except (HiveStateError, OSError, TypeError, ValueError, RecursionError):
             raise AdminOperationError("control.operation_store_unavailable") from None
+
+    @classmethod
+    def _owner_free_document(cls, records: list[dict[str, Any]]) -> bytes:
+        return cls._encoded_document(
+            1,
+            [
+                {key: value for key, value in record.items() if key != "owner"}
+                for record in records
+            ],
+        )
 
     @staticmethod
     def _encoded_document(
