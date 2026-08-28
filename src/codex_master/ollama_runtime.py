@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-import http.client
+from dataclasses import dataclass, field
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,9 +12,11 @@ import secrets
 import socket
 import stat
 import subprocess
-from typing import Mapping, NoReturn, Protocol
+import sys
+import time
+from typing import NoReturn, Protocol
 
-from codex_master.ollama_registry import OllamaInstanceV1
+from codex_master.ollama_registry import OllamaInstanceV1, OllamaRegistryV1
 from codex_master.resource_cgroup import (
     OllamaCpuProfile,
     ResourceCgroupError,
@@ -23,10 +25,12 @@ from codex_master.resource_cgroup import (
 
 SYSTEMD_RUN_PATH = "/usr/bin/systemd-run"
 SYSTEMCTL_PATH = "/usr/bin/systemctl"
+CGROUP_ROOT = Path("/sys/fs/cgroup")
 OLLAMA_SLICE = "codex-master.slice"
 PROBE_TIMEOUT_SECONDS = 2.0
 MAX_TAG_RESPONSE_BYTES = 64 * 1024
 _MAX_CGROUP_BYTES = 4096
+_MAX_EXECUTABLE_BYTES = 512 * 1024 * 1024
 _UNIT_NAME = re.compile(r"^codex-master-ollama-[a-f0-9]{32}\.scope$")
 _CPU_PROPERTY = re.compile(
     r"^--property=AllowedCPUs=(?:0|[1-9][0-9]*)(?:-(?:[1-9][0-9]*))?"
@@ -35,6 +39,14 @@ _CPU_PROPERTY = re.compile(
 _QUOTA_PROPERTY = re.compile(r"^--property=CPUQuota=([1-9][0-9]{0,4})%$")
 _WEIGHT_PROPERTY = re.compile(r"^--property=CPUWeight=([1-9][0-9]{0,4})$")
 _LOOPBACK_HOST = re.compile(r"^127\.0\.0\.1:([1-9][0-9]{0,4})$")
+_PLAN_SEAL = object()
+_PLAN_RECORDS: dict[bytes, tuple[object, ...]] = {}
+_START_SEAL = object()
+_START_RECORDS: dict[bytes, tuple[object, ...]] = {}
+_RUNNING_SEAL = object()
+_STOP_SEAL = object()
+_STOP_RECORDS: dict[bytes, tuple[object, ...]] = {}
+_RUNNING_RECORDS: dict[bytes, tuple[object, ...]] = {}
 
 
 class OllamaRuntimeError(RuntimeError):
@@ -55,6 +67,10 @@ def _fail(code: str) -> NoReturn:
 class OllamaHostSnapshot:
     available_cpus: tuple[int, ...]
     effective_uid: int
+    effective_gid: int = field(default_factory=os.getegid)
+    supplementary_gids: tuple[int, ...] = field(
+        default_factory=lambda: tuple(sorted(set(os.getgroups())))
+    )
 
     def __post_init__(self) -> None:
         if (
@@ -64,8 +80,23 @@ class OllamaHostSnapshot:
             or tuple(sorted(set(self.available_cpus))) != self.available_cpus
             or type(self.effective_uid) is not int
             or self.effective_uid < 0
+            or type(self.effective_gid) is not int
+            or self.effective_gid < 0
+            or not isinstance(self.supplementary_gids, tuple)
+            or any(type(group) is not int or group < 0 for group in self.supplementary_gids)
+            or tuple(sorted(set(self.supplementary_gids))) != self.supplementary_gids
         ):
             _fail("resource.host_probe_invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class OllamaAncestorEvidence:
+    path: str
+    device: int
+    inode: int
+    mode: int
+    owner_uid: int
+    owner_gid: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +106,13 @@ class OllamaPathEvidence:
     inode: int
     mode: int
     owner_uid: int
+    owner_gid: int
+    link_count: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    sha256: str | None
+    ancestors: tuple[OllamaAncestorEvidence, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +123,71 @@ class OllamaLocalPlan:
     models_directory: OllamaPathEvidence
     cpu_profile: OllamaCpuProfile
     selected_provider_model_ids: tuple[str, ...]
+    _provenance: bytes = field(repr=False, compare=False)
+    _seal: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if (
+            self._seal is not _PLAN_SEAL
+            or not isinstance(self._provenance, bytes)
+            or len(self._provenance) != 32
+            or not isinstance(self.instance, OllamaInstanceV1)
+            or self.instance.host_ref != "local"
+            or not isinstance(self.host, OllamaHostSnapshot)
+            or not isinstance(self.executable, OllamaPathEvidence)
+            or not isinstance(self.models_directory, OllamaPathEvidence)
+            or self.executable.path != self.instance.ollama_executable
+            or self.models_directory.path != self.instance.models_directory
+            or not isinstance(self.cpu_profile, OllamaCpuProfile)
+            or self.cpu_profile.systemd_properties()
+            != {
+                "AllowedCPUs": self.instance.allowed_cpus,
+                "CPUQuota": f"{self.instance.cpu_quota_percent}%",
+                "CPUWeight": str(self.instance.cpu_weight),
+            }
+            or not isinstance(self.selected_provider_model_ids, tuple)
+            or len(self.selected_provider_model_ids)
+            != len(self.instance.selected_model_refs)
+            or any(not isinstance(model_id, str) or not model_id for model_id in self.selected_provider_model_ids)
+        ):
+            _fail("provider.plan_invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class OllamaStartRequest:
+    unit_name: str
+    argv: tuple[str, ...]
+    launcher_environment: dict[str, str]
+    executable: OllamaPathEvidence
+    models_directory: OllamaPathEvidence
+    host: OllamaHostSnapshot
+    port: int
+    systemd_properties: tuple[tuple[str, str], ...]
+    _provenance: bytes = field(repr=False, compare=False)
+    _seal: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        expected_environment = _launcher_environment(self.host.effective_uid)
+        if (
+            self._seal is not _START_SEAL
+            or not isinstance(self._provenance, bytes)
+            or len(self._provenance) != 32
+            or not _UNIT_NAME.fullmatch(self.unit_name)
+            or type(self.port) is not int
+            or not 1 <= self.port <= 65535
+            or not _valid_systemd_properties(self.systemd_properties)
+            or self.launcher_environment != expected_environment
+            or self.argv
+            != _start_argv(
+                self.unit_name,
+                self.executable,
+                self.models_directory,
+                self.host,
+                self.port,
+                self.systemd_properties,
+            )
+        ):
+            _fail("provider.operation_not_allowed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +196,55 @@ class RunningOllamaInstance:
     unit_name: str
     port: int
     process: OllamaProcess
+    ollama_pid: int
+    control_group: str
+    process_start_ticks: int
+    _provenance: bytes = field(repr=False, compare=False)
+    _seal: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if (
+            self._seal is not _RUNNING_SEAL
+            or not isinstance(self.plan, OllamaLocalPlan)
+            or not _UNIT_NAME.fullmatch(self.unit_name)
+            or type(self.port) is not int
+            or not 1 <= self.port <= 65535
+            or type(self.ollama_pid) is not int
+            or self.ollama_pid < 1
+            or not isinstance(self.control_group, str)
+            or not self.control_group.startswith("/")
+            or "\n" in self.control_group
+            or type(self.process_start_ticks) is not int
+            or self.process_start_ticks < 1
+            or not isinstance(self._provenance, bytes)
+            or len(self._provenance) != 32
+        ):
+            _fail("provider.instance_invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class OllamaStopRequest:
+    unit_name: str
+    process: OllamaProcess
+    ollama_pid: int
+    control_group: str
+    process_start_ticks: int
+    _provenance: bytes = field(repr=False, compare=False)
+    _seal: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if (
+            self._seal is not _STOP_SEAL
+            or not isinstance(self._provenance, bytes)
+            or len(self._provenance) != 32
+            or not _UNIT_NAME.fullmatch(self.unit_name)
+            or type(self.ollama_pid) is not int
+            or self.ollama_pid < 1
+            or not self.control_group.startswith("/")
+            or type(self.process_start_ticks) is not int
+            or self.process_start_ticks < 1
+        ):
+            _fail("provider.operation_not_allowed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,25 +262,37 @@ class OllamaProcess(Protocol):
 
     def poll(self) -> int | None: ...
 
+    def wait(self, timeout: float | None = None) -> int: ...
+
 
 class OllamaRuntime(Protocol):
     def available_cpus(self) -> tuple[int, ...]: ...
 
     def allocate_loopback_port(self) -> int: ...
 
-    def start_scope(
-        self, argv: tuple[str, ...], environment: dict[str, str]
-    ) -> OllamaProcess: ...
+    def start_scope(self, request: OllamaStartRequest) -> OllamaProcess: ...
 
-    def process_running(self, process: object) -> bool: ...
+    def resolve_scope(
+        self, request: OllamaStartRequest, process: OllamaProcess
+    ) -> tuple[int, str, int]: ...
 
-    def scope_contains(self, unit_name: str, pid: int) -> bool: ...
+    def process_running(
+        self, process: OllamaProcess, pid: int, start_ticks: int
+    ) -> bool: ...
+
+    def scope_process_matches(
+        self, unit_name: str, pid: int, control_group: str, start_ticks: int
+    ) -> bool: ...
+
+    def listener_owned_by(self, pid: int, port: int) -> bool: ...
 
     def fetch_tags(
         self, port: int, *, timeout_seconds: float, max_bytes: int
     ) -> set[str] | None: ...
 
-    def stop_scope(self, unit_name: str, process: object) -> None: ...
+    def cleanup_scope(self, request: OllamaStartRequest, process: OllamaProcess) -> None: ...
+
+    def stop_scope(self, request: OllamaStopRequest) -> None: ...
 
 
 class SystemOllamaRuntime:
@@ -148,15 +312,14 @@ class SystemOllamaRuntime:
         except OSError:
             _fail("provider.loopback_allocation_failed")
 
-    def start_scope(
-        self, argv: tuple[str, ...], environment: dict[str, str]
-    ) -> OllamaProcess:
-        if not _allowed_start_operation(argv, environment):
+    def start_scope(self, request: OllamaStartRequest) -> OllamaProcess:
+        if not _recorded_start_request(request):
             _fail("provider.operation_not_allowed")
+        request.__post_init__()
         try:
             return subprocess.Popen(
-                argv,
-                env=environment,
+                request.argv,
+                env=request.launcher_environment,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -166,15 +329,39 @@ class SystemOllamaRuntime:
         except OSError:
             _fail("provider.process_start_failed")
 
-    def process_running(self, process: object) -> bool:
+    def resolve_scope(
+        self, request: OllamaStartRequest, process: OllamaProcess
+    ) -> tuple[int, str, int]:
+        deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
+        while time.monotonic() < deadline and process.poll() is None:
+            observed = self._scope_observation(request.unit_name)
+            if observed is not None:
+                return observed
+            time.sleep(0.01)
+        _fail("resource.scope_membership_invalid")
+
+    def process_running(
+        self, process: OllamaProcess, pid: int, start_ticks: int
+    ) -> bool:
         try:
-            return process.poll() is None  # type: ignore[attr-defined]
+            return process.poll() is None and _process_start_ticks(pid) == start_ticks
         except (AttributeError, OSError):
             return False
 
-    def scope_contains(self, unit_name: str, pid: int) -> bool:
-        if not _UNIT_NAME.fullmatch(unit_name) or type(pid) is not int or pid < 1:
+    def scope_process_matches(
+        self, unit_name: str, pid: int, control_group: str, start_ticks: int
+    ) -> bool:
+        if (
+            not _UNIT_NAME.fullmatch(unit_name)
+            or type(pid) is not int
+            or pid < 1
+            or not isinstance(control_group, str)
+            or type(start_ticks) is not int
+        ):
             return False
+        return self._scope_observation(unit_name) == (pid, control_group, start_ticks)
+
+    def _scope_observation(self, unit_name: str) -> tuple[int, str, int] | None:
         try:
             result = subprocess.run(
                 (
@@ -191,43 +378,76 @@ class SystemOllamaRuntime:
                 check=False,
             )
             if result.returncode != 0 or result.stderr or len(result.stdout) > _MAX_CGROUP_BYTES:
+                return None
+            lines = result.stdout.decode("ascii").splitlines()
+            if len(lines) != 1 or any("=" not in line for line in lines):
+                return None
+            values = dict(line.split("=", 1) for line in lines)
+            if set(values) != {"ControlGroup"}:
+                return None
+            control_group = values["ControlGroup"]
+            pids = _cgroup_processes(control_group)
+            if len(pids) != 1:
+                return None
+            leader = pids[0]
+            if _process_control_group(leader) != control_group:
+                return None
+            return leader, control_group, _process_start_ticks(leader)
+        except (OSError, ValueError, subprocess.SubprocessError, UnicodeDecodeError):
+            return None
+
+    def listener_owned_by(self, pid: int, port: int) -> bool:
+        if type(pid) is not int or pid < 1 or type(port) is not int or not 1 <= port <= 65535:
+            return False
+        try:
+            listener_inodes = _loopback_listener_inodes(port)
+            if not listener_inodes:
                 return False
-            line = result.stdout.decode("ascii")
-            if not line.startswith("ControlGroup=/") or not line.endswith("\n"):
+            descriptors = tuple((Path("/proc") / str(pid) / "fd").iterdir())
+            if len(descriptors) > 4096:
                 return False
-            control_group = line.removeprefix("ControlGroup=").removesuffix("\n")
-            if "\n" in control_group:
-                return False
-            with open(f"/proc/{pid}/cgroup", "rb", buffering=0) as stream:
-                raw = stream.read(_MAX_CGROUP_BYTES + 1)
-            if len(raw) > _MAX_CGROUP_BYTES:
-                return False
-            entries = raw.decode("ascii").splitlines()
-            return f"0::{control_group}" in entries
-        except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+            owned: set[str] = set()
+            for descriptor in descriptors:
+                try:
+                    target = os.readlink(descriptor)
+                except FileNotFoundError:
+                    continue
+                match = re.fullmatch(r"socket:\[([0-9]+)\]", target)
+                if match is not None:
+                    owned.add(match.group(1))
+            return bool(listener_inodes & owned)
+        except OSError:
             return False
 
     def fetch_tags(
         self, port: int, *, timeout_seconds: float, max_bytes: int
     ) -> set[str] | None:
-        connection: http.client.HTTPConnection | None = None
+        if (
+            type(port) is not int
+            or not 1 <= port <= 65535
+            or not isinstance(timeout_seconds, (int, float))
+            or not 0 < timeout_seconds <= PROBE_TIMEOUT_SECONDS
+            or type(max_bytes) is not int
+            or not 1 <= max_bytes <= MAX_TAG_RESPONSE_BYTES
+        ):
+            return None
+        deadline = time.monotonic() + float(timeout_seconds)
         try:
-            connection = http.client.HTTPConnection(
-                "127.0.0.1", port, timeout=timeout_seconds
-            )
-            connection.request("GET", "/api/tags", headers={"Connection": "close"})
-            response = connection.getresponse()
-            length = response.getheader("Content-Length")
-            if (
-                response.status != 200
-                or (length is not None and (not length.isascii() or not length.isdigit()))
-                or (length is not None and int(length) > max_bytes)
-            ):
+            with socket.create_connection(
+                ("127.0.0.1", port), timeout=_remaining_seconds(deadline)
+            ) as connection:
+                connection.settimeout(_remaining_seconds(deadline))
+                connection.sendall(
+                    b"GET /api/tags HTTP/1.1\r\n"
+                    b"Host: 127.0.0.1\r\n"
+                    b"Connection: close\r\n\r\n"
+                )
+                encoded = _read_http_response(
+                    connection, deadline=deadline, max_body_bytes=max_bytes
+                )
+            if encoded is None:
                 return None
-            raw = response.read(max_bytes + 1)
-            if len(raw) > max_bytes:
-                return None
-            document = json.loads(raw.decode("utf-8"))
+            document = json.loads(encoded.decode("utf-8"))
             if type(document) is not dict or type(document.get("models")) is not list:
                 return None
             models = document["models"]
@@ -242,15 +462,33 @@ class SystemOllamaRuntime:
                     return None
                 tags.add(model_id)
             return tags
-        except (OSError, ValueError, json.JSONDecodeError, http.client.HTTPException):
+        except (OSError, TimeoutError, ValueError, json.JSONDecodeError):
             return None
-        finally:
-            if connection is not None:
-                connection.close()
 
-    def stop_scope(self, unit_name: str, process: object) -> None:
-        if not _UNIT_NAME.fullmatch(unit_name):
-            _fail("resource.scope_invalid")
+    def cleanup_scope(self, request: OllamaStartRequest, process: OllamaProcess) -> None:
+        if not _recorded_start_request(request):
+            return
+        try:
+            self._stop_unit(request.unit_name)
+        except OllamaRuntimeError:
+            pass
+        try:
+            process.wait(timeout=1.0)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    def stop_scope(self, request: OllamaStopRequest) -> None:
+        if not _recorded_stop_request(request):
+            _fail("provider.operation_not_allowed")
+        try:
+            self._stop_unit(request.unit_name)
+            request.process.wait(timeout=5.0)
+        except OllamaRuntimeError:
+            raise
+        except (OSError, subprocess.SubprocessError):
+            _fail("provider.process_stop_failed")
+
+    def _stop_unit(self, unit_name: str) -> None:
         try:
             result = subprocess.run(
                 (SYSTEMCTL_PATH, "--user", "--no-pager", "stop", unit_name),
@@ -262,17 +500,19 @@ class SystemOllamaRuntime:
             )
             if result.returncode != 0:
                 _fail("provider.process_stop_failed")
-            process.wait(timeout=5.0)  # type: ignore[attr-defined]
         except OllamaRuntimeError:
             raise
-        except (AttributeError, OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError):
             _fail("provider.process_stop_failed")
 
 
 def probe_ollama_host(*, runtime: OllamaRuntime | None = None) -> OllamaHostSnapshot:
     adapter = runtime or SystemOllamaRuntime()
     return OllamaHostSnapshot(
-        available_cpus=adapter.available_cpus(), effective_uid=os.geteuid()
+        available_cpus=adapter.available_cpus(),
+        effective_uid=os.geteuid(),
+        effective_gid=os.getegid(),
+        supplementary_gids=tuple(sorted(set(os.getgroups()))),
     )
 
 
@@ -280,24 +520,33 @@ def plan_local_instance(
     instance: OllamaInstanceV1,
     host: OllamaHostSnapshot,
     *,
-    selected_provider_model_ids: tuple[str, ...] | None = None,
+    registry: OllamaRegistryV1,
 ) -> OllamaLocalPlan:
-    if not isinstance(instance, OllamaInstanceV1) or instance.host_ref != "local":
-        _fail("provider.instance_invalid")
-    if not isinstance(host, OllamaHostSnapshot):
-        _fail("resource.host_probe_invalid")
-    selected = (
-        instance.selected_model_refs
-        if selected_provider_model_ids is None
-        else selected_provider_model_ids
-    )
     if (
-        not isinstance(selected, tuple)
-        or not selected
-        or any(not isinstance(model_id, str) or not model_id for model_id in selected)
-        or len(set(selected)) != len(selected)
+        not isinstance(instance, OllamaInstanceV1)
+        or instance.host_ref != "local"
+        or not isinstance(registry, OllamaRegistryV1)
+        or sum(candidate == instance for candidate in registry.instances) != 1
     ):
-        _fail("provider.model_invalid")
+        _fail("provider.instance_invalid")
+    if (
+        not isinstance(host, OllamaHostSnapshot)
+        or host.effective_uid != os.geteuid()
+        or host.effective_gid != os.getegid()
+        or host.supplementary_gids != tuple(sorted(set(os.getgroups())))
+    ):
+        _fail("resource.host_probe_invalid")
+    by_ref = {model.ref: model for model in registry.models}
+    try:
+        selected_models = tuple(by_ref[ref] for ref in instance.selected_model_refs)
+    except KeyError:
+        _fail("provider.model_unavailable")
+    if any(
+        not model.installed or not model.hive_enabled or not model.simple_only
+        for model in selected_models
+    ):
+        _fail("provider.model_unavailable")
+    selected = tuple(model.provider_model_id for model in selected_models)
     try:
         profile = OllamaCpuProfile.parse(
             instance.allowed_cpus,
@@ -307,31 +556,39 @@ def plan_local_instance(
         )
     except ResourceCgroupError as error:
         raise OllamaRuntimeError(str(error)) from None
-    return OllamaLocalPlan(
+    provenance = secrets.token_bytes(32)
+    plan = OllamaLocalPlan(
         instance=instance,
         host=host,
         executable=_inspect_path(
             instance.ollama_executable,
-            effective_uid=host.effective_uid,
+            host=host,
             kind="executable",
         ),
         models_directory=_inspect_path(
             instance.models_directory,
-            effective_uid=host.effective_uid,
+            host=host,
             kind="models",
         ),
         cpu_profile=profile,
         selected_provider_model_ids=selected,
+        _provenance=provenance,
+        _seal=_PLAN_SEAL,
     )
+    _PLAN_RECORDS[provenance] = _plan_snapshot(plan)
+    return plan
 
 
 def start_local_instance(
     plan: OllamaLocalPlan, *, runtime: OllamaRuntime | None = None
 ) -> RunningOllamaInstance:
-    if not isinstance(plan, OllamaLocalPlan):
+    if (
+        not isinstance(plan, OllamaLocalPlan)
+        or _PLAN_RECORDS.pop(plan._provenance, None) != _plan_snapshot(plan)
+    ):
         _fail("provider.plan_invalid")
-    _revalidate_path(plan.executable, plan.host.effective_uid, kind="executable")
-    _revalidate_path(plan.models_directory, plan.host.effective_uid, kind="models")
+    _revalidate_path(plan.executable, plan.host, kind="executable")
+    _revalidate_path(plan.models_directory, plan.host, kind="models")
     adapter = runtime or SystemOllamaRuntime()
     port = adapter.allocate_loopback_port()
     if type(port) is not int or not 1 <= port <= 65535:
@@ -339,56 +596,118 @@ def start_local_instance(
     unit_name = f"codex-master-ollama-{secrets.token_hex(16)}.scope"
     if not _UNIT_NAME.fullmatch(unit_name):
         _fail("resource.scope_invalid")
-    properties = plan.cpu_profile.systemd_properties()
-    argv = (
-        SYSTEMD_RUN_PATH,
-        "--user",
-        "--scope",
-        "--quiet",
-        "--collect",
-        f"--unit={unit_name}",
-        f"--slice={OLLAMA_SLICE}",
-        *(f"--property={name}={value}" for name, value in properties.items()),
-        plan.instance.ollama_executable,
-        "serve",
+    properties = tuple(plan.cpu_profile.systemd_properties().items())
+    request_provenance = secrets.token_bytes(32)
+    request = OllamaStartRequest(
+        unit_name=unit_name,
+        argv=_start_argv(
+            unit_name,
+            plan.executable,
+            plan.models_directory,
+            plan.host,
+            port,
+            properties,
+        ),
+        launcher_environment=_launcher_environment(plan.host.effective_uid),
+        executable=plan.executable,
+        models_directory=plan.models_directory,
+        host=plan.host,
+        port=port,
+        systemd_properties=properties,
+        _provenance=request_provenance,
+        _seal=_START_SEAL,
     )
-    environment = {
-        "OLLAMA_HOST": f"127.0.0.1:{port}",
-        "OLLAMA_MODELS": plan.instance.models_directory,
-    }
-    process = adapter.start_scope(argv, environment)
-    pid = getattr(process, "pid", None)
-    if type(pid) is not int or pid < 1 or not adapter.process_running(process):
+    _START_RECORDS[request_provenance] = _start_request_snapshot(request)
+    process: OllamaProcess | None = None
+    try:
+        process = adapter.start_scope(request)
+        pid, control_group, start_ticks = adapter.resolve_scope(request, process)
+        if not adapter.process_running(process, pid, start_ticks):
+            _fail("provider.process_start_failed")
+    except Exception as error:
+        if process is not None:
+            try:
+                adapter.cleanup_scope(request, process)
+            except Exception:
+                pass
+        if isinstance(error, OllamaRuntimeError):
+            raise
         _fail("provider.process_start_failed")
-    return RunningOllamaInstance(
+    finally:
+        _START_RECORDS.pop(request_provenance, None)
+    provenance = secrets.token_bytes(32)
+    running = RunningOllamaInstance(
         plan=plan,
         unit_name=unit_name,
         port=port,
         process=process,
+        ollama_pid=pid,
+        control_group=control_group,
+        process_start_ticks=start_ticks,
+        _provenance=provenance,
+        _seal=_RUNNING_SEAL,
     )
+    _RUNNING_RECORDS[provenance] = _running_snapshot(running)
+    return running
 
 
 def stop_local_instance(
     instance: RunningOllamaInstance, *, runtime: OllamaRuntime | None = None
 ) -> None:
-    if not isinstance(instance, RunningOllamaInstance):
+    if not _recorded_running(instance):
         _fail("provider.instance_invalid")
-    (runtime or SystemOllamaRuntime()).stop_scope(instance.unit_name, instance.process)
+    adapter = runtime or SystemOllamaRuntime()
+    if not adapter.scope_process_matches(
+        instance.unit_name,
+        instance.ollama_pid,
+        instance.control_group,
+        instance.process_start_ticks,
+    ):
+        _fail("resource.scope_membership_invalid")
+    request_provenance = secrets.token_bytes(32)
+    request = OllamaStopRequest(
+        unit_name=instance.unit_name,
+        process=instance.process,
+        ollama_pid=instance.ollama_pid,
+        control_group=instance.control_group,
+        process_start_ticks=instance.process_start_ticks,
+        _provenance=request_provenance,
+        _seal=_STOP_SEAL,
+    )
+    _STOP_RECORDS[request_provenance] = _stop_request_snapshot(request)
+    try:
+        adapter.stop_scope(request)
+    finally:
+        _STOP_RECORDS.pop(request_provenance, None)
+    _RUNNING_RECORDS.pop(instance._provenance, None)
 
 
 def probe_instance_readiness(
     instance: RunningOllamaInstance, *, runtime: OllamaRuntime | None = None
 ) -> OllamaReadinessStatus:
-    if not isinstance(instance, RunningOllamaInstance):
+    if not _recorded_running(instance):
         _fail("provider.instance_invalid")
     adapter = runtime or SystemOllamaRuntime()
-    process_running = adapter.process_running(instance.process)
+    process_running = adapter.process_running(
+        instance.process, instance.ollama_pid, instance.process_start_ticks
+    )
     if not process_running:
         return _readiness(reason="provider.process_unavailable")
-    cgroup_member = adapter.scope_contains(instance.unit_name, instance.process.pid)
+    cgroup_member = adapter.scope_process_matches(
+        instance.unit_name,
+        instance.ollama_pid,
+        instance.control_group,
+        instance.process_start_ticks,
+    )
     if not cgroup_member:
         return _readiness(
             reason="resource.scope_membership_invalid", process_running=True
+        )
+    if not adapter.listener_owned_by(instance.ollama_pid, instance.port):
+        return _readiness(
+            reason="provider.endpoint_identity_invalid",
+            process_running=True,
+            cgroup_member=True,
         )
     tags = adapter.fetch_tags(
         instance.port,
@@ -439,14 +758,19 @@ def _readiness(
 
 
 def _canonical_path(value: str) -> Path:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("/")
+        or "\x00" in value
+        or any(part in {"", ".", ".."} for part in value.split("/")[1:])
+    ):
+        _fail("resource.target_path_invalid")
     try:
         path = Path(value)
     except (TypeError, ValueError):
         _fail("resource.target_path_invalid")
     if (
-        not isinstance(value, str)
-        or not value
-        or not path.is_absolute()
+        not path.is_absolute()
         or path == Path("/")
         or str(path) != value
     ):
@@ -454,104 +778,164 @@ def _canonical_path(value: str) -> Path:
     return path
 
 
-def _allowed_start_operation(
-    argv: tuple[str, ...], environment: Mapping[str, str]
-) -> bool:
-    if (
-        type(argv) is not tuple
-        or len(argv) != 12
-        or any(not isinstance(argument, str) for argument in argv)
-        or type(environment) is not dict
-        or set(environment) != {"OLLAMA_HOST", "OLLAMA_MODELS"}
-        or any(not isinstance(value, str) for value in environment.values())
-        or argv[:5]
-        != (SYSTEMD_RUN_PATH, "--user", "--scope", "--quiet", "--collect")
-        or argv[6] != f"--slice={OLLAMA_SLICE}"
-        or argv[11] != "serve"
-        or not argv[5].startswith("--unit=")
-        or not _UNIT_NAME.fullmatch(argv[5].removeprefix("--unit="))
-        or not _CPU_PROPERTY.fullmatch(argv[7])
-    ):
-        return False
-    quota = _QUOTA_PROPERTY.fullmatch(argv[8])
-    weight = _WEIGHT_PROPERTY.fullmatch(argv[9])
-    if (
-        quota is None
-        or weight is None
-        or int(quota.group(1)) > 10000
-        or int(weight.group(1)) > 10000
-    ):
+def _valid_systemd_properties(value: object) -> bool:
+    if type(value) is not tuple or len(value) != 3:
         return False
     try:
-        executable = Path(argv[10])
-        models = Path(environment["OLLAMA_MODELS"])
-    except (KeyError, TypeError, ValueError):
+        allowed, quota, weight = value
+        return (
+            allowed[0] == "AllowedCPUs"
+            and quota[0] == "CPUQuota"
+            and weight[0] == "CPUWeight"
+            and _CPU_PROPERTY.fullmatch(f"--property=AllowedCPUs={allowed[1]}")
+            is not None
+            and (quota_match := _QUOTA_PROPERTY.fullmatch(f"--property=CPUQuota={quota[1]}"))
+            is not None
+            and (weight_match := _WEIGHT_PROPERTY.fullmatch(f"--property=CPUWeight={weight[1]}"))
+            is not None
+            and int(quota_match.group(1)) <= 10000
+            and int(weight_match.group(1)) <= 10000
+        )
+    except (IndexError, TypeError, ValueError):
         return False
-    host = _LOOPBACK_HOST.fullmatch(environment.get("OLLAMA_HOST", ""))
+
+
+def _launcher_environment(effective_uid: int) -> dict[str, str]:
+    runtime_directory = f"/run/user/{effective_uid}"
+    module_root = Path(__file__).parent.parent
+    if not module_root.is_absolute():
+        _fail("provider.operation_not_allowed")
+    return {
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime_directory}/bus",
+        "PYTHONPATH": str(module_root),
+        "XDG_RUNTIME_DIR": runtime_directory,
+    }
+
+
+def _start_argv(
+    unit_name: str,
+    executable: OllamaPathEvidence,
+    models_directory: OllamaPathEvidence,
+    host: OllamaHostSnapshot,
+    port: int,
+    properties: tuple[tuple[str, str], ...],
+) -> tuple[str, ...]:
+    payload = json.dumps(
+        {
+            "schema": 1,
+            "executable": _path_evidence_document(executable),
+            "models_directory": _path_evidence_document(models_directory),
+            "host": {
+                "available_cpus": list(host.available_cpus),
+                "effective_uid": host.effective_uid,
+                "effective_gid": host.effective_gid,
+                "supplementary_gids": list(host.supplementary_gids),
+            },
+            "port": port,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return (
-        host is not None
-        and int(host.group(1)) <= 65535
-        and executable.is_absolute()
-        and executable != Path("/")
-        and str(executable) == argv[10]
-        and models.is_absolute()
-        and models != Path("/")
-        and str(models) == environment["OLLAMA_MODELS"]
+        SYSTEMD_RUN_PATH,
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+        f"--unit={unit_name}",
+        f"--slice={OLLAMA_SLICE}",
+        *(f"--property={name}={value}" for name, value in properties),
+        f"/proc/{os.getpid()}/exe",
+        "-m",
+        "codex_master.ollama_runtime",
+        "--exec-pinned",
+        payload,
     )
 
 
-def _inspect_path(
-    value: str, *, effective_uid: int, kind: str
-) -> OllamaPathEvidence:
-    path = _canonical_path(value)
-    metadata = _open_absolute_no_symlinks(path, directory=kind == "models")
-    mode = stat.S_IMODE(metadata.st_mode)
-    trusted_owner = metadata.st_uid in {0, effective_uid}
-    if kind == "executable":
-        valid = (
-            stat.S_ISREG(metadata.st_mode)
-            and trusted_owner
-            and bool(mode & 0o111)
-            and not bool(mode & 0o022)
-        )
-    else:
-        private_user_directory = metadata.st_uid == effective_uid and mode == 0o700
-        administrative_directory = (
-            metadata.st_uid == 0 and bool(mode & 0o500) and not bool(mode & 0o022)
-        )
-        valid = stat.S_ISDIR(metadata.st_mode) and trusted_owner and (
-            private_user_directory or administrative_directory
-        )
-    if not valid:
-        _fail("resource.target_path_invalid")
-    return OllamaPathEvidence(
-        path=str(path),
-        device=metadata.st_dev,
-        inode=metadata.st_ino,
-        mode=metadata.st_mode,
-        owner_uid=metadata.st_uid,
+def _path_evidence_document(evidence: OllamaPathEvidence) -> dict[str, object]:
+    return {
+        "path": evidence.path,
+        "device": evidence.device,
+        "inode": evidence.inode,
+        "mode": evidence.mode,
+        "owner_uid": evidence.owner_uid,
+        "owner_gid": evidence.owner_gid,
+        "link_count": evidence.link_count,
+        "size": evidence.size,
+        "mtime_ns": evidence.mtime_ns,
+        "ctime_ns": evidence.ctime_ns,
+        "sha256": evidence.sha256,
+        "ancestors": [
+            {
+                "path": ancestor.path,
+                "device": ancestor.device,
+                "inode": ancestor.inode,
+                "mode": ancestor.mode,
+                "owner_uid": ancestor.owner_uid,
+                "owner_gid": ancestor.owner_gid,
+            }
+            for ancestor in evidence.ancestors
+        ],
+    }
+
+
+def _recorded_running(instance: object) -> bool:
+    return (
+        isinstance(instance, RunningOllamaInstance)
+        and instance._seal is _RUNNING_SEAL
+        and _RUNNING_RECORDS.get(instance._provenance) == _running_snapshot(instance)
     )
 
 
-def _open_absolute_no_symlinks(path: Path, *, directory: bool) -> os.stat_result:
+def _recorded_start_request(request: object) -> bool:
+    return (
+        isinstance(request, OllamaStartRequest)
+        and request._seal is _START_SEAL
+        and _START_RECORDS.get(request._provenance)
+        == _start_request_snapshot(request)
+    )
+
+
+def _recorded_stop_request(request: object) -> bool:
+    return (
+        isinstance(request, OllamaStopRequest)
+        and request._seal is _STOP_SEAL
+        and _STOP_RECORDS.get(request._provenance)
+        == _stop_request_snapshot(request)
+    )
+
+
+def _plan_snapshot(plan: OllamaLocalPlan) -> tuple[object, ...]:
+    return (id(plan), repr(plan))
+
+
+def _running_snapshot(instance: RunningOllamaInstance) -> tuple[object, ...]:
+    return (
+        id(instance),
+        repr(instance.plan),
+        instance.unit_name,
+        instance.port,
+        id(instance.process),
+        instance.ollama_pid,
+        instance.control_group,
+        instance.process_start_ticks,
+    )
+
+
+def _start_request_snapshot(request: OllamaStartRequest) -> tuple[object, ...]:
+    return (id(request), repr(request))
+
+
+def _stop_request_snapshot(request: OllamaStopRequest) -> tuple[object, ...]:
+    return (id(request), repr(request), id(request.process))
+
+
+def _inspect_path(value: str, *, host: OllamaHostSnapshot, kind: str) -> OllamaPathEvidence:
     descriptor = -1
     try:
-        descriptor = os.open(
-            "/", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
-        )
-        parts = path.parts[1:]
-        for index, part in enumerate(parts):
-            final = index == len(parts) - 1
-            flags = os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW
-            if not final or directory:
-                flags |= os.O_DIRECTORY
-            next_descriptor = os.open(part, flags, dir_fd=descriptor)
-            os.close(descriptor)
-            descriptor = next_descriptor
-        metadata = os.fstat(descriptor)
-        if stat.S_ISLNK(metadata.st_mode):
-            _fail("resource.target_path_invalid")
-        return metadata
+        descriptor, evidence = _open_validated_path(value, host=host, kind=kind)
+        return evidence
     except OllamaRuntimeError:
         raise
     except OSError:
@@ -561,14 +945,516 @@ def _open_absolute_no_symlinks(path: Path, *, directory: bool) -> os.stat_result
             os.close(descriptor)
 
 
+def _open_validated_path(
+    value: str, *, host: OllamaHostSnapshot, kind: str
+) -> tuple[int, OllamaPathEvidence]:
+    path = _canonical_path(value)
+    descriptor, metadata, ancestors = _open_path_chain(
+        path, directory=kind == "models", host=host
+    )
+    try:
+        mode = stat.S_IMODE(metadata.st_mode)
+        trusted_owner = metadata.st_uid in {0, host.effective_uid}
+        if kind == "executable":
+            valid = (
+                stat.S_ISREG(metadata.st_mode)
+                and trusted_owner
+                and not bool(mode & 0o022)
+                and _effective_access(metadata, host, read=True, execute=True)
+                and (metadata.st_uid == 0 or metadata.st_nlink == 1)
+                and 0 < metadata.st_size <= _MAX_EXECUTABLE_BYTES
+            )
+            digest = _digest_descriptor(descriptor) if valid else None
+        else:
+            private_user_directory = (
+                metadata.st_uid == host.effective_uid and mode == 0o700
+            )
+            administrative_directory = (
+                metadata.st_uid == 0 and not bool(mode & 0o022)
+            )
+            valid = (
+                stat.S_ISDIR(metadata.st_mode)
+                and trusted_owner
+                and _effective_access(metadata, host, read=True, execute=True)
+                and (private_user_directory or administrative_directory)
+            )
+            digest = None
+        if not valid:
+            _fail("resource.target_path_invalid")
+        evidence = OllamaPathEvidence(
+            path=str(path),
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            mode=metadata.st_mode,
+            owner_uid=metadata.st_uid,
+            owner_gid=metadata.st_gid,
+            link_count=metadata.st_nlink,
+            size=metadata.st_size,
+            mtime_ns=metadata.st_mtime_ns,
+            ctime_ns=metadata.st_ctime_ns,
+            sha256=digest,
+            ancestors=ancestors,
+        )
+        return descriptor, evidence
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_path_chain(
+    path: Path, *, directory: bool, host: OllamaHostSnapshot
+) -> tuple[int, os.stat_result, tuple[OllamaAncestorEvidence, ...]]:
+    descriptor = os.open(
+        "/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    )
+    ancestors: list[OllamaAncestorEvidence] = []
+    current = Path("/")
+    try:
+        parts = path.parts[1:]
+        for index, part in enumerate(parts):
+            final = index == len(parts) - 1
+            metadata = os.fstat(descriptor)
+            _validate_ancestor(current, metadata, host)
+            ancestors.append(_ancestor_evidence(current, metadata))
+            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+            if not final or directory:
+                flags |= os.O_DIRECTORY
+            next_descriptor = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+            current /= part
+        metadata = os.fstat(descriptor)
+        if stat.S_ISLNK(metadata.st_mode):
+            _fail("resource.target_path_invalid")
+        return descriptor, metadata, tuple(ancestors)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _ancestor_evidence(path: Path, metadata: os.stat_result) -> OllamaAncestorEvidence:
+    return OllamaAncestorEvidence(
+        path=str(path),
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        mode=metadata.st_mode,
+        owner_uid=metadata.st_uid,
+        owner_gid=metadata.st_gid,
+    )
+
+
+def _validate_ancestor(
+    path: Path, metadata: os.stat_result, host: OllamaHostSnapshot
+) -> None:
+    mode = stat.S_IMODE(metadata.st_mode)
+    writable = bool(mode & 0o022)
+    trusted_sticky = metadata.st_uid == 0 and bool(mode & stat.S_ISVTX)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid not in {0, host.effective_uid}
+        or not _effective_access(metadata, host, read=False, execute=True)
+        or (writable and not trusted_sticky)
+        or not path.is_absolute()
+    ):
+        _fail("resource.target_path_invalid")
+
+
+def _effective_access(
+    metadata: os.stat_result,
+    host: OllamaHostSnapshot,
+    *,
+    read: bool,
+    execute: bool,
+) -> bool:
+    mode = stat.S_IMODE(metadata.st_mode)
+    required = (0o4 if read else 0) | (0o1 if execute else 0)
+    if host.effective_uid == 0:
+        return (not execute or bool(mode & 0o111))
+    if metadata.st_uid == host.effective_uid:
+        granted = (mode >> 6) & 0o7
+    elif metadata.st_gid in {host.effective_gid, *host.supplementary_gids}:
+        granted = (mode >> 3) & 0o7
+    else:
+        granted = mode & 0o7
+    return granted & required == required
+
+
+def _digest_descriptor(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while chunk := os.read(descriptor, 1024 * 1024):
+        digest.update(chunk)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return digest.hexdigest()
+
+
 def _revalidate_path(
-    expected: OllamaPathEvidence, effective_uid: int, *, kind: str
+    expected: OllamaPathEvidence, host: OllamaHostSnapshot, *, kind: str
 ) -> None:
     try:
-        current = _inspect_path(
-            expected.path, effective_uid=effective_uid, kind=kind
-        )
+        current = _inspect_path(expected.path, host=host, kind=kind)
     except OllamaRuntimeError:
         _fail("resource.target_path_changed")
-    if (current.device, current.inode) != (expected.device, expected.inode):
+    if current != expected:
         _fail("resource.target_path_changed")
+
+
+def _exec_pinned(
+    executable: OllamaPathEvidence,
+    models_directory: OllamaPathEvidence,
+    host: OllamaHostSnapshot,
+    *,
+    port: int,
+) -> NoReturn:
+    executable_fd = -1
+    models_fd = -1
+    try:
+        executable_fd, current_executable = _open_validated_path(
+            executable.path, host=host, kind="executable"
+        )
+        models_fd, current_models = _open_validated_path(
+            models_directory.path, host=host, kind="models"
+        )
+        if current_executable != executable or current_models != models_directory:
+            _fail("resource.target_path_changed")
+        os.set_inheritable(models_fd, True)
+        os.execve(
+            executable_fd,
+            (executable.path, "serve"),
+            {
+                "OLLAMA_HOST": f"127.0.0.1:{port}",
+                "OLLAMA_MODELS": f"/proc/self/fd/{models_fd}",
+            },
+        )
+    except OllamaRuntimeError:
+        raise
+    except OSError:
+        _fail("provider.process_start_failed")
+    finally:
+        if executable_fd >= 0:
+            os.close(executable_fd)
+        if models_fd >= 0:
+            os.close(models_fd)
+    raise AssertionError("unreachable")
+
+
+def _process_control_group(pid: int) -> str:
+    with open(f"/proc/{pid}/cgroup", "rb", buffering=0) as stream:
+        raw = stream.read(_MAX_CGROUP_BYTES + 1)
+    if len(raw) > _MAX_CGROUP_BYTES:
+        raise OSError("cgroup evidence too large")
+    lines = raw.decode("ascii").splitlines()
+    matches = [line.removeprefix("0::") for line in lines if line.startswith("0::/")]
+    if len(matches) != 1:
+        raise OSError("cgroup evidence invalid")
+    return matches[0]
+
+
+def _cgroup_processes(control_group: str) -> tuple[int, ...]:
+    if (
+        not isinstance(control_group, str)
+        or not control_group.startswith("/")
+        or len(control_group) > 4096
+    ):
+        raise OSError("control group invalid")
+    parts = control_group.removeprefix("/").split("/")
+    if (
+        not parts
+        or len(parts) > 64
+        or any(
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}", part)
+            for part in parts
+        )
+    ):
+        raise OSError("control group invalid")
+    path = CGROUP_ROOT.joinpath(*parts, "cgroup.procs")
+    with open(path, "rb", buffering=0) as stream:
+        raw = stream.read(_MAX_CGROUP_BYTES + 1)
+    if len(raw) > _MAX_CGROUP_BYTES:
+        raise OSError("cgroup process evidence too large")
+    lines = raw.decode("ascii").splitlines()
+    if not lines:
+        return ()
+    pids = tuple(int(line) for line in lines)
+    if any(pid < 1 for pid in pids) or len(set(pids)) != len(pids):
+        raise OSError("cgroup process evidence invalid")
+    return pids
+
+
+def _remaining_seconds(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    return remaining
+
+
+def _read_http_response(
+    connection: socket.socket, *, deadline: float, max_body_bytes: int
+) -> bytes | None:
+    maximum = 16 * 1024 + max_body_bytes + 16 * 1024
+    raw = bytearray()
+    while len(raw) <= maximum:
+        connection.settimeout(_remaining_seconds(deadline))
+        chunk = connection.recv(min(8192, maximum + 1 - len(raw)))
+        if not chunk:
+            break
+        raw.extend(chunk)
+        header_end = raw.find(b"\r\n\r\n")
+        if header_end >= 0:
+            header = bytes(raw[:header_end])
+            if len(header) > 16 * 1024:
+                return None
+            headers = _http_headers(header)
+            if headers is None:
+                return None
+            body_size = len(raw) - header_end - 4
+            length = headers.get("content-length")
+            if length is not None and length.isdigit() and body_size >= int(length):
+                break
+            if headers.get("transfer-encoding") == "chunked" and raw.endswith(b"0\r\n\r\n"):
+                break
+    if len(raw) > maximum:
+        return None
+    header_end = raw.find(b"\r\n\r\n")
+    if header_end < 0 or header_end > 16 * 1024:
+        return None
+    headers = _http_headers(bytes(raw[:header_end]))
+    if headers is None:
+        return None
+    body = bytes(raw[header_end + 4 :])
+    transfer_encoding = headers.get("transfer-encoding")
+    content_length = headers.get("content-length")
+    if transfer_encoding is not None:
+        if transfer_encoding != "chunked" or content_length is not None:
+            return None
+        decoded = _decode_chunked_body(body, max_body_bytes)
+        if decoded is None:
+            return None
+        body = decoded
+    elif content_length is not None:
+        if not content_length.isascii() or not content_length.isdigit():
+            return None
+        expected = int(content_length)
+        if expected > max_body_bytes or len(body) != expected:
+            return None
+    if len(body) > max_body_bytes:
+        return None
+    return body
+
+
+def _http_headers(raw: bytes) -> dict[str, str] | None:
+    try:
+        lines = raw.decode("ascii").split("\r\n")
+    except UnicodeDecodeError:
+        return None
+    if not lines or lines[0] not in {"HTTP/1.0 200 OK", "HTTP/1.1 200 OK"}:
+        return None
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        if ":" not in line:
+            return None
+        name, value = line.split(":", 1)
+        name = name.strip().lower()
+        value = value.strip().lower()
+        if not name or name in headers or "\x00" in value:
+            return None
+        headers[name] = value
+    return headers
+
+
+def _decode_chunked_body(raw: bytes, maximum: int) -> bytes | None:
+    offset = 0
+    decoded = bytearray()
+    while True:
+        line_end = raw.find(b"\r\n", offset)
+        if line_end < 0 or line_end - offset > 16:
+            return None
+        size_text = raw[offset:line_end].split(b";", 1)[0]
+        try:
+            size = int(size_text, 16)
+        except ValueError:
+            return None
+        offset = line_end + 2
+        if size == 0:
+            return bytes(decoded) if raw[offset:] == b"\r\n" else None
+        if size < 0 or len(decoded) + size > maximum or offset + size + 2 > len(raw):
+            return None
+        decoded.extend(raw[offset : offset + size])
+        offset += size
+        if raw[offset : offset + 2] != b"\r\n":
+            return None
+        offset += 2
+
+
+def _process_start_ticks(pid: int) -> int:
+    with open(f"/proc/{pid}/stat", "rb", buffering=0) as stream:
+        raw = stream.read(_MAX_CGROUP_BYTES + 1)
+    if len(raw) > _MAX_CGROUP_BYTES:
+        raise OSError("process evidence too large")
+    text = raw.decode("ascii")
+    end = text.rfind(")")
+    if end < 0:
+        raise OSError("process evidence invalid")
+    fields = text[end + 2 :].split()
+    if len(fields) < 20:
+        raise OSError("process evidence invalid")
+    start_ticks = int(fields[19])
+    if start_ticks < 1:
+        raise OSError("process evidence invalid")
+    return start_ticks
+
+
+def _loopback_listener_inodes(port: int) -> set[str]:
+    target = f"0100007F:{port:04X}"
+    with open("/proc/net/tcp", "rb", buffering=0) as stream:
+        raw = stream.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise OSError("tcp evidence too large")
+    inodes: set[str] = set()
+    for line in raw.decode("ascii").splitlines()[1:]:
+        fields = line.split()
+        if len(fields) >= 10 and fields[1] == target and fields[3] == "0A":
+            inodes.add(fields[9])
+    return inodes
+
+
+def _run_exec_helper(payload: str) -> NoReturn:
+    if not isinstance(payload, str) or len(payload.encode("utf-8")) > 64 * 1024:
+        _fail("provider.operation_not_allowed")
+    try:
+        document = json.loads(payload)
+        if type(document) is not dict or set(document) != {
+            "schema",
+            "executable",
+            "models_directory",
+            "host",
+            "port",
+        }:
+            _fail("provider.operation_not_allowed")
+        if document["schema"] != 1:
+            _fail("provider.operation_not_allowed")
+        host_document = document["host"]
+        if type(host_document) is not dict or set(host_document) != {
+            "available_cpus",
+            "effective_uid",
+            "effective_gid",
+            "supplementary_gids",
+        }:
+            _fail("provider.operation_not_allowed")
+        available_cpus = host_document["available_cpus"]
+        supplementary_gids = host_document["supplementary_gids"]
+        if type(available_cpus) is not list or type(supplementary_gids) is not list:
+            _fail("provider.operation_not_allowed")
+        host = OllamaHostSnapshot(
+            available_cpus=tuple(available_cpus),
+            effective_uid=_document_int(host_document["effective_uid"]),
+            effective_gid=_document_int(host_document["effective_gid"]),
+            supplementary_gids=tuple(supplementary_gids),
+        )
+        if (
+            host.effective_uid != os.geteuid()
+            or host.effective_gid != os.getegid()
+            or host.supplementary_gids != tuple(sorted(set(os.getgroups())))
+        ):
+            _fail("provider.operation_not_allowed")
+        _exec_pinned(
+            _path_evidence_from_document(document["executable"]),
+            _path_evidence_from_document(document["models_directory"]),
+            host,
+            port=_document_int(document["port"], maximum=65535, minimum=1),
+        )
+    except OllamaRuntimeError:
+        raise
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        _fail("provider.operation_not_allowed")
+    raise AssertionError("unreachable")
+
+
+def _path_evidence_from_document(value: object) -> OllamaPathEvidence:
+    keys = {
+        "path",
+        "device",
+        "inode",
+        "mode",
+        "owner_uid",
+        "owner_gid",
+        "link_count",
+        "size",
+        "mtime_ns",
+        "ctime_ns",
+        "sha256",
+        "ancestors",
+    }
+    if type(value) is not dict or set(value) != keys:
+        _fail("provider.operation_not_allowed")
+    ancestors = value["ancestors"]
+    if type(ancestors) is not list or not ancestors or len(ancestors) > 64:
+        _fail("provider.operation_not_allowed")
+    parsed_ancestors: list[OllamaAncestorEvidence] = []
+    for ancestor in ancestors:
+        if type(ancestor) is not dict or set(ancestor) != {
+            "path",
+            "device",
+            "inode",
+            "mode",
+            "owner_uid",
+            "owner_gid",
+        }:
+            _fail("provider.operation_not_allowed")
+        path = ancestor["path"]
+        if not isinstance(path, str) or not path.startswith("/"):
+            _fail("provider.operation_not_allowed")
+        parsed_ancestors.append(
+            OllamaAncestorEvidence(
+                path=path,
+                device=_document_int(ancestor["device"]),
+                inode=_document_int(ancestor["inode"], minimum=1),
+                mode=_document_int(ancestor["mode"], minimum=1),
+                owner_uid=_document_int(ancestor["owner_uid"]),
+                owner_gid=_document_int(ancestor["owner_gid"]),
+            )
+        )
+    path = value["path"]
+    sha256 = value["sha256"]
+    if (
+        not isinstance(path, str)
+        or not path.startswith("/")
+        or (sha256 is not None and (not isinstance(sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", sha256)))
+    ):
+        _fail("provider.operation_not_allowed")
+    return OllamaPathEvidence(
+        path=path,
+        device=_document_int(value["device"]),
+        inode=_document_int(value["inode"], minimum=1),
+        mode=_document_int(value["mode"], minimum=1),
+        owner_uid=_document_int(value["owner_uid"]),
+        owner_gid=_document_int(value["owner_gid"]),
+        link_count=_document_int(value["link_count"], minimum=1),
+        size=_document_int(value["size"]),
+        mtime_ns=_document_int(value["mtime_ns"]),
+        ctime_ns=_document_int(value["ctime_ns"]),
+        sha256=sha256,
+        ancestors=tuple(parsed_ancestors),
+    )
+
+
+def _document_int(value: object, *, minimum: int = 0, maximum: int = (1 << 63) - 1) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        _fail("provider.operation_not_allowed")
+    return value
+
+
+def _helper_main(arguments: tuple[str, ...]) -> int:
+    if len(arguments) != 2 or arguments[0] != "--exec-pinned":
+        return 125
+    try:
+        _run_exec_helper(arguments[1])
+    except OllamaRuntimeError:
+        return 125
+    except Exception:
+        return 126
+    return 126
+
+
+if __name__ == "__main__":
+    raise SystemExit(_helper_main(tuple(sys.argv[1:])))
