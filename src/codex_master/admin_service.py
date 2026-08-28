@@ -90,6 +90,7 @@ _STEP_UP_OPERATIONS = frozenset(
     }
 )
 _CODE = re.compile(r"[a-z][a-z0-9_.-]{0,127}\Z", re.ASCII)
+_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _HEX_DIGEST = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _FORBIDDEN_ARGUMENT_KEYS = frozenset(
     {
@@ -137,6 +138,14 @@ class GoogleProvisionerPort(Protocol):
 
 class SecretIngressPort(Protocol):
     def create_session(self, **values: object) -> SecretIngressSessionV1: ...
+
+    def put_secret(
+        self,
+        session_id: str,
+        secret: bytes | bytearray | memoryview,
+        *,
+        principal: str,
+    ) -> SecretIngressSessionV1: ...
 
     def resolve(self, session: object, **values: object) -> tuple[object, object]: ...
 
@@ -215,6 +224,38 @@ class MasterjetControlService:
         except BaseException:
             raise _service_error("control.request_invalid") from None
         return self.handle(principal, request)
+
+    def put_secret(
+        self,
+        principal: AdminPrincipalV1,
+        session_id: str,
+        secret: bytes | bytearray | memoryview,
+    ) -> dict[str, object]:
+        """Consume one secret outside all JSON control request paths."""
+
+        if type(principal) is not AdminPrincipalV1:
+            raise _service_error("control.request_invalid")
+        if "fleet.secrets.ingress" not in principal.scopes:
+            raise _denied("authority.scope_denied")
+        if not principal.step_up:
+            raise _denied("authority.step_up_required")
+        if type(session_id) is not str or _SESSION_ID.fullmatch(session_id) is None:
+            raise _service_error("control.request_invalid")
+        secret = _secret_value(secret)
+        ingress = _required(self._secret_ingress)
+        try:
+            result = ingress.put_secret(
+                session_id,
+                secret,
+                principal=principal.subject,
+            )
+        except AdminServiceError:
+            raise
+        except BaseException as error:
+            owner_error = _owner_service_error(error)
+            del error
+            raise owner_error from None
+        return _public_mapping(_serialize_ingress_session(result))
 
     def command(
         self,
@@ -640,6 +681,23 @@ def _capability(value: object | None) -> object:
     if value is None or type(value) in {bytes, bytearray, memoryview}:
         raise _service_error("control.request_invalid")
     return value
+
+
+def _secret_value(value: object) -> bytes | bytearray | memoryview:
+    if type(value) in {bytes, bytearray}:
+        if len(value) == 0:  # type: ignore[arg-type]
+            raise _service_error("control.request_invalid")
+        return cast(bytes | bytearray, value)
+    if type(value) is memoryview:
+        if (
+            value.nbytes == 0
+            or value.ndim != 1
+            or value.itemsize != 1
+            or not value.contiguous
+        ):
+            raise _service_error("control.request_invalid")
+        return value
+    raise _service_error("control.request_invalid")
 
 
 def _generation(request: AdminRequestV1) -> int:

@@ -413,6 +413,8 @@ class SecretIngress:
     def __init__(self) -> None:
         self.create_calls = 0
         self.resolve_calls = 0
+        self.put_calls = 0
+        self.last_put: tuple[str, object, str] | None = None
 
     def create_session(self, **values: object) -> SecretIngressSessionV1:
         self.create_calls += 1
@@ -426,6 +428,13 @@ class SecretIngress:
         if values["credential_kind"] == "openai.auth-json":
             return "openai-plan", "openai-upload"
         return "google-client-plan", "google-client-upload"
+
+    def put_secret(
+        self, session_id: str, secret: object, *, principal: str
+    ) -> SecretIngressSessionV1:
+        self.put_calls += 1
+        self.last_put = (session_id, secret, principal)
+        return SecretIngressSessionV1(session_id, "openai-one", "consumed")
 
 
 @dataclass
@@ -602,6 +611,71 @@ def test_raw_secret_field_is_rejected_before_ingress_or_credential_owner() -> No
     assert "private-marker" not in str(captured.value)
     assert owners.secret_ingress.resolve_calls == 0
     assert owners.openai_credentials.apply_calls == 0
+
+
+def test_put_secret_delegates_same_buffer_with_bound_principal() -> None:
+    service, owners = service_at()
+    secret = bytearray(b"private-marker")
+
+    result = service.put_secret(
+        principal("fleet.secrets.ingress", step_up=True),
+        "ingress-one",
+        secret,
+    )
+
+    assert result == {
+        "id": "ingress-one",
+        "account_ref": "openai-one",
+        "state": "consumed",
+    }
+    assert owners.secret_ingress.put_calls == 1
+    assert owners.secret_ingress.last_put is not None
+    assert owners.secret_ingress.last_put[0] == "ingress-one"
+    assert owners.secret_ingress.last_put[1] is secret
+    assert owners.secret_ingress.last_put[2] == "operator-one"
+
+
+def test_put_secret_requires_exact_scope_and_step_up_before_owner() -> None:
+    service, owners = service_at()
+
+    with pytest.raises(AdminDenied, match="authority.scope_denied"):
+        service.put_secret(
+            principal("fleet.read", step_up=True),
+            "ingress-one",
+            bytearray(b"private-marker"),
+        )
+    with pytest.raises(AdminDenied, match="authority.step_up_required"):
+        service.put_secret(
+            principal("fleet.secrets.ingress"),
+            "ingress-one",
+            bytearray(b"private-marker"),
+        )
+
+    assert owners.secret_ingress.put_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("session_id", "secret"),
+    [
+        ("", bytearray(b"private-marker")),
+        ("ingress-one", bytearray()),
+        ("ingress-one", "private-marker"),
+    ],
+)
+def test_put_secret_rejects_invalid_non_json_boundary_types(
+    session_id: object, secret: object
+) -> None:
+    service, owners = service_at()
+
+    with pytest.raises(AdminServiceError, match="control.request_invalid") as caught:
+        service.put_secret(  # type: ignore[arg-type]
+            principal("fleet.secrets.ingress", step_up=True),
+            session_id,
+            secret,
+        )
+
+    assert "private-marker" not in repr(caught.value)
+    assert owners.secret_ingress.put_calls == 0
 
 
 def test_openai_plan_forwards_generation_and_idempotency_once() -> None:
