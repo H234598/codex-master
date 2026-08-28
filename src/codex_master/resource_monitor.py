@@ -13,6 +13,7 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Callable, Literal, Protocol
@@ -70,6 +71,7 @@ _THERMAL_FIELD_SUFFIXES = frozenset(
     )
 )
 _RESOURCE_SNAPSHOT_PATH = PurePosixPath("resources/resource-snapshot-v1.json")
+_RESOURCE_EVIDENCE_V2_PATH = PurePosixPath("resources/resource-evidence-v2.json")
 _THERMAL_POLICY_PATH = PurePosixPath("resources/thermal-policy-v1.json")
 _THERMAL_POLICY_FIELDS = frozenset(("schema_version", "sensor_thresholds"))
 _SNAPSHOT_FIELDS = frozenset(
@@ -98,6 +100,41 @@ _SNAPSHOT_FIELDS = frozenset(
         "available_memory_mib",
         "legacy_pressure",
     )
+)
+_RESOURCE_EVIDENCE_V2_FIELDS = frozenset(
+    (
+        "schema_version",
+        "boot_id",
+        "generation",
+        "observed_at_utc",
+        "observed_monotonic_ns",
+        "state",
+        "completed_sample_count",
+        "reason_codes",
+        "measurements",
+    )
+)
+_RESOURCE_MEASUREMENTS_V2_FIELDS = frozenset(
+    (
+        "current",
+        "available_memory_mib",
+        "legacy_pressure",
+        "mean_1m",
+        "mean_10m",
+        "peak_10m",
+        "normalized_pressure",
+        "normalized_headroom",
+        "trend",
+        "bottleneck",
+        "preferred_profiles",
+        "avoid_profiles",
+        "confidence",
+        "monitor_cgroup_state",
+        "thermal_state",
+    )
+)
+_RESOURCE_PRESSURE_REASONS = frozenset(
+    ("temperature_monitor_unavailable", "temperature_pressure_high")
 )
 
 
@@ -413,6 +450,96 @@ class LegacyPressureV1:
         )
 
 
+class ResourceEvidenceStateV2(str, Enum):
+    WARMING = "warming"
+    UNAVAILABLE = "unavailable"
+    READY = "ready"
+    PRESSURE = "pressure"
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceMeasurementsV2:
+    current: Mapping[str, float]
+    available_memory_mib: int
+    legacy_pressure: LegacyPressureV1
+    mean_1m: Mapping[str, float]
+    mean_10m: Mapping[str, float]
+    peak_10m: Mapping[str, float]
+    normalized_pressure: Mapping[str, int]
+    normalized_headroom: Mapping[str, int]
+    trend: Mapping[str, Literal["rising", "stable", "falling"] | None]
+    bottleneck: Literal["cpu", "io", "memory", "thermal", "cgroup", "unknown"]
+    preferred_profiles: tuple[str, ...]
+    avoid_profiles: tuple[str, ...]
+    confidence: Literal["high", "low"]
+    monitor_cgroup_state: Literal["ready", "preflight_failed"]
+    thermal_state: Literal["warming_up", "no_valid_sensors", "ready", "monitor_unavailable"]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "current", _require_metric_mapping(self.current))
+        object.__setattr__(self, "available_memory_mib", _require_available_memory_mib(self.available_memory_mib))
+        if not isinstance(self.legacy_pressure, LegacyPressureV1):
+            _invalid()
+        object.__setattr__(self, "mean_1m", _require_metric_mapping(self.mean_1m))
+        object.__setattr__(self, "mean_10m", _require_metric_mapping(self.mean_10m))
+        object.__setattr__(self, "peak_10m", _require_metric_mapping(self.peak_10m))
+        object.__setattr__(self, "normalized_pressure", _require_percentage_mapping(self.normalized_pressure))
+        object.__setattr__(self, "normalized_headroom", _require_percentage_mapping(self.normalized_headroom))
+        confidence = _require_confidence(self.confidence)
+        object.__setattr__(self, "trend", _require_snapshot_trend_mapping(self.trend, confidence))
+        object.__setattr__(self, "confidence", confidence)
+        object.__setattr__(self, "bottleneck", _require_bottleneck(self.bottleneck))
+        object.__setattr__(self, "preferred_profiles", _require_identifiers(self.preferred_profiles, pattern=_PROFILE, maximum=8))
+        object.__setattr__(self, "avoid_profiles", _require_identifiers(self.avoid_profiles, pattern=_PROFILE, maximum=8))
+        object.__setattr__(self, "monitor_cgroup_state", _require_monitor_cgroup_state(self.monitor_cgroup_state))
+        object.__setattr__(self, "thermal_state", _require_thermal_state(self.thermal_state))
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceEvidenceV2:
+    schema_version: Literal[2]
+    boot_id: str
+    generation: int
+    observed_at_utc: datetime
+    observed_monotonic_ns: int
+    state: ResourceEvidenceStateV2
+    completed_sample_count: int
+    reason_codes: tuple[str, ...]
+    measurements: ResourceMeasurementsV2 | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "schema_version", _require_evidence_schema_version(self.schema_version))
+        object.__setattr__(self, "boot_id", _require_canonical_boot_id(self.boot_id))
+        object.__setattr__(self, "generation", _require_positive_int(self.generation))
+        object.__setattr__(self, "observed_at_utc", _require_utc_datetime(self.observed_at_utc))
+        object.__setattr__(self, "observed_monotonic_ns", _require_positive_int(self.observed_monotonic_ns))
+        if not isinstance(self.state, ResourceEvidenceStateV2):
+            _invalid()
+        object.__setattr__(self, "completed_sample_count", _require_sample_count(self.completed_sample_count))
+        reasons = _require_identifiers(self.reason_codes, pattern=_IDENTIFIER, maximum=16)
+        object.__setattr__(self, "reason_codes", reasons)
+        if self.state is ResourceEvidenceStateV2.WARMING:
+            if self.completed_sample_count > _MIN_COMPLETE_SAMPLES - 1 or self.measurements is not None:
+                _invalid()
+            if reasons != ("resource_monitor_warming",):
+                _invalid()
+        elif self.state is ResourceEvidenceStateV2.UNAVAILABLE:
+            if self.completed_sample_count != 0 or self.measurements is not None:
+                _invalid()
+            if reasons != ("resource_monitor_unavailable",):
+                _invalid()
+        elif self.state is ResourceEvidenceStateV2.READY:
+            if self.completed_sample_count < _MIN_COMPLETE_SAMPLES or not isinstance(self.measurements, ResourceMeasurementsV2):
+                _invalid()
+            if reasons != ("resource_ready",):
+                _invalid()
+        else:
+            if self.completed_sample_count < _MIN_COMPLETE_SAMPLES or not isinstance(self.measurements, ResourceMeasurementsV2):
+                _invalid()
+            if not reasons or any(reason not in _RESOURCE_PRESSURE_REASONS for reason in reasons):
+                _invalid()
+
+
 @dataclass(frozen=True, slots=True)
 class ResourceSnapshotV1:
     schema_version: int
@@ -627,6 +754,24 @@ def _require_schema_version(value: object) -> int:
     return value
 
 
+def _require_evidence_schema_version(value: object) -> Literal[2]:
+    if type(value) is not int or value != 2:
+        _invalid()
+    return 2
+
+
+def _require_sample_count(value: object) -> int:
+    if type(value) is not int or not 0 <= value <= _MAX_SAMPLE_BUCKETS:
+        _invalid()
+    return value
+
+
+def _require_monitor_cgroup_state(value: object) -> Literal["ready", "preflight_failed"]:
+    if not isinstance(value, str) or value not in {"ready", "preflight_failed"}:
+        _invalid()
+    return value  # type: ignore[return-value]
+
+
 def _require_confidence(value: object) -> Literal["high", "low"]:
     if not isinstance(value, str) or value not in {"high", "low"}:
         _invalid()
@@ -791,6 +936,69 @@ def parse_snapshot_document(
     )
 
 
+def _parse_resource_evidence_state(value: object) -> ResourceEvidenceStateV2:
+    if not isinstance(value, str):
+        _invalid()
+    try:
+        return ResourceEvidenceStateV2(value)
+    except ValueError:
+        _invalid()
+
+
+def _measurements_v2_from_document(payload: object) -> ResourceMeasurementsV2:
+    if not isinstance(payload, Mapping) or set(payload) != _RESOURCE_MEASUREMENTS_V2_FIELDS:
+        _invalid()
+    return ResourceMeasurementsV2(
+        current=payload["current"],  # type: ignore[arg-type]
+        available_memory_mib=payload["available_memory_mib"],  # type: ignore[arg-type]
+        legacy_pressure=_require_legacy_pressure(payload["legacy_pressure"]),
+        mean_1m=payload["mean_1m"],  # type: ignore[arg-type]
+        mean_10m=payload["mean_10m"],  # type: ignore[arg-type]
+        peak_10m=payload["peak_10m"],  # type: ignore[arg-type]
+        normalized_pressure=payload["normalized_pressure"],  # type: ignore[arg-type]
+        normalized_headroom=payload["normalized_headroom"],  # type: ignore[arg-type]
+        trend=payload["trend"],  # type: ignore[arg-type]
+        bottleneck=payload["bottleneck"],  # type: ignore[arg-type]
+        preferred_profiles=payload["preferred_profiles"],  # type: ignore[arg-type]
+        avoid_profiles=payload["avoid_profiles"],  # type: ignore[arg-type]
+        confidence=payload["confidence"],  # type: ignore[arg-type]
+        monitor_cgroup_state=payload["monitor_cgroup_state"],  # type: ignore[arg-type]
+        thermal_state=payload["thermal_state"],  # type: ignore[arg-type]
+    )
+
+
+def _resource_evidence_v2_from_document(
+    payload: Mapping[str, object], *, expected_boot_id: str | None = None
+) -> ResourceEvidenceV2:
+    if not isinstance(payload, Mapping) or set(payload) != _RESOURCE_EVIDENCE_V2_FIELDS:
+        _invalid()
+    measurements_payload = payload["measurements"]
+    measurements = None if measurements_payload is None else _measurements_v2_from_document(measurements_payload)
+    return ResourceEvidenceV2(
+        schema_version=payload["schema_version"],  # type: ignore[arg-type]
+        boot_id=_require_canonical_boot_id(payload["boot_id"], expected_boot_id),
+        generation=payload["generation"],  # type: ignore[arg-type]
+        observed_at_utc=_parse_utc(payload["observed_at_utc"]),
+        observed_monotonic_ns=payload["observed_monotonic_ns"],  # type: ignore[arg-type]
+        state=_parse_resource_evidence_state(payload["state"]),
+        completed_sample_count=payload["completed_sample_count"],  # type: ignore[arg-type]
+        reason_codes=payload["reason_codes"],  # type: ignore[arg-type]
+        measurements=measurements,
+    )
+
+
+def parse_resource_evidence_v2(
+    payload: Mapping[str, object], *, now_utc: datetime, expected_boot_id: str
+) -> ResourceEvidenceV2:
+    """Validate one canonical V2 evidence payload and its wall-clock freshness."""
+
+    now_utc = _require_utc_datetime(now_utc)
+    evidence = _resource_evidence_v2_from_document(payload, expected_boot_id=expected_boot_id)
+    if evidence.observed_at_utc > now_utc or now_utc - evidence.observed_at_utc > _FRESHNESS_MAX_AGE:
+        _invalid()
+    return evidence
+
+
 def _require_state(value: object) -> HiveStateStore:
     if not isinstance(value, HiveStateStore):
         _invalid()
@@ -943,6 +1151,112 @@ def _encode_resource_document(payload: Mapping[str, object]) -> bytes:
     if len(raw) > _RESOURCE_DOCUMENT_MAX_BYTES:
         _invalid()
     return raw
+
+
+def _measurements_v2_document(measurements: ResourceMeasurementsV2) -> Mapping[str, object]:
+    if not isinstance(measurements, ResourceMeasurementsV2):
+        _invalid()
+    return {
+        "current": dict(measurements.current),
+        "available_memory_mib": measurements.available_memory_mib,
+        "legacy_pressure": {
+            "load_per_cpu": measurements.legacy_pressure.load_per_cpu,
+            "cpu_busy_percent": measurements.legacy_pressure.cpu_busy_percent,
+            "io_wait_percent": measurements.legacy_pressure.io_wait_percent,
+            "available_memory_percent": measurements.legacy_pressure.available_memory_percent,
+        },
+        "mean_1m": dict(measurements.mean_1m),
+        "mean_10m": dict(measurements.mean_10m),
+        "peak_10m": dict(measurements.peak_10m),
+        "normalized_pressure": dict(measurements.normalized_pressure),
+        "normalized_headroom": dict(measurements.normalized_headroom),
+        "trend": dict(measurements.trend),
+        "bottleneck": measurements.bottleneck,
+        "preferred_profiles": list(measurements.preferred_profiles),
+        "avoid_profiles": list(measurements.avoid_profiles),
+        "confidence": measurements.confidence,
+        "monitor_cgroup_state": measurements.monitor_cgroup_state,
+        "thermal_state": measurements.thermal_state,
+    }
+
+
+def _resource_evidence_v2_document(evidence: ResourceEvidenceV2) -> Mapping[str, object]:
+    if not isinstance(evidence, ResourceEvidenceV2):
+        _invalid()
+    return {
+        "schema_version": evidence.schema_version,
+        "boot_id": evidence.boot_id,
+        "generation": evidence.generation,
+        "observed_at_utc": evidence.observed_at_utc.isoformat().replace("+00:00", "Z"),
+        "observed_monotonic_ns": evidence.observed_monotonic_ns,
+        "state": evidence.state.value,
+        "completed_sample_count": evidence.completed_sample_count,
+        "reason_codes": list(evidence.reason_codes),
+        "measurements": (
+            None if evidence.measurements is None else _measurements_v2_document(evidence.measurements)
+        ),
+    }
+
+
+def _encode_resource_evidence_v2(evidence: ResourceEvidenceV2) -> bytes:
+    return _encode_resource_document(_resource_evidence_v2_document(evidence))
+
+
+def read_resource_evidence_v2(
+    state: HiveStateStore, *, now_utc: datetime, expected_boot_id: str
+) -> ResourceEvidenceV2:
+    """Read exactly one canonical, fresh V2 evidence document."""
+
+    store = _require_state(state)
+    try:
+        raw = store.read_private_bytes(_RESOURCE_EVIDENCE_V2_PATH, max_bytes=_RESOURCE_DOCUMENT_MAX_BYTES)
+    except HiveStateError:
+        _invalid()
+    payload = _decode_resource_document(raw)
+    if raw != _encode_resource_document(payload):
+        _invalid()
+    return parse_resource_evidence_v2(payload, now_utc=now_utc, expected_boot_id=expected_boot_id)
+
+
+def write_resource_evidence_v2(state: HiveStateStore, evidence: ResourceEvidenceV2) -> None:
+    """Atomically publish verified V2 evidence and remove the private V1 file."""
+
+    store = _require_state(state)
+    raw = _encode_resource_evidence_v2(evidence)
+    try:
+        with store.locked():
+            try:
+                previous_raw = store.read_private_bytes(
+                    _RESOURCE_EVIDENCE_V2_PATH, max_bytes=_RESOURCE_DOCUMENT_MAX_BYTES
+                )
+            except HiveStateError as exc:
+                if str(exc) != "state_not_found":
+                    raise
+                previous = None
+            else:
+                previous_payload = _decode_resource_document(previous_raw)
+                if previous_raw != _encode_resource_document(previous_payload):
+                    _invalid()
+                previous = _resource_evidence_v2_from_document(previous_payload)
+            if previous is not None and previous.boot_id == evidence.boot_id and (
+                evidence.generation <= previous.generation
+                or evidence.observed_monotonic_ns <= previous.observed_monotonic_ns
+            ):
+                _invalid()
+            store.replace_private_bytes(_RESOURCE_EVIDENCE_V2_PATH, raw)
+            verified_raw = store.read_private_bytes(
+                _RESOURCE_EVIDENCE_V2_PATH, max_bytes=_RESOURCE_DOCUMENT_MAX_BYTES
+            )
+            if verified_raw != raw:
+                _invalid()
+            verified_payload = _decode_resource_document(verified_raw)
+            if verified_raw != _encode_resource_document(verified_payload):
+                _invalid()
+            if _resource_evidence_v2_from_document(verified_payload) != evidence:
+                _invalid()
+            store.remove_private_bytes(_RESOURCE_SNAPSHOT_PATH)
+    except HiveStateError:
+        _invalid()
 
 
 def read_resource_snapshot(
@@ -1523,14 +1837,32 @@ def collect_resource_sample(
     )
 
 
+def _stored_resource_generation_v2(state: HiveStateStore) -> tuple[str | None, int]:
+    try:
+        raw = state.read_private_bytes(_RESOURCE_EVIDENCE_V2_PATH, max_bytes=_RESOURCE_DOCUMENT_MAX_BYTES)
+    except HiveStateError as exc:
+        if str(exc) == "state_not_found":
+            return None, 0
+        _monitor_unavailable()
+    payload = _decode_resource_document(raw)
+    if raw != _encode_resource_document(payload):
+        _monitor_unavailable()
+    try:
+        evidence = _resource_evidence_v2_from_document(payload)
+    except ResourceSnapshotError:
+        _monitor_unavailable()
+    return evidence.boot_id, evidence.generation
+
+
 def run_resource_monitor(
     state: HiveStateStore,
     *,
     backend: ResourceInputBackend | None = None,
     clocks: ResourceClocks | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    cgroup_preflight: Callable[[], bool] | None = None,
 ) -> None:
-    """Continuously publish complete one-Hz generations through one authorized store."""
+    """Continuously publish boot-bound V2 evidence through one authorized store."""
 
     store = _require_state(state)
     if clocks is None:
@@ -1538,18 +1870,84 @@ def run_resource_monitor(
             now_utc=lambda: datetime.now(timezone.utc),
             monotonic_ns=time.monotonic_ns,
         )
-    if not isinstance(clocks, ResourceClocks) or not callable(sleep):
+    if not isinstance(clocks, ResourceClocks) or not callable(sleep) or (
+        cgroup_preflight is not None and not callable(cgroup_preflight)
+    ):
         _invalid()
     if backend is None:
         backend = HostResourceInputBackend(monotonic_seconds=time.monotonic)
 
-    generation_boot_id, prior_generation = _stored_resource_generation(store)
-    samples: list[ResourceSampleV1] = []
-    published_thermal_policy: ThermalPolicyV1 | None = None
     paths = ResourceInputPaths()
-    next_deadline_ns = _require_positive_int(clocks.monotonic_ns()) + _ONE_SECOND_NS
+    generation_boot_id, prior_generation = _stored_resource_generation_v2(store)
+    try:
+        current_boot_id = read_current_resource_boot_id(backend=backend, paths=paths)
+    except ResourceSnapshotError:
+        current_boot_id = None
+    if current_boot_id is not None and current_boot_id != generation_boot_id:
+        generation_boot_id, prior_generation = current_boot_id, 0
+
+    def publish(
+        state_value: ResourceEvidenceStateV2,
+        *,
+        completed_sample_count: int,
+        observed_at_utc: datetime,
+        observed_monotonic_ns: int,
+        measurements: ResourceMeasurementsV2 | None = None,
+    ) -> bool:
+        nonlocal prior_generation
+        if current_boot_id is None:
+            _monitor_unavailable()
+        evidence = ResourceEvidenceV2(
+            schema_version=2,
+            boot_id=current_boot_id,
+            generation=prior_generation + 1,
+            observed_at_utc=observed_at_utc,
+            observed_monotonic_ns=observed_monotonic_ns,
+            state=state_value,
+            completed_sample_count=completed_sample_count,
+            reason_codes=(
+                ("resource_monitor_warming",)
+                if state_value is ResourceEvidenceStateV2.WARMING
+                else ("resource_monitor_unavailable",)
+                if state_value is ResourceEvidenceStateV2.UNAVAILABLE
+                else ("resource_ready",)
+                if state_value is ResourceEvidenceStateV2.READY
+                else tuple()
+            ),
+            measurements=measurements,
+        )
+        try:
+            write_resource_evidence_v2(store, evidence)
+        except ResourceSnapshotError:
+            return False
+        prior_generation = evidence.generation
+        return True
+
+    try:
+        initial_now = _require_utc_datetime(clocks.now_utc())
+        initial_monotonic = _require_positive_int(clocks.monotonic_ns())
+    except (ResourceSnapshotError, Exception):
+        _monitor_unavailable()
+    if current_boot_id is not None:
+        publish(
+            ResourceEvidenceStateV2.WARMING,
+            completed_sample_count=0,
+            observed_at_utc=initial_now,
+            observed_monotonic_ns=max(1, initial_monotonic - 1),
+        )
+
+    samples: list[ResourceSampleV1] = []
+    cgroup_preflight_results: list[bool] = []
+    published_thermal_policy: ThermalPolicyV1 | None = None
+    next_deadline_ns = initial_monotonic + _ONE_SECOND_NS
     while True:
         sample: ResourceSampleV1 | None = None
+        cgroup_preflight_ready = False
+        if cgroup_preflight is not None:
+            try:
+                cgroup_preflight_ready = cgroup_preflight() is True
+            except Exception:
+                pass
         try:
             sample = collect_resource_sample(
                 backend,
@@ -1560,20 +1958,49 @@ def run_resource_monitor(
             )
         except ResourceSnapshotError:
             samples.clear()
+            cgroup_preflight_results.clear()
+            try:
+                unavailable_now = _require_utc_datetime(clocks.now_utc())
+                unavailable_monotonic = _require_positive_int(clocks.monotonic_ns())
+            except (ResourceSnapshotError, Exception):
+                _monitor_unavailable()
+            publish(
+                ResourceEvidenceStateV2.UNAVAILABLE,
+                completed_sample_count=0,
+                observed_at_utc=unavailable_now,
+                observed_monotonic_ns=unavailable_monotonic,
+            )
+        if sample is not None and current_boot_id is None:
+            current_boot_id = sample.boot_id
+            if generation_boot_id != sample.boot_id:
+                prior_generation = 0
+            generation_boot_id = sample.boot_id
         try:
             now_monotonic_ns = _require_positive_int(clocks.monotonic_ns())
         except (ResourceSnapshotError, Exception):
             _monitor_unavailable()
         if now_monotonic_ns > next_deadline_ns:
             samples.clear()
+            cgroup_preflight_results.clear()
+            try:
+                warming_now = _require_utc_datetime(clocks.now_utc())
+            except (ResourceSnapshotError, Exception):
+                _monitor_unavailable()
+            publish(
+                ResourceEvidenceStateV2.WARMING,
+                completed_sample_count=0,
+                observed_at_utc=warming_now,
+                observed_monotonic_ns=now_monotonic_ns,
+            )
             next_deadline_ns = now_monotonic_ns + 2 * _ONE_SECOND_NS
             sleep(1.0)
             continue
         if sample is not None:
-            if generation_boot_id != sample.boot_id:
-                generation_boot_id = sample.boot_id
+            if current_boot_id != sample.boot_id:
+                current_boot_id = sample.boot_id
                 prior_generation = 0
                 samples.clear()
+                cgroup_preflight_results.clear()
             if samples and sample.thermal_policy != samples[0].thermal_policy:
                 samples = [
                     replace(
@@ -1585,26 +2012,59 @@ def run_resource_monitor(
                         ),
                     )
                 ]
+                cgroup_preflight_results = [cgroup_preflight_ready]
             else:
                 samples.append(sample)
+                cgroup_preflight_results.append(cgroup_preflight_ready)
             if len(samples) > _MAX_SAMPLE_BUCKETS:
                 del samples[:-_MAX_SAMPLE_BUCKETS]
-            if len(samples) >= _MIN_COMPLETE_SAMPLES:
+                del cgroup_preflight_results[:-_MAX_SAMPLE_BUCKETS]
+            if len(samples) < _MIN_COMPLETE_SAMPLES:
+                publish(
+                    ResourceEvidenceStateV2.WARMING,
+                    completed_sample_count=len(samples),
+                    observed_at_utc=sample.observed_at_utc,
+                    observed_monotonic_ns=sample.observed_monotonic_ns,
+                )
+            else:
                 try:
-                    snapshot = build_monitor_snapshot(
+                    monitor_cgroup_state = (
+                        "ready"
+                        if len(cgroup_preflight_results) == len(samples) and all(cgroup_preflight_results)
+                        else "preflight_failed"
+                    )
+                    evidence = build_monitor_evidence_v2(
                         samples,
                         prior_generation=prior_generation,
                         clocks=clocks,
+                        monitor_cgroup_state=monitor_cgroup_state,
                     )
-                    snapshot_policy = samples[-1].thermal_policy
-                    if snapshot_policy is not None and snapshot_policy != published_thermal_policy:
-                        write_thermal_policy(store, snapshot_policy)
-                    write_resource_snapshot(store, snapshot)
                 except ResourceSnapshotError:
                     samples.clear()
+                    cgroup_preflight_results.clear()
+                    try:
+                        unavailable_now = _require_utc_datetime(clocks.now_utc())
+                        unavailable_monotonic = _require_positive_int(clocks.monotonic_ns())
+                    except (ResourceSnapshotError, Exception):
+                        _monitor_unavailable()
+                    publish(
+                        ResourceEvidenceStateV2.UNAVAILABLE,
+                        completed_sample_count=0,
+                        observed_at_utc=unavailable_now,
+                        observed_monotonic_ns=unavailable_monotonic,
+                    )
                 else:
-                    prior_generation = snapshot.generation
-                    published_thermal_policy = snapshot_policy
+                    snapshot_policy = samples[-1].thermal_policy
+                    try:
+                        if snapshot_policy is not None and snapshot_policy != published_thermal_policy:
+                            write_thermal_policy(store, snapshot_policy)
+                        write_resource_evidence_v2(store, evidence)
+                    except ResourceSnapshotError:
+                        samples.clear()
+                        cgroup_preflight_results.clear()
+                    else:
+                        prior_generation = evidence.generation
+                        published_thermal_policy = snapshot_policy
         sleep(max(0.0, (next_deadline_ns - now_monotonic_ns) / _ONE_SECOND_NS))
         next_deadline_ns += _ONE_SECOND_NS
 
@@ -1635,6 +2095,116 @@ def _legacy_pressure_from_samples(
         cpu_busy_percent=busy_delta * 100.0 / total_delta,
         io_wait_percent=io_wait_delta * 100.0 / total_delta,
         available_memory_percent=latest.available_memory_percent,
+    )
+
+
+def _build_resource_measurements_v2(
+    samples: Sequence[ResourceSampleV1], *, clocks: ResourceClocks, monitor_cgroup_state: str
+) -> ResourceMeasurementsV2:
+    if not isinstance(clocks, ResourceClocks) or not isinstance(monitor_cgroup_state, str):
+        _invalid()
+    samples = tuple(samples)
+    if len(samples) < _MIN_COMPLETE_SAMPLES:
+        _invalid()
+    if len(samples) > _MAX_SAMPLE_BUCKETS or any(not isinstance(sample, ResourceSampleV1) for sample in samples):
+        _invalid()
+    if monitor_cgroup_state not in {"ready", "preflight_failed"}:
+        _invalid()
+    first = samples[0]
+    if any(sample.thermal_policy != first.thermal_policy for sample in samples[1:]):
+        _monitor_unavailable()
+    for previous, current in zip(samples, samples[1:]):
+        monotonic_interval = current.observed_monotonic_ns - previous.observed_monotonic_ns
+        utc_interval = current.observed_at_utc - previous.observed_at_utc
+        if (
+            current.boot_id != first.boot_id
+            or abs(monotonic_interval - _ONE_SECOND_NS) > _SAMPLE_INTERVAL_JITTER_NS
+            or abs(utc_interval - timedelta(seconds=1)) > _SAMPLE_INTERVAL_JITTER
+        ):
+            _invalid()
+    latest = samples[-1]
+    try:
+        now_utc = _require_utc_datetime(clocks.now_utc())
+        now_monotonic_ns = _require_positive_int(clocks.monotonic_ns())
+    except (ResourceSnapshotError, Exception):
+        _monitor_unavailable()
+    if (
+        latest.observed_at_utc > now_utc
+        or now_utc - latest.observed_at_utc > _FRESHNESS_MAX_AGE
+        or now_monotonic_ns < latest.observed_monotonic_ns
+    ):
+        _monitor_unavailable()
+    legacy_pressure = _legacy_pressure_from_samples(samples[-2], latest)
+    recent = samples[-10:]
+    means_1m = {dimension: _mean(recent, dimension) for dimension in _DIMENSIONS}
+    means_10m = {dimension: _mean(samples, dimension) for dimension in _DIMENSIONS}
+    peaks = {dimension: max(sample.current[dimension] for sample in samples) for dimension in _DIMENSIONS}
+    assessments = {
+        dimension: classify_trend([round(sample.current[dimension]) for sample in samples])
+        for dimension in _DIMENSIONS
+    }
+    confidence: Literal["high", "low"] = "high" if all(
+        assessment.confidence == "high" for assessment in assessments.values()
+    ) else "low"
+    trend = {
+        dimension: assessments[dimension].trend if confidence == "high" else None
+        for dimension in _DIMENSIONS
+    }
+    pressure = {dimension: int(round(latest.current[dimension])) for dimension in _DIMENSIONS}
+    headroom = {dimension: 100 - pressure[dimension] for dimension in _DIMENSIONS}
+    return ResourceMeasurementsV2(
+        current=latest.current,
+        available_memory_mib=latest.available_memory_mib,
+        legacy_pressure=legacy_pressure,
+        mean_1m=means_1m,
+        mean_10m=means_10m,
+        peak_10m=peaks,
+        normalized_pressure=pressure,
+        normalized_headroom=headroom,
+        trend=trend,
+        bottleneck="unknown",
+        preferred_profiles=("balanced",),
+        avoid_profiles=(),
+        confidence=confidence,
+        monitor_cgroup_state=monitor_cgroup_state,  # type: ignore[arg-type]
+        thermal_state=latest.thermal_state,
+    )
+
+
+def build_monitor_evidence_v2(
+    samples: Sequence[ResourceSampleV1],
+    *,
+    prior_generation: int,
+    clocks: ResourceClocks,
+    monitor_cgroup_state: str,
+) -> ResourceEvidenceV2:
+    """Build one V2 full-window record; Cgroup input remains diagnostic only."""
+
+    if type(prior_generation) is not int or prior_generation < 0:
+        _invalid()
+    measurements = _build_resource_measurements_v2(
+        samples, clocks=clocks, monitor_cgroup_state=monitor_cgroup_state
+    )
+    samples = tuple(samples)
+    reasons: list[str] = []
+    if measurements.thermal_state in {"warming_up", "no_valid_sensors", "monitor_unavailable"}:
+        reasons.append("temperature_monitor_unavailable")
+    if any(sample.thermal_pressure_high for sample in samples):
+        reasons.append("temperature_pressure_high")
+    state = ResourceEvidenceStateV2.PRESSURE if reasons else ResourceEvidenceStateV2.READY
+    return ResourceEvidenceV2(
+        schema_version=2,
+        boot_id=samples[-1].boot_id,
+        generation=prior_generation + 1,
+        observed_at_utc=samples[-1].observed_at_utc,
+        observed_monotonic_ns=samples[-1].observed_monotonic_ns,
+        state=state,
+        completed_sample_count=len(samples),
+        reason_codes=tuple(reasons) if reasons else ("resource_ready",),
+        measurements=replace(
+            measurements,
+            bottleneck="thermal" if reasons else measurements.bottleneck,
+        ),
     )
 
 
@@ -1686,6 +2256,7 @@ def build_monitor_snapshot(
     }
     pressure = {dimension: int(round(latest.current[dimension])) for dimension in _DIMENSIONS}
     headroom = {dimension: 100 - pressure[dimension] for dimension in _DIMENSIONS}
+    cgroup_state: Literal["preflight_failed"] = "preflight_failed"
     reasons_list: list[str] = []
     gate_state: Literal["ready", "blocked"] = "ready"
     bottleneck: Literal["cpu", "io", "memory", "thermal", "cgroup", "unknown"] = "unknown"
@@ -1696,7 +2267,7 @@ def build_monitor_snapshot(
         gate_state = "blocked"
         bottleneck = "thermal"
     else:
-        if latest.cgroup_state != "ready":
+        if cgroup_state != "ready":
             reasons_list.append("cgroup_preflight_failed")
             gate_state = "blocked"
             bottleneck = "cgroup"
@@ -1727,8 +2298,31 @@ def build_monitor_snapshot(
         preferred_profiles=("balanced",),
         avoid_profiles=(),
         confidence=confidence,
-        cgroup_state=latest.cgroup_state,
+        cgroup_state=cgroup_state,
         thermal_state=latest.thermal_state,
+    )
+
+
+def _snapshot_with_cgroup_preflight(snapshot: ResourceSnapshotV1, *, ready: bool) -> ResourceSnapshotV1:
+    if not isinstance(snapshot, ResourceSnapshotV1) or type(ready) is not bool:
+        _invalid()
+    if not ready:
+        return replace(snapshot, cgroup_state="preflight_failed")
+    reasons = tuple(reason for reason in snapshot.reason_codes if reason != "cgroup_preflight_failed")
+    if not reasons:
+        reasons = ("resource_ready",)
+    if reasons == ("resource_ready",):
+        gate_state: Literal["ready", "blocked"] = "ready"
+        bottleneck: Literal["cpu", "io", "memory", "thermal", "cgroup", "unknown"] = "unknown"
+    else:
+        gate_state = "blocked"
+        bottleneck = "thermal"
+    return replace(
+        snapshot,
+        gate_state=gate_state,
+        reason_codes=reasons,
+        bottleneck=bottleneck,
+        cgroup_state="ready",
     )
 
 

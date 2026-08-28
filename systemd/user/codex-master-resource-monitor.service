@@ -35,3 +35,6 @@ BindReadOnlyPaths=%h/codex-master/bin/codex-master-resource-monitor:%h/.local/bi
 ReadOnlyPaths=/usr/bin/python3 /usr/bin/sensors /proc/loadavg /proc/meminfo /proc/stat /proc/pressure/cpu /proc/pressure/io /proc/pressure/memory /proc/sys/kernel/random/boot_id
 ReadWritePaths=%h/.local/state/codex-master-mcp/hive/resources %h/.local/state/codex-master-mcp/hive/.hive-state.lock
 ExecStart=%h/.local/bin/codex-master-resource-monitor
+
+[Install]
+WantedBy=default.target

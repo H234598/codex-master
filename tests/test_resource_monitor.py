@@ -14,13 +14,18 @@ import pytest
 
 from codex_master.hive import state as hive_state_module
 from codex_master import resource_monitor as resource_monitor_module
-from codex_master.hive.state import HiveStateStore
+from codex_master.hive.state import HiveStateError, HiveStateStore
 from codex_master.resource_monitor import (
     ResourceClocks,
+    ResourceEvidenceStateV2,
+    ResourceEvidenceV2,
+    ResourceMeasurementsV2,
     ResourceInputPaths,
     ResourceSampleV1,
     CpuCountersV1,
     ResourceSnapshotError,
+    parse_resource_evidence_v2,
+    read_resource_evidence_v2,
     ResourceSnapshotV1,
     ResourceGateFacts,
     LegacyPressureV1,
@@ -41,6 +46,7 @@ from codex_master.resource_monitor import (
     read_thermal_policy,
     resolve_thermal_policy,
     write_resource_snapshot,
+    write_resource_evidence_v2,
     write_thermal_policy,
 )
 
@@ -49,6 +55,7 @@ NOW = datetime(2026, 8, 16, 12, 0, tzinfo=timezone.utc)
 BOOT_ID = "123e4567-e89b-12d3-a456-426614174000"
 SNAPSHOT_PATH = PurePosixPath("resources/resource-snapshot-v1.json")
 THERMAL_POLICY_PATH = PurePosixPath("resources/thermal-policy-v1.json")
+RESOURCE_EVIDENCE_V2_PATH = PurePosixPath("resources/resource-evidence-v2.json")
 
 
 class FakeResourceBackend:
@@ -208,6 +215,395 @@ def snapshot_document() -> dict[str, object]:
             "available_memory_percent": 50.0,
         },
     }
+
+
+def measurements_v2() -> ResourceMeasurementsV2:
+    return ResourceMeasurementsV2(
+        current={"cpu": 12.0, "io": 8.0, "memory": 20.0},
+        available_memory_mib=512,
+        legacy_pressure=LegacyPressureV1(
+            load_per_cpu=0.25,
+            cpu_busy_percent=25.0,
+            io_wait_percent=0.0,
+            available_memory_percent=50.0,
+        ),
+        mean_1m={"cpu": 11.0, "io": 7.0, "memory": 19.0},
+        mean_10m={"cpu": 10.0, "io": 6.0, "memory": 18.0},
+        peak_10m={"cpu": 13.0, "io": 9.0, "memory": 21.0},
+        normalized_pressure={"cpu": 12, "io": 8, "memory": 20},
+        normalized_headroom={"cpu": 88, "io": 92, "memory": 80},
+        trend={"cpu": "stable", "io": "stable", "memory": "stable"},
+        bottleneck="unknown",
+        preferred_profiles=("balanced",),
+        avoid_profiles=(),
+        confidence="high",
+        monitor_cgroup_state="ready",
+        thermal_state="ready",
+    )
+
+
+def evidence_v2_document(
+    *,
+    state: str = "warming",
+    completed_sample_count: int = 0,
+    reason_codes: list[str] | None = None,
+    measurements: ResourceMeasurementsV2 | None = None,
+) -> dict[str, object]:
+    encoded_measurements: dict[str, object] | None = None
+    if measurements is not None:
+        encoded_measurements = {
+            "current": dict(measurements.current),
+            "available_memory_mib": measurements.available_memory_mib,
+            "legacy_pressure": {
+                "load_per_cpu": measurements.legacy_pressure.load_per_cpu,
+                "cpu_busy_percent": measurements.legacy_pressure.cpu_busy_percent,
+                "io_wait_percent": measurements.legacy_pressure.io_wait_percent,
+                "available_memory_percent": measurements.legacy_pressure.available_memory_percent,
+            },
+            "mean_1m": dict(measurements.mean_1m),
+            "mean_10m": dict(measurements.mean_10m),
+            "peak_10m": dict(measurements.peak_10m),
+            "normalized_pressure": dict(measurements.normalized_pressure),
+            "normalized_headroom": dict(measurements.normalized_headroom),
+            "trend": dict(measurements.trend),
+            "bottleneck": measurements.bottleneck,
+            "preferred_profiles": list(measurements.preferred_profiles),
+            "avoid_profiles": list(measurements.avoid_profiles),
+            "confidence": measurements.confidence,
+            "monitor_cgroup_state": measurements.monitor_cgroup_state,
+            "thermal_state": measurements.thermal_state,
+        }
+    return {
+        "schema_version": 2,
+        "boot_id": BOOT_ID,
+        "generation": 1,
+        "observed_at_utc": "2026-08-16T12:00:00Z",
+        "observed_monotonic_ns": 123_456_789,
+        "state": state,
+        "completed_sample_count": completed_sample_count,
+        "reason_codes": reason_codes if reason_codes is not None else ["resource_monitor_warming"],
+        "measurements": encoded_measurements,
+    }
+
+
+def evidence_v2(
+    *,
+    generation: int = 1,
+    observed_at_utc: datetime = NOW,
+    observed_monotonic_ns: int = 123_456_789,
+) -> ResourceEvidenceV2:
+    return ResourceEvidenceV2(
+        schema_version=2,
+        boot_id=BOOT_ID,
+        generation=generation,
+        observed_at_utc=observed_at_utc,
+        observed_monotonic_ns=observed_monotonic_ns,
+        state=ResourceEvidenceStateV2.WARMING,
+        completed_sample_count=0,
+        reason_codes=("resource_monitor_warming",),
+        measurements=None,
+    )
+
+
+def test_v2_state_matrix_has_no_transient_metrics_and_requires_full_measurements() -> None:
+    warming = parse_resource_evidence_v2(
+        evidence_v2_document(), now_utc=NOW, expected_boot_id=BOOT_ID
+    )
+    assert warming.state is ResourceEvidenceStateV2.WARMING
+    assert warming.measurements is None
+
+    ready = evidence_v2_document(
+        state="ready",
+        completed_sample_count=10,
+        reason_codes=["resource_ready"],
+        measurements=measurements_v2(),
+    )
+    parsed_ready = parse_resource_evidence_v2(ready, now_utc=NOW, expected_boot_id=BOOT_ID)
+    assert parsed_ready.measurements == measurements_v2()
+
+    pressure = evidence_v2_document(
+        state="pressure",
+        completed_sample_count=10,
+        reason_codes=["temperature_pressure_high"],
+        measurements=measurements_v2(),
+    )
+    assert parse_resource_evidence_v2(pressure, now_utc=NOW, expected_boot_id=BOOT_ID).state is ResourceEvidenceStateV2.PRESSURE
+
+    invalid_documents = (
+        evidence_v2_document(measurements=measurements_v2()),
+        evidence_v2_document(state="warming", completed_sample_count=10),
+        evidence_v2_document(state="unavailable", completed_sample_count=1, reason_codes=["resource_monitor_unavailable"]),
+        evidence_v2_document(state="ready", completed_sample_count=9, reason_codes=["resource_ready"], measurements=measurements_v2()),
+        evidence_v2_document(state="ready", completed_sample_count=10, reason_codes=["resource_ready"]),
+        evidence_v2_document(state="pressure", completed_sample_count=10, reason_codes=["resource_ready"], measurements=measurements_v2()),
+    )
+    for document in invalid_documents:
+        with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+            parse_resource_evidence_v2(document, now_utc=NOW, expected_boot_id=BOOT_ID)
+
+
+def test_v2_reader_and_writer_fail_closed_on_codec_time_boot_and_clock_regressions(tmp_path: Path) -> None:
+    store = HiveStateStore(tmp_path / "state")
+    valid = evidence_v2()
+    write_resource_evidence_v2(store, valid)
+    assert read_resource_evidence_v2(store, now_utc=NOW, expected_boot_id=BOOT_ID) == valid
+
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        write_resource_evidence_v2(store, replace(valid, generation=1))
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        write_resource_evidence_v2(store, replace(valid, generation=2, observed_monotonic_ns=1))
+
+    invalid_raw_documents = (
+        b'{"schema_version":2,"schema_version":2}',
+        json.dumps(evidence_v2_document(), sort_keys=False).encode("utf-8"),
+        b"{" + b'"schema_version":2,"boot_id":"' + BOOT_ID.encode("ascii") + b'"}' + b" " * (64 * 1024),
+    )
+    for raw in invalid_raw_documents:
+        store.replace_private_bytes(RESOURCE_EVIDENCE_V2_PATH, raw)
+        with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+            read_resource_evidence_v2(store, now_utc=NOW, expected_boot_id=BOOT_ID)
+
+    stale = evidence_v2_document()
+    stale["observed_at_utc"] = (NOW - timedelta(seconds=4)).isoformat()
+    future = evidence_v2_document()
+    future["observed_at_utc"] = (NOW + timedelta(seconds=1)).isoformat()
+    wrong_boot = evidence_v2_document()
+    wrong_boot["boot_id"] = "123e4567-e89b-12d3-a456-426614174001"
+    for document, expected_boot in (
+        (stale, BOOT_ID),
+        (future, BOOT_ID),
+        (wrong_boot, BOOT_ID),
+    ):
+        store.replace_private_bytes(
+            RESOURCE_EVIDENCE_V2_PATH,
+            json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        )
+        with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+            read_resource_evidence_v2(store, now_utc=NOW, expected_boot_id=expected_boot)
+
+
+def test_v2_monitor_publishes_warming_before_ten_samples_and_ready_after_full_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class MonitorStopped(RuntimeError):
+        pass
+
+    class BootOnlyBackend:
+        def read_private_kernel_bytes(self, path: Path, *, max_bytes: int) -> bytes:
+            assert path == Path("/proc/sys/kernel/random/boot_id")
+            return (BOOT_ID + "\n").encode("ascii")
+
+        def run_sensors_json(self, **kwargs: object) -> bytes:
+            raise AssertionError("patched collector must be used")
+
+    now = NOW
+    monotonic_ns = 10_000_000_000
+    calls = 0
+    policy = ThermalPolicyV1(schema_version=1, sensor_thresholds={"chip:adapter:package": 80.0})
+
+    def collect(*_args: object, **kwargs: object) -> ResourceSampleV1:
+        nonlocal calls
+        calls += 1
+        return ResourceSampleV1(
+            boot_id=BOOT_ID,
+            observed_at_utc=now,
+            observed_monotonic_ns=monotonic_ns,
+            current={"cpu": 10.0, "io": 1.0, "memory": 20.0},
+            available_memory_mib=8192,
+            load1=1.0,
+            available_memory_percent=80.0,
+            cpu_counters=CpuCountersV1(1, 100 + calls * 10, 20 + calls, 5),
+            cgroup_state="unavailable",
+            thermal_state="ready",
+            thermal_policy=policy,
+        )
+
+    def stop_after_one(second_count: float) -> None:
+        nonlocal now, monotonic_ns
+        now += timedelta(seconds=second_count)
+        monotonic_ns += int(second_count * 1_000_000_000)
+        raise MonitorStopped
+
+    monkeypatch.setattr(resource_monitor_module, "collect_resource_sample", collect)
+    store = HiveStateStore(tmp_path / "state")
+    with pytest.raises(MonitorStopped):
+        resource_monitor_module.run_resource_monitor(
+            store,
+            backend=BootOnlyBackend(),
+            clocks=ResourceClocks(now_utc=lambda: now, monotonic_ns=lambda: monotonic_ns),
+            sleep=stop_after_one,
+            cgroup_preflight=lambda: True,
+        )
+    warming = read_resource_evidence_v2(store, now_utc=now, expected_boot_id=BOOT_ID)
+    assert warming.state is ResourceEvidenceStateV2.WARMING
+    assert warming.completed_sample_count == 1
+    assert warming.measurements is None
+
+    def stop_after_ten(second_count: float) -> None:
+        nonlocal now, monotonic_ns
+        now += timedelta(seconds=second_count)
+        monotonic_ns += int(second_count * 1_000_000_000)
+        if calls >= 11:
+            raise MonitorStopped
+
+    with pytest.raises(MonitorStopped):
+        resource_monitor_module.run_resource_monitor(
+            store,
+            backend=BootOnlyBackend(),
+            clocks=ResourceClocks(now_utc=lambda: now, monotonic_ns=lambda: monotonic_ns),
+            sleep=stop_after_ten,
+            cgroup_preflight=lambda: True,
+        )
+    ready = read_resource_evidence_v2(store, now_utc=now, expected_boot_id=BOOT_ID)
+    assert ready.state is ResourceEvidenceStateV2.READY
+    assert ready.completed_sample_count == 10
+    assert ready.measurements is not None
+
+
+def test_v2_monitor_publishes_unavailable_without_reusing_previous_measurements(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class MonitorStopped(RuntimeError):
+        pass
+
+    class BootOnlyBackend:
+        def read_private_kernel_bytes(self, path: Path, *, max_bytes: int) -> bytes:
+            assert path == Path("/proc/sys/kernel/random/boot_id")
+            return (BOOT_ID + "\n").encode("ascii")
+
+    now = NOW
+    monotonic_ns = 10_000_000_000
+
+    def collect(*_args: object, **_kwargs: object) -> ResourceSampleV1:
+        raise ResourceSnapshotError("resource_monitor_unavailable")
+
+    def stop(seconds: float) -> None:
+        nonlocal now, monotonic_ns
+        now += timedelta(seconds=seconds)
+        monotonic_ns += int(seconds * 1_000_000_000)
+        raise MonitorStopped
+
+    monkeypatch.setattr(resource_monitor_module, "collect_resource_sample", collect)
+    store = HiveStateStore(tmp_path / "state")
+    with pytest.raises(MonitorStopped):
+        resource_monitor_module.run_resource_monitor(
+            store,
+            backend=BootOnlyBackend(),
+            clocks=ResourceClocks(now_utc=lambda: now, monotonic_ns=lambda: monotonic_ns),
+            sleep=stop,
+        )
+
+    unavailable = read_resource_evidence_v2(store, now_utc=now, expected_boot_id=BOOT_ID)
+    assert unavailable.state is ResourceEvidenceStateV2.UNAVAILABLE
+    assert unavailable.completed_sample_count == 0
+    assert unavailable.measurements is None
+    assert unavailable.reason_codes == ("resource_monitor_unavailable",)
+
+
+def test_v2_full_window_write_failure_keeps_previous_warming_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class MonitorStopped(RuntimeError):
+        pass
+
+    class BootOnlyBackend:
+        def read_private_kernel_bytes(self, path: Path, *, max_bytes: int) -> bytes:
+            assert path == Path("/proc/sys/kernel/random/boot_id")
+            return (BOOT_ID + "\n").encode("ascii")
+
+    now = NOW
+    monotonic_ns = 10_000_000_000
+    calls = 0
+    full_window_attempts = 0
+    policy = ThermalPolicyV1(schema_version=1, sensor_thresholds={"chip:adapter:package": 80.0})
+
+    def collect(*_args: object, **_kwargs: object) -> ResourceSampleV1:
+        nonlocal calls
+        calls += 1
+        return ResourceSampleV1(
+            boot_id=BOOT_ID,
+            observed_at_utc=now,
+            observed_monotonic_ns=monotonic_ns,
+            current={"cpu": 10.0, "io": 1.0, "memory": 20.0},
+            available_memory_mib=8192,
+            load1=1.0,
+            available_memory_percent=80.0,
+            cpu_counters=CpuCountersV1(1, 100 + calls * 10, 20 + calls, 5),
+            cgroup_state="unavailable",
+            thermal_state="ready",
+            thermal_policy=policy,
+        )
+
+    real_write = resource_monitor_module.write_resource_evidence_v2
+
+    def fail_first_full_window_write(store: HiveStateStore, evidence: ResourceEvidenceV2) -> None:
+        nonlocal full_window_attempts
+        if evidence.measurements is not None:
+            full_window_attempts += 1
+            if full_window_attempts == 1:
+                raise ResourceSnapshotError("resource_snapshot_invalid")
+        real_write(store, evidence)
+
+    def stop_after_full_window(seconds: float) -> None:
+        nonlocal now, monotonic_ns
+        now += timedelta(seconds=seconds)
+        monotonic_ns += int(seconds * 1_000_000_000)
+        if calls == 10:
+            raise MonitorStopped
+
+    monkeypatch.setattr(resource_monitor_module, "collect_resource_sample", collect)
+    monkeypatch.setattr(resource_monitor_module, "write_resource_evidence_v2", fail_first_full_window_write)
+    store = HiveStateStore(tmp_path / "state")
+    with pytest.raises(MonitorStopped):
+        resource_monitor_module.run_resource_monitor(
+            store,
+            backend=BootOnlyBackend(),
+            clocks=ResourceClocks(now_utc=lambda: now, monotonic_ns=lambda: monotonic_ns),
+            sleep=stop_after_full_window,
+            cgroup_preflight=lambda: True,
+        )
+
+    assert full_window_attempts == 1
+    previous = read_resource_evidence_v2(store, now_utc=now, expected_boot_id=BOOT_ID)
+    assert previous.state is ResourceEvidenceStateV2.WARMING
+    assert previous.measurements is None
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        read_resource_evidence_v2(
+            store,
+            now_utc=now + timedelta(seconds=2),
+            expected_boot_id=BOOT_ID,
+        )
+
+
+def test_v2_cutover_removes_v1_only_after_verified_v2_replacement(tmp_path: Path) -> None:
+    class RecordingStore(HiveStateStore):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.read_paths: list[PurePosixPath] = []
+
+        def read_private_bytes(self, relative: PurePosixPath, *, max_bytes: int) -> bytes:
+            self.read_paths.append(relative)
+            return super().read_private_bytes(relative, max_bytes=max_bytes)
+
+    store = RecordingStore(tmp_path / "state")
+    store.replace_private_bytes(SNAPSHOT_PATH, b"legacy")
+    write_resource_evidence_v2(store, evidence_v2())
+
+    assert not (tmp_path / "state" / SNAPSHOT_PATH).exists()
+    assert read_resource_evidence_v2(store, now_utc=NOW, expected_boot_id=BOOT_ID) == evidence_v2()
+    assert set(store.read_paths) == {RESOURCE_EVIDENCE_V2_PATH}
+
+    class FailingStore(HiveStateStore):
+        def replace_private_bytes(self, relative: PurePosixPath, payload: bytes) -> None:
+            if relative == RESOURCE_EVIDENCE_V2_PATH:
+                raise HiveStateError("state_write_failed")
+            super().replace_private_bytes(relative, payload)
+
+    failed_store = FailingStore(tmp_path / "failed-state")
+    failed_store.replace_private_bytes(SNAPSHOT_PATH, b"legacy")
+    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
+        write_resource_evidence_v2(failed_store, evidence_v2())
+    assert (tmp_path / "failed-state" / SNAPSHOT_PATH).read_bytes() == b"legacy"
 
 
 class ResourceMonitorTests(unittest.TestCase):
@@ -874,8 +1270,10 @@ def test_monitor_publishes_only_complete_generation_and_never_claims_healthy_whe
 
     assert partial_calls == list(range(1, 10))
     assert partial_sleeps == [1.0] * 9
-    with pytest.raises(ResourceSnapshotError, match="^resource_snapshot_invalid$"):
-        read_resource_snapshot(store, now_utc=NOW + timedelta(seconds=9), expected_boot_id=BOOT_ID)
+    warming = read_resource_evidence_v2(store, now_utc=NOW + timedelta(seconds=9), expected_boot_id=BOOT_ID)
+    assert warming.state is ResourceEvidenceStateV2.WARMING
+    assert warming.completed_sample_count == 9
+    assert warming.measurements is None
 
     unavailable_samples = [
         replace(sample, thermal_state="monitor_unavailable", thermal_policy=None)
@@ -901,16 +1299,17 @@ def test_monitor_publishes_only_complete_generation_and_never_claims_healthy_whe
     with pytest.raises(MonitorStopped):
         runner(store, backend=object(), clocks=complete_cadence.clocks, sleep=stop_complete)
 
-    snapshot = read_resource_snapshot(
+    evidence = read_resource_evidence_v2(
         store,
         now_utc=NOW + timedelta(seconds=9),
         expected_boot_id=BOOT_ID,
     )
     assert complete_calls == list(range(1, 11))
     assert complete_sleeps == [1.0] * 10
-    assert snapshot.generation == 1
-    assert snapshot.gate_state == "blocked"
-    assert snapshot.reason_codes == ("temperature_monitor_unavailable",)
+    assert evidence.generation == 10
+    assert evidence.state is ResourceEvidenceStateV2.PRESSURE
+    assert evidence.reason_codes == ("temperature_monitor_unavailable",)
+    assert evidence.measurements is not None
 
 
 def test_monitor_long_run_caps_completed_count_and_keeps_publishing_fresh_generations(
@@ -964,9 +1363,92 @@ def test_monitor_long_run_caps_completed_count_and_keeps_publishing_fresh_genera
         )
 
     assert completed_counts == [*range(1, 61), *([60] * 5)]
-    snapshot = read_resource_snapshot(store, now_utc=now, expected_boot_id=BOOT_ID)
-    assert snapshot.generation == 56
-    assert snapshot.observed_at_utc == NOW + timedelta(seconds=64)
+    evidence = read_resource_evidence_v2(store, now_utc=now, expected_boot_id=BOOT_ID)
+    assert evidence.generation == 65
+    assert evidence.completed_sample_count == 60
+    assert evidence.observed_at_utc == NOW + timedelta(seconds=64)
+    assert evidence.state is ResourceEvidenceStateV2.READY
+
+
+@pytest.mark.parametrize(
+    (
+        "preflight_results",
+        "sample_count",
+        "expected_monitor_cgroup_state",
+    ),
+    (
+        ([True] * 10, 10, "ready"),
+        ([1] * 10, 10, "preflight_failed"),
+        ([RuntimeError("preflight failed")] + [True] * 9, 10, "preflight_failed"),
+        ([RuntimeError("preflight failed")] + [True] * 60, 61, "ready"),
+    ),
+)
+def test_monitor_rechecks_explicit_cgroup_preflight_for_every_sample_and_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preflight_results: list[object],
+    sample_count: int,
+    expected_monitor_cgroup_state: str,
+) -> None:
+    class MonitorStopped(RuntimeError):
+        pass
+
+    now = NOW
+    monotonic_ns = 10_000_000_000
+    collected_samples = 0
+    preflight_calls: list[object] = []
+    policy = ThermalPolicyV1(schema_version=1, sensor_thresholds={"chip:adapter:package": 80.0})
+
+    def collect(*_args: object, **kwargs: object) -> ResourceSampleV1:
+        nonlocal collected_samples
+        index = collected_samples
+        collected_samples += 1
+        return ResourceSampleV1(
+            boot_id=BOOT_ID,
+            observed_at_utc=now,
+            observed_monotonic_ns=monotonic_ns,
+            current={"cpu": 10.0, "io": 1.0, "memory": 20.0},
+            available_memory_mib=8192,
+            load1=1.0,
+            available_memory_percent=80.0,
+            cpu_counters=CpuCountersV1(1, 100 + index * 10, 20 + index, 5),
+            cgroup_state="unavailable",
+            thermal_state="ready",
+            thermal_policy=policy,
+        )
+
+    def cgroup_preflight() -> bool:
+        outcome = preflight_results[len(preflight_calls)]
+        preflight_calls.append(outcome)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome is True
+
+    def sleep(seconds: float) -> None:
+        nonlocal now, monotonic_ns
+        now += timedelta(seconds=seconds)
+        monotonic_ns += int(seconds * 1_000_000_000)
+        if collected_samples == sample_count:
+            raise MonitorStopped
+
+    monkeypatch.setattr(resource_monitor_module, "collect_resource_sample", collect)
+    with pytest.raises(MonitorStopped):
+        resource_monitor_module.run_resource_monitor(
+            HiveStateStore(tmp_path / "state"),
+            backend=object(),
+            clocks=ResourceClocks(now_utc=lambda: now, monotonic_ns=lambda: monotonic_ns),
+            sleep=sleep,
+            cgroup_preflight=cgroup_preflight,
+        )
+
+    evidence = read_resource_evidence_v2(
+        HiveStateStore(tmp_path / "state"), now_utc=now, expected_boot_id=BOOT_ID
+    )
+    assert len(preflight_calls) == sample_count
+    assert evidence.state is ResourceEvidenceStateV2.READY
+    assert evidence.reason_codes == ("resource_ready",)
+    assert evidence.measurements is not None
+    assert evidence.measurements.monitor_cgroup_state == expected_monitor_cgroup_state
 
 
 def test_monitor_real_collection_path_discovers_host_shape_and_uses_deadline_cadence(
@@ -1035,14 +1517,16 @@ def test_monitor_real_collection_path_discovers_host_shape_and_uses_deadline_cad
             sleep=ready_cadence.sleep,
         )
 
-    snapshot = read_resource_snapshot(store, now_utc=ready_cadence.now, expected_boot_id=BOOT_ID)
+    evidence = read_resource_evidence_v2(store, now_utc=ready_cadence.now, expected_boot_id=BOOT_ID)
     assert ready_cadence.sleeps == [0.75] * 11
     assert ready_backend.sample_index == 11
     assert len(ready_backend.sensor_calls) == 11
-    assert snapshot.generation == 2
-    assert snapshot.thermal_state == "ready"
-    assert snapshot.gate_state == "blocked"
-    assert snapshot.reason_codes == ("cgroup_preflight_failed",)
+    assert evidence.generation == 12
+    assert evidence.state is ResourceEvidenceStateV2.READY
+    assert evidence.reason_codes == ("resource_ready",)
+    assert evidence.measurements is not None
+    assert evidence.measurements.thermal_state == "ready"
+    assert evidence.measurements.monitor_cgroup_state == "preflight_failed"
     assert read_thermal_policy(store) == ThermalPolicyV1(
         schema_version=1,
         sensor_thresholds={
@@ -1052,7 +1536,7 @@ def test_monitor_real_collection_path_discovers_host_shape_and_uses_deadline_cad
         },
     )
     assert store.replaced.count(THERMAL_POLICY_PATH) == 1
-    assert store.replaced.count(SNAPSHOT_PATH) == 2
+    assert store.replaced.count(RESOURCE_EVIDENCE_V2_PATH) == 12
 
 
 def test_monitor_does_not_persist_invented_policy_for_no_valid_sensors(
@@ -1111,8 +1595,11 @@ def test_monitor_does_not_persist_invented_policy_for_no_valid_sensors(
         )
 
     assert read_thermal_policy(store) is None
-    snapshot = read_resource_snapshot(store, now_utc=now, expected_boot_id=BOOT_ID)
-    assert snapshot.thermal_state == "no_valid_sensors"
+    evidence = read_resource_evidence_v2(store, now_utc=now, expected_boot_id=BOOT_ID)
+    assert evidence.state is ResourceEvidenceStateV2.PRESSURE
+    assert evidence.reason_codes == ("temperature_monitor_unavailable",)
+    assert evidence.measurements is not None
+    assert evidence.measurements.thermal_state == "no_valid_sensors"
 
 
 def test_monitor_discards_window_when_discovered_candidate_or_threshold_set_changes(
@@ -1284,13 +1771,14 @@ def test_monitor_resets_generation_to_one_when_sample_boot_changes(
             sleep=stop,
         )
 
-    snapshot = read_resource_snapshot(
+    evidence = read_resource_evidence_v2(
         store,
         now_utc=NOW + timedelta(seconds=9),
         expected_boot_id=BOOT_ID,
     )
-    assert snapshot.boot_id == BOOT_ID
-    assert snapshot.generation == 1
+    assert evidence.boot_id == BOOT_ID
+    assert evidence.generation == 10
+    assert not (tmp_path / "state" / "resources" / "resource-snapshot-v1.json").exists()
 
 
 def _resource_monitor_unit_directives(text: str) -> dict[str, str]:
@@ -1417,7 +1905,7 @@ def test_resource_monitor_unit_checks_readonly_and_readwrite_paths_separately() 
     ]
 
 
-def test_resource_monitor_unit_uses_absolute_exec_and_never_enables_or_starts_itself() -> None:
+def test_resource_monitor_unit_uses_absolute_exec_and_declares_default_target_install() -> None:
     root = Path(__file__).resolve().parents[1]
     service = root / "systemd" / "user" / "codex-master-resource-monitor.service"
     entrypoint = root / "bin" / "codex-master-resource-monitor"
@@ -1428,7 +1916,7 @@ def test_resource_monitor_unit_uses_absolute_exec_and_never_enables_or_starts_it
     assert directives["ExecStart"] == "%h/.local/bin/codex-master-resource-monitor"
     assert directives["ExecStart"].startswith("%h/")
     assert " " not in directives["ExecStart"]
-    assert "[Install]" not in text
+    assert "[Install]\nWantedBy=default.target\n" in text
     assert "systemctl" not in text
     assert "Environment=" not in text
     assert entrypoint.stat().st_mode & 0o111

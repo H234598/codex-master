@@ -197,3 +197,22 @@ def test_private_bytes_reject_root_swap_inside_and_after_held_store_lock(tmp_pat
     assert str(reacquired_write_error) == "state_root_untrusted"
     assert (displaced_root / "resources" / "snapshot.bin").read_bytes() == b"old"
     assert replacement_path.read_bytes() == b"new"
+
+
+def test_state_store_removes_one_private_file_locked_without_following_links(tmp_path: Path) -> None:
+    store = HiveStateStore(tmp_path / "state")
+    relative = PurePosixPath("resources/v1.json")
+    store.replace_private_bytes(relative, b"old")
+
+    store.remove_private_bytes(relative)
+
+    with pytest.raises(HiveStateError, match="state_not_found"):
+        store.read_private_bytes(relative, max_bytes=64)
+
+    outside = tmp_path / "outside.json"
+    outside.write_bytes(b"keep")
+    linked = tmp_path / "state" / "resources" / "v1.json"
+    linked.symlink_to(outside)
+    with pytest.raises(HiveStateError, match="state_file_untrusted"):
+        store.remove_private_bytes(relative)
+    assert outside.read_bytes() == b"keep"

@@ -129,6 +129,12 @@ class HiveStateStore:
         with self._lock():
             self._replace_private_bytes_locked(relative, payload)
 
+    def remove_private_bytes(self, relative: PurePosixPath) -> None:
+        """Remove one private regular file through the store lock."""
+
+        with self._lock():
+            self._remove_private_bytes_locked(relative)
+
     @contextlib.contextmanager
     def locked(self) -> Any:
         """Hold the cross-process state lock for a read/modify/write CAS."""
@@ -445,6 +451,21 @@ class HiveStateStore:
                 if temporary:
                     with contextlib.suppress(OSError):
                         os.unlink(temporary, dir_fd=parent_descriptor)
+
+    def _remove_private_bytes_locked(self, relative: PurePosixPath) -> None:
+        with self._private_parent(relative) as (parent_descriptor, name):
+            try:
+                current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                raise HiveStateError("state_unavailable") from exc
+            self._validate_private_file(current, MAX_HIVE_STATE_BYTES)
+            try:
+                os.unlink(name, dir_fd=parent_descriptor)
+                os.fsync(parent_descriptor)
+            except OSError as exc:
+                raise HiveStateError("state_unavailable") from exc
 
     @staticmethod
     def _validate_limit(max_bytes: int) -> None:

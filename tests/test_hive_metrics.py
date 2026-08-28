@@ -1,428 +1,124 @@
 from __future__ import annotations
 
-import re
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from itertools import count
 
 import pytest
 
-from codex_master.fleet_overview import (
-    FleetOverviewAgentRow,
-    FleetOverviewSeriesRow,
-    FleetOverviewSnapshot,
-)
-from codex_master.hive_metrics import (
-    FleetMetricObservation,
-    HiveMetricsError,
-    fleet_metric_values,
-    project_hive_metrics,
-    render_openmetrics,
-)
+from codex_master.fleet_overview import FleetOverviewAgentRow, FleetOverviewSeriesRow, FleetOverviewSnapshot
+from codex_master.hive_metrics import HiveMetricsError, fleet_metric_values, pcp_htop_meter_config, render_openmetrics
 
 
-CAPTURED = datetime(2026, 8, 22, 16, 0, tzinfo=timezone.utc)
-MAX_OBSERVATIONS = 4096
-_OBSERVATION_SEQUENCE = count()
+NOW = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
 
 
-def opaque_key(index: int | None = None) -> str:
-    value = next(_OBSERVATION_SEQUENCE) if index is None else index
-    return f"sha256:{value:064x}"
+def agent(agent_id: str, provider: str, role: str | None) -> FleetOverviewAgentRow:
+    return FleetOverviewAgentRow(
+        agent_id, "runtime", provider, "headless", "model", None, None, "running", role, None,
+        None, None, None, None, None, "unavailable",
+    )
 
 
-def observation(
-    provider: str,
-    role: str,
+def overview(
     *,
-    active: bool = True,
-    valid: bool = True,
-    detail: bool = True,
-    special_class: str = "analyst",
-    model_tier: str = "M2",
-    reasoning_tier: str = "R3",
-    lifecycle: str = "persistent",
-    observation_key: str | None = None,
-) -> FleetMetricObservation:
-    values: dict[str, object] = {
-        "active": active,
-        "valid": valid,
-        "provider": provider,
-        "role": role,
-        "special_class": special_class if detail else None,
-        "model_tier": model_tier if detail else None,
-        "reasoning_tier": reasoning_tier if detail else None,
-        "lifecycle": lifecycle if detail else None,
-    }
-    if observation_key is not None:
-        values["observation_key"] = observation_key
-    try:
-        return FleetMetricObservation(**values)  # type: ignore[arg-type]
-    except TypeError as error:
-        if observation_key is None:
-            raise
-        pytest.fail(f"opaque observation key is not accepted: {error}")
-
-
-def overview(*, generation: int = 4, homes: int = 0) -> FleetOverviewSnapshot:
+    agents: tuple[FleetOverviewAgentRow, ...] | None = None,
+    created_at: datetime = NOW,
+    registered_homes: int | None = None,
+) -> FleetOverviewSnapshot:
+    active_agents = agents if agents is not None else (
+        agent("oa-queen", "openai_chatgpt", "koenigin"),
+        agent("oa-worker", "openai_api", "arbeitsbiene"),
+        agent("g-worker", "gemini_api", "exploriererin"),
+        agent("an-tl", "anthropic_api", "teamleiterin"),
+        agent("hu-worker", "huggingface_inference", "worker"),
+        agent("ol-worker", "ollama_local", "worker"),
+        agent("ds-goddess", "deepseek_api", "gottbiene"),
+        agent("rogue", "openai_api", "rogue"),
+    )
+    home_count = len(active_agents) if registered_homes is None else registered_homes
+    registered_ids = tuple(row.agent_id for row in active_agents) + tuple(
+        f"stopped-{index}" for index in range(home_count - len(active_agents))
+    )
     return FleetOverviewSnapshot(
-        generation=generation,
-        created_at=CAPTURED,
-        integration_freshness="fresh",
-        series=(
+        7, created_at, "fresh",
+        (
             FleetOverviewSeriesRow(
-                "x", "Example", "openai_api", "codex", "model", 0, homes, (),
+                "h", "Hive", "openai_api", "codex_cli", "model", len(active_agents), home_count,
+                registered_ids,
             ),
-        ) if homes else (),
-        agents=(),
-        account_limits=(),
-        warnings=(),
+        ), active_agents, (), (),
     )
 
 
-def test_detail_tiers_validate_each_axis_including_zero_and_future_levels() -> None:
-    def state_for(model_tier: str, reasoning_tier: str) -> str:
-        return project_hive_metrics(
-            observations=(
-                observation("gemini", "worker", model_tier=model_tier, reasoning_tier=reasoning_tier),
-            ),
-            registered_homes=1,
-            captured_at=CAPTURED,
-            observed_at=CAPTURED,
-        ).state
-
-    assert state_for("M0", "R0") == "fresh"
-    assert state_for("R3", "M3") == "invalid"
-    assert state_for("M10", "R3") == "invalid"
-    assert state_for("M9", "R9") == "fresh"
-
-
-@pytest.mark.parametrize("unsafe_class", ("sk-live-secret", "account-123"))
-def test_detail_projects_unrecognized_special_class_to_unknown(unsafe_class: str) -> None:
-    projection = project_hive_metrics(
-        observations=(observation("gemini", "worker", special_class=unsafe_class),),
-        registered_homes=1,
-        captured_at=CAPTURED,
-        observed_at=CAPTURED,
-    )
-
-    assert projection.state == "fresh"
-    assert projection.details[0].special_class == "unknown"
-    assert unsafe_class not in repr(projection)
+def test_fleet_metrics_count_active_observations_and_registered_homes_separately() -> None:
+    values = fleet_metric_values(overview(registered_homes=13), native_active=3, observed_at=NOW)
+    assert values["codex_master_bees_native"] == 3
+    assert values["codex_master_bees_codex"] == 3
+    assert values["codex_master_bees_gemini"] == 1
+    assert values["codex_master_bees_claude"] == 1
+    assert values["codex_master_bees_huggingface"] == 1
+    assert values["codex_master_bees_ollama"] == 1
+    assert values["codex_master_bees_deepseek"] == 1
+    assert values["codex_master_bees_goddess"] == 1
+    assert values["codex_master_bees_queen"] == 1
+    assert values["codex_master_bees_teamleader"] == 1
+    assert values["codex_master_bees_worker"] == 4
+    assert values["codex_master_bees_rogue"] == 1
+    assert values["codex_master_bees_total"] == 11
+    assert values["codex_master_homes_registered"] == 13
 
 
-def test_projection_deduplicates_opaque_observation_keys_without_exposing_them() -> None:
-    first_key = opaque_key(1)
-    second_key = opaque_key(2)
-    original = observation("gemini", "worker", observation_key=first_key)
-    repeated_event = observation("gemini", "worker", observation_key=first_key)
-    projection = project_hive_metrics(
-        observations=(
-            original,
-            repeated_event,
-            observation("gemini", "worker", model_tier="M3", observation_key=second_key),
-        ),
-        registered_homes=2,
-        captured_at=CAPTURED,
-        observed_at=CAPTURED,
-    )
-
-    assert projection.active_bees == 2
-    assert len(projection.details) == 2
-    assert first_key not in repr(original)
-    assert first_key not in repr(projection)
-
-
-def test_projection_rejects_nonopaque_observation_keys() -> None:
-    projection = project_hive_metrics(
-        observations=(
-            observation("gemini", "worker", observation_key="account-123"),
-        ),
-        registered_homes=1,
-        captured_at=CAPTURED,
-        observed_at=CAPTURED,
-    )
-
-    assert projection.state == "invalid"
-    assert "account-123" not in repr(projection)
-
-
-def test_overview_adapter_requires_common_native_generation_binding() -> None:
-    snapshot = overview(generation=7)
-
-    with pytest.raises(HiveMetricsError, match="invalid_metric_input"):
-        fleet_metric_values(snapshot, native_active=1, observed_at=CAPTURED)
-
+def test_fleet_metrics_expose_unknown_provider_and_role_counts() -> None:
     values = fleet_metric_values(
-        snapshot,
-        native_active=1,
-        native_generation=7,
-        observed_at=CAPTURED,
+        overview(agents=overview().agents + (
+            agent("unknown-provider", "mistral", "architect"),
+            agent("unknown-role", "openai_api", None),
+        )),
+        native_active=0,
+        observed_at=NOW,
     )
+    assert values["codex_master_bees_total"] == 10
+    assert values["codex_master_bees_provider_unknown"] == 1
+    assert values["codex_master_bees_role_unknown"] == 2
 
-    assert values["codex_master_bees_total"] == 1
-    with pytest.raises(HiveMetricsError, match="invalid_metric_input"):
+
+def test_stale_snapshot_keeps_last_valid_values_at_exact_60_second_boundary() -> None:
+    snapshot = overview()
+    at_boundary = fleet_metric_values(snapshot, native_active=3, observed_at=NOW + timedelta(seconds=60))
+    stale = fleet_metric_values(snapshot, native_active=3, observed_at=NOW + timedelta(seconds=60, microseconds=1))
+    assert at_boundary["codex_master_snapshot_stale"] == 0
+    assert stale["codex_master_snapshot_stale"] == 1
+    assert stale["codex_master_snapshot_age_seconds"] == 60.000001
+    assert stale["codex_master_snapshot_observed_at_seconds"] == NOW.timestamp()
+    assert stale["codex_master_bees_total"] == 11
+    assert stale["codex_master_bees_codex"] == 3
+
+
+def test_invalid_observation_is_not_masked_as_stale() -> None:
+    invalid_snapshot = replace(overview(), agents=(replace(overview().agents[0], provider=None),))
+    with pytest.raises(HiveMetricsError, match="invalid_hive_metrics_input"):
         fleet_metric_values(
-            snapshot,
-            native_active=1,
-            native_generation=8,
-            observed_at=CAPTURED,
+            invalid_snapshot,
+            native_active=0,
+            observed_at=NOW + timedelta(seconds=61),
         )
 
 
-def test_projection_consumes_no_more_than_bounded_input_prefix() -> None:
-    class EndlessObservations:
-        def __init__(self) -> None:
-            self.consumed = 0
-
-        def __iter__(self):
-            while True:
-                self.consumed += 1
-                if self.consumed > MAX_OBSERVATIONS + 1:
-                    pytest.fail("projection consumed beyond its bounded input prefix")
-                yield observation("gemini", "worker", detail=False)
-
-    source = EndlessObservations()
-    with pytest.raises(HiveMetricsError, match="invalid_metric_input"):
-        project_hive_metrics(
-            observations=source,
-            registered_homes=0,
-            captured_at=CAPTURED,
-            observed_at=CAPTURED,
-        )
-    assert source.consumed == MAX_OBSERVATIONS + 1
+def test_invalid_snapshot_schema_remains_a_metrics_error() -> None:
+    invalid_snapshot = replace(overview(), created_at=None)
+    with pytest.raises(HiveMetricsError, match="invalid_hive_metrics_input"):
+        fleet_metric_values(invalid_snapshot, native_active=0, observed_at=NOW)
 
 
-@pytest.mark.parametrize("count", (MAX_OBSERVATIONS - 1, MAX_OBSERVATIONS))
-def test_projection_accepts_observation_input_at_telemetry_bound(count: int) -> None:
-    projection = project_hive_metrics(
-        observations=tuple(observation("gemini", "worker", detail=False) for _ in range(count)),
-        registered_homes=0,
-        captured_at=CAPTURED,
-        observed_at=CAPTURED,
-    )
-
-    assert projection.active_bees == count
-
-
-def test_projection_rejects_observation_input_above_telemetry_bound() -> None:
-    with pytest.raises(HiveMetricsError, match="invalid_metric_input"):
-        project_hive_metrics(
-            observations=tuple(
-                observation("gemini", "worker", detail=False)
-                for _ in range(MAX_OBSERVATIONS + 1)
-            ),
-            registered_homes=0,
-            captured_at=CAPTURED,
-            observed_at=CAPTURED,
-        )
-
-
-@pytest.mark.parametrize("registered_homes", (MAX_OBSERVATIONS - 1, MAX_OBSERVATIONS))
-def test_projection_accepts_inventory_at_telemetry_input_bound(registered_homes: int) -> None:
-    projection = project_hive_metrics(
-        observations=(),
-        registered_homes=registered_homes,
-        captured_at=CAPTURED,
-        observed_at=CAPTURED,
-    )
-
-    assert projection.registered_homes == registered_homes
-
-
-def test_projection_rejects_inventory_above_telemetry_input_bound() -> None:
-    with pytest.raises(HiveMetricsError, match="invalid_metric_input"):
-        project_hive_metrics(
-            observations=(),
-            registered_homes=MAX_OBSERVATIONS + 1,
-            captured_at=CAPTURED,
-            observed_at=CAPTURED,
-        )
-
-
-@pytest.mark.parametrize("native_active", (MAX_OBSERVATIONS - 1, MAX_OBSERVATIONS))
-def test_overview_adapter_accepts_native_input_at_telemetry_bound(native_active: int) -> None:
-    snapshot = overview(generation=9)
-
-    values = fleet_metric_values(
-        snapshot,
-        native_active=native_active,
-        native_generation=9,
-        observed_at=CAPTURED,
-    )
-
-    assert values["codex_master_bees_total"] == native_active
-
-
-def test_overview_adapter_rejects_native_input_above_telemetry_bound() -> None:
-    with pytest.raises(HiveMetricsError, match="invalid_metric_input"):
-        fleet_metric_values(
-            overview(generation=9),
-            native_active=MAX_OBSERVATIONS + 1,
-            native_generation=9,
-            observed_at=CAPTURED,
-        )
-
-
-def test_openmetrics_uses_label_free_openmetrics_eof_contract() -> None:
-    rendered = render_openmetrics({"codex_master_bees_total": 4})
-
-    assert rendered == "codex_master_bees_total 4\n# EOF\n"
-    assert re.fullmatch(r"codex_master_bees_total 4\n# EOF\n", rendered)
-    with pytest.raises(HiveMetricsError, match="invalid_metric_values"):
-        render_openmetrics({'codex_master_bees{provider="gemini"}': 1})
-
-
-def test_projection_separates_active_inventory_and_visible_unknowns() -> None:
-    projection = project_hive_metrics(
-        observations=(
-            observation("native", "goddess"),
-            observation("openai_api", "queen"),
-            observation("gemini_api", "teamleiterin"),
-            observation("anthropic", "arbeitsbiene"),
-            observation("huggingface_inference", "rogue"),
-            observation("ollama_local", "worker"),
-            observation("deepseek", "queen"),
-            observation("unlisted-provider", "unlisted-role"),
-        ),
-        registered_homes=13,
-        captured_at=CAPTURED,
-        observed_at=CAPTURED,
-    )
-
-    assert projection.state == "fresh"
-    assert projection.registered_homes == 13
-    assert projection.active_bees == 8
-    assert dict(projection.provider_counts) == {
-        "native": 1,
-        "codex": 1,
-        "gemini": 1,
-        "claude": 1,
-        "hf": 1,
-        "ollama": 1,
-        "deepseek": 1,
-        "unknown": 1,
-    }
-    assert dict(projection.role_counts) == {
-        "godbee": 1,
-        "queen": 2,
-        "team_lead": 1,
-        "worker": 2,
-        "rogue": 1,
-        "unknown": 1,
-    }
-    assert projection.details[0].special_class == "unknown"
-    assert projection.details[0].model_tier == "M2"
-    assert projection.details[0].reasoning_tier == "R3"
-    assert projection.details[0].lifecycle == "persistent"
-    assert "agent_id" not in projection.details[0].__dataclass_fields__
-    assert "account_id" not in projection.details[0].__dataclass_fields__
-
-
-def test_invalid_observation_returns_invalid_state_without_zero_counts() -> None:
-    projection = project_hive_metrics(
-        observations=(
-            observation("gemini", "worker"),
-            observation("codex", "worker", valid=False),
-        ),
-        registered_homes=2,
-        captured_at=CAPTURED,
-        observed_at=CAPTURED,
-    )
-
-    assert projection.state == "invalid"
-    assert projection.active_bees is None
-    assert projection.provider_counts is None
-    assert projection.role_counts is None
-    assert projection.details == ()
-
-
-def test_stale_boundary_preserves_last_valid_counts() -> None:
-    kwargs = {
-        "observations": (observation("gemini", "worker", detail=False),),
-        "registered_homes": 4,
-        "captured_at": CAPTURED,
-        "stale_after_seconds": 60,
-    }
-
-    fresh = project_hive_metrics(observed_at=CAPTURED + timedelta(seconds=60), **kwargs)
-    stale = project_hive_metrics(observed_at=CAPTURED + timedelta(seconds=61), **kwargs)
-
-    assert fresh.state == "fresh"
-    assert stale.state == "stale"
-    assert stale.active_bees == 1
-    assert dict(stale.provider_counts or ())["gemini"] == 1
-    assert stale.age_seconds == 61.0
-
-
-def test_projection_bounds_detail_output_without_changing_counts() -> None:
-    projection = project_hive_metrics(
-        observations=tuple(observation("gemini", "worker") for _ in range(129)),
-        registered_homes=129,
-        captured_at=CAPTURED,
-        observed_at=CAPTURED,
-    )
-
-    assert projection.active_bees == 129
-    assert len(projection.details) == 128
-    assert projection.details_truncated is True
-
-
-def test_legacy_overview_adapter_uses_one_active_counting_semantics() -> None:
-    overview = FleetOverviewSnapshot(
-        generation=4,
-        created_at=CAPTURED,
-        integration_freshness="fresh",
-        series=(
-            FleetOverviewSeriesRow(
-                "x", "Example", "openai_api", "codex", "model", 2, 5, ("x1", "x2"),
-            ),
-        ),
-        agents=(
-            FleetOverviewAgentRow(
-                "x1", "Example", "openai_api", "codex", "model", None, None,
-                "running", "teamleiterin", None, None, None, None, None, None, "fresh",
-            ),
-            FleetOverviewAgentRow(
-                "x2", "Example", "unlisted-provider", "codex", "model", None, None,
-                "running", "unlisted-role", None, None, None, None, None, None, "fresh",
-            ),
-            FleetOverviewAgentRow(
-                "x3", "Example", "gemini_api", "gemini", "model", None, None,
-                "stopped", "worker", None, None, None, None, None, None, "fresh",
-            ),
-        ),
-        account_limits=(),
-        warnings=(),
-    )
-
-    values = fleet_metric_values(
-        overview,
-        native_active=2,
-        native_generation=4,
-        observed_at=CAPTURED,
-    )
-
-    assert values["codex_master_bees_total"] == 4
-    assert values["codex_master_homes_registered"] == 5
-    assert values["codex_master_bees_codex"] == 1
-    assert values["codex_master_bees_native"] == 2
-    assert values["codex_master_bees_unknown"] == 1
-    assert values["codex_master_roles_team_lead"] == 1
-    assert values["codex_master_roles_unknown"] == 3
-
-
-def test_openmetrics_renderer_is_deterministic_and_rejects_nonfinite_values() -> None:
-    rendered = render_openmetrics(
-        {
-            "codex_master_bees_total": 4,
-            "codex_master_hive_metrics_age_seconds": 0.5,
-        }
-    )
-
-    assert rendered == (
-        "codex_master_bees_total 4\n"
-        "codex_master_hive_metrics_age_seconds 0.5\n"
-        "# EOF\n"
-    )
-    with pytest.raises(HiveMetricsError, match="invalid_metric_values"):
-        render_openmetrics({"codex_master_bees_total": float("nan")})
+def test_openmetrics_and_pcp_names_are_stable() -> None:
+    rendered = render_openmetrics(fleet_metric_values(overview(), native_active=3, observed_at=NOW))
+    assert "# TYPE codex_master_bees_native gauge" in rendered
+    assert rendered.endswith("# EOF\n")
+    meters = pcp_htop_meter_config()
+    assert "[codex_master_provider_bees]" in meters
+    assert "native.metric = openmetrics.codexmaster.codex_master_bees_native" in meters
+    assert "ollama.metric = openmetrics.codexmaster.codex_master_bees_ollama" in meters
+    assert "deepseek.metric = openmetrics.codexmaster.codex_master_bees_deepseek" in meters
+    assert "unknown.metric = openmetrics.codexmaster.codex_master_bees_provider_unknown" in meters
+    assert "[codex_master_role_bees]" in meters
+    assert "unknown.metric = openmetrics.codexmaster.codex_master_bees_role_unknown" in meters
