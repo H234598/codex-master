@@ -113,6 +113,69 @@ def open_private_runtime(path: Path) -> int:
     )
 
 
+def write_materialization_claim(
+    service: OpenAICredentialService,
+    runtime: Path,
+    *,
+    legacy_v1: bool,
+    token: str,
+    expires_at: float,
+) -> Path:
+    runtime_stat = runtime.stat()
+    target = runtime / "auth.json"
+    target.write_bytes(auth_json("acct-one"))
+    target.chmod(0o600)
+    target_stat = target.stat()
+    claim = {
+        "account_ref": "openai-one",
+        "directory_metadata": [
+            runtime_stat.st_dev,
+            runtime_stat.st_ino,
+            runtime_stat.st_mode,
+            runtime_stat.st_uid,
+            runtime_stat.st_gid,
+            runtime_stat.st_nlink,
+        ],
+        "directory_path": str(runtime),
+        "expires_at": expires_at,
+        "file_metadata": [
+            target_stat.st_dev,
+            target_stat.st_ino,
+            target_stat.st_mode,
+            target_stat.st_uid,
+            target_stat.st_gid,
+            target_stat.st_nlink,
+            target_stat.st_size,
+            target_stat.st_mtime_ns,
+            target_stat.st_ctime_ns,
+        ],
+        "generation": 2,
+        "owner_boot_id": service._vault._owner_boot_id,  # noqa: SLF001
+        "owner_pid": service._vault._process_id,  # noqa: SLF001
+        "owner_start_ticks": service._vault._owner_start_ticks,  # noqa: SLF001
+        "state": "published",
+        "token": token,
+    }
+    if not legacy_v1:
+        temporary_name = f".auth.json.{token}.tmp"
+        claim["temporary_name"] = temporary_name
+        os.setxattr(target, "user.codex_master_claim", token.encode("ascii"))
+    raw = (
+        json.dumps(
+            {"claims": [claim], "schema_version": 1},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("ascii")
+    with service._vault._state.locked():  # noqa: SLF001
+        service._vault._state.replace_private_bytes(  # noqa: SLF001
+            PurePosixPath("materialization-claims.json"), raw
+        )
+    return target
+
+
 def assert_private_values_absent(rendered: str, *values: str) -> None:
     if any(value in rendered for value in values):
         pytest.fail("private value exposed", pytrace=False)
@@ -1062,6 +1125,109 @@ def test_cleanup_claim_survives_service_restart(
             os.stat(runtime / "auth.json", follow_symlinks=False)
     finally:
         restarted.close()
+
+
+def test_restart_migrates_f0f1262_v1_claim_and_removes_published_secret(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    service = synced_service(tmp_path, clock=clock)
+    service.close()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    runtime.chmod(0o700)
+    target = write_materialization_claim(
+        service,
+        runtime,
+        legacy_v1=True,
+        token="a" * 64,
+        expires_at=clock.value - 1,
+    )
+
+    restarted = make_service(tmp_path, clock=clock)
+    try:
+        assert not target.exists()
+        migrated = json.loads(
+            (tmp_path / "vault" / "materialization-claims.json").read_text(
+                encoding="ascii"
+            )
+        )
+        assert migrated == {"claims": [], "schema_version": 2}
+    finally:
+        restarted.close()
+
+
+def test_revoke_migrates_active_f0f1262_v1_claim_and_removes_published_secret(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    service = synced_service(tmp_path, clock=clock)
+    service.close()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    runtime.chmod(0o700)
+    target = write_materialization_claim(
+        service,
+        runtime,
+        legacy_v1=True,
+        token="c" * 64,
+        expires_at=clock.value + 60,
+    )
+
+    assert service._vault.revoke_account(  # noqa: SLF001
+        "openai-one", expected_generation=2
+    )
+    assert not target.exists()
+    migrated = json.loads(
+        (tmp_path / "vault" / "materialization-claims.json").read_text(encoding="ascii")
+    )
+    assert migrated == {"claims": [], "schema_version": 2}
+
+
+def test_restart_removes_claim_bound_file_after_in_place_update(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    service = synced_service(tmp_path, clock=clock)
+    service.close()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir(mode=0o700)
+    runtime.chmod(0o700)
+    target = write_materialization_claim(
+        service,
+        runtime,
+        legacy_v1=False,
+        token="b" * 64,
+        expires_at=clock.value - 1,
+    )
+    original_identity = (target.stat().st_dev, target.stat().st_ino)
+    with target.open("wb") as handle:
+        handle.write(auth_json("acct-one", marker="runtime-refresh"))
+        handle.flush()
+        os.fsync(handle.fileno())
+    assert (target.stat().st_dev, target.stat().st_ino) == original_identity
+    assert os.getxattr(target, "user.codex_master_claim") == b"b" * 64
+
+    restarted = make_service(tmp_path, clock=clock)
+    try:
+        assert not target.exists()
+    finally:
+        restarted.close()
+
+
+def test_materialization_claim_schema_newer_than_supported_fails_closed(
+    tmp_path: Path,
+) -> None:
+    service = synced_service(tmp_path)
+    service.close()
+    raw = b'{"claims":[],"schema_version":3}\n'
+    with service._vault._state.locked():  # noqa: SLF001
+        service._vault._state.replace_private_bytes(  # noqa: SLF001
+            PurePosixPath("materialization-claims.json"), raw
+        )
+
+    with pytest.raises(OpenAICredentialError, match="credential.source_unavailable"):
+        make_service(tmp_path)
 
 
 def test_materialization_claim_is_durable_before_projection_decrypt(

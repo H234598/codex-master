@@ -52,13 +52,37 @@ _ACCOUNT_REF: Final[re.Pattern[str]] = re.compile(
 _MATERIALIZATION_DOCUMENT: Final[PurePosixPath] = PurePosixPath(
     "materialization-claims.json"
 )
+_LEGACY_MATERIALIZATION_SCHEMA_VERSION: Final[int] = 1
+_MATERIALIZATION_SCHEMA_VERSION: Final[int] = 2
 _MAX_MATERIALIZATION_BYTES: Final[int] = 2 * 1024 * 1024
 _MAX_RUNTIME_PATH_BYTES: Final[int] = 4096
 _MATERIALIZED_NAME: Final[str] = "auth.json"
+_LEGACY_MATERIALIZED_TEMP_NAME: Final[str] = ".auth.json.tmp"
 _MATERIALIZED_CLAIM_XATTR: Final[str] = "user.codex_master_claim"
 _MATERIALIZED_TEMP_NAME: Final[re.Pattern[str]] = re.compile(
     r"\.auth\.json\.[0-9a-f]{64}\.tmp\Z", re.ASCII
 )
+_MATERIALIZATION_V1_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "account_ref",
+        "directory_metadata",
+        "directory_path",
+        "expires_at",
+        "file_metadata",
+        "generation",
+        "owner_boot_id",
+        "owner_pid",
+        "owner_start_ticks",
+        "state",
+        "token",
+    }
+)
+_MATERIALIZATION_V1_XATTR_FIELDS: Final[frozenset[str]] = _MATERIALIZATION_V1_FIELDS | {
+    "temporary_name"
+}
+_MATERIALIZATION_V2_FIELDS: Final[frozenset[str]] = _MATERIALIZATION_V1_XATTR_FIELDS | {
+    "claim_format"
+}
 _ERROR_CODES: Final[frozenset[str]] = frozenset(
     {
         "credential.generation_conflict",
@@ -449,6 +473,7 @@ class CredentialVault:
                     claims.append(
                         {
                             "account_ref": account_ref,
+                            "claim_format": "xattr_v2",
                             "directory_metadata": list(target.directory_metadata),
                             "directory_path": target.directory_path,
                             "expires_at": state.expires_at,
@@ -1029,7 +1054,7 @@ class CredentialVault:
 
     @staticmethod
     def _validated_cleanup_target(
-        value: CredentialCleanupTarget,
+        value: CredentialCleanupTarget, *, allow_legacy_temporary: bool = False
     ) -> CredentialCleanupTarget:
         if (
             not isinstance(value, CredentialCleanupTarget)
@@ -1039,7 +1064,13 @@ class CredentialVault:
             or len(value.directory_path.encode("utf-8", errors="replace"))
             > _MAX_RUNTIME_PATH_BYTES
             or type(value.temporary_name) is not str
-            or _MATERIALIZED_TEMP_NAME.fullmatch(value.temporary_name) is None
+            or (
+                _MATERIALIZED_TEMP_NAME.fullmatch(value.temporary_name) is None
+                and not (
+                    allow_legacy_temporary
+                    and value.temporary_name == _LEGACY_MATERIALIZED_TEMP_NAME
+                )
+            )
         ):
             raise CredentialVaultError("credential.vault_request_invalid")
         metadata = value.directory_metadata
@@ -1100,21 +1131,36 @@ class CredentialVault:
             )
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
             raise CredentialVaultError("credential.vault_schema_invalid") from None
+        if not isinstance(document, Mapping) or set(document) != {
+            "claims",
+            "schema_version",
+        }:
+            raise CredentialVaultError("credential.vault_schema_invalid")
+        schema_version = document.get("schema_version")
+        raw_claims = document.get("claims")
         if (
-            not isinstance(document, Mapping)
-            or set(document) != {"claims", "schema_version"}
-            or document.get("schema_version") != 1
-            or type(document.get("claims")) is not list
-            or len(document["claims"]) > MAX_ACTIVE_LEASES
+            isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+            or type(raw_claims) is not list
+            or len(raw_claims) > MAX_ACTIVE_LEASES
         ):
             raise CredentialVaultError("credential.vault_schema_invalid")
-        claims = [self._validated_claim(value) for value in document["claims"]]
+        migrated = False
+        if schema_version == _MATERIALIZATION_SCHEMA_VERSION:
+            claims = [self._validated_claim(value) for value in raw_claims]
+        elif schema_version == _LEGACY_MATERIALIZATION_SCHEMA_VERSION:
+            claims = self._migrated_v1_claims(raw_claims, raw=raw)
+            migrated = True
+        else:
+            raise CredentialVaultError("credential.vault_schema_invalid")
         tokens = [claim["token"] for claim in claims]
         accounts = [claim["account_ref"] for claim in claims]
         if len(set(tokens)) != len(tokens) or len(set(accounts)) != len(accounts):
             raise CredentialVaultError("credential.vault_schema_invalid")
-        if raw != self._materialization_document(claims):
+        if not migrated and raw != self._materialization_document(claims):
             raise CredentialVaultError("credential.vault_schema_invalid")
+        if migrated:
+            self._write_materialization_claims_locked(claims)
         return claims
 
     def _write_materialization_claims_locked(
@@ -1125,33 +1171,60 @@ class CredentialVault:
             raise CredentialVaultError("credential.lease_limit")
         self._state.replace_private_bytes(_MATERIALIZATION_DOCUMENT, raw)
 
-    def _validated_claim(self, value: object) -> dict[str, object]:
-        fields = {
-            "account_ref",
-            "directory_metadata",
-            "directory_path",
-            "expires_at",
-            "file_metadata",
-            "generation",
-            "owner_boot_id",
-            "owner_pid",
-            "owner_start_ticks",
-            "state",
-            "temporary_name",
-            "token",
+    def _migrated_v1_claims(
+        self, values: list[object], *, raw: bytes
+    ) -> list[dict[str, object]]:
+        field_sets = {
+            frozenset(value) if isinstance(value, Mapping) else frozenset()
+            for value in values
         }
-        if not isinstance(value, Mapping) or set(value) != fields:
+        if not values:
+            claim_format = "xattr_v2"
+        elif field_sets == {_MATERIALIZATION_V1_FIELDS}:
+            claim_format = "legacy_v1"
+        elif field_sets == {_MATERIALIZATION_V1_XATTR_FIELDS}:
+            claim_format = "xattr_v2"
+        else:
+            raise CredentialVaultError("credential.vault_schema_invalid")
+        claims: list[dict[str, object]] = []
+        source_claims: list[dict[str, object]] = []
+        for value in values:
+            source = dict(cast(Mapping[str, object], value))
+            claim = dict(source)
+            if claim_format == "legacy_v1":
+                claim["temporary_name"] = _LEGACY_MATERIALIZED_TEMP_NAME
+            claim["claim_format"] = claim_format
+            validated = self._validated_claim(claim)
+            source["expires_at"] = validated["expires_at"]
+            source_claims.append(source)
+            claims.append(validated)
+        if self._materialization_document_v1(source_claims) != raw:
+            raise CredentialVaultError("credential.vault_schema_invalid")
+        return claims
+
+    def _validated_claim(self, value: object) -> dict[str, object]:
+        if not isinstance(value, Mapping) or set(value) != _MATERIALIZATION_V2_FIELDS:
             raise CredentialVaultError("credential.vault_schema_invalid")
         claim = dict(value)
+        claim_format = claim["claim_format"]
+        if claim_format not in {"legacy_v1", "xattr_v2"}:
+            raise CredentialVaultError("credential.vault_schema_invalid")
+        if (
+            claim_format == "legacy_v1"
+            and claim["temporary_name"] != _LEGACY_MATERIALIZED_TEMP_NAME
+        ):
+            raise CredentialVaultError("credential.vault_schema_invalid")
         try:
-            self._validated_account_ref(claim["account_ref"])
-            self._validated_generation(claim["generation"])
+            self._validated_account_ref(cast(str, claim["account_ref"]))
+            self._validated_generation(cast(int, claim["generation"]))
             target = CredentialCleanupTarget(
                 cast(str, claim["directory_path"]),
                 tuple(cast(list[int], claim["directory_metadata"])),
                 cast(str, claim["temporary_name"]),
             )
-            self._validated_cleanup_target(target)
+            self._validated_cleanup_target(
+                target, allow_legacy_temporary=claim_format == "legacy_v1"
+            )
         except (CredentialVaultError, TypeError):
             raise CredentialVaultError("credential.vault_schema_invalid") from None
         expires_at = claim["expires_at"]
@@ -1184,7 +1257,8 @@ class CredentialVault:
         if file_metadata is not None:
             try:
                 self._validated_file_metadata(
-                    tuple(cast(list[int], file_metadata)), allow_empty=True
+                    tuple(cast(list[int], file_metadata)),
+                    allow_empty=claim_format == "xattr_v2",
                 )
             except CredentialVaultError:
                 raise CredentialVaultError("credential.vault_schema_invalid") from None
@@ -1202,6 +1276,24 @@ class CredentialVault:
 
     @staticmethod
     def _materialization_document(claims: list[dict[str, object]]) -> bytes:
+        try:
+            return (
+                json.dumps(
+                    {
+                        "claims": claims,
+                        "schema_version": _MATERIALIZATION_SCHEMA_VERSION,
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("ascii")
+        except (TypeError, ValueError, UnicodeError, RecursionError):
+            raise CredentialVaultError("credential.vault_schema_invalid") from None
+
+    @staticmethod
+    def _materialization_document_v1(claims: list[dict[str, object]]) -> bytes:
         try:
             return (
                 json.dumps(
@@ -1248,25 +1340,47 @@ class CredentialVault:
                     pass
             temporary = present.get(temporary_name)
             final = present.get(_MATERIALIZED_NAME)
+            claim_format = cast(str, claim["claim_format"])
             if expected is None:
                 if temporary is None:
                     return final is None
-                if final is not None or not self._safe_unbound_temporary(temporary):
+                safe_unbound = (
+                    claim_format == "xattr_v2"
+                    and self._safe_unbound_temporary(temporary)
+                ) or (
+                    claim_format == "legacy_v1"
+                    and claim["state"] in {"publishing", "invalidated", "orphaned"}
+                    and self._safe_unbound_legacy_temporary(temporary)
+                )
+                if final is not None or not safe_unbound:
                     return False
                 os.unlink(temporary_name, dir_fd=descriptor)
                 os.fsync(descriptor)
                 return True
-            claim_token = temporary_name.split(".")[-2].encode("ascii")
-            if any(
-                not self._claim_xattr_matches(descriptor, name, observed, claim_token)
-                for name, observed in present.items()
-            ):
-                return False
             expected_metadata = tuple(cast(list[int], expected))
-            if any(
-                not self._bound_materialized_file(observed, expected_metadata)
-                for observed in present.values()
-            ):
+            if claim_format == "xattr_v2":
+                claim_token = temporary_name.split(".")[-2].encode("ascii")
+                if any(
+                    not self._claim_xattr_matches(
+                        descriptor, name, observed, claim_token
+                    )
+                    for name, observed in present.items()
+                ):
+                    return False
+                if any(
+                    not self._bound_materialized_file(observed, expected_metadata)
+                    for observed in present.values()
+                ):
+                    return False
+            elif claim_format == "legacy_v1":
+                if any(
+                    not self._bound_legacy_materialized_file(
+                        observed, expected_metadata
+                    )
+                    for observed in present.values()
+                ):
+                    return False
+            else:  # pragma: no cover - validated claim exhaustiveness
                 return False
             if (
                 temporary is not None
@@ -1278,12 +1392,17 @@ class CredentialVault:
                 != (temporary.st_dev, temporary.st_ino)
             ):
                 return False
-            if claim["state"] == "published" and final is not None:
-                if (
-                    temporary is not None
-                    or self._raw_file_metadata(final) != expected_metadata
+            if len(present) == 1 and claim_format == "legacy_v1":
+                if self._raw_file_metadata(next(iter(present.values()))) != (
+                    expected_metadata
                 ):
                     return False
+            elif (
+                claim["state"] == "published"
+                and temporary is not None
+                and final is not None
+            ):
+                return False
             for name in present:
                 os.unlink(name, dir_fd=descriptor)
             if present:
@@ -1307,6 +1426,17 @@ class CredentialVault:
             and value.st_gid == os.getegid()
             and value.st_nlink == 1
             and value.st_size == 0
+        )
+
+    @staticmethod
+    def _safe_unbound_legacy_temporary(value: os.stat_result) -> bool:
+        return (
+            stat.S_ISREG(value.st_mode)
+            and stat.S_IMODE(value.st_mode) == 0o600
+            and value.st_uid == os.geteuid()
+            and value.st_gid == os.getegid()
+            and value.st_nlink == 1
+            and 0 <= value.st_size <= MAX_PROJECTION_BYTES
         )
 
     @staticmethod
@@ -1349,6 +1479,21 @@ class CredentialVault:
             and value.st_nlink in {1, 2}
             and (value.st_dev, value.st_ino) == expected[:2]
             and value.st_size <= MAX_PROJECTION_BYTES
+        )
+
+    @staticmethod
+    def _bound_legacy_materialized_file(
+        value: os.stat_result, expected: tuple[int, ...]
+    ) -> bool:
+        return (
+            stat.S_ISREG(value.st_mode)
+            and stat.S_IMODE(value.st_mode) == 0o600
+            and value.st_uid == os.geteuid()
+            and value.st_gid == os.getegid()
+            and value.st_nlink in {1, 2}
+            and (value.st_dev, value.st_ino) == expected[:2]
+            and value.st_size == expected[6]
+            and value.st_mtime_ns == expected[7]
         )
 
     @staticmethod
