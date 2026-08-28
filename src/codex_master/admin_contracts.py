@@ -28,9 +28,9 @@ _MAX_OPERATION_LIFETIME = timedelta(days=1)
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
 _PRIVATE_TEXT = re.compile(
-    r"\b(?:bearer|basic|access(?:[_ -]?token)?|api(?:[_ -]?key)?|auth(?:entication|orization)?|token|cookie|credential|passphrase|session|secret|jwt)\b"
+    r"\b(?:bearer|basic|(?:access|refresh)[\s_.-]*token|client[\s_.-]*secret|api[\s_.-]*key|auth(?:entication|orization)?|token|cookie|credential|passphrase|password|session|secret|jwt)\b"
     r"|(?:sk-[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)"
-    r"|file:|\\\\|(?:^|[\s\"'=:(])/(?:[^\s]+)|[A-Za-z]:[\\/]",
+    r"|file:|\\\\|\\(?:[^\\\s]+\\)+|(?:^|[\s\"'=:(\[])/(?:[^\s]+)|[A-Za-z]:[\\/]",
     re.IGNORECASE,
 )
 _OPERATION_STATES = frozenset({"planned", "queued", "running", "partial", "succeeded", "failed", "blocked"})

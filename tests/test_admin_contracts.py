@@ -145,7 +145,10 @@ def test_problem_wire_matches_spec_fixture() -> None:
 @pytest.mark.parametrize("text", [
     "access_token=never", "cookie=session-secret", "Basic never", "eyJhbGciOiJIUzI1NiJ9.payload.sig",
     "sk-verysecretkey", "AIzaSyD012345678901234567890",
+    "refresh_token=never", "clientSecret=never", "password never",
+    "client.secret=never", "refresh-token=never", "client secret never",
     "apiKey=never", "failed at \"/private/auth.json\"", r"\\server\share\auth.json",
+    "error [/home/x]", r"\Windows\private", r"\private\auth.json",
     "file:///private/auth.json", "bad\x1b[31mtext", "token rejected",
 ])
 def test_problem_rejects_secret_path_and_control_text(text: str) -> None:
