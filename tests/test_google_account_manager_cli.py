@@ -11,6 +11,9 @@ from codex_master.google_account_manager_cli import _load_quota_evidence, build_
 from codex_master.google_cloud_provisioner import GoogleCloudProvisionerError
 
 
+INVENTORY_FINGERPRINT = "sha256:" + "a" * 64
+
+
 def test_cli_has_inventory_oauth_rename_and_private_quota_evidence_only() -> None:
     parser = build_parser()
 
@@ -95,7 +98,7 @@ def test_private_quota_evidence_file_loads_exact_schema(tmp_path) -> None:
         tmp_path,
         '{"remaining":23,"observed_at":"2026-08-28T12:00:00Z",'
         '"source":"cloudresourcemanager","account_ref":"google-account-01",'
-        '"inventory_generation":7}',
+        '"inventory_generation":7,"inventory_fingerprint":"sha256:' + "a" * 64 + '"}',
     )
 
     evidence = _load_quota_evidence(path)
@@ -110,16 +113,18 @@ def test_private_quota_evidence_file_loads_exact_schema(tmp_path) -> None:
     [
         '{"remaining":1,"remaining":2,"observed_at":"2026-08-28T12:00:00Z",'
         '"source":"cloudresourcemanager","account_ref":"google-account-01",'
-        '"inventory_generation":7}',
+        '"inventory_generation":7,"inventory_fingerprint":"sha256:' + "a" * 64 + '"}',
         '{"remaining":NaN,"observed_at":"2026-08-28T12:00:00Z",'
         '"source":"cloudresourcemanager","account_ref":"google-account-01",'
-        '"inventory_generation":7}',
+        '"inventory_generation":7,"inventory_fingerprint":"sha256:' + "a" * 64 + '"}',
         '{"remaining":null,"observed_at":"2026-08-28T12:00:00Z",'
         '"source":"cloudresourcemanager","account_ref":"google-account-01",'
-        '"inventory_generation":7}',
+        '"inventory_generation":7,"inventory_fingerprint":"sha256:' + "a" * 64 + '"}',
         '{"remaining":1,"observed_at":"2026-08-28T12:00:00Z",'
         '"source":"cloudresourcemanager","account_ref":"google-account-01",'
-        '"inventory_generation":7,"access_token":"private-secret"}',
+        '"inventory_generation":7,"inventory_fingerprint":"sha256:'
+        + "a" * 64
+        + '","access_token":"private-secret"}',
     ],
 )
 def test_private_quota_evidence_file_rejects_ambiguous_or_extra_data(
@@ -199,6 +204,7 @@ def test_cli_binds_evidence_to_current_manager_generation_before_provider_search
             account = SimpleNamespace(subject_id="subject-one")
             return SimpleNamespace(
                 generation=1,
+                content_fingerprint=INVENTORY_FINGERPRINT,
                 by_account_ref={"google-account-01": account},
             )
 
@@ -260,6 +266,7 @@ def test_cli_plans_from_manager_snapshot_without_second_inventory_read(
     )
     snapshot = SimpleNamespace(
         generation=1,
+        content_fingerprint=INVENTORY_FINGERPRINT,
         accounts=(account,),
         by_account_ref={"google-account-01": account},
     )
@@ -298,9 +305,102 @@ def test_cli_plans_from_manager_snapshot_without_second_inventory_read(
     assert manager.closed is True
 
 
+def test_untrusted_private_evidence_can_preview_but_never_apply(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    path = _private_evidence_file(
+        tmp_path,
+        json_payload(
+            remaining=1,
+            observed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            inventory_generation=1,
+        ),
+    )
+    inventory_fingerprint = "sha256:" + "a" * 64
+    account = SimpleNamespace(
+        ref="google-account-01", subject_id="subject-one", projects=()
+    )
+    snapshot = SimpleNamespace(
+        generation=1,
+        content_fingerprint=inventory_fingerprint,
+        accounts=(account,),
+        by_account_ref={"google-account-01": account},
+    )
+
+    class Store:
+        def __init__(self):
+            self.mutations = 0
+
+        def _read(self):
+            return b"", {
+                "google_accounts": [
+                    {
+                        "ref": "google-account-01",
+                        "subject_id": "subject-one",
+                        "projects": [],
+                    }
+                ]
+            }
+
+        def atomic_update(self, transform):
+            self.mutations += 1
+            raise AssertionError("untrusted mutation")
+
+    class Api:
+        creates = 0
+
+        def subject_id(self):
+            return "subject-one"
+
+        def search_projects(self):
+            return []
+
+        def create_project(self, *_):
+            self.creates += 1
+            return {"name": "projects/123"}
+
+    class Manager:
+        def reload(self):
+            return None
+
+        def _snapshot_for_internal_use(self):
+            return snapshot
+
+        def close(self):
+            return None
+
+    store = Store()
+    api = Api()
+    monkeypatch.setattr(cli, "GoogleInventoryStore", lambda: store)
+    monkeypatch.setattr(cli, "_api", lambda *_: api)
+    monkeypatch.setattr(cli, "GoogleAccountInventoryManager", Manager)
+    arguments = build_parser().parse_args(
+        [
+            "provision",
+            "--account",
+            "google-account-01",
+            "--client-file",
+            "/private/client.json",
+            "--fill-to-quota",
+            "--quota-evidence-file",
+            str(path),
+            "--yes",
+        ]
+    )
+
+    with pytest.raises(GoogleCloudProvisionerError, match="quota_evidence_untrusted"):
+        cli.run(arguments)
+
+    output = capsys.readouterr().out
+    assert '"apply_blocked_reason": "quota_evidence_untrusted"' in output
+    assert api.creates == 0
+    assert store.mutations == 0
+
+
 def json_payload(*, remaining: int, observed_at: str, inventory_generation: int) -> str:
     return (
         f'{{"remaining":{remaining},"observed_at":"{observed_at}",'
         '"source":"cloudresourcemanager","account_ref":"google-account-01",'
-        f'"inventory_generation":{inventory_generation}}}'
+        f'"inventory_generation":{inventory_generation},'
+        f'"inventory_fingerprint":"{INVENTORY_FINGERPRINT}"}}'
     )

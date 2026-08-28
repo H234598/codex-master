@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+import urllib.error
 
 import pytest
 
-from codex_master.google_cloud_api import GoogleCloudApi, GoogleCloudApiError
+from codex_master.google_cloud_api import (
+    GoogleCloudApi,
+    GoogleCloudApiError,
+    _UrlLibTransport,
+)
 
 
 class FakeTransport:
@@ -15,6 +20,30 @@ class FakeTransport:
     def request(self, method, url, headers, body):
         self.calls.append((method, url, headers, body))
         return next(self.responses)
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [(409, "google.api_conflict"), (429, "google.api_quota_exhausted")],
+)
+def test_http_conflict_and_quota_exhaustion_are_machine_distinct(
+    status: int, code: str
+) -> None:
+    class Opener:
+        def open(self, *_args, **_kwargs):
+            raise urllib.error.HTTPError(
+                "https://cloudresourcemanager.googleapis.com/v3/projects",
+                status,
+                "private provider text",
+                None,
+                None,
+            )
+
+    transport = _UrlLibTransport()
+    transport._opener = Opener()
+
+    with pytest.raises(GoogleCloudApiError, match=code):
+        transport.request("POST", "https://example.invalid", {}, {})
 
 
 def test_search_projects_is_bounded_and_paginated_without_token_rendering() -> None:
@@ -39,7 +68,13 @@ def test_mutation_payloads_are_allowlisted_and_key_is_restricted() -> None:
     transport = FakeTransport(
         [
             {"name": "operations/project-create"},
-            {"done": True, "response": {"projectId": "quietglow-aurora-a1b2c3", "name": "projects/1"}},
+            {
+                "done": True,
+                "response": {
+                    "projectId": "quietglow-aurora-a1b2c3",
+                    "name": "projects/1",
+                },
+            },
             {"name": "operations/services"},
             {"done": True, "response": {}},
             {"name": "operations/key"},
@@ -75,7 +110,9 @@ def test_mutation_payloads_are_allowlisted_and_key_is_restricted() -> None:
 
 
 def test_userinfo_subject_must_be_nonempty() -> None:
-    api = GoogleCloudApi._for_test("private-access-token", FakeTransport([{"sub": "123"}]))
+    api = GoogleCloudApi._for_test(
+        "private-access-token", FakeTransport([{"sub": "123"}])
+    )
     assert api.subject_id() == "123"
 
     broken = GoogleCloudApi._for_test("private-access-token", FakeTransport([{}]))
@@ -227,8 +264,6 @@ def test_project_display_name_patch_accepts_inline_done_operation() -> None:
         ),
     )
     assert (
-        api.update_project_name("projects/123456", "Quietglow Aurorabay")[
-            "displayName"
-        ]
+        api.update_project_name("projects/123456", "Quietglow Aurorabay")["displayName"]
         == "Quietglow Aurorabay"
     )

@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import sys
 import time
+from typing import cast
 
 from .google_account_inventory import GoogleAccountInventoryError
 from .google_account_inventory import _read_private_inventory_bytes
@@ -21,14 +22,20 @@ from .google_cloud_provisioner import (
     GoogleQuotaEvidenceV1,
     _validate_quota_evidence,
     build_fill_to_quota_plan,
-    execute_fill_to_quota_plan,
 )
 from .google_inventory_store import GoogleInventoryStore
 from .google_oauth_session import authorize_google_account, load_access_token
 
 
 _QUOTA_EVIDENCE_FIELDS = frozenset(
-    {"remaining", "observed_at", "source", "account_ref", "inventory_generation"}
+    {
+        "remaining",
+        "observed_at",
+        "source",
+        "account_ref",
+        "inventory_generation",
+        "inventory_fingerprint",
+    }
 )
 _MAX_QUOTA_EVIDENCE_BYTES = 16 * 1024
 
@@ -116,11 +123,13 @@ def _load_quota_evidence(path: Path) -> GoogleQuotaEvidenceV1:
             source=parsed["source"],
             account_ref=parsed["account_ref"],
             inventory_generation=parsed["inventory_generation"],
+            inventory_fingerprint=parsed["inventory_fingerprint"],
         )
         _validate_quota_evidence(
             evidence,
             account_ref=evidence.account_ref,
             inventory_generation=evidence.inventory_generation,
+            inventory_fingerprint=evidence.inventory_fingerprint,
             now=evidence.observed_at,
         )
         return evidence
@@ -190,6 +199,7 @@ def run(arguments: argparse.Namespace) -> int:
             manager.reload()
             snapshot = manager._snapshot_for_internal_use()
             generation = snapshot.generation
+            inventory_fingerprint = snapshot.content_fingerprint
             try:
                 account = snapshot.by_account_ref[arguments.account]
             except KeyError:
@@ -204,6 +214,7 @@ def run(arguments: argparse.Namespace) -> int:
                 evidence,
                 account_ref=arguments.account,
                 inventory_generation=generation,
+                inventory_fingerprint=inventory_fingerprint,
                 now=now,
             )
             cloud_projects = api.search_projects()
@@ -213,14 +224,15 @@ def run(arguments: argparse.Namespace) -> int:
                 expected_subject_id=subject,
                 quota_evidence=evidence,
                 inventory_generation=generation,
+                inventory_fingerprint=inventory_fingerprint,
                 now=now,
                 visible_project_names={
-                    item["displayName"]
+                    cast(str, item["displayName"])
                     for item in cloud_projects
                     if type(item.get("displayName")) is str
                 },
                 reserved_project_ids={
-                    item["projectId"]
+                    cast(str, item["projectId"])
                     for item in cloud_projects
                     if type(item.get("projectId")) is str
                 },
@@ -240,26 +252,15 @@ def run(arguments: argparse.Namespace) -> int:
                             for item in plan.projects
                         ],
                         "fingerprint": plan.fingerprint,
-                        "execute": bool(arguments.yes),
+                        "execute": False,
+                        "apply_blocked_reason": "quota_evidence_untrusted",
                     },
                     sort_keys=True,
                 )
             )
-            if not arguments.yes:
-                return 2
-            receipt = execute_fill_to_quota_plan(
-                plan,
-                api=api,
-                store=store,
-                confirmed_fingerprint=plan.fingerprint,
-            )
-            print(
-                json.dumps(
-                    {"completed": receipt.completed, "planned": receipt.planned},
-                    sort_keys=True,
-                )
-            )
-            return 0
+            if arguments.yes:
+                raise GoogleCloudProvisionerError("quota_evidence_untrusted")
+            return 2
         finally:
             manager.close()
 

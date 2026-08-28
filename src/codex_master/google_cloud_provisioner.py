@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 import json
 import re
-from typing import Collection, Protocol, cast
+from typing import Callable, Collection, Protocol, cast
 
 from .google_cloud_api import GoogleCloudApiError
 from .google_project_naming import (
@@ -18,10 +18,13 @@ from .google_project_naming import (
 
 
 class GoogleCloudProvisionerError(Exception):
-    __slots__ = ("code",)
+    __slots__ = ("code", "partial")
 
-    def __init__(self, code: str) -> None:
+    def __init__(
+        self, code: str, *, partial: ProvisionPartialReceipt | None = None
+    ) -> None:
         self.code = code
+        self.partial = partial
         super().__init__(code)
 
     def __repr__(self) -> str:
@@ -43,6 +46,7 @@ class GoogleQuotaEvidenceV1:
     source: str
     account_ref: str
     inventory_generation: int
+    inventory_fingerprint: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +56,7 @@ class FillToQuotaPlan:
     quota_remaining: int
     quota_evidence: GoogleQuotaEvidenceV1
     inventory_generation: int
+    inventory_fingerprint: str
     projects: tuple[PlannedHiveProject, ...]
     fingerprint: str
 
@@ -60,6 +65,15 @@ class FillToQuotaPlan:
 class ProvisionReceipt:
     completed: int
     planned: int
+
+
+@dataclass(frozen=True, slots=True)
+class ProvisionPartialReceipt:
+    completed: int
+    planned: int
+    failed: int
+    not_attempted: int
+    reason_code: str
 
 
 class _Api(Protocol):
@@ -85,6 +99,7 @@ _MAX_QUOTA_REMAINING = 10_000
 _MAX_QUOTA_AGE = timedelta(minutes=5)
 _MAX_QUOTA_FUTURE_SKEW = timedelta(seconds=30)
 _UTC_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
+_FINGERPRINT = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
 
 
 def _utc_timestamp(value: object) -> datetime:
@@ -104,6 +119,7 @@ def _validate_quota_evidence(
     *,
     account_ref: str,
     inventory_generation: int,
+    inventory_fingerprint: str,
     now: object,
 ) -> GoogleQuotaEvidenceV1:
     if (
@@ -115,6 +131,12 @@ def _validate_quota_evidence(
         or len(evidence.account_ref.encode("utf-8")) > 256
         or type(evidence.inventory_generation) is not int
         or not 1 <= evidence.inventory_generation <= 2**63 - 1
+        or type(inventory_generation) is not int
+        or not 1 <= inventory_generation <= 2**63 - 1
+        or type(evidence.inventory_fingerprint) is not str
+        or _FINGERPRINT.fullmatch(evidence.inventory_fingerprint) is None
+        or type(inventory_fingerprint) is not str
+        or _FINGERPRINT.fullmatch(inventory_fingerprint) is None
     ):
         raise GoogleCloudProvisionerError("quota.evidence_invalid")
     if type(evidence.source) is not str or evidence.source not in _QUOTA_SOURCES:
@@ -125,6 +147,8 @@ def _validate_quota_evidence(
         raise GoogleCloudProvisionerError("quota.evidence_account_mismatch")
     if evidence.inventory_generation != inventory_generation:
         raise GoogleCloudProvisionerError("quota.evidence_generation_mismatch")
+    if evidence.inventory_fingerprint != inventory_fingerprint:
+        raise GoogleCloudProvisionerError("quota.evidence_inventory_mismatch")
     if observed_at > now_utc + _MAX_QUOTA_FUTURE_SKEW:
         raise GoogleCloudProvisionerError("quota.evidence_future")
     if now_utc - observed_at > _MAX_QUOTA_AGE:
@@ -160,6 +184,7 @@ def build_fill_to_quota_plan(
     expected_subject_id: str,
     quota_evidence: GoogleQuotaEvidenceV1,
     inventory_generation: int,
+    inventory_fingerprint: str,
     now: str,
     visible_project_names: Collection[str],
     reserved_project_ids: Collection[str],
@@ -171,12 +196,15 @@ def build_fill_to_quota_plan(
         or not expected_subject_id
         or type(inventory_generation) is not int
         or not 1 <= inventory_generation <= 2**63 - 1
+        or type(inventory_fingerprint) is not str
+        or _FINGERPRINT.fullmatch(inventory_fingerprint) is None
     ):
         raise GoogleCloudProvisionerError("provisioner.plan_invalid")
     evidence = _validate_quota_evidence(
         quota_evidence,
         account_ref=account_ref,
         inventory_generation=inventory_generation,
+        inventory_fingerprint=inventory_fingerprint,
         now=now,
     )
     account = _account(document, account_ref)
@@ -248,6 +276,7 @@ def build_fill_to_quota_plan(
                     "source": evidence.source,
                     "account_ref": evidence.account_ref,
                     "inventory_generation": evidence.inventory_generation,
+                    "inventory_fingerprint": evidence.inventory_fingerprint,
                 },
                 "refs": sorted(refs),
                 "visible_project_names": sorted(names),
@@ -283,6 +312,7 @@ def build_fill_to_quota_plan(
             "source": evidence.source,
             "account_ref": evidence.account_ref,
             "inventory_generation": evidence.inventory_generation,
+            "inventory_fingerprint": evidence.inventory_fingerprint,
         },
         "projects": [
             {
@@ -306,6 +336,7 @@ def build_fill_to_quota_plan(
         quota_remaining=evidence.remaining,
         quota_evidence=evidence,
         inventory_generation=inventory_generation,
+        inventory_fingerprint=inventory_fingerprint,
         projects=tuple(planned),
         fingerprint=fingerprint,
     )
@@ -334,6 +365,29 @@ def _find_project(document: dict[str, object], account_ref: str, ref: str):
     return matches[0] if matches else None
 
 
+def _validate_account_subject(
+    document: dict[str, object], plan: FillToQuotaPlan
+) -> None:
+    if (
+        _account(document, plan.account_ref).get("subject_id")
+        != plan.expected_subject_id
+    ):
+        raise GoogleCloudProvisionerError("provisioner.subject_mismatch")
+
+
+def _validate_project_identity(
+    project: dict[str, object], item: PlannedHiveProject, project_number: str
+) -> None:
+    if (
+        project.get("project_name") != item.project_name
+        or project.get("project_id") != item.project_id
+        or project.get("project_number") != project_number
+        or project.get("key_name") != item.key_display_name
+        or project.get("purpose") != "hive"
+    ):
+        raise GoogleCloudProvisionerError("provisioner.inventory_conflict")
+
+
 def _persist_created(
     store: _Store,
     plan: FillToQuotaPlan,
@@ -341,13 +395,16 @@ def _persist_created(
     project_number: str,
 ) -> None:
     def update(document: dict[str, object]) -> None:
+        _validate_account_subject(document, plan)
         account = _account(document, plan.account_ref)
         projects = account.get("projects")
         if type(projects) is not list:
             raise GoogleCloudProvisionerError("provisioner.inventory_invalid")
-        if any(
-            type(value) is dict and value.get("ref") == item.ref for value in projects
-        ):
+        existing = _find_project(document, plan.account_ref, item.ref)
+        if existing is not None:
+            _validate_project_identity(existing, item, project_number)
+            if existing.get("status") != "provisioning":
+                raise GoogleCloudProvisionerError("provisioner.inventory_conflict")
             return
         projects.append(
             {
@@ -369,12 +426,21 @@ def _persist_created(
 
 
 def _persist_services(
-    store: _Store, plan: FillToQuotaPlan, item: PlannedHiveProject
+    store: _Store,
+    plan: FillToQuotaPlan,
+    item: PlannedHiveProject,
+    project_number: str,
 ) -> None:
     def update(document: dict[str, object]) -> None:
+        _validate_account_subject(document, plan)
         project = _find_project(document, plan.account_ref, item.ref)
         if project is None:
             raise GoogleCloudProvisionerError("provisioner.inventory_invalid")
+        _validate_project_identity(project, item, project_number)
+        if project.get("status") == "services_enabled":
+            return
+        if project.get("status") != "provisioning":
+            raise GoogleCloudProvisionerError("provisioner.inventory_conflict")
         project["status"] = "services_enabled"
 
     store.atomic_update(update)
@@ -384,6 +450,7 @@ def _persist_key(
     store: _Store,
     plan: FillToQuotaPlan,
     item: PlannedHiveProject,
+    project_number: str,
     key: dict[str, object],
 ) -> None:
     name = key.get("name")
@@ -401,9 +468,21 @@ def _persist_key(
     key_id = name.rsplit("/", 1)[-1]
 
     def update(document: dict[str, object]) -> None:
+        _validate_account_subject(document, plan)
         project = _find_project(document, plan.account_ref, item.ref)
         if project is None:
             raise GoogleCloudProvisionerError("provisioner.inventory_invalid")
+        _validate_project_identity(project, item, project_number)
+        if project.get("status") == "active":
+            if (
+                project.get("key_id") == key_id
+                and project.get("key_uid") == uid
+                and project.get("secret") == secret
+            ):
+                return
+            raise GoogleCloudProvisionerError("provisioner.inventory_conflict")
+        if project.get("status") != "services_enabled":
+            raise GoogleCloudProvisionerError("provisioner.inventory_conflict")
         project.update(
             {"status": "active", "key_id": key_id, "key_uid": uid, "secret": secret}
         )
@@ -417,15 +496,32 @@ def execute_fill_to_quota_plan(
     api: _Api,
     store: _Store,
     confirmed_fingerprint: str,
+    now: Callable[[], str],
+    current_inventory: Callable[[], tuple[int, str]],
 ) -> ProvisionReceipt:
     if type(plan) is not FillToQuotaPlan or confirmed_fingerprint != plan.fingerprint:
         raise GoogleCloudProvisionerError("provisioner.confirmation_invalid")
+    completed = 0
     try:
         if api.subject_id() != plan.expected_subject_id:
             raise GoogleCloudProvisionerError("provisioner.subject_mismatch")
-        completed = 0
+        try:
+            current_generation, current_fingerprint = current_inventory()
+            current_now = now()
+        except Exception:
+            raise GoogleCloudProvisionerError(
+                "provisioner.inventory_conflict"
+            ) from None
+        _validate_quota_evidence(
+            plan.quota_evidence,
+            account_ref=plan.account_ref,
+            inventory_generation=current_generation,
+            inventory_fingerprint=current_fingerprint,
+            now=current_now,
+        )
         for item in plan.projects:
             document = store._read()[1]
+            _validate_account_subject(document, plan)
             project = _find_project(document, plan.account_ref, item.ref)
             if project is None:
                 response = api.create_project(item.project_id, item.project_name)
@@ -451,7 +547,7 @@ def execute_fill_to_quota_plan(
                 continue
             if status == "provisioning":
                 api.enable_required_services(number)
-                _persist_services(store, plan, item)
+                _persist_services(store, plan, item, number)
             matches = [
                 key
                 for key in api.list_keys(number)
@@ -466,10 +562,25 @@ def execute_fill_to_quota_plan(
                 key["keyString"] = api.get_key_string(str(key.get("name", "")))
             else:
                 key = api.create_restricted_key(number, item.key_display_name)
-            _persist_key(store, plan, item, key)
+            _persist_key(store, plan, item, number, key)
             completed += 1
         return ProvisionReceipt(completed=completed, planned=len(plan.projects))
     except GoogleCloudProvisionerError:
         raise
-    except GoogleCloudApiError:
+    except GoogleCloudApiError as error:
+        if error.code == "google.api_quota_exhausted":
+            failed = int(completed < len(plan.projects))
+            raise GoogleCloudProvisionerError(
+                "quota.provider_exhausted",
+                partial=ProvisionPartialReceipt(
+                    completed=completed,
+                    planned=len(plan.projects),
+                    failed=failed,
+                    not_attempted=max(
+                        len(plan.projects) - completed - failed,
+                        0,
+                    ),
+                    reason_code="quota.provider_exhausted",
+                ),
+            ) from None
         raise GoogleCloudProvisionerError("provisioner.google_failed") from None
