@@ -354,10 +354,14 @@ class GoogleBillingService:
 
     def _snapshot(self) -> Any:
         try:
-            status = self._manager.status()
-            if not status.new_work_allowed:
-                raise GoogleBillingError("billing.inventory_unavailable")
-            return self._manager._snapshot_for_internal_use()
+            with self._manager._lock:
+                status = self._manager._status_locked()
+                if not status.new_work_allowed:
+                    raise GoogleBillingError("billing.inventory_unavailable")
+                snapshot = self._manager._snapshot_for_internal_use()
+                if not self._manager._status_locked().new_work_allowed:
+                    raise GoogleBillingError("billing.inventory_unavailable")
+                return snapshot
         except GoogleBillingError:
             raise
         except GoogleAccountInventoryError:
@@ -473,8 +477,7 @@ class GoogleBillingService:
         code: str | None = None,
     ) -> NoReturn:
         if code is None:
-            raw_provider_code = getattr(error, "code", None)
-            provider_code = raw_provider_code if type(raw_provider_code) is str else ""
+            provider_code = _safe_provider_code(error)
             code = (
                 "billing.provider_response_invalid"
                 if provider_code == "billing.provider_response_invalid"
@@ -630,18 +633,33 @@ def _token(value: object, code: str) -> str:
 
 
 def _valid_provider_id_or_none(value: object) -> bool:
-    return value is None or (
-        type(value) is str and bool(value) and len(value.encode("utf-8")) <= 512
-    )
+    if value is None:
+        return True
+    if type(value) is not str or not value:
+        return False
+    try:
+        return len(value.encode("utf-8")) <= 512
+    except UnicodeError:
+        return False
 
 
 def _valid_precondition(value: object) -> bool:
-    return (
-        type(value) is str
-        and bool(value)
-        and len(value.encode("utf-8")) <= 512
-        and all(character >= " " and character != "\x7f" for character in value)
-    )
+    if type(value) is not str or not value:
+        return False
+    try:
+        return len(value.encode("utf-8")) <= 512 and all(
+            character >= " " and character != "\x7f" for character in value
+        )
+    except UnicodeError:
+        return False
+
+
+def _safe_provider_code(error: object) -> str:
+    try:
+        value = getattr(error, "code", None)
+    except Exception:
+        return ""
+    return value if type(value) is str else ""
 
 
 def _generation(value: object) -> int:

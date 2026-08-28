@@ -48,6 +48,10 @@ class FakeBillingLease:
         self.reads: list[tuple[str, ...]] = []
         self.fail_get: str | None = None
         self.fail_create: str | None = None
+        self.get_error: Exception | None = None
+        self.bind_error: Exception | None = None
+        self.observation_override: object | None = None
+        self.bind_result_override: object | None = None
         self.revision = 0
         self.lookup_hook: Callable[[], None] | None = None
 
@@ -55,8 +59,12 @@ class FakeBillingLease:
         self, project_id: str
     ) -> GoogleBillingBindingObservationV1:
         self.reads.append(("billing.resourceAssociations.get", project_id))
+        if self.get_error is not None:
+            raise self.get_error
         if self.fail_get is not None:
             raise GoogleCloudApiError(self.fail_get)
+        if self.observation_override is not None:
+            return self.observation_override  # type: ignore[return-value]
         observed = GoogleBillingBindingObservationV1(
             billing_account_id=self.bindings.get(project_id),
             precondition=f"etag-{self.revision}",
@@ -80,8 +88,12 @@ class FakeBillingLease:
                 expected_precondition,
             )
         )
+        if self.bind_error is not None:
+            raise self.bind_error
         if self.fail_create is not None:
             raise GoogleCloudApiError(self.fail_create)
+        if self.bind_result_override is not None:
+            return self.bind_result_override  # type: ignore[return-value]
         current = self.bindings.get(project_id)
         if expected_precondition != f"etag-{self.revision}":
             return GoogleBillingBindResultV1(
@@ -148,6 +160,18 @@ class ExplodingCredentialLease:
     @property
     def subject_id(self):
         raise RuntimeError("private-lease-attestation-marker")
+
+
+class ExplodingProviderCodeError(Exception):
+    @property
+    def code(self):
+        raise RuntimeError("private-provider-code-marker")
+
+    def __repr__(self) -> str:
+        raise AssertionError("provider repr must not run")
+
+    def __str__(self) -> str:
+        raise AssertionError("provider str must not run")
 
 
 def _inventory(
@@ -563,6 +587,32 @@ def test_manager_state_errors_are_typed_at_plan_boundary(tmp_path, state: str) -
     assert lease.calls == []
 
 
+def test_reload_blocked_between_status_and_snapshot_cannot_publish_plan(
+    tmp_path, monkeypatch
+) -> None:
+    service, manager, lease, _ = _service(tmp_path)
+    original_snapshot = manager._snapshot_for_internal_use
+
+    def snapshot_after_reload_block():
+        manager._block_after_reload_failure("private-manager-race-marker")
+        return original_snapshot()
+
+    monkeypatch.setattr(
+        manager, "_snapshot_for_internal_use", snapshot_after_reload_block
+    )
+
+    with pytest.raises(GoogleBillingError, match="billing.inventory_unavailable"):
+        service.plan_billing_binding(
+            project_ref="the-hive-1",
+            billing_ref="billing-one",
+            expected_generation=1,
+            idempotency_key="manager-race",
+        )
+
+    assert lease.reads == []
+    assert lease.calls == []
+
+
 def test_manager_failure_is_typed_at_apply_boundary(tmp_path) -> None:
     service, manager, lease, _ = _service(tmp_path)
     plan = service.plan_billing_binding(
@@ -787,6 +837,86 @@ def test_malformed_binding_lookup_is_redacted_before_mutation(tmp_path) -> None:
 
     assert raised.value.partial is None
     assert api.calls == []
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [
+        GoogleBillingBindingObservationV1(
+            billing_account_id=chr(0xD800), precondition="etag-0"
+        ),
+        GoogleBillingBindingObservationV1(
+            billing_account_id=None, precondition=chr(0xD800)
+        ),
+    ],
+    ids=["billing-account-surrogate", "precondition-surrogate"],
+)
+def test_provider_observation_surrogate_is_typed_and_redacted(
+    tmp_path, observation: GoogleBillingBindingObservationV1
+) -> None:
+    lease = FakeBillingLease()
+    lease.observation_override = observation
+    service, _, _, _ = _service(tmp_path, api=lease)
+    plan = service.plan_billing_binding(
+        project_ref="the-hive-1",
+        billing_ref="billing-one",
+        expected_generation=1,
+        idempotency_key="observation-surrogate",
+    )
+
+    with pytest.raises(
+        GoogleBillingError, match="billing.provider_response_invalid"
+    ) as raised:
+        _apply(service, plan)
+
+    assert raised.value.partial is None
+    assert lease.calls == []
+
+
+def test_provider_bind_result_surrogate_is_typed_and_redacted(tmp_path) -> None:
+    lease = FakeBillingLease()
+    lease.bind_result_override = GoogleBillingBindResultV1(
+        state="created", billing_account_id=chr(0xD800)
+    )
+    service, _, _, _ = _service(tmp_path, api=lease)
+    plan = service.plan_billing_binding(
+        project_ref="the-hive-1",
+        billing_ref="billing-one",
+        expected_generation=1,
+        idempotency_key="bind-result-surrogate",
+    )
+
+    with pytest.raises(
+        GoogleBillingError, match="billing.provider_response_invalid"
+    ) as raised:
+        _apply(service, plan)
+
+    assert raised.value.partial is not None
+    assert raised.value.partial.reason_code == "billing.provider_response_invalid"
+
+
+@pytest.mark.parametrize("phase", ["lookup", "bind"])
+def test_exploding_provider_code_property_is_typed_and_redacted(
+    tmp_path, phase: str
+) -> None:
+    lease = FakeBillingLease()
+    if phase == "lookup":
+        lease.get_error = ExplodingProviderCodeError()
+    else:
+        lease.bind_error = ExplodingProviderCodeError()
+    service, _, _, _ = _service(tmp_path, api=lease)
+    plan = service.plan_billing_binding(
+        project_ref="the-hive-1",
+        billing_ref="billing-one",
+        expected_generation=1,
+        idempotency_key=f"exploding-code-{phase}",
+    )
+
+    with pytest.raises(GoogleBillingError, match="billing.provider_failed") as raised:
+        _apply(service, plan)
+
+    assert "private-provider-code-marker" not in repr(raised.value)
+    assert (raised.value.partial is not None) is (phase == "bind")
 
 
 def test_repeated_and_concurrent_apply_create_one_association(tmp_path) -> None:
