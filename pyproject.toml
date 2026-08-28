@@ -8,6 +8,7 @@ version = "0.10.5"
 description = "Local MCP wrapper for controlling a sleeping Codex Agentinnen pool via tmux"
 requires-python = ">=3.11"
 dependencies = [
+  "PyJWT[crypto]>=2.9,<3",
   "PyYAML>=6.0",
   "dbus-python==1.4.0",
   "PyGObject==3.56.3",
