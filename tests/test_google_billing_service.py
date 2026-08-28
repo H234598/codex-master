@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import re
@@ -14,6 +15,8 @@ from codex_master.google_account_inventory_manager import (
     GoogleAccountInventoryManager,
 )
 from codex_master.google_billing_service import (
+    GoogleBillingBindingObservationV1,
+    GoogleBillingBindResultV1,
     GoogleBillingError,
     GoogleBillingService,
 )
@@ -31,54 +34,120 @@ class Clock:
         self.value += timedelta(seconds=seconds)
 
 
-class FakeBillingApi:
-    def __init__(self) -> None:
+class FakeBillingLease:
+    def __init__(
+        self,
+        *,
+        account_ref: str = "google-one",
+        subject_id: str = "subject-one",
+    ) -> None:
+        self.account_ref = account_ref
+        self.subject_id = subject_id
         self.bindings: dict[str, str] = {}
         self.calls: list[tuple[str, ...]] = []
         self.reads: list[tuple[str, ...]] = []
         self.fail_get: str | None = None
         self.fail_create: str | None = None
+        self.revision = 0
+        self.lookup_hook: Callable[[], None] | None = None
 
-    def get_project_billing_binding(self, project_id: str) -> str | None:
+    def get_project_billing_binding(
+        self, project_id: str
+    ) -> GoogleBillingBindingObservationV1:
         self.reads.append(("billing.resourceAssociations.get", project_id))
         if self.fail_get is not None:
             raise GoogleCloudApiError(self.fail_get)
-        return self.bindings.get(project_id)
+        observed = GoogleBillingBindingObservationV1(
+            billing_account_id=self.bindings.get(project_id),
+            precondition=f"etag-{self.revision}",
+        )
+        if self.lookup_hook is not None:
+            self.lookup_hook()
+        return observed
 
-    def create_project_billing_binding(
-        self, project_id: str, billing_account_id: str
-    ) -> None:
+    def bind_project_if_unbound(
+        self,
+        project_id: str,
+        billing_account_id: str,
+        *,
+        expected_precondition: str,
+    ) -> GoogleBillingBindResultV1:
         self.calls.append(
             (
                 "billing.resourceAssociations.create",
                 project_id,
                 billing_account_id,
+                expected_precondition,
             )
         )
         if self.fail_create is not None:
             raise GoogleCloudApiError(self.fail_create)
+        current = self.bindings.get(project_id)
+        if expected_precondition != f"etag-{self.revision}":
+            return GoogleBillingBindResultV1(
+                state="conflict", billing_account_id=current
+            )
+        if current is not None:
+            return GoogleBillingBindResultV1(
+                state="already_bound" if current == billing_account_id else "conflict",
+                billing_account_id=current,
+            )
         self.bindings[project_id] = billing_account_id
+        self.revision += 1
+        return GoogleBillingBindResultV1(
+            state="created", billing_account_id=billing_account_id
+        )
+
+    def external_bind(self, project_id: str, billing_account_id: str) -> None:
+        self.bindings[project_id] = billing_account_id
+        self.revision += 1
 
 
-class BlockingBillingApi(FakeBillingApi):
+class BlockingBillingLease(FakeBillingLease):
     def __init__(self) -> None:
         super().__init__()
         self.entered = threading.Event()
         self.release = threading.Event()
 
-    def create_project_billing_binding(
-        self, project_id: str, billing_account_id: str
-    ) -> None:
-        self.calls.append(
-            (
-                "billing.resourceAssociations.create",
-                project_id,
-                billing_account_id,
-            )
-        )
+    def bind_project_if_unbound(
+        self,
+        project_id: str,
+        billing_account_id: str,
+        *,
+        expected_precondition: str,
+    ) -> GoogleBillingBindResultV1:
         self.entered.set()
         assert self.release.wait(timeout=5)
-        self.bindings[project_id] = billing_account_id
+        return super().bind_project_if_unbound(
+            project_id,
+            billing_account_id,
+            expected_precondition=expected_precondition,
+        )
+
+
+class FakeCredentialAuthority:
+    def __init__(self, lease: FakeBillingLease) -> None:
+        self.lease = lease
+        self.requests: list[tuple[str, str]] = []
+        self.fail = False
+
+    def lease_billing_effect(
+        self, account_ref: str, subject_id: str
+    ) -> FakeBillingLease:
+        self.requests.append((account_ref, subject_id))
+        if self.fail:
+            raise RuntimeError("private-credential-source-marker")
+        return self.lease
+
+
+class ExplodingCredentialLease:
+    @property
+    def account_ref(self):
+        raise RuntimeError("private-lease-attestation-marker")
+
+    @property
+    def subject_id(self):
+        raise RuntimeError("private-lease-attestation-marker")
 
 
 def _inventory(
@@ -164,11 +233,35 @@ def _manager(document) -> GoogleAccountInventoryManager:
     return manager
 
 
-def _service(tmp_path, *, api=None, clock=None):
+def _unloaded_manager(document) -> GoogleAccountInventoryManager:
+    return GoogleAccountInventoryManager._for_test_loader(
+        lambda: document,
+        monotonic_clock=lambda: 0.0,
+        operator_timestamp_utc=lambda: "2026-08-28T12:00:00Z",
+    )
+
+
+def _service(tmp_path, *, api=None, authority=None, clock=None):
     manager = _manager(_inventory(tmp_path))
-    api = api or FakeBillingApi()
+    api = api or FakeBillingLease()
+    authority = authority or FakeCredentialAuthority(api)
     clock = clock or Clock()
-    return GoogleBillingService(manager, api, clock=clock), manager, api, clock
+    return (
+        GoogleBillingService(manager, authority, clock=clock),
+        manager,
+        api,
+        clock,
+    )
+
+
+def _apply(service, plan, **overrides):
+    arguments = {
+        "expected_generation": plan.inventory_generation,
+        "confirmed_digest": plan.digest,
+        "idempotency_key": plan.idempotency_key,
+    }
+    arguments.update(overrides)
+    return service.apply_billing_binding(plan.id, **arguments)
 
 
 def _replace_snapshot(
@@ -203,6 +296,14 @@ def test_plan_rejects_project_and_billing_from_different_accounts(tmp_path) -> N
 
     assert api.reads == []
     assert api.calls == []
+
+    retry = service.plan_billing_binding(
+        project_ref="the-hive-1",
+        billing_ref="billing-one",
+        expected_generation=1,
+        idempotency_key="cross-account",
+    )
+    assert retry.billing_ref == "billing-one"
 
 
 def test_plan_binds_private_snapshot_identity_but_public_view_is_redacted(
@@ -277,7 +378,7 @@ def test_apply_exposes_only_project_binding_lookup_and_create(tmp_path) -> None:
         idempotency_key="apply-one",
     )
 
-    receipt = service.apply_billing_binding(plan.id, expected_generation=1)
+    receipt = _apply(service, plan)
 
     assert receipt.state == "succeeded"
     assert api.calls == [
@@ -285,6 +386,7 @@ def test_apply_exposes_only_project_binding_lookup_and_create(tmp_path) -> None:
             "billing.resourceAssociations.create",
             "provider-project-one",
             "provider-billing-one",
+            "etag-0",
         )
     ]
     assert set(call[0] for call in api.reads + api.calls) == {
@@ -293,6 +395,189 @@ def test_apply_exposes_only_project_binding_lookup_and_create(tmp_path) -> None:
     }
     assert "provider-project-one" not in repr(receipt)
     assert "provider-billing-one" not in repr(receipt)
+
+
+def test_effect_credential_lease_is_requested_and_attested_for_plan_identity(
+    tmp_path,
+) -> None:
+    lease = FakeBillingLease()
+    authority = FakeCredentialAuthority(lease)
+    service, _, _, _ = _service(tmp_path, api=lease, authority=authority)
+    plan = service.plan_billing_binding(
+        project_ref="the-hive-1",
+        billing_ref="billing-one",
+        expected_generation=1,
+        idempotency_key="credential-one",
+    )
+
+    _apply(service, plan)
+
+    assert authority.requests == [("google-one", "subject-one")]
+    assert len(lease.calls) == 1
+
+
+def test_foreign_credential_lease_fails_before_provider_access(tmp_path) -> None:
+    lease = FakeBillingLease(account_ref="google-two", subject_id="subject-two")
+    authority = FakeCredentialAuthority(lease)
+    service, _, _, _ = _service(tmp_path, api=lease, authority=authority)
+    plan = service.plan_billing_binding(
+        project_ref="the-hive-1",
+        billing_ref="billing-one",
+        expected_generation=1,
+        idempotency_key="credential-foreign",
+    )
+
+    with pytest.raises(
+        GoogleBillingError, match="billing.credential_identity_mismatch"
+    ):
+        _apply(service, plan)
+
+    assert authority.requests == [("google-one", "subject-one")]
+    assert lease.reads == []
+    assert lease.calls == []
+
+
+def test_credential_authority_failure_is_typed_and_redacted(tmp_path) -> None:
+    lease = FakeBillingLease()
+    authority = FakeCredentialAuthority(lease)
+    authority.fail = True
+    service, _, _, _ = _service(tmp_path, api=lease, authority=authority)
+    plan = service.plan_billing_binding(
+        project_ref="the-hive-1",
+        billing_ref="billing-one",
+        expected_generation=1,
+        idempotency_key="credential-failure",
+    )
+
+    with pytest.raises(
+        GoogleBillingError, match="billing.credential_unavailable"
+    ) as raised:
+        _apply(service, plan)
+
+    assert "private-credential-source-marker" not in repr(raised.value)
+    assert lease.reads == []
+    assert lease.calls == []
+
+
+def test_credential_attestation_failure_is_typed_and_redacted(tmp_path) -> None:
+    lease = ExplodingCredentialLease()
+    authority = FakeCredentialAuthority(lease)  # type: ignore[arg-type]
+    service, _, _, _ = _service(tmp_path, authority=authority)
+    plan = service.plan_billing_binding(
+        project_ref="the-hive-1",
+        billing_ref="billing-one",
+        expected_generation=1,
+        idempotency_key="credential-attestation-failure",
+    )
+
+    with pytest.raises(
+        GoogleBillingError, match="billing.credential_unavailable"
+    ) as raised:
+        _apply(service, plan)
+
+    assert "private-lease-attestation-marker" not in repr(raised.value)
+
+
+def test_missing_digest_or_idempotency_never_reaches_credential_authority(
+    tmp_path,
+) -> None:
+    lease = FakeBillingLease()
+    authority = FakeCredentialAuthority(lease)
+    service, _, _, _ = _service(tmp_path, api=lease, authority=authority)
+    plan = service.plan_billing_binding(
+        project_ref="the-hive-1",
+        billing_ref="billing-one",
+        expected_generation=1,
+        idempotency_key="required-apply",
+    )
+
+    with pytest.raises(TypeError):
+        service.apply_billing_binding(
+            plan.id,
+            expected_generation=1,
+            idempotency_key=plan.idempotency_key,
+        )
+    with pytest.raises(TypeError):
+        service.apply_billing_binding(
+            plan.id,
+            expected_generation=1,
+            confirmed_digest=plan.digest,
+        )
+
+    assert authority.requests == []
+    assert lease.reads == []
+    assert lease.calls == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "code"),
+    [
+        ({"confirmed_digest": "sha256:" + "0" * 64}, "billing.plan_digest_mismatch"),
+        ({"idempotency_key": "other-key"}, "billing.idempotency_conflict"),
+    ],
+)
+def test_apply_rejects_wrong_digest_or_idempotency_before_credential(
+    tmp_path, overrides, code: str
+) -> None:
+    lease = FakeBillingLease()
+    authority = FakeCredentialAuthority(lease)
+    service, _, _, _ = _service(tmp_path, api=lease, authority=authority)
+    plan = service.plan_billing_binding(
+        project_ref="the-hive-1",
+        billing_ref="billing-one",
+        expected_generation=1,
+        idempotency_key="exact-apply",
+    )
+
+    with pytest.raises(GoogleBillingError, match=code):
+        _apply(service, plan, **overrides)
+
+    assert authority.requests == []
+    assert lease.reads == []
+    assert lease.calls == []
+
+
+@pytest.mark.parametrize("state", ["empty", "closed", "reload_blocked"])
+def test_manager_state_errors_are_typed_at_plan_boundary(tmp_path, state: str) -> None:
+    document = _inventory(tmp_path)
+    manager = _unloaded_manager(document)
+    if state != "empty":
+        manager.reload()
+    if state == "closed":
+        manager.close()
+    elif state == "reload_blocked":
+        manager._block_after_reload_failure("private-manager-marker")
+    lease = FakeBillingLease()
+    authority = FakeCredentialAuthority(lease)
+    service = GoogleBillingService(manager, authority, clock=Clock())
+
+    with pytest.raises(GoogleBillingError, match="billing.inventory_unavailable"):
+        service.plan_billing_binding(
+            project_ref="the-hive-1",
+            billing_ref="billing-one",
+            expected_generation=1,
+            idempotency_key="manager-state",
+        )
+
+    assert lease.reads == []
+    assert lease.calls == []
+
+
+def test_manager_failure_is_typed_at_apply_boundary(tmp_path) -> None:
+    service, manager, lease, _ = _service(tmp_path)
+    plan = service.plan_billing_binding(
+        project_ref="the-hive-1",
+        billing_ref="billing-one",
+        expected_generation=1,
+        idempotency_key="manager-apply",
+    )
+    manager.close()
+
+    with pytest.raises(GoogleBillingError, match="billing.inventory_unavailable"):
+        _apply(service, plan)
+
+    assert lease.reads == []
+    assert lease.calls == []
 
 
 def test_apply_revalidates_generation_and_fingerprint_before_api(tmp_path) -> None:
@@ -315,10 +600,17 @@ def test_apply_revalidates_generation_and_fingerprint_before_api(tmp_path) -> No
     )
 
     with pytest.raises(GoogleBillingError, match="billing.plan_stale"):
-        service.apply_billing_binding(plan.id, expected_generation=1)
+        _apply(service, plan)
 
     assert api.reads == []
     assert api.calls == []
+    retry = service.plan_billing_binding(
+        project_ref="the-hive-1",
+        billing_ref="billing-one",
+        expected_generation=1,
+        idempotency_key="stale-one",
+    )
+    assert retry.id != plan.id
 
 
 @pytest.mark.parametrize(
@@ -345,7 +637,7 @@ def test_apply_rejects_ref_reuse_and_provider_id_change_before_api(
     )
 
     with pytest.raises(GoogleBillingError, match="billing.binding_changed"):
-        service.apply_billing_binding(plan.id, expected_generation=1)
+        _apply(service, plan)
 
     assert api.reads == []
     assert api.calls == []
@@ -364,14 +656,76 @@ def test_expired_plan_stops_before_api(tmp_path) -> None:
     clock.advance(5)
 
     with pytest.raises(GoogleBillingError, match="billing.plan_expired"):
-        service.apply_billing_binding(plan.id, expected_generation=1)
+        _apply(service, plan)
 
     assert api.reads == []
     assert api.calls == []
 
 
+def test_plan_expiring_during_lookup_stops_before_effect(tmp_path) -> None:
+    clock = Clock()
+    lease = FakeBillingLease()
+    lease.lookup_hook = lambda: clock.advance(5)
+    service, _, _, _ = _service(tmp_path, api=lease, clock=clock)
+    plan = service.plan_billing_binding(
+        project_ref="the-hive-1",
+        billing_ref="billing-one",
+        expected_generation=1,
+        idempotency_key="expires-during-lookup",
+        ttl_seconds=5,
+    )
+
+    with pytest.raises(GoogleBillingError, match="billing.plan_expired"):
+        _apply(service, plan)
+
+    assert len(lease.reads) == 1
+    assert lease.calls == []
+
+
+@pytest.mark.parametrize("idempotency_key", [None, "expired-retry"])
+def test_expired_plan_does_not_poison_idempotency_key(
+    tmp_path, idempotency_key: str | None
+) -> None:
+    clock = Clock()
+    service, _, _, _ = _service(tmp_path, clock=clock)
+    arguments = {
+        "project_ref": "the-hive-1",
+        "billing_ref": "billing-one",
+        "expected_generation": 1,
+        "ttl_seconds": 5,
+    }
+    if idempotency_key is not None:
+        arguments["idempotency_key"] = idempotency_key
+    first = service.plan_billing_binding(**arguments)
+    clock.advance(5)
+
+    second = service.plan_billing_binding(**arguments)
+
+    assert second.id != first.id
+    assert second.idempotency_key == first.idempotency_key
+
+
+def test_unexpired_plan_collection_is_bounded(tmp_path) -> None:
+    service, _, _, _ = _service(tmp_path)
+    for number in range(256):
+        service.plan_billing_binding(
+            project_ref="the-hive-1",
+            billing_ref="billing-one",
+            expected_generation=1,
+            idempotency_key=f"bounded-{number}",
+        )
+
+    with pytest.raises(GoogleBillingError, match="billing.plan_limit"):
+        service.plan_billing_binding(
+            project_ref="the-hive-1",
+            billing_ref="billing-one",
+            expected_generation=1,
+            idempotency_key="bounded-overflow",
+        )
+
+
 def test_existing_foreign_binding_is_never_replaced(tmp_path) -> None:
-    api = FakeBillingApi()
+    api = FakeBillingLease()
     api.bindings["provider-project-one"] = "provider-billing-foreign"
     service, _, _, _ = _service(tmp_path, api=api)
     plan = service.plan_billing_binding(
@@ -382,14 +736,41 @@ def test_existing_foreign_binding_is_never_replaced(tmp_path) -> None:
     )
 
     with pytest.raises(GoogleBillingError, match="billing.foreign_binding"):
-        service.apply_billing_binding(plan.id, expected_generation=1)
+        _apply(service, plan)
 
     assert api.calls == []
     assert api.bindings == {"provider-project-one": "provider-billing-foreign"}
 
 
+def test_provider_race_to_foreign_binding_is_cas_blocked(tmp_path) -> None:
+    lease = FakeBillingLease()
+    lease.lookup_hook = lambda: lease.external_bind(
+        "provider-project-one", "provider-billing-foreign"
+    )
+    service, _, _, _ = _service(tmp_path, api=lease)
+    plan = service.plan_billing_binding(
+        project_ref="the-hive-1",
+        billing_ref="billing-one",
+        expected_generation=1,
+        idempotency_key="provider-race",
+    )
+
+    with pytest.raises(GoogleBillingError, match="billing.foreign_binding"):
+        _apply(service, plan)
+
+    assert lease.calls == [
+        (
+            "billing.resourceAssociations.create",
+            "provider-project-one",
+            "provider-billing-one",
+            "etag-0",
+        )
+    ]
+    assert lease.bindings == {"provider-project-one": "provider-billing-foreign"}
+
+
 def test_malformed_binding_lookup_is_redacted_before_mutation(tmp_path) -> None:
-    api = FakeBillingApi()
+    api = FakeBillingLease()
     api.bindings["provider-project-one"] = 7  # type: ignore[assignment]
     service, _, _, _ = _service(tmp_path, api=api)
     plan = service.plan_billing_binding(
@@ -402,14 +783,14 @@ def test_malformed_binding_lookup_is_redacted_before_mutation(tmp_path) -> None:
     with pytest.raises(
         GoogleBillingError, match="billing.provider_response_invalid"
     ) as raised:
-        service.apply_billing_binding(plan.id, expected_generation=1)
+        _apply(service, plan)
 
     assert raised.value.partial is None
     assert api.calls == []
 
 
 def test_repeated_and_concurrent_apply_create_one_association(tmp_path) -> None:
-    api = BlockingBillingApi()
+    api = BlockingBillingLease()
     service, _, _, _ = _service(tmp_path, api=api)
     plan = service.plan_billing_binding(
         project_ref="the-hive-1",
@@ -420,7 +801,7 @@ def test_repeated_and_concurrent_apply_create_one_association(tmp_path) -> None:
     receipts = []
 
     def apply() -> None:
-        receipts.append(service.apply_billing_binding(plan.id, expected_generation=1))
+        receipts.append(_apply(service, plan))
 
     first = threading.Thread(target=apply)
     second = threading.Thread(target=apply)
@@ -436,7 +817,7 @@ def test_repeated_and_concurrent_apply_create_one_association(tmp_path) -> None:
     assert len(receipts) == 2
     assert receipts[0] == receipts[1]
     assert len(api.calls) == 1
-    assert service.apply_billing_binding(plan.id, expected_generation=1) == receipts[0]
+    assert _apply(service, plan) == receipts[0]
     assert len(api.calls) == 1
 
 
@@ -451,7 +832,7 @@ def test_repeated_and_concurrent_apply_create_one_association(tmp_path) -> None:
 def test_provider_failures_are_structured_redacted_and_retryable(
     tmp_path, provider_code: str, public_code: str
 ) -> None:
-    api = FakeBillingApi()
+    api = FakeBillingLease()
     api.fail_create = provider_code
     service, _, _, _ = _service(tmp_path, api=api)
     plan = service.plan_billing_binding(
@@ -462,7 +843,7 @@ def test_provider_failures_are_structured_redacted_and_retryable(
     )
 
     with pytest.raises(GoogleBillingError, match=public_code) as raised:
-        service.apply_billing_binding(plan.id, expected_generation=1)
+        _apply(service, plan)
 
     assert raised.value.code == public_code
     assert raised.value.partial is not None
@@ -471,3 +852,23 @@ def test_provider_failures_are_structured_redacted_and_retryable(
     assert provider_code not in repr(raised.value.partial)
     assert "provider-project-one" not in repr(raised.value.partial)
     assert "provider-billing-one" not in repr(raised.value.partial)
+
+
+def test_provider_lookup_failure_is_typed_without_partial_effect(tmp_path) -> None:
+    lease = FakeBillingLease()
+    lease.fail_get = "google.api_unavailable"
+    service, _, _, _ = _service(tmp_path, api=lease)
+    plan = service.plan_billing_binding(
+        project_ref="the-hive-1",
+        billing_ref="billing-one",
+        expected_generation=1,
+        idempotency_key="provider-lookup-failure",
+    )
+
+    with pytest.raises(
+        GoogleBillingError, match="billing.provider_unavailable"
+    ) as raised:
+        _apply(service, plan)
+
+    assert raised.value.partial is None
+    assert lease.calls == []
