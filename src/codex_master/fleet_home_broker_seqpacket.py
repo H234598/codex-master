@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from enum import Enum
+from hashlib import sha256
 import socket
 import struct
 from typing import Protocol
 
+from codex_master.fleet_home_broker_dispatch import BrokerDispatchCommand
 from codex_master.fleet_home_broker_linux import (
     LinuxOperations,
     PeerSnapshot,
@@ -200,7 +202,7 @@ def _reattest_seqpacket_peer_from_active_wal_binding(
     linux_operations: LinuxOperations,
     wal_operations: WalOperations,
     release: BrokerReleaseSpec,
-) -> KernelPeerEvidence:
+) -> tuple[KernelPeerEvidence, PrincipalBinding]:
     """Private composition used by connected peer admission."""
 
     try:
@@ -232,7 +234,7 @@ def _reattest_seqpacket_peer_from_active_wal_binding(
         _peer_security_context(
             operations.peer_security_context(), release.agent_domain, expected.mcs_pair
         )
-        return KernelPeerEvidence(
+        evidence = KernelPeerEvidence(
             pid,
             uid,
             gid,
@@ -243,6 +245,7 @@ def _reattest_seqpacket_peer_from_active_wal_binding(
             snapshot.invocation_id,
             snapshot.mcs_pair,
         )
+        return evidence, expected
     except Exception:
         raise SeqpacketPeerError("seqpacket peer attestation failed") from None
 
@@ -253,7 +256,7 @@ def admit_connected_seqpacket_peer(
     linux_operations: LinuxOperations,
     wal_operations: WalOperations,
     release: BrokerReleaseSpec,
-) -> KernelPeerEvidence:
+) -> tuple[KernelPeerEvidence, PrincipalBinding]:
     return _reattest_seqpacket_peer_from_active_wal_binding(
         _ConnectedSeqpacketSocketOptions(connection, enforcement_operations),
         linux_operations,
@@ -268,11 +271,8 @@ def receive_admitted_seqpacket_request(
     linux_operations: LinuxOperations,
     wal_operations: WalOperations,
     release: BrokerReleaseSpec,
-) -> tuple[
-    KernelPeerEvidence,
-    AttestHomeRequest | QueryTransactionRequest | GetTerminalResultRequest,
-]:
-    evidence = admit_connected_seqpacket_peer(
+) -> tuple[KernelPeerEvidence, BrokerDispatchCommand]:
+    evidence, principal = admit_connected_seqpacket_peer(
         connection,
         enforcement_operations,
         linux_operations,
@@ -313,7 +313,12 @@ def receive_admitted_seqpacket_request(
         raise SeqpacketRouteError(
             SeqpacketRouteCode.FORBIDDEN_REQUEST_KIND
         ) from None
-    return evidence, message
+    return evidence, BrokerDispatchCommand(
+        principal,
+        message,
+        sha256(payload).hexdigest(),
+        None,
+    )
 
 
 def reattest_seqpacket_peer(

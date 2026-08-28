@@ -11,6 +11,7 @@ import pytest
 
 import codex_master.fleet_home_broker_seqpacket as seqpacket
 import codex_master.fleet_home_broker_wal as wal
+from codex_master.fleet_home_broker_dispatch import BrokerDispatchCommand
 from codex_master.fleet_home_broker_linux import FdStat, PidfdIdentity
 from codex_master.fleet_home_broker_protocol import (
     MAX_CHPB_MESSAGE_BYTES,
@@ -663,24 +664,27 @@ def test_admit_connected_seqpacket_peer_is_real_single_caller_and_returns_wal_bo
     )
     wal_operations = seeded_active_wal(PRINCIPAL)
     calls: list[tuple[object, ...]] = []
+    returned: list[tuple[KernelPeerEvidence, PrincipalBinding]] = []
     original = seqpacket._reattest_seqpacket_peer_from_active_wal_binding
 
-    def capture(*args: object) -> KernelPeerEvidence:
+    def capture(*args: object) -> tuple[KernelPeerEvidence, PrincipalBinding]:
         calls.append(args)
-        return original(*args)
+        result = original(*args)
+        returned.append(result)
+        return result
 
     monkeypatch.setattr(
         seqpacket, "_reattest_seqpacket_peer_from_active_wal_binding", capture
     )
 
-    evidence_one = admit(
+    evidence_one, principal_one = admit(
         connection,
         enforcement_operations,
         linux_operations,
         wal_operations,
         release_spec(),
     )
-    evidence_two = admit(
+    evidence_two, principal_two = admit(
         connection,
         enforcement_operations,
         linux_operations,
@@ -701,6 +705,10 @@ def test_admit_connected_seqpacket_peer_is_real_single_caller_and_returns_wal_bo
     )
     assert evidence_one == expected_evidence
     assert evidence_two == expected_evidence
+    assert principal_one == PRINCIPAL
+    assert principal_two == PRINCIPAL
+    assert principal_one is returned[0][1]
+    assert principal_two is returned[1][1]
     assert len(calls) == 2
     assert all(type(call[0]) is adapter_type for call in calls)
     assert all(call[0]._connection is connection for call in calls)
@@ -749,12 +757,15 @@ def test_private_wal_composition_uses_one_root_owned_key_and_original_principal(
 
     monkeypatch.setattr(wal, "_validated_chain", capture_validated_chain)
     monkeypatch.setattr(seqpacket, "_lookup_active_principal_binding", capture)
-    evidence = seqpacket._reattest_seqpacket_peer_from_active_wal_binding(
-        RecordingOperations(events), linux_operations, wal_operations, release_spec()
+    evidence, principal = (
+        seqpacket._reattest_seqpacket_peer_from_active_wal_binding(
+            RecordingOperations(events), linux_operations, wal_operations, release_spec()
+        )
     )
 
     assert len(observed_keys) == 1
     assert observed_keys[0][1:] == (17, 29, "1" * 32, 9, "c0,c1")
+    assert principal is returned_principals[0]
     assert returned_principals[0] is validated_records[0][-1].status.binding.principal
     assert wal_operations.events == ["read"]
     assert linux_operations.reuse_checks == 16
@@ -929,6 +940,9 @@ def test_wal_composition_source_keeps_private_api_and_single_authority() -> None
 
     assert len(coordinators) == 1
     coordinator = coordinators[0]
+    assert ast.unparse(coordinator.returns) == (
+        "tuple[KernelPeerEvidence, PrincipalBinding]"
+    )
     calls = [node for node in ast.walk(coordinator) if isinstance(node, ast.Call)]
     assert sum(
         isinstance(node.func, ast.Name)
@@ -976,6 +990,9 @@ def test_wal_composition_source_keeps_private_api_and_single_authority() -> None
     ]
     assert len(admissions) == 1
     admission = admissions[0]
+    assert ast.unparse(admission.returns) == (
+        "tuple[KernelPeerEvidence, PrincipalBinding]"
+    )
     admission_calls = [
         node for node in ast.walk(admission) if isinstance(node, ast.Call)
     ]
@@ -1331,7 +1348,6 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
 
     forbidden_imports = (
         "fleet_home_broker_transport",
-        "fleet_home_broker_dispatch",
         "fleet_home_broker_client",
         "subprocess",
         "systemd",
@@ -1357,6 +1373,17 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
     assert [alias.name for alias in wal_imports[0].names] == [
         "WalOperations",
         "_lookup_active_principal_binding",
+    ]
+
+    dispatch_imports = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "codex_master.fleet_home_broker_dispatch"
+    ]
+    assert len(dispatch_imports) == 1
+    assert [alias.name for alias in dispatch_imports[0].names] == [
+        "BrokerDispatchCommand"
     ]
 
     forbidden_call_names = {
@@ -1425,8 +1452,7 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
     receive_source = ast.get_source_segment(source, receive_function)
     assert receive_source is not None
     assert ast.unparse(receive_function.returns) == (
-        "tuple[KernelPeerEvidence, AttestHomeRequest | QueryTransactionRequest | "
-        "GetTerminalResultRequest]"
+        "tuple[KernelPeerEvidence, BrokerDispatchCommand]"
     )
 
     admission_calls = [
@@ -1496,17 +1522,35 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
         and ast.unparse(node.exc)
         == "SeqpacketRequestError(SeqpacketRequestCode.NOT_REQUEST)"
     ]
+    command_calls = [
+        node
+        for node in ast.walk(receive_function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "BrokerDispatchCommand"
+    ]
+    assert len(command_calls) == 1
+    assert [ast.unparse(arg) for arg in command_calls[0].args] == [
+        "principal",
+        "message",
+        "sha256(payload).hexdigest()",
+        "None",
+    ]
+    assert command_calls[0].keywords == []
     returns = [
         node
         for node in ast.walk(receive_function)
         if isinstance(node, ast.Return)
         and node.value is not None
-        and ast.unparse(node.value) == "(evidence, message)"
+        and ast.unparse(node.value)
+        == "(evidence, BrokerDispatchCommand(principal, message, sha256(payload).hexdigest(), None))"
     ]
-    assert len(role_gates) == len(request_raises) == len(returns) == 1
+    assert len(role_gates) == len(request_raises) == len(command_calls) == len(returns) == 1
     assert decode_calls[0].lineno < role_gates[0].lineno
     assert role_gates[0].lineno <= request_raises[0].lineno
-    assert request_raises[0].lineno < returns[0].lineno
+    assert request_raises[0].lineno < command_calls[0].lineno
+    assert command_calls[0].lineno == returns[0].lineno
+    assert command_calls[0] in ast.walk(returns[0])
 
     route_gates = [
         node
@@ -1618,7 +1662,7 @@ def test_seqpacket_source_has_no_live_transport_or_authority_calls() -> None:
         "QueryTransactionRequest",
         "GetTerminalResultRequest",
     ):
-        assert source.count(allowed_type) == 3
+        assert source.count(allowed_type) == 2
     for forbidden_type in (
         "ProvisionHomeRequest",
         "ReplaceHomeRequest",
@@ -1707,9 +1751,7 @@ def test_receive_admitted_seqpacket_request_accepts_exact_agent_route_set_after_
     receive = getattr(seqpacket, "receive_admitted_seqpacket_request")
     assert get_type_hints(receive)["return"] == tuple[
         KernelPeerEvidence,
-        AttestHomeRequest
-        | QueryTransactionRequest
-        | GetTerminalResultRequest,
+        BrokerDispatchCommand,
     ]
     monkeypatch.setattr(seqpacket.socket, "socket", RecordingConnectedSocket)
     expected = BindingExpectation(
@@ -1744,6 +1786,19 @@ def test_receive_admitted_seqpacket_request_accepts_exact_agent_route_set_after_
         ),
     )
     canonical_decode = seqpacket.decode_chpb_message
+    canonical_lookup = seqpacket._lookup_active_principal_binding
+    lookup_principals: list[PrincipalBinding | None] = []
+
+    def recording_lookup(*args: object) -> PrincipalBinding | None:
+        principal = canonical_lookup(*args)
+        lookup_principals.append(principal)
+        return principal
+
+    monkeypatch.setattr(
+        seqpacket,
+        "_lookup_active_principal_binding",
+        recording_lookup,
+    )
     expected_evidence = KernelPeerEvidence(
         PEER_PID,
         1000,
@@ -1773,7 +1828,7 @@ def test_receive_admitted_seqpacket_request_accepts_exact_agent_route_set_after_
         )
         wal_operations = seeded_active_wal(PRINCIPAL)
 
-        evidence, received_request = receive(
+        evidence, command = receive(
             connection,
             RecordingEnforcementOperations(events),
             RecordingLinuxOperations(events),
@@ -1784,9 +1839,13 @@ def test_receive_admitted_seqpacket_request_accepts_exact_agent_route_set_after_
         recv_event = ("recvmsg", MAX_CHPB_MESSAGE_BYTES + 1, 0)
         decode_event = ("decode", payload)
         assert evidence == expected_evidence
-        assert received_request is decoded[0]
-        assert type(received_request) is type(request)
-        assert received_request == request
+        assert type(command) is BrokerDispatchCommand
+        assert command.principal is lookup_principals[-1]
+        assert command.request is decoded[0]
+        assert type(command.request) is type(request)
+        assert command.request == request
+        assert command.request_digest == sha256(payload).hexdigest()
+        assert command.plan is None
         assert [event for event in events if event[0] == "recvmsg"] == [
             recv_event
         ]
@@ -1934,7 +1993,7 @@ def test_receive_admitted_seqpacket_request_admits_reads_once_then_decodes_canon
     linux_operations = RecordingLinuxOperations(events)
     wal_operations = seeded_active_wal(PRINCIPAL)
 
-    evidence, received_request = receive(
+    evidence, command = receive(
         connection,
         enforcement_operations,
         linux_operations,
@@ -1953,8 +2012,12 @@ def test_receive_admitted_seqpacket_request_admits_reads_once_then_decodes_canon
         PRINCIPAL.invocation_id,
         PRINCIPAL.mcs_pair,
     )
-    assert type(received_request) is AttestHomeRequest
-    assert received_request == request
+    assert type(command) is BrokerDispatchCommand
+    assert command.principal == PRINCIPAL
+    assert type(command.request) is AttestHomeRequest
+    assert command.request == request
+    assert command.request_digest == sha256(payload).hexdigest()
+    assert command.plan is None
     recv_events = [event for event in events if event[0] == "recvmsg"]
     assert recv_events == [("recvmsg", MAX_CHPB_MESSAGE_BYTES + 1, 0)]
     assert [event for event in events if event[0] == "decode"] == [
@@ -2226,7 +2289,11 @@ def test_receive_admitted_seqpacket_request_enforces_packet_size_boundaries_befo
             release_spec(),
         )
         assert result[0] == expected_evidence
-        assert result[1] is request
+        assert type(result[1]) is BrokerDispatchCommand
+        assert result[1].principal == PRINCIPAL
+        assert result[1].request is request
+        assert result[1].request_digest == sha256(payload).hexdigest()
+        assert result[1].plan is None
         assert decode_calls == [payload]
         decode_calls.clear()
 
@@ -2339,10 +2406,15 @@ def test_receive_admitted_seqpacket_request_repeats_fresh_admission_read_and_dec
     )
     assert result_one[0] == expected_evidence
     assert result_two[0] == expected_evidence
-    assert type(result_one[1]) is AttestHomeRequest
-    assert type(result_two[1]) is AttestHomeRequest
-    assert result_one[1] == request_one
-    assert result_two[1] == request_two
+    command_one = result_one[1]
+    command_two = result_two[1]
+    assert type(command_one) is BrokerDispatchCommand
+    assert type(command_two) is BrokerDispatchCommand
+    assert command_one.request == request_one
+    assert command_two.request == request_two
+    assert command_one.request_digest == sha256(payload_one).hexdigest()
+    assert command_two.request_digest == sha256(payload_two).hexdigest()
+    assert command_one.plan is command_two.plan is None
     assert linux_operations.reuse_checks == 32
     assert len(linux_operations.observed_identities) == 32
     assert wal_operations.events == ["read", "read"]
