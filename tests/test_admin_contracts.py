@@ -156,6 +156,12 @@ def test_problem_rejects_secret_path_and_control_text(text: str) -> None:
         problem(detail=text)
 
 
+@pytest.mark.parametrize("text", ["client_secret=never", r"\secret.txt", r"\report.txt"])
+def test_public_problem_projection_rejects_exact_adversarial_text(text: str) -> None:
+    with pytest.raises(AdminContractError, match="control.response_private"):
+        public_admin_result(problem(detail=text))
+
+
 def test_problem_rejects_invalid_severity_and_retry_contract() -> None:
     with pytest.raises(AdminContractError, match="control.response_private"):
         problem(severity="fatal")
