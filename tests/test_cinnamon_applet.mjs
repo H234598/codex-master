@@ -130,6 +130,12 @@ function sampleNativeAgent(overrides = {}) {
 }
 
 function sampleOverviewPayload(overrides = {}) {
+  const limitWindows = [
+    { pool: "primary", window_seconds: 18000, used_percent: 24.5, remaining_percent: 75.5, reset_at: "2026-08-15T13:00:00+00:00" },
+    { pool: "primary", window_seconds: 604800, used_percent: 10, remaining_percent: 90, reset_at: "2026-08-22T12:00:00+00:00" },
+    { pool: "spark", window_seconds: 18000, used_percent: 5, remaining_percent: 95, reset_at: "2026-08-15T13:00:00+00:00" },
+    { pool: "primary", window_seconds: 2592000, used_percent: 12, remaining_percent: 88, reset_at: "2026-09-14T12:00:00+00:00" },
+  ];
   return {
     generation: 7,
     created_at: "2026-08-15T12:00:00+00:00",
@@ -164,6 +170,7 @@ function sampleOverviewPayload(overrides = {}) {
         limit_week_reset_at: "2026-08-22T12:00:00+00:00",
         cost_last_hour_percentage_points: 2.5,
         usage_freshness: "fresh",
+        limit_windows: limitWindows,
       },
     ],
     account_limits: [
@@ -177,6 +184,7 @@ function sampleOverviewPayload(overrides = {}) {
         week_reset_at: "2026-08-22T12:00:00+00:00",
         cost_last_hour_percentage_points: 2.5,
         usage_freshness: "fresh",
+        limit_windows: limitWindows,
       },
     ],
     warnings: [],

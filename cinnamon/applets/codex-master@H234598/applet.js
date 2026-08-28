@@ -1809,6 +1809,26 @@ FlottenmanagementApplet.prototype = {
             && candidate.getUTCSeconds() === second;
     },
 
+    _overviewLimitWindows(value) {
+        if (!Array.isArray(value) || value.length > 32) return false;
+        return value.every((window) => this._overviewHasExactFields(window, [
+            "pool", "window_seconds", "used_percent", "remaining_percent", "reset_at",
+        ])
+            && this._overviewString(window.pool, 64)
+            && Number.isSafeInteger(window.window_seconds)
+            && window.window_seconds >= 1 && window.window_seconds <= 2592000
+            && this._overviewPercent(window.used_percent)
+            && this._overviewPercent(window.remaining_percent)
+            && this._overviewUtc(window.reset_at));
+    },
+
+    _overviewLimitLabel(window) {
+        const duration = window.window_seconds === 18000 ? "5h"
+            : window.window_seconds === 604800 ? "7d"
+                : window.window_seconds === 2592000 ? "30d" : `${window.window_seconds}s`;
+        return `${window.pool}/${duration}`;
+    },
+
     _isValidOverviewPayload(payload) {
         try {
             if (!this._overviewHasExactFields(payload, [
@@ -1851,7 +1871,7 @@ FlottenmanagementApplet.prototype = {
                 if (!this._overviewHasExactFields(row, [
                     "agent_id", "series_display", "provider", "runner", "model", "account_id", "account_label", "state",
                     "principal_role", "dispatch_id", "limit_short_remaining_percent", "limit_short_reset_at",
-                    "limit_week_remaining_percent", "limit_week_reset_at", "cost_last_hour_percentage_points", "usage_freshness",
+                    "limit_week_remaining_percent", "limit_week_reset_at", "cost_last_hour_percentage_points", "usage_freshness", "limit_windows",
                 ])) return false;
                 if (!this._overviewAgentId(row.agent_id)
                     || !seriesAgentIds.has(row.agent_id)
@@ -1866,6 +1886,7 @@ FlottenmanagementApplet.prototype = {
                     || !this._overviewPercent(row.limit_week_remaining_percent)
                     || !this._overviewUtc(row.limit_week_reset_at)
                     || !this._overviewPercent(row.cost_last_hour_percentage_points)
+                    || !this._overviewLimitWindows(row.limit_windows)
                     || !["fresh", "stale", "unavailable"].includes(row.usage_freshness)) return false;
                 agentIds.add(row.agent_id);
                 usageFreshnesses.push(row.usage_freshness);
@@ -1875,13 +1896,14 @@ FlottenmanagementApplet.prototype = {
             for (const row of payload.account_limits) {
                 if (!this._overviewHasExactFields(row, [
                     "account_id", "account_label", "provider", "short_remaining_percent", "short_reset_at",
-                    "week_remaining_percent", "week_reset_at", "cost_last_hour_percentage_points", "usage_freshness",
+                    "week_remaining_percent", "week_reset_at", "cost_last_hour_percentage_points", "usage_freshness", "limit_windows",
                 ])) return false;
                 if (!this._overviewAccountId(row.account_id) || accountIds.has(row.account_id)
                     || !this._overviewString(row.account_label) || !this._overviewString(row.provider)
                     || !this._overviewPercent(row.short_remaining_percent) || !this._overviewUtc(row.short_reset_at)
                     || !this._overviewPercent(row.week_remaining_percent) || !this._overviewUtc(row.week_reset_at)
                     || !this._overviewPercent(row.cost_last_hour_percentage_points)
+                    || !this._overviewLimitWindows(row.limit_windows)
                     || !["fresh", "stale", "unavailable"].includes(row.usage_freshness)) return false;
                 accountIds.add(row.account_id);
                 usageFreshnesses.push(row.usage_freshness);
@@ -1940,6 +1962,7 @@ FlottenmanagementApplet.prototype = {
             : payload.account_limits.map((row) => (
                 `${row.account_id} short=${row.short_remaining_percent === null ? "—" : `${row.short_remaining_percent.toFixed(1)}%`}`
                 + ` week=${row.week_remaining_percent === null ? "—" : `${row.week_remaining_percent.toFixed(1)}%`}`
+                + ` limits=${row.limit_windows.map((window) => `${this._overviewLimitLabel(window)}=${window.remaining_percent === null ? "—" : `${window.remaining_percent.toFixed(1)}%`}`).join(",") || "—"}`
                 + ` cost=${row.cost_last_hour_percentage_points === null ? "—" : `${row.cost_last_hour_percentage_points.toFixed(1)}%`}`
             )).join(" · ");
         const summary = this.overviewCompact

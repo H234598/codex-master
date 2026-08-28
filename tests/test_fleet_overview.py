@@ -149,6 +149,8 @@ def usage_triplet(account_id: str = "codex-account", *, source: str = "live") ->
     limits = (
         UsageLimit("primary", 18000, 25.0, 75.0, SHORT_RESET),
         UsageLimit("primary", 604800, 40.0, 60.0, WEEK_RESET),
+        UsageLimit("spark", 18000, 10.0, 90.0, SHORT_RESET),
+        UsageLimit("primary", 2592000, 12.0, 88.0, datetime(2026, 9, 14, 12, 0, tzinfo=timezone.utc)),
     )
     costs = (UsageCostWindow(3600, "primary", 18000, 12.5, "complete", 2),)
     return UsageSnapshot(
@@ -189,6 +191,9 @@ def test_unique_live_usage_triplet_enriches_account_and_agent_rows() -> None:
     assert agent.limit_week_remaining_percent == 60.0
     assert agent.cost_last_hour_percentage_points == 12.5
     assert agent.usage_freshness == "fresh"
+    assert {(item.pool, item.window_seconds) for item in account.limit_windows} == {
+        ("primary", 18000), ("primary", 604800), ("primary", 2592000), ("spark", 18000),
+    }
 
 
 def test_enrichment_does_not_mutate_base_or_usage_and_ignores_input_permutations() -> None:

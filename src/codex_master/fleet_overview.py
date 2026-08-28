@@ -49,6 +49,7 @@ class FleetOverviewAgentRow:
     limit_week_reset_at: str | None
     cost_last_hour_percentage_points: float | None
     usage_freshness: str
+    limit_windows: tuple[UsageLimit, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +75,7 @@ class FleetOverviewAccountLimitRow:
     week_reset_at: str | None
     cost_last_hour_percentage_points: float | None
     usage_freshness: str
+    limit_windows: tuple[UsageLimit, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +222,22 @@ def _format_percent(value: float | None) -> str:
     return "—" if value is None else f"{value:.1f}%"
 
 
+def _limit_label(limit: UsageLimit) -> str:
+    if limit.window_seconds == 18_000:
+        window = "5h"
+    elif limit.window_seconds == 604_800:
+        window = "7d"
+    elif limit.window_seconds == 2_592_000:
+        window = "30d"
+    else:
+        window = f"{limit.window_seconds}s"
+    return f"{limit.pool}/{window}"
+
+
+def _format_limit_windows(limits: tuple[UsageLimit, ...]) -> str:
+    return ",".join(f"{_limit_label(item)}={_format_percent(item.remaining_percent)}" for item in limits) or "—"
+
+
 def _validate_usage_snapshot(usage_snapshot: UsageSnapshot) -> None:
     try:
         if type(usage_snapshot) is not UsageSnapshot:
@@ -259,6 +277,7 @@ def _validate_usage_snapshot(usage_snapshot: UsageSnapshot) -> None:
                 or type(account.limits) is not tuple
                 or type(account.cost_windows) is not tuple
                 or type(account.usage_resets) is not tuple
+                or type(account.limits) is not tuple
             ):
                 _invalid_overview_input()
             account_ids.add(account.account_id)
@@ -338,20 +357,32 @@ def _reset_text(value: datetime | None) -> str | None:
     return value.isoformat() if isinstance(value, datetime) else None
 
 
+def _usage_limit_document(limit: UsageLimit) -> dict[str, object]:
+    return {
+        "pool": limit.pool,
+        "window_seconds": limit.window_seconds,
+        "used_percent": limit.used_percent,
+        "remaining_percent": limit.remaining_percent,
+        "reset_at": _reset_text(limit.reset_at),
+    }
+
+
 def _usage_fields(
     usage_snapshot: UsageSnapshot,
     account_id: str | None,
-) -> tuple[float | None, str | None, float | None, str | None, float | None, str]:
+) -> tuple[float | None, str | None, float | None, str | None, float | None, str, tuple[UsageLimit, ...]]:
     account = _usage_account_for_id(usage_snapshot, account_id)
     if (
         account is None
         or usage_snapshot.source == "unavailable"
         or (usage_snapshot.source == "live" and account.stale)
     ):
-        return None, None, None, None, None, "unavailable"
+        return None, None, None, None, None, "unavailable", ()
 
-    short_limits = tuple(limit for limit in account.limits if limit.window_seconds == 18000)
-    week_limits = tuple(limit for limit in account.limits if limit.window_seconds == 604800)
+    short_limits = tuple(
+        limit for limit in account.limits if limit.pool == "primary" and limit.window_seconds == 18000
+    ) or tuple(limit for limit in account.limits if limit.window_seconds == 18000)
+    week_limits = tuple(limit for limit in account.limits if limit.pool == "primary" and limit.window_seconds == 604800)
     short = short_limits[0] if len(short_limits) == 1 else None
     week = week_limits[0] if len(week_limits) == 1 else None
     cost: UsageCostWindow | None = None
@@ -375,6 +406,12 @@ def _usage_fields(
         _reset_text(week.reset_at) if week is not None else None,
         cost.consumed_percentage_points if cost is not None else None,
         freshness,
+        tuple(
+            sorted(
+                account.limits,
+                key=lambda item: (item.pool, item.window_seconds, item.reset_at is not None, item.reset_at or datetime.min),
+            )
+        ),
     )
 
 
@@ -394,6 +431,7 @@ def enrich_fleet_overview_usage(
                 limit_week_reset_at=fields[3],
                 cost_last_hour_percentage_points=fields[4],
                 usage_freshness=fields[5],
+                limit_windows=fields[6],
             )
             for row in overview.agents
             for fields in (_usage_fields(usage_snapshot, row.account_id),)
@@ -407,6 +445,7 @@ def enrich_fleet_overview_usage(
                 week_reset_at=fields[3],
                 cost_last_hour_percentage_points=fields[4],
                 usage_freshness=fields[5],
+                limit_windows=fields[6],
             )
             for row in overview.account_limits
             for fields in (_usage_fields(usage_snapshot, row.account_id),)
@@ -607,6 +646,7 @@ def fleet_overview_document(overview: FleetOverviewSnapshot) -> dict[str, object
                 "limit_week_reset_at": row.limit_week_reset_at,
                 "cost_last_hour_percentage_points": row.cost_last_hour_percentage_points,
                 "usage_freshness": row.usage_freshness,
+                "limit_windows": [_usage_limit_document(item) for item in row.limit_windows],
             }
             for row in overview.agents
         ],
@@ -621,6 +661,7 @@ def fleet_overview_document(overview: FleetOverviewSnapshot) -> dict[str, object
                 "week_reset_at": row.week_reset_at,
                 "cost_last_hour_percentage_points": row.cost_last_hour_percentage_points,
                 "usage_freshness": row.usage_freshness,
+                "limit_windows": [_usage_limit_document(item) for item in row.limit_windows],
             }
             for row in overview.account_limits
         ],
@@ -668,6 +709,7 @@ def render_fleet_overview(
         lines.extend(
             f"account {row.account_id} short={_format_percent(row.short_remaining_percent)} "
             f"week={_format_percent(row.week_remaining_percent)} "
+            f"limits={_format_limit_windows(row.limit_windows)} "
             f"cost={_format_percent(row.cost_last_hour_percentage_points)}"
             for row in overview.account_limits
         )
@@ -705,14 +747,13 @@ def render_fleet_overview(
         [
             "",
             "## Account limits",
-            "| Account | Label | Provider | Short | Week | Cost/hour |",
-            "| --- | --- | --- | ---: | ---: | ---: |",
+            "| Account | Label | Provider | Limits | Cost/hour |",
+            "| --- | --- | --- | --- | ---: |",
         ]
     )
     lines.extend(
         f"| {row.account_id} | {row.account_label} | {row.provider} | "
-        f"{_format_percent(row.short_remaining_percent)} | "
-        f"{_format_percent(row.week_remaining_percent)} | "
+        f"{_format_limit_windows(row.limit_windows)} | "
         f"{_format_percent(row.cost_last_hour_percentage_points)} |"
         for row in overview.account_limits
     )
