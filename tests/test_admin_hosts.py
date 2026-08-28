@@ -251,6 +251,166 @@ def test_transport_binding_ref_cannot_encode_private_endpoint(
 
 
 @pytest.mark.parametrize(
+    ("field", "private_value"),
+    [
+        ("ref", "10.0.0.8:22"),
+        ("ref", "localhost"),
+        ("ref", "clientSecretOpaque"),
+        ("ref", "private%255Fendpoint"),
+        ("label", "worker.internal:22"),
+        ("label", "localhost"),
+        ("label", "CredentialToken Worker"),
+        ("label", "models%252Froot"),
+        ("transport_kind", "localhost:11434"),
+        ("transport_kind", "privateEndpoint"),
+        ("transport_kind", "ssh%253A%252F%252Flocalhost"),
+        ("capability", "10.0.0.8:22"),
+        ("capability", "authToken:opaqueValue123"),
+        ("capability", "resource%252Eprobe"),
+        ("source", "worker.internal:22"),
+        ("source", "credentialToken"),
+        ("source", "host%252Dagent"),
+        ("source", "\ud800"),
+        ("binding_ref", "localhost"),
+    ],
+)
+def test_every_public_string_field_rejects_private_or_encoded_values_without_echo(
+    tmp_path: Path, field: str, private_value: str
+) -> None:
+    registry = registry_at(tmp_path)
+    evidence = valid_evidence()
+    ref = "worker-one"
+    if field == "ref":
+        ref = private_value
+    elif field == "label":
+        evidence["label"] = private_value
+    elif field == "transport_kind":
+        transport = cast(dict[str, object], evidence["transport_binding"])
+        transport["kind"] = private_value
+    elif field == "capability":
+        evidence["capabilities"] = ["codex.execute", private_value]
+    elif field == "binding_ref":
+        transport = cast(dict[str, object], evidence["transport_binding"])
+        transport["binding_ref"] = private_value
+    else:
+        evidence["source"] = private_value
+
+    with pytest.raises(HostRegistryError) as captured:
+        registry.record_probe(ref, generation=1, evidence=evidence)
+
+    assert captured.value.code == "control.host_invalid"
+    assert str(captured.value) == "control.host_invalid"
+    assert repr(captured.value) == "HostRegistryError('control.host_invalid')"
+    assert registry.list() == ()
+    assert private_value not in repr(registry)
+
+
+@pytest.mark.parametrize(
+    ("field", "private_value"),
+    [
+        ("ref", "localhost:11434"),
+        ("label", "privateEndpoint Worker"),
+        ("transport_kind", "ssh%253A%252F%252Flocalhost"),
+        ("capability", "credentialToken"),
+        ("source", "worker.internal:22"),
+    ],
+)
+def test_direct_host_contract_rejects_private_public_string_fields(
+    field: str, private_value: str
+) -> None:
+    values: dict[str, object] = {
+        "ref": "worker-one",
+        "label": "Worker One",
+        "role": "execution",
+        "transport_binding": {"kind": "ssh", "binding_ref": "worker-one-ssh"},
+        "capabilities": ("codex.execute",),
+        "reachability": {"state": "reachable"},
+        "resource_evidence": {"cpu_threads": 16, "memory_bytes": 1024},
+        "generation": 4,
+        "observed_at": datetime(2026, 8, 28, 10, 0, tzinfo=UTC),
+        "source": "host-agent",
+    }
+    if field == "transport_kind":
+        values["transport_binding"] = {
+            "kind": private_value,
+            "binding_ref": "worker-one-ssh",
+        }
+    elif field == "capability":
+        values["capabilities"] = (private_value,)
+    else:
+        values[field] = private_value
+
+    with pytest.raises(HostRegistryError) as captured:
+        ControlHostV1(**cast(Any, values))
+
+    assert captured.value.code == "control.host_invalid"
+    assert private_value not in repr(captured.value)
+
+
+def test_host_repr_redacts_ref_label_and_transport_binding_values() -> None:
+    host = ControlHostV1(
+        ref="worker-one",
+        label="Worker One",
+        role="execution",
+        transport_binding={"kind": "ssh", "binding_ref": "worker-one-ssh"},
+        capabilities=("codex.execute",),
+        reachability={"state": "reachable"},
+        resource_evidence={"cpu_threads": 16, "memory_bytes": 1024},
+        generation=4,
+        observed_at=datetime(2026, 8, 28, 10, 0, tzinfo=UTC),
+        source="host-agent",
+    )
+
+    rendered = repr(host)
+
+    assert rendered.startswith("ControlHostV1(")
+    assert "worker-one" not in rendered
+    assert "Worker One" not in rendered
+    assert "ssh" not in rendered
+
+
+def test_label_allowlist_does_not_reject_benign_embedded_short_fragments(
+    tmp_path: Path,
+) -> None:
+    host = registry_at(tmp_path).record_probe(
+        "worker-one",
+        generation=1,
+        evidence=valid_evidence(label="Curl Worker"),
+    )
+
+    assert host.label == "Curl Worker"
+
+
+def test_nested_private_binding_values_remain_private_only(tmp_path: Path) -> None:
+    evidence = valid_evidence()
+    evidence["binding_state"] = {
+        "endpoint": "ssh://worker.internal:22",
+        "credential": {"clientSecret": "opaque-private-value"},
+        "root": "/srv/codex-worker",
+        "metadata": {"encodedMarker": "private%255Fendpoint"},
+    }
+
+    host = registry_at(tmp_path).record_probe(
+        "worker-one", generation=1, evidence=evidence
+    )
+    document = json.loads(
+        (tmp_path / "admin-hosts" / "hosts.json").read_text(encoding="utf-8")
+    )
+    public_rendered = json.dumps(host.public_projection(), sort_keys=True)
+    repr_rendered = repr(host)
+
+    assert document["bindings"][0]["binding_state"] == evidence["binding_state"]
+    for private_value in (
+        "worker.internal",
+        "opaque-private-value",
+        "/srv/codex-worker",
+        "private%255Fendpoint",
+    ):
+        assert private_value not in public_rendered
+        assert private_value not in repr_rendered
+
+
+@pytest.mark.parametrize(
     ("field", "key", "value"),
     [
         ("transport_binding", "description", "public"),
@@ -295,7 +455,7 @@ def test_equal_generation_is_idempotent_only_for_identical_bound_evidence(
 
     for field, replacement in [
         ("role", "control"),
-        ("source", "other-agent"),
+        ("source", "inventory-agent"),
         ("observed_at", "2026-08-28T10:00:01Z"),
         ("capabilities", ["resource.probe"]),
         (

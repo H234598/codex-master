@@ -20,7 +20,6 @@ from urllib.parse import unquote
 
 from codex_master.admin_contracts import (
     AdminContractError,
-    public_admin_ref,
     public_admin_text,
 )
 from codex_master.hive.state import HiveStateError, HiveStateStore
@@ -37,6 +36,14 @@ _MAX_PRIVATE_TEXT_BYTES = 4096
 _MAX_NESTING = 6
 _ROLES = frozenset({"control", "execution"})
 _REACHABILITY_STATES = frozenset({"reachable", "unreachable", "unknown"})
+_TRANSPORT_KINDS = frozenset({"ssh"})
+_CAPABILITY_CODES = frozenset({"codex.execute", "resource.probe"})
+_PROBE_SOURCES = frozenset({"host-agent", "inventory-agent"})
+_HOST_REF = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\Z", re.ASCII)
+_HOST_LABEL = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9 _-]{0,126}[A-Za-z0-9])?\Z", re.ASCII
+)
+_CODE_TOKEN = re.compile(r"[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*\Z", re.ASCII)
 _EVIDENCE_FIELDS = frozenset(
     {
         "label",
@@ -90,7 +97,9 @@ _SENSITIVE_KEY_PARTS = frozenset(
         "url",
     }
 )
-_PRIVATE_HOST_SUFFIXES = (".home", ".internal", ".lan", ".local", ".localhost")
+_SENSITIVE_VALUE_PARTS = _SENSITIVE_KEY_PARTS - {"host"}
+_SENSITIVE_VALUE_SUBSTRINGS = _SENSITIVE_VALUE_PARTS - {"jwt", "uri", "url"}
+_PRIVATE_VALUE_MARKERS = frozenset({"localhost"})
 
 
 class HostRegistryError(ValueError):
@@ -118,8 +127,8 @@ class ControlHostV1:
 
     def __post_init__(self) -> None:
         error_code = "control.host_invalid"
-        object.__setattr__(self, "ref", _public_ref(self.ref, error_code))
-        object.__setattr__(self, "label", _public_text(self.label, error_code))
+        object.__setattr__(self, "ref", _host_ref(self.ref, error_code))
+        object.__setattr__(self, "label", _host_label(self.label, error_code))
         if type(self.role) is not str or self.role not in _ROLES:
             raise HostRegistryError(error_code)
         transport = _transport_binding(self.transport_binding, error_code)
@@ -133,13 +142,10 @@ class ControlHostV1:
         object.__setattr__(self, "resource_evidence", _freeze_mapping(resources))
         object.__setattr__(self, "generation", _generation(self.generation, error_code))
         object.__setattr__(self, "observed_at", _utc_time(self.observed_at, error_code))
-        object.__setattr__(self, "source", _public_ref(self.source, error_code))
+        object.__setattr__(self, "source", _probe_source(self.source, error_code))
 
     def __repr__(self) -> str:
-        return (
-            f"ControlHostV1(ref={self.ref!r}, role={self.role!r}, "
-            f"generation={self.generation!r})"
-        )
+        return f"ControlHostV1(role={self.role!r}, generation={self.generation!r})"
 
     def public_projection(self) -> dict[str, object]:
         """Return the complete public host view without private binding state."""
@@ -186,7 +192,7 @@ class HostRegistry:
             return tuple(self._host(record) for record in hosts)
 
     def get(self, ref: str) -> ControlHostV1:
-        ref = _public_ref(ref, "control.host_invalid")
+        ref = _host_ref(ref, "control.host_invalid")
         with self._locked_state() as (hosts, _bindings):
             for record in hosts:
                 if record["ref"] == ref:
@@ -200,7 +206,7 @@ class HostRegistry:
         generation: int,
         evidence: Mapping[str, object],
     ) -> ControlHostV1:
-        ref = _public_ref(ref, "control.host_invalid")
+        ref = _host_ref(ref, "control.host_invalid")
         generation = _generation(generation, "control.host_invalid")
         record, binding = _validated_probe_record(
             ref,
@@ -287,7 +293,7 @@ class HostRegistry:
         for item in raw_bindings:
             if not isinstance(item, Mapping) or set(item) != _BINDING_FIELDS:
                 raise HostRegistryError("control.host_store_unavailable")
-            ref = _public_ref(item["ref"], "control.host_store_unavailable")
+            ref = _host_ref(item["ref"], "control.host_store_unavailable")
             if ref in bindings:
                 raise HostRegistryError("control.host_store_unavailable")
             bindings[ref] = _private_mapping(
@@ -298,7 +304,7 @@ class HostRegistry:
         for item in raw_hosts:
             if not isinstance(item, Mapping) or set(item) != _HOST_FIELDS:
                 raise HostRegistryError("control.host_store_unavailable")
-            ref = _public_ref(item["ref"], "control.host_store_unavailable")
+            ref = _host_ref(item["ref"], "control.host_store_unavailable")
             if ref in seen or ref not in bindings:
                 raise HostRegistryError("control.host_store_unavailable")
             evidence = {
@@ -335,7 +341,7 @@ class HostRegistry:
         for item in raw_hosts:
             if not isinstance(item, Mapping) or set(item) != expected:
                 raise HostRegistryError("control.host_store_unavailable")
-            ref = _public_ref(item["ref"], "control.host_store_unavailable")
+            ref = _host_ref(item["ref"], "control.host_store_unavailable")
             if ref in bindings:
                 raise HostRegistryError("control.host_store_unavailable")
             record, binding = self._probe_record(
@@ -362,7 +368,7 @@ class HostRegistry:
             evidence, _EVIDENCE_FIELDS, error_code
         ):
             raise HostRegistryError(error_code)
-        label = _public_text(evidence["label"], error_code)
+        label = _host_label(evidence["label"], error_code)
         role = evidence["role"]
         if type(role) is not str or role not in _ROLES:
             raise HostRegistryError(error_code)
@@ -371,7 +377,7 @@ class HostRegistry:
         reachability = _reachability(evidence["reachability"], error_code)
         resources = _resources(evidence["resource_evidence"], error_code)
         observed = _parse_time(evidence["observed_at"], error_code)
-        source = _public_ref(evidence["source"], error_code)
+        source = _probe_source(evidence["source"], error_code)
         binding = _private_mapping(evidence["binding_state"], error_code)
         if not binding:
             raise HostRegistryError(error_code)
@@ -469,11 +475,53 @@ def _public_text(value: object, error_code: str) -> str:
         _raise(error_code)
 
 
-def _public_ref(value: object, error_code: str) -> str:
-    try:
-        return public_admin_ref(value)
-    except AdminContractError:
+def _field_string(
+    value: object,
+    *,
+    pattern: re.Pattern[str],
+    error_code: str,
+) -> str:
+    if type(value) is not str:
         _raise(error_code)
+    normalized = _normalized_key(value, error_code)
+    parts = frozenset(part for part in normalized.split("_") if part)
+    compact = normalized.replace("_", "")
+    if (
+        parts & _SENSITIVE_VALUE_PARTS
+        or any(marker in compact for marker in _SENSITIVE_VALUE_SUBSTRINGS)
+        or any(marker in compact for marker in _PRIVATE_VALUE_MARKERS)
+    ):
+        _raise(error_code)
+    try:
+        value.encode("ascii")
+    except UnicodeError:
+        _raise(error_code)
+    if pattern.fullmatch(value) is None:
+        _raise(error_code)
+    return value
+
+
+def _host_ref(value: object, error_code: str) -> str:
+    return _field_string(value, pattern=_HOST_REF, error_code=error_code)
+
+
+def _host_label(value: object, error_code: str) -> str:
+    return _field_string(value, pattern=_HOST_LABEL, error_code=error_code)
+
+
+def _registered_code(value: object, allowed: frozenset[str], error_code: str) -> str:
+    code = _field_string(value, pattern=_CODE_TOKEN, error_code=error_code)
+    if code not in allowed:
+        _raise(error_code)
+    return code
+
+
+def _transport_kind(value: object, error_code: str) -> str:
+    return _registered_code(value, _TRANSPORT_KINDS, error_code)
+
+
+def _probe_source(value: object, error_code: str) -> str:
+    return _registered_code(value, _PROBE_SOURCES, error_code)
 
 
 def _generation(value: object, error_code: str) -> int:
@@ -514,7 +562,9 @@ def _capabilities(value: object, error_code: str) -> tuple[str, ...]:
     values = cast(list[object] | tuple[object, ...], value)
     if not 1 <= len(values) <= _MAX_COLLECTION_ITEMS:
         _raise(error_code)
-    capabilities = tuple(_public_ref(item, error_code) for item in values)
+    capabilities = tuple(
+        _registered_code(item, _CAPABILITY_CODES, error_code) for item in values
+    )
     if len(set(capabilities)) != len(capabilities):
         _raise(error_code)
     return capabilities
@@ -578,23 +628,13 @@ def _transport_binding(value: object, error_code: str) -> dict[str, object]:
         error_code=error_code,
     )
     return {
-        "kind": _public_ref(transport["kind"], error_code),
+        "kind": _transport_kind(transport["kind"], error_code),
         "binding_ref": _opaque_binding_ref(transport["binding_ref"], error_code),
     }
 
 
 def _opaque_binding_ref(value: object, error_code: str) -> str:
-    ref = _public_ref(value, error_code)
-    candidate = unicodedata.normalize("NFKC", ref).casefold()
-    if ":" in candidate or "/" in candidate or "\\" in candidate:
-        _raise(error_code)
-    if candidate == "localhost" or candidate.endswith(_PRIVATE_HOST_SUFFIXES):
-        _raise(error_code)
-    try:
-        ipaddress.ip_address(candidate)
-    except ValueError:
-        return ref
-    _raise(error_code)
+    return _field_string(value, pattern=_HOST_REF, error_code=error_code)
 
 
 def _reachability(value: object, error_code: str) -> dict[str, object]:
